@@ -23,6 +23,7 @@ Other places to look:
 - [config/example.toml](https://github.com/attenuo-dev/attenuo/blob/main/config/example.toml): every config key, annotated.
 - [examples/github-leak-demo](https://github.com/attenuo-dev/attenuo/blob/main/examples/github-leak-demo/README.md): a scripted replay of a real incident.
 - [examples/multi-hop-demo](https://github.com/attenuo-dev/attenuo/blob/main/examples/multi-hop-demo/README.md): a planner delegating to a coder, narrowed at each hop, ended by one revocation of the chain.
+- [examples/idp-exchange-demo](https://github.com/attenuo-dev/attenuo/blob/main/examples/idp-exchange-demo/README.md): hop 0 from an OIDC ID token at `POST /token`, with the dev mint off, against a local mock identity provider.
 - [examples/claude-agent-sdk](https://github.com/attenuo-dev/attenuo/blob/main/examples/claude-agent-sdk/README.md) and [examples/langchain-agent](https://github.com/attenuo-dev/attenuo/blob/main/examples/langchain-agent/README.md): agent frameworks talking to MCP servers through attenuo, a token per hop.
 - [RFC-0001](../spec/rfc-0001-attenuo.md) and the [threat model](../spec/threat-model.md): what the system promises and what it does not.
 

@@ -5,6 +5,7 @@ attenuo does not log users in. It trusts your identity provider (IdP) for that, 
 **Read this first: what was tested.**
 
 - The config keys, the claim mapping and the error codes below come from the code in `crates/attenuo-server/src/config.rs` and `crates/attenuo-server/src/idp/`. The server's own tests exercise them with locally signed tokens. Config shapes in this guide were parsed by the real server.
+- [examples/idp-exchange-demo](https://github.com/attenuo-dev/attenuo/blob/main/examples/idp-exchange-demo/README.md) runs hop 0 end to end, with the dev mint off: OIDC discovery, the JWKS fetch, an ES256 ID token exchanged at `POST /token`, the replay refusal, then a delegation and two proxied calls. Its identity provider is a local mock, for demonstration only, not a real provider.
 - **No provider-specific setup in this guide was run against a live provider.** Every IdP section is marked **untested**. The issuer formats, claim names and console steps come from the providers' public conventions and may be out of date or wrong for your tenant. Check each against your tenant before relying on it, using [Checking your setup](#checking-your-setup).
 
 ## How hop 0 works
@@ -130,7 +131,7 @@ capabilities = [
 
 ID tokens are bearer credentials, bound to the agent that presents them only through `aud`/`azp` (SR-37): a token issued for agent A is refused from agent B with `credential_audience_mismatch`. `nonce` is not checked, because it binds a token to the browser session that requested it and the agent presenting the token here is not that session; the bearer risk remains until sender-constrained tokens exist.
 
-Root tokens last `[issuer] default_ttl_seconds` (900 by default), not as long as the ID token. v0 does not cap them by the ID token's `exp`, and does not remember used ID tokens: the same ID token can be exchanged again by the same agent until it expires. Prefer short-lived ID tokens.
+Root tokens last `requested_ttl_seconds`, or `[issuer] default_ttl_seconds` (900 by default), capped at the ID token's remaining lifetime: a root token never outlives the credential it came from. Each credential mints one root token (`replayed` on a second presentation, see [`[[agents]]`](#agents)); the record of used credentials is in memory, per server process. Prefer short-lived ID tokens.
 
 ## Provider recipes
 
