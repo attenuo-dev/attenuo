@@ -112,6 +112,9 @@ pub struct AppState {
     /// (the OS releases it when the process exits); `None` for `:memory:`. Declared last, so
     /// it is released after the stores above.
     store_fence: Option<attenuo_audit::WriterFence>,
+    /// Never sent on; dropped with the state, after the fence, which is what
+    /// [`AppState::released`] waits for.
+    released: tokio::sync::watch::Sender<()>,
 }
 
 impl AppState {
@@ -351,6 +354,7 @@ impl AppState {
             clock,
             trace,
             store_fence,
+            released: tokio::sync::watch::Sender::new(()),
         })
     }
 
@@ -360,6 +364,20 @@ impl AppState {
         self.store_fence
             .as_ref()
             .map(attenuo_audit::WriterFence::path)
+    }
+
+    /// Resolves once this state has been dropped: its stores are closed and its single-writer
+    /// fence is released, so another server can open the same database. The state lives as
+    /// long as anything holds it (the router and every copy of it, a request still running,
+    /// a background task), so this is how a caller that stopped a server in this process
+    /// knows the file is free, rather than trying the lock until it is.
+    pub fn released(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let mut rx = self.released.subscribe();
+        async move {
+            // Nothing is ever sent: `changed` fails once the sender, a field of the state,
+            // is dropped.
+            while rx.changed().await.is_ok() {}
+        }
     }
 
     /// The current time by [`AppState::clock`].

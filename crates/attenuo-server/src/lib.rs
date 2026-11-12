@@ -219,28 +219,42 @@ pub fn router(state: Arc<AppState>, upstreams: Vec<UpstreamConfig>, config: &Con
 /// Start the `[audit] checkpoint_interval_seconds` timer: every `period`, sign the head if
 /// entries were appended since the newest checkpoint. (The `checkpoint_every` count trigger
 /// runs inside the append itself.) Dropping the handle does not stop it; abort it to stop.
+/// [`run`] stops its own timer between ticks instead, so that no signing is cut off halfway.
 pub fn spawn_checkpointer(
     state: Arc<AppState>,
     period: std::time::Duration,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(period);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        tick.tick().await; // the first tick is immediate
-        loop {
-            tick.tick().await;
-            let result = state
-                .blocking(|s| s.audit.checkpoint_if_new(time::OffsetDateTime::now_utc()))
-                .await;
-            match result {
-                Ok(Some(cp)) => {
-                    tracing::info!(seq = cp.seq, kid = %cp.kid, "audit checkpoint signed")
-                }
-                Ok(None) => {}
-                Err(e) => tracing::error!(error = %e, "signing an audit checkpoint failed"),
-            }
+    tokio::spawn(checkpoint_ticks(state, period, std::future::pending()))
+}
+
+/// The timer of [`spawn_checkpointer`], until `stop` resolves. `stop` is only looked at
+/// between ticks: a signing in progress on the blocking pool finishes first, so that when this
+/// returns nothing it started still holds the state.
+async fn checkpoint_ticks(
+    state: Arc<AppState>,
+    period: std::time::Duration,
+    stop: impl std::future::Future<Output = ()>,
+) {
+    tokio::pin!(stop);
+    let mut tick = tokio::time::interval(period);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tick.tick().await; // the first tick is immediate
+    loop {
+        tokio::select! {
+            () = &mut stop => return,
+            _ = tick.tick() => {}
         }
-    })
+        let result = state
+            .blocking(|s| s.audit.checkpoint_if_new(time::OffsetDateTime::now_utc()))
+            .await;
+        match result {
+            Ok(Some(cp)) => {
+                tracing::info!(seq = cp.seq, kid = %cp.kid, "audit checkpoint signed")
+            }
+            Ok(None) => {}
+            Err(e) => tracing::error!(error = %e, "signing an audit checkpoint failed"),
+        }
+    }
 }
 
 /// Default of `[leases] maintenance_interval_seconds`: how often the lease maintenance ticker
@@ -413,20 +427,29 @@ pub async fn prune_user_windows(state: &Arc<AppState>) -> u64 {
 /// [`prune_user_windows`] (each
 /// does nothing when its retention is 0). Sessions go first, so a binding whose chain is about
 /// to be pruned is counted as a session; run state goes last, since it is only pruned once
-/// its leases are gone. Dropping the handle does not stop it; abort it to stop.
+/// its leases are gone. Dropping the handle does not stop it; abort it to stop. [`run`] stops
+/// its own ticker between runs instead.
 pub fn spawn_lease_maintenance(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(state.lease_maintenance.interval);
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        tick.tick().await; // the first tick is immediate
-        loop {
-            tick.tick().await;
-            prune_session_bindings(&state).await;
-            prune_lease_registry(&state).await;
-            prune_run_state(&state).await;
-            prune_user_windows(&state).await;
+    tokio::spawn(maintenance_ticks(state, std::future::pending()))
+}
+
+/// The ticker of [`spawn_lease_maintenance`], until `stop` resolves. `stop` is only looked at
+/// between runs, as in [`checkpoint_ticks`]: a run in progress finishes its passes first.
+async fn maintenance_ticks(state: Arc<AppState>, stop: impl std::future::Future<Output = ()>) {
+    tokio::pin!(stop);
+    let mut tick = tokio::time::interval(state.lease_maintenance.interval);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tick.tick().await; // the first tick is immediate
+    loop {
+        tokio::select! {
+            () = &mut stop => return,
+            _ = tick.tick() => {}
         }
-    })
+        prune_session_bindings(&state).await;
+        prune_lease_registry(&state).await;
+        prune_run_state(&state).await;
+        prune_user_windows(&state).await;
+    }
 }
 
 /// How long `[audit.sink]` keeps delivering queued checkpoints after a shutdown signal.
@@ -435,7 +458,16 @@ pub const SINK_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_s
 /// How long in-flight requests get to finish after a shutdown signal.
 pub const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Bind `[server] listen` and serve until SIGINT or SIGTERM, then drain for [`DRAIN_TIMEOUT`].
+/// How long [`serve`] waits, once [`run`] has returned, for the state to be dropped and the
+/// single-writer fence released. After a clean drain nothing is left to wait for; only
+/// requests abandoned at [`DRAIN_TIMEOUT`] can still hold the state, until they end.
+pub const RELEASE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Bind `[server] listen` and serve until SIGINT or SIGTERM, then drain for [`DRAIN_TIMEOUT`]
+/// and stop as [`run`] does. Returns once the state has been dropped, so the database's
+/// single-writer fence is released before this returns (a supervisor or an embedder can start
+/// the next server on the same file at once); a request still running after the drain is the
+/// one thing that can keep it, and that is logged after [`RELEASE_GRACE`].
 ///
 /// # Errors
 ///
@@ -445,46 +477,128 @@ pub const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10
 pub async fn serve(config: Config) -> anyhow::Result<()> {
     let (app, state) = build(&config)?;
     let listener = tokio::net::TcpListener::bind(config.server.listen).await?;
+    let fence = state.store_fence().map(std::path::Path::to_path_buf);
+    let released = state.released();
+    let res = run(&config, state, app, listener, shutdown_signal()).await;
+    match tokio::time::timeout(RELEASE_GRACE, released).await {
+        Ok(()) => {
+            if let Some(lock) = fence {
+                tracing::info!(lock = %lock.display(), "single-writer fence released");
+            }
+        }
+        Err(_) => tracing::warn!(
+            "requests still running after the drain hold the server state: the database stays \
+             fenced until they end or the process exits"
+        ),
+    }
+    res
+}
+
+/// Serve `app` (built over `state` by [`build`]) on `listener` with everything [`serve`] runs
+/// next to it (the checkpoint timer, lease maintenance, the `[metrics]` and `[admin_ui]`
+/// listeners) until `shutdown` resolves; then drain every listener for [`DRAIN_TIMEOUT`] and
+/// stop. This is [`serve`] without the binding of `[server] listen` and the signal handling,
+/// for an embedder that runs the server in its own process and stops it itself.
+///
+/// When it returns, everything it started has finished and been dropped: the listeners are
+/// closed, their connections drained (or, past the drain timeout, abandoned), the timers stopped
+/// between ticks and awaited, `[audit.sink]` and `[approvals.notify]` stopped after their grace,
+/// and the WAL checkpointed. `run` drops its own reference to `state` last, so once the caller
+/// drops its references too the state goes, its stores close and the single-writer fence is
+/// released; [`AppState::released`] resolves at that point.
+///
+/// # Errors
+///
+/// When the metrics or admin UI listener cannot be bound (nothing has started then), or when
+/// serving fails with an I/O error. A failed final WAL checkpoint is logged, not returned.
+pub async fn run(
+    config: &Config,
+    state: Arc<AppState>,
+    app: Router,
+    listener: tokio::net::TcpListener,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
     tracing::info!(addr = %listener.local_addr()?, upstreams = config.upstreams.len(), "attenuo server listening");
-    let checkpoint_task = (!state.checkpoint_interval.is_zero())
-        .then(|| spawn_checkpointer(state.clone(), state.checkpoint_interval));
-    let prune_task = (state.session_retention.is_some()
-        || state.lease_retention.is_some()
-        || state.run_state_retention.is_some()
-        || state.user_window_retention.is_some())
-    .then(|| spawn_lease_maintenance(state.clone()));
-    let metrics_task = if config.metrics.enabled {
+    let metrics_listener = if config.metrics.enabled {
         let l = tokio::net::TcpListener::bind(config.metrics.listen).await?;
         tracing::info!(addr = %l.local_addr()?, "metrics listening (unauthenticated)");
-        let app = metrics::router(state.metrics.clone());
-        Some(tokio::spawn(async move { axum::serve(l, app).await }))
+        Some(l)
     } else {
         None
     };
-    let console_task = if config.admin_ui.enabled {
+    let console_listener = if config.admin_ui.enabled {
         let l = tokio::net::TcpListener::bind(config.admin_ui.listen).await?;
         tracing::info!(
             addr = %l.local_addr()?,
             allow_write = config.admin_ui.allow_write,
             "admin console listening at /admin/ui/"
         );
-        let app = admin_ui::router(state.clone(), &config);
-        Some(tokio::spawn(async move { axum::serve(l, app).await }))
+        Some(l)
     } else {
         None
     };
-    let res = serve_until(listener, app, shutdown_signal(), DRAIN_TIMEOUT).await;
-    if let Some(t) = console_task {
-        t.abort();
+    // One stop for everything started here: set when `shutdown` resolves, and seen as set too
+    // once the sender is dropped (the main listener failing ends `serve_until` early).
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let stopped = move || {
+        let mut rx = stop_rx.clone();
+        async move {
+            let _ = rx.wait_for(|stop| *stop).await;
+        }
+    };
+    let mut tasks: Vec<(&str, tokio::task::JoinHandle<anyhow::Result<()>>)> = Vec::new();
+    if !state.checkpoint_interval.is_zero() {
+        let ticks = checkpoint_ticks(state.clone(), state.checkpoint_interval, stopped());
+        tasks.push((
+            "checkpoint timer",
+            tokio::spawn(async move {
+                ticks.await;
+                Ok(())
+            }),
+        ));
     }
-    if let Some(t) = metrics_task {
-        t.abort();
+    if state.session_retention.is_some()
+        || state.lease_retention.is_some()
+        || state.run_state_retention.is_some()
+        || state.user_window_retention.is_some()
+    {
+        let ticks = maintenance_ticks(state.clone(), stopped());
+        tasks.push((
+            "lease maintenance",
+            tokio::spawn(async move {
+                ticks.await;
+                Ok(())
+            }),
+        ));
     }
-    if let Some(t) = checkpoint_task {
-        t.abort();
+    if let Some(l) = metrics_listener {
+        let app = metrics::router(state.metrics.clone());
+        let until = serve_and_release(l, app, stopped(), DRAIN_TIMEOUT);
+        tasks.push(("metrics listener", tokio::spawn(until)));
     }
-    if let Some(t) = prune_task {
-        t.abort();
+    if let Some(l) = console_listener {
+        let app = admin_ui::router(state.clone(), config);
+        let until = serve_and_release(l, app, stopped(), DRAIN_TIMEOUT);
+        tasks.push(("admin console listener", tokio::spawn(until)));
+    }
+    let res = serve_and_release(
+        listener,
+        app,
+        async move {
+            shutdown.await;
+            let _ = stop_tx.send(true);
+        },
+        DRAIN_TIMEOUT,
+    )
+    .await;
+    // The timers and the other listeners stop with the main one; wait for each, so none of
+    // them still holds the state when this returns.
+    for (what, task) in tasks {
+        match task.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!(error = %e, "{what} failed"),
+            Err(e) => tracing::warn!(error = %e, "{what} panicked"),
+        }
     }
     // Give checkpoints still queued for `[audit.sink]` a moment to leave the host.
     if state.checkpoint_sink.is_some() {
@@ -522,21 +636,34 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
 ///
 /// # Errors
 ///
-/// When the server task fails with an I/O error or panics, before or during the drain. A drain that
-/// times out is not an error: the remaining connections are closed.
+/// When the server task fails with an I/O error or panics, before or during the drain. A drain
+/// that times out is not an error: the requests still running are abandoned (no longer waited
+/// for; each connection closes when its request ends).
 pub async fn serve_until(
     listener: tokio::net::TcpListener,
     app: Router,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     drain: std::time::Duration,
 ) -> anyhow::Result<()> {
+    serve_until_drained(listener, app, shutdown, drain)
+        .await
+        .map(drop)
+}
+
+/// [`serve_until`], saying whether every connection was drained (`false`: the drain timed out).
+async fn serve_until_drained(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    drain: std::time::Duration,
+) -> anyhow::Result<bool> {
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let server = axum::serve(listener, app).with_graceful_shutdown(async move {
         let _ = rx.await;
     });
     let mut server = tokio::spawn(async move { server.await });
     tokio::select! {
-        res = &mut server => return Ok(res??),
+        res = &mut server => return res?.map(|()| true).map_err(Into::into),
         () = shutdown => {}
     }
     tracing::info!(
@@ -548,10 +675,44 @@ pub async fn serve_until(
         Ok(res) => {
             res??;
             tracing::info!("shutdown complete");
+            Ok(true)
         }
         Err(_) => {
+            // Wait for the abort, so the server future (and its copy of `app`) is dropped
+            // before this returns. Requests still running on their connections are not stopped
+            // by it: they end on their own.
             server.abort();
-            tracing::warn!("drain timeout elapsed; closing remaining connections");
+            let _ = server.await;
+            tracing::warn!("drain timeout elapsed; abandoning the requests still running");
+            Ok(false)
+        }
+    }
+}
+
+/// A copy of this is in every copy of a router [`serve_and_release`] serves: in the router
+/// itself, in each connection's service and in each request.
+#[derive(Clone)]
+struct RouterCopy {
+    _held: tokio::sync::mpsc::Sender<()>,
+}
+
+/// [`serve_until`], then, after a clean drain, wait until every copy of `app` is gone. axum's
+/// drain ends when each connection's task has said it is done, which it says a moment before
+/// it drops its copy of the router (and so of the state): this is what makes "drained" mean
+/// "dropped". After a timed-out drain the requests still running keep their copies, and this
+/// does not wait for them.
+async fn serve_and_release(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    drain: std::time::Duration,
+) -> anyhow::Result<()> {
+    let (copy, mut copies) = tokio::sync::mpsc::channel::<()>(1);
+    let app = app.layer(axum::Extension(RouterCopy { _held: copy }));
+    if serve_until_drained(listener, app, shutdown, drain).await? {
+        // Nothing is sent: `recv` answers `None` once the last sender, so the last copy, is gone.
+        if tokio::time::timeout(drain, copies.recv()).await.is_err() {
+            tracing::warn!("a copy of the router outlived the drain");
         }
     }
     Ok(())
@@ -642,6 +803,86 @@ mod shutdown_tests {
         task.await.unwrap().unwrap();
         assert!(t.elapsed() < Duration::from_secs(5));
         req.abort();
+    }
+
+    /// A server on `dir`'s SQLite file with everything `run` starts next to the main listener:
+    /// the checkpoint timer, lease maintenance, the metrics listener and the admin console.
+    fn everything_on(dir: &std::path::Path) -> Config {
+        let mut cfg = Config::default();
+        cfg.audit.sqlite_path = dir.join("audit.sqlite").to_string_lossy().into_owned();
+        cfg.audit.checkpoint_interval_seconds = 1;
+        cfg.leases.maintenance_interval_seconds = 1;
+        cfg.admin.token = Some("restart-test-admin".into());
+        cfg.metrics.enabled = true;
+        cfg.metrics.listen = "127.0.0.1:0".parse().unwrap();
+        cfg.admin_ui.enabled = true;
+        cfg.admin_ui.listen = "127.0.0.1:0".parse().unwrap();
+        cfg
+    }
+
+    /// Stop a server through `run` and start the next one on the same file at once, again and
+    /// again: once `run` has returned and the caller has dropped its state, nothing holds the
+    /// single-writer fence, so the next start never meets it. Nothing waits in between, not
+    /// even a yield to the scheduler. Each server is used first (a request that reads the database, over a
+    /// connection the client keeps open across the stop), so a connection task holds a copy
+    /// of the router when the stop begins.
+    async fn stop_and_restart_in_a_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = everything_on(dir.path());
+        let client = reqwest::Client::new();
+        let (mut app, mut state) = build(&cfg).unwrap();
+        assert!(state.store_fence().is_some());
+        for round in 0..20 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!(
+                "http://{}/admin/audit/verify",
+                listener.local_addr().unwrap()
+            );
+            let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+            let released = state.released();
+            // `run` is polled in this task, not spawned: the restart below follows its return
+            // without a turn of the scheduler in between, so a task it left behind (aborted but
+            // not yet dropped, or a connection still closing) would still hold the state.
+            let serving = run(&cfg, state.clone(), app, listener, async move {
+                let _ = stopped.await;
+            });
+            let using = async {
+                let resp = client
+                    .get(&url)
+                    .bearer_auth("restart-test-admin")
+                    .send()
+                    .await
+                    .unwrap();
+                assert!(
+                    resp.status().is_success(),
+                    "round {round}: {}",
+                    resp.status()
+                );
+                stop.send(()).unwrap();
+            };
+            let (res, ()) = tokio::join!(serving, using);
+            res.unwrap();
+            drop(state);
+            (app, state) = build(&cfg).unwrap_or_else(|e| {
+                panic!("round {round}: the stopped server still holds the database: {e:#}")
+            });
+            // The state was dropped just now, so this is already resolved.
+            tokio::time::timeout(Duration::from_secs(1), released)
+                .await
+                .expect("released resolves once the state is dropped");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_server_stopped_by_run_can_be_restarted_on_its_file_at_once() {
+        stop_and_restart_in_a_loop().await;
+    }
+
+    /// The same on a multi-threaded runtime, where the connection tasks, the timers and the
+    /// other listeners run on other workers than `run` itself.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_server_stopped_by_run_can_be_restarted_at_once_on_many_threads() {
+        stop_and_restart_in_a_loop().await;
     }
 }
 
