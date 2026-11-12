@@ -10,6 +10,7 @@ import {
   mcpFetch,
   AttenuoClient,
   AttenuoError,
+  TransportError,
 } from "../src/index.js";
 import { jsonResponse, mockFetch, rpcOk, Signer, tokenResponse, type Seen } from "./helpers.js";
 
@@ -399,7 +400,10 @@ describe("DPoP server nonces", () => {
     };
     const { fetch, calls } = mockFetch((seen) => (fail ? fail() : server.handler(seen)));
     const ob = new AttenuoClient(BASE, { fetch, dpopKey: key });
-    await expect(ob.callTool(child, "github", "read_file")).rejects.toThrow(TypeError);
+    // The client wraps fetch's TypeError in a TransportError (its cause).
+    const first = await ob.callTool(child, "github", "read_file").catch((e: unknown) => e);
+    expect(first).toBeInstanceOf(TransportError);
+    expect((first as TransportError).cause).toBeInstanceOf(TypeError);
     expect(calls).toHaveLength(1);
 
     fail = undefined;
@@ -409,7 +413,9 @@ describe("DPoP server nonces", () => {
       return server.handler(seen);
     });
     const ob2 = new AttenuoClient(BASE, { fetch: drops.fetch, dpopKey: key });
-    await expect(ob2.callTool(child, "github", "read_file")).rejects.toThrow(TypeError);
+    const second = await ob2.callTool(child, "github", "read_file").catch((e: unknown) => e);
+    expect(second).toBeInstanceOf(TransportError);
+    expect((second as TransportError).cause).toBeInstanceOf(TypeError);
     expect(drops.calls).toHaveLength(3);
 
     const aborts = mockFetch((seen) => {

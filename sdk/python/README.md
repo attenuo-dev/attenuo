@@ -267,7 +267,7 @@ with Client(url, dpop_key=coder_key) as ob:
     ob.call_tool(coder, "github", "read_file", {"repo": "alice/docs"})  # proof attached
 ```
 
-With a key, every `call_tool`, `list_tools`, `renew` and `authzen_evaluate` sends `Authorization: DPoP <token>` and a fresh proof, and every `exchange` binds the new token. When the parent is bound to another key, its holder's sign-off names the new key and agent and works for that one exchange; a process that holds both keys can pass `subject_dpop_key=planner_key` instead. When the parent is bound to the client's own key, no sign-off is needed. `Token.dpop_jkt` is the thumbprint a token is bound to (`None` for a bearer token), and `AuditEntry.dpop_bound` says whether a decision was made with a proven bound token. A bound token without a proof is `Unauthorized` with `error == "dpop_required"`. See [Binding tokens to keys](https://github.com/attenuo-dev/attenuo/blob/main/docs/guides/binding-tokens-to-keys.md).
+With a key, every `call_tool`, `list_tools`, `renew` and `authzen_evaluate` sends `Authorization: DPoP <token>` and a fresh proof, and every `exchange` binds the new token. When the parent is bound to another key, its holder's sign-off names the new key and agent and works for that one exchange; a process that holds both keys can pass `subject_dpop_key=planner_key` instead. When the parent is bound to the client's own key, no sign-off is needed. `Token.dpop_jkt` is the thumbprint a token is bound to (`None` for a bearer token), and `AuditEntry.dpop_bound` says whether a decision was made with a proven bound token. A bound token without a proof is `Unauthorized` with `reason == "dpop_required"`, from `call_tool` as from `renew` or `exchange` (see [Errors](#errors)). See [Binding tokens to keys](https://github.com/attenuo-dev/attenuo/blob/main/docs/guides/binding-tokens-to-keys.md).
 
 Server nonces (RFC 9449 §8, `[token] dpop_nonce = "required"`) need no code. `Client`, `AsyncClient`, `AdminClient.mint_root_dev` and `TokenAuth` keep the latest `DPoP-Nonce` header the server sent and put it in each proof. When the server refuses a proof with `use_dpop_nonce`, they retry the request once with a new proof carrying the nonce from that response, on a new connection: the server can close the connection that carried the refusal without saying so (it does when it answers before reading the request body), so `NonceCache.update` shuts that socket down and the pool opens another (`attenuo.dpop.drop_connection`; a response without a socket, such as from a mock transport, is left alone). For your own HTTP code, `DpopKey.proof(method, url, access_token, nonce=...)` adds the claim, and `attenuo.dpop.NonceCache` does the bookkeeping: `update(response)` stores the nonce and returns true when the request should be retried.
 
@@ -370,18 +370,47 @@ except Denied as d:
 
 ### Errors
 
-All SDK errors derive from `AttenuoError`.
+All SDK errors derive from `AttenuoError`, transport failures included.
 
-| Exception                                   | When                                                                                                                                                                                                                                                                                                                                                                         |
-| ------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Denied` (`.reason`, `.decision_id`)        | The proxy said no (JSON-RPC `-32003` with the `X-Attenuo-Decision-Id` header naming `data.decision_id`; an upstream's own `-32003` without that proof is an `RpcError`). Also raised by `call_tool_stream` when the proxy cuts a stream for a lease or token reason ([Streaming a call](#streaming-a-call)). Branch on `reason`: `capability_denied`, `policy_deny`, `lease_revoked`, `lease_expired`, ... See the [integration guide](https://github.com/attenuo-dev/attenuo/blob/main/docs/guides/integrating-mcp-clients.md#handling-denied-responses). |
+| Exception | When |
+| --- | --- |
+| `Denied` (`.reason`, `.decision_id`, `.data`, `.limit`, `.usage`, `.untrusted_args`) | The proxy said no (JSON-RPC `-32003` with the `X-Attenuo-Decision-Id` header naming `data.decision_id`; an upstream's own `-32003` without that proof is an `RpcError`). Also raised by `call_tool_stream` when the proxy cuts a stream for a lease or token reason ([Streaming a call](#streaming-a-call)). Branch on `reason`: `capability_denied`, `policy_deny`, `budget_exhausted`, `lease_revoked`, `lease_expired`, ... See the [integration guide](https://github.com/attenuo-dev/attenuo/blob/main/docs/guides/integrating-mcp-clients.md#handling-denied-responses). `data` is the error's whole `data` object; what the server adds to it is typed too (below). |
 | `ApprovalRequired` (`.approval_id`, `.expires_at`, `.call_hash`) | A `Denied` for JSON-RPC `-32008`: a policy holds the call until it is approved. See [Approvals](#approvals). |
 | `ApprovalNotGranted` (`.approval_id`, `.state`) | Waiting for an approval ended without a grant: `declined`, `expired`, `consumed` or `timeout`. |
-| `Unauthorized`                              | HTTP 401: missing, bad or expired bearer.                                                                                                                                                                                                                                                                                                                                    |
-| `ApiError` (`.status`, `.error`, `.detail`) | Any other non-success from the server: `invalid_scope`, `invalid_grant`, 404, 422.                                                                                                                                                                                                                                                                                           |
-| `RpcError`                                  | A JSON-RPC error that is not a denial (unknown upstream, upstream down).                                                                                                                                                                                                                                                                                                     |
-| `RefreshError` (`.reason`)                  | A `TokenRefresher` gave up: `lease_revoked`, `lease_lost`, `token_expired`, `refused`, `key_mismatch`.
-| `VerificationError`                         | `inspect(verify=True)` failed.                                                                                                                                                                                                                                                                                                                                               |
+| `Unauthorized` (`.reason`, `.decision_id`, `.data`) | HTTP 401 or JSON-RPC `-32001`: missing, bad or expired bearer, a DPoP failure, or (from the proxy) a lease that is no longer live. A subclass of `ApiError`. Branch on `reason` (below). |
+| `ApiError` (`.status`, `.error`, `.detail`, `.decision_id`) | Any other non-success from the server: `invalid_scope`, `invalid_grant`, 404, 422. `decision_id` names the audit record of a refused exchange or renewal. |
+| `TransportError` | No answer: the connection was refused or dropped, a timeout ran out, TLS or a proxy failed. `__cause__` is the `httpx` error. |
+| `RpcError` | A JSON-RPC error that is not a denial (unknown upstream, upstream down). |
+| `RefreshError` (`.reason`) | A `TokenRefresher` gave up: `lease_revoked`, `lease_lost`, `token_expired`, `refused`, `key_mismatch`. |
+| `VerificationError` | `inspect(verify=True)` failed. |
+
+**`Unauthorized.reason`** is the server's stable code, the same for `call_tool` and the REST routes: `missing_token`, `invalid_token`, `token_expired`, `dpop_required`, `invalid_dpop_proof`, `use_dpop_nonce` (the clients already retry this one once with the server's nonce), and from the proxy also `lease_revoked`, `lease_expired` and `lease_unknown`. A lease refusal of a request the proxy decides nothing for (`initialize`, `tools/list`, ...) is recorded in the audit log, and `decision_id` names the record. `error` keeps its old value: `"unauthorized"` for every proxy 401, and the REST body's `error` (`unauthorized`, `dpop_required`, ...) otherwise.
+
+```python
+from attenuo import Denied, TransportError, Unauthorized
+
+try:
+    ob.call_tool(token, "github", "read_file", {"repo": "alice/docs"})
+except Unauthorized as e:
+    if e.reason in ("lease_revoked", "lease_unknown"):
+        stop(e.decision_id)  # the run was revoked: do not retry
+    elif e.reason == "lease_expired":
+        ob.renew(token)  # the lease stopped renewing: renew once, then retry once
+    else:
+        raise
+except Denied as d:
+    if d.reason == "budget_exhausted" and d.limit is not None:
+        print(f"limit {d.limit.kind} of hop {d.limit.hop}: used {d.limit.used} of {d.limit.max}")
+    raise
+except TransportError as e:
+    print("server unreachable:", e.__cause__)
+```
+
+**What a denial carries.** `Denied.limit` is the run limit a `budget_exhausted` call would take past its `max`, as a `BudgetLimit` (the same type a dry run's `limit` is, so it can be stated back to `policy_evaluate`); `None` otherwise. `Denied.usage` is set for a tool the catalog marks destructive or gives an `outbound` input: a `RunUsage(calls, amount, destination_seen, user_window)`, the run's usage before this call as the policy saw it, with `user_window` a `UserWindow(hour, day)` of `WindowUsage(calls, amount)` when a policy reads per-user windows and a figure is not zero. `Denied.untrusted_args` lists the arguments that copy an untrusted result of the run as `UntrustedArg(arg, kind, seq)`, empty when the server sent none. `ApprovalRequired` carries the same three next to its approval fields. The shapes are in the [HTTP API reference](https://github.com/attenuo-dev/attenuo/blob/main/docs/reference/http-api.md#mcp-proxy).
+
+**Decision ids are proven.** A `decision_id` on `Unauthorized` or `ApiError` is taken from the body only when the `X-Attenuo-Decision-Id` header names it, as for `Denied`: the proxy never forwards that header from an upstream, so an upstream's answer cannot pass off an id.
+
+**Transport failures.** `TransportError` is also an `httpx.TransportError`, so `except httpx.TransportError` (or `httpx.RequestError`, `httpx.HTTPError`) keeps catching it; a handler for one `httpx` subclass, such as `httpx.ConnectError`, should test `isinstance(e.__cause__, httpx.ConnectError)` now. A failure while a streamed answer is read is one too. `TokenAuth` runs inside your own `httpx` client, whose errors stay plain `httpx` errors.
 
 A denied `tools/call` is a decision, not a glitch: do not retry it blindly. A `lease_expired` denial is the one case where `renew()` then one retry makes sense; `lease_revoked` means stop.
 

@@ -422,9 +422,11 @@ def test_github_leak_scenario(stack: Stack) -> None:
         ob.exchange(root, "reviewer", ["github:read_file"])
     assert unauthenticated.value.status == 401
 
-    # 11. A bad bearer is a 401, not a denial.
-    with pytest.raises(Unauthorized):
+    # 11. A bad bearer is a 401, not a denial, and says why.
+    with pytest.raises(Unauthorized) as bad_bearer:
         ob.call_tool("not.a.token", "github", "read_file", {"repo": "alice/public-docs"})
+    assert bad_bearer.value.reason == "invalid_token"
+    assert bad_bearer.value.decision_id is None  # a token that does not verify writes no record
 
     # 12. Revoke the root lease: the cascade takes the coder and the tester with it.
     revoked = admin.revoke_lease(root.lease, "agent session compromised")
@@ -437,8 +439,15 @@ def test_github_leak_scenario(stack: Stack) -> None:
     assert after.value.reason == "lease_revoked"
     with pytest.raises(Denied):
         ob.call_tool(tester, "github", "read_file", {"repo": "alice/public-docs"})
-    with pytest.raises(ApiError):
+    # A request without a per-call decision is a 401 that names the reason and its record.
+    with pytest.raises(Unauthorized) as listing:
+        ob.list_tools(tester, "github")
+    assert listing.value.reason == "lease_revoked"
+    assert listing.value.decision_id
+    with pytest.raises(ApiError) as renewal:
         ob.renew(coder)  # a revoked lease is final
+    assert (renewal.value.status, renewal.value.error) == (400, "invalid_grant")
+    assert renewal.value.decision_id
 
     # 13. The audit log has every decision, and its hash chain verifies.
     report = admin.audit_verify()
@@ -449,6 +458,10 @@ def test_github_leak_scenario(stack: Stack) -> None:
     assert by_id[policy_denied.value.decision_id].reason == "policy_deny"
     assert by_id[cap_denied.value.decision_id].reason == "capability_denied"
     assert by_id[after.value.decision_id].reason == "lease_revoked"
+    listed = by_id[listing.value.decision_id]
+    assert (listed.tool, listed.reason) == ("tools/list", "lease_revoked")
+    renew_record = by_id[renewal.value.decision_id]
+    assert (renew_record.tool, renew_record.reason) == ("lease.renew", "lease_revoked")
 
     # 14. Only the intended reads (one for the coder, one for the tester) reached upstream.
     assert len(stack.upstream_calls()) == 2
@@ -516,20 +529,31 @@ def test_dpop_bound_chain(stack: Stack) -> None:
 
     # The same token without the key: refused everywhere.
     with Client(stack.url) as thief:
+        # Every route says why the same way: `reason`, for the proxy as for REST routes.
         with pytest.raises(Unauthorized) as no_proof:
             thief.call_tool(coder, "github", "read_file", {"repo": "alice/public-docs"})
         assert no_proof.value.status == 401
+        assert no_proof.value.reason == "dpop_required"
+        with pytest.raises(Unauthorized) as no_proof_list:
+            thief.list_tools(coder, "github")
+        assert no_proof_list.value.reason == "dpop_required"
         with pytest.raises(Unauthorized) as renew:
             thief.renew(coder)
         assert renew.value.error == "dpop_required"
+        assert renew.value.reason == "dpop_required"
         with pytest.raises(Unauthorized) as exchange:
             thief.exchange(coder, "tester", ["github:read_file"], client_secret=TESTER_SECRET)
         assert exchange.value.error == "dpop_required"
+        assert exchange.value.reason == "dpop_required"
     # Another key does not help either.
     with Client(stack.url, dpop_key=DpopKey.generate()) as other:
         with pytest.raises(Unauthorized) as wrong_key:
             other.renew(coder)
         assert wrong_key.value.error == "invalid_dpop_proof"
+        assert wrong_key.value.reason == "invalid_dpop_proof"
+        with pytest.raises(Unauthorized) as wrong_key_call:
+            other.call_tool(coder, "github", "read_file", {"repo": "alice/public-docs"})
+        assert wrong_key_call.value.reason == "invalid_dpop_proof"
 
     # The audit log records the bound use.
     entries = admin.audit_tail(50)
@@ -1018,6 +1042,9 @@ def test_dry_run_with_a_stated_budget_session_approval_and_usage(stack: Stack) -
     with pytest.raises(Denied) as over:
         ob.call_tool(coder, "github", "read_file", read)
     assert over.value.reason == "budget_exhausted"
+    # The refusal names the limit, as the dry run did.
+    assert over.value.limit == BudgetLimit(hop=1, kind="calls", used=2, arg=None, max=2)
+    assert over.value.data["limit"] == over.value.limit.to_json()
     admin.revoke_lease(root.lease)
     admin.close()
     ob.close()

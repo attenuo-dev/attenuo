@@ -287,10 +287,13 @@ describe.skipIf(!enabled)("GitHub leak scenario against the real server", () => 
     expect(lease.lease).toBe(coder.lease);
     expect(lease.expiresIn).toBeGreaterThan(0);
 
-    // 11. A bad bearer is a 401, not a denial.
-    await expect(
-      ob.callTool("not.a.token", "github", "read_file", { repo: "alice/public-docs" }),
-    ).rejects.toBeInstanceOf(UnauthorizedError);
+    // 11. A bad bearer is a 401, not a denial, and says why.
+    const badBearer = (await ob
+      .callTool("not.a.token", "github", "read_file", { repo: "alice/public-docs" })
+      .catch((e: unknown) => e)) as UnauthorizedError;
+    expect(badBearer).toBeInstanceOf(UnauthorizedError);
+    expect(badBearer.reason).toBe("invalid_token");
+    expect(badBearer.decisionId).toBeUndefined(); // a token that does not verify writes no record
 
     // 12. Revoke the root lease: the cascade takes the coder and the tester with it.
     const revoked = await admin.revokeLease(root.lease, "agent session compromised");
@@ -304,7 +307,17 @@ describe.skipIf(!enabled)("GitHub leak scenario against the real server", () => 
     await expect(
       ob.callTool(tester, "github", "read_file", { repo: "alice/public-docs" }),
     ).rejects.toBeInstanceOf(DeniedError);
-    await expect(ob.renew(coder)).rejects.toBeInstanceOf(ApiError); // a revoked lease is final
+    // A request without a per-call decision is a 401 that names the reason and its record.
+    const listing = (await ob
+      .listTools(tester, "github")
+      .catch((e: unknown) => e)) as UnauthorizedError;
+    expect(listing).toBeInstanceOf(UnauthorizedError);
+    expect(listing.reason).toBe("lease_revoked");
+    expect(listing.decisionId).toBeTruthy();
+    const renewal = (await ob.renew(coder).catch((e: unknown) => e)) as ApiError; // final
+    expect(renewal).toBeInstanceOf(ApiError);
+    expect([renewal.status, renewal.error]).toEqual([400, "invalid_grant"]);
+    expect(renewal.decisionId).toBeTruthy();
 
     // 13. The audit log has every decision, and its hash chain verifies.
     const report = await admin.auditVerify();
@@ -315,6 +328,10 @@ describe.skipIf(!enabled)("GitHub leak scenario against the real server", () => 
     expect(byId.get(pd.decisionId)?.record.reason).toBe("policy_deny");
     expect(byId.get(capDenied.decisionId)?.record.reason).toBe("capability_denied");
     expect(byId.get(after.decisionId)?.record.reason).toBe("lease_revoked");
+    const listed = byId.get(listing.decisionId!)?.record;
+    expect([listed?.tool, listed?.reason]).toEqual(["tools/list", "lease_revoked"]);
+    const renewRecord = byId.get(renewal.decisionId!)?.record;
+    expect([renewRecord?.tool, renewRecord?.reason]).toEqual(["lease.renew", "lease_revoked"]);
     expect((await admin.auditCheckpoint()).seq).toBeGreaterThanOrEqual(report.entries);
 
     // 14. Only the intended reads (one for the coder, one for the tester) reached upstream.
@@ -378,14 +395,29 @@ describe.skipIf(!enabled)("GitHub leak scenario against the real server", () => 
     const noProof = await thief
       .callTool(coder, "github", "read_file", { repo: "alice/public-docs" })
       .catch((e: unknown) => e);
+    // Every route says why the same way: `reason`, for the proxy as for REST routes.
     expect(noProof).toBeInstanceOf(UnauthorizedError);
-    await expect(thief.renew(coder)).rejects.toMatchObject({ status: 401, error: "dpop_required" });
+    expect((noProof as UnauthorizedError).reason).toBe("dpop_required");
+    await expect(thief.listTools(coder, "github")).rejects.toMatchObject({
+      reason: "dpop_required",
+    });
+    await expect(thief.renew(coder)).rejects.toMatchObject({
+      status: 401,
+      error: "dpop_required",
+      reason: "dpop_required",
+    });
     await expect(
       thief.exchange(coder, "tester", "github:read_file", { clientSecret: TESTER_SECRET }),
-    ).rejects.toMatchObject({ status: 401, error: "dpop_required" });
+    ).rejects.toMatchObject({ status: 401, error: "dpop_required", reason: "dpop_required" });
     // Another key does not help either.
     const other = new AttenuoClient(url, { dpopKey: await DpopKey.generate() });
-    await expect(other.renew(coder)).rejects.toMatchObject({ error: "invalid_dpop_proof" });
+    await expect(other.renew(coder)).rejects.toMatchObject({
+      error: "invalid_dpop_proof",
+      reason: "invalid_dpop_proof",
+    });
+    await expect(
+      other.callTool(coder, "github", "read_file", { repo: "alice/public-docs" }),
+    ).rejects.toMatchObject({ reason: "invalid_dpop_proof" });
 
     // The audit log records the bound use.
     const entries = await admin.auditTail(50);
@@ -890,9 +922,14 @@ describe.skipIf(!enabled)("filtered export and revocation by selector", () => {
     for (let i = 0; i < 2; i++) {
       expect((await ob.callTool(coder, "github", "read_file", read)).decisionId).toBeTruthy();
     }
-    await expect(ob.callTool(coder, "github", "read_file", read)).rejects.toMatchObject({
-      reason: "budget_exhausted",
-    });
+    const over = (await ob
+      .callTool(coder, "github", "read_file", read)
+      .catch((e: unknown) => e)) as DeniedError;
+    expect(over).toBeInstanceOf(DeniedError);
+    expect(over.reason).toBe("budget_exhausted");
+    // The refusal names the limit, as the dry run did.
+    expect(over.limit).toEqual({ hop: 1, kind: "calls", used: 2, max: 2 });
+    expect(over.data.limit).toEqual(over.limit);
     await admin.revokeLease(root.lease);
   });
 });
