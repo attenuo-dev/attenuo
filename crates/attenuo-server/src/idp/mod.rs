@@ -17,8 +17,9 @@
 //! # Verification ([`IdpRegistry::verify`])
 //!
 //! 1. Header and payload decode; the header `typ` is checked: an ID-JAG must say
-//!    `oauth-id-jag+jwt` (case-insensitive, with or without `application/`, RFC 7515 §4.1.9); an ID token must not carry any other explicit `…+jwt` type
-//!    (RFC 8725 §3.11), so an access token or an ID-JAG cannot be replayed as an ID token.
+//!    `oauth-id-jag+jwt` (case-insensitive, with or without `application/`, RFC 7515
+//!    §4.1.9); an ID token must not carry any other explicit `…+jwt` type (RFC 8725 §3.11),
+//!    so an access token or an ID-JAG cannot be replayed as an ID token.
 //! 2. The unverified `iss` selects the `[[idps]]` entry; unknown issuers are rejected before
 //!    any network call.
 //! 3. `alg` must be in that IdP's `allowed_algs` (asymmetric only).
@@ -653,6 +654,32 @@ mod tests {
 
     fn claims(v: Value) -> Map<String, Value> {
         v.as_object().unwrap().clone()
+    }
+
+    #[test]
+    fn typ_media_type_comparison_rfc7515() {
+        for t in [
+            "oauth-id-jag+jwt",
+            "OAUTH-ID-JAG+JWT",
+            "application/oauth-id-jag+jwt",
+            "Application/OAuth-ID-JAG+JWT",
+        ] {
+            assert!(typ_is(t, ID_JAG_TYP), "{t}");
+        }
+        for t in [
+            "",
+            "JWT",
+            "at+jwt",
+            "application/",
+            "text/oauth-id-jag+jwt",
+            "application/application/oauth-id-jag+jwt",
+            "oauth-id-jag+jwt ",
+            "applicatio\u{20ac}x",
+        ] {
+            assert!(!typ_is(t, ID_JAG_TYP), "{t}");
+        }
+        // The actor-token check uses the same comparison.
+        assert!(typ_is("application/attenuo+jwt", attenuo_token::TOKEN_TYPE));
     }
 
     #[test]

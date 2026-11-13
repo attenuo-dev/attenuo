@@ -90,9 +90,9 @@ The table is generated from `attenuo_core::error_codes::ERROR_CODES`, the one pl
 | `client_authentication_failed` | 401 `invalid_client` |  |  | The client id or secret is wrong. |
 | `client_id_mismatch` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The credential was issued to another client. |
 | `credential_audience_mismatch` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The ID token was not issued to the presenting agent: its `aud` or `azp` names another client. |
+| `credential_expired` | 400 `invalid_grant` |  |  | The hop-0 credential expires before the token could be issued. |
 | `credential_pop_mismatch` | 400 `invalid_grant` |  |  | The DPoP proof is by another key than the one the ID-JAG is bound to (`cnf.jkt`). |
 | `credential_pop_required` | 400 `invalid_grant` |  |  | The ID-JAG is bound to a key (`cnf`) and the request has no DPoP proof that this server checks. |
-| `credential_expired` | 400 `invalid_grant` |  |  | The hop-0 credential expires before the token could be issued. |
 | `dpop_replay_cache_full` | 503 `temporarily_unavailable` | `-32006` (503) |  | Too many DPoP proofs are in flight; retry later. |
 | `dpop_required` | 401 | `-32001` (401) |  | The token is bound to a key and no DPoP proof was sent. |
 | `duplicate_actor` | 400 `invalid_request` |  |  | The `actor` is already in the chain. |

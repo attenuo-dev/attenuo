@@ -177,7 +177,8 @@ pub(crate) async fn handle(
                         if state.dpop.mode() == crate::config::DpopMode::Off {
                             "the ID-JAG is bound to a DPoP key and [token] dpop is off".into()
                         } else {
-                            "the ID-JAG is bound to a DPoP key: send a DPoP proof by that key".into()
+                            "the ID-JAG is bound to a DPoP key: send a DPoP proof by that key"
+                                .into()
                         },
                     )
                     .into())
