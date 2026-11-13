@@ -58,7 +58,7 @@ hygiene:
 
 # the fuzz targets compile on stable against fuzz/Cargo.lock (no fuzzing; see fuzz/README.md)
 fuzz-check:
-    RUSTFLAGS="--cfg fuzzing" cargo check --manifest-path fuzz/Cargo.toml --bins --examples --locked
+    RUSTFLAGS="--cfg fuzzing -D warnings" cargo check --manifest-path fuzz/Cargo.toml --bins --examples --locked
 
 # cargo-deny (cargo install cargo-deny)
 deny:

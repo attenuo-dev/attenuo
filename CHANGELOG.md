@@ -69,6 +69,7 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 
 ### Changed
 
+- `scripts/dev.sh fuzz`, `just fuzz-check` and the command in `fuzz/README.md` pass `-D warnings` with `--cfg fuzzing`, as CI's `fuzz-check` job does, so a warning in a fuzz target fails locally too instead of first in CI.
 - BREAKING (HTTP API): the remaining token refusals that sent a generic class as `code` now send their specific reason, by the same rule as the entry below: the HTTP status, `error`, `detail`, `error_description` (still absent on these), headers, audit reasons and logs are unchanged; only `code` changes. Before → after `code`:
   - `POST /token` (exchange), asks for more than the subject token holds: `invalid_scope` → `scope_exceeds_parent`.
   - `POST /token` (exchange), the chain would be deeper than `[issuer] max_depth`: `invalid_scope` → `chain_too_deep`.
