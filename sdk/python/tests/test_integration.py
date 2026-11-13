@@ -318,6 +318,7 @@ def test_call_tool_stream_relays_events_and_raises_on_revocation(sse_stack: Stac
     with pytest.raises(Denied) as denied:
         next(ob.call_tool_stream(coder, "github", "read_file", {"repo": "alice/private-x"}))
     assert denied.value.reason == "policy_deny"
+    assert denied.value.stable_code == "policy_deny"
 
     # The upstream holds the response back for 20 s; revoke the lease after the first event.
     held = ob.call_tool_stream(coder, "github", "read_file", {**args, "hold_ms": 20000})
@@ -329,6 +330,7 @@ def test_call_tool_stream_relays_events_and_raises_on_revocation(sse_stack: Stac
         next(held)
     assert time.monotonic() - started < 10  # one re-check interval (1 s), with slack
     assert cut.value.reason == "lease_revoked"
+    assert cut.value.stable_code == "lease_revoked"
     assert cut.value.decision_id
     end = admin.audit_record(cut.value.decision_id).entry
     assert (end.tool, end.decision, end.reason) == ("stream.end", "deny", "lease_revoked")
@@ -1478,6 +1480,7 @@ def test_close_session(fresh_stack: Stack) -> None:
     with pytest.raises(RpcError) as unknown:
         ob.close_session(coder, "github", "no-such-session")
     assert unknown.value.code == -32600
+    assert unknown.value.stable_code == "session_unknown"
     admin.revoke_lease(other.lease)
     admin.revoke_lease(root.lease)
     ob.close()

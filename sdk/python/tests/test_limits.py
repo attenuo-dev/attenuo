@@ -274,6 +274,48 @@ async def test_mcp_refusal_without_the_proxys_marks_stays_an_rpc_error(
     assert e.value.code in (-32006, -32007)
 
 
+@pytest.mark.parametrize(
+    ("status", "number", "data", "cls", "stable"),
+    [
+        (503, -32006, {"code": "overloaded", "reason": "overloaded"}, Unavailable, "overloaded"),
+        (503, -32006, {"reason": "session_registry_full"}, Unavailable, "session_registry_full"),
+        (503, -32006, {}, Unavailable, "temporarily_unavailable"),
+        (
+            429,
+            -32007,
+            {"code": "rate_limited", "reason": "rate_limited"},
+            RateLimited,
+            "rate_limited",
+        ),
+        (429, -32007, {"reason": "too_many_sessions"}, RateLimited, "too_many_sessions"),
+    ],
+)
+async def test_proxy_load_refusal_stable_code(
+    make: Any,  # noqa: F811
+    status: int,
+    number: int,
+    data: dict[str, Any],
+    cls: type[ApiError],
+    stable: str,
+) -> None:
+    client, _ = make(
+        lambda r: rpc_err(
+            number, "attenuo: refused", data, status=status, headers={"retry-after": "1"}
+        )
+    )
+    with pytest.raises(cls) as e:
+        await call(client, "call_tool", "TOK", "github", "read_file")
+    assert e.value.stable_code == e.value.code == stable
+
+
+def test_load_refusal_stable_code_prefers_data_code() -> None:
+    assert Unavailable("overloaded", 1, "", {"code": "overloaded"}).stable_code == "overloaded"
+    assert Unavailable("overloaded").stable_code == "overloaded"
+    assert (
+        RateLimited("rate_limited", data={"code": "too_many_sessions"}).code == "too_many_sessions"
+    )
+
+
 @pytest.mark.parametrize("value", ["soon", "1.5", "-1", "", " ", "Wed, 21 Oct 2026 07:28:00 GMT"])
 async def test_malformed_retry_after_is_none(make: Any, value: str) -> None:  # noqa: F811
     client, _ = make(lambda r: rest_rate_limited(value))

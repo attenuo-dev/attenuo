@@ -9,6 +9,27 @@ import type { BudgetLimit, LimitKind } from "./admin.js";
 
 type Json = Record<string, unknown>;
 
+/**
+ * The stable code of a JSON-RPC error's `data`: `data.code`, or for a server older than the
+ * `code` member `data.reason`, else undefined (no `data` object, or neither member a non-empty
+ * string).
+ */
+function stableCodeOf(data: unknown): string | undefined {
+  if (typeof data !== "object" || data === null || Array.isArray(data)) return undefined;
+  const d = data as Json;
+  for (const key of ["code", "reason"]) {
+    const v = d[key];
+    if (typeof v === "string" && v) return v;
+  }
+  return undefined;
+}
+
+/** `data.code` when it is a non-empty string, else undefined. */
+function dataCodeOf(data: Json | undefined): string | undefined {
+  const v = data?.code;
+  return typeof v === "string" && v ? v : undefined;
+}
+
 /** Base class for every error the SDK throws, transport failures included. */
 export class AttenuoError extends Error {
   constructor(message: string) {
@@ -137,7 +158,9 @@ export function untrustedArgsOf(v: unknown): UntrustedArg[] {
  * `detail`, which is text for people and may change. For a server that sends no `code` it is the
  * `error_description` sub-code, or else `error`. `error` is the OAuth-style error
  * (`invalid_grant`, `unauthorized`, ...) and `description` the `error_description`, which is
- * deprecated as a machine field. `decisionId` is the audit record of a refusal the server recorded (a refused token exchange or
+ * deprecated as a machine field. `stableCode` is the same string as `code`, under the name
+ * `RpcError` and `DeniedError` use, so one property reads the stable code of every error the
+ * server answered with. `decisionId` is the audit record of a refusal the server recorded (a refused token exchange or
  * renewal, a proxy 401 for a lease that is no longer live). It is taken from the body only when
  * the `X-Attenuo-Decision-Id` header names the same id, the proof the proxy gives for its own
  * records (an upstream's answer it relays never carries that header).
@@ -155,6 +178,11 @@ export class ApiError extends AttenuoError {
   ) {
     super(`server answered ${status}: ${error}${detail ? `: ${detail}` : ""}`);
     this.code = code || description || error;
+  }
+
+  /** The server's stable code: the same string as `code`. */
+  get stableCode(): string {
+    return this.code;
   }
 }
 
@@ -203,6 +231,8 @@ export class UnauthorizedError extends ApiError {
  *
  * `reason` is the server's stable code: on a REST route the `error_description` of its
  * `temporarily_unavailable` answer, on `/mcp/{server}` the `data.reason` of JSON-RPC `-32006`.
+ * `code` (and `stableCode`) is the proxy's `data.code` when it sends one (the same string as
+ * `data.reason`), else `reason`.
  * `retryAfter` is the `Retry-After` header in whole seconds, undefined when it is missing or not
  * a number. `status` is 503 and `error` is `"temporarily_unavailable"`; `data` is the proxy's
  * JSON-RPC error `data` (`{}` for a REST route).
@@ -231,7 +261,7 @@ export class UnavailableError extends ApiError {
     data?: Json,
     status = 503,
   ) {
-    super(status, "temporarily_unavailable", detail, reason);
+    super(status, "temporarily_unavailable", detail, reason, undefined, dataCodeOf(data) || reason);
     this.data = data ?? {};
   }
 }
@@ -242,7 +272,8 @@ export class UnavailableError extends ApiError {
  * does not catch it.
  *
  * `reason` is the server's stable code: `error_description` on a REST route, the `data.reason`
- * of JSON-RPC `-32007` on `/mcp/{server}`. `retryAfter` is the `Retry-After` header in whole
+ * of JSON-RPC `-32007` on `/mcp/{server}`. `code` (and `stableCode`) is the proxy's `data.code`
+ * when it sends one, else `reason`. `retryAfter` is the `Retry-After` header in whole
  * seconds (until the caller's minute ends), undefined when it is missing or not a number.
  * `status` is 429 and `error` is `"rate_limited"`; `data` is the proxy's JSON-RPC error `data`
  * (`{}` for a REST route).
@@ -269,25 +300,39 @@ export class RateLimitedError extends ApiError {
     data?: Json,
     status = 429,
   ) {
-    super(status, "rate_limited", detail, reason);
+    super(status, "rate_limited", detail, reason, undefined, dataCodeOf(data) || reason);
     this.data = data ?? {};
   }
 }
 
-/** A JSON-RPC error that is not a denial (unknown upstream, upstream down, ...). */
+/**
+ * A JSON-RPC error that is not a denial (unknown upstream, upstream down, ...).
+ *
+ * `code` is the JSON-RPC error number (`-32004`, `-32005`, ...). `stableCode` is the server's
+ * stable machine-readable code (`unknown_server`, `upstream_unreachable`, ...; the list is in the
+ * HTTP reference under "Errors"): `data.code`, or `data.reason` for a server that sends no
+ * `code`, else undefined. Branch on it, not on `rpcMessage`. An error the proxy relays from the
+ * upstream keeps the upstream's own `data`, so its `stableCode` is whatever the upstream put
+ * there, often undefined.
+ */
 export class RpcError extends AttenuoError {
+  readonly stableCode: string | undefined;
+
   constructor(
     readonly code: number,
     readonly rpcMessage: string,
     readonly data?: unknown,
   ) {
     super(`JSON-RPC error ${code}: ${rpcMessage}`);
+    this.stableCode = stableCodeOf(data);
   }
 }
 
 /**
  * The proxy denied a call (JSON-RPC `-32003`). `reason` is the stable code; `decisionId` is the
- * id of the audit record. `data` is the error's whole `data` object, and the members the server
+ * id of the audit record. `stableCode` is the stable code under the name `ApiError` and
+ * `RpcError` share: `data.code`, or `data.reason` for an older server, else `reason`; for a
+ * denial the server sends it is the same string as `reason`. `data` is the error's whole `data` object, and the members the server
  * adds are also typed:
  *
  * - `limit`: the run limit a `budget_exhausted` call would take past its `max`, as a
@@ -300,6 +345,7 @@ export class RpcError extends AttenuoError {
  */
 export class DeniedError extends AttenuoError {
   readonly reason: string;
+  readonly stableCode: string;
   readonly decisionId: string | undefined;
   readonly detail: string;
   readonly data: Json;
@@ -314,6 +360,7 @@ export class DeniedError extends AttenuoError {
     this.decisionId = decisionId;
     this.detail = message;
     this.data = data ?? {};
+    this.stableCode = stableCodeOf(this.data) ?? reason;
     this.limit = budgetLimitOf(this.data.limit);
     this.usage = runUsageOf(this.data.usage);
     this.untrustedArgs = untrustedArgsOf(this.data.untrusted_args);

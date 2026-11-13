@@ -18,6 +18,19 @@ class AttenuoError(Exception):
     """Base class for every error the SDK raises, transport failures included."""
 
 
+def _stable_code_of(data: Any) -> str | None:
+    """The stable code of a JSON-RPC error's ``data``: ``data["code"]``, or for a server older
+    than the ``code`` member ``data["reason"]``, else ``None`` (no ``data`` object, or neither
+    member a non-empty string)."""
+    if not isinstance(data, dict):
+        return None
+    for key in ("code", "reason"):
+        value = data.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
 class TransportError(AttenuoError, httpx.TransportError):
     """The request got no answer: the connection was refused or dropped, a timeout ran out, a
     proxy or TLS handshake failed. ``__cause__`` is the ``httpx`` error.
@@ -181,6 +194,9 @@ class ApiError(AttenuoError):
     For a server that sends no ``code`` it is the ``error_description`` sub-code, or else
     ``error``. ``error`` is the OAuth-style error (``invalid_grant``, ``unauthorized``, ...) and
     ``description`` the ``error_description``, which is deprecated as a machine field.
+    ``stable_code`` is the same string as ``code``, under the name :class:`RpcError` and
+    :class:`Denied` use, so one attribute reads the stable code of every error the server
+    answered with.
 
     ``decision_id`` is the audit record of a refusal the server recorded (a refused token
     exchange or renewal, a proxy 401 for a lease that is no longer live), else ``None``. It is
@@ -208,6 +224,11 @@ class ApiError(AttenuoError):
         if detail:
             text += f": {detail}"
         super().__init__(text)
+
+    @property
+    def stable_code(self) -> str:
+        """The server's stable code: the same string as ``code``."""
+        return self.code
 
 
 class Unauthorized(ApiError):
@@ -248,6 +269,12 @@ class Unauthorized(ApiError):
         self.data: dict[str, Any] = data if data is not None else {}
 
 
+def _data_code(data: dict[str, Any] | None) -> str | None:
+    """``data["code"]`` when it is a non-empty string, else ``None``."""
+    value = data.get("code") if data is not None else None
+    return value if isinstance(value, str) and value else None
+
+
 class Unavailable(ApiError):
     """HTTP 503 from the server itself: it refused the request for its own load or state, not
     for anything about the request or its token. It is not a :class:`Denied`, nor an
@@ -255,9 +282,11 @@ class Unavailable(ApiError):
 
     ``reason`` is the server's stable code: on a REST route the ``error_description`` of its
     ``temporarily_unavailable`` answer, on ``/mcp/{server}`` the ``data.reason`` of JSON-RPC
-    ``-32006``. ``retry_after`` is the ``Retry-After`` header in whole seconds, ``None`` when it
-    is missing or not a number. ``status`` is 503 and ``error`` is ``"temporarily_unavailable"``;
-    ``data`` is the proxy's JSON-RPC error ``data`` (``{}`` for a REST route).
+    ``-32006``. ``code`` (and ``stable_code``) is the proxy's ``data.code`` when it sends one
+    (the same string as ``data.reason``), else ``reason``. ``retry_after`` is the
+    ``Retry-After`` header in whole seconds, ``None`` when it is missing or not a number.
+    ``status`` is 503 and ``error`` is ``"temporarily_unavailable"``; ``data`` is the proxy's
+    JSON-RPC error ``data`` (``{}`` for a REST route).
 
     - ``overloaded``: ``[limits] max_in_flight`` requests were already running. The request was
       refused before any work (no decision, no audit record, nothing sent upstream), so it is
@@ -282,7 +311,9 @@ class Unavailable(ApiError):
         data: dict[str, Any] | None = None,
         status: int = 503,
     ) -> None:
-        super().__init__(status, "temporarily_unavailable", detail, reason)
+        super().__init__(
+            status, "temporarily_unavailable", detail, reason, code=_data_code(data) or reason
+        )
         self.reason = reason
         self.retry_after = retry_after
         self.data: dict[str, Any] = data if data is not None else {}
@@ -294,7 +325,8 @@ class RateLimited(ApiError):
     denials does not catch it.
 
     ``reason`` is the server's stable code: ``error_description`` on a REST route, the
-    ``data.reason`` of JSON-RPC ``-32007`` on ``/mcp/{server}``. ``retry_after`` is the
+    ``data.reason`` of JSON-RPC ``-32007`` on ``/mcp/{server}``. ``code`` (and ``stable_code``)
+    is the proxy's ``data.code`` when it sends one, else ``reason``. ``retry_after`` is the
     ``Retry-After`` header in whole seconds (until the caller's minute ends), ``None`` when it is
     missing or not a number. ``status`` is 429 and ``error`` is ``"rate_limited"``; ``data`` is
     the proxy's JSON-RPC error ``data`` (``{}`` for a REST route).
@@ -320,19 +352,28 @@ class RateLimited(ApiError):
         data: dict[str, Any] | None = None,
         status: int = 429,
     ) -> None:
-        super().__init__(status, "rate_limited", detail, reason)
+        super().__init__(status, "rate_limited", detail, reason, code=_data_code(data) or reason)
         self.reason = reason
         self.retry_after = retry_after
         self.data: dict[str, Any] = data if data is not None else {}
 
 
 class RpcError(AttenuoError):
-    """A JSON-RPC error that is not a denial (unknown upstream, upstream down, ...)."""
+    """A JSON-RPC error that is not a denial (unknown upstream, upstream down, ...).
+
+    ``code`` is the JSON-RPC error number (``-32004``, ``-32005``, ...). ``stable_code`` is the
+    server's stable machine-readable code (``unknown_server``, ``upstream_unreachable``, ...;
+    the list is in the HTTP reference under "Errors"): ``data["code"]``, or ``data["reason"]``
+    for a server that sends no ``code``, else ``None``. Branch on it, not on ``message``. An
+    error the proxy relays from the upstream keeps the upstream's own ``data``, so its
+    ``stable_code`` is whatever the upstream put there, often ``None``.
+    """
 
     def __init__(self, code: int, message: str, data: Any = None) -> None:
         self.code = code
         self.message = message
         self.data = data
+        self.stable_code: str | None = _stable_code_of(data)
         super().__init__(f"JSON-RPC error {code}: {message}")
 
 
@@ -340,8 +381,10 @@ class Denied(AttenuoError):
     """The proxy denied a call (JSON-RPC ``-32003``).
 
     ``reason`` is the stable code from the server; ``decision_id`` is the id of the audit record.
-    ``data`` is the error's whole ``data`` object, and the members the server adds are also
-    typed:
+    ``stable_code`` is the stable code under the name :class:`ApiError` and :class:`RpcError`
+    share: ``data["code"]``, or ``data["reason"]`` for an older server, else ``reason``; for a
+    denial the server sends it is the same string as ``reason``. ``data`` is the error's whole
+    ``data`` object, and the members the server adds are also typed:
 
     - ``limit``: the run limit a ``budget_exhausted`` call would take past its ``max``, as a
       :class:`BudgetLimit`; else ``None``.
@@ -362,6 +405,7 @@ class Denied(AttenuoError):
         self.reason = reason
         self.decision_id = decision_id
         self.data: dict[str, Any] = data if data is not None else {}
+        self.stable_code: str = _stable_code_of(self.data) or reason
         self.limit = budget_limit_from_json(self.data.get("limit"))
         self.usage = run_usage_from_json(self.data.get("usage"))
         self.untrusted_args = untrusted_args_from_json(self.data.get("untrusted_args"))

@@ -252,6 +252,7 @@ describe.skipIf(!enabled)("GitHub leak scenario against the real server", () => 
     expect(policyDenied).toBeInstanceOf(DeniedError);
     const pd = policyDenied as DeniedError;
     expect(pd.reason).toBe("policy_deny");
+    expect(pd.stableCode).toBe("policy_deny");
     expect(pd.decisionId).toBeTruthy();
 
     // 8. Exfiltration through create_issue: never delegated.
@@ -619,6 +620,7 @@ describe.skipIf(!enabled)("streamed tools/call against the real server", () => {
     expect(Date.now() - started).toBeLessThan(10_000); // one re-check interval (1 s), with slack
     expect(cut).toBeInstanceOf(DeniedError);
     expect((cut as DeniedError).reason).toBe("lease_revoked");
+    expect((cut as DeniedError).stableCode).toBe("lease_revoked");
     const end = (await admin.auditRecord((cut as DeniedError).decisionId!)).entry;
     expect([end.record.tool, end.record.decision, end.record.reason]).toEqual([
       "stream.end",
@@ -1135,6 +1137,7 @@ describe.skipIf(!enabled)(
       const unknown = await ob.closeSession(coder, "github", "no-such-session").catch((e) => e);
       expect(unknown).toBeInstanceOf(RpcError);
       expect((unknown as RpcError).code).toBe(-32600);
+      expect((unknown as RpcError).stableCode).toBe("session_unknown");
       await admin.revokeLease(root.lease);
       await admin.revokeLease(other.lease);
     });

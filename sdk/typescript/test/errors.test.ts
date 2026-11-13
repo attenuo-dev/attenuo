@@ -14,17 +14,20 @@ import {
   EXPORT_FORMAT,
   GENESIS_HASH,
   PROOF_TYPE,
+  RateLimitedError,
   RpcError,
   SHIPPED_FORMAT,
   TransportError,
   TransportTimeoutError,
   UnauthorizedError,
+  UnavailableError,
   entryHash,
   type BudgetLimit,
   type RunUsage,
   type UntrustedArg,
 } from "../src/index.js";
 import { jsonResponse, mockFetch, rpcErr } from "./helpers.js";
+import { streamEndError } from "../src/sse.js";
 
 const BASE = "http://ob.test";
 const DEC = "6f1c2d9e-0000-4000-8000-000000000001";
@@ -182,6 +185,127 @@ describe("the stable code (K-8)", () => {
     expect(new UnauthorizedError(401, "unauthorized", "", "token_expired").code).toBe(
       "token_expired",
     );
+  });
+});
+
+describe("the stable code of a JSON-RPC error (stableCode)", () => {
+  it.each([
+    [{ code: "unknown_server", reason: "unknown_server" }, "unknown_server"],
+    [{ code: "upstream_unreachable" }, "upstream_unreachable"],
+    // An older server sends `reason` only.
+    [{ reason: "upstream_timeout" }, "upstream_timeout"],
+    // `code` wins over `reason`.
+    [{ code: "upstream_timeout", reason: "other" }, "upstream_timeout"],
+    // Nothing usable: an upstream's own data, or none at all.
+    [{ code: -1, reason: "" }, undefined],
+    [{}, undefined],
+    [undefined, undefined],
+    [["not", "an", "object"], undefined],
+    ["text", undefined],
+  ])("is read from data (%#)", async (data, stable) => {
+    const { ob } = client(() => rpcErr(-32004, "attenuo: unknown server", data, 404));
+    const e = (await caught(ob.callTool("TOK", "nope", "read_file"))) as RpcError;
+    expect(e).toBeInstanceOf(RpcError);
+    expect(e.code).toBe(-32004); // the JSON-RPC number is unchanged
+    expect(e.stableCode).toBe(stable);
+    expect(e.data).toEqual(data);
+  });
+
+  it("is set by the constructor", () => {
+    expect(new RpcError(-32005, "m").stableCode).toBeUndefined();
+    const e = new RpcError(-32005, "m", { code: "upstream_timeout" });
+    expect([e.code, e.stableCode]).toEqual([-32005, "upstream_timeout"]);
+  });
+
+  it("is carried by a denial", async () => {
+    const denial =
+      (data: Record<string, unknown>, code = -32003) =>
+      () =>
+        rpcErr(code, "attenuo: denied", data, 200, { "x-attenuo-decision-id": DEC });
+    const { ob } = client(denial({ code: "policy_deny", reason: "policy_deny", decision_id: DEC }));
+    const e = (await caught(ob.callTool("TOK", "github", "read_file"))) as DeniedError;
+    expect([e.stableCode, e.reason]).toEqual(["policy_deny", "policy_deny"]);
+
+    // An older server: `reason` only.
+    const { ob: old } = client(denial({ reason: "capability_denied", decision_id: DEC }));
+    const e2 = (await caught(old.callTool("TOK", "github", "read_file"))) as DeniedError;
+    expect(e2.stableCode).toBe("capability_denied");
+
+    const approval = { code: "approval_required", reason: "approval_required", decision_id: DEC };
+    const { ob: ap } = client(denial(approval, -32008));
+    const e3 = (await caught(ap.callTool("TOK", "github", "delete_repo"))) as ApprovalRequiredError;
+    expect(e3).toBeInstanceOf(ApprovalRequiredError);
+    expect(e3.stableCode).toBe("approval_required");
+
+    // Built by hand without data: the reason.
+    expect(new DeniedError("policy_deny", "id").stableCode).toBe("policy_deny");
+    expect(new ApprovalRequiredError("id", undefined, undefined, undefined).stableCode).toBe(
+      "approval_required",
+    );
+  });
+
+  it("is carried by the cut of a stream", () => {
+    const cut = streamEndError({
+      jsonrpc: "2.0",
+      id: null,
+      error: {
+        code: -32001,
+        message: "attenuo: stream ended: lease_revoked",
+        data: { code: "lease_revoked", reason: "lease_revoked", decision_id: DEC },
+      },
+    });
+    expect(cut).toBeInstanceOf(DeniedError);
+    expect(cut?.stableCode).toBe("lease_revoked");
+    const other = streamEndError({
+      jsonrpc: "2.0",
+      id: null,
+      error: { code: -32001, message: "x", data: 3 },
+    });
+    expect(other).toBeInstanceOf(RpcError);
+    expect(other?.stableCode).toBeUndefined();
+  });
+
+  it("is code on an ApiError", async () => {
+    const body = { error: "invalid_grant", code: "audience_mismatch", detail: "audience_mismatch" };
+    const { ob } = client(() => jsonResponse(body, 400));
+    const e = (await caught(ob.exchange("a.b.c", "coder", "github:read_file"))) as ApiError;
+    expect([e.stableCode, e.code]).toEqual(["audience_mismatch", "audience_mismatch"]);
+
+    const data = { code: "lease_revoked", reason: "lease_revoked" };
+    const { ob: p } = client(() => rpcErr(-32001, "attenuo: unauthorized", data, 401));
+    const e2 = (await caught(p.callTool("TOK", "github", "read_file"))) as UnauthorizedError;
+    expect(e2.stableCode).toBe("lease_revoked");
+  });
+
+  it.each([
+    [503, -32006, { code: "overloaded", reason: "overloaded" }, UnavailableError, "overloaded"],
+    [503, -32006, { reason: "session_registry_full" }, UnavailableError, "session_registry_full"],
+    [503, -32006, {}, UnavailableError, "temporarily_unavailable"],
+    [
+      429,
+      -32007,
+      { code: "rate_limited", reason: "rate_limited" },
+      RateLimitedError,
+      "rate_limited",
+    ],
+    [429, -32007, { reason: "too_many_sessions" }, RateLimitedError, "too_many_sessions"],
+  ])("is carried by a proxy load refusal (%#)", async (status, number, data, cls, stable) => {
+    const { ob } = client(() =>
+      rpcErr(number, "attenuo: refused", data, status, { "retry-after": "1" }),
+    );
+    const e = (await caught(ob.callTool("TOK", "github", "read_file"))) as ApiError;
+    expect(e).toBeInstanceOf(cls);
+    expect([e.stableCode, e.code]).toEqual([stable, stable]);
+  });
+
+  it("of a load refusal prefers data.code", () => {
+    expect(new UnavailableError("overloaded", 1, "", { code: "overloaded" }).stableCode).toBe(
+      "overloaded",
+    );
+    expect(new UnavailableError("overloaded").stableCode).toBe("overloaded");
+    expect(
+      new RateLimitedError("rate_limited", undefined, "", { code: "too_many_sessions" }).code,
+    ).toBe("too_many_sessions");
   });
 });
 

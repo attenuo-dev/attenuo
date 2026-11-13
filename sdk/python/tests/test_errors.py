@@ -236,6 +236,104 @@ def test_api_error_code_defaults() -> None:
     assert Unauthorized(401, "unauthorized", "", "token_expired").code == "token_expired"
 
 
+# --- the stable code of a JSON-RPC error: `stable_code`, next to the JSON-RPC number -------
+
+
+@pytest.mark.parametrize(
+    ("data", "stable"),
+    [
+        ({"code": "unknown_server", "reason": "unknown_server"}, "unknown_server"),
+        ({"code": "upstream_unreachable"}, "upstream_unreachable"),
+        # An older server sends `reason` only.
+        ({"reason": "upstream_timeout"}, "upstream_timeout"),
+        # `code` wins over `reason`.
+        ({"code": "upstream_timeout", "reason": "other"}, "upstream_timeout"),
+        # Nothing usable: an upstream's own data, or none at all.
+        ({"code": -1, "reason": ""}, None),
+        ({}, None),
+        (None, None),
+        (["not", "an", "object"], None),
+        ("text", None),
+    ],
+)
+async def test_rpc_error_stable_code(
+    make: Any,  # noqa: F811
+    data: Any,
+    stable: str | None,
+) -> None:
+    client, _ = make(lambda r: rpc_err(-32004, "attenuo: unknown server", data, status=404))
+    with pytest.raises(RpcError) as e:
+        await call(client, "call_tool", "TOK", "nope", "read_file")
+    assert e.value.code == -32004  # the JSON-RPC number is unchanged
+    assert e.value.stable_code == stable
+    assert e.value.data == data
+
+
+def test_rpc_error_stable_code_positional() -> None:
+    assert RpcError(-32005, "m").stable_code is None
+    assert RpcError(-32005, "m", {"code": "upstream_timeout"}).stable_code == "upstream_timeout"
+    assert RpcError(-32005, "m", {"code": "upstream_timeout"}).code == -32005
+
+
+async def test_denied_stable_code(make: Any) -> None:  # noqa: F811
+    data = {"code": "policy_deny", "reason": "policy_deny", "decision_id": DEC}
+    client, _ = make(denial(data))
+    with pytest.raises(Denied) as e:
+        await call(client, "call_tool", "TOK", "github", "read_file")
+    assert (e.value.stable_code, e.value.reason) == ("policy_deny", "policy_deny")
+
+    # An older server: `reason` only.
+    client, _ = make(denial({"reason": "capability_denied", "decision_id": DEC}))
+    with pytest.raises(Denied) as e2:
+        await call(client, "call_tool", "TOK", "github", "read_file")
+    assert e2.value.stable_code == "capability_denied"
+
+    approval = {"code": "approval_required", "reason": "approval_required", "decision_id": DEC}
+    client, _ = make(denial(approval, code=-32008))
+    with pytest.raises(ApprovalRequired) as e3:
+        await call(client, "call_tool", "TOK", "github", "delete_repo")
+    assert e3.value.stable_code == "approval_required"
+
+    # Built by hand without data: the reason.
+    assert Denied("policy_deny", "id").stable_code == "policy_deny"
+    assert ApprovalRequired("id", None).stable_code == "approval_required"
+
+
+async def test_stream_cut_denied_stable_code(make: Any) -> None:  # noqa: F811
+    from attenuo._sse import stream_end_error
+
+    cut = stream_end_error(
+        {
+            "jsonrpc": "2.0",
+            "id": None,
+            "error": {
+                "code": -32001,
+                "message": "attenuo: stream ended: lease_revoked",
+                "data": {"code": "lease_revoked", "reason": "lease_revoked", "decision_id": DEC},
+            },
+        }
+    )
+    assert isinstance(cut, Denied) and cut.stable_code == "lease_revoked"
+    other = stream_end_error(
+        {"jsonrpc": "2.0", "id": None, "error": {"code": -32001, "message": "x", "data": 3}}
+    )
+    assert isinstance(other, RpcError) and other.stable_code is None
+
+
+async def test_api_error_stable_code_is_code(make: Any) -> None:  # noqa: F811
+    body = {"error": "invalid_grant", "code": "audience_mismatch", "detail": "audience_mismatch"}
+    client, _ = make(lambda r: httpx.Response(400, json=body))
+    with pytest.raises(ApiError) as e:
+        await call(client, "exchange", "a.b.c", "coder", ["github:read_file"])
+    assert e.value.stable_code == e.value.code == "audience_mismatch"
+
+    data = {"code": "lease_revoked", "reason": "lease_revoked"}
+    client, _ = make(lambda r: rpc_err(-32001, "attenuo: unauthorized", data, status=401))
+    with pytest.raises(Unauthorized) as e2:
+        await call(client, "call_tool", "TOK", "github", "read_file")
+    assert e2.value.stable_code == "lease_revoked"
+
+
 # --- K-3: a denial keeps what the server says about it -------------------------------------
 
 
