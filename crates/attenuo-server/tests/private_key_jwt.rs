@@ -791,3 +791,135 @@ async fn startup_refuses_unusable_client_keys() {
     cfg.token.client_assertion_max_lifetime_seconds = 0;
     assert!(attenuo_server::build(&cfg).is_err());
 }
+
+/// SR-108: an agent over `[limits] token_requests_per_minute` is refused before its client
+/// assertion is recorded as used. Before the fix the assertion's `jti` was written to the
+/// replay store first and the limit checked after, so a rate-limited agent still wrote one
+/// marker per request (a database write and a slot of the store every single-use credential
+/// shares), and a client that retried the same assertion after `Retry-After`, as the SDKs'
+/// opt-in retry does, was refused as a replay.
+#[tokio::test]
+async fn a_rate_limited_agent_does_not_spend_its_assertion_sr108() {
+    let h = Harness::start(|c| c.limits.token_requests_per_minute = 1).await;
+
+    // Exchange: the first request of the minute goes through.
+    let (root, _) = h.root().await;
+    let a = h.keys.coder_new.assertion("coder");
+    let (status, _, v) = answer(
+        h.post(
+            "/token",
+            &exchange_body(&root, "coder", assertion_fields(&a)),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let markers = h.state.replay.len();
+    // The second is refused by the limit, and its assertion is not used up.
+    let (root, _) = h.root().await;
+    let b = h.keys.coder_new.assertion("coder");
+    let (status, _, v) = answer(
+        h.post(
+            "/token",
+            &exchange_body(&root, "coder", assertion_fields(&b)),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{v}");
+    assert_eq!(v["error"], "rate_limited", "{v}");
+    assert_eq!(
+        h.state.replay.len(),
+        markers,
+        "a rate-limited request wrote a replay marker"
+    );
+
+    // Hop 0, the same.
+    let a = h.keys.planner.assertion("planner");
+    let (status, _, v) = answer(
+        h.post(
+            "/token",
+            &intake_body(&h.idp.id_token("alice"), assertion_fields(&a)),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let markers = h.state.replay.len();
+    let b = h.keys.planner.assertion("planner");
+    let (status, _, v) = answer(
+        h.post(
+            "/token",
+            &intake_body(&h.idp.id_token("alice"), assertion_fields(&b)),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{v}");
+    assert_eq!(
+        h.state.replay.len(),
+        markers,
+        "a rate-limited hop-0 request wrote a replay marker"
+    );
+    assert!(h
+        .state
+        .metrics
+        .render()
+        .contains("attenuo_requests_rate_limited_total{limit=\"token\",cause=\"limit\"} 2\n"));
+}
+
+/// SR-111: with `[token] dpop_nonce = "required"`, a request whose DPoP proof has no current
+/// nonce is refused with `use_dpop_nonce` so that the client sends it once more with the
+/// nonce (RFC 9449 §8). The client assertion of that request must survive the retry: the
+/// SDKs and the CLI resend the same body with a new proof. Before the fix the assertion was
+/// recorded as used before the proof was checked, and the retry was refused as a replay.
+#[tokio::test]
+async fn a_nonce_retry_can_resend_its_assertion_sr111() {
+    use attenuo_server::config::{DpopMode, DpopNonceMode};
+    let h = Harness::start(|c| {
+        c.token.dpop = DpopMode::Optional;
+        c.token.dpop_nonce = DpopNonceMode::Required;
+    })
+    .await;
+    let key = DpopKey::generate().unwrap();
+    let url = h.server.url("/token");
+    let send = |body: Value, nonce: Option<String>| {
+        let proof = key.proof_with_nonce("POST", &url, None, nonce.as_deref(), now());
+        h.client.post(&url).header("DPoP", proof).json(&body).send()
+    };
+    let nonce_of = |resp: &reqwest::Response| {
+        resp.headers()
+            .get("dpop-nonce")
+            .map(|v| v.to_str().unwrap().to_owned())
+    };
+
+    // Exchange.
+    let (root, _) = h.root().await;
+    let body = exchange_body(
+        &root,
+        "coder",
+        assertion_fields(&h.keys.coder_new.assertion("coder")),
+    );
+    let resp = send(body.clone(), None).await.unwrap();
+    let nonce = nonce_of(&resp);
+    let (status, _, v) = answer(resp).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{v}");
+    assert_eq!(code(&v).1, "use_dpop_nonce", "{v}");
+    let (status, _, v) = answer(send(body.clone(), nonce.clone()).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK, "the retry with the nonce: {v}");
+    // Used once all the same.
+    let (status, _, v) = answer(send(body, nonce.clone()).await.unwrap()).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{v}");
+    assert_eq!(code(&v), ("invalid_client", "client_assertion_replayed"));
+
+    // Hop 0.
+    let body = intake_body(
+        &h.idp.id_token("alice"),
+        assertion_fields(&h.keys.planner.assertion("planner")),
+    );
+    let (status, _, v) = answer(send(body.clone(), None).await.unwrap()).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{v}");
+    assert_eq!(code(&v).1, "use_dpop_nonce", "{v}");
+    let (status, _, v) = answer(send(body, nonce).await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK, "the retry with the nonce: {v}");
+}

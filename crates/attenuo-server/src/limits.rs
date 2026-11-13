@@ -155,23 +155,51 @@ impl Limits {
         };
         match limiter.admit(agent, Instant::now()) {
             Verdict::Admit => Ok(()),
-            refused => {
-                let retry = self.refused(RateLimitedBy::Token, &refused);
-                if refused.first() {
-                    tracing::warn!(
-                        limit = "token_requests_per_minute",
-                        agent,
-                        retry_after_seconds = retry,
-                        "rate limit reached; further token requests of this agent are refused \
-                         until the minute ends"
-                    );
-                }
-                Err(rate_limited(
-                    "too many token requests for this agent; retry later",
-                    retry,
-                ))
-            }
+            refused => Err(self.agent_refused(&refused, agent)),
         }
+    }
+
+    /// [`admit_agent`](Self::admit_agent) without counting: refuse the authenticated agent
+    /// `agent` when it is over `token_requests_per_minute`, and mark the request as
+    /// authenticated. For a request whose credential is used up when it is accepted (a client
+    /// assertion): it runs before that credential is recorded, so an agent over its limit
+    /// writes nothing to the replay store and can send the same assertion again after
+    /// `Retry-After` (SR-108). The request is counted by `admit_agent` afterwards.
+    ///
+    /// # Errors
+    ///
+    /// As [`admit_agent`](Self::admit_agent).
+    pub(crate) fn check_agent(
+        &self,
+        mark: Option<&CallerMark>,
+        agent: &str,
+    ) -> Result<(), ApiError> {
+        if let Some(mark) = mark {
+            mark.0.store(true, Ordering::Release);
+        }
+        let Some(limiter) = &self.token else {
+            return Ok(());
+        };
+        match limiter.check(agent, Instant::now()) {
+            Verdict::Admit => Ok(()),
+            refused => Err(self.agent_refused(&refused, agent)),
+        }
+    }
+
+    /// The `429` of an agent over `token_requests_per_minute`, counted in the metrics and
+    /// logged on its first refusal in the minute.
+    fn agent_refused(&self, refused: &Verdict, agent: &str) -> ApiError {
+        let retry = self.refused(RateLimitedBy::Token, refused);
+        if refused.first() {
+            tracing::warn!(
+                limit = "token_requests_per_minute",
+                agent,
+                retry_after_seconds = retry,
+                "rate limit reached; further token requests of this agent are refused until \
+                 the minute ends"
+            );
+        }
+        rate_limited("too many token requests for this agent; retry later", retry)
     }
 
     /// Count a refusal in the metrics; returns its `Retry-After` in seconds.
@@ -348,6 +376,29 @@ impl RateLimiter {
             }
         }
         Verdict::Admit
+    }
+
+    /// [`peek`](Self::peek), except that a refusal of a key over its limit is remembered as
+    /// [`admit`](Self::admit) remembers it: `first` is set on the key's first refusal in its
+    /// window, whichever of the two made it. Counts nothing.
+    pub(crate) fn check(&self, key: &str, now: Instant) -> Verdict {
+        let window = self.window;
+        {
+            let mut t = self.lock();
+            if let Some(slot) = t.slots.get_mut(key) {
+                let end = slot.start + window;
+                if now < end && slot.count >= self.limit {
+                    let first = !slot.warned;
+                    slot.warned = true;
+                    return Verdict::Limited {
+                        retry_after: end.saturating_duration_since(now),
+                        first,
+                    };
+                }
+                return Verdict::Admit;
+            }
+        }
+        self.peek(key, now)
     }
 
     /// How many keys are tracked.
@@ -607,6 +658,38 @@ mod tests {
 
     /// A limit of N admits N in a window, refuses the N+1st (and every later one, uncounted),
     /// and admits N again once the window has ended.
+    /// `check` counts nothing, refuses what `admit` would refuse, and shares the first-refusal
+    /// flag with `admit`, so the warning is logged once a minute whichever of them refused
+    /// first (SR-108).
+    #[test]
+    fn check_counts_nothing_and_shares_the_first_refusal() {
+        let l = RateLimiter::new(2, W, 100);
+        let t0 = Instant::now();
+        for _ in 0..5 {
+            assert_eq!(l.check("agent", t0), Verdict::Admit);
+        }
+        assert_eq!(l.tracked(), 0, "check adds no key");
+        assert_eq!(l.admit("agent", t0), Verdict::Admit);
+        assert_eq!(l.admit("agent", t0), Verdict::Admit);
+        assert!(matches!(
+            l.check("agent", t0),
+            Verdict::Limited { first: true, .. }
+        ));
+        assert!(matches!(
+            l.check("agent", t0),
+            Verdict::Limited { first: false, .. }
+        ));
+        assert!(matches!(
+            l.admit("agent", t0),
+            Verdict::Limited { first: false, .. }
+        ));
+        assert_eq!(l.check("agent", t0 + W), Verdict::Admit);
+        // A new key on a full table is refused as `admit` would refuse it.
+        let full = RateLimiter::new(1, W, 1);
+        assert_eq!(full.admit("a", t0), Verdict::Admit);
+        assert!(matches!(full.check("b", t0), Verdict::Full { .. }));
+    }
+
     #[test]
     fn admits_n_refuses_n_plus_one_and_recovers_after_the_window() {
         let l = RateLimiter::new(3, W, 100);

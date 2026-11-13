@@ -34,7 +34,8 @@
 //!   `private_key_jwt` assertion, as the agent's entry allows); the client id must equal
 //!   `actor`. Failures are 401 `invalid_client` (sub-codes as for intake, and
 //!   `client_assertion_*`). An assertion is used up as soon as it authenticates, even when the
-//!   exchange is then refused.
+//!   exchange is then refused, except by the agent's rate limit or a refused `DPoP` header
+//!   proof, which are checked first (SR-108, SR-111).
 //! - an `actor_token` from an `[[actor_trust]]` issuer (a SPIFFE JWT-SVID, or any JWT with a
 //!   JWKS), verified by `crate::actor::ActorTrustRegistry::verify`; the agent its `sub` maps
 //!   to must equal `actor`. Failures are 400 `invalid_request` with `actor_token_*` sub-codes.
@@ -340,8 +341,11 @@ fn exchange_sync(
             now,
         )?;
         let method = client.method();
-        // An assertion authenticates this one request, whatever its outcome: its `jti` is
-        // recorded now (`crate::clientauth`).
+        // The rate limit and a DPoP proof that will be refused come first, so that a request
+        // the client is told to send again does not use its assertion up (SR-108, SR-111).
+        client.check_before_commit(state, headers, mark, now)?;
+        // Past that, an assertion authenticates this one request, whatever its outcome: its
+        // `jti` is recorded now (`crate::clientauth`).
         let agent = client.commit(&state.replay, now)?;
         if agent != req.actor.0 && mismatch.is_none() {
             mismatch = Some(clientauth::invalid_request(
