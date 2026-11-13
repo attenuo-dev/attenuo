@@ -743,6 +743,15 @@ mod tests {
                 "[[root_grants]] is an array of tables",
             ),
             ("ATTENUO__ISSUER__PREVIOUS_KEY_PATHS", "is a list"),
+            // ADR-0016: operators are file-only.
+            (
+                "ATTENUO__ADMIN__OPERATORS",
+                "cannot be set from the environment",
+            ),
+            (
+                "ATTENUO__ADMIN__OPERATORS__NAME",
+                "cannot be set from the environment",
+            ),
             (
                 "ATTENUO__POLICY__CATALOG__GITHUB__READ__READONLY",
                 "is a table of names",
