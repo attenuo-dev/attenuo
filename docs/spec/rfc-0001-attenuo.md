@@ -107,7 +107,7 @@ A set `P` covers a set `C` only if each `c âˆˆ C` is covered by a *single* `p âˆ
 
 ### 3.1 Not yet implemented / proposed
 
-These parts of the original design have no counterpart in the code. They are tracked in [the task board](../tasks/board.md) (Next: "Token claims: proposed extensions").
+These parts of the original design have no counterpart in the code. They are tracked in [the task board](../tasks/board.md) (Open, "Server and identity").
 
 - **`evidence`** on the originating user (type, `jti` and digest of the ID token or ID-JAG it came from), so audit can show how the user was verified. Hop 0 is minted from an IdP credential (section 4), but the credential itself is not referenced from the token; `ou_sig` is attenuo's own signature. Not yet implemented; tracked on the [task board](../tasks/board.md).
 - **`chain_id`**, a stable id for a whole run, for revoking by chain and correlating audit. In the audit log it is implemented as the lease id of the first hop (section 7), and that id is also the revocation handle (`POST /admin/leases/revoke` with `{"chain_id": ...}`, which revokes the first hop's lease and everything delegated from it). As a token claim it is not yet implemented; tracked on the [task board](../tasks/board.md).
