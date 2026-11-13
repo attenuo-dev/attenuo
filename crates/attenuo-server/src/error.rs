@@ -1,9 +1,9 @@
 //! JSON error responses: `{"error": "<error>", "code": "<code>", "detail": "<human-readable
 //! text>"}`, plus `error_description` where one is set.
 //!
-//! `code` is the stable machine-readable code of the answer: the specific reason the route
-//! names with [`ApiError::with_code`] when there is one, else `error_description` when the
-//! answer has one, else `error`. Every code, with its HTTP status, its JSON-RPC number and
+//! `code` is the stable machine-readable code of the answer: its sub-code when it has one
+//! (sent also as `error_description`, except for a reason set with [`ApiError::with_code`]),
+//! else `error`. Every code, with its HTTP status, its JSON-RPC number and
 //! whether it is also a deny `reason`, is in one table, [`ERROR_CODES`] (from
 //! `attenuo_core::error_codes`, so that the proxy and the CLI read the same table). `detail` is
 //! text for people and may change in any release; `error_description` keeps the sub-code it
@@ -47,13 +47,14 @@ pub struct ApiError {
     /// Human-readable explanation, sent as `detail`. [`Self::internal`] sends
     /// [`INTERNAL_DETAIL`] here and keeps the cause in the log.
     pub detail: String,
-    /// Stable sub-code, sent as `error_description` (RFC 6749 §5.2) when set, and then also the
-    /// answer's `code`.
+    /// Stable sub-code: the answer's `code` when set, and also sent as `error_description`
+    /// (RFC 6749 §5.2) unless [`Self::code_only`].
     pub description: Option<&'static str>,
-    /// The specific reason of a refusal whose `error` is a generic class and that has no
-    /// `error_description` (a refused renewal's `lease_revoked`, say): sent as `code` only, so
-    /// `error`, `detail` and the absence of `error_description` stay as they were.
-    pub specific: Option<&'static str>,
+    /// The sub-code is sent as `code` only, with no `error_description`: the specific reason
+    /// of a refusal that never had an `error_description` (a refused renewal's
+    /// `lease_revoked`, say), set by [`Self::with_code`] so that `error`, `detail` and the
+    /// absence of `error_description` stay as they were.
+    pub code_only: bool,
     /// The id of the `deny` audit record this refusal wrote, when it wrote one (a refused
     /// token exchange whose subject token verified, or a refused renewal whose token
     /// verified). Sent as `decision_id` in the body and in
@@ -65,11 +66,11 @@ pub struct ApiError {
 }
 
 impl ApiError {
-    /// The answer's stable code, sent as `code`: the [`Self::with_code`] reason when there is
-    /// one, else the `error_description` sub-code when there is one, else `error`. Always an
-    /// entry of [`ERROR_CODES`] (checked in debug builds).
+    /// The answer's stable code, sent as `code`: the sub-code when there is one
+    /// ([`Self::with_description`], [`Self::with_code`]), `error` otherwise. Always an entry of
+    /// [`ERROR_CODES`] (checked in debug builds).
     pub fn stable_code(&self) -> &str {
-        self.specific.or(self.description).unwrap_or(&self.code)
+        self.description.unwrap_or(&self.code)
     }
 
     /// In a debug build, panic unless [`ERROR_CODES`] lists [`Self::stable_code`] with this
@@ -95,7 +96,7 @@ impl ApiError {
             code: code.into(),
             detail: detail.into(),
             description: None,
-            specific: None,
+            code_only: false,
             decision_id: None,
             retry_after: None,
         }
@@ -110,6 +111,7 @@ impl ApiError {
     /// Attach a stable `error_description` sub-code.
     pub fn with_description(mut self, description: &'static str) -> Self {
         self.description = Some(description);
+        self.code_only = false;
         self
     }
 
@@ -118,7 +120,8 @@ impl ApiError {
     /// `detail` or in the message text, and whose `error`, `detail` and other fields stay as they
     /// were for clients that read them.
     pub fn with_code(mut self, code: &'static str) -> Self {
-        self.specific = Some(code);
+        self.description = Some(code);
+        self.code_only = true;
         self
     }
 
@@ -183,7 +186,7 @@ impl IntoResponse for ApiError {
         self.debug_check();
         let code = self.stable_code();
         let mut body = json!({ "error": self.code, "code": code, "detail": self.detail });
-        if let Some(d) = self.description {
+        if let Some(d) = self.description.filter(|_| !self.code_only) {
             body["error_description"] = d.into();
         }
         if let Some(id) = self.decision_id {
@@ -430,12 +433,17 @@ mod tests {
             b,
             json!({"error": "invalid_grant", "code": "lease_revoked", "detail": "lease_revoked"})
         );
-        // It wins over a sub-code, which is still sent as `error_description`.
-        let e = ApiError::bad_request("invalid_grant", "x")
-            .with_description("replayed")
-            .with_code("lease_revoked");
-        assert_eq!(e.stable_code(), "lease_revoked");
-        assert_eq!(body_of(e).await["error_description"], "replayed");
+        // `with_description` sends a sub-code in both fields again.
+        let b = body_of(
+            ApiError::bad_request("invalid_grant", "x")
+                .with_code("lease_revoked")
+                .with_description("replayed"),
+        )
+        .await;
+        assert_eq!(
+            (&b["code"], &b["error_description"]),
+            (&json!("replayed"), &json!("replayed"))
+        );
     }
 
     /// A subject token that verified but expired (itself, or a hop of its chain) answers
@@ -450,7 +458,7 @@ mod tests {
             (StatusCode::BAD_REQUEST, "invalid_grant", "token_expired")
         );
         assert_eq!(e.detail, TokenError::Expired.to_string());
-        assert_eq!(e.description, None);
+        assert!(e.code_only, "no error_description");
         e.debug_check();
         let hop = TokenError::Chain(attenuo_core::ChainError::HopExpired {
             index: 1,
