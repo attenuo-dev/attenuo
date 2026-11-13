@@ -201,6 +201,13 @@ def analyse(results: Path) -> dict:
             lost, gained = sum(cell["lost"].values()), sum(cell["gained"].values())
             cell["lost_total"], cell["gained_total"] = lost, gained
             cell["lost_user_tasks"] = len(cell["lost_user_tasks"])
+        by_user: dict = defaultdict(int)
+        for case in report["cases"]:
+            if case["kind"] == kind and case["direction"] == "lost":
+                by_user[case["run"].rsplit("/", 1)[0]] += 1
+        per["total"]["lost_by_user_task"] = dict(
+            sorted(by_user.items(), key=lambda kv: (-kv[1], kv[0]))
+        )
             # Sanity check: lost minus gained is the difference of the two arms' totals.
             assert lost - gained == cell["stock"] - cell["attenuo"], cell
         report["kinds"][kind] = per
@@ -259,7 +266,13 @@ def markdown(report: dict) -> str:
                     lines.append(
                         f"| *{text}* | " + " | ".join(str(per[c][key]) for c in cols) + " |"
                     )
-        lines.append("")
+        lines += [
+            "",
+            "Lost cases by user task: "
+            + ", ".join(f"{u} {n}" for u, n in per["total"]["lost_by_user_task"].items())
+            + ".",
+            "",
+        ]
     return "\n".join(lines)
 
 
