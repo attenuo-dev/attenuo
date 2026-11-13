@@ -435,7 +435,9 @@ All SDK errors derive from `AttenuoError`, transport failures included.
 | `ApprovalRequired` (`.approval_id`, `.expires_at`, `.call_hash`) | A `Denied` for JSON-RPC `-32008`: a policy holds the call until it is approved. See [Approvals](#approvals). |
 | `ApprovalNotGranted` (`.approval_id`, `.state`) | Waiting for an approval ended without a grant: `declined`, `expired`, `consumed` or `timeout`. |
 | `Unauthorized` (`.reason`, `.decision_id`, `.data`) | HTTP 401 or JSON-RPC `-32001`: missing, bad or expired bearer, a DPoP failure, or (from the proxy) a lease that is no longer live. A subclass of `ApiError`. Branch on `reason` (below). |
-| `ApiError` (`.status`, `.error`, `.detail`, `.decision_id`) | Any other non-success from the server: `invalid_scope`, `invalid_grant`, 404, 422. `decision_id` names the audit record of a refused exchange or renewal. |
+| `Unavailable` (`.reason`, `.retry_after`, `.data`) | HTTP 503 from the server itself (REST `temporarily_unavailable`, or the proxy's JSON-RPC `-32006`): `overloaded`, `request_timeout`, `session_registry_full`, ... A subclass of `ApiError`, not a denial. See [Load refusals](#load-refusals). |
+| `RateLimited` (`.reason`, `.retry_after`, `.data`) | HTTP 429 (REST `rate_limited`, or the proxy's JSON-RPC `-32007`): `rate_limited` or `too_many_sessions`. A subclass of `ApiError`, not a denial. See [Load refusals](#load-refusals). |
+| `ApiError` (`.status`, `.error`, `.detail`, `.decision_id`) | Any other non-success from the server: `invalid_scope`, `invalid_grant`, 404, 408 `request_timeout`, 422. `decision_id` names the audit record of a refused exchange or renewal. |
 | `TransportError` | No answer: the connection was refused or dropped, a timeout ran out, TLS or a proxy failed. `__cause__` is the `httpx` error. |
 | `TransportTimeout` | A `TransportError` because a timeout ran out: the client's `timeout` (`__cause__` is the `httpx.TimeoutException`) or a streamed call's `deadline`. Also an `httpx.TimeoutException`. |
 | `RpcError` | A JSON-RPC error that is not a denial (unknown upstream, upstream down). |
@@ -471,6 +473,34 @@ except TransportError as e:
 **Transport failures.** `TransportError` is also an `httpx.TransportError`, so `except httpx.TransportError` (or `httpx.RequestError`, `httpx.HTTPError`) keeps catching it; a handler for one `httpx` subclass, such as `httpx.ConnectError`, should test `isinstance(e.__cause__, httpx.ConnectError)` now. A failure while a streamed answer is read is one too. A timeout is the subclass `TransportTimeout` (also an `httpx.TimeoutException`), so a retry policy can tell a slow server from an unreachable one. `TokenAuth` runs inside your own `httpx` client, whose errors stay plain `httpx` errors.
 
 A denied `tools/call` is a decision, not a glitch: do not retry it blindly. A `lease_expired` denial is the one case where `renew()` then one retry makes sense; `lease_revoked` means stop.
+
+#### Load refusals
+
+A server with [`[limits]`](https://github.com/attenuo-dev/attenuo/blob/main/docs/reference/config.md#limits) can refuse a request because it is busy or because the caller is over a rate limit. These are not authorization decisions: `Unavailable` and `RateLimited` are `ApiError`s, never `Denied` or `Unauthorized`, so `except Denied` and `except Unauthorized` do not catch them. Both carry `reason` (the server's code), `retry_after` (the `Retry-After` header in whole seconds, `None` when it is missing or not a number), `status` and, for a proxy answer, the JSON-RPC `data`.
+
+| `reason` | Error | Ran on the server? | Retried by `max_retries` |
+| --- | --- | --- | --- |
+| `overloaded` | `Unavailable` (503) | No: refused before any decision, audit record or upstream call. Safe to retry after `retry_after`. | Yes |
+| `rate_limited` | `RateLimited` (429) | No: `POST /token` per agent or address, `/mcp/{server}` per run, refused before the work. Safe to retry after `retry_after` (the end of the caller's minute). | Yes |
+| `request_timeout` | `Unavailable` (503) | Maybe: the handler may have issued a token or written a decision. | No |
+| `too_many_sessions`, `session_registry_full` | `RateLimited` (429), `Unavailable` (503) | The upstream answered `initialize`; the proxy then closed that session. | No |
+| `jwks_unavailable`, `dpop_replay_cache_full` | `Unavailable` (503) | No decision was made. | No |
+
+A body that does not arrive within `request_body_timeout_seconds` is a plain `ApiError` (408 `request_timeout`). On `/mcp/{server}`, a `-32006` or `-32007` counts as the proxy's own only when the answer carries `Retry-After`, which the proxy sets on its refusals and never relays from an upstream; an upstream's error of that shape stays an `RpcError`.
+
+The clients do not retry by default. `Client(..., max_retries=N)` (and `AsyncClient`) retries `overloaded` and `rate_limited` up to `N` times (at most 10), waiting each answer's `Retry-After` (1 s without one), up to 20 % longer so that clients refused together do not come back together. A `Retry-After` over `max_retry_delay` (seconds, default 10, at most 300) is not waited out: the error is raised at once, so the retries of one call wait at most `max_retries * max_retry_delay` in all. Each retry is a new request with new DPoP proofs. `call_tool_stream` retries only before the stream starts, and never past its `deadline`. When the retries run out, the last refusal is raised. Nothing else is retried. `AdminClient` raises the same errors and does not retry.
+
+```python
+from attenuo import Client, Denied, RateLimited, Unavailable
+
+ob = Client("http://127.0.0.1:8080", max_retries=3, max_retry_delay=30)
+try:
+    ob.call_tool(token, "github", "read_file", {"repo": "alice/docs"})
+except (Unavailable, RateLimited) as e:
+    print(f"server refused ({e.reason}); try again in {e.retry_after or 1} s")
+except Denied as d:
+    print("denied:", d.reason)  # a decision: do not retry it
+```
 
 ## MCP clients
 
