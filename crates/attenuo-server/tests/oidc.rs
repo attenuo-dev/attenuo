@@ -228,6 +228,7 @@ impl Harness {
             attribute_claims: vec!["email".into(), "groups".into(), "amr".into()],
             jwks_ttl_seconds: 300,
             clock_skew_seconds: 60,
+            tenant: None,
             client_ids: ["planner", "coder"]
                 .map(|a| (a.to_string(), CLIENT_AUD.to_string()))
                 .into(),

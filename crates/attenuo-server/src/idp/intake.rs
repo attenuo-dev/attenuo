@@ -29,7 +29,9 @@
 //! `actor_token_*` sub-codes); authenticate the agent (`invalid_client`, 401, for client
 //! credentials); check `actor` and that capabilities were requested (`invalid_request`); verify
 //! the credential ([`IdpRegistry::verify`](super::IdpRegistry::verify), `invalid_grant`); for
-//! an ID-JAG, require its `client_id` to be the authenticated agent; build the originating user
+//! an ID-JAG, require its `client_id` to be the authenticated agent and, when it has a
+//! `cnf.jkt`, a DPoP proof by that key (`credential_pop_required`, `credential_pop_mismatch`);
+//! build the originating user
 //! ([`claims::originating_user`]); find the `[[root_grants]]` entry for (issuer, agent,
 //! subject) and attenuate the request against it (`invalid_scope`); cap the TTL at the
 //! credential's remaining lifetime (`credential_expired` if none is left) and at the actor
@@ -163,6 +165,24 @@ pub(crate) async fn handle(
                 client: agent,
             }
             .into());
+        }
+        // A sender-constrained ID-JAG (draft -04 §9.8.1.2, -06 §4.4.1): the request must carry
+        // a DPoP proof by the key in `cnf.jkt`, and the root token is then bound to that key.
+        if let Some(jkt) = &jag.cnf_jkt {
+            match &cnf {
+                Some(c) if c.jkt == *jkt => {}
+                Some(_) => return Err(IntakeError::PopMismatch.into()),
+                None => {
+                    return Err(IntakeError::PopRequired(
+                        if state.dpop.mode() == crate::config::DpopMode::Off {
+                            "the ID-JAG is bound to a DPoP key and [token] dpop is off".into()
+                        } else {
+                            "the ID-JAG is bound to a DPoP key: send a DPoP proof by that key".into()
+                        },
+                    )
+                    .into())
+                }
+            }
         }
     }
     let user = claims::originating_user(&verified)?;

@@ -138,6 +138,7 @@ impl Harness {
             attribute_claims: vec![],
             jwks_ttl_seconds: 300,
             clock_skew_seconds: 0,
+            tenant: None,
             client_ids: BTreeMap::new(),
         }];
         cfg.agents = vec![AgentConfig {

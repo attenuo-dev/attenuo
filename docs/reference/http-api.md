@@ -89,7 +89,9 @@ The table is generated from `attenuo_core::error_codes::ERROR_CODES`, the one pl
 | `client_auth_not_accepted` | 400 `invalid_request` |  |  | `[token] actor_auth` does not accept client credentials. |
 | `client_authentication_failed` | 401 `invalid_client` |  |  | The client id or secret is wrong. |
 | `client_id_mismatch` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The credential was issued to another client. |
-| `credential_audience_mismatch` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The ID-JAG's audience does not match the authenticated agent. |
+| `credential_audience_mismatch` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The ID token was not issued to the presenting agent: its `aud` or `azp` names another client. |
+| `credential_pop_mismatch` | 400 `invalid_grant` |  |  | The DPoP proof is by another key than the one the ID-JAG is bound to (`cnf.jkt`). |
+| `credential_pop_required` | 400 `invalid_grant` |  |  | The ID-JAG is bound to a key (`cnf`) and the request has no DPoP proof that this server checks. |
 | `credential_expired` | 400 `invalid_grant` |  |  | The hop-0 credential expires before the token could be issued. |
 | `dpop_replay_cache_full` | 503 `temporarily_unavailable` | `-32006` (503) |  | Too many DPoP proofs are in flight; retry later. |
 | `dpop_required` | 401 | `-32001` (401) |  | The token is bound to a key and no DPoP proof was sent. |
@@ -147,6 +149,7 @@ The table is generated from `attenuo_core::error_codes::ERROR_CODES`, the one pl
 | `session_mismatch` |  | `-32003` (403) |  | The `Mcp-Session-Id` belongs to another principal. |
 | `session_registry_full` |  | `-32006` (503) |  | No free session slot (`[proxy] max_sessions`). |
 | `session_unknown` |  | `-32600` (404) |  | The `Mcp-Session-Id` is not bound; start a new session. |
+| `tenant_mismatch` | 400 `invalid_grant` |  |  | The ID-JAG's `tenant` is not the `[[idps]] tenant` of its issuer. |
 | `token_expired` | 401 `unauthorized` | `-32001` (401), `-32001` (200) |  | The token verified but has expired. |
 | `too_many_pending_approvals` | 429 |  |  | The run already has the maximum number of pending approvals. |
 | `too_many_sessions` |  | `-32007` (429) |  | The principal holds `[proxy] max_sessions_per_principal` live sessions. |

@@ -196,6 +196,7 @@ impl Harness {
             attribute_claims: vec![],
             jwks_ttl_seconds: 300,
             clock_skew_seconds: 0,
+            tenant: None,
             client_ids: [("planner".to_string(), CLIENT_AUD.to_string())].into(),
         }];
         tweak(&mut cfg);

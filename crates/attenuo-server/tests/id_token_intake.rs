@@ -136,6 +136,7 @@ async fn server_trusting(idp: &EcIdp) -> Spawned {
         attribute_claims: vec![],
         jwks_ttl_seconds: 300,
         clock_skew_seconds: 60,
+        tenant: None,
         client_ids: BTreeMap::from([("planner".to_string(), CLIENT_AUD.to_string())]),
     }];
     cfg.agents = vec![AgentConfig {
@@ -229,6 +230,7 @@ async fn server_with_two_clients(idp: &EcIdp) -> Spawned {
         attribute_claims: vec![],
         jwks_ttl_seconds: 300,
         clock_skew_seconds: 60,
+        tenant: None,
         client_ids: BTreeMap::from([
             ("planner".to_string(), "planner-app".to_string()),
             ("coder".to_string(), "coder-app".to_string()),
