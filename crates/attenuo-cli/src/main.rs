@@ -24,6 +24,9 @@ mod render;
 mod secrets;
 mod watch;
 
+#[cfg(test)]
+mod reference_doc;
+
 use std::io::Read;
 use std::process::ExitCode;
 use std::time::Duration;

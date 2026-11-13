@@ -189,7 +189,7 @@ pub const ERROR_CODES: &[ErrorCode] = &[
     d("input_type_mismatch", NONE, DENY, "A call argument does not have the type the catalog declares."),
     e("invalid_agent", BAD_GRANT, NO_RPC, "The agent id of the token to mint is empty (an exchange's `actor`, or `agent` at `POST /admin/root-token`)."),
     e("invalid_capability", &[r(400, "invalid_grant"), r(400, "invalid_scope")], NO_RPC, "A requested capability is not one a call can have: a server or tool name that breaks the naming rules, or a malformed limit (sent with `error` `invalid_grant`); or a shorthand that is not `server:tool` (a form `scope` at `POST /token`, `capabilities` at `POST /admin/root-token`; sent with `error` `invalid_scope`)."),
-    e("invalid_chain", &[r(400, "invalid_chain"), r(400, "invalid_request")], NO_RPC, "The chain in the body does not validate (`POST /admin/policies/check`, or a PEP's unsigned chain at AuthZEN, sent with `error` `invalid_request`)."),
+    e("invalid_chain", &[r(400, "invalid_chain"), r(400, "invalid_request")], NO_RPC, "The chain in the body does not validate (`POST /admin/policies/evaluate`, or a PEP's unsigned chain at AuthZEN, sent with `error` `invalid_request`)."),
     e("invalid_client", BAD_CLIENT, NO_RPC, "Client authentication failed."),
     e("invalid_cursor", &[r(400, "invalid_cursor")], NO_RPC, "The paging cursor is malformed or belongs to another list or order."),
     e("invalid_dpop_proof", &[r(401, "invalid_dpop_proof")], &[j(UNAUTHORIZED, 401)], "The DPoP proof does not verify, is replayed, or is for another key, method or URL."),
