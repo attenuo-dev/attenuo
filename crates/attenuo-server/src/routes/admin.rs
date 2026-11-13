@@ -28,11 +28,14 @@ use super::page;
 use super::{audit_admin, bearer_of, REASON_ADMIN_ACTION};
 use crate::error::ApiError;
 use crate::metrics::RefundSource;
-use crate::operators::{required_role, AdminIdentity};
+use crate::operators::{required_role, AdminIdentity, AuthFailure};
 use crate::state::AppState;
 use attenuo_core::Decision;
 use attenuo_proxy::session::{session_digest, session_tag};
 use sha2::Digest;
+
+/// The 401 code of an admin bearer that matches an operator whose `expires_at` has passed.
+pub const REASON_ADMIN_CREDENTIAL_EXPIRED: &str = "admin_credential_expired";
 
 /// Largest page `GET /admin/audit` and `GET /admin/audit/checkpoints` return; a larger
 /// `limit` is a 400.
@@ -48,12 +51,17 @@ pub const DEFAULT_AUDIT_PAGE: usize = 100;
 /// - No bearer, or one that matches no credential: 401 with
 ///   `WWW-Authenticate: Bearer realm="attenuo-admin"`. The bearer is hashed and compared with
 ///   every credential in constant time ([`AdminCredentials::authenticate`]).
+/// - A bearer that matches an operator whose `expires_at` has passed: the same 401, with the
+///   code `admin_credential_expired`. The expiry is checked only after the comparison with
+///   every credential.
 /// - A role below [`required_role`] of the matched route (a route with no entry in
 ///   [`crate::operators::ROUTE_ROLES`] needs `admin`): 403 `admin_role_insufficient`, naming
 ///   the role needed.
 ///
 /// Otherwise the request goes on with an [`AdminIdentity`] in its extensions, which the
-/// handlers record as the actor.
+/// handlers record as the actor. The credentials are read once, from the set in force when
+/// the request arrives: a request admitted before an operators reload completes even if the
+/// reload removed or demoted its operator.
 ///
 /// [`AdminCredentials::authenticate`]: crate::operators::AdminCredentials::authenticate
 pub async fn require_admin(
@@ -61,7 +69,9 @@ pub async fn require_admin(
     mut req: Request,
     next: Next,
 ) -> Response {
-    if state.admin_credentials.is_empty() {
+    // One snapshot per request: a reload that swaps the set meanwhile does not affect it.
+    let creds = state.admin_credentials.snapshot();
+    if creds.is_empty() {
         return ApiError::new(
             StatusCode::FORBIDDEN,
             "admin_disabled",
@@ -70,21 +80,29 @@ pub async fn require_admin(
         .into_response();
     }
     let identity = match bearer_of(req.headers()) {
-        Ok(Some(token)) => state.admin_credentials.authenticate(token),
-        _ => None,
+        Ok(Some(token)) => creds.authenticate(token, state.now()),
+        _ => Err(AuthFailure::Unknown),
     };
-    let Some(identity) = identity else {
-        let reason = match bearer_of(req.headers()) {
-            Ok(None) => crate::error::REASON_MISSING_TOKEN,
-            _ => crate::error::REASON_INVALID_TOKEN,
-        };
-        let mut resp =
-            ApiError::unauthorized(reason, "admin bearer token required").into_response();
-        resp.headers_mut().insert(
-            header::WWW_AUTHENTICATE,
-            HeaderValue::from_static("Bearer realm=\"attenuo-admin\""),
-        );
-        return resp;
+    drop(creds);
+    let identity = match identity {
+        Ok(identity) => identity,
+        Err(failure) => {
+            let reason = match (&failure, bearer_of(req.headers())) {
+                (AuthFailure::Expired { name }, _) => {
+                    tracing::info!(operator = %name, "an expired admin credential was presented");
+                    REASON_ADMIN_CREDENTIAL_EXPIRED
+                }
+                (AuthFailure::Unknown, Ok(None)) => crate::error::REASON_MISSING_TOKEN,
+                (AuthFailure::Unknown, _) => crate::error::REASON_INVALID_TOKEN,
+            };
+            let mut resp =
+                ApiError::unauthorized(reason, "admin bearer token required").into_response();
+            resp.headers_mut().insert(
+                header::WWW_AUTHENTICATE,
+                HeaderValue::from_static("Bearer realm=\"attenuo-admin\""),
+            );
+            return resp;
+        }
     };
     let route = req
         .extensions()
@@ -114,11 +132,16 @@ pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// `GET /admin/whoami`: the name and role of the credential that sent the request,
-/// `{"name": ..., "role": "viewer" | "operator" | "admin"}`. The operator of `[admin] token`
-/// is `{"name": "admin", "role": "admin"}`. Reads nothing else and records nothing.
+/// `GET /admin/whoami`: the name, role and expiry of the credential that sent the request,
+/// `{"name": ..., "role": "viewer" | "operator" | "admin", "expires_at": <RFC 3339> | null}`.
+/// The operator of `[admin] token` is `{"name": "admin", "role": "admin", "expires_at":
+/// null}`. Reads nothing else and records nothing.
 pub async fn whoami(Extension(who): Extension<AdminIdentity>) -> Json<Value> {
-    Json(json!({ "name": who.name, "role": who.role }))
+    let expires_at = who
+        .expires_at
+        .and_then(|t| t.format(&Rfc3339).ok())
+        .map_or(Value::Null, Value::String);
+    Json(json!({ "name": who.name, "role": who.role, "expires_at": expires_at }))
 }
 
 /// Body of `POST /admin/leases/{lease_id}/revoke`; an empty body is allowed.
@@ -1510,6 +1533,145 @@ pub async fn reload_policies(
         "policy_ids": ids,
         "warnings": warnings,
         "sha256": digest,
+        "audit_id": audit_id,
+    })))
+}
+
+/// Audit a refused operators reload (`deny`, with the refusal's code as the reason) and build
+/// the refusal. A failure to audit is logged; the refusal is answered either way.
+async fn refuse_operators_reload(
+    state: &Arc<AppState>,
+    who: AdminIdentity,
+    path: &std::path::Path,
+    status: StatusCode,
+    code: &'static str,
+    detail: String,
+    now: OffsetDateTime,
+) -> ApiError {
+    let p = path.to_path_buf();
+    let _ = state
+        .blocking(move |state| {
+            audit_admin(
+                state,
+                &who,
+                "admin.operators.reload",
+                Decision::Deny,
+                code,
+                Vec::new(),
+                json!({ "path": p }),
+                now,
+            )
+        })
+        .await
+        .inspect_err(|e| tracing::error!(error = ?e.detail, "failed reload was not audited"));
+    ApiError::new(status, code, detail)
+}
+
+/// `POST /admin/operators/reload`: re-read the `[[admin.operators]]` array, and nothing else,
+/// from the config file the server was started with, check it as at startup (against the
+/// `[admin] token` in force, which is not reloaded) and swap the operators in force for it in
+/// one step. Answers the names of the operators `added`, `removed` and `changed` (role,
+/// `token_sha256` or `expires_at`), never a digest, and the id of the audit record.
+///
+/// A reload may remove or demote the operator who sent it; that request still completes, and
+/// the next one is checked against the new set. Requests admitted before the swap complete as
+/// they were admitted. A reload that would leave no unexpired credential with role `admin`
+/// (no `[admin] token` and no such operator) is refused, so that a typo cannot lock everyone
+/// out until a restart.
+///
+/// # Errors
+///
+/// Nothing changes on any error. 409 `reload_unavailable` when the server was not started
+/// from a config file; 500 `config_unreadable` when the file cannot be read (the cause is in
+/// the log); 422 `operators_invalid` when the file is not TOML or the list breaks a startup
+/// rule; 422 `operators_no_admin` for the lock-out above. The two 422s are audited as a
+/// `deny`.
+pub async fn reload_operators(
+    State(state): State<Arc<AppState>>,
+    Extension(who): Extension<AdminIdentity>,
+) -> Result<Json<Value>, ApiError> {
+    let path = state.config_path.clone().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::CONFLICT,
+            "reload_unavailable",
+            "the server was not started from a config file; there is nothing to reload",
+        )
+    })?;
+    // One reload at a time, from reading the file to the swap.
+    let _reloading = state.operators_reload.lock().await;
+    let text = tokio::fs::read_to_string(&path).await.map_err(|e| {
+        ApiError::internal(format!("reading {}: {e}", path.display()))
+            .with_code("config_unreadable")
+    })?;
+    let now = state.now();
+    let current = state.admin_credentials.snapshot();
+    let checked =
+        crate::operators::operators_from_toml(&text).and_then(|ops| current.with_operators(&ops));
+    let new = match checked {
+        Ok(new) => new,
+        Err(e) => {
+            let detail = format!("{e:#}; the operators in force are unchanged");
+            return Err(refuse_operators_reload(
+                &state,
+                who,
+                &path,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "operators_invalid",
+                detail,
+                now,
+            )
+            .await);
+        }
+    };
+    if !new.has_live_admin(now) {
+        return Err(refuse_operators_reload(
+            &state,
+            who,
+            &path,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "operators_no_admin",
+            "the reloaded list leaves no unexpired credential with role `admin` (no [admin] \
+             token and no such operator); the operators in force are unchanged"
+                .into(),
+            now,
+        )
+        .await);
+    }
+    let changes = current.changes_to(&new);
+    new.warn_expired(now, "by the reload");
+    state.admin_credentials.swap(Arc::new(new));
+    tracing::info!(
+        added = ?changes.added,
+        removed = ?changes.removed,
+        changed = ?changes.changed,
+        "admin operators reloaded"
+    );
+    let args = json!({
+        "path": path,
+        "added": changes.added,
+        "removed": changes.removed,
+        "changed": changes.changed,
+    });
+    let audit_id = state
+        .blocking(move |state| {
+            audit_admin(
+                state,
+                &who,
+                "admin.operators.reload",
+                Decision::Allow,
+                REASON_ADMIN_ACTION,
+                Vec::new(),
+                args,
+                now,
+            )
+        })
+        .await
+        .inspect_err(|e| tracing::error!(error = ?e.detail, "operators reload was not audited"))
+        .ok();
+    Ok(Json(json!({
+        "added": changes.added,
+        "removed": changes.removed,
+        "changed": changes.changed,
         "audit_id": audit_id,
     })))
 }

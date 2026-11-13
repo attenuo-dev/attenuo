@@ -93,7 +93,10 @@ async fn new_prints_a_token_and_an_entry_the_server_accepts() {
         .json()
         .await
         .unwrap();
-    assert_eq!(v, serde_json::json!({"name": "alice", "role": "operator"}));
+    assert_eq!(
+        v,
+        serde_json::json!({"name": "alice", "role": "operator", "expires_at": null})
+    );
 
     // A second run makes another token.
     let again = tokio::task::spawn_blocking(|| new(&["--name", "alice", "--role", "operator"]))

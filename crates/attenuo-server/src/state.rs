@@ -58,9 +58,17 @@ pub struct AppState {
     /// Held by `POST /admin/policies/reload` from reading the file to the swap, so two
     /// reloads cannot cross (the one that read the older text swapping last).
     pub policy_reload: tokio::sync::Mutex<()>,
-    /// The admin credentials (`[admin] token` and `[[admin.operators]]`, by digest); none
-    /// answers every admin call 403 `admin_disabled`.
-    pub admin_credentials: crate::operators::AdminCredentials,
+    /// The admin credentials in force (`[admin] token` and `[[admin.operators]]`, by digest);
+    /// none answers every admin call 403 `admin_disabled`. `POST /admin/operators/reload`
+    /// swaps the operators in whole.
+    pub admin_credentials: crate::operators::SharedAdminCredentials,
+    /// Held by `POST /admin/operators/reload` from reading the file to the swap, so two
+    /// reloads cannot cross.
+    pub operators_reload: tokio::sync::Mutex<()>,
+    /// The config file the server was started with ([`Config::source_path`]), which
+    /// `POST /admin/operators/reload` re-reads; `None` when the config was not read from a
+    /// file.
+    pub config_path: Option<PathBuf>,
     /// `[[root_grants]]`, the ceilings of root tokens.
     pub root_grants: Vec<RootGrant>,
     /// Trusted IdPs for hop-0 intake.
@@ -152,6 +160,10 @@ impl AppState {
             .check(config.admin.api_listen(config.server.listen))?;
         config.check_admin_token()?;
         config.check_admin_operators()?;
+        let admin_credentials = crate::operators::AdminCredentials::from_config(&config.admin)?;
+        // An entry that has expired is kept (its token is refused), so an old entry does not
+        // stop the server; it is named in a warning.
+        admin_credentials.warn_expired(clock.now_utc(), "at startup");
         config.metrics.check_listen()?;
         config.admin_ui.check_listen()?;
         if config.authzen.max_batch == 0 {
@@ -351,7 +363,9 @@ impl AppState {
             policies_path: config.policy.policies_path.clone(),
             loaded_policies,
             policy_reload: tokio::sync::Mutex::new(()),
-            admin_credentials: crate::operators::AdminCredentials::from_config(&config.admin)?,
+            admin_credentials: crate::operators::SharedAdminCredentials::new(admin_credentials),
+            operators_reload: tokio::sync::Mutex::new(()),
+            config_path: config.source_path.clone(),
             root_grants: config.root_grants.clone(),
             idps,
             agents,
@@ -806,7 +820,7 @@ mod tests {
         let state = AppState::from_config(&cfg).unwrap();
         let ids = state.pipeline.policy().snapshot().policy_ids();
         assert!(ids.contains(&"permit_readonly_tools".to_string()));
-        assert!(state.admin_credentials.is_empty());
+        assert!(state.admin_credentials.snapshot().is_empty());
     }
 
     /// SR-64: a policy that asks for approvals with `[approvals] client_id` unset warns on a

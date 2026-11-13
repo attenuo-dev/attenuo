@@ -122,6 +122,12 @@ pub struct Config {
     /// listener. See [`LimitsSection`].
     #[serde(default)]
     pub limits: LimitsSection,
+    /// The file this configuration was read from: set by [`Config::load`] and
+    /// [`Config::load_with_env`], `None` for a configuration built in code or parsed from text.
+    /// Not a key of the file. `POST /admin/operators/reload` re-reads `[[admin.operators]]`
+    /// from it, and refuses with 409 `reload_unavailable` when there is none.
+    #[serde(skip)]
+    pub source_path: Option<PathBuf>,
 }
 
 /// `[authzen]`
@@ -1650,7 +1656,8 @@ pub struct AdminSection {
     /// `[[admin.operators]]`: named admin credentials with a role (ADR-0016), next to
     /// [`token`](Self::token), which stays the operator `admin` with role `admin`. Read from
     /// the file only (an array of tables cannot be set by an environment override), at
-    /// startup: a change takes a restart. Checked by [`Config::check_admin_operators`].
+    /// startup and again by `POST /admin/operators/reload`, which re-reads this array alone
+    /// and swaps it in without a restart. Checked by [`Config::check_admin_operators`].
     #[serde(default)]
     pub operators: Vec<AdminOperator>,
 }
@@ -1662,6 +1669,7 @@ pub struct AdminSection {
 /// name = "alice"
 /// token_sha256 = "<64 lowercase hex characters>"
 /// role = "operator"
+/// expires_at = "2026-12-31T23:59:59Z"   # optional
 /// ```
 ///
 /// `attenuo admin operator new --name alice --role operator` generates a token and prints
@@ -1676,6 +1684,60 @@ pub struct AdminOperator {
     pub token_sha256: String,
     /// `viewer`, `operator` or `admin` ([`crate::operators::AdminRole`]).
     pub role: crate::operators::AdminRole,
+    /// When the token stops authenticating: an RFC 3339 time with an offset
+    /// (`"2026-12-31T23:59:59Z"`, quoted or as a TOML offset date-time). From then on the
+    /// token is answered 401 `admin_credential_expired`. Optional: without it the token is
+    /// valid until the entry is removed. A time that does not parse refuses the file; an
+    /// entry that has already expired is accepted with a warning naming it.
+    #[serde(
+        default,
+        with = "rfc3339_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub expires_at: Option<time::OffsetDateTime>,
+}
+
+/// `expires_at` of an `[[admin.operators]]` entry: an RFC 3339 time with an offset, written
+/// as a string or as a TOML offset date-time; serialized as an RFC 3339 string.
+mod rfc3339_option {
+    use serde::de::Error as _;
+    use serde::{Deserialize, Deserializer, Serializer};
+    use time::format_description::well_known::Rfc3339;
+    use time::OffsetDateTime;
+
+    pub(super) fn serialize<S: Serializer>(
+        v: &Option<OffsetDateTime>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(t) => s.serialize_str(&t.format(&Rfc3339).map_err(serde::ser::Error::custom)?),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<Option<OffsetDateTime>, D::Error> {
+        let text = match toml::Value::deserialize(d)? {
+            toml::Value::String(s) => s,
+            toml::Value::Datetime(dt) => dt.to_string(),
+            other => {
+                return Err(D::Error::custom(format!(
+                    "expires_at must be an RFC 3339 time with an offset (like \
+                     \"2026-12-31T23:59:59Z\"), not a {}",
+                    other.type_str()
+                )))
+            }
+        };
+        OffsetDateTime::parse(&text, &Rfc3339)
+            .map(Some)
+            .map_err(|_| {
+                D::Error::custom(format!(
+                    "expires_at `{text}` is not an RFC 3339 time with an offset (like \
+                     2026-12-31T23:59:59Z)"
+                ))
+            })
+    }
 }
 
 impl AdminSection {
@@ -2879,37 +2941,13 @@ impl Config {
     /// On the first entry that breaks one of those rules; the message names the entry, never
     /// a digest or the token.
     pub fn check_admin_operators(&self) -> anyhow::Result<()> {
-        use crate::operators::{check_operator_name, parse_token_sha256, token_sha256};
-        let legacy = self.admin.token.as_deref().map(token_sha256);
-        let mut seen: Vec<(&str, [u8; 32])> = Vec::with_capacity(self.admin.operators.len());
-        for op in &self.admin.operators {
-            check_operator_name(&op.name)
-                .map_err(|e| anyhow::anyhow!("[[admin.operators]]: {e}"))?;
-            let digest = parse_token_sha256(&op.token_sha256)
-                .map_err(|e| anyhow::anyhow!("[[admin.operators]] `{}`: {e}", op.name))?;
-            if seen.iter().any(|(name, _)| *name == op.name) {
-                anyhow::bail!(
-                    "[[admin.operators]]: the name `{}` is used twice; names must be unique",
-                    op.name
-                );
-            }
-            if let Some((other, _)) = seen.iter().find(|(_, d)| *d == digest) {
-                anyhow::bail!(
-                    "[[admin.operators]] `{}` and `{other}` have the same token_sha256; give \
-                     each operator a token of its own",
-                    op.name
-                );
-            }
-            if legacy == Some(digest) {
-                anyhow::bail!(
-                    "[[admin.operators]] `{}`: token_sha256 is the digest of [admin] token; \
-                     give the operator a token of its own",
-                    op.name
-                );
-            }
-            seen.push((&op.name, digest));
-        }
-        Ok(())
+        crate::operators::check_operators(
+            &self.admin.operators,
+            self.admin
+                .token
+                .as_deref()
+                .map(crate::operators::token_sha256),
+        )
     }
 
     /// Apply environment overrides: [`ADMIN_TOKEN_ENV`] replaces `[admin] token`.
@@ -2965,11 +3003,14 @@ impl Config {
     /// # Errors
     ///
     /// When the file cannot be read, or as [`from_toml`](Self::from_toml); the message names the
-    /// path.
+    /// path. The path is kept as [`source_path`](Self::source_path).
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("reading config {}: {e}", path.display()))?;
-        Self::from_toml(&text).map_err(|e| anyhow::anyhow!("parsing {}: {e}", path.display()))
+        let mut config = Self::from_toml(&text)
+            .map_err(|e| anyhow::anyhow!("parsing {}: {e}", path.display()))?;
+        config.source_path = Some(path.to_path_buf());
+        Ok(config)
     }
 
     /// Read and parse a file, then apply the environment overrides in `env`, as
@@ -2992,7 +3033,9 @@ impl Config {
         let file: toml::Table = text
             .parse()
             .map_err(|e| anyhow::anyhow!("parsing {}: {e}", path.display()))?;
-        overrides::apply(file, base, env)
+        let (mut config, applied) = overrides::apply(file, base, env)?;
+        config.source_path = Some(path.to_path_buf());
+        Ok((config, applied))
     }
 }
 
@@ -3814,6 +3857,7 @@ mod tests {
                     name: name.into(),
                     token_sha256,
                     role: AdminRole::Viewer,
+                    expires_at: None,
                 })
                 .collect();
             cfg.check_admin_operators().map_err(|e| e.to_string())
@@ -3864,6 +3908,7 @@ mod tests {
             name: "alice".into(),
             token_sha256: crate::operators::token_sha256_hex("t"),
             role: crate::operators::AdminRole::Admin,
+            expires_at: None,
         });
         cfg.check_admin_token().unwrap();
         cfg.admin.token = Some("change-me".into());

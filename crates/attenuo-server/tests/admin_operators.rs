@@ -41,6 +41,7 @@ fn config(dir: &Path, operators: bool) -> Config {
                 name: (*name).into(),
                 token_sha256: token_sha256_hex(token),
                 role: *role,
+                expires_at: None,
             })
             .collect();
     }
@@ -166,11 +167,17 @@ async fn whoami_names_the_credential() {
     for base in [server.url(""), console.url("")] {
         let (status, v) = send(&client, &base, "GET", "/admin/whoami", Some(LEGACY)).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(v, json!({"name": "admin", "role": "admin"}));
+        assert_eq!(
+            v,
+            json!({"name": "admin", "role": "admin", "expires_at": null})
+        );
         for (name, token, role) in OPERATORS {
             let (status, v) = send(&client, &base, "GET", "/admin/whoami", Some(token)).await;
             assert_eq!(status, StatusCode::OK);
-            assert_eq!(v, json!({"name": name, "role": role.as_str()}));
+            assert_eq!(
+                v,
+                json!({"name": name, "role": role.as_str(), "expires_at": null})
+            );
         }
     }
 }
