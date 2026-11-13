@@ -17,6 +17,7 @@ mod client;
 mod dpop_key;
 mod health;
 mod jwt;
+mod operator_cmd;
 mod policy_cmd;
 mod render;
 mod secrets;
@@ -33,8 +34,8 @@ use serde_json::{json, Map, Value};
 use time::OffsetDateTime;
 
 use cli::{
-    ApprovalCmd, AuditCmd, AuthzenCmd, BudgetCmd, Cli, Command, ExportFormat, Field, HealthArgs,
-    KeyCmd, LeaseCmd, PolicyCmd, TokenCmd,
+    AdminCmd, ApprovalCmd, AuditCmd, AuthzenCmd, BudgetCmd, Cli, Command, ExportFormat, Field,
+    HealthArgs, KeyCmd, LeaseCmd, OperatorCmd, PolicyCmd, TokenCmd,
 };
 use client::{query_escape, Client};
 use render::fmt_audit_entry;
@@ -130,6 +131,19 @@ async fn run(cli: Cli) -> Result<Outcome> {
     match cli.command {
         Command::Token(TokenCmd::Inspect(args)) => inspect(client.ok(), args, json).await,
         Command::Health(a) => health(&client?, &a, json).await,
+        Command::Admin(AdminCmd::Operator(OperatorCmd::New { name, role })) => {
+            operator_cmd::check_name(&name)?;
+            let token = operator_cmd::generate_token()?;
+            let (out, err) = operator_cmd::new_output(&name, role, &token, json);
+            print!("{out}");
+            eprint!("{err}");
+            Ok(Outcome::Ok)
+        }
+        Command::Admin(AdminCmd::Operator(OperatorCmd::Hash)) => {
+            let token = stdin.secret("operator token", std::io::stdin().lock())?;
+            print!("{}", operator_cmd::hash_output(&token, json));
+            Ok(Outcome::Ok)
+        }
         Command::Key(KeyCmd::Gen { dpop }) => {
             let key = dpop_key::generate(&dpop)?;
             if json {

@@ -1,6 +1,6 @@
 # CLI commands
 
-The `attenuo` binary comes from the `attenuo-cli` crate. It talks to a running attenuo server over HTTP, except for `key gen`, `policy lint`, `policy test` with `--via local` (the default), `token inspect` without `--verify`, `audit verify --file` with `--jwks`, and `approval verify` with a `--jwks` file, which run offline.
+The `attenuo` binary comes from the `attenuo-cli` crate. It talks to a running attenuo server over HTTP, except for `key gen`, `admin operator new` and `admin operator hash`, `policy lint`, `policy test` with `--via local` (the default), `token inspect` without `--verify`, `audit verify --file` with `--jwks`, and `approval verify` with a `--jwks` file, which run offline.
 
 ```
 attenuo [--server URL] [--json] <command>
@@ -148,6 +148,32 @@ $ attenuo key gen --dpop coder.jwk
 wrote DPoP key coder.jwk (EdDSA)
 jkt  4MMDxQj9pafXPrWH6dxBeoSk2DpHFpEZvXvsmr6JibU
 ```
+
+### `admin operator new --name <NAME> --role <ROLE>` / `admin operator hash`
+
+Make the credential of a named admin operator ([ADR-0016](../decisions/0016-admin-operators.md)). Offline: nothing is written to disk and nothing is sent to a server.
+
+`admin operator new` generates a token from 32 random bytes (base64url, 43 characters) and prints it once on stdout, then a blank line, then the `[[admin.operators]]` entry for the server's config, which holds only the token's SHA-256. A two-line reminder goes to stderr. `--role` is `viewer`, `operator` or `admin` ([roles](config.md#admin)). `--name` is `[a-z0-9_-]{1,64}` and not `admin`; a name the server would refuse is refused here (exit code 1, nothing on stdout). With `--json`, stdout is one object with `name`, `role`, `token`, `token_sha256` and `toml` (the entry). Hand the token to the operator over a secure channel, add the entry to the config file and restart the server.
+
+```console
+$ attenuo admin operator new --name alice --role operator
+q3J0bXk1Wm5hZ2FvN2dLc2l0bU9lQk1HWWJ0QkxzRmc
+
+[[admin.operators]]
+name = "alice"
+token_sha256 = "42a700cb2073e31b8140cd98dee7d52ab967d8331ede74514a895d9e41c5163f"
+role = "operator"
+The token above is shown once and is stored nowhere: give it to `alice` over a secure channel.
+Add the [[admin.operators]] entry to the server's config file and restart the server.
+```
+
+`admin operator hash` reads a token from the first line of stdin and prints its `token_sha256` (`{"token_sha256": ...}` with `--json`), for a token made some other way. It cannot be combined with `--admin-token-stdin`.
+
+```sh
+openssl rand -base64 32 | tr '+/' '-_' | tr -d '=' | tee alice.token | attenuo admin operator hash
+```
+
+The operator then uses the token like any admin token (`ATTENUO_ADMIN_TOKEN`, `--admin-token-file`, `--admin-token-stdin`); a command whose route the operator's role does not reach exits 1 with `admin_role_insufficient`.
 
 ### `token inspect <JWT>`
 
