@@ -196,6 +196,18 @@ async fn verified_tokens_are_cached_but_expiry_is_rechecked() {
     let again = auth.authenticate(&issued.token, now).await.unwrap();
     assert_eq!(again, issued.chain, "served from the cache");
 
+    // A hit shares the cached claims instead of copying them, and the entry holds the chain
+    // once, as `claims.chain`.
+    let (hit, was_hit) = auth.verify_inner(&issued.token, now).unwrap();
+    assert!(was_hit);
+    {
+        let chains = auth.verified.chains.lock().unwrap();
+        let cached = chains.get(&VerifiedTokens::key(&issued.token)).unwrap();
+        assert!(Arc::ptr_eq(&hit.claims, cached));
+        assert_eq!(cached.chain, issued.chain);
+    }
+    assert_eq!(hit.into_chain(), issued.chain);
+
     // Past the token's expiry the cached chain is refused, like a fresh verification.
     let later = issued.expires_at + Duration::seconds(1);
     assert!(auth.authenticate(&issued.token, later).await.is_err());
@@ -270,18 +282,18 @@ fn verified_token_cache_stays_bounded() {
     let issued = issuer
         .issue_root(user, AgentId::new("planner"), caps, None, now)
         .unwrap();
-    let v = issuer.verifier().verify(&issued.token, now).unwrap();
+    let v = Arc::new(issuer.verifier().verify(&issued.token, now).unwrap().claims);
     let cache = VerifiedTokens::new(3);
     for i in 0..10 {
-        cache.insert(VerifiedTokens::key(&format!("t{i}")), &v, now);
+        cache.insert(VerifiedTokens::key(&format!("t{i}")), v.clone(), now);
         assert!(cache.chains.lock().unwrap().len() <= 3);
     }
     // Expired entries go first when the cache is full.
     let expired_at = v.chain.hops[0].expires_at;
     let cache = VerifiedTokens::new(2);
-    cache.insert(VerifiedTokens::key("a"), &v, now);
-    cache.insert(VerifiedTokens::key("b"), &v, now);
-    cache.insert(VerifiedTokens::key("c"), &v, expired_at);
+    cache.insert(VerifiedTokens::key("a"), v.clone(), now);
+    cache.insert(VerifiedTokens::key("b"), v.clone(), now);
+    cache.insert(VerifiedTokens::key("c"), v.clone(), expired_at);
     let chains = cache.chains.lock().unwrap();
     assert_eq!(chains.len(), 1);
     assert!(chains.contains_key(&VerifiedTokens::key("c")));
