@@ -1,0 +1,8 @@
+# Release tooling for the Python package, compiled with hashes into release-requirements.txt.
+# The release workflow installs that file with `pip install --require-hashes` and builds with
+# `python -m build --no-isolation`, so hatchling must be listed here: nothing else installs it.
+# How to regenerate: sdk/python/README.md, "Release tooling".
+build
+twine
+# The build backend named in pyproject.toml ([build-system] requires).
+hatchling>=1.27
