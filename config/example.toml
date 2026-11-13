@@ -196,6 +196,11 @@ attribute_claims = ["email", "groups", "amr"]
 [[agents]]
 id = "planner"
 secret_sha256 = "a93d472e76b73bffcef69973eb463fb679b1365377e183a459d7f33c2ee97b7a"   # "planner-secret-change-me"
+# Instead of (or next to) secret_sha256, an entry can hold public keys; the agent then signs a
+# client assertion (private_key_jwt, RFC 7523) with aud = [issuer] issuer and a fresh jti.
+# `attenuo key gen --client planner.jwk` writes the private key and prints this line.
+# Up to 8 keys (RSA >= 2048 / RS256, P-256 / ES256, Ed25519 / EdDSA); give each a kid to rotate.
+# jwks = '''{"keys":[{"kty":"OKP","crv":"Ed25519","x":"<public key>","kid":"planner-1","alg":"EdDSA","use":"sig"}]}'''
 
 # Agents also authenticate on every token exchange (hop n to n+1) as the `actor` they name.
 [[agents]]

@@ -56,5 +56,6 @@ Only the `status` and `date` fields and the More Information section of an accep
 | [0014](0014-request-limits.md) | Request limits: an in-flight cap and deadlines on by default, per-run and per-agent rate limits in process and off by default | proposed |
 | [0015](0015-audit-retention.md) | Audit retention: archive a prefix of the log at a signed checkpoint, prune it in the server behind a signed anchor, off by default | proposed |
 | [0016](0016-admin-operators.md) | Admin operators: named admin bearer tokens stored as SHA-256 digests, three fixed roles checked from one route table, and the operator recorded as the actor | proposed |
+| [0017](0017-private-key-jwt.md) | Client authentication with `private_key_jwt`: public keys inline in `[[agents]]` and `[[peps]]`, `aud` fixed to the issuer identifier, and every assertion used once | proposed |
 
 Add a row for each new ADR.

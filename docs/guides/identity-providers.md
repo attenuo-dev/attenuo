@@ -97,8 +97,27 @@ Notes:
 
 - Use a separate entry and a separate secret for each agent identity. Do not share one across agents.
 - The secret goes in the agent's runtime. Treat a leak as a leak of that agent's root-grant ceiling for every user whose ID token the attacker can also get.
-- Secrets are static. There is no `private_key_jwt` and no mTLS in v0. Rotating one means editing the config and restarting.
+- Secrets are static. Rotating one means editing the config and restarting. To keep no shared secret on the server at all, give the agent a key pair instead (below). There is no mTLS client authentication.
 - If an `actor` is sent on an intake request it must equal the authenticated agent.
+
+### A key instead of a secret
+
+An entry can hold public keys instead of, or next to, the secret hash. The agent then proves who it is with a short-lived JWT it signs (RFC 7523 client authentication, `private_key_jwt`), and the server stores nothing that would let anyone else sign one:
+
+```sh
+attenuo key gen --client planner-client.jwk --kid planner-1
+# wrote client key planner-client.jwk (EdDSA, kid planner-1)
+# add to the agent's [[agents]] (or the PEP's [[peps]]) entry:
+# jwks = '''{"keys":[{"kty":"OKP","crv":"Ed25519","x":"…","kid":"planner-1","alg":"EdDSA","use":"sig"}]}'''
+```
+
+```toml
+[[agents]]
+id = "planner"
+jwks = '''{"keys":[{"kty":"OKP","crv":"Ed25519","x":"…","kid":"planner-1","alg":"EdDSA","use":"sig"}]}'''
+```
+
+The private key file stays with the agent. On each request it sends `client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer` and `client_assertion`, a JWT with `iss` and `sub` = `planner`, `aud` = the server's `[issuer] issuer` (not the token endpoint URL), a short `exp` and a fresh `jti`; each assertion is accepted once. The CLI does this with `--client-key`, the SDKs with `DpopKey.client_assertion` (Python) and `clientAssertion` (TypeScript). The full list of checks and refusal codes is in the [HTTP API reference](../reference/http-api.md#client-authentication). To rotate, add the new key with its own `kid` next to the old one, restart, switch the agent, then remove the old key and restart again.
 - The same `[[agents]]` entries authenticate sub-agents: a token exchange must authenticate as its `actor`. Give every agent that receives delegated tokens an entry, or a workload identity under [`[[actor_trust]]`](#workload-identity-for-sub-agents).
 - Each ID token or ID-JAG mints one root token. A second presentation, by any agent, is `invalid_grant` / `replayed` (keyed by `iss` and `jti`, or by the whole token when it has no `jti`). The root token expires no later than the credential, and a credential accepted only thanks to `clock_skew_seconds` is refused with `credential_expired`. The record of used credentials is kept in the server's database (`[audit] sqlite_path`), so it survives a restart; it is not shared with a server on another database file.
 
@@ -261,7 +280,7 @@ What attenuo checks:
 - With `[[idps]] tenant` set, `tenant` is present and equal to it (see below).
 - With a `cnf` claim (a sender-constrained ID-JAG), the request carries a DPoP proof by the key in `cnf.jkt`, and the root token is bound to that key. Without a proof the request fails with `credential_pop_required`, with a proof by another key with `credential_pop_mismatch`. A `cnf` without `jkt` (for example an mTLS certificate binding) is refused with `credential_pop_required`, because attenuo cannot check it, and so is any `cnf` when `[token] dpop = "off"`.
 
-The agent always authenticates (client secret or actor token), even for a sender-constrained ID-JAG; the draft only requires one or the other.
+The agent always authenticates (client secret, client assertion or actor token), even for a sender-constrained ID-JAG; the draft only requires one or the other.
 
 The draft's `resource`, `scope` and `authorization_details` claims are not used: what the root token may carry comes from `[[root_grants]]` and the request. An IdP that narrows an ID-JAG to one resource does not narrow the root token; `[[root_grants]]` is the only ceiling. Nor are `aud_tenant`, `aud_sub` or `sub_id`: the user is `sub`.
 
@@ -296,7 +315,7 @@ Status: **untested against any real provider.** The server's tests use assertion
 
 ## Workload identity for sub-agents
 
-Hop 0 is about the user. Every later hop is about an agent: the caller of an exchange must prove it is the `actor` it names. Besides an `[[agents]]` client secret, it can send an RFC 8693 `actor_token`: a JWT that a workload-identity system issued to that agent. attenuo verifies it against an `[[actor_trust]]` entry and maps its `sub` to an agent id, which must equal `actor`.
+Hop 0 is about the user. Every later hop is about an agent: the caller of an exchange must prove it is the `actor` it names. Besides an `[[agents]]` client secret or client assertion, it can send an RFC 8693 `actor_token`: a JWT that a workload-identity system issued to that agent. attenuo verifies it against an `[[actor_trust]]` entry and maps its `sub` to an agent id, which must equal `actor`.
 
 **Status: tested only with tokens the server's tests sign themselves.** The SPIRE settings below follow SPIRE's documentation and have not been run against a live SPIRE deployment.
 
