@@ -288,6 +288,14 @@ impl IdpRegistry {
                 .map(|a| parse_asymmetric_alg(a))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| anyhow::anyhow!("[[idps]] `{}`: {e}", cfg.issuer))?;
+            // An empty tenant would look set and could match no real ID-JAG (or one with an
+            // empty `tenant` claim): a mistake in the file, so refuse it at startup.
+            if cfg.tenant.as_deref().is_some_and(|t| t.trim().is_empty()) {
+                anyhow::bail!(
+                    "[[idps]] `{}`: tenant is empty; remove the line or name a tenant",
+                    cfg.issuer
+                );
+            }
             if cfg.jwks_ttl_seconds == 0 {
                 anyhow::bail!(
                     "[[idps]] `{}`: jwks_ttl_seconds must be positive",
@@ -800,6 +808,31 @@ mod tests {
             ..cfg
         };
         assert!(IdpRegistry::from_config(&[good.clone(), good], "me").is_err());
+    }
+
+    #[test]
+    fn an_empty_tenant_is_refused_in_config() {
+        let idp = |tenant: Option<&str>| IdpConfig {
+            issuer: "https://idp.example".into(),
+            audience: "a".into(),
+            jwks_url: None,
+            allowed_algs: vec!["RS256".into()],
+            attribute_claims: vec![],
+            jwks_ttl_seconds: 300,
+            clock_skew_seconds: 60,
+            tenant: tenant.map(str::to_owned),
+            client_ids: Default::default(),
+        };
+        for ok in [None, Some("acme")] {
+            IdpRegistry::from_config(&[idp(ok)], "me").unwrap();
+        }
+        for bad in ["", "  "] {
+            let err = IdpRegistry::from_config(&[idp(Some(bad))], "me")
+                .err()
+                .expect("an empty tenant must be refused")
+                .to_string();
+            assert!(err.contains("tenant is empty"), "{err}");
+        }
     }
 
     /// S-8: the JWKS (or, without `jwks_url`, the issuer used for discovery) is https, or plain

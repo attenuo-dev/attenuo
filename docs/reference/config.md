@@ -225,7 +225,7 @@ Every key fetch (`jwks_url`, or the discovery document at `issuer` and the `jwks
 | --- | --- | --- |
 | `issuer` | | The IdP issuer URL. |
 | `client_ids` | `{}` | Table of agent id to the client id registered for it at the IdP. An ID token must have that value in `aud` (and in `azp` when `aud` has several values or `azp` is present), or it is refused with `credential_audience_mismatch`. An agent with no entry must have a client id equal to its agent id; the server logs a warning at startup for each such agent. |
-| `tenant` | unset | For a multi-tenant issuer, the tenant whose users this entry trusts. An ID-JAG must carry a `tenant` claim equal to it, else it is refused with `missing_claim` or `tenant_mismatch` (draft-ietf-oauth-identity-assertion-authz-grant-06 §4.4.1). ID tokens are not affected. Unset: `tenant` is not checked. |
+| `tenant` | unset | For a multi-tenant issuer, the tenant whose users this entry trusts. An ID-JAG must carry a `tenant` claim equal to it, else it is refused with `missing_claim` or `tenant_mismatch` (draft-ietf-oauth-identity-assertion-authz-grant-06 §4.4.1). ID tokens are not affected. Unset: `tenant` is not checked. An empty value is refused at startup. |
 | `audience` | | Deprecated and ignored for ID tokens. Parsed so old configs load; a warning is logged when set. |
 | `jwks_url` | discovery | JWKS location. Otherwise `jwks_uri` from `<issuer>/.well-known/openid-configuration`. |
 | `allowed_algs` | `RS256`, `ES256`, `EdDSA` | Accepted signature algorithms. HMAC is refused. |
