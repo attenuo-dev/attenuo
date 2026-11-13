@@ -4,6 +4,7 @@
 > Note (2026-10-23): this project was renamed from `onbehalf` to `attenuo`. This historical document keeps the old name.
 
 - Status: draft plan. First slice run: a synthetic, LLM-free replay of injected tool calls, [injection suite](../evaluation/injection-suite.md) (2026-10-23)
+- Later results: AgentDojo ([plan](agentdojo-plan-2026-11-05.md), [planner-written grants](../evaluation/agentdojo-planner-grants.md), [a local open-weight model](../evaluation/agentdojo-local-model.md))
 - Date: 2026-10-22
 - Related: [RFC-0001](../spec/rfc-0001-attenuo.md), [threat model](../spec/threat-model.md), [incidents](incidents-2025-2026.md), [related work](related-work.md), [performance notes](../design/performance.md)
 
