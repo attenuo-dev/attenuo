@@ -18,16 +18,16 @@ Start a server with the example config (`[dev] allow_root_mint = true` for the d
 ```ts
 import { AdminClient, DeniedError, AttenuoClient, capability, prefix } from "@attenuo/sdk";
 
-const URL = "http://127.0.0.1:8080";
+const SERVER = "http://127.0.0.1:8080";
 
 // Development only: mint a root token for an asserted user. In production hop 0 comes from
 // your IdP: ob.exchange(idToken, "planner", ["github:*"], { clientId, clientSecret }).
-const admin = new AdminClient(URL, process.env.ATTENUO_ADMIN_TOKEN!); // the token the server was started with
+const admin = new AdminClient(SERVER, process.env.ATTENUO_ADMIN_TOKEN!); // the token the server was started with
 const root = await admin.mintRootDev("alice", "https://idp.example", "planner", {
   capabilities: ["github:*"],
 });
 
-const ob = new AttenuoClient(URL);
+const ob = new AttenuoClient(SERVER);
 
 // The planner hands the coder read_file on alice's public repos only.
 const coder = await ob.exchange(
@@ -89,7 +89,7 @@ A `Token` carries `lease`, `expiresAt`, `chain` (user and hops with capabilities
 These wrap the read-only operator routes the admin console uses. None of them signs, changes or audits anything.
 
 ```ts
-const admin = new AdminClient(URL, process.env.ATTENUO_ADMIN_TOKEN!);
+const admin = new AdminClient(SERVER, process.env.ATTENUO_ADMIN_TOKEN!);
 
 // Newest denials first. A filtered page can come back short (even empty) with nextCursor
 // still set, so iterate rather than reading one page: auditIter follows the cursor to the end.
@@ -208,7 +208,7 @@ An allowed call is charged to its run's limits before it goes upstream. When its
 ```ts
 import { AdminClient, ApiError } from "@attenuo/sdk";
 
-const admin = new AdminClient(URL, process.env.ATTENUO_ADMIN_TOKEN!);
+const admin = new AdminClient(SERVER, process.env.ATTENUO_ADMIN_TOKEN!);
 try {
   const r = await admin.refundBudget(result.decisionId!, "upstream returned 502");
   console.log(r.refunded, r.auditId); // counters credited; the admin.budget.refund record
@@ -293,10 +293,10 @@ const coderKey = await DpopKey.fromJwk(JSON.parse(await readFile("coder.jwk", "u
 // or: await DpopKey.generate(), and keep key.privateJwk() to reuse it
 
 // In the planner's process: consent to delegating `root` to the coder's key and agent id.
-const signOff = await plannerKey.signOff(`${URL}/token`, root.jwt, coderKey.thumbprint, "coder");
+const signOff = await plannerKey.signOff(`${SERVER}/token`, root.jwt, coderKey.thumbprint, "coder");
 
 // In the coder's process: the new token is bound to coderKey.
-const ob = new AttenuoClient(URL, { dpopKey: coderKey });
+const ob = new AttenuoClient(SERVER, { dpopKey: coderKey });
 const coder = await ob.exchange(root, "coder", "github:read_file", {
   clientSecret,
   subjectTokenDpop: signOff,
@@ -329,7 +329,7 @@ const refresher = new TokenRefresher({
 const dispose = refresher.start();
 
 // A per-request token hook for the MCP transport: it always sends the current token.
-const transport = new StreamableHTTPClientTransport(new URL(mcpUrl(URL, "github")), {
+const transport = new StreamableHTTPClientTransport(new URL(mcpUrl(SERVER, "github")), {
   fetch: refresher.fetch({ dpopKey: coderKey }), // = mcpFetch(refresher.provider, { dpopKey })
 });
 
@@ -546,7 +546,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { mcpHeaders, mcpUrl } from "@attenuo/sdk";
 
-const transport = new StreamableHTTPClientTransport(new URL(mcpUrl(URL, "github")), {
+const transport = new StreamableHTTPClientTransport(new URL(mcpUrl(SERVER, "github")), {
   requestInit: { headers: mcpHeaders(coder) },
 });
 const client = new Client({ name: "my-agent", version: "1.0.0" });
@@ -559,7 +559,7 @@ A denied call surfaces as an `McpError` carrying JSON-RPC code `-32003`; `error.
 `requestInit.headers` is fixed when the transport is built. If your token changes (re-exchange before `exp`), or it is bound to a key (each request then needs a fresh DPoP proof), pass `mcpFetch` as the transport's `fetch` instead: it sets `Authorization` (and `DPoP`) per request.
 
 ```ts
-const transport = new StreamableHTTPClientTransport(new URL(mcpUrl(URL, "github")), {
+const transport = new StreamableHTTPClientTransport(new URL(mcpUrl(SERVER, "github")), {
   fetch: mcpFetch(() => currentToken, { dpopKey: coderKey }),
 });
 ```
@@ -571,7 +571,9 @@ To have the token replaced for you, use a [`TokenRefresher`](#keeping-a-token-al
 ```ts
 import { verifyExport } from "@attenuo/sdk";
 
-const jwks = await (await fetch("http://127.0.0.1:8080/.well-known/jwks.json")).json();
+const jwks = (await (await fetch("http://127.0.0.1:8080/.well-known/jwks.json")).json()) as {
+  keys: unknown[];
+};
 const report = await verifyExport({ path: "audit.jsonl" }, { checkpointPublicKeys: jwks });
 if (!report.ok) console.log(report.firstBadSeq, report.badCheckpoints, report.truncated);
 ```
