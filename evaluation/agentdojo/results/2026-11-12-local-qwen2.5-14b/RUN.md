@@ -55,7 +55,7 @@ Each `<suite>/` directory has two arms.
 
 The runner's `work-*` directory is left out of `enforced/`. It holds the generated server config, Cedar policy and server log, which contain local paths. The config and policy are generated from the committed grants and suite policy by `enforced.py`.
 
-Errored runs: a run that the model server aborted has a line in `errors.jsonl` (or in the baseline's `results-<suite>-0.json` `errors` and `console.log`). Its per-run log has no `utility` and no `security` score. Count these runs apart; they are neither successes nor failures. Every error so far is Ollama's `500 prediction aborted, token repeat limit reached`, where the model repeated itself until the server stopped it.
+Errored runs: a run that the model server aborted has a line in `errors.jsonl` (or in the baseline's `results-<suite>-0.json` `errors` and `console.log`). Its per-run log has no `utility` and no `security` score. Count these runs apart; they are neither successes nor failures. An arm with no errored run has no `errors.jsonl`. Every error so far is Ollama's `500 prediction aborted, token repeat limit reached`, where the model repeated itself until the server stopped it.
 
 ## Runs
 
@@ -63,5 +63,7 @@ Errored runs: a run that the model server aborted has a line in `errors.jsonl` (
 |---|---|---|---|---|---|---|---|---|
 | slack | baseline | 2026-11-12 19:05:07 | 20:47:35 | 126 | 1 (attack) | 10/21 | 78/104 | 46/104 |
 | slack | attenuo, planner grants | 2026-11-12 20:47:35 | 22:11:20 | 126 | 7 (1 benign, 6 attack) | 8/20 | 15/99 | 26/99 |
+| banking | baseline | 2026-11-12 22:11:20 | 23:13:43 | 160 | 1 (attack) | 10/16 | 73/143 | 84/143 |
+| banking | attenuo, planner grants | 2026-11-12 23:13:43 | 2026-11-13 00:25:22 | 160 | 0 | 8/16 | 0/144 | 65/144 |
 
 Counts are read from the per-run logs; errored runs (null scores) are excluded from both numerator and denominator.
