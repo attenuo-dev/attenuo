@@ -1,4 +1,4 @@
-import { TransportError, TransportTimeoutError } from "./errors.js";
+import { ApiError, TransportError, TransportTimeoutError } from "./errors.js";
 import { normalizeBase } from "./wire.js";
 
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
@@ -70,10 +70,35 @@ function guardBody(res: Response, method: string, url: string, ownTimeout: boole
   }
 }
 
+/** The `error` and `code` of the `ApiError` a 3xx answer throws (SR-112). */
+export const REDIRECT_NOT_FOLLOWED = "redirect_not_followed";
+
+/**
+ * The error for a redirect answer, else undefined. No client of the SDK follows a redirect
+ * (`redirect: "manual"`): a followed `307` or `308` would send the body again to wherever
+ * `Location` names, a client secret, client assertion or subject token included (SR-112). Node
+ * hands back the 3xx itself; a browser hands back an opaque redirect (`type` `opaqueredirect`,
+ * status 0) whose `Location` it does not show.
+ */
+export function redirectError(res: Response, method: string, url: string): ApiError | undefined {
+  const opaque = res.type === "opaqueredirect";
+  if (!opaque && !(res.status >= 300 && res.status < 400)) return undefined;
+  const location = opaque ? null : res.headers.get("location");
+  const where = location ? `Location ${location}` : "no Location";
+  const status = opaque ? "a redirect" : String(res.status);
+  return new ApiError(
+    res.status,
+    REDIRECT_NOT_FOLLOWED,
+    `${method} ${url} answered ${status} (${where}); the client does not follow redirects, ` +
+      "so the server URL must be the final URL, the one that answers without a redirect",
+  );
+}
+
 /**
  * A tiny fetch wrapper: base URL, default headers, timeout, JSON bodies. A transport failure,
  * while sending or while reading the body, is a `TransportError` whose `cause` is what `fetch`
- * threw.
+ * threw. Redirects are not followed: a 3xx is an `ApiError` `redirect_not_followed`
+ * (`redirectError`).
  */
 export class Http {
   readonly base: string;
@@ -125,9 +150,15 @@ export class Http {
   ): Promise<Response> {
     let res: Response;
     try {
-      res = await this.doFetch(url, init);
+      // Passed in `init`, so a `fetch` given in the options gets it too (SR-112).
+      res = await this.doFetch(url, { ...init, redirect: "manual" });
     } catch (e) {
       throw isTransportFailure(e, ownTimeout) ? transportError(method, url, e) : e;
+    }
+    const redirect = redirectError(res, method, url);
+    if (redirect !== undefined) {
+      await res.body?.cancel().catch(() => undefined);
+      throw redirect;
     }
     return guardBody(res, method, url, ownTimeout);
   }
