@@ -3,10 +3,12 @@
 <!-- renamed-note -->
 > Note (2026-10-23): this project was renamed from `onbehalf` to `attenuo`. This historical document keeps the old name.
 
-- Date: 2026-10-22, updated 2026-11-12 (sections marked "added 2026-11-12" use the current name)
+- Date: 2026-10-22, updated 2026-11-12 and 2026-11-13 (sections marked "added 2026-11-12" or "added 2026-11-13" use the current name)
 - Related: [RFC-0001](../spec/rfc-0001-attenuo.md), [related work](related-work.md)
 
 > Update (2026-11-12): MCP's DPoP profile is now an experimental extension, Enterprise-Managed Authorization (ID-JAG) is marked stable on MCP's auth roadmap, ID-JAG is at -06, `draft-ietf-wimse-aims` at -01 has been read in part, and three IETF drafts were added: [attenuating agent tokens](#attenuating-authorization-tokens-for-agentic-delegation-chains), the [OAuth actor profile](#oauth-actor-profile-for-delegation) and the AuthZEN profiles. The closing section no longer says the composition is unowned.
+>
+> Update (2026-11-13): the ID-JAG validator was checked against the text of -04, -05 and -06, with a [conformance table](#id-jag-conformance-against--06), and four gaps were fixed; attenuo now emits `act.iss` ([actor profile](#oauth-actor-profile-for-delegation)).
 
 Each entry: what it is, what it gives onbehalf, what gap remains. Status as reported in the cited sources on the date above; drafts move, so re-check before quoting.
 
@@ -37,7 +39,57 @@ Okta's Cross-App Access was adopted by the IETF OAuth WG in September 2025 and f
 
 - **Gives us:** an IdP-issued assertion that names the user and the target resource, which is the cleanest hop-0 input for `originating_user`.
 - **Gap:** single hop, single trust domain, issued by the IdP for one resource; nothing about hops after the first, attenuation, or revocation. onbehalf treats ID-JAG as one of several hop-0 credential types and must track the draft as it changes.
-- **Update (2026-11-12):** the draft is at -06, dated 31 October 2026 on its cover page ([datatracker](https://datatracker.ietf.org/doc/draft-ietf-oauth-identity-assertion-authz-grant/)). Per our secondary summary, -05 and -06 add a refresh token as `subject_token`, an optional `sub_id`, multi-tenant issuer rules and an `access_denied` error [verify: not read against the draft text]. attenuo's validator was written against -04 and has not been re-tested against -06.
+- **Update (2026-11-12):** the draft is at -06, dated 31 October 2026 on its cover page ([datatracker](https://datatracker.ietf.org/doc/draft-ietf-oauth-identity-assertion-authz-grant/)). Per our secondary summary, -05 and -06 add a refresh token as `subject_token`, an optional `sub_id`, multi-tenant issuer rules and an `access_denied` error. Corrected on 2026-11-13 against the draft text: the refresh token as `subject_token` and `sub_id` were already in -04; the rule that the authorization server must require `tenant` from a multi-tenant issuer and the `access_denied` error are new in -05.
+
+### ID-JAG conformance against -06
+
+Added 2026-11-13. Read from the draft text: [-04](https://www.ietf.org/archive/id/draft-ietf-oauth-identity-assertion-authz-grant-04.txt) (21 May 2026), [-05](https://www.ietf.org/archive/id/draft-ietf-oauth-identity-assertion-authz-grant-05.txt) (30 October 2026) and [-06](https://www.ietf.org/archive/id/draft-ietf-oauth-identity-assertion-authz-grant-06.txt) (31 October 2026; [HTML](https://www.ietf.org/archive/id/draft-ietf-oauth-identity-assertion-authz-grant-06.html)). The datatracker [history](https://datatracker.ietf.org/doc/draft-ietf-oauth-identity-assertion-authz-grant/history/) shows -05 and -06 both posted on 30 October 2026, with no change notes.
+
+What was not read: the tool used to read the drafts cuts each text at about 100,000 characters, so the end of -05 and -06 (from section 9.6 on, which holds the DPoP section 9.11, the IANA considerations and the document history) and the references of -04 were not read, and no line-by-line diff was made. Every point below comes from sections 3 to 9.5 of each revision. -05 and -06 agree on every point checked here.
+
+**Changes from -04 to -06 that touch what attenuo does** (attenuo is the Resource Authorization Server of the draft; the IdP-side rules of section 4.3 do not apply to it):
+
+| Section (-06) | -04 | -06 |
+| --- | --- | --- |
+| 3.1 claims | `iss`, `sub`, `aud`, `client_id`, `jti`, `exp`, `iat` REQUIRED; `typ` MUST be `oauth-id-jag+jwt` | unchanged |
+| 4.3 token types | `urn:ietf:params:oauth:token-type:id-jag` | unchanged |
+| 4.4 grant type | `urn:ietf:params:oauth:grant-type:jwt-bearer` (`jwt-dpop` only in a 9.8.1.2.1 example) | `jwt-bearer`, or `urn:ietf:params:oauth:grant-type:jwt-dpop` for a DPoP-bound ID-JAG, defined in another individual draft, `draft-parecki-oauth-jwt-dpop-grant` |
+| 4.4 client authentication | no rule at the token endpoint (9.1: "SHOULD only be supported for confidential clients") | "SHOULD require client authentication"; "MUST reject a request that has neither client authentication nor a sender-constrained ID-JAG", with `invalid_client` |
+| 4.4.1 issuer | 4.1: the server "MUST be configured to recognize that issuer" | MUST reject with `invalid_grant` if `iss` is not a trusted IdP, "accepting only the algorithms it allows for that issuer" |
+| 4.4.1 `aud` | string or one-element array: "If the aud claim is an array, it MUST contain exactly one element" | unchanged |
+| 4.4.1 `tenant` | only an IdP duty (6.1: include `tenant` for a multi-tenant issuer) | new: for a multi-tenant issuer, MUST reject with `invalid_grant` unless `tenant` is present and trusted together with `iss` |
+| 4.4.1 `client_id` | MUST match the authenticated client | unchanged; without client authentication, proof of possession of the `cnf` key takes its place |
+| 4.4.1 `cnf` | 9.8.1.2: with `cnf.jkt`, a DPoP proof whose key thumbprint matches "MUST" be presented, else `invalid_grant` | a bullet in 4.4.1 points to 9.11 (not read) |
+| 4.4.1 `resource` | "MUST process it according to Section 2 of RFC 8707" | each value MUST be a resource this server governs, else `invalid_grant`; `access_denied` if none is acceptable |
+| 4.4.3 errors | `invalid_grant` only | adds `access_denied` (valid ID-JAG, user or client not authorized); `invalid_grant` lists "cnf binding" |
+| 4.4.4 replay | no rule (4.4.3 lets the client re-send the ID-JAG until it expires) | the server "can reject an ID-JAG with an exp longer than its policy allows, or accept each ID-JAG only once by tracking its jti" |
+| 4.4.4 refresh tokens | "SHOULD NOT return a Refresh Token" | unchanged |
+| 3.1, 4.3.3 `act` | no normative processing of `actor_token` or `act` | unchanged |
+
+**Conformance, attenuo as the Resource Authorization Server** (main at `7493efb` before this check; "now" is after the fixes of 2026-11-13):
+
+| -06 requirement | attenuo | Status |
+| --- | --- | --- |
+| `typ` is `oauth-id-jag+jwt` (3, 4.4.1) | checked, case-insensitive; now also accepts `application/oauth-id-jag+jwt` (RFC 7515 §4.1.9) | conformant |
+| `iss` trusted, allowed algorithms, signature (4.4.1) | `[[idps]]` issuer and `allowed_algs` (asymmetric only), key by `kid` | conformant |
+| `aud` is this server, array of exactly one (4.4.1) | was: an array was accepted if it contained `[issuer] issuer` among others. Now refused (`audience_mismatch`) | conformant now (was not, already against -04) |
+| REQUIRED claims (3.1) | `iss`, `sub`, `aud`, `client_id`, `exp`, `iat` were required; `jti` was not (the replay key fell back to a hash). Now `jti` is required (`missing_claim`) | conformant now |
+| `exp`, `iat` | checked with `clock_skew_seconds`; the root token never outlives `exp` | conformant |
+| `client_id` is the authenticated client (4.4.1) | equals the agent id (`client_id_mismatch`) | conformant |
+| client authentication (4.4) | always required, even for a bound ID-JAG (stricter than the SHOULD). With `[token] actor_auth = "actor_token"` and no credential at all, the answer is `400 invalid_request` / `actor_token_required`, not `invalid_client` | conformant except that error code |
+| `tenant` for a multi-tenant issuer (4.4.1) | was not checked. Now `[[idps]] tenant`, optional: when set, `tenant` must be present and equal (`missing_claim`, `tenant_mismatch`). attenuo cannot tell on its own that an issuer is multi-tenant, so the operator says so | conformant when configured |
+| `cnf` proof of possession (4.4.1, -04 9.8.1.2) | was ignored: a bound ID-JAG was accepted as a bearer one. Now `cnf.jkt` needs a DPoP proof by that key on the request (`credential_pop_required`, `credential_pop_mismatch`) and the root token is bound to it; any other `cnf` is refused | conformant to -04 9.8.1.2; -06 9.11 not read |
+| `jwt-dpop` grant type (4.4) | not supported (`unsupported_grant_type`); a bound ID-JAG is sent as `jwt-bearer` with a `DPoP` header | open |
+| `resource` (4.4.1) | ignored; the root token is bounded by `[[root_grants]]` and the request only | not conformant, open |
+| `scope`, `authorization_details` (4.4.1) | the request's are attenuated against `[[root_grants]]`; the ID-JAG's own claims are ignored | partly; open |
+| `access_denied` for a valid ID-JAG the user or client may not use (4.4.3) | `400 invalid_scope` / `no_root_grant` or `scope_exceeds_grant` | not conformant, open |
+| replay (4.4.4) | each (`iss`, `jti`) is used once, and the root token is capped at `exp` | conformant (the stricter of the two options) |
+| no refresh token (4.4.4) | none is issued | conformant |
+| `sub_id`, `aud_tenant`, `aud_sub`, `acr`, `email` | ignored; `auth_time` and `amr` feed the user block | not applicable (OPTIONAL) |
+| `subject_token_type` `...:id-jag` in a token exchange | an attenuo extension next to `jwt-bearer`; not in the draft | not applicable |
+| IdP rules (4.3, 6) | attenuo is not the IdP | not applicable |
+
+**Open items**, not implemented because they are larger or the draft leaves them open: honour the ID-JAG's `resource`, `scope` and `authorization_details` as a ceiling under `[[root_grants]]` (needs a mapping from resource identifiers to attenuo's upstream servers); answer `access_denied` instead of `invalid_scope` for a missing root grant (changes the error a client sees, so it needs a release note); accept `jwt-dpop` once its draft settles; read -06 section 9.11 and check the DPoP rules against it; answer `invalid_client` when `actor_auth = "actor_token"` and no credential was sent; trust several tenants of one issuer (needs `tenant` in `[[root_grants]]`).
 
 ## RFC 9396, Rich Authorization Requests (RAR)
 
@@ -89,9 +141,11 @@ Added 2026-11-12. `draft-niyikiza-oauth-attenuating-agent-tokens-02`, 26 October
 
 ## OAuth Actor Profile for Delegation
 
-Added 2026-11-12. `draft-mcguinness-oauth-actor-profile-01`, dated 9 October 2026, an individual Internet-Draft ([datatracker](https://datatracker.ietf.org/doc/draft-mcguinness-oauth-actor-profile/)). It requires `act.iss` and `act.sub` in an `act` object and recommends `sub_profile`, a list of entity profile values (its examples use `ai_agent`) defined by a companion entity-profiles draft.
+Added 2026-11-12. `draft-mcguinness-oauth-actor-profile-01`, dated 9 October 2026, an individual Internet-Draft, not a working-group document and not a standard ([datatracker](https://datatracker.ietf.org/doc/draft-mcguinness-oauth-actor-profile/)). It requires `act.iss` and `act.sub` in an `act` object and recommends `sub_profile`, a list of entity profile values (its examples use `ai_agent`) defined by a companion entity-profiles draft.
 
-- **Relation to attenuo:** attenuo carries the human in a signed `obo` block and the agents in `act` and `chain`. It does not emit `act.iss` or `sub_profile` today.
+- **Relation to attenuo:** attenuo carries the human in a signed `obo` block and the agents in `act` and `chain`. Since 2026-11-13 every level of `act` carries `iss`; it does not emit `sub_profile`.
+- **`act.iss` (added 2026-11-13).** Section 3.4 defines `act.iss` as "the issuer or namespace context for act.sub" and says it "MUST identify the context used when assigning or asserting that identifier", and that implementations MUST NOT read it as the current token issuer or the credential issuer. In attenuo `act.sub` is an agent id from `[[agents]]`: a client secret authenticates that id directly, and an actor token (a SPIFFE JWT-SVID or another workload JWT) is only mapped onto it by `subject_to_agent`. The namespace is therefore attenuo's own `[issuer] issuer` at every level, whatever the authentication method; the SPIFFE trust domain or the actor token's issuer would be the credential issuer the draft rules out. A chain never crosses issuers (an exchange verifies the parent against this server's `iss`), so all levels share it. The change is additive: verifiers that ignore `act.iss` (older attenuo, the Python and TypeScript SDKs) are unaffected, and attenuo still verifies tokens without it. The profile's other rules: one linear chain, outermost actor first (attenuo already does this); a local depth limit, refused with `invalid_request` (attenuo has `[issuer] max_depth` but answers `invalid_scope`, a difference left as is); and an issuer that extends an inbound chain "MUST NOT change any inherited actor field", which attenuo meets except that a parent issued before this change gets `iss` added to its inherited levels. Section 4.1's example has an authorization server whose own issuer is `act.iss` for agents it registered, which matches.
+- **`sub_profile` not emitted.** Its values "MUST be registered with the 'Actor Profile' usage location in the OAuth Entity Profiles registry" (section 3.4), a registry defined by another individual draft, `draft-mora-oauth-entity-profiles`; `ai_agent` appears only in examples, and the registry contents were not read. Emitting it would mean guessing a value.
 - **Gap:** individual draft; the profile values live in another draft.
 
 ## IETF 127 (14-20 November 2026)
