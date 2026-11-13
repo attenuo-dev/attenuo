@@ -3653,6 +3653,98 @@ mod tests {
         assert!(docker.check_admin_token().is_err());
     }
 
+    /// ADR-0016: `[[admin.operators]]` parse, and startup refuses bad names, duplicate names,
+    /// malformed digests, two operators with one digest and an operator with the digest of
+    /// `[admin] token`.
+    #[test]
+    fn admin_operators_are_checked() {
+        use crate::operators::{token_sha256_hex, AdminRole};
+        let a = token_sha256_hex("alice-token");
+        let b = token_sha256_hex("bob-token");
+        let cfg = Config::from_toml(&format!(
+            "[admin]\ntoken = \"legacy-token-0123456789abcdef01234\"\n\
+             [[admin.operators]]\nname = \"alice\"\ntoken_sha256 = \"{a}\"\nrole = \"viewer\"\n\
+             [[admin.operators]]\nname = \"bob\"\ntoken_sha256 = \"{b}\"\nrole = \"operator\"\n"
+        ))
+        .unwrap();
+        assert_eq!(cfg.admin.operators.len(), 2);
+        assert_eq!(cfg.admin.operators[1].role, AdminRole::Operator);
+        cfg.check_admin_operators().unwrap();
+        // An unknown role or key does not parse.
+        for bad in [
+            format!("[[admin.operators]]\nname = \"x\"\ntoken_sha256 = \"{a}\"\nrole = \"root\"\n"),
+            format!("[[admin.operators]]\nname = \"x\"\ntoken_sha256 = \"{a}\"\nrole = \"admin\"\ntoken = \"t\"\n"),
+            "[[admin.operators]]\nname = \"x\"\nrole = \"admin\"\n".to_string(),
+        ] {
+            assert!(Config::from_toml(&bad).is_err(), "{bad}");
+        }
+        let with = |ops: Vec<(&str, String)>, token: Option<&str>| {
+            let mut cfg = Config::default();
+            cfg.admin.token = token.map(Into::into);
+            cfg.admin.operators = ops
+                .into_iter()
+                .map(|(name, token_sha256)| AdminOperator {
+                    name: name.into(),
+                    token_sha256,
+                    role: AdminRole::Viewer,
+                })
+                .collect();
+            cfg.check_admin_operators().map_err(|e| e.to_string())
+        };
+        with(
+            vec![("alice", a.clone()), ("bob", b.clone())],
+            Some("legacy"),
+        )
+        .unwrap();
+        for (ops, token, want) in [
+            (vec![("admin", a.clone())], None, "reserved"),
+            (vec![("Alice", a.clone())], None, "a-z"),
+            (vec![("", a.clone())], None, "1 to 64"),
+            (
+                vec![("alice", a.clone()), ("alice", b.clone())],
+                None,
+                "used twice",
+            ),
+            (vec![("alice", a.to_uppercase())], None, "lowercase hex"),
+            (vec![("alice", a[..10].to_string())], None, "lowercase hex"),
+            (
+                vec![("alice", a.clone()), ("bob", a.clone())],
+                None,
+                "same token_sha256",
+            ),
+            (
+                vec![("alice", a.clone())],
+                Some("alice-token"),
+                "[admin] token",
+            ),
+        ] {
+            let err = with(ops, token).unwrap_err();
+            assert!(err.contains(want), "{err}");
+            // Neither a digest nor the token is repeated.
+            assert!(!err.contains(&a) && !err.contains("alice-token"), "{err}");
+        }
+    }
+
+    /// ADR-0016: off loopback, operators alone are enough, but a legacy token that is set must
+    /// still be strong.
+    #[test]
+    fn operators_count_as_an_admin_credential_off_loopback() {
+        let mut cfg = Config::default();
+        cfg.server.listen = "0.0.0.0:8080".parse().unwrap();
+        let err = cfg.check_admin_token().unwrap_err().to_string();
+        assert!(err.contains("[[admin.operators]]"), "{err}");
+        cfg.admin.operators.push(AdminOperator {
+            name: "alice".into(),
+            token_sha256: crate::operators::token_sha256_hex("t"),
+            role: crate::operators::AdminRole::Admin,
+        });
+        cfg.check_admin_token().unwrap();
+        cfg.admin.token = Some("change-me".into());
+        assert!(cfg.check_admin_token().is_err());
+        cfg.admin.token = Some("0123456789abcdef0123456789abcdef".into());
+        cfg.check_admin_token().unwrap();
+    }
+
     #[test]
     fn admin_ui_is_disabled_by_default() {
         let cfg = Config::from_toml("").unwrap();
@@ -3832,6 +3924,7 @@ mod tests {
             token: None,
             listen: listen.map(addr),
             serve_on_main_listener: on_main,
+            operators: Vec::new(),
         };
         // Loopback, nothing configured: on the main listener, as before.
         for main in ["127.0.0.1:8080", "[::1]:8080"] {

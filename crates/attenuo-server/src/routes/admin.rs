@@ -78,7 +78,8 @@ pub async fn require_admin(
             Ok(None) => crate::error::REASON_MISSING_TOKEN,
             _ => crate::error::REASON_INVALID_TOKEN,
         };
-        let mut resp = ApiError::unauthorized(reason, "admin bearer token required").into_response();
+        let mut resp =
+            ApiError::unauthorized(reason, "admin bearer token required").into_response();
         resp.headers_mut().insert(
             header::WWW_AUTHENTICATE,
             HeaderValue::from_static("Bearer realm=\"attenuo-admin\""),

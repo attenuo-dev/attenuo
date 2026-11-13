@@ -180,7 +180,11 @@ impl fmt::Debug for AdminCredentials {
     /// Names and roles only, never a digest.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_list()
-            .entries(self.creds.iter().map(|c| (&c.identity.name, c.identity.role)))
+            .entries(
+                self.creds
+                    .iter()
+                    .map(|c| (&c.identity.name, c.identity.role)),
+            )
             .finish()
     }
 }
@@ -273,7 +277,11 @@ pub const ROUTE_ROLES: &[(&str, &str, AdminRole)] = &[
     ("POST", "/admin/policies/evaluate", AdminRole::Viewer),
     ("GET", "/admin/approvals", AdminRole::Viewer),
     ("GET", "/admin/approvals/{id}", AdminRole::Viewer),
-    ("POST", "/admin/leases/{lease_id}/revoke", AdminRole::Operator),
+    (
+        "POST",
+        "/admin/leases/{lease_id}/revoke",
+        AdminRole::Operator,
+    ),
     ("POST", "/admin/leases/revoke", AdminRole::Operator),
     ("POST", "/admin/approvals/{id}", AdminRole::Operator),
     ("POST", "/admin/budgets/refund", AdminRole::Admin),
@@ -328,7 +336,10 @@ mod tests {
             Some(AdminIdentity::legacy())
         );
         let alice = creds.authenticate("alice-token").unwrap();
-        assert_eq!((alice.name.as_str(), alice.role), ("alice", AdminRole::Viewer));
+        assert_eq!(
+            (alice.name.as_str(), alice.role),
+            ("alice", AdminRole::Viewer)
+        );
         let bob = creds.authenticate("bob-token").unwrap();
         assert_eq!((bob.name.as_str(), bob.role), ("bob", AdminRole::Operator));
         for wrong in ["", "alice", "alice-token ", "Legacy-token"] {
@@ -411,7 +422,9 @@ mod tests {
     fn the_route_table_has_no_duplicates() {
         for (i, (m, p, _)) in ROUTE_ROLES.iter().enumerate() {
             assert!(
-                !ROUTE_ROLES[..i].iter().any(|(m2, p2, _)| m == m2 && p == p2),
+                !ROUTE_ROLES[..i]
+                    .iter()
+                    .any(|(m2, p2, _)| m == m2 && p == p2),
                 "{m} {p} listed twice"
             );
         }
@@ -421,10 +434,7 @@ mod tests {
     /// as (method, path) pairs. The console's own asset routes (`/admin/ui...`) sit outside
     /// `require_admin` and are left out.
     fn mounted_admin_routes() -> Vec<(String, String)> {
-        let sources = [
-            include_str!("lib.rs"),
-            include_str!("admin_ui.rs"),
-        ];
+        let sources = [include_str!("lib.rs"), include_str!("admin_ui.rs")];
         let mut out = Vec::new();
         for src in sources {
             let mut rest = src;
@@ -493,9 +503,7 @@ mod tests {
         assert!(mounted.len() >= ROUTE_ROLES.len(), "{mounted:?}");
         for (method, path) in &mounted {
             assert!(
-                ROUTE_ROLES
-                    .iter()
-                    .any(|(m, p, _)| m == method && p == path),
+                ROUTE_ROLES.iter().any(|(m, p, _)| m == method && p == path),
                 "{method} {path} is mounted but has no entry in ROUTE_ROLES"
             );
         }
