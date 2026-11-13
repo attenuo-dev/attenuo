@@ -234,6 +234,84 @@ class Unauthorized(ApiError):
         self.data: dict[str, Any] = data if data is not None else {}
 
 
+class Unavailable(ApiError):
+    """HTTP 503 from the server itself: it refused the request for its own load or state, not
+    for anything about the request or its token. It is not a :class:`Denied`, nor an
+    :class:`Unauthorized`: no decision was made, so code that catches denials does not catch it.
+
+    ``reason`` is the server's stable code: on a REST route the ``error_description`` of its
+    ``temporarily_unavailable`` answer, on ``/mcp/{server}`` the ``data.reason`` of JSON-RPC
+    ``-32006``. ``retry_after`` is the ``Retry-After`` header in whole seconds, ``None`` when it
+    is missing or not a number. ``status`` is 503 and ``error`` is ``"temporarily_unavailable"``;
+    ``data`` is the proxy's JSON-RPC error ``data`` (``{}`` for a REST route).
+
+    - ``overloaded``: ``[limits] max_in_flight`` requests were already running. The request was
+      refused before any work (no decision, no audit record, nothing sent upstream), so it is
+      safe to retry after ``retry_after``. The client's ``max_retries`` retries it.
+    - ``request_timeout`` (REST routes): no answer within ``[limits] request_timeout_seconds``.
+      The handler may have done its work (an issued token, a decision and its audit record), so
+      it is never retried for you.
+    - Others: ``jwks_unavailable``, ``dpop_replay_cache_full`` and, on the proxy,
+      ``session_registry_full`` (the upstream answered ``initialize`` and the proxy then closed
+      that session). Not retried for you.
+
+    On ``/mcp/{server}`` a ``-32006`` counts as the proxy's own only with a ``Retry-After``
+    header, which the proxy sets on its refusals and never relays from an upstream; without it,
+    it stays an :class:`RpcError`, as an upstream's error.
+    """
+
+    def __init__(
+        self,
+        reason: str,
+        retry_after: int | None = None,
+        detail: str = "",
+        data: dict[str, Any] | None = None,
+        status: int = 503,
+    ) -> None:
+        super().__init__(status, "temporarily_unavailable", detail, reason)
+        self.reason = reason
+        self.retry_after = retry_after
+        self.data: dict[str, Any] = data if data is not None else {}
+
+
+class RateLimited(ApiError):
+    """HTTP 429: the caller is over a rate limit of the server. It is not a :class:`Denied`, nor
+    an :class:`Unauthorized`: the token is good and no decision was made, so code that catches
+    denials does not catch it.
+
+    ``reason`` is the server's stable code: ``error_description`` on a REST route, the
+    ``data.reason`` of JSON-RPC ``-32007`` on ``/mcp/{server}``. ``retry_after`` is the
+    ``Retry-After`` header in whole seconds (until the caller's minute ends), ``None`` when it is
+    missing or not a number. ``status`` is 429 and ``error`` is ``"rate_limited"``; ``data`` is
+    the proxy's JSON-RPC error ``data`` (``{}`` for a REST route).
+
+    - ``rate_limited``: ``POST /token`` over ``[limits] token_requests_per_minute`` (per agent)
+      or ``token_unauthenticated_requests_per_minute`` (per address), or ``/mcp/{server}`` over
+      ``mcp_requests_per_minute`` (per run). The request was refused before the server did the
+      work (no token issued, no decision, no audit record, nothing sent upstream), so it is safe
+      to retry after ``retry_after``. The client's ``max_retries`` retries it.
+    - ``too_many_sessions`` (proxy): the principal holds ``[proxy] max_sessions_per_principal``
+      live sessions; the upstream answered ``initialize`` and the proxy then closed that
+      session. Close a session first; not retried for you.
+
+    On ``/mcp/{server}`` a ``-32007`` counts as the proxy's own only with a ``Retry-After``
+    header (see :class:`Unavailable`).
+    """
+
+    def __init__(
+        self,
+        reason: str,
+        retry_after: int | None = None,
+        detail: str = "",
+        data: dict[str, Any] | None = None,
+        status: int = 429,
+    ) -> None:
+        super().__init__(status, "rate_limited", detail, reason)
+        self.reason = reason
+        self.retry_after = retry_after
+        self.data: dict[str, Any] = data if data is not None else {}
+
+
 class RpcError(AttenuoError):
     """A JSON-RPC error that is not a denial (unknown upstream, upstream down, ...)."""
 

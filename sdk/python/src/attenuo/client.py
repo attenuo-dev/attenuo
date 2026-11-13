@@ -11,14 +11,16 @@ from __future__ import annotations
 import asyncio
 import itertools
 import time
-from collections.abc import AsyncIterator, Callable, Iterable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Iterator
 from types import TracebackType
 from typing import Any
 
 import httpx
 
+from . import _retry
 from . import _wire as w
 from ._http import AsyncHttpClient, HttpClient
+from ._retry import DEFAULT_MAX_RETRY_DELAY, RetryPolicy
 from ._sse import DEFAULT_MAX_EVENT_BYTES, CallStream, Deadline, StreamEvent, check_deadline
 from .capability import CapabilityLike
 from .dpop import DpopKey, NonceCache, exchange_proofs, presented
@@ -43,6 +45,18 @@ class Client:
     bound to a key is refused without proofs, so a copied token is useless on its own. When the
     server hands out DPoP nonces, the client keeps the latest one, puts it in every proof, and
     retries a request once when the server answers ``use_dpop_nonce``.
+
+    ``max_retries`` (default 0: off) retries a request the server refused for its load before
+    doing any work: 503 ``overloaded`` (:class:`~attenuo.Unavailable`) and 429 ``rate_limited``
+    (:class:`~attenuo.RateLimited`). Each retry waits the answer's ``Retry-After`` (1 s when it
+    has none), up to 20 % longer so refused clients spread out; a ``Retry-After`` over
+    ``max_retry_delay`` seconds (default 10) is not waited out and the error is raised at once,
+    so all retries of one call wait at most ``max_retries * max_retry_delay`` seconds. Every
+    retry is a new request with new DPoP proofs. Nothing else is retried: not a
+    ``request_timeout`` (the server may have done the work), not a denial, not an
+    :class:`~attenuo.Unauthorized`, not a transport error. A streamed call is retried only
+    before its stream starts, and not past its ``deadline``. When the retries run out, the last
+    refusal is raised. ``max_retries`` is at most 10 and ``max_retry_delay`` at most 300.
     """
 
     def __init__(
@@ -54,9 +68,12 @@ class Client:
         transport: httpx.BaseTransport | None = None,
         headers: dict[str, str] | None = None,
         dpop_key: DpopKey | dict[str, Any] | None = None,
+        max_retries: int = 0,
+        max_retry_delay: float = DEFAULT_MAX_RETRY_DELAY,
     ) -> None:
         self.server_url = w.normalize_base(server_url)
         self.token = token
+        self._retry = RetryPolicy(max_retries, max_retry_delay)
         self.dpop_key = DpopKey.of(dpop_key)
         self._nonce = NonceCache()
         self._http = HttpClient(
@@ -154,12 +171,32 @@ class Client:
         **kwargs: Any,
     ) -> httpx.Response:
         """``method path`` with ``headers(nonce)``; once more with the server's new nonce when
-        it answers ``use_dpop_nonce``."""
-        resp = self._http.request(method, path, headers=headers(self._nonce.value), **kwargs)
-        if self.dpop_key is not None and self._nonce.update(resp):
+        it answers ``use_dpop_nonce``; again, with new headers, on a load refusal while
+        ``max_retries`` allows (:meth:`_retrying`)."""
+
+        def send() -> httpx.Response:
             resp = self._http.request(method, path, headers=headers(self._nonce.value), **kwargs)
-            self._nonce.update(resp)
-        return resp
+            if self.dpop_key is not None and self._nonce.update(resp):
+                resp = self._http.request(
+                    method, path, headers=headers(self._nonce.value), **kwargs
+                )
+                self._nonce.update(resp)
+            return resp
+
+        return self._retrying(send)
+
+    def _retrying(self, send: Callable[[], httpx.Response]) -> httpx.Response:
+        """``send()``, and again after a wait while it answers a load refusal the client's
+        retry policy retries (``max_retries``)."""
+        retries = 0
+        while True:
+            resp = send()
+            wait = self._retry.delay(resp, retries)
+            if wait is None:
+                return resp
+            resp.close()
+            _retry.sleep(wait)
+            retries += 1
 
     def _auth(
         self, token: str, path: str, method: str = "POST"
@@ -289,17 +326,28 @@ class Client:
             h = headers(self._nonce.value)
             req = self._http.build_request("POST", path, headers=h, json=body)
             resp = self._http.send(req, stream=True)
-            if resp.status_code in (400, 401):
-                resp.read()  # small; NonceCache looks in it for use_dpop_nonce
+            if resp.status_code in (400, 401, 429, 503):
+                resp.read()  # small; NonceCache and RetryPolicy look in it
             return resp
 
-        expires = Deadline(deadline)
-        resp = send()
-        try:
+        def first() -> httpx.Response:
+            resp = send()
             if self.dpop_key is not None and self._nonce.update(resp):
                 resp.close()
                 resp = send()
                 self._nonce.update(resp)
+            return resp
+
+        expires = Deadline(deadline)
+        retries = 0
+        resp = first()
+        # A load refusal is retried here, before anything of the stream has been yielded.
+        while (wait := self._retry.delay(resp, retries, expires.left())) is not None:
+            resp.close()
+            _retry.sleep(wait)
+            retries += 1
+            resp = first()
+        try:
             stream = CallStream(resp, request_id, max_event_bytes)
             if not (stream.sse and resp.is_success):
                 data = bytearray()
@@ -416,9 +464,8 @@ class Client:
 
     def _decide(self, approval_id: str, id_token: str, decision: str) -> w.Approval:
         path = f"/approvals/{w.path_segment(approval_id, 'approval_id')}"
-        resp = self._http.post(
-            path, headers=w.id_token_headers(id_token), json=w.approval_decision_body(decision)
-        )
+        h, body = w.id_token_headers(id_token), w.approval_decision_body(decision)
+        resp = self._retrying(lambda: self._http.post(path, headers=h, json=body))
         return w.approval_from_json(w.json_body(resp))
 
     # -- AuthZEN --
@@ -461,13 +508,13 @@ class Client:
     def authzen_configuration(self) -> w.AuthzenConfiguration:
         """``GET /.well-known/authzen-configuration``: the AuthZEN discovery document. No
         credential is sent."""
-        resp = self._http.get("/.well-known/authzen-configuration")
+        resp = self._retrying(lambda: self._http.get("/.well-known/authzen-configuration"))
         return w.authzen_configuration_from_json(w.json_body(resp))
 
     # -- inspection --
     def jwks(self) -> dict[str, Any]:
         """``GET /.well-known/jwks.json``."""
-        body = w.json_body(self._http.get("/.well-known/jwks.json"))
+        body = w.json_body(self._retrying(lambda: self._http.get("/.well-known/jwks.json")))
         return body if isinstance(body, dict) else {}
 
     def inspect(
@@ -501,9 +548,12 @@ class AsyncClient:
         transport: httpx.AsyncBaseTransport | None = None,
         headers: dict[str, str] | None = None,
         dpop_key: DpopKey | dict[str, Any] | None = None,
+        max_retries: int = 0,
+        max_retry_delay: float = DEFAULT_MAX_RETRY_DELAY,
     ) -> None:
         self.server_url = w.normalize_base(server_url)
         self.token = token
+        self._retry = RetryPolicy(max_retries, max_retry_delay)
         self.dpop_key = DpopKey.of(dpop_key)
         self._nonce = NonceCache()
         self._http = AsyncHttpClient(
@@ -572,13 +622,29 @@ class AsyncClient:
         headers: Callable[[str | None], dict[str, str]],
         **kwargs: Any,
     ) -> httpx.Response:
-        h = headers(self._nonce.value)
-        resp = await self._http.request(method, path, headers=h, **kwargs)
-        if self.dpop_key is not None and self._nonce.update(resp):
+
+        async def send() -> httpx.Response:
             h = headers(self._nonce.value)
             resp = await self._http.request(method, path, headers=h, **kwargs)
-            self._nonce.update(resp)
-        return resp
+            if self.dpop_key is not None and self._nonce.update(resp):
+                h = headers(self._nonce.value)
+                resp = await self._http.request(method, path, headers=h, **kwargs)
+                self._nonce.update(resp)
+            return resp
+
+        return await self._retrying(send)
+
+    async def _retrying(self, send: Callable[[], Awaitable[httpx.Response]]) -> httpx.Response:
+        """:meth:`Client._retrying`."""
+        retries = 0
+        while True:
+            resp = await send()
+            wait = self._retry.delay(resp, retries)
+            if wait is None:
+                return resp
+            await resp.aclose()
+            await _retry.asleep(wait)
+            retries += 1
 
     def _auth(
         self, token: str, path: str, method: str = "POST"
@@ -686,17 +752,28 @@ class AsyncClient:
             h = headers(self._nonce.value)
             req = self._http.build_request("POST", path, headers=h, json=body)
             resp = await self._http.send(req, stream=True)
-            if resp.status_code in (400, 401):
-                await resp.aread()  # small; NonceCache looks in it for use_dpop_nonce
+            if resp.status_code in (400, 401, 429, 503):
+                await resp.aread()  # small; NonceCache and RetryPolicy look in it
             return resp
 
-        expires = Deadline(deadline)
-        resp = await send()
-        try:
+        async def first() -> httpx.Response:
+            resp = await send()
             if self.dpop_key is not None and self._nonce.update(resp):
                 await resp.aclose()
                 resp = await send()
                 self._nonce.update(resp)
+            return resp
+
+        expires = Deadline(deadline)
+        retries = 0
+        resp = await first()
+        # A load refusal is retried here, before anything of the stream has been yielded.
+        while (wait := self._retry.delay(resp, retries, expires.left())) is not None:
+            await resp.aclose()
+            await _retry.asleep(wait)
+            retries += 1
+            resp = await first()
+        try:
             stream = CallStream(resp, request_id, max_event_bytes)
             if not (stream.sse and resp.is_success):
                 data = bytearray()
@@ -791,9 +868,8 @@ class AsyncClient:
 
     async def _decide(self, approval_id: str, id_token: str, decision: str) -> w.Approval:
         path = f"/approvals/{w.path_segment(approval_id, 'approval_id')}"
-        resp = await self._http.post(
-            path, headers=w.id_token_headers(id_token), json=w.approval_decision_body(decision)
-        )
+        h, body = w.id_token_headers(id_token), w.approval_decision_body(decision)
+        resp = await self._retrying(lambda: self._http.post(path, headers=h, json=body))
         return w.approval_from_json(w.json_body(resp))
 
     async def authzen_evaluate(
@@ -823,11 +899,12 @@ class AsyncClient:
         return w.authzen_batch_from_response(w.json_body(resp))
 
     async def authzen_configuration(self) -> w.AuthzenConfiguration:
-        resp = await self._http.get("/.well-known/authzen-configuration")
+        resp = await self._retrying(lambda: self._http.get("/.well-known/authzen-configuration"))
         return w.authzen_configuration_from_json(w.json_body(resp))
 
     async def jwks(self) -> dict[str, Any]:
-        body = w.json_body(await self._http.get("/.well-known/jwks.json"))
+        resp = await self._retrying(lambda: self._http.get("/.well-known/jwks.json"))
+        body = w.json_body(resp)
         return body if isinstance(body, dict) else {}
 
     async def inspect(
