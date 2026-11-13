@@ -8,7 +8,7 @@
 import {
   h, append, replace, link, mono, time, leaseState, leaseStatePill, empty, loading, kv, table,
 } from './dom.js';
-import { api, qs, showNotice } from './api.js';
+import { api, qs, showNotice, needsRole } from './api.js';
 
 const CONFIRM_CHARS = 6;
 // Ids of each list a selector preview shows; the counts are always complete.
@@ -35,30 +35,30 @@ export async function leaseView(root, leaseId) {
 function render(root, leaseId, tree) {
   const self = tree.nodes[0];
   const done = () => reload(root, leaseId);
-  const revokeBtn = h('button', {
+  const revokeBtn = needsRole(h('button', {
     type: 'button', class: 'danger', disabled: tree.would_revoke === 0,
     title: tree.would_revoke === 0 ? 'Nothing left to revoke in this subtree' : null,
     on: { click: () => openRevoke(leaseId, tree, done) },
-  }, 'Revoke…');
+  }, 'Revoke…'), 'operator');
   // An older server sends no chain_id; the tree's root is the same lease.
   const chainId = self.chain_id ?? tree.root;
-  const chainBtn = h('button', {
+  const chainBtn = needsRole(h('button', {
     type: 'button', class: 'danger', title: `Revoke every lease of the chain ${chainId}`,
     on: { click: () => openSelectorRevoke({ chain_id: chainId }, done) },
-  }, 'Revoke chain…');
+  }, 'Revoke chain…'), 'operator');
   // Only a lease whose originating user was recorded at issue gets the user action; leases
   // registered before the server kept subjects have none. The subject is caller-controlled
   // text: it only ever becomes text nodes and attribute values (h() never parses HTML).
   const subject = typeof self.subject === 'string' && self.subject !== '' ? self.subject : null;
-  const userBtn = subject !== null ? h('button', {
+  const userBtn = subject !== null ? needsRole(h('button', {
     type: 'button', class: 'danger', title: `Revoke every lease issued for ${subject}`,
     on: { click: () => openSelectorRevoke({ user: subject }, done) },
-  }, `Revoke all for ${clip(subject)}…`) : null;
+  }, `Revoke all for ${clip(subject)}…`), 'operator') : null;
   // Not tied to this lease: the session id is typed in, and may resolve to any chain.
-  const sessionBtn = h('button', {
+  const sessionBtn = needsRole(h('button', {
     type: 'button', class: 'danger', title: 'Revoke the chains that opened an MCP session, by its Mcp-Session-Id',
     on: { click: () => openSessionRevoke(done) },
-  }, 'Revoke by session…');
+  }, 'Revoke by session…'), 'operator');
 
   replace(root,
     h('section', { class: 'panel', 'aria-labelledby': 'lease-title' },
