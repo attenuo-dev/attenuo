@@ -482,67 +482,8 @@ async fn an_operator_token_stops_working_at_its_expiry() {
     assert_eq!(v["code"], "invalid_token");
 }
 
-/// A `MakeWriter` that keeps what is logged.
-#[derive(Clone, Default)]
-struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-impl std::io::Write for Captured {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
-    type Writer = Captured;
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
-    }
-}
-
-/// An entry that has already expired when the server starts does not stop it: a warning
-/// names the operator, and its token is refused as expired.
-#[tokio::test]
-async fn an_expired_entry_at_startup_warns_and_does_not_authenticate() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = write_config(
-        dir.path(),
-        Some(LEGACY),
-        &(entry("old", "old-token", "admin", Some("2020-01-01T00:00:00Z"))
-            + &entry("ada", "ada-token", "admin", None)),
-    );
-    let cfg = Config::load(&path).unwrap();
-    let logs = Captured::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(logs.clone())
-        .with_ansi(false)
-        .with_max_level(tracing::Level::WARN)
-        .finish();
-    let (router, _state) =
-        tracing::subscriber::with_default(subscriber, || attenuo_server::build(&cfg)).unwrap();
-    let logged = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
-    let line = logged
-        .lines()
-        .find(|l| l.contains("expired"))
-        .unwrap_or_else(|| panic!("no warning: {logged}"));
-    assert!(line.contains("WARN"), "{line}");
-    assert!(line.contains("`old`"), "{line}");
-    assert!(line.contains("2020-01-01T00:00:00Z"), "{line}");
-    assert!(!logged.contains("ada"), "{logged}");
-
-    let server = spawn_router(router).await.unwrap();
-    let client = reqwest::Client::new();
-    let (status, v) = whoami(&client, &server.url(""), "old-token").await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
-    assert_eq!(v["code"], "admin_credential_expired");
-    assert_eq!(
-        whoami(&client, &server.url(""), "ada-token").await.0,
-        StatusCode::OK
-    );
-}
+// The warning for an entry that has already expired at startup is checked in
+// `admin_operator_expired_at_startup.rs`, a test binary of its own: see there for why.
 
 /// An `expires_at` that is not an RFC 3339 time with an offset refuses the file, naming the
 /// key; so does it at a reload (below).
