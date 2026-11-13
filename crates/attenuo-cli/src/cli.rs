@@ -20,6 +20,12 @@ pub(crate) struct Cli {
     #[arg(long, visible_alias = "url", env = "ATTENUO_SERVER", default_value = DEFAULT_SERVER)]
     pub server: String,
 
+    /// Base URL of the server's admin API, for a server with `[admin] listen`. Every request
+    /// to `/admin/*` goes here; every other request (tokens, AuthZEN, the proxy, `health`,
+    /// the JWKS) still goes to `--server`. Unset or empty, `/admin/*` goes to `--server` too.
+    #[arg(long, global = true, env = "ATTENUO_ADMIN_SERVER", value_name = "URL")]
+    pub admin_server: Option<String>,
+
     /// Bearer token for `/admin/*` (token root, lease, audit, policy). Without this flag,
     /// `--admin-token-stdin` or `--admin-token-file`, the `ATTENUO_ADMIN_TOKEN` environment
     /// variable is used.
@@ -1659,6 +1665,7 @@ mod tests {
         let cli = parse(&["audit", "tail", "-n", "5", "-f", "--json"]).unwrap();
         assert!(cli.json);
         assert_eq!(cli.server, DEFAULT_SERVER);
+        assert_eq!(cli.admin_server, None);
         let Command::Audit(AuditCmd::Tail { lines, follow, .. }) = cli.command else {
             panic!("not tail")
         };

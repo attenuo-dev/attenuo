@@ -124,7 +124,9 @@ async fn run(cli: Cli) -> Result<Outcome> {
         secrets::ADMIN_TOKEN_ENV,
         &mut stdin,
     )?;
-    let client = Client::new(&cli.server, admin_token);
+    // An empty `ATTENUO_ADMIN_SERVER` (a compose file's `${VAR:-}`) counts as unset.
+    let admin_server = cli.admin_server.as_deref().filter(|s| !s.is_empty());
+    let client = Client::new(&cli.server, admin_server, admin_token);
     match cli.command {
         Command::Token(TokenCmd::Inspect(args)) => inspect(client.ok(), args, json).await,
         Command::Health(a) => health(&client?, &a, json).await,
@@ -1640,7 +1642,7 @@ mod tests {
 
     #[test]
     fn server_name_instead_of_url_is_explained() {
-        let err = Client::new("github", None).err().unwrap().to_string();
+        let err = Client::new("github", None, None).err().unwrap().to_string();
         assert!(err.contains("base URL"), "{err}");
     }
 }
