@@ -21,7 +21,8 @@
 //! agent's entry holds), an `actor_token` (`"actor_token"`), or either (`"either"`, the
 //! default; when both are sent, both are checked and must name the same agent). A method the
 //! mode does not accept is refused (`actor_token_not_accepted`, `client_auth_not_accepted`),
-//! and with `"actor_token"` and no token the request fails with `actor_token_required`. Hop 0
+//! and with `"actor_token"` and no token the request fails with 401 `invalid_client` /
+//! `actor_token_required`. Hop 0
 //! always needs an authenticated agent: `[token] require_actor_auth` does not apply. The agent
 //! an actor token maps to must equal `actor` and `client_id` when the request names them
 //! (`actor_mismatch`), and is the agent `[[root_grants]]` and the IdP's `client_ids` are looked
@@ -29,7 +30,7 @@
 //!
 //! Steps, in order: check and verify the actor token, if any (`invalid_request` with
 //! `actor_token_*` sub-codes); authenticate the agent (`invalid_client`, 401, for client
-//! credentials); check `actor` and that capabilities were requested (`invalid_request`); verify
+//! credentials, or for no credential at all); check `actor` and that capabilities were requested (`invalid_request`); verify
 //! the credential ([`IdpRegistry::verify`](super::IdpRegistry::verify), `invalid_grant`); for
 //! an ID-JAG, require its `client_id` to be the authenticated agent and, when it has a
 //! `cnf.jkt`, a DPoP proof by that key (`credential_pop_required`, `credential_pop_mismatch`);
@@ -453,10 +454,12 @@ fn authenticate_agent(
             }
         }
         None if mode == ActorAuth::ActorToken => {
-            return Err(invalid_request(
+            // No credential at all: `invalid_client` (RFC 6749 §5.2; -06 §4.4 for an ID-JAG),
+            // decided before any agent is looked up (SR-110).
+            return Err(clientauth::invalid_client(
                 "actor_token_required",
                 format!("an actor_token (actor_token_type `{ACTOR_TOKEN_TYPE}`) is required"),
-            ))
+            ));
         }
         None => {
             let client = authenticate_client(agents, headers, req, assertion, now)?;

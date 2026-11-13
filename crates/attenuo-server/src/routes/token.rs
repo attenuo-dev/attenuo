@@ -42,7 +42,7 @@
 //!
 //! When both are sent, both are checked. A method `actor_auth` does not accept is refused
 //! (`actor_token_not_accepted`, `client_auth_not_accepted`); with `actor_auth = "actor_token"`
-//! and no token, `actor_token_required`. So an agent can only receive a delegation in its own
+//! and no token, 401 `invalid_client` / `actor_token_required`. So an agent can only receive a delegation in its own
 //! name, and `principal` in Cedar and the agent in the audit log are authenticated, not
 //! asserted. A mismatch is 400 `invalid_request` / `actor_mismatch`. An `actor` that already
 //! appears in the parent chain is 400 `invalid_request` / `duplicate_actor`.
@@ -337,7 +337,10 @@ fn exchange_sync(
     }
     if presented || (state.require_actor_auth && actor.is_none()) {
         if state.actor_auth == ActorAuth::ActorToken {
-            return Err(clientauth::invalid_request(
+            // No credential at all: RFC 6749 §5.2 `invalid_client` ("no client authentication
+            // included"), decided before any agent is looked up, so it reads the same for a
+            // known and an unknown `actor` (SR-110).
+            return Err(clientauth::invalid_client(
                 "actor_token_required",
                 format!("an actor_token (actor_token_type `{ACTOR_TOKEN_TYPE}`) is required"),
             ));

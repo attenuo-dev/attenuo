@@ -443,6 +443,7 @@ Errors carry a stable `code` (the same value as `error_description`, which older
 | --- | --- |
 | `401 invalid_client` / `client_authentication_failed` | Wrong agent id or secret, or the hash in `[[agents]]` was made from a different string. Check for a trailing newline: use `printf %s`, not `echo` |
 | `401 invalid_client` / `no_agents_configured` | `[[agents]]` is empty |
+| `401 invalid_client` / `client_auth_missing`, `actor_token_required` | The request sent no credential at all; `actor_token_required` when `[token] actor_auth = "actor_token"`, where only an `actor_token` authenticates the agent |
 | `400 invalid_grant` / `untrusted_issuer` | `iss` is not in `[[idps]]`. Look for a trailing slash, `http` against `https`, or a tenant id mismatch |
 | `400 invalid_grant` / `credential_audience_mismatch` | An ID token's `aud` (or `azp`) does not name the presenting agent's client id: the token was issued to another client, or `client_ids` has no entry for this agent and the id differs from the agent id |
 | `400 invalid_grant` / `audience_mismatch` | An ID-JAG's `aud` is not `[issuer] issuer`, or is an array with more than one element |

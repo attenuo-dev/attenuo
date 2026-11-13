@@ -62,7 +62,7 @@ The table is generated from `attenuo_core::error_codes::ERROR_CODES`, the one pl
 | `actor_token_missing_kid` | 400 `invalid_request` |  |  | The actor token names no `kid`. |
 | `actor_token_not_accepted` | 400 `invalid_request` |  |  | `[token] actor_auth` does not accept actor tokens. |
 | `actor_token_not_yet_valid` | 400 `invalid_request` |  |  | The actor token is not valid yet. |
-| `actor_token_required` | 400 `invalid_request` |  |  | `[token] actor_auth` requires an actor token. |
+| `actor_token_required` | 401 `invalid_client` |  |  | `[token] actor_auth` requires an actor token. |
 | `actor_token_typ_mismatch` | 400 `invalid_request` |  |  | The actor token's `typ` header is not accepted. |
 | `actor_token_type_unsupported` | 400 `invalid_request` |  |  | `actor_token_type` is not `urn:ietf:params:oauth:token-type:jwt`. |
 | `actor_token_unknown_kid` | 400 `invalid_request` |  |  | The actor token's `kid` is not in its issuer's keys. |
@@ -233,6 +233,8 @@ An agent (on `POST /token`) or a PEP (on the AuthZEN endpoints) proves who it is
 - **Client assertion** (`private_key_jwt`, RFC 7523 §2.2). The body carries `client_assertion_type` = `urn:ietf:params:oauth:client-assertion-type:jwt-bearer` and `client_assertion`, a JWT the client signs with a private key whose public half is in the entry's `jwks`. `client_id` (or `pep_id`) may be sent too and must then equal the assertion's `sub`. The CLI makes one with `attenuo token exchange --client-key`, the SDKs with `DpopKey.client_assertion` / `clientAssertion`.
 
 A request uses one way only: Basic and a body credential, or a secret and an assertion, is 400 `invalid_request` / `multiple_client_auth` (RFC 6749 §2.3). Sending only one of the two assertion fields is `malformed_request`; another `client_assertion_type` is 400 `client_assertion_type_unsupported`.
+
+A request with no credential at all (no secret, no assertion, and at `POST /token` no `actor_token`) is 401 `invalid_client` (RFC 6749 §5.2), with `WWW-Authenticate: Basic realm="attenuo"`: `client_auth_missing`, or `actor_token_required` when `[token] actor_auth = "actor_token"`. Both are decided before any agent or PEP is looked up, so the answer is the same for a known and an unknown client id or `actor` (SR-110).
 
 An assertion is accepted when all of this holds, checked in this order:
 
