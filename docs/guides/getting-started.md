@@ -178,6 +178,9 @@ user alice  (issuer https://idp.example)
         until 2026-10-22T22:29:20Z (in 14m 59s)
         lease c5e66077-7b36-43d2-8333-69d31b0e1e24
 
+iss http://127.0.0.1:8080   aud attenuo   jti 0f6a1a4e-5c0e-4a53-9d55-1f3d1c9b2b7e
+kid bjV6lpkuX53lv6qotD1Dsg   ou_kid bjV6lpkuX53lv6qotD1Dsg
+exp 2026-10-22T22:29:20Z (in 14m 59s)
 may_act (absent): any authenticated agent may exchange this token
 verified: signature, type, issuer, audience, expiry, chain
 ```
@@ -193,8 +196,9 @@ attenuo call --upstream github --tool read_file --arg repo=acme/api --arg path=R
 ```
 
 ```text
+read_file            fake tool read_file
 ALLOWED
-{"name":"read_file","arguments":{"repo":"acme/api","path":"README.md"}}
+{"arguments":{"path":"README.md","repo":"acme/api"},"name":"read_file"}
 ```
 
 `tools` lists only the tools the token may call. The call went through the whole pipeline: token check, lease check, capability check, Cedar policy, audit append, then the upstream.
@@ -223,8 +227,10 @@ curl -s -X POST http://127.0.0.1:8080/mcp/github \
 ```
 
 ```json
-{"jsonrpc":"2.0","id":2,"error":{"code":-32003,"message":"attenuo: denied: capability_denied","data":{"reason":"capability_denied","decision_id":"98849dc3-f053-4649-9b1a-fae0c2f11426"}}}
+{"jsonrpc":"2.0","id":2,"error":{"code":-32003,"message":"attenuo: denied: capability_denied","data":{"reason":"capability_denied","decision_id":"98849dc3-f053-4649-9b1a-fae0c2f11426","untrusted_args":[{"arg":"repo","seq":5,"kind":"leaf"},{"arg":"repo","seq":5,"kind":"entity"}]}}}
 ```
+
+`untrusted_args` says that the `repo` argument copies text from an untrusted tool result of this run, audit entry 5: the fake server echoed `acme/api` back in its answer to the `read_file` call. Policies can act on that ([output labelling](../design/output-labelling.md)); here the capability check refused the call first.
 
 ## 8. Revoke
 
@@ -251,17 +257,20 @@ attenuo audit verify
 ```
 
 ```text
-#1  2026-10-22T22:14:20Z  ALLOW attenuo/token.root          planner for alice          reason=token_issued
-#2  2026-10-22T22:14:20Z  ALLOW attenuo/admin.root_token    by urn:attenuo:admin      reason=admin_action
-#3  2026-10-22T22:14:20Z  ALLOW attenuo/token.exchange      planner > coder for alice  reason=token_issued
-#4  2026-10-22T22:14:20Z  ALLOW github/read_file             planner > coder for alice  reason=policy_allow
-#5  2026-10-22T22:14:20Z  DENY  github/create_issue          planner > coder for alice  reason=capability_denied
-#6  2026-10-22T22:14:21Z  ALLOW attenuo/admin.lease.revoke  by urn:attenuo:admin      reason=admin_action
-#7  2026-10-22T22:14:21Z  DENY  github/read_file             planner > coder for alice  reason=lease_revoked
-audit chain OK: 7 entries verified
+#1    2026-10-22T22:14:20Z  ALLOW attenuo/token.root  planner for alice  reason=token_issued  id=ee0f...
+#2    2026-10-22T22:14:20Z  ALLOW attenuo/admin.root_token  by urn:attenuo:admin  reason=admin_action  id=7c60...
+#3    2026-10-22T22:14:20Z  ALLOW attenuo/token.exchange  planner > coder for alice  reason=token_issued  id=b574...
+#4    2026-10-22T22:14:20Z  ALLOW github/read_file  planner > coder for alice  reason=policy_allow  id=38df...
+#5    2026-10-22T22:14:20Z  tool_result  github/read_file  planner > coder for alice  decision=38df...  label=untrusted size=140  id=6805...
+#6    2026-10-22T22:14:20Z  DENY  github/create_issue  planner > coder for alice  reason=capability_denied  id=b662...
+#7    2026-10-22T22:14:20Z  DENY  github/create_issue  planner > coder for alice  reason=capability_denied  id=54ea...
+#8    2026-10-22T22:14:21Z  ALLOW attenuo/admin.lease.revoke  by urn:attenuo:admin  reason=admin_action  id=ae49...
+#9    2026-10-22T22:14:21Z  DENY  github/read_file  planner > coder for alice  reason=lease_revoked  id=89ef...
+audit chain OK: 9 entries verified
+checkpoints: none signed yet
 ```
 
-Timestamps and ids are shortened here. Every row names the agents and the user separately, and admin actions (the development root mint, the revocation) are recorded too. Each row also carries the hash of the row before it. `audit verify` walks the whole chain from the start and exits 1 if any row was changed, removed or reordered. The log stores a digest of the call arguments, not the arguments themselves. Use `audit tail --follow` to watch decisions as they happen.
+Timestamps and ids are shortened here. Every row names the agents and the user separately, and admin actions (the development root mint, the revocation) are recorded too. Entry 5 is the `tool_result` record of the allowed read (its size and label, not its content), and entries 6 and 7 are the two refused `create_issue` calls, from the CLI and from `curl`. Each row also carries the hash of the row before it. `audit verify` walks the whole chain from the start and exits 2 if any row was changed, removed or reordered. The log stores a digest of the call arguments, not the arguments themselves. Use `audit tail --follow` to watch decisions as they happen.
 
 The same data is available over HTTP:
 
