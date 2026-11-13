@@ -401,7 +401,7 @@ fn with_admin_hint(mut err: anyhow::Error) -> anyhow::Error {
 
 /// Did the server refuse a proof for want of its nonce (RFC 9449 §8)? A 401 with
 /// `WWW-Authenticate: DPoP error="use_dpop_nonce"` (attenuo's own routes), or a 400 or 401
-/// whose JSON `error` is `use_dpop_nonce`.
+/// whose JSON `code` or `error` is `use_dpop_nonce`.
 fn is_use_dpop_nonce(status: StatusCode, headers: &HeaderMap, body: &str) -> bool {
     if status != StatusCode::UNAUTHORIZED && status != StatusCode::BAD_REQUEST {
         return false;
@@ -413,7 +413,7 @@ fn is_use_dpop_nonce(status: StatusCode, headers: &HeaderMap, body: &str) -> boo
         .any(|v| v.contains(USE_DPOP_NONCE));
     challenged
         || serde_json::from_str::<Value>(body)
-            .is_ok_and(|v| v["error"].as_str() == Some(USE_DPOP_NONCE))
+            .is_ok_and(|v| stable_code(&v) == Some(USE_DPOP_NONCE))
 }
 
 /// A non-success answer from the server. Its text is `server answered <status>: <code>:
@@ -423,7 +423,9 @@ fn is_use_dpop_nonce(status: StatusCode, headers: &HeaderMap, body: &str) -> boo
 #[derive(Debug)]
 pub(crate) struct ApiError {
     pub status: StatusCode,
-    /// The JSON body's `error` code, when the body is `{"error": code, ...}`.
+    /// The answer's stable code, when the body is `{"error": ..., ...}`: its `code`, or for a
+    /// server that does not send one, its `error_description` sub-code or else its `error`
+    /// (see [`stable_code`]).
     pub code: Option<String>,
     /// The JSON body's `detail`, when it has a string one.
     pub detail: Option<String>,
@@ -438,16 +440,27 @@ impl std::fmt::Display for ApiError {
 
 impl std::error::Error for ApiError {}
 
-/// A server error as `{"error": code, "detail": text}`, or the raw body when it is not that.
+/// The stable code of a REST error body: `code`, or for a server that does not send one
+/// (before audit K-8), the `error_description` sub-code, or else `error`. Only the first is a
+/// documented machine field; the fallbacks keep the CLI working against an older server.
+pub(crate) fn stable_code(body: &Value) -> Option<&str> {
+    [&body["code"], &body["error_description"], &body["error"]]
+        .into_iter()
+        .find_map(|v| v.as_str().filter(|s| !s.is_empty()))
+}
+
+/// A server error as `{"error": error, "code": code, "detail": text}`, or the raw body when it
+/// is not that.
 pub(crate) fn api_error(status: StatusCode, body: &str) -> anyhow::Error {
     let mut detail = None;
     let (code, message) = match serde_json::from_str::<Value>(body) {
         Ok(v) if v["error"].is_string() => {
             detail = v["detail"].as_str().map(str::to_string);
-            let code = v["error"].as_str().unwrap_or_default().to_string();
+            let error = v["error"].as_str().unwrap_or_default();
+            let code = stable_code(&v).unwrap_or(error).to_string();
             // A refusal the server audited (a refused token exchange) names its record.
             let message = format!(
-                "server answered {status}: {code}{}{}",
+                "server answered {status}: {error}{}{}",
                 v["detail"]
                     .as_str()
                     .map(|d| format!(": {d}"))
@@ -549,6 +562,28 @@ mod tests {
             (StatusCode::NOT_FOUND, None)
         );
         assert_eq!(e.to_string(), "server answered 404 Not Found");
+        // K-8: `code` is the stable code; the message still names `error`.
+        let e = api_error(
+            StatusCode::UNAUTHORIZED,
+            r#"{"error":"unauthorized","code":"token_expired","detail":"token_expired","error_description":"token_expired"}"#,
+        );
+        let api = e.downcast_ref::<ApiError>().unwrap();
+        assert_eq!(api.code.as_deref(), Some("token_expired"));
+        assert_eq!(
+            e.to_string(),
+            "server answered 401 Unauthorized: unauthorized: token_expired"
+        );
+        // A server without `code`: the sub-code, else `error`.
+        let sub =
+            r#"{"error":"temporarily_unavailable","detail":"x","error_description":"overloaded"}"#;
+        let e = api_error(StatusCode::SERVICE_UNAVAILABLE, sub);
+        let api = e.downcast_ref::<ApiError>().unwrap();
+        assert_eq!(api.code.as_deref(), Some("overloaded"));
+        // `code` wins over the deprecated `error_description`.
+        let both = r#"{"error":"invalid_grant","code":"replayed","error_description":"other"}"#;
+        let e = api_error(StatusCode::BAD_REQUEST, both);
+        let api = e.downcast_ref::<ApiError>().unwrap();
+        assert_eq!(api.code.as_deref(), Some("replayed"));
     }
 
     #[test]
@@ -570,6 +605,11 @@ mod tests {
             unauthorized,
             &none,
             r#"{"error":"use_dpop_nonce","detail":"x"}"#
+        ));
+        assert!(is_use_dpop_nonce(
+            unauthorized,
+            &none,
+            r#"{"error":"use_dpop_nonce","code":"use_dpop_nonce","detail":"x"}"#
         ));
         // Other refusals, other statuses and non-JSON bodies are not nonce requests.
         assert!(!is_use_dpop_nonce(
