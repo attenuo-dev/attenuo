@@ -24,8 +24,8 @@ use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
 use attenuo_audit::{
-    AuditSink, Durability, LeaseStore, RunLabel, SqliteAudit, SqliteLeaseStore,
-    DEFAULT_WAL_CHECKPOINT_INTERVAL,
+    AuditSink, Durability, LeaseRegistry, RunLabel, RunLimits, RunState, SqliteAudit,
+    SqliteLeaseStore, DEFAULT_WAL_CHECKPOINT_INTERVAL,
 };
 use attenuo_core::{Charge, Decision, LeaseId, LimitKind};
 use common::{chain, record_for};

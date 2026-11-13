@@ -50,7 +50,7 @@ use std::hint::black_box;
 use std::sync::Arc;
 
 use attenuo_audit::{
-    AuditSink, Durability, LeaseStore, SqliteAudit, SqliteLeaseStore,
+    AuditSink, Durability, LeaseStore, RunLimits, SqliteAudit, SqliteLeaseStore,
     DEFAULT_WAL_CHECKPOINT_INTERVAL,
 };
 use attenuo_core::limits::{charges_for, usage_charges, ArgLimit, Derive, Limits};

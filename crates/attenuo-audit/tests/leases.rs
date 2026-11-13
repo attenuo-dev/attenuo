@@ -4,8 +4,9 @@
 mod common;
 
 use attenuo_audit::{
-    AuditError, AuditSink, LeaseNode, LeasePrune, LeaseSelector, LeaseStatus, LeaseStore,
-    LeaseSubtree, MemoryLeaseStore, SessionBinding, SqliteAudit, SqliteLeaseStore,
+    AuditError, AuditSink, LeaseNode, LeasePrune, LeaseRegistry, LeaseSelector, LeaseStatus,
+    LeaseStore, LeaseSubtree, MemoryLeaseStore, RunState, SessionBinding, SqliteAudit,
+    SqliteLeaseStore,
 };
 use attenuo_core::LeaseId;
 use attenuo_core::{Decision, DelegationChain, RecordKind};

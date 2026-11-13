@@ -360,7 +360,7 @@ impl DelegationChain {
     /// issued). `prefix_digest(depth - 1)` equals [`digest`](Self::digest). `None` when `index`
     /// is out of range.
     ///
-    /// The issuer records this per lease (`LeaseStore::bind`), so a chain received without its
+    /// The issuer records this per lease (`LeaseRegistry::bind`), so a chain received without its
     /// signature can be matched hop by hop against what was actually issued.
     pub fn prefix_digest(&self, index: usize) -> Option<String> {
         if index >= self.hops.len() {

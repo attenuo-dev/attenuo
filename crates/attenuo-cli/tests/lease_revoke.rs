@@ -7,7 +7,7 @@ mod common;
 
 use std::process::{Command, Output};
 
-use attenuo_audit::LeaseStore;
+use attenuo_audit::RunState;
 use attenuo_core::LeaseId;
 use attenuo_proxy::session::{session_digest, session_tag};
 use attenuo_proxy::testing::spawn_router;

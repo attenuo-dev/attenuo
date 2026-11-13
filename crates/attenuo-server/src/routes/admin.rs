@@ -7,8 +7,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use attenuo_audit::{
-    AuditEntry, AuditError, AuditSink, EntryFilter, LeaseNode, LeaseSelector, LeaseStore, Order,
-    SelectorRevocation, SignedVerifyReport,
+    AuditEntry, AuditError, AuditSink, EntryFilter, LeaseNode, LeaseRegistry, LeaseSelector, Order,
+    RunLimits, RunState, SelectorRevocation, SignedVerifyReport,
 };
 use attenuo_core::{AgentId, LeaseId, RecordKind};
 use axum::body::Bytes;
@@ -283,7 +283,7 @@ fn selector_response(
 ///   lease with a parent is not a chain id and matches nothing.
 /// - `session` takes a raw MCP session id, hashes it ([`session_digest`]) and matches, as
 ///   `chain_id` would, the chain of each caller that opened the session through the proxy
-///   (`LeaseStore::record_session`, written when the proxy binds a new session for a verified
+///   (`RunState::record_session`, written when the proxy binds a new session for a verified
 ///   token). The response's `selector` is `{session_tag, chain_ids}`: the session's audit
 ///   tag and the resolved chains, never the id. A session the server never recorded (unknown,
 ///   or opened before this route existed) resolves to no chain and matches nothing.
@@ -571,7 +571,7 @@ pub struct TreeQuery {
 ///
 /// Each node carries its registry row, whether it is active now, `chain_id` (the chain's
 /// first-hop lease, the same as `root`; the selector `POST /admin/leases/revoke` takes),
-/// `subject` (the originating user recorded at issue, [`LeaseStore::subject`], read for all
+/// `subject` (the originating user recorded at issue, [`LeaseRegistry::subject`], read for all
 /// nodes in one store call; null for a lease registered before subjects were recorded),
 /// `agent`, `issued_at` and `issued_seq` from the audit record that issued it (null when none
 /// is found), and `budget`, the hop's run limits and what is left of them (see `hop_budget`;
@@ -667,7 +667,7 @@ pub async fn lease_tree(
 ///   amount, destinations}`.
 ///
 /// Read only; value hashes are never shown.
-fn hop_budget(leases: &dyn attenuo_audit::LeaseStore, lease: &LeaseId) -> Result<Value, ApiError> {
+fn hop_budget(leases: &dyn RunLimits, lease: &LeaseId) -> Result<Value, ApiError> {
     let recorded = leases.hop_limits(lease)?;
     let counters = leases.budget_summary(lease)?;
     if recorded.is_none() && counters.is_empty() {

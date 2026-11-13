@@ -5,8 +5,8 @@
 mod common;
 
 use attenuo_audit::{
-    Approval, ApprovalLabel, ApprovalMethod, ApprovalState, Approver, AuditError, LeaseStore,
-    MemoryLeaseStore, SqliteLeaseStore, MAX_PENDING_APPROVALS_PER_RUN,
+    Approval, ApprovalLabel, ApprovalMethod, ApprovalState, ApprovalStore, Approver, AuditError,
+    LeaseStore, MemoryLeaseStore, SqliteLeaseStore, MAX_PENDING_APPROVALS_PER_RUN,
 };
 use attenuo_core::{LeaseId, UntrustedArg, UntrustedKind};
 use common::{chain, t0};

@@ -16,7 +16,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use attenuo_audit::LeaseStore;
+use attenuo_audit::LeaseRegistry;
 use attenuo_core::{AgentId, CapabilitySet, OriginatingUser};
 use attenuo_token::{ExchangeResponse, IssueOptions, MayAct};
 use axum::extract::State;

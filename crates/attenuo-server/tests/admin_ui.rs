@@ -828,7 +828,7 @@ async fn selector_revocation_works_on_the_console_with_allow_write() {
 /// there, and with `allow_write` it revokes the chain. The raw id is never echoed back.
 #[tokio::test]
 async fn session_revocation_on_the_console_previews_without_allow_write_and_revokes_with_it() {
-    use attenuo_audit::LeaseStore;
+    use attenuo_audit::RunState;
     use attenuo_proxy::session::{session_digest, session_tag};
 
     const RAW: &str = "console-raw-session-id";

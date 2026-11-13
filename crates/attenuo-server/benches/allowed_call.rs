@@ -17,7 +17,8 @@ use std::sync::Arc;
 use std::time::{Duration as StdDuration, Instant};
 
 use attenuo_audit::{
-    Durability, LeaseStore, SqliteAudit, SqliteLeaseStore, DEFAULT_WAL_CHECKPOINT_INTERVAL,
+    ApprovalStore, Durability, LeaseStore, SqliteAudit, SqliteLeaseStore,
+    DEFAULT_WAL_CHECKPOINT_INTERVAL,
 };
 use attenuo_core::{AgentId, Capability, CapabilitySet, OriginatingUser, ToolCall};
 use attenuo_policy::{ArgType, PolicyEngineBuilder, ToolAttrs, ToolCatalog};

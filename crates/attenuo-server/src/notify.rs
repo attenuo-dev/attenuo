@@ -50,7 +50,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
 use attenuo_audit::{
-    Approval, ApprovalState, LeaseStore, NewNotice, OutboxNotice, SqliteLeaseStore,
+    Approval, ApprovalState, ApprovalStore, NewNotice, OutboxNotice, SqliteLeaseStore,
 };
 use attenuo_core::Clock;
 use serde_json::{json, Value};
@@ -924,7 +924,7 @@ fn prune_outbox(emit: &Emitter, retention: Duration) {
 /// The expiry watcher: queue `approval.expired` for each watched approval still pending once
 /// its expiry has passed, and prune the outbox every [`OUTBOX_PRUNE_PERIOD`].
 fn watch_expiry(watch: &Watch, emit: &Emitter, retention: Duration) {
-    let leases: &dyn LeaseStore = emit.store.as_ref();
+    let leases: &dyn ApprovalStore = emit.store.as_ref();
     let metrics = &emit.metrics;
     let clock = &emit.clock;
     let mut prune_at = clock.now();

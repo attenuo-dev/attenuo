@@ -68,7 +68,7 @@ CREATE TABLE IF NOT EXISTS lease_bindings (
     id      TEXT PRIMARY KEY,
     binding TEXT NOT NULL
 );
--- The originating user's subject of each lease (`LeaseStore::record_subject`), for revoking
+-- The originating user's subject of each lease (`LeaseRegistry::record_subject`), for revoking
 -- every lease of one user. Added to a pre-versioning store when it is adopted; a lease
 -- registered before then has no row and is not matched by a subject.
 CREATE TABLE IF NOT EXISTS lease_subjects (
@@ -77,7 +77,7 @@ CREATE TABLE IF NOT EXISTS lease_subjects (
 );
 CREATE INDEX IF NOT EXISTS lease_subjects_subject_idx ON lease_subjects(subject);
 -- MCP sessions opened through the proxy and the chain that opened each
--- (`LeaseStore::record_session`), for revoking by session. `session` is the SHA-256 of the
+-- (`RunState::record_session`), for revoking by session. `session` is the SHA-256 of the
 -- `Mcp-Session-Id` in hex, never the id. Write-once per (session, server). Added to a
 -- pre-versioning store when it is adopted; a session opened before then has no row and
 -- matches nothing.

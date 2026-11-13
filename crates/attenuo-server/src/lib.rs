@@ -380,7 +380,7 @@ pub async fn prune_session_bindings(state: &Arc<AppState>) -> u64 {
         state,
         "session bindings",
         move |s, now| {
-            use attenuo_audit::LeaseStore;
+            use attenuo_audit::StoreRetention;
             let batch = s.lease_maintenance.batch_rows;
             let p = s.leases.prune_sessions(now, retention, batch)?;
             Ok((p.pruned, p.wrapped))
@@ -394,7 +394,7 @@ pub async fn prune_session_bindings(state: &Arc<AppState>) -> u64 {
 }
 
 /// One run of lease retention (`[leases] retention_seconds`): passes of
-/// [`LeaseStore::prune_leases`](attenuo_audit::LeaseStore::prune_leases) over
+/// [`StoreRetention::prune_leases`](attenuo_audit::StoreRetention::prune_leases) over
 /// `maintenance_batch_rows` lease rows each (looked at, read to decide a run, or deleted),
 /// bounded like [`prune_session_bindings`]. A lease tree goes whole once every lease in it
 /// ended (revoked or expired) longer ago than the retention, with its subjects and bindings;
@@ -409,7 +409,7 @@ pub async fn prune_lease_registry(state: &Arc<AppState>) -> u64 {
         state,
         "leases",
         move |s, now| {
-            use attenuo_audit::LeaseStore;
+            use attenuo_audit::StoreRetention;
             let batch = s.lease_maintenance.batch_rows;
             let p = s.leases.prune_leases(now, retention, batch)?;
             Ok((p.pruned, p.wrapped))
@@ -423,7 +423,7 @@ pub async fn prune_lease_registry(state: &Arc<AppState>) -> u64 {
 }
 
 /// One run of run-state retention (`[leases] run_state_retention_seconds`): passes of
-/// [`LeaseStore::prune_run_state`](attenuo_audit::LeaseStore::prune_run_state) over
+/// [`StoreRetention::prune_run_state`](attenuo_audit::StoreRetention::prune_run_state) over
 /// `maintenance_batch_rows` rows each, bounded like [`prune_session_bindings`]. Run-limit
 /// counters, the charge log and approvals go once the leases they belong to are gone from the
 /// registry and they are older than the retention; nothing of a lease still in the registry
@@ -437,7 +437,7 @@ pub async fn prune_run_state(state: &Arc<AppState>) -> u64 {
         state,
         "run-limit counters, charges and approvals",
         move |s, now| {
-            use attenuo_audit::LeaseStore;
+            use attenuo_audit::StoreRetention;
             let batch = s.lease_maintenance.batch_rows;
             let p = s.leases.prune_run_state(now, retention, batch)?;
             Ok((p, p.wrapped))
@@ -452,7 +452,7 @@ pub async fn prune_run_state(state: &Arc<AppState>) -> u64 {
 
 /// One run of per-user window retention (`[leases] user_window_retention_seconds`, run limits
 /// phase 3): passes of
-/// [`LeaseStore::prune_user_windows`](attenuo_audit::LeaseStore::prune_user_windows), bounded
+/// [`StoreRetention::prune_user_windows`](attenuo_audit::StoreRetention::prune_user_windows), bounded
 /// like [`prune_run_state`]. A window and its charges go once the window ended longer ago than
 /// the retention; an open window is never touched. Counts what it deleted in
 /// `run_state_pruned_total{kind="user_window"}` and returns it; 0 when retention is off.
@@ -464,7 +464,7 @@ pub async fn prune_user_windows(state: &Arc<AppState>) -> u64 {
         state,
         "per-user windows",
         move |s, now| {
-            use attenuo_audit::LeaseStore;
+            use attenuo_audit::StoreRetention;
             let batch = s.lease_maintenance.batch_rows;
             let p = s.leases.prune_user_windows(now, retention, batch)?;
             Ok((p, p.wrapped))
@@ -1015,7 +1015,7 @@ mod shutdown_tests {
 #[cfg(test)]
 mod maintenance_tests {
     use super::*;
-    use attenuo_audit::LeaseStore;
+    use attenuo_audit::LeaseRegistry;
     use attenuo_core::LeaseId;
 
     /// A server on an in-memory store with a lease retention of 1 s, the given

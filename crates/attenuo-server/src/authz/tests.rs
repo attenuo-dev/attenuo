@@ -1,7 +1,6 @@
 use super::authorizer::VerifiedTokens;
 use super::*;
-use attenuo_audit::LeaseStore;
-use attenuo_audit::{MemoryAudit, MemoryLeaseStore};
+use attenuo_audit::{LeaseRegistry, MemoryAudit, MemoryLeaseStore};
 use attenuo_core::{AgentId, Capability, CapabilitySet, LeaseId, OriginatingUser};
 use attenuo_core::{Decision, DelegationChain, ToolCall};
 use attenuo_policy::PolicyEngineBuilder;

@@ -47,7 +47,7 @@ pub(super) fn window_in(conn: &Connection, key: &WindowKey) -> Result<u64, Audit
         .map_err(|_| AuditError::Storage(format!("window counter {used} is negative")))
 }
 
-/// [`LeaseStore::charge_windowed`](crate::lease::LeaseStore::charge_windowed) in one
+/// [`RunLimits::charge_windowed`](crate::lease::RunLimits::charge_windowed) in one
 /// `IMMEDIATE` transaction: the re-check and the writes see the same counters, and a
 /// concurrent charge waits for this one to commit. Window charges are written only once every
 /// limit fits, in the same transaction.
@@ -138,7 +138,7 @@ fn charge_in(
     })
 }
 
-/// [`LeaseStore::refund`](crate::lease::LeaseStore::refund) in one `IMMEDIATE` transaction. The value rows of a `distinct` limit
+/// [`RunLimits::refund`](crate::lease::RunLimits::refund) in one `IMMEDIATE` transaction. The value rows of a `distinct` limit
 /// are freed only when no other unrefunded decision logged them (SR-62); every other counter
 /// gets back what the decision logged.
 pub(super) fn refund_in(
@@ -267,7 +267,7 @@ pub(super) fn refund_in(
         .execute(params![lease, cap, kind, arg, value, to_i64(total)?])?;
     }
     tx.commit()?;
-    // Token-limit counters only (see `LeaseStore::refund`).
+    // Token-limit counters only (see `RunLimits::refund`).
     Ok(u64::try_from(limits).unwrap_or(0) + freed)
 }
 
@@ -315,7 +315,7 @@ fn refund_windows_in(
     Ok(())
 }
 
-/// [`LeaseStore::prune_user_windows`](crate::lease::LeaseStore::prune_user_windows) in one
+/// [`StoreRetention::prune_user_windows`](crate::lease::StoreRetention::prune_user_windows) in one
 /// `IMMEDIATE` transaction: up to `max_rows` window counters whose window ended more than
 /// `retention` ago, then the charges logged against windows that old (at most `max_rows`).
 pub(super) fn prune_windows_in(
@@ -357,7 +357,7 @@ pub(super) fn prune_windows_in(
 }
 
 impl SqliteLeaseStore {
-    /// [`LeaseStore::charge`](crate::lease::LeaseStore::charge), or with `defer` [`LeaseStore::charge_sync_deferred`](crate::lease::LeaseStore::charge_sync_deferred).
+    /// [`RunLimits::charge`](crate::lease::RunLimits::charge), or with `defer` [`RunLimits::charge_sync_deferred`](crate::lease::RunLimits::charge_sync_deferred).
     pub(super) fn charge_with(
         &self,
         decision_id: &str,

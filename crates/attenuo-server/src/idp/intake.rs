@@ -38,7 +38,7 @@
 //! as `token.root` / `token_issued`, with `agent_auth` and the actor token's subject and trust
 //! entry in the record's arguments.
 
-use attenuo_audit::LeaseStore;
+use attenuo_audit::LeaseRegistry;
 use attenuo_core::{AgentId, CapabilitySet};
 use attenuo_token::{ExchangeResponse, AUTHORIZATION_DETAILS_TYPE, TOKEN_EXCHANGE_GRANT_TYPE};
 use axum::http::HeaderMap;

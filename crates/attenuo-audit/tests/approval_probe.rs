@@ -9,7 +9,8 @@ mod common;
 use std::sync::{Arc, Barrier};
 
 use attenuo_audit::{
-    Approval, ApprovalMethod, ApprovalState, Approver, Durability, LeaseStore, SqliteLeaseStore,
+    Approval, ApprovalMethod, ApprovalState, ApprovalStore, Approver, Durability, LeaseRegistry,
+    LeaseStore, SqliteLeaseStore,
 };
 use attenuo_core::LeaseId;
 use common::{chain, t0};
