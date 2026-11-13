@@ -356,8 +356,33 @@ pub(crate) fn render_entry_view(v: &Value) -> String {
     out
 }
 
+/// The options a listing was given that its next page needs again (`--limit`, filters), as
+/// ` --name value` each, values quoted for a POSIX shell when they need it, for the hint that
+/// names the next page's command. Options without a value are left out.
+pub(crate) fn repeat_flags(flags: &[(&str, Option<String>)]) -> String {
+    let mut out = String::new();
+    for (name, value) in flags {
+        if let Some(v) = value {
+            out.push_str(&format!(" {name} {}", shell_word(v)));
+        }
+    }
+    out
+}
+
+/// `s` as one POSIX shell word: as it is when it has only safe characters, else in single
+/// quotes.
+fn shell_word(s: &str) -> String {
+    let safe = |c: char| c.is_ascii_alphanumeric() || "-_.:/@%+=,".contains(c);
+    if !s.is_empty() && s.chars().all(safe) {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
+}
+
 /// `audit checkpoints`: one line per stored checkpoint, newest first, and how to page on.
-pub(crate) fn render_checkpoints(v: &Value) -> String {
+/// `flags` are the options to repeat on the next page ([`repeat_flags`]).
+pub(crate) fn render_checkpoints(v: &Value, flags: &str) -> String {
     let cps = v["checkpoints"].as_array().cloned().unwrap_or_default();
     if cps.is_empty() {
         return "no checkpoints stored\n".to_string();
@@ -373,7 +398,9 @@ pub(crate) fn render_checkpoints(v: &Value) -> String {
         ));
     }
     if let Some(next) = v["next_cursor"].as_str() {
-        out.push_str(&format!("older: audit checkpoints --cursor {next}\n"));
+        out.push_str(&format!(
+            "older: audit checkpoints{flags} --cursor {next}\n"
+        ));
     }
     out
 }
@@ -599,8 +626,9 @@ pub(crate) fn render_selector_revocation(v: &Value) -> String {
     out
 }
 
-/// `approval list`: one line per approval, newest first.
-pub(crate) fn render_approvals(v: &Value) -> String {
+/// `approval list`: one line per approval, newest first. `flags` are the filters and
+/// `--limit` to repeat on the next page ([`repeat_flags`]).
+pub(crate) fn render_approvals(v: &Value, flags: &str) -> String {
     let list = v["approvals"].as_array().cloned().unwrap_or_default();
     if list.is_empty() {
         return "no approvals\n".to_string();
@@ -624,7 +652,7 @@ pub(crate) fn render_approvals(v: &Value) -> String {
     }
     if let Some(next) = v["next_cursor"].as_str() {
         out.push_str(&format!(
-            "more: approval list --cursor {next} (with the same filters), or --all\n"
+            "more: approval list{flags} --cursor {next}, or --all\n"
         ));
     }
     out
@@ -1290,7 +1318,7 @@ would revoke 4 lease(s) if revoked now
     #[test]
     fn empty_checkpoints_and_expired_evaluation() {
         assert_eq!(
-            render_checkpoints(&json!({"checkpoints": [], "prev": null})),
+            render_checkpoints(&json!({"checkpoints": [], "prev": null}), ""),
             "no checkpoints stored\n"
         );
         let text = render_evaluation(&json!({
@@ -1340,17 +1368,46 @@ would revoke 4 lease(s) if revoked now
     #[test]
     fn approval_list_has_one_line_each() {
         assert_eq!(
-            render_approvals(&json!({"approvals": []})),
+            render_approvals(&json!({"approvals": []}), ""),
             "no approvals\n"
         );
         let mut expired = approval();
         expired["state"] = json!("pending");
         expired["expired"] = json!(true);
-        let text = render_approvals(&json!({"approvals": [approval(), expired]}));
+        let text = render_approvals(&json!({"approvals": [approval(), expired]}), "");
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 2, "{text}");
         assert!(lines[0].starts_with("a-1  granted"), "{text}");
         assert!(lines[0].contains("github/delete_repo  run l1"), "{text}");
         assert!(lines[1].contains("pending (expired)"), "{text}");
+    }
+
+    #[test]
+    fn next_page_hints_repeat_the_limit_and_filters() {
+        let flags = repeat_flags(&[
+            ("--chain-id", Some("l1".into())),
+            ("--state", None),
+            ("--limit", Some("5".into())),
+        ]);
+        assert_eq!(flags, " --chain-id l1 --limit 5");
+        let page = json!({"approvals": [approval()], "next_cursor": "AQID"});
+        assert!(
+            render_approvals(&page, &flags)
+                .ends_with("more: approval list --chain-id l1 --limit 5 --cursor AQID, or --all\n"),
+            "{}",
+            render_approvals(&page, &flags)
+        );
+        let cps = json!({"checkpoints": [{"seq": 9, "at": "t", "kid": "k", "head_hash": "h"}],
+                         "next_cursor": "AQIC"});
+        let text = render_checkpoints(&cps, &repeat_flags(&[("--limit", Some("3".into()))]));
+        assert!(
+            text.ends_with("older: audit checkpoints --limit 3 --cursor AQIC\n"),
+            "{text}"
+        );
+        assert_eq!(
+            repeat_flags(&[("--x", Some("it's a b".into()))]),
+            r" --x 'it'\''s a b'"
+        );
+        assert_eq!(repeat_flags(&[("--x", Some(String::new()))]), " --x ''");
     }
 }

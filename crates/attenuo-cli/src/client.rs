@@ -51,13 +51,23 @@ struct Reply {
     status: StatusCode,
     headers: HeaderMap,
     text: String,
+    /// Whether a bare 404 to this request should carry [`ADMIN_LISTENER_HINT`].
+    admin_hint: bool,
 }
+
+/// Added under a 404 without an error code (the server's answer to a route it does not have,
+/// not its JSON `not_found` for a missing lease or record) to an `/admin/*` request sent to
+/// `--server` because no `--admin-server` was given.
+const ADMIN_LISTENER_HINT: &str = "hint: the server may serve its admin API on a separate \
+     listener ([admin] listen); pass --admin-server URL (or set ATTENUO_ADMIN_SERVER)";
 
 pub(crate) struct Client {
     http: reqwest::Client,
     base: String,
     /// Where `/admin/*` goes: `--admin-server` when given, else `base`.
     admin_base: String,
+    /// Whether `admin_base` was given (`--admin-server` or `ATTENUO_ADMIN_SERVER`).
+    admin_base_given: bool,
     admin_token: Option<String>,
     /// The latest `DPoP-Nonce` this server sent (RFC 9449 §8), for the next proof. Never
     /// printed or logged.
@@ -73,6 +83,7 @@ impl Client {
         admin_token: Option<String>,
     ) -> Result<Self> {
         let base = base_url(base)?;
+        let admin_base_given = admin_base.is_some();
         let admin_base = match admin_base {
             Some(a) => base_url(a).map_err(|_| {
                 anyhow!(
@@ -89,6 +100,7 @@ impl Client {
                 .build()?,
             base,
             admin_base,
+            admin_base_given,
             admin_token,
             nonce: Mutex::new(None),
         })
@@ -117,6 +129,7 @@ impl Client {
         loop {
             let req = build(self.current_nonce().as_deref())?.build()?;
             let base = self.base_for(req.url().path()).to_owned();
+            let admin_hint = self.hints_admin_listener(req.url().path());
             let resp = self
                 .http
                 .execute(req)
@@ -144,6 +157,7 @@ impl Client {
                 status,
                 headers,
                 text,
+                admin_hint,
             });
         }
     }
@@ -151,12 +165,17 @@ impl Client {
     /// The base URL that serves `path`: the admin listener's for `/admin` and everything
     /// under it, the main listener's for the rest. The only place that chooses between them.
     fn base_for(&self, path: &str) -> &str {
-        let rest = path.strip_prefix("/admin").unwrap_or("x");
-        if rest.is_empty() || rest.starts_with(['/', '?']) {
+        if is_admin_path(path) {
             &self.admin_base
         } else {
             &self.base
         }
+    }
+
+    /// Whether a bare 404 to `path` gets [`ADMIN_LISTENER_HINT`]: an `/admin/*` path sent to
+    /// `--server` because no admin listener was named.
+    fn hints_admin_listener(&self, path: &str) -> bool {
+        !self.admin_base_given && is_admin_path(path)
     }
 
     fn url(&self, path: &str) -> String {
@@ -221,7 +240,12 @@ impl Client {
         if status.is_success() {
             return Ok(resp);
         }
-        Err(api_error(status, &resp.text().await?))
+        let err = api_error(status, &resp.text().await?);
+        Err(if self.hints_admin_listener(path) {
+            with_admin_hint(err)
+        } else {
+            err
+        })
     }
 
     pub(crate) async fn admin_post(&self, path: &str, body: &Value) -> Result<Value> {
@@ -311,6 +335,7 @@ impl Client {
             status,
             headers,
             text,
+            ..
         } = self
             .send_dpop(key.is_some(), |nonce| {
                 Ok(
@@ -337,12 +362,41 @@ impl Client {
 
 /// The JSON body of a success, or the server's error.
 fn json_reply(reply: Reply) -> Result<Value> {
-    let Reply { status, text, .. } = reply;
+    let Reply {
+        status,
+        text,
+        admin_hint,
+        ..
+    } = reply;
     if status.is_success() {
         return serde_json::from_str(&text)
             .with_context(|| format!("server sent non-JSON ({status}): {text}"));
     }
-    Err(api_error(status, &text))
+    let err = api_error(status, &text);
+    Err(if admin_hint {
+        with_admin_hint(err)
+    } else {
+        err
+    })
+}
+
+/// Whether `path` is `/admin` or under it, which `--admin-server` serves.
+fn is_admin_path(path: &str) -> bool {
+    let rest = path.strip_prefix("/admin").unwrap_or("x");
+    rest.is_empty() || rest.starts_with(['/', '?'])
+}
+
+/// `err` with [`ADMIN_LISTENER_HINT`] on a line of its own when it is a 404 without an error
+/// code: the answer to an unknown route. A JSON 404 (`not_found` for a lease, approval or
+/// audit record that does not exist) comes from a route that does exist, so it stays as it is.
+fn with_admin_hint(mut err: anyhow::Error) -> anyhow::Error {
+    if let Some(api) = err.downcast_mut::<ApiError>() {
+        if api.status == StatusCode::NOT_FOUND && api.code.is_none() {
+            api.message.push('\n');
+            api.message.push_str(ADMIN_LISTENER_HINT);
+        }
+    }
+    err
 }
 
 /// Did the server refuse a proof for want of its nonce (RFC 9449 §8)? A 401 with
@@ -526,6 +580,42 @@ mod tests {
         assert!(!is_use_dpop_nonce(unauthorized, &none, "<html>"));
         assert!(!is_use_dpop_nonce(StatusCode::FORBIDDEN, &challenge, ""));
         assert!(!is_use_dpop_nonce(StatusCode::OK, &challenge, ""));
+    }
+
+    #[test]
+    fn admin_listener_hint_only_for_a_bare_404_to_an_implicit_admin_base() {
+        let one = Client::new("http://main:8080", None, None).unwrap();
+        assert!(one.hints_admin_listener("/admin/audit/verify"));
+        assert!(one.hints_admin_listener("/admin"));
+        for path in ["/token", "/mcp/admin", "/administer", "/healthz"] {
+            assert!(!one.hints_admin_listener(path), "{path}");
+        }
+        let split = Client::new("http://main:8080", Some("http://adm:9102"), None).unwrap();
+        assert!(!split.hints_admin_listener("/admin/audit/verify"));
+
+        let bare = with_admin_hint(api_error(StatusCode::NOT_FOUND, "")).to_string();
+        assert_eq!(
+            bare,
+            format!("server answered 404 Not Found\n{ADMIN_LISTENER_HINT}")
+        );
+        // Still an `ApiError` for callers that read the status.
+        let e = with_admin_hint(api_error(StatusCode::NOT_FOUND, ""));
+        assert_eq!(
+            e.downcast_ref::<ApiError>().unwrap().status,
+            StatusCode::NOT_FOUND
+        );
+        // A JSON `not_found` (a missing item on a route that exists) and other statuses stay.
+        for (status, body) in [
+            (
+                StatusCode::NOT_FOUND,
+                r#"{"error":"not_found","detail":"unknown lease `x`"}"#,
+            ),
+            (StatusCode::UNAUTHORIZED, ""),
+            (StatusCode::BAD_GATEWAY, "oops"),
+        ] {
+            let e = with_admin_hint(api_error(status, body)).to_string();
+            assert!(!e.contains("hint:"), "{e}");
+        }
     }
 
     #[test]
