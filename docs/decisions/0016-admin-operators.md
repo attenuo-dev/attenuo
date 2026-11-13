@@ -40,12 +40,12 @@ Chosen option: "named bearer tokens stored as SHA-256 digests, with three fixed 
 - `GET /admin/audit/checkpoint` is a viewer route although it signs a checkpoint of the head when there is none: the signature records no new fact, and the CLI and console treat it as a read. The selector revoke's `?preview=true` dry run is an operator route because it is the same route as the revocation; a viewer reads the same leases through the lease tree.
 - Attribution: audit records of admin actions name the operator as `originating_subject`, and an operator's approval decision has it as the approver subject (also the approval token's `sub`). `[admin] token` keeps `urn:attenuo:admin`; a named operator is `urn:attenuo:admin:<name>`. Both are under the reserved `urn:attenuo:` prefix, which no IdP user can have (SR-34). The default revocation reason names the operator (`revoked by alice`; `revoked by admin` for the legacy token, as before). The audit record format and `SCHEMA_VERSION` are unchanged: the subject was always a string.
 - `GET /admin/whoami` answers `{name, role}`. The console uses it to log in, shows the operator and role in its header, and disables the buttons the role cannot use; the server stays the enforcement point.
-- Operators are read from the file at startup only. `POST /admin/policies/reload` reloads policies, not the config, so adding, removing or changing an operator takes a restart. `[[admin.operators]]` cannot be set from the environment, as no array of tables can; `ATTENUO_ADMIN_TOKEN` keeps replacing `[admin] token`.
+- Operators are read from the file at startup only. `POST /admin/policies/reload` reloads policies, not the config, so adding, removing or changing an operator takes a restart. (Superseded in part by the [update of 2026-11-13](#update-2026-11-13-expiry-and-reload): `POST /admin/operators/reload` re-reads the operators without a restart.) `[[admin.operators]]` cannot be set from the environment, as no array of tables can; `ATTENUO_ADMIN_TOKEN` keeps replacing `[admin] token`.
 
 What this does not do:
 
 - No OIDC or other login for operators, no cookie sessions: an operator is whoever presents the token.
-- No token expiry and no rotation workflow beyond editing the config and restarting. Withdrawing an operator's access is removing its entry and restarting.
+- ~~No token expiry and no rotation workflow beyond editing the config and restarting. Withdrawing an operator's access is removing its entry and restarting.~~ Addressed by the [update of 2026-11-13](#update-2026-11-13-expiry-and-reload): an entry may carry `expires_at`, and removing (or expiring) an entry takes effect with `POST /admin/operators/reload`, without a restart. Rotation is still adding a second entry, reloading, and removing the old one.
 - No per-operator rate limits, and no limit on how many admin requests one operator makes.
 - No per-route or per-resource permissions beyond the three roles, and no restriction of an operator to some users or runs.
 - Nothing stops whoever can edit the config file, or set `ATTENUO_ADMIN_TOKEN`, from adding an admin. The config file and the server's environment remain part of the trusted base, like the issuer key.
@@ -56,7 +56,7 @@ What this does not do:
 - Good, because a person who only needs to read the log, or to revoke and approve, can be given a token that cannot reload the policy, refund budgets or mint roots.
 - Good, because nothing changes for a deployment that keeps `[admin] token` alone: same records, same responses, same checks.
 - Bad, because the legacy token and a named operator with role `admin` are both all-powerful, and the legacy token's records do not name a person; a deployment gets attribution only by moving its people to named operators.
-- Bad, because a leaked operator token stays valid until its entry is removed and the server restarted.
+- ~~Bad, because a leaked operator token stays valid until its entry is removed and the server restarted.~~ Addressed by the [update of 2026-11-13](#update-2026-11-13-expiry-and-reload): removing the entry and reloading withdraws it, and an entry can be given an expiry. Still bad: until someone notices the leak, the token works up to its `expires_at`, if it has one.
 - Neutral, because the roles are fixed in code: a deployment that wants another split has to propose one.
 
 ### Confirmation
@@ -73,7 +73,7 @@ What this does not do:
 
 - Good, because every existing client already sends a bearer, so nothing else changes.
 - Good, because the config holds no secret an operator could replay.
-- Bad, because tokens do not expire on their own.
+- ~~Bad, because tokens do not expire on their own.~~ Addressed by the [update of 2026-11-13](#update-2026-11-13-expiry-and-reload) (optional `expires_at`).
 
 ### The same with a slow password hash
 
@@ -94,4 +94,25 @@ What this does not do:
 
 - Audit finding S-2 (one static admin bearer, no roles, every action recorded as `admin`). Related: ADR-0008 (the console holds the token in page memory), ADR-0013 (the admin API's listener), SR-15 (admin actions are audited), SR-34 (reserved subjects).
 - Configuration: `docs/reference/config.md#adminoperators`; HTTP: `docs/reference/http-api.md#admin`; CLI: `docs/reference/cli.md`; threat model: attacker A8 in `docs/spec/threat-model.md`.
-- Revisit when operators need expiry or rotation without a restart, or OIDC login for the console.
+- Revisit when operators need OIDC login for the console. (Expiry, and changes without a restart, are covered by the [update of 2026-11-13](#update-2026-11-13-expiry-and-reload).)
+
+### Update 2026-11-13: expiry and reload
+
+The decision above stands and is kept as written; this closes two of the gaps it listed (a leaked token valid until a restart, and no expiry) without changing the token format, the roles, the route table's rules or the audit record format.
+
+**Expiry.** An `[[admin.operators]]` entry may carry `expires_at`, an RFC 3339 time with an offset (a quoted string or a TOML offset date-time). `AdminCredentials::authenticate(token, now)` still hashes the bearer once and compares the digest with every credential in constant time without stopping at a match; only then does it compare the matched entry's `expires_at` with `now` (the server's clock, so tests step a `ManualClock`). A match that has expired is answered 401 `admin_credential_expired`, with the same `WWW-Authenticate: Bearer realm="attenuo-admin"` as the other admin 401s; the time taken before the comparison ends does not depend on which credential matched. An entry that has already expired when the server starts is accepted, and a warning names it, so that an old entry left in the file does not stop the server; a timestamp that does not parse, or has no offset, refuses the file. `attenuo admin operator new` takes `--expires-in <n>{s,m,h,d}` or `--expires-at <RFC 3339>` (not both) and writes the field into the entry it prints. `GET /admin/whoami` adds `expires_at` (null when none), and the console shows it after the role. `[admin] token` does not expire: it is one string in the file or in `ATTENUO_ADMIN_TOKEN`, with nowhere to put a lifetime.
+
+**Reload.** `POST /admin/operators/reload` (role `admin`, in `ROUTE_ROLES`; `attenuo admin operator reload`; the SDKs' `operators_reload` / `operatorsReload`) re-reads the `[[admin.operators]]` array, and nothing else, from the config file the server was started with (`Config::source_path`, set when the config is loaded from `--config` or `ATTENUO_CONFIG`). It checks the list with the startup rules (`operators::check_operators`, also what `Config::check_admin_operators` calls), against the `[admin] token` in force, which is not reloaded. Then it swaps the credential set in one step: the set is an `RwLock<Arc<AdminCredentials>>` (`SharedAdminCredentials`), the primitive the policy engine already uses for its reload (`SharedPolicy`), held only to copy or replace the pointer. Reloads are serialized by a mutex, from reading the file to the swap. The answer lists the names of the operators added, removed and changed (role, `token_sha256` or `expires_at`), never a digest, and an `admin.operators.reload` audit record names the caller as actor and has `{path, added, removed, changed}` as its arguments. A refusal is recorded as a `deny` with the refusal's code as reason, as a refused policy reload is.
+
+Rules:
+
+- `require_admin` takes one snapshot of the set per request. A request admitted before a swap completes with the identity it was admitted with; the next request is checked against the new set. So the caller may remove or demote its own entry: that reload completes, and the caller's next request is refused or limited.
+- A list that would leave no credential with role `admin` that has not expired (no `[admin] token`, and no unexpired operator with role `admin`) is refused with 422 `operators_no_admin`: a typo could otherwise lock everyone out of the admin API until a restart. At startup the rule stays as it was (operators alone, any role, are enough), since a restart is how that is fixed.
+- On any error nothing changes: 422 `operators_invalid` for a file that is not TOML or an entry that breaks a rule (the message never quotes the file, whose `[admin] token` line it could otherwise echo), 500 `config_unreadable` for a file that cannot be read (the cause in the log only), 409 `reload_unavailable` when the server was not started from a file (a program that builds its `Config` in code).
+- Only the operators are read. The rest of the file is not reloaded, and not checked, though it must still be TOML.
+
+Options considered for the reload, and rejected: a `SIGHUP` handler (no actor to record, and no answer to show what changed or why it was refused); watching the file (an editor's half-written save would be read, and there is no actor); reloading the whole config (most of it, listeners, keys and stores, cannot be swapped in a running server, and a partial reload of "the config" would mislead); a revocation list of token digests next to the entries (a second list to keep in step, where removing the entry already says it). For expiry: a lifetime in the token itself (the token is random bytes, deliberately not a JWT; a lifetime there would need signing and parsing for no gain over the entry).
+
+What this still does not do: no login, no second factor, no per-operator rate limit; no expiry or reload of `[admin] token`; a leaked token works until someone withdraws it or until its `expires_at`; expiry follows the server's clock.
+
+Confirmation: `crates/attenuo-server/src/operators.rs` tests (authentication before, at and after `expires_at` with explicit times, parsing of `expires_at`, the reload's read of the operators alone, `with_operators` and its change lists, the live-admin rule, a snapshot outliving a swap); `crates/attenuo-server/tests/admin_operators.rs` (expiry on a stepped clock, an entry expired at startup warning and refused, a malformed timestamp refused, a reload that adds, removes and changes role, digest and expiry, an invalid or missing file leaving the set in force, the lock-out refusal, role refusals, the audit records, `[admin] token` untouched, reloads racing requests); the refusal-code guard in `crates/attenuo-server/tests/e2e.rs`; `crates/attenuo-cli/tests/admin_operator.rs` (`new --expires-in`, then `reload` against a running server).

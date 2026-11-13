@@ -9,7 +9,7 @@
 import { h, replace } from './dom.js';
 
 let token = null;
-// `GET /admin/whoami` of the token: {name, role}. The server enforces roles (ADR-0016); the
+// `GET /admin/whoami` of the token: {name, role, expires_at}. The server enforces roles (ADR-0016); the
 // console only uses this to name the operator and to disable buttons the role cannot use.
 let identity = null;
 let onUnauthorized = () => {};

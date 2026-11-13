@@ -132,10 +132,19 @@ async fn run(cli: Cli) -> Result<Outcome> {
     match cli.command {
         Command::Token(TokenCmd::Inspect(args)) => inspect(client.ok(), args, json).await,
         Command::Health(a) => health(&client?, &a, json).await,
-        Command::Admin(AdminCmd::Operator(OperatorCmd::New { name, role })) => {
+        Command::Admin(AdminCmd::Operator(OperatorCmd::New {
+            name,
+            role,
+            expires_in,
+            expires_at,
+        })) => {
             operator_cmd::check_name(&name)?;
+            let expires_at =
+                expires_at.or_else(|| expires_in.map(|d| time::OffsetDateTime::now_utc() + d));
+            // Whole seconds: the entry reads better, and nothing is lost that matters.
+            let expires_at = expires_at.map(|t| t.replace_nanosecond(0).unwrap_or(t));
             let token = operator_cmd::generate_token()?;
-            let (out, err) = operator_cmd::new_output(&name, role, &token, json);
+            let (out, err) = operator_cmd::new_output(&name, role, &token, expires_at, json);
             print!("{out}");
             eprint!("{err}");
             Ok(Outcome::Ok)
@@ -758,6 +767,17 @@ async fn run(cli: Cli) -> Result<Outcome> {
             } else {
                 Outcome::No
             })
+        }
+        Command::Admin(AdminCmd::Operator(OperatorCmd::Reload)) => {
+            let resp = client?
+                .admin_post("/admin/operators/reload", &json!({}))
+                .await?;
+            if json {
+                print_json(&resp);
+            } else {
+                print!("{}", operator_cmd::reload_output(&resp));
+            }
+            Ok(Outcome::Ok)
         }
         Command::Policy(PolicyCmd::Reload) => {
             let resp = client?

@@ -41,6 +41,7 @@ fn config(dir: &Path, operators: bool) -> Config {
                 name: (*name).into(),
                 token_sha256: token_sha256_hex(token),
                 role: *role,
+                expires_at: None,
             })
             .collect();
     }
@@ -166,11 +167,17 @@ async fn whoami_names_the_credential() {
     for base in [server.url(""), console.url("")] {
         let (status, v) = send(&client, &base, "GET", "/admin/whoami", Some(LEGACY)).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(v, json!({"name": "admin", "role": "admin"}));
+        assert_eq!(
+            v,
+            json!({"name": "admin", "role": "admin", "expires_at": null})
+        );
         for (name, token, role) in OPERATORS {
             let (status, v) = send(&client, &base, "GET", "/admin/whoami", Some(token)).await;
             assert_eq!(status, StatusCode::OK);
-            assert_eq!(v, json!({"name": name, "role": role.as_str()}));
+            assert_eq!(
+                v,
+                json!({"name": name, "role": role.as_str(), "expires_at": null})
+            );
         }
     }
 }
@@ -354,4 +361,551 @@ fn startup_refuses_a_bad_operator_table() {
     cfg.admin.operators[1].name = "vera".into();
     let err = attenuo_server::build(&cfg).err().unwrap().to_string();
     assert!(err.contains("used twice"), "{err}");
+}
+
+// --- Expiry and reload (ADR-0016, update of 2026-11-13) ---
+
+/// One `[[admin.operators]]` entry as TOML.
+fn entry(name: &str, token: &str, role: &str, expires_at: Option<&str>) -> String {
+    let mut s = format!(
+        "[[admin.operators]]\nname = \"{name}\"\ntoken_sha256 = \"{}\"\nrole = \"{role}\"\n",
+        token_sha256_hex(token)
+    );
+    if let Some(at) = expires_at {
+        s.push_str(&format!("expires_at = \"{at}\"\n"));
+    }
+    s
+}
+
+/// Write `<dir>/attenuo.toml` with `[admin] token` (when `legacy` is set) and `operators`
+/// (TOML entries), and return its path. The file is replaced in one rename, so a reload never
+/// reads half of it.
+fn write_config(dir: &Path, legacy: Option<&str>, operators: &str) -> std::path::PathBuf {
+    let path = dir.join("attenuo.toml");
+    let tmp = dir.join("attenuo.toml.tmp");
+    let token = legacy.map_or(String::new(), |t| format!("token = \"{t}\"\n"));
+    std::fs::write(
+        &tmp,
+        format!(
+            "[issuer]\nprivate_key_pem_path = \"{}\"\n\n[audit]\nsqlite_path = \"{}\"\n\n\
+             [admin]\n{token}\n{operators}",
+            dir.join("keys/issuer.pem").display(),
+            dir.join("audit.sqlite").display(),
+        ),
+    )
+    .unwrap();
+    std::fs::rename(&tmp, &path).unwrap();
+    path
+}
+
+/// A server started from the config file at `path`, as `attenuo-server --config` starts one.
+async fn start_from_file(
+    path: &Path,
+) -> (
+    attenuo_proxy::testing::Spawned,
+    std::sync::Arc<attenuo_server::AppState>,
+) {
+    let cfg = Config::load(path).unwrap();
+    assert_eq!(cfg.source_path.as_deref(), Some(path));
+    let (router, state) = attenuo_server::build(&cfg).unwrap();
+    (spawn_router(router).await.unwrap(), state)
+}
+
+async fn reload(client: &reqwest::Client, base: &str, bearer: &str) -> (StatusCode, Value) {
+    send(
+        client,
+        base,
+        "POST",
+        "/admin/operators/reload",
+        Some(bearer),
+    )
+    .await
+}
+
+async fn whoami(client: &reqwest::Client, base: &str, bearer: &str) -> (StatusCode, Value) {
+    send(client, base, "GET", "/admin/whoami", Some(bearer)).await
+}
+
+/// A token that has expired is 401 `admin_credential_expired`, with the same challenge as
+/// any admin 401; before its `expires_at` it works and `whoami` shows the expiry. The server's
+/// clock is stepped, nothing sleeps.
+#[tokio::test]
+async fn an_operator_token_stops_working_at_its_expiry() {
+    use time::format_description::well_known::Rfc3339;
+    let dir = tempfile::tempdir().unwrap();
+    let clock = attenuo_core::ManualClock::new();
+    let expires = (time::OffsetDateTime::now_utc() + time::Duration::hours(1))
+        .replace_nanosecond(0)
+        .unwrap();
+    let mut cfg = config(dir.path(), true);
+    cfg.admin.operators.push(AdminOperator {
+        name: "temp".into(),
+        token_sha256: token_sha256_hex("temp-token"),
+        role: AdminRole::Operator,
+        expires_at: Some(expires),
+    });
+    let (router, _state) = attenuo_server::build_with_clock(&cfg, clock.clone()).unwrap();
+    let server = spawn_router(router).await.unwrap();
+    let base = server.url("");
+    let client = reqwest::Client::new();
+
+    let (status, v) = whoami(&client, &base, "temp-token").await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(
+        v,
+        json!({"name": "temp", "role": "operator", "expires_at": expires.format(&Rfc3339).unwrap()})
+    );
+
+    clock.advance(std::time::Duration::from_secs(2 * 3600));
+    let resp = client
+        .get(format!("{base}/admin/whoami"))
+        .bearer_auth("temp-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        resp.headers()["www-authenticate"],
+        "Bearer realm=\"attenuo-admin\""
+    );
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(v["code"], "admin_credential_expired", "{v}");
+    assert_eq!(v["error"], "unauthorized", "{v}");
+    assert!(!v.to_string().contains("temp-token"), "{v}");
+    // The other credentials, which do not expire, still work.
+    for token in [LEGACY, "vera-token", "bob-token", "ada-token"] {
+        assert_eq!(whoami(&client, &base, token).await.0, StatusCode::OK);
+    }
+    // A wrong token is still `invalid_token`, not the expired code.
+    let (status, v) = whoami(&client, &base, "temp-token-x").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(v["code"], "invalid_token");
+}
+
+/// A `MakeWriter` that keeps what is logged.
+#[derive(Clone, Default)]
+struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+    type Writer = Captured;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// An entry that has already expired when the server starts does not stop it: a warning
+/// names the operator, and its token is refused as expired.
+#[tokio::test]
+async fn an_expired_entry_at_startup_warns_and_does_not_authenticate() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_config(
+        dir.path(),
+        Some(LEGACY),
+        &(entry("old", "old-token", "admin", Some("2020-01-01T00:00:00Z"))
+            + &entry("ada", "ada-token", "admin", None)),
+    );
+    let cfg = Config::load(&path).unwrap();
+    let logs = Captured::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(logs.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .finish();
+    let (router, _state) =
+        tracing::subscriber::with_default(subscriber, || attenuo_server::build(&cfg)).unwrap();
+    let logged = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    let line = logged
+        .lines()
+        .find(|l| l.contains("expired"))
+        .unwrap_or_else(|| panic!("no warning: {logged}"));
+    assert!(line.contains("WARN"), "{line}");
+    assert!(line.contains("`old`"), "{line}");
+    assert!(line.contains("2020-01-01T00:00:00Z"), "{line}");
+    assert!(!logged.contains("ada"), "{logged}");
+
+    let server = spawn_router(router).await.unwrap();
+    let client = reqwest::Client::new();
+    let (status, v) = whoami(&client, &server.url(""), "old-token").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(v["code"], "admin_credential_expired");
+    assert_eq!(
+        whoami(&client, &server.url(""), "ada-token").await.0,
+        StatusCode::OK
+    );
+}
+
+/// An `expires_at` that is not an RFC 3339 time with an offset refuses the file, naming the
+/// key; so does it at a reload (below).
+#[test]
+fn a_malformed_expiry_refuses_to_start() {
+    let dir = tempfile::tempdir().unwrap();
+    for bad in ["2026-13-01T00:00:00Z", "2026-12-01T00:00:00", "next week"] {
+        let path = write_config(
+            dir.path(),
+            Some(LEGACY),
+            &entry("alice", "alice-token", "viewer", Some(bad)),
+        );
+        let err = format!("{:#}", Config::load(&path).unwrap_err());
+        assert!(err.contains("expires_at"), "{bad}: {err}");
+        assert!(!err.contains(LEGACY), "{err}");
+    }
+}
+
+/// Add, remove, change role, change digest and change expiry in one reload: the answer
+/// names each by name, never a digest, and the next requests see the new set. `[admin] token`
+/// is not reloaded, even when the file's value changed.
+#[tokio::test]
+async fn a_reload_adds_removes_and_changes_operators() {
+    let dir = tempfile::tempdir().unwrap();
+    let before = entry("ada", "ada-token", "admin", None)
+        + &entry("bob", "bob-token", "operator", None)
+        + &entry("carol", "carol-token", "viewer", None)
+        + &entry("dave", "dave-token", "viewer", None)
+        + &entry("erin", "erin-token", "viewer", Some("2099-01-01T00:00:00Z"))
+        + &entry("vera", "vera-token", "viewer", None);
+    let path = write_config(dir.path(), Some(LEGACY), &before);
+    let (server, _state) = start_from_file(&path).await;
+    let base = server.url("");
+    let client = reqwest::Client::new();
+    assert_eq!(
+        whoami(&client, &base, "bob-token").await.1["role"],
+        "operator"
+    );
+
+    // Unchanged: ada, vera. bob demoted, carol's digest changed, dave given an expiry that
+    // has passed, erin's expiry removed, frank added, and `[admin] token` edited in the file.
+    let after = entry("ada", "ada-token", "admin", None)
+        + &entry("bob", "bob-token", "viewer", None)
+        + &entry("carol", "carol-token-2", "viewer", None)
+        + &entry("dave", "dave-token", "viewer", Some("2020-01-01T00:00:00Z"))
+        + &entry("erin", "erin-token", "viewer", None)
+        + &entry("frank", "frank-token", "operator", None);
+    write_config(
+        dir.path(),
+        Some("an-edited-legacy-token-0123456789abcdef"),
+        &after,
+    );
+    let (status, v) = reload(&client, &base, "ada-token").await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(v["added"], json!(["frank"]));
+    assert_eq!(v["removed"], json!(["vera"]));
+    assert_eq!(v["changed"], json!(["bob", "carol", "dave", "erin"]));
+    assert!(v["audit_id"].is_string(), "{v}");
+    for t in ["ada-token", "bob-token", "carol-token", "frank-token"] {
+        assert!(!v.to_string().contains(&token_sha256_hex(t)), "{v}");
+    }
+
+    let (status, v) = whoami(&client, &base, "vera-token").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "removed: {v}");
+    assert_eq!(v["code"], "invalid_token");
+    assert_eq!(
+        whoami(&client, &base, "bob-token").await.1["role"],
+        "viewer"
+    );
+    let (status, v) = send(
+        &client,
+        &base,
+        "POST",
+        "/admin/leases/x/revoke",
+        Some("bob-token"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(v["code"], "admin_role_insufficient");
+    assert_eq!(
+        whoami(&client, &base, "carol-token").await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        whoami(&client, &base, "carol-token-2").await.1["name"],
+        "carol"
+    );
+    let (status, v) = whoami(&client, &base, "dave-token").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(v["code"], "admin_credential_expired");
+    assert_eq!(
+        whoami(&client, &base, "erin-token").await.1["expires_at"],
+        Value::Null
+    );
+    assert_eq!(
+        whoami(&client, &base, "frank-token").await.1["role"],
+        "operator"
+    );
+    // `[admin] token` is the one the server started with.
+    assert_eq!(whoami(&client, &base, LEGACY).await.1["name"], "admin");
+    assert_eq!(
+        whoami(&client, &base, "an-edited-legacy-token-0123456789abcdef")
+            .await
+            .0,
+        StatusCode::UNAUTHORIZED
+    );
+
+    // A second reload of the same file changes nothing.
+    let (status, v) = reload(&client, &base, LEGACY).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(
+        (&v["added"], &v["removed"], &v["changed"]),
+        (&json!([]), &json!([]), &json!([]))
+    );
+}
+
+/// The reload is recorded like any admin action: the actor, and the name lists in the
+/// arguments (whose digest the record keeps). A refused reload is recorded as a `deny`.
+#[tokio::test]
+async fn a_reload_is_audited_with_the_actor_and_the_lists() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_config(
+        dir.path(),
+        Some(LEGACY),
+        &(entry("ada", "ada-token", "admin", None) + &entry("vera", "vera-token", "viewer", None)),
+    );
+    let (server, _state) = start_from_file(&path).await;
+    let base = server.url("");
+    let client = reqwest::Client::new();
+    write_config(
+        dir.path(),
+        Some(LEGACY),
+        &(entry("ada", "ada-token", "operator", None) + &entry("bob", "bob-token", "viewer", None)),
+    );
+    // ada demotes herself: the request that does it completes.
+    let (status, v) = reload(&client, &base, "ada-token").await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let audit_id = v["audit_id"].as_str().unwrap().to_string();
+    // ...and her next reload is refused for the role.
+    let (status, v) = reload(&client, &base, "ada-token").await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(v["code"], "admin_role_insufficient");
+
+    write_config(dir.path(), Some(LEGACY), "this is not toml");
+    let (status, v) = reload(&client, &base, LEGACY).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{v}");
+    assert_eq!(v["code"], "operators_invalid");
+
+    let (status, v) = send(
+        &client,
+        &base,
+        "GET",
+        "/admin/audit?from=1&limit=1000",
+        Some(LEGACY),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let records: Vec<&Value> = v["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| &e["record"])
+        .filter(|r| r["tool"] == "admin.operators.reload")
+        .collect();
+    assert_eq!(records.len(), 2, "{records:?}");
+    let ok = records[0];
+    assert_eq!(ok["id"], audit_id);
+    assert_eq!(ok["originating_subject"], "urn:attenuo:admin:ada");
+    assert_eq!(ok["decision"], "allow");
+    assert_eq!(ok["server"], "attenuo");
+    let args = json!({
+        "path": path,
+        "added": ["bob"],
+        "removed": ["vera"],
+        "changed": ["ada"],
+    });
+    let want = attenuo_core::ToolCall::new("attenuo", "admin.operators.reload", args);
+    assert_eq!(ok["arguments_digest"], want.arguments_digest());
+    let refused = records[1];
+    assert_eq!(refused["originating_subject"], "urn:attenuo:admin");
+    assert_eq!(refused["decision"], "deny");
+    assert_eq!(refused["reason"], "operators_invalid");
+}
+
+/// A file that does not parse or breaks a startup rule leaves the set in force as it was.
+#[tokio::test]
+async fn an_invalid_file_leaves_the_operators_in_force() {
+    let dir = tempfile::tempdir().unwrap();
+    let ops =
+        entry("ada", "ada-token", "admin", None) + &entry("bob", "bob-token", "operator", None);
+    let path = write_config(dir.path(), Some(LEGACY), &ops);
+    let (server, _state) = start_from_file(&path).await;
+    let base = server.url("");
+    let client = reqwest::Client::new();
+    let good_rest = entry("ada", "ada-token", "admin", None);
+    for (operators, want) in [
+        ("[[admin.operators]\n".to_string(), "not valid TOML"),
+        (
+            good_rest.clone() + &entry("ada", "x-token", "viewer", None),
+            "used twice",
+        ),
+        (
+            good_rest.clone() + &entry("eve", LEGACY, "viewer", None),
+            "[admin] token",
+        ),
+        (
+            good_rest.clone() + &entry("eve", "eve-token", "viewer", Some("soon")),
+            "expires_at",
+        ),
+        (
+            good_rest.clone() + "[[admin.operators]]\nname = \"eve\"\ntoken_sha256 = \"abc\"\nrole = \"viewer\"\n",
+            "64 lowercase hex",
+        ),
+        (
+            good_rest.clone() + &entry("Eve", "eve-token", "viewer", None),
+            "a-z",
+        ),
+        (
+            good_rest.clone() + &entry("eve", "eve-token", "root", None),
+            "root",
+        ),
+    ] {
+        write_config(dir.path(), Some(LEGACY), &operators);
+        let (status, v) = reload(&client, &base, "ada-token").await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{operators}: {v}");
+        assert_eq!(v["code"], "operators_invalid", "{v}");
+        let detail = v["detail"].as_str().unwrap();
+        assert!(detail.contains(want), "{want}: {detail}");
+        assert!(!detail.contains(LEGACY), "{detail}");
+        assert_eq!(whoami(&client, &base, "bob-token").await.1["role"], "operator");
+    }
+    // A file that is gone: 500 with its own code, the path in the log only.
+    std::fs::remove_file(&path).unwrap();
+    let (status, v) = reload(&client, &base, "ada-token").await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{v}");
+    assert_eq!(v["code"], "config_unreadable");
+    assert!(!v.to_string().contains("attenuo.toml"), "{v}");
+    assert_eq!(whoami(&client, &base, "bob-token").await.0, StatusCode::OK);
+}
+
+/// Without `[admin] token`, a reload that would leave no unexpired admin operator is refused,
+/// so that a typo cannot lock everyone out until a restart.
+#[tokio::test]
+async fn a_reload_that_would_lock_out_every_admin_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let ops =
+        entry("ada", "ada-token", "admin", None) + &entry("bob", "bob-token", "operator", None);
+    let path = write_config(dir.path(), None, &ops);
+    let (server, _state) = start_from_file(&path).await;
+    let base = server.url("");
+    let client = reqwest::Client::new();
+    for operators in [
+        // ada removed.
+        entry("bob", "bob-token", "operator", None),
+        // ada demoted.
+        entry("ada", "ada-token", "operator", None),
+        // ada expired.
+        entry("ada", "ada-token", "admin", Some("2020-01-01T00:00:00Z")),
+        // Nobody.
+        String::new(),
+    ] {
+        write_config(dir.path(), None, &operators);
+        let (status, v) = reload(&client, &base, "ada-token").await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{operators}: {v}");
+        assert_eq!(v["code"], "operators_no_admin", "{v}");
+        assert_eq!(whoami(&client, &base, "ada-token").await.1["role"], "admin");
+    }
+    // Handing admin to another operator is fine.
+    write_config(
+        dir.path(),
+        None,
+        &(entry("bob", "bob-token", "admin", None) + &entry("ada", "ada-token", "viewer", None)),
+    );
+    let (status, v) = reload(&client, &base, "ada-token").await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(v["changed"], json!(["ada", "bob"]));
+}
+
+/// A viewer and an operator are refused the reload for their role; a server whose config was
+/// not read from a file has nothing to reload.
+#[tokio::test]
+async fn a_reload_needs_the_admin_role_and_a_config_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_config(
+        dir.path(),
+        Some(LEGACY),
+        &(entry("vera", "vera-token", "viewer", None)
+            + &entry("bob", "bob-token", "operator", None)),
+    );
+    let (server, _state) = start_from_file(&path).await;
+    let client = reqwest::Client::new();
+    for token in ["vera-token", "bob-token"] {
+        let (status, v) = reload(&client, &server.url(""), token).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{v}");
+        assert_eq!(v["code"], "admin_role_insufficient");
+        assert!(v["detail"].as_str().unwrap().contains("`admin`"), "{v}");
+    }
+
+    // Built in code (as `serve(config)` from an embedding program): no file.
+    let other = tempfile::tempdir().unwrap();
+    let cfg = config(other.path(), true);
+    assert_eq!(cfg.source_path, None);
+    let (router, _state) = attenuo_server::build(&cfg).unwrap();
+    let server = spawn_router(router).await.unwrap();
+    let (status, v) = reload(&client, &server.url(""), LEGACY).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{v}");
+    assert_eq!(v["code"], "reload_unavailable");
+}
+
+/// Requests keep being answered while reloads swap the set: nothing panics or deadlocks, a
+/// credential present in every version always works, and one that comes and goes is either
+/// admitted or refused, never anything else.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn requests_during_reloads_neither_panic_nor_deadlock() {
+    let dir = tempfile::tempdir().unwrap();
+    let with_bob =
+        entry("ada", "ada-token", "admin", None) + &entry("bob", "bob-token", "viewer", None);
+    let without_bob = entry("ada", "ada-token", "admin", None);
+    let path = write_config(dir.path(), Some(LEGACY), &with_bob);
+    let (server, _state) = start_from_file(&path).await;
+    let base = server.url("");
+    let client = reqwest::Client::new();
+
+    let work = async {
+        let mut readers = Vec::new();
+        for _ in 0..8 {
+            let (client, base) = (client.clone(), base.clone());
+            readers.push(tokio::spawn(async move {
+                for _ in 0..40 {
+                    let (status, _) = whoami(&client, &base, "ada-token").await;
+                    assert_eq!(status, StatusCode::OK);
+                    let (status, v) = whoami(&client, &base, "bob-token").await;
+                    assert!(
+                        status == StatusCode::OK || status == StatusCode::UNAUTHORIZED,
+                        "{status}: {v}"
+                    );
+                }
+            }));
+        }
+        let reloader = {
+            let (client, base, dir) = (client.clone(), base.clone(), dir.path().to_path_buf());
+            tokio::spawn(async move {
+                for i in 0..30 {
+                    let ops = if i % 2 == 0 { &without_bob } else { &with_bob };
+                    write_config(&dir, Some(LEGACY), ops);
+                    let (status, v) = reload(&client, &base, "ada-token").await;
+                    assert_eq!(status, StatusCode::OK, "{v}");
+                }
+            })
+        };
+        // Two reloads at once are serialized, not refused.
+        let (a, b) = tokio::join!(
+            reload(&client, &base, LEGACY),
+            reload(&client, &base, LEGACY)
+        );
+        assert_eq!((a.0, b.0), (StatusCode::OK, StatusCode::OK));
+        for r in readers {
+            r.await.unwrap();
+        }
+        reloader.await.unwrap();
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(120), work)
+        .await
+        .expect("requests during reloads did not finish: deadlock?");
+    assert_eq!(whoami(&client, &base, "ada-token").await.0, StatusCode::OK);
 }

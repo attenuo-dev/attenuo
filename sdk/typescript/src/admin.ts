@@ -152,16 +152,28 @@ export interface AuditCheckpoint {
 
 /**
  * Who the admin token is (`GET /admin/whoami`, ADR-0016): the operator's `name` (`admin` for
- * the server's `[admin] token`) and `role`.
+ * the server's `[admin] token`), `role`, and `expiresAt`, the RFC 3339 time the token stops
+ * working (absent when it does not expire).
  */
 export interface AdminIdentity {
   name: string;
   role: "viewer" | "operator" | "admin" | string;
+  expiresAt?: string;
 }
 
 export interface PolicyReload {
   policyIds: string[];
   warnings: string[];
+}
+
+/**
+ * What `POST /admin/operators/reload` changed, by operator name (never a digest): operators
+ * `added`, `removed` and `changed` (role, token or expiry).
+ */
+export interface OperatorsReload {
+  added: string[];
+  removed: string[];
+  changed: string[];
 }
 
 /**
@@ -1002,6 +1014,18 @@ export class AdminClient {
   }
 
   /**
+   * Re-read `[[admin.operators]]` from the server's config file and put them in force (role
+   * `admin`). A list that does not parse, breaks a rule or would leave no `admin` throws
+   * `ApiError` (422) and the operators in force stay as they were.
+   */
+  async operatorsReload(): Promise<OperatorsReload> {
+    const res = await this.http.post("/admin/operators/reload", { json: {} });
+    const b = w.asObject(await w.jsonBody(res), "operators reload");
+    const names = (v: unknown): string[] => (Array.isArray(v) ? v.map(String) : []);
+    return { added: names(b.added), removed: names(b.removed), changed: names(b.changed) };
+  }
+
+  /**
    * The lease, its descendants and ancestors, and how many leases a revoke would change now. A
    * dry run of `revokeLease`: nothing changes, nothing is audited.
    */
@@ -1090,11 +1114,14 @@ export class AdminClient {
     }
   }
 
-  /** The name and role of the admin token this client sends (`GET /admin/whoami`). */
+  /** The name, role and expiry of the admin token this client sends (`GET /admin/whoami`). */
   async whoami(): Promise<AdminIdentity> {
     const res = await this.http.get("/admin/whoami");
     const b = w.asObject(await w.jsonBody(res), "whoami");
-    return { name: String(b.name ?? ""), role: String(b.role ?? "") };
+    const who: AdminIdentity = { name: String(b.name ?? ""), role: String(b.role ?? "") };
+    const expiresAt = opt<string>(b.expires_at);
+    if (expiresAt !== undefined) who.expiresAt = String(expiresAt);
+    return who;
   }
 
   /** The policy set in force: file, digest, load time, ids, warnings and texts. */

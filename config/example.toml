@@ -160,11 +160,15 @@ url = "http://127.0.0.1:3001/mcp"
 # Named operators, each with its own token and a role (ADR-0016): viewer (reads), operator
 # (also revoke leases and decide approvals) or admin (everything). Only the SHA-256 of the
 # token is kept here. `attenuo admin operator new --name alice --role operator` prints a new
-# token once and this entry. Read at startup only: restart after a change.
+# token once and this entry. Read at startup, and again by `attenuo admin operator reload`
+# (POST /admin/operators/reload), which puts a changed list in force without a restart: to
+# withdraw a leaked token, remove its entry and reload. Optional `expires_at` (RFC 3339 with
+# an offset; `--expires-in 90d` writes it): after it the token is refused.
 # [[admin.operators]]
 # name = "alice"
 # token_sha256 = "<64 lowercase hex characters>"
 # role = "operator"
+# expires_at = "2026-12-31T23:59:59Z"
 
 # Trusted identity providers for hop 0. POST /token accepts an OIDC ID token
 # (subject_token_type = urn:ietf:params:oauth:token-type:id_token) or an ID-JAG

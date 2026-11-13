@@ -498,6 +498,7 @@ async fn write_routes_are_absent_without_allow_write() {
     for path in [
         "/admin/leases/x/revoke",
         "/admin/policies/reload",
+        "/admin/operators/reload",
         "/admin/budgets/refund",
     ] {
         let r = Harness::client()

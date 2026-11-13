@@ -27,13 +27,14 @@
 //! | `GET /admin/audit/entries/{seq}`, `/admin/audit/records/{id}`, `/admin/audit/checkpoints` | admin | one entry with its context; stored checkpoints (read-only) |
 //! | `GET /admin/audit/export?from&to` | admin | stream a verifiable slice of the log as JSON Lines |
 //! | `POST /admin/policies/reload` | admin | hot-reload the Cedar policy file |
+//! | `POST /admin/operators/reload` | admin | re-read `[[admin.operators]]` from the config file and swap them in ([`routes::admin::reload_operators`]) |
 //! | `GET /admin/policies` | admin | the policy set in force: ids, text, file digest, load time ([`routes::policies`]) |
 //! | `GET /admin/policies/check` | admin | lint the policy file on disk against the running schema; swaps nothing |
 //! | `POST /admin/policies/evaluate` | admin | dry run: what the loaded policies say about one call, optionally with a stated run-limit state (`budget`); no lease check, no charge, no audit |
 //! | `POST /approvals/{id}` | the originating user's IdP ID token (never a delegation token) | grant or decline a pending approval ([`routes::approvals`]) |
 //! | `GET /approvals/{id}` | the user's ID token, or a delegation token of the same run | the approval: exact call, labels, state, expiry |
 //! | `GET /admin/approvals?chain_id`, `GET /admin/approvals/{id}`, `POST /admin/approvals/{id}` | admin | list, show, and grant or decline as an operator |
-//! | `GET /admin/whoami` | admin | the name and role of the credential that sent the request ([`routes::admin::whoami`]) |
+//! | `GET /admin/whoami` | admin | the name, role and expiry of the credential that sent the request ([`routes::admin::whoami`]) |
 //!
 //! "admin" in the Auth column means an admin credential (`[admin] token` or an
 //! `[[admin.operators]]` entry, [`operators`]) whose role is at least the one
@@ -251,6 +252,7 @@ fn admin_routes(state: &Arc<AppState>) -> Router<Arc<AppState>> {
             post(policies::evaluate_policies),
         )
         .route("/admin/policies/reload", post(admin::reload_policies))
+        .route("/admin/operators/reload", post(admin::reload_operators))
         .route("/admin/approvals", get(approvals::admin_list))
         .route(
             "/admin/approvals/{id}",

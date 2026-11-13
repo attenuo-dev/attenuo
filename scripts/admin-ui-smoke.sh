@@ -102,7 +102,7 @@ code="$(status GET "$UI/admin/audit?limit=1" -H "Authorization: Bearer $ADMIN_TO
 echo "ok  GET /admin/audit with the token: 200"
 # The console's login check: the token's operator and role (ADR-0016).
 who="$(curl -s "$UI/admin/whoami" -H "Authorization: Bearer $ADMIN_TOKEN")"
-[ "$who" = '{"name":"admin","role":"admin"}' ] || fail "GET /admin/whoami answered '$who'"
+[ "$who" = '{"name":"admin","role":"admin","expires_at":null}' ] || fail "GET /admin/whoami answered '$who'"
 echo "ok  GET /admin/whoami with the token: admin, role admin"
 
 # 3. The dev mint is on the main listener only.

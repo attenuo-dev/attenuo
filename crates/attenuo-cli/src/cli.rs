@@ -170,7 +170,8 @@ pub(crate) enum Command {
     /// Generate keys.
     #[command(subcommand)]
     Key(KeyCmd),
-    /// Make admin credentials offline (ADR-0016).
+    /// Admin operators: make their credentials offline, and reload them on the server
+    /// (ADR-0016).
     #[command(subcommand)]
     Admin(AdminCmd),
     /// Check that the server is up (`GET /healthz`), or ready with `--ready` (`GET /readyz`).
@@ -203,7 +204,7 @@ pub(crate) enum OperatorCmd {
     /// Generate a token for a new operator: 32 random bytes, base64url. Prints the token once
     /// on stdout, then the `[[admin.operators]]` entry to add to the server's config, which
     /// holds only the token's SHA-256. Writes nothing to disk and sends nothing to a server;
-    /// the server picks the entry up when it restarts.
+    /// the server picks the entry up on `attenuo admin operator reload` or a restart.
     New {
         /// The operator's name, `[a-z0-9_-]{1,64}` and not `admin`; recorded in the audit
         /// log as `urn:attenuo:admin:<name>`.
@@ -213,10 +214,70 @@ pub(crate) enum OperatorCmd {
         /// decide approvals) or `admin` (everything).
         #[arg(long)]
         role: OperatorRole,
+        /// The token stops working this long from now: a whole number and a unit, `s`, `m`,
+        /// `h` or `d` (`90d`, `12h`). Written into the entry as `expires_at`.
+        #[arg(long, value_name = "DURATION", value_parser = parse_expires_in, conflicts_with = "expires_at")]
+        expires_in: Option<time::Duration>,
+        /// The token stops working at this RFC 3339 time with an offset
+        /// (`2026-12-31T23:59:59Z`), which must be in the future.
+        #[arg(long, value_name = "RFC3339", value_parser = parse_expires_at)]
+        expires_at: Option<time::OffsetDateTime>,
     },
     /// Print the `token_sha256` of a token read from the first line of standard input, for
     /// a token made some other way.
     Hash,
+    /// Ask the server to re-read `[[admin.operators]]` from its config file and put them in
+    /// force without a restart (`POST /admin/operators/reload`, role `admin`). Prints the
+    /// operators added, removed and changed. `[admin] token` is not reloaded. On a refusal
+    /// (a list that does not parse or breaks a rule, or one that would leave no `admin`) the
+    /// operators in force are unchanged.
+    Reload,
+}
+
+/// Longest `--expires-in`: ten years.
+const MAX_EXPIRES_IN_DAYS: i64 = 3650;
+
+/// `--expires-in`: a whole number of `s`, `m`, `h` or `d`, at least one second and at most
+/// [`MAX_EXPIRES_IN_DAYS`] days.
+pub(crate) fn parse_expires_in(s: &str) -> Result<time::Duration, String> {
+    let bad = || {
+        format!("`{s}` is not a duration: write a whole number and a unit, s, m, h or d (like 90d)")
+    };
+    let unit = s.chars().last().ok_or_else(bad)?;
+    let digits = &s[..s.len() - unit.len_utf8()];
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(bad());
+    }
+    let n: i64 = digits.parse().map_err(|_| bad())?;
+    let seconds_per = match unit {
+        's' => 1,
+        'm' => 60,
+        'h' => 3600,
+        'd' => 86_400,
+        _ => return Err(bad()),
+    };
+    let secs = n.checked_mul(seconds_per).ok_or_else(bad)?;
+    if secs < 1 {
+        return Err(format!("`{s}`: the duration must be at least 1s"));
+    }
+    if secs > MAX_EXPIRES_IN_DAYS * 86_400 {
+        return Err(format!(
+            "`{s}`: the duration must be at most {MAX_EXPIRES_IN_DAYS}d"
+        ));
+    }
+    Ok(time::Duration::seconds(secs))
+}
+
+/// `--expires-at`: an RFC 3339 time with an offset, in the future.
+fn parse_expires_at(s: &str) -> Result<time::OffsetDateTime, String> {
+    use time::format_description::well_known::Rfc3339;
+    let t = time::OffsetDateTime::parse(s, &Rfc3339).map_err(|_| {
+        format!("`{s}` is not an RFC 3339 time with an offset (like 2026-12-31T23:59:59Z)")
+    })?;
+    if t <= time::OffsetDateTime::now_utc() {
+        return Err(format!("`{s}` is in the past"));
+    }
+    Ok(t)
 }
 
 /// The role of an admin operator.
@@ -2152,5 +2213,74 @@ mod tests {
             parse(&["policy", "evaluate", "--tool", "t"]).is_err(),
             "--server required"
         );
+    }
+
+    #[test]
+    fn operator_new_takes_one_expiry() {
+        let new = |extra: &[&str]| {
+            let mut a = vec![
+                "admin", "operator", "new", "--name", "a", "--role", "viewer",
+            ];
+            a.extend_from_slice(extra);
+            parse(&a).map(|c| match c.command {
+                Command::Admin(AdminCmd::Operator(OperatorCmd::New {
+                    expires_in,
+                    expires_at,
+                    ..
+                })) => (expires_in, expires_at),
+                _ => panic!("not operator new"),
+            })
+        };
+        assert_eq!(new(&[]).unwrap(), (None, None));
+        assert_eq!(
+            new(&["--expires-in", "90d"]).unwrap().0,
+            Some(time::Duration::days(90))
+        );
+        let at = new(&["--expires-at", "2999-01-01T00:00:00+02:00"])
+            .unwrap()
+            .1
+            .unwrap();
+        assert_eq!(at.offset().whole_hours(), 2);
+        assert!(new(&["--expires-in", "1h", "--expires-at", "2999-01-01T00:00:00Z"]).is_err());
+        assert!(
+            new(&["--expires-at", "2020-01-01T00:00:00Z"]).is_err(),
+            "past"
+        );
+        assert!(
+            new(&["--expires-at", "2999-01-01T00:00:00"]).is_err(),
+            "no offset"
+        );
+        assert!(parse(&["admin", "operator", "reload"]).is_ok());
+    }
+
+    #[test]
+    fn expires_in_is_a_number_and_a_unit() {
+        for (s, secs) in [
+            ("1s", 1),
+            ("30m", 1800),
+            ("12h", 43_200),
+            ("90d", 7_776_000),
+            ("3650d", 315_360_000),
+        ] {
+            assert_eq!(parse_expires_in(s).unwrap().whole_seconds(), secs, "{s}");
+        }
+        for bad in [
+            "",
+            "d",
+            "0s",
+            "1",
+            "1w",
+            "1.5h",
+            "-1d",
+            "+1d",
+            " 1d",
+            "1 d",
+            "1D",
+            "3651d",
+            "99999999999999999999d",
+            "1dé",
+        ] {
+            assert!(parse_expires_in(bad).is_err(), "{bad:?}");
+        }
     }
 }

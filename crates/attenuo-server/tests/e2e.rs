@@ -3551,6 +3551,81 @@ async fn every_refusal_names_its_specific_reason_in_code() {
     )
     .await;
 
+    a.rest(
+        "admin: operators reload without a config file",
+        h.admin_post("/admin/operators/reload", json!({})).await,
+        StatusCode::CONFLICT,
+        Some("reload_unavailable"),
+    )
+    .await;
+    // Named operators (one expired) and a config file to reload them from.
+    let ops_dir = tempfile::tempdir().unwrap();
+    let ops_path = ops_dir.path().join("attenuo.toml");
+    let op_entry = |name: &str, token: &str, role: &str, expires: &str| {
+        format!(
+            "[[admin.operators]]\nname = \"{name}\"\ntoken_sha256 = \"{}\"\nrole = \
+             \"{role}\"\n{expires}",
+            sha256_hex(token)
+        )
+    };
+    let ops_path_cfg = ops_path.clone();
+    let h2 = Harness::start_tweaked(false, move |cfg| {
+        cfg.admin.token = None;
+        cfg.admin.operators = attenuo_server::operators::operators_from_toml(
+            &(op_entry("ada", "ada-token", "admin", "")
+                + &op_entry(
+                    "old",
+                    "old-token",
+                    "viewer",
+                    "expires_at = \"2020-01-01T00:00:00Z\"\n",
+                )),
+        )
+        .unwrap();
+        cfg.source_path = Some(ops_path_cfg);
+    })
+    .await;
+    let reload_as = |token: &'static str| {
+        h2.client
+            .post(h2.url("/admin/operators/reload"))
+            .bearer_auth(token)
+            .send()
+    };
+    a.rest(
+        "admin: expired operator credential",
+        h2.client
+            .get(h2.url("/admin/whoami"))
+            .bearer_auth("old-token")
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::UNAUTHORIZED,
+        Some("admin_credential_expired"),
+    )
+    .await;
+    a.rest(
+        "admin: operators reload of a config file that cannot be read",
+        reload_as("ada-token").await.unwrap(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Some("config_unreadable"),
+    )
+    .await;
+    std::fs::write(&ops_path, "[[admin.operators]\n").unwrap();
+    a.rest(
+        "admin: operators reload of a file that is not TOML",
+        reload_as("ada-token").await.unwrap(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Some("operators_invalid"),
+    )
+    .await;
+    std::fs::write(&ops_path, op_entry("ada", "ada-token", "viewer", "")).unwrap();
+    a.rest(
+        "admin: operators reload that leaves no admin",
+        reload_as("ada-token").await.unwrap(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Some("operators_no_admin"),
+    )
+    .await;
+
     // --- AuthZEN ---
     a.rest(
         "authzen: no bearer",

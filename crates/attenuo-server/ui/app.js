@@ -155,7 +155,7 @@ async function tryLogin(candidate, errorEl) {
   } catch (e) {
     forgetToken();
     errorEl.textContent = e.status === 401
-      ? 'That token was refused.'
+      ? (e.code === 'admin_credential_expired' ? 'That token has expired.' : 'That token was refused.')
       : e.status === 403
         ? 'The server has no admin credential configured ([admin] token or [[admin.operators]]), so the admin API is disabled.'
         : `Could not log in: ${e.message}`;
@@ -169,8 +169,13 @@ function enterConsole() {
   lockBtn.hidden = false;
   const who = getIdentity();
   if (who) {
-    whoEl.textContent = `${who.name} · ${who.role}`;
-    whoEl.title = `Logged in as the operator ${who.name}, role ${who.role}`;
+    // `expires_at` is RFC 3339 or null (ADR-0016): show its date, and the full time on hover.
+    const expires = typeof who.expires_at === 'string' ? who.expires_at : null;
+    whoEl.textContent = expires
+      ? `${who.name} · ${who.role} · expires ${expires.slice(0, 10)}`
+      : `${who.name} · ${who.role}`;
+    whoEl.title = `Logged in as the operator ${who.name}, role ${who.role}`
+      + (expires ? `; the token expires at ${expires}` : '');
     whoEl.hidden = false;
   }
   clearStatus();

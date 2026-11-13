@@ -741,11 +741,13 @@ async fn a_named_operator_decides_and_is_recorded_a_viewer_cannot_adr0016() {
                 name: "bob".into(),
                 token_sha256: token_sha256_hex("bob-token"),
                 role: AdminRole::Operator,
+                expires_at: None,
             },
             AdminOperator {
                 name: "vera".into(),
                 token_sha256: token_sha256_hex("vera-token"),
                 role: AdminRole::Viewer,
+                expires_at: None,
             },
         ];
     })
