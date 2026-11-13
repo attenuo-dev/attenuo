@@ -2,7 +2,7 @@
 # Local pre-push checks: fmt, clippy, tests, and the three scripted demos.
 #
 #   scripts/dev.sh            # everything
-#   scripts/dev.sh fmt|clippy|test|demo|policy|docs|deny|links|fuzz   # one step
+#   scripts/dev.sh fmt|clippy|test|demo|guide|policy|docs|deny|links|fuzz   # one step
 #
 # Mirrors .github/workflows/ci.yml. Steps whose tool is not installed (cargo-deny) are skipped
 # with a note rather than failing.
@@ -16,6 +16,7 @@ demo()   {
   bash examples/github-leak-demo/run.sh && bash examples/multi-hop-demo/run.sh \
     && bash examples/idp-exchange-demo/run.sh
 }
+guide()  { bash scripts/check-getting-started.sh; }
 policy() {
   cargo run -q -p attenuo-cli -- policy test examples/github-leak-demo/policy_test.yaml examples/multi-hop-demo/policy_test.yaml
   cargo run -q -p attenuo-cli -- policy test --fail-on-unexercised config/policies/*_test.yaml
@@ -35,11 +36,11 @@ run() {
 
 if [ "$#" -eq 0 ]; then
   for step in fmt clippy test demo; do run "$step"; done
-  printf '\nfmt, clippy, test and demo passed. CI also runs: policy docs links deny fuzz\n'
+  printf '\nfmt, clippy, test and demo passed. CI also runs: guide policy docs links deny fuzz\n'
 else
   for step in "$@"; do
     case "$step" in
-      fmt|clippy|test|demo|policy|docs|links|deny|fuzz) run "$step" ;;
+      fmt|clippy|test|demo|guide|policy|docs|links|deny|fuzz) run "$step" ;;
       *) echo "unknown step: $step" >&2; exit 2 ;;
     esac
   done

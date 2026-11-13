@@ -3,7 +3,8 @@ name: CI
 # Where each check runs (docs/research/ci-minutes-2026-11-05.md has the numbers):
 # - every pull request: everything below except the macOS tests, the nightly fuzz build and
 #   the docker compose demo (those two run on a pull request that changes their files); a pull
-#   request that only touches documentation (see the `changes` job) runs only the link check.
+#   request that only touches documentation (see the `changes` job) runs only the link check,
+#   and the getting-started check when it changes that guide.
 # - every push to main: the same, plus the nightly fuzz build and the docker compose demo.
 # - weekly (Monday) and on manual dispatch: everything, including the macOS tests.
 # macOS minutes are billed at 10x on a private repository and the hosted macOS arm64 pool often
@@ -55,6 +56,7 @@ jobs:
       rust: ${{ github.event_name != 'pull_request' || steps.filter.outputs.rust == 'true' }}
       fuzz: ${{ github.event_name != 'pull_request' || steps.filter.outputs.fuzz == 'true' }}
       docker: ${{ github.event_name != 'pull_request' || steps.filter.outputs.docker == 'true' }}
+      guide: ${{ github.event_name != 'pull_request' || steps.filter.outputs.guide == 'true' }}
     steps:
       - id: filter
         if: github.event_name == 'pull_request'
@@ -78,6 +80,10 @@ jobs:
             # The image and compose files, the compose demo's config and its test.
             docker:
               - "{Dockerfile,.dockerignore,docker-compose.yml,examples/github-leak-demo/config.docker.toml,scripts/compose-smoke.sh,.github/workflows/ci.yml}"
+            # The getting-started guide is documentation, which `rust` leaves out, but its
+            # commands are checked by running them (the `getting-started` job).
+            guide:
+              - "{docs/guides/getting-started.md,scripts/check-getting-started.sh}"
 
   fmt:
     name: rustfmt
@@ -109,7 +115,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-  # The test, demo, policy-tests and console-browser jobs build the same debug dependencies with
+  # The test, demo, getting-started, policy-tests and console-browser jobs build the same debug dependencies with
   # the same flags, so they share one cache (`shared-key: debug`), written by this job on main.
   test:
     name: test (ubuntu-latest, stable)
@@ -242,6 +248,25 @@ jobs:
       # The admin console listener against the real binary: page and CSP, admin token, no dev mint.
       - name: Admin console smoke test
         run: bash scripts/admin-ui-smoke.sh
+
+  # Runs every command of docs/guides/getting-started.md in order, as a reader would, against
+  # the debug binaries its step 1 builds, and checks the outputs the guide shows
+  # (scripts/check-getting-started.sh). On every pull request that can change Rust, and on one
+  # that changes only the guide or the script.
+  getting-started:
+    name: getting-started guide
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.guide == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: debug
+          save-if: false
+      - run: bash scripts/check-getting-started.sh
 
   # Builds the release and demo images and plays the leak demo through docker-compose.yml
   # (scripts/compose-smoke.sh): release image contents, `attenuo health` as the HEALTHCHECK, the
@@ -398,7 +423,7 @@ jobs:
   ci-ok:
     name: ci-ok
     if: always()
-    needs: [changes, fmt, clippy, test, msrv, deny, audit, demo, compose, console-browser, policy-tests, fuzz-check, fuzz-build, docs]
+    needs: [changes, fmt, clippy, test, msrv, deny, audit, demo, getting-started, compose, console-browser, policy-tests, fuzz-check, fuzz-build, docs]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

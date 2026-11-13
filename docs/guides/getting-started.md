@@ -1,5 +1,7 @@
 # Getting started
 
+<!-- scripts/check-getting-started.sh (CI job getting-started) runs every sh block of this page in order and compares its output with the text or json block right after it. Run it when you change a command or an output here. The "check:" comments before some blocks tell it how to run them. -->
+
 This guide takes you from a fresh checkout to a working proxy. You build attenuo, start it in front of an MCP server, mint a token, make an allowed call and a denied call, revoke the token, and read the audit log. It takes about ten minutes, most of it compiling.
 
 attenuo is pre-alpha. This guide runs everything on one machine and uses a development shortcut for the first token. [Identity providers](identity-providers.md) shows how to replace the shortcut with a real login. [Deploying](deploying.md) covers what to change before anyone else can reach the server.
@@ -12,6 +14,7 @@ attenuo is pre-alpha. This guide runs everything on one machine and uses a devel
 
 ## 1. Build
 
+<!-- check: build -->
 ```sh
 git clone https://github.com/attenuo-dev/attenuo.git
 cd attenuo
@@ -109,12 +112,14 @@ The config has more keys than this. `config/example.toml` in the repository is t
 
 In one terminal:
 
+<!-- check: background -->
 ```sh
 $REPO/target/debug/examples/fake_mcp --port 3001
 ```
 
 In a second terminal, from `~/attenuo-try` (set `REPO` again there):
 
+<!-- check: background -->
 ```sh
 $REPO/target/debug/attenuo-server --config attenuo.toml
 ```
@@ -205,6 +210,7 @@ ALLOWED
 
 Now one that should fail. `coder` was never given `create_issue`:
 
+<!-- check: exit 2 -->
 ```sh
 attenuo call --upstream github --tool create_issue --arg repo=acme/api --arg title=x
 echo $?
@@ -227,7 +233,7 @@ curl -s -X POST http://127.0.0.1:8080/mcp/github \
 ```
 
 ```json
-{"jsonrpc":"2.0","id":2,"error":{"code":-32003,"message":"attenuo: denied: capability_denied","data":{"reason":"capability_denied","decision_id":"98849dc3-f053-4649-9b1a-fae0c2f11426","untrusted_args":[{"arg":"repo","seq":5,"kind":"leaf"},{"arg":"repo","seq":5,"kind":"entity"}]}}}
+{"jsonrpc":"2.0","id":2,"error":{"code":-32003,"message":"attenuo: denied: capability_denied","data":{"reason":"capability_denied","decision_id":"98849dc3-f053-4649-9b1a-fae0c2f11426","untrusted_args":[{"arg":"repo","seq":5,"kind":"leaf"},{"arg":"repo","seq":5,"kind":"entity"}],"code":"capability_denied"}}}
 ```
 
 `untrusted_args` says that the `repo` argument copies text from an untrusted tool result of this run, audit entry 5: the fake server echoed `acme/api` back in its answer to the `read_file` call. Policies can act on that ([output labelling](../design/output-labelling.md)); here the capability check refused the call first.
@@ -236,6 +242,7 @@ curl -s -X POST http://127.0.0.1:8080/mcp/github \
 
 Revoking a lease cuts off that hop and everything delegated from it. Revoke the root lease:
 
+<!-- check: exit 2 -->
 ```sh
 attenuo lease revoke "$ROOT_LEASE" --reason "trying it out"
 attenuo call --upstream github --tool read_file --arg repo=acme/api --arg path=README.md
