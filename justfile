@@ -60,9 +60,11 @@ hygiene:
 fuzz-check:
     RUSTFLAGS="--cfg fuzzing -D warnings" cargo check --manifest-path fuzz/Cargo.toml --bins --examples --locked
 
-# the Lean proof of the covering rule: build, no sorry, standard axioms only (proofs/lean/README.md)
+# the Lean proof of the covering rule: build, no sorry, standard axioms only; then the model
+# against the Rust code on generated cases (proofs/lean/README.md)
 lean:
     bash scripts/check-lean.sh
+    bash scripts/check-lean-differential.sh
 
 # cargo-deny (cargo install cargo-deny)
 deny:

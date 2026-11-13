@@ -85,9 +85,10 @@ jobs:
             # out, but their commands are checked by running them (the `getting-started` job).
             guide:
               - "{docs/guides/getting-started.md,README.md,scripts/check-getting-started.sh,scripts/check-doc-commands.sh}"
-            # The Lean proof of the covering rule and its check.
+            # The Lean proof of the covering rule, its checks, and the Rust code and test the
+            # differential check runs against it.
             lean:
-              - "{proofs/lean/**,scripts/check-lean.sh,.github/workflows/ci.yml}"
+              - "{proofs/lean/**,scripts/check-lean.sh,scripts/check-lean-differential.sh,crates/attenuo-core/**,Cargo.lock,.github/workflows/ci.yml}"
 
   fmt:
     name: rustfmt
@@ -398,8 +399,10 @@ jobs:
           done
 
   # Builds the Lean model of the covering rule (proofs/lean) and checks that it has no `sorry`
-  # and only Lean's standard axioms. elan's installer is pinned to the v4.2.4 commit; elan then
-  # installs the toolchain proofs/lean/lean-toolchain names. Core Lean only, no Mathlib.
+  # and only Lean's standard axioms, then runs the model against the Rust code on the cases of
+  # crates/attenuo-core/tests/lean_differential.rs. elan's installer is pinned to the v4.2.4
+  # commit; elan then installs the toolchain proofs/lean/lean-toolchain names. Core Lean only,
+  # no Mathlib.
   lean:
     name: Lean proof of the covering rule
     needs: changes
@@ -414,6 +417,12 @@ jobs:
           sh "$RUNNER_TEMP/elan-init.sh" -y --default-toolchain none --no-modify-path
           echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
       - run: bash scripts/check-lean.sh
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: debug
+          save-if: false
+      - run: bash scripts/check-lean-differential.sh
 
   # The Markdown link check runs on every pull request, documentation-only ones included;
   # rustdoc runs when Rust can have changed.
