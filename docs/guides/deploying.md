@@ -10,7 +10,7 @@ attenuo is pre-alpha. Do not treat this guide as a statement that it is ready fo
 - **SQLite only.** The audit log and the lease registry live in the same SQLite file, in WAL mode. Store calls run on the blocking pool, and audit appends go through one writer thread that commits whatever is queued in one transaction (group commit). On a shared 4-core development container a file-backed server handled about 3,000 to 4,500 calls per second at one hop (memory: about 5,000 to 6,600); see [design/performance.md](../design/performance.md) for the method and the caveats.
 - **No high availability.** If the process is down, every call through the proxy fails. That is by design: attenuo fails closed. Do not start a second replica against the same file, or against a copy. Against a copy, each process keeps its own idea of which leases are revoked and how much of a run limit is spent. Against the same file, the lease registry and the counters are shared, but the state that makes a credential single use, the locks that serialise a run's budgeted decisions and a user's decisions under a per-user window, and the loaded policy set live in each process, so a credential can be redeemed once per replica and a reload reaches one replica only. Per-user windows (`context.usage.user_window`) are therefore a single-replica guarantee: against a copy each replica keeps its own windows, so a user gets the cap once per replica, and against the same file two replicas can each pass a call the window should have stopped. A window that guards money should also run at `[audit] durability = "full"`: at `"normal"` a power failure can drop the newest commits, and a lost window charge can be spent again in the same window (a call that also charges a `sum` limit already commits with a full sync). The inventory is in [multi-replica readiness](../design/multi-replica.md) (proposed).
 - **No TLS.** The server speaks plain HTTP. Terminate TLS in front of it.
-- **One static admin token.** There are no operator accounts or roles. Admin actions (lease revocations, policy reloads, development root mints) are recorded in the audit log as `by urn:attenuo:admin`, a subject no identity provider can issue (the `urn:attenuo:` prefix is reserved).
+- **Static admin tokens.** Each operator can have a token of its own with a role (`[[admin.operators]]`, [ADR-0016](../decisions/0016-admin-operators.md)): `viewer`, `operator` (also revokes and decides approvals) or `admin`. There is no login, no expiry and no rotation short of editing the config and restarting. Admin actions (lease revocations, policy reloads, refunds, development root mints, operator approvals) are recorded in the audit log under the operator, `urn:attenuo:admin:<name>`, or `urn:attenuo:admin` for the single `[admin] token`; the `urn:attenuo:` prefix is reserved, so no identity provider can issue such a subject.
 - **Metrics on a side listener only.** `GET /metrics` (Prometheus text) is served on its own loopback listener when you enable it, with no authentication. See [What to monitor](#what-to-monitor).
 - **Manual key rotation with no overlap.** See [Key rotation](#key-rotation).
 
@@ -22,7 +22,7 @@ Go through this before pointing anything real at the server.
 
 - [ ] `[dev] allow_root_mint` is `false` or absent. With it on, anyone holding the admin token can mint a root token for any user. When the admin API's listener (`[admin] listen`, else `[server] listen`) is not loopback the server refuses to start with it; `[dev] allow_root_mint_off_loopback` exists only for the docker-compose demo and must not appear in your config.
 - [ ] Root tokens come from a real identity provider: `[[idps]]`, `[[agents]]`, `[[root_grants]]`. See [Identity providers](identity-providers.md).
-- [ ] The admin token (`[admin] token`, or `ATTENUO_ADMIN_TOKEN`, which overrides it) is a long random value that is not in any example, not in version control and not shared with agents. Generate it with `openssl rand -hex 32`. Off a loopback `listen` address the server refuses to start without one, with one shorter than 32 bytes, or with a known placeholder; it cannot tell whether your token was leaked.
+- [ ] Each person who operates the server has an `[[admin.operators]]` entry of their own with the least role they need (`attenuo admin operator new --name <name> --role viewer|operator|admin`), so the audit log names who acted; see [admin operators](#admin-operators). If you keep `[admin] token` (or `ATTENUO_ADMIN_TOKEN`, which overrides it), it is a long random value that is not in any example, not in version control and not shared with agents. Generate it with `openssl rand -hex 32`. Off a loopback `listen` address the server refuses to start with no admin credential at all, or with an `[admin] token` shorter than 32 bytes or a known placeholder; it cannot tell whether a token was leaked.
 - [ ] Every agent that receives a token is an `[[agents]]` entry with its own secret: token exchanges authenticate as their `actor` (`[token] require_actor_auth`, on by default).
 - [ ] `[policy] unknown_tools` is `deny` (the default) or `sensitive`, not `allow`.
 - [ ] `/admin/*` is not reachable from the networks agents live on: `[admin] listen` gives it a port of its own. See [Network exposure](#network-exposure).
@@ -33,7 +33,7 @@ Go through this before pointing anything real at the server.
 - [ ] `[issuer] issuer` is the URL clients will use, for example `https://attenuo.example.com`. It becomes the `iss` of every token, and changing it later invalidates tokens. `[server] public_url` is set to the same base URL so the AuthZEN discovery document points at the right host. Off a loopback `listen` address the server refuses to start without it.
 - [ ] `[policy] policies_path` points at your policy, and the catalog lists every tool a policy names.
 - [ ] Every tool on the upstream that agents should call is in the catalog. With the default `[policy] unknown_tools = "deny"`, a tool missing from the catalog is denied with `tool_not_in_catalog`; with `"allow"` it is neither `readonly` nor `sensitive`, so rules that depend on those attributes do not see it.
-- [ ] The config file is mode 0600. It holds secret hashes and possibly the admin token. The admin token can come from `ATTENUO_ADMIN_TOKEN` instead, `[telemetry]` reads the standard `OTEL_*` variables ([observability](observability.md)), and any scalar key can be set with an `ATTENUO__<SECTION>__<KEY>` variable ([environment overrides](../reference/config.md#environment-overrides)). The file is still read, and lists and arrays of tables (`[[agents]]`, `[[upstreams]]`, ...) come only from it. Nothing is substituted inside the file.
+- [ ] The config file is mode 0600, and only the people allowed to be admins can edit it: whoever can edit it can add an `[[admin.operators]]` entry with role `admin`. It holds secret hashes and possibly the admin token. The admin token can come from `ATTENUO_ADMIN_TOKEN` instead, `[telemetry]` reads the standard `OTEL_*` variables ([observability](observability.md)), and any scalar key can be set with an `ATTENUO__<SECTION>__<KEY>` variable ([environment overrides](../reference/config.md#environment-overrides)). The file is still read, and lists and arrays of tables (`[[agents]]`, `[[upstreams]]`, ...) come only from it. Nothing is substituted inside the file.
 - [ ] You have read the [threat model](../spec/threat-model.md) section "What attenuo does not prevent" and have decided how the agents' other routes (direct API keys, local STDIO servers) are closed.
 - [ ] `[limits]` fits your load: `max_in_flight` above your peak of concurrent requests, and the rate limits (off by default) set for your busiest legitimate run and agent if you want one caller kept from crowding out the rest. See [Load limits](#load-limits).
 - [ ] Something checks `attenuo audit verify` on a schedule, and `[audit.sink]` ships checkpoints off the host ([audit log](../concepts/audit-log.md#shipping-checkpoints-off-the-host)). The server signs checkpoints itself (`[audit] checkpoint_every`, `checkpoint_interval_seconds`); `audit verify` reports the last signed `seq`.
@@ -51,7 +51,7 @@ The routes fall into three groups:
 | `/admin/*` | Operators only |
 | `GET /healthz` | Your health checker |
 
-Without `[admin] listen`, `/admin` is on the same listener as everything else. On `127.0.0.1` that is fine for local use. Off loopback the static admin token would be the only thing between the agents' network and "revoke any lease, reload policy, read the audit log", so the server refuses to start that way. Give the admin API a listener of its own:
+Without `[admin] listen`, `/admin` is on the same listener as everything else. On `127.0.0.1` that is fine for local use. Off loopback the admin tokens would be the only thing between the agents' network and "revoke any lease, reload policy, read the audit log", so the server refuses to start that way. Give the admin API a listener of its own:
 
 ```toml
 [server]
@@ -107,15 +107,31 @@ attenuo is an inline, fail-closed decision point: when it is down or swamped, ev
 
 Your reverse proxy or load balancer is still the place for connection limits per client address and for limits across replicas; attenuo does not read `X-Forwarded-For`.
 
-## Admin token handling
+## Admin operators
 
-- The token is compared in constant time, and a missing token disables `/admin` (403) rather than opening it.
-- It sits in the config file in clear text. Treat the file as a secret: mode 0600, not in the image, not in the repository, not in a CI log. In Docker or Kubernetes, mount the whole file from a secret.
-- Operators pass it to the CLI with `ATTENUO_ADMIN_TOKEN`, `--admin-token-stdin` or `--admin-token-file`. `--admin-token` still works but prints a warning, since command-line arguments show up in process listings (`ps`, `/proc/<pid>/cmdline`) and shell history. The same goes for an agent's client secret (`ATTENUO_CLIENT_SECRET`, `--client-secret-stdin`, `--client-secret-file`).
-- Rotating it means editing the file and restarting. There is no overlap window and no way to have two tokens.
-- Do not hand the admin token to agents. It can revoke any lease and read all audit entries. Agents use delegation tokens only.
+Give each person who operates the server a token of their own, with the least role they need ([ADR-0016](../decisions/0016-admin-operators.md), [config](../reference/config.md#adminoperators)):
 
-This is the weakest part of v0. Real operator authentication is on the [task board](../tasks/board.md).
+```sh
+attenuo admin operator new --name alice --role operator
+```
+
+prints a new token once and the entry to add to the config file:
+
+```toml
+[[admin.operators]]
+name = "alice"
+token_sha256 = "<64 lowercase hex characters>"
+role = "operator"
+```
+
+Restart the server; operators are read at startup only. Hand the token to alice over a secure channel; the file keeps only its SHA-256. `viewer` reads (the audit log, its export, leases, policies, approvals), `operator` also revokes leases and decides approvals, `admin` does everything (policy reload, budget refunds, the dev root mint). A role too low gets 403 `admin_role_insufficient`. `GET /admin/whoami` (and the console's header) says which operator a token is. In the audit log, each admin action and operator approval names `urn:attenuo:admin:<name>`.
+
+- Every token is compared, as a SHA-256 digest, in constant time against every credential; with no credential configured `/admin` answers 403 rather than opening.
+- `[admin] token` still works as before: it is the operator `admin` with role `admin`, recorded as `urn:attenuo:admin`, so its records do not say which person used it. It sits in the config file in clear text (or comes from `ATTENUO_ADMIN_TOKEN`). Treat the file as a secret either way: mode 0600, not in the image, not in the repository, not in a CI log. In Docker or Kubernetes, mount the whole file from a secret. Once everyone has an operator entry, remove `[admin] token`.
+- Operators pass their token to the CLI with `ATTENUO_ADMIN_TOKEN`, `--admin-token-stdin` or `--admin-token-file`. `--admin-token` still works but prints a warning, since command-line arguments show up in process listings (`ps`, `/proc/<pid>/cmdline`) and shell history. The same goes for an agent's client secret (`ATTENUO_CLIENT_SECRET`, `--client-secret-stdin`, `--client-secret-file`).
+- Rotating or withdrawing a token means editing the file and restarting. To rotate without a gap, add a second entry for the same person (`alice-2`) with a new token, restart, switch, then remove the old entry and restart again. Tokens do not expire.
+- Do not hand an admin token to agents. Even a `viewer` token reads every audit entry. Agents use delegation tokens only.
+- Whoever can edit the config file, or set `ATTENUO_ADMIN_TOKEN` in the server's environment, can make themselves an admin. There is no login, no second factor and no per-operator rate limit; the [threat model](../spec/threat-model.md) (A8) lists what is and is not covered.
 
 ## Key rotation
 

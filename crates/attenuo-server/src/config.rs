@@ -1580,12 +1580,13 @@ fn seconds_or_off(seconds: u64) -> Option<time::Duration> {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AdminSection {
-    /// Static bearer token for `/admin/*`. When unset, every admin endpoint answers 403.
-    /// v0 only: replace with real operator authentication before exposing the server.
+    /// Static bearer token for `/admin/*`: the operator `admin`, role `admin`, recorded as
+    /// `urn:attenuo:admin` (ADR-0016). With neither this nor [`operators`](Self::operators),
+    /// every admin endpoint answers 403.
     ///
-    /// Outside a loopback `listen` address the server refuses to start when this is missing,
-    /// shorter than [`MIN_ADMIN_TOKEN_LEN`] bytes or a known placeholder; on loopback it only
-    /// warns. Generate one with `openssl rand -hex 32`, or set [`ADMIN_TOKEN_ENV`].
+    /// Outside a loopback `listen` address the server refuses to start when no admin
+    /// credential is configured, or when this is set and shorter than [`MIN_ADMIN_TOKEN_LEN`]
+    /// bytes or a known placeholder; on loopback it only warns. Generate one with `openssl rand -hex 32`, or set [`ADMIN_TOKEN_ENV`].
     #[serde(default)]
     pub token: Option<String>,
     /// Serve the admin API (`/admin/*`) on a listener of its own at this address, and not on
