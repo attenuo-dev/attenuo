@@ -92,3 +92,7 @@ harness = false
 [[bench]]
 name = "audit_reads"
 harness = false
+
+[[bench]]
+name = "token_cache"
+harness = false
