@@ -1,6 +1,6 @@
 # Demo recordings
 
-Terminal recordings of the two end-to-end demos. Both use a fake GitHub MCP server on loopback, with no model and no real GitHub. The credentials on screen are the fixture values from the demo configs.
+Terminal recordings of two of the end-to-end demos, the GitHub leak demo and the multi-hop demo (the [IdP exchange demo](https://github.com/attenuo-dev/attenuo/blob/main/examples/idp-exchange-demo/README.md) has no recording). Both use a fake GitHub MCP server on loopback, with no model and no real GitHub. The credentials on screen are the fixture values from the demo configs.
 
 ## GitHub leak demo
 
