@@ -123,6 +123,24 @@ pub enum AuditError {
         /// [`SCHEMA_VERSION`](crate::SCHEMA_VERSION), the newest this build knows.
         supported: u32,
     },
+    /// The database's directory is on a network filesystem
+    /// ([`Filesystem::Network`](crate::Filesystem::Network)), where SQLite's WAL mode and the
+    /// single-writer fence's lock are not reliable. The server refuses to start on it unless
+    /// `[audit] allow_network_filesystem` is set.
+    #[error(
+        "{} is on a network filesystem ({fs}): SQLite in WAL mode needs every process on one \
+         host, and file locks there may not keep a second writer out, so the audit log and \
+         lease registry could be corrupted. Put sqlite_path on a local disk or a volume one \
+         host mounts (a ReadWriteOnce volume), or set `[audit] allow_network_filesystem = \
+         true` if only one host ever mounts this filesystem and its locking works.",
+        dir.display()
+    )]
+    NetworkFilesystem {
+        /// The directory that holds the database, after symbolic links are resolved.
+        dir: std::path::PathBuf,
+        /// The filesystem's usual name (`"nfs"`, `"cifs"`, `"9p"`, ...).
+        fs: &'static str,
+    },
 }
 
 impl<T> From<std::sync::PoisonError<T>> for AuditError {

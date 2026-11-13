@@ -58,6 +58,8 @@ glob-match = "0.2"
 rand = "0.8"
 ring = "0.17"
 tempfile = "3"
+# `statfs(2)` for the network-filesystem check (attenuo-audit); the version tempfile already uses.
+rustix = { version = "1.1", features = ["fs"] }
 async-trait = "0.1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 bytes = "1"

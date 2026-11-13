@@ -291,6 +291,7 @@ impl From<attenuo_audit::AuditError> for ApiError {
             | E::Jwks(_)
             | E::BindingConflict(_)
             | E::Fenced { .. }
+            | E::NetworkFilesystem { .. }
             | E::Overloaded(_)
             | E::SchemaTooNew { .. }) => ApiError::internal(e),
         }
@@ -463,6 +464,10 @@ mod tests {
                 found: 2,
                 supported: 1,
             },
+            E::NetworkFilesystem {
+                dir: "/mnt/nfs/attenuo".into(),
+                fs: "nfs",
+            },
         ]
     }
 
@@ -501,6 +506,8 @@ mod tests {
                 E::Overloaded(_) => (20, true),
                 // Only at start-up, which it stops.
                 E::SchemaTooNew { .. } => (21, true),
+                // Only at start-up, which it stops.
+                E::NetworkFilesystem { .. } => (22, true),
             }
         }
         let all = one_of_each_audit_error();
