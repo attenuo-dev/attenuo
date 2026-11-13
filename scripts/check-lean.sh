@@ -30,7 +30,7 @@ fi
 
 fail() { echo "error: $*" >&2; exit 1; }
 
-sources=(Attenuo.lean PrintAxioms.lean $(find Attenuo -name '*.lean' | sort))
+sources=(Attenuo.lean PrintAxioms.lean Differential.lean $(find Attenuo -name '*.lean' | sort))
 
 # 1. Nothing in the sources that skips a proof or adds an assumption.
 if grep -nE '\b(sorry|admit|native_decide|implemented_by)\b|^\s*(@\[[^]]*\]\s*)?((private|protected|noncomputable|unsafe)\s+)*(axiom|opaque)\b|@\[extern' \
@@ -38,7 +38,8 @@ if grep -nE '\b(sorry|admit|native_decide|implemented_by)\b|^\s*(@\[[^]]*\]\s*)?
   fail "the Lean sources above hold sorry, admit, an axiom or another escape hatch"
 fi
 
-# 2. The build, with warnings as errors (a `sorry` the grep missed is a warning).
+# 2. The build, with warnings as errors (a `sorry` the grep missed is a warning): the library
+# and the `differential` executable (scripts/check-lean-differential.sh runs it).
 lake build --wfail
 
 # 3. The axioms under the main theorems: only Lean's standard three.

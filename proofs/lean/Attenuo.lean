@@ -8,3 +8,5 @@ import Attenuo.Constraint
 import Attenuo.Capability
 import Attenuo.Chain
 import Attenuo.Examples
+import Attenuo.Concrete
+import Attenuo.Cases

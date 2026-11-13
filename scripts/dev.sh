@@ -36,8 +36,11 @@ policy() {
 docs()   { RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps; }
 links()  { python3 scripts/check-links.py; }
 fuzz()   { RUSTFLAGS="--cfg fuzzing -D warnings" cargo check --manifest-path fuzz/Cargo.toml --bins --examples --locked; }
-# The Lean proof of the covering rule (proofs/lean/README.md); skipped when Lean is not installed.
-lean()   { bash scripts/check-lean.sh --if-installed; }
+# The Lean proof of the covering rule and its differential test against the Rust code
+# (proofs/lean/README.md); skipped when Lean is not installed.
+lean()   {
+  bash scripts/check-lean.sh --if-installed && bash scripts/check-lean-differential.sh --if-installed
+}
 deny() {
   if cargo deny --version >/dev/null 2>&1; then cargo deny check
   else echo "cargo-deny not installed, skipping (cargo install cargo-deny)"; fi

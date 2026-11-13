@@ -39,7 +39,7 @@ The three reference pages are checked against the code by tests that fail with t
 
 The MSRV (`rust-version` in `Cargo.toml`) is checked in CI only.
 
-`scripts/check-lean.sh` (`scripts/dev.sh lean`, `just lean`, the `lean` CI job) builds the Lean model and proof of the covering rule in `proofs/lean/` and fails on `sorry` or a non-standard axiom. It needs Lean, installed with elan ([proofs/lean/README.md](proofs/lean/README.md#running-it)); `scripts/dev.sh lean` skips it when Lean is missing. If you change `covers`, `implies`, `permits`, `attenuate` or a constraint kind in `crates/attenuo-core/src/capability.rs`, change the model to match and run it.
+`scripts/check-lean.sh` (`scripts/dev.sh lean`, `just lean`, the `lean` CI job) builds the Lean model and proof of the covering rule in `proofs/lean/` and fails on `sorry` or a non-standard axiom. It needs Lean, installed with elan ([proofs/lean/README.md](proofs/lean/README.md#running-it)); `scripts/dev.sh lean` skips it when Lean is missing. `scripts/check-lean-differential.sh` (run by the same three after it) runs the model, as a program, against the Rust code on the cases `crates/attenuo-core/tests/lean_differential.rs` writes, and fails on any case where their answers differ. If you change `covers`, `implies`, `permits`, `attenuate` or a constraint kind in `crates/attenuo-core/src/capability.rs`, change the model to match and run both.
 
 ### Property tests
 
