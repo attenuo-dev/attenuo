@@ -459,14 +459,19 @@ The harness builds a real `DelegationChain` and calls the same `PolicyEngine::au
 attenuo policy test policy_test.yaml [more.yaml ...] [--fail-on-unexercised] [--schema-file F] [--watch] [--json]
 ```
 
-```
+For example, with a policy `loose_read` that permits every `read_file` appended to the demo's `policy.cedar`, and the four-agent case taken out of its `policy_test.yaml` (the first lines of the run):
+
+```text
 examples/github-leak-demo/policy_test.yaml
-  ✓ coder may read a public repo  (allow: policy_allow [read_file_public_repos_only])
+  ✗ coder may read a public repo  (allow: policy_allow [loose_read, read_file_public_repos_only])
+      expected policy_ids [read_file_public_repos_only], got [loose_read, read_file_public_repos_only]
   ✗ the injected read of a private repo is denied  (allow: policy_allow [loose_read])
       expected deny, got allow (policy_allow)
+      expected reason policy_deny, got policy_allow
+  ...
 
-8 passed, 1 failed (9 cases in 1 file)
-1 of 5 policies not exercised:
+7 passed, 3 failed (10 cases in 1 file)
+1 of 6 policies not exercised:
   examples/github-leak-demo/policy.cedar:37  forbid_deep_chains
 ```
 
