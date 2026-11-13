@@ -154,7 +154,7 @@ The PEM is the most sensitive file attenuo owns. Whoever has it can mint any tok
 
 Placement:
 
-- Put it on local, durable storage that the service user owns. SQLite over NFS or other network file systems is a known source of locking trouble.
+- Put it on local, durable storage that the service user owns. The server refuses to start when the file's directory is on a network filesystem; see [Not on a network filesystem](#not-on-a-network-filesystem).
 - Keep it away from anything agents can reach. Whoever can write the file can rewrite the log and un-revoke leases.
 - In a container, mount a volume. The image's working directory is `/var/lib/attenuo`, owned by the `attenuo` user (uid 10001).
 - Watch free disk space. An audit append that fails turns the decision into a deny with reason `audit_error`, so a full disk stops all calls and token issuance. That is the fail-closed rule working as designed.
@@ -194,7 +194,7 @@ This changes how you roll out a new version. Anything that starts the new instan
 
 - **Docker Compose, systemd, a VM pair:** stop the old instance before starting the new one; a failover script must make sure the old host has let go of the volume.
 
-The lock is a `flock` advisory lock. It is reliable on a local disk and on a `ReadWriteOnce` volume mounted by one host. It is not a cluster lock: do not put the file on NFS (SQLite's WAL mode does not work there either).
+The lock is a `flock` advisory lock. It is reliable on a local disk and on a `ReadWriteOnce` volume mounted by one host. It is not a cluster lock: do not put the file on NFS (SQLite's WAL mode does not work there either, and the server refuses it, below).
 
 Durability (`[audit] durability`):
 
@@ -209,6 +209,24 @@ Backup:
 - Know what a restore does. Restoring an old backup rewinds the lease registry, so a lease revoked after the backup is live again, and it cuts the audit log back to that point. After a restore, revoke anything that was revoked since, and note the gap.
 - Copy `GET /admin/audit/checkpoint` (`{seq, head_hash, at, kid, signature}`) somewhere the server's host cannot write, such as a ticket system or a separate log store. A hash chain proves the log was not edited in the middle. It does not prove nobody truncated the end or rebuilt the chain. The server signs a checkpoint every `[audit] checkpoint_every` entries and every `checkpoint_interval_seconds`, and `audit verify` rejects a log that is shorter than a stored checkpoint or whose hash at that `seq` differs. The signing key is the server's own, so a checkpoint stored only on the host will not help if the server process is compromised. Set `[audit.sink]` (webhook, a file on another mount, or S3) so each checkpoint leaves the host when it is signed, with credentials that can add but not overwrite; then `attenuo audit verify --file export.jsonl --jwks jwks.json --checkpoints shipped.jsonl` shows any checkpoint signed again after it was shipped. Alert on `audit_sink_dropped_total` and on `readyz` reporting `"degraded": true`.
 - Keep retired signing keys in `[issuer] previous_key_paths` for as long as you want old checkpoints to verify. Without the old key in the JWKS, a checkpoint it signed is reported invalid.
+
+### Not on a network filesystem
+
+Before it takes the lock, the server asks the operating system which filesystem holds the database's directory (`statfs`, after symbolic links are resolved) and refuses to start on a network filesystem:
+
+```text
+Error: checking the filesystem of /mnt/nfs/attenuo/attenuo.sqlite
+
+Caused by:
+    /mnt/nfs/attenuo is on a network filesystem (nfs): SQLite in WAL mode needs every process on one host, and file locks there may not keep a second writer out, so the audit log and lease registry could be corrupted. Put sqlite_path on a local disk or a volume one host mounts (a ReadWriteOnce volume), or set `[audit] allow_network_filesystem = true` if only one host ever mounts this filesystem and its locking works.
+```
+
+SQLite in WAL mode keeps its index in shared memory, which only works when every process is on one host, and on a network filesystem file locks (the single-writer lock included) may not keep a second writer out. What goes wrong is not an error but two writers that both think they hold the lock, and a corrupt log ([multi-replica design](../design/multi-replica.md), section 3 (d)).
+
+- **Refused.** On Linux: NFS, SMB/CIFS (SMB 1 to 3), NCP, Coda, AFS, 9p (also WSL 2's `/mnt/c` and VM shared folders), CephFS and Lustre. On macOS: `nfs`, `smbfs`, `afpfs`, `webdav`, `cifs`.
+- **Warned, not refused: FUSE.** The kernel reports one type for every FUSE filesystem, remote (sshfs, s3fs, GlusterFS, ceph-fuse) or local (fuse-overlayfs, the root filesystem of rootless containers; gocryptfs). The server starts and logs `the database is on a FUSE filesystem`. If yours is remote, move the file.
+- **Not checked.** When `statfs` fails, or on a platform other than Linux, Android, macOS and iOS, the server logs that it could not tell and starts. Cluster filesystems on shared block storage (GFS2, OCFS2) are not detected.
+- **Override.** `[audit] allow_network_filesystem = true` starts the server anyway and logs a warning at every start. Use it only when one host ever mounts the filesystem and you know its locking works; it does not make two servers on one file safe. Not tested against a real NFS or SMB mount: the detection is covered by tests of the type numbers and names, not by a mount.
 
 ## Leases: tuning the interval
 
