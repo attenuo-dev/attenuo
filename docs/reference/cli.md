@@ -135,7 +135,7 @@ Made by the holder of a bound parent token, to consent to one exchange that bind
 | `--actor AGENT` | The sub-agent that will make the exchange. Required. |
 
 ```sh
-attenuo token sign-off --subject-token "$ROOT" --dpop-key assistant.jwk \
+ATTENUO_TOKEN="$ROOT" attenuo token sign-off --dpop-key assistant.jwk \
   --child-jkt "$CODER_JKT" --actor coder > sign-off.txt
 ```
 

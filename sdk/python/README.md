@@ -13,7 +13,7 @@ Python 3.10 or newer.
 
 ## Quickstart
 
-Start a server with the example config (`[dev] allow_root_mint = true` for the dev root token) and an MCP upstream, as in [getting started](https://github.com/attenuo-dev/attenuo/blob/main/docs/guides/getting-started.md). Then:
+Start a server with the example config (`[dev] allow_root_mint = true` for the dev root token) and an MCP upstream, as in [getting started](https://github.com/attenuo-dev/attenuo/blob/main/docs/guides/getting-started.md). Export the admin token the server was started with as `ATTENUO_ADMIN_TOKEN`, and the coder's client secret as `CODER_SECRET` (`coder-secret-change-me` in `config/example.toml`). Then:
 
 ```python
 import os
@@ -24,7 +24,7 @@ URL = "http://127.0.0.1:8080"
 
 # Development only: mint a root token for an asserted user. In production hop 0 comes from
 # your IdP: client.exchange(id_token, "planner", ["github:*"], client_id=..., client_secret=...).
-admin = AdminClient(URL, "dev-admin-token-change-me")
+admin = AdminClient(URL, os.environ["ATTENUO_ADMIN_TOKEN"])
 root = admin.mint_root_dev("alice", "https://idp.example", "planner", ["github:*"])
 
 with Client(URL) as ob:
@@ -85,9 +85,11 @@ print(admin.audit_verify())  # VerifyReport(ok=True, entries=..., ...)
 These wrap the read-only operator routes the admin console uses. None of them signs, changes or audits anything.
 
 ```python
+import os
+
 from attenuo import AdminClient, AuditFilter
 
-admin = AdminClient(URL, "dev-admin-token-change-me")
+admin = AdminClient(URL, os.environ["ATTENUO_ADMIN_TOKEN"])
 
 # Newest denials first. A filtered page can come back short (even empty) with next_cursor
 # still set, so iterate rather than reading one page: audit_iter follows the cursor to the end.
@@ -203,9 +205,11 @@ It returns a `SelectorRevocation`: `selector` (as the server shows it), `preview
 An allowed call is charged to its run's limits before it goes upstream. When its effect did not happen (the upstream failed, or a person undid it), an operator can give the charge back, once, by the decision's id:
 
 ```python
+import os
+
 from attenuo import AdminClient, ApiError
 
-admin = AdminClient(URL, "dev-admin-token-change-me")
+admin = AdminClient(URL, os.environ["ATTENUO_ADMIN_TOKEN"])
 try:
     r = admin.refund_budget(result.decision_id, "upstream returned 502")
     print(r.refunded, r.audit_id)  # counters credited; the admin.budget.refund record
@@ -218,7 +222,7 @@ except ApiError as e:
 ### Capabilities
 
 ```python
-from attenuo import Capability, Equals, OneOf, Prefix, Range
+from attenuo import Capability, Equals, OneOf, PathPrefix, Prefix, Range
 
 Capability("github", "read_file")  # github:read_file
 Capability("github", "create_issue", repo=OneOf("acme/api", "acme/web"))

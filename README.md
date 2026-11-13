@@ -137,7 +137,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the full set of checks CI runs.
 
 ## Run the server yourself
 
-Run the server with the example config. It generates an issuer key in `data/` on first start, keeps the audit log and lease registry in `data/attenuo.sqlite`, and proxies an MCP server expected at `http://127.0.0.1:3001/mcp` as `github` (edit `[[upstreams]]` to point at yours).
+Run the server with the example config. It generates an issuer key in `data/` on first start, keeps the audit log and lease registry in `data/attenuo.sqlite`, and proxies an MCP server expected at `http://127.0.0.1:3001/mcp` as `github` (edit `[[upstreams]]` to point at yours, or start the repository's fake one there: `cargo build -p attenuo-proxy --features testing --example fake_mcp`, then `target/debug/examples/fake_mcp --port 3001`).
 
 ```sh
 cargo build -p attenuo-server
@@ -217,7 +217,7 @@ mcp '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_file",
 # ... "message":"attenuo: denied: lease_revoked" ...
 
 # Every decision and issuance is in the hash-chained audit log.
-curl -s $SRV/admin/audit/verify -H "Authorization: Bearer $ADMIN"   # {"entries":5,"ok":true,"first_bad_seq":null,"checkpoints":...,...}
+curl -s $SRV/admin/audit/verify -H "Authorization: Bearer $ADMIN"   # {"entries":7,"ok":true,"first_bad_seq":null,"checkpoints":0,...}
 curl -s "$SRV/admin/audit?from=1&limit=20" -H "Authorization: Bearer $ADMIN" | jq '.entries[].record | {decision,reason,tool,agents}'
 ```
 
@@ -245,13 +245,14 @@ export PATH=$PWD/target/debug:$PATH   # or $CARGO_TARGET_DIR/debug
 
 # token root uses the dev mint: it needs [dev] allow_root_mint = true (see above; local development
 # only). With the example config as shipped it gets a 404.
-attenuo token root --subject alice --issuer https://idp.example --agent planner --cap 'github:*'
-printf '%s\n' coder-secret-change-me | ATTENUO_TOKEN="$ROOT_TOKEN" attenuo token exchange --actor coder --client-secret-stdin --cap github:read_file
+ROOT_JSON=$(attenuo --json token root --subject alice --issuer https://idp.example --agent planner --cap 'github:*')
+ROOT_TOKEN=$(echo "$ROOT_JSON" | jq -r .access_token); ROOT_LEASE=$(echo "$ROOT_JSON" | jq -r .lease)
+CHILD_TOKEN=$(printf '%s\n' coder-secret-change-me | ATTENUO_TOKEN="$ROOT_TOKEN" attenuo token exchange --actor coder --client-secret-stdin --cap github:read_file --print token)
 attenuo token inspect "$CHILD_TOKEN" --verify      # the chain as a tree; --verify checks it against the server's JWKS
 printf '%s\n' "$CHILD_TOKEN" | attenuo call --token - --upstream github --tool read_file --arg repo=acme/api
 attenuo lease revoke "$ROOT_LEASE" --reason demo
-attenuo audit tail -n 10 --follow
 attenuo audit verify
+attenuo audit tail -n 10 --follow   # keeps polling; Ctrl-C to stop
 ```
 
 Other subcommands: `tools` (`tools/list`), `lease show`, `lease tree` (the delegation tree under a lease, with each hop's run limits and what is left), `approval` (list, show, grant and decline approvals), `budget refund` (give back what one decision charged, for a call whose effect did not happen), `policy reload`, `authzen eval`. Output is for people by default and JSON with `--json`. Exit status is 0 on success, 1 on an error and 2 when the server said no (a denied call, a negative AuthZEN decision, a broken audit chain). Secrets stay out of the argument list: use the environment variables, `-stdin` flags or `-file` flags described in the [CLI reference](docs/reference/cli.md).
@@ -263,9 +264,11 @@ A `Dockerfile` and `docker-compose.yml` run the same pair of servers in containe
 [`sdk/python`](sdk/python/README.md) is a Python client (`pip install -e sdk/python`, Python 3.10 or newer, depends on `httpx`) for agents written in Python: token exchange with typed capabilities, constraints and run limits, calls through the proxy that raise `Denied(reason, decision_id)` on a denial and `ApprovalRequired` when a policy asks for an approval (`call_tool_with_approval` waits for it and retries once), lease renewal, a token refresher that renews leases and re-exchanges before `exp`, AuthZEN evaluation (single and batch) and discovery, granting or declining an approval as the run's user, closing a proxy session, token inspection, and an admin client for revocation, budget refunds and the audit log. A timeout raises `TransportTimeout`; a server refusing for its load raises `Unavailable` (503) or `RateLimited` (429), retried only with `max_retries`. There is an async variant of each client. [`examples/python-agent`](examples/python-agent/agent.py) shows a planner delegating to a coder, with a run limit and an approval, and a second script wires the official `mcp` client to the proxy.
 
 ```python
+import os
+
 from attenuo import AdminClient, Capability, Client, Denied, Prefix
 
-admin = AdminClient("http://127.0.0.1:8080", "dev-admin-token-change-me")
+admin = AdminClient("http://127.0.0.1:8080", os.environ["ATTENUO_ADMIN_TOKEN"])  # as the server got it
 root = admin.mint_root_dev("alice", "https://idp.example", "planner", ["github:*"])   # dev only
 with Client("http://127.0.0.1:8080") as ob:
     coder = ob.exchange(
@@ -287,7 +290,7 @@ It is pre-alpha like the rest and is not published to PyPI.
 ```ts
 import { AdminClient, DeniedError, AttenuoClient, capability, prefix } from "@attenuo/sdk";
 
-const admin = new AdminClient("http://127.0.0.1:8080", "dev-admin-token-change-me");
+const admin = new AdminClient("http://127.0.0.1:8080", process.env.ATTENUO_ADMIN_TOKEN!); // as the server got it
 const root = await admin.mintRootDev("alice", "https://idp.example", "planner", {
   capabilities: ["github:*"], // dev only
 });

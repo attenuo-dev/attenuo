@@ -165,7 +165,10 @@ Placement:
 At start-up the server takes an exclusive lock on `<sqlite_path>.lock` (for `/var/lib/attenuo/attenuo.sqlite`, `/var/lib/attenuo/attenuo.sqlite.lock`) and holds it until it exits. A second server pointed at the same file stops before it opens the database:
 
 ```text
-Error: taking the single-writer fence of /var/lib/attenuo/attenuo.sqlite: /var/lib/attenuo/attenuo.sqlite.lock is locked by another process: one server process per database file; stop the other instance first (in Kubernetes, use `strategy: Recreate`). The lock file records pid 1234, the last attenuo server that took it; if that process is gone, another program holds the lock (find it with `fuser` or `lsof`).
+Error: taking the single-writer fence of /var/lib/attenuo/attenuo.sqlite
+
+Caused by:
+    /var/lib/attenuo/attenuo.sqlite.lock is locked by another process: one server process per database file; stop the other instance first (in Kubernetes, use `strategy: Recreate`). The lock file records pid 1234, the last attenuo server that took it; if that process is gone, another program holds the lock (find it with `fuser` or `lsof`).
 ```
 
 The pid is the one the lock file records, not necessarily the holder: any process that can open the file can lock it without writing to it. The server creates the lock file, the database and SQLite's `-wal` and `-shm` files with mode `0600` (owner only), and the data directory with `0700` when it creates it, so on a shared host other local users can neither read the log nor hold the lock. It narrows a lock file it finds with a wider mode to `0600`. It does not change the mode of a database file that already exists, so a file you made group-readable on purpose (for a backup user) stays that way, and SQLite gives the `-wal` and `-shm` files the same mode. A directory that already exists keeps its mode too: make sure only the server's user can write to it.
@@ -419,7 +422,7 @@ From the audit log (`GET /admin/audit`, `attenuo audit tail`):
 - The count of denies by reason. A jump in `capability_denied` or `policy_deny` for one agent often means a prompt-injected agent. A jump in `lease_expired` means agents that stopped renewing. `lease_revoked` denies after a revocation, under `initialize`, `tools/list` or a tool, mean an agent or its client is still using the revoked token.
 - Any `audit_error`, `lease_error` or `policy_error`. These are internal failures and every one denied a call.
 - `token.root` rows per user and agent. Root mints are the entry point of every chain.
-- `audit verify` on a schedule. It exits 1 on a broken chain.
+- `audit verify` on a schedule. It exits 2 on a broken chain or an invalid checkpoint, and 1 when it could not check (server unreachable, bad admin token).
 - The checkpoint `seq` should only grow. Compare each reading with the last.
 
 If you run a second system that needs to react to revocations, such as an AuthZEN PEP, remember it learns only by asking. There is no push channel in v0.
@@ -448,7 +451,10 @@ Rules that follow from this:
 - **There is no downgrade.** An older binary refuses a file a newer one has migrated, before it reads or writes anything:
 
   ```text
-  Error: opening audit log /var/lib/attenuo/attenuo.sqlite: the database has schema version 2, written by a newer attenuo; this build reads schema versions up to 1. Run the newer binary, or restore the backup taken before upgrading: there is no downgrade
+  Error: opening audit log /var/lib/attenuo/attenuo.sqlite
+
+  Caused by:
+      the database has schema version 2, written by a newer attenuo; this build reads schema versions up to 1. Run the newer binary, or restore the backup taken before upgrading: there is no downgrade
   ```
 
   To go back, restore the backup from step 2. Whatever happened after the upgrade, decisions and revocations included, is not in it (see "Know what a restore does" under [Backup](#sqlite-file-placement-and-backup)).

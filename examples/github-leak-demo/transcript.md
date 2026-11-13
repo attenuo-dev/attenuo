@@ -4,7 +4,6 @@ Output of `examples/github-leak-demo/run.sh` from one real run. Ports, lease ids
 
 ```text
 
-
 == Setup
 # attenuo at http://127.0.0.1:34201 proxies a fake GitHub MCP server at port 51751 as 'github'.
 # Policy: read_file only when repo like "alice/public-*"; create_issue there only after an approval. See policy.cedar.
@@ -24,6 +23,7 @@ examples/github-leak-demo/policy_test.yaml
   ✓ a three-agent chain is fine  (allow: policy_allow [read_file_public_repos_only])
 
 11 passed, 0 failed (11 cases in 1 file)
+all 5 policies exercised
 
 == 1. Alice's assistant gets a broad token (any github tool), like the over-privileged PAT
 $ attenuo token root --subject alice --agent assistant --cap "github:*"

@@ -13,7 +13,7 @@ Node 20 or newer (Ed25519 in WebCrypto needs no flag there: it is available sinc
 
 ## Quickstart
 
-Start a server with the example config (`[dev] allow_root_mint = true` for the dev root token) and an MCP upstream, as in [getting started](https://github.com/attenuo-dev/attenuo/blob/main/docs/guides/getting-started.md). Then:
+Start a server with the example config (`[dev] allow_root_mint = true` for the dev root token) and an MCP upstream, as in [getting started](https://github.com/attenuo-dev/attenuo/blob/main/docs/guides/getting-started.md). Export the admin token the server was started with as `ATTENUO_ADMIN_TOKEN`, and the coder's client secret as `ATTENUO_CLIENT_SECRET` (`coder-secret-change-me` in `config/example.toml`). Then:
 
 ```ts
 import { AdminClient, DeniedError, AttenuoClient, capability, prefix } from "@attenuo/sdk";
@@ -22,7 +22,7 @@ const URL = "http://127.0.0.1:8080";
 
 // Development only: mint a root token for an asserted user. In production hop 0 comes from
 // your IdP: ob.exchange(idToken, "planner", ["github:*"], { clientId, clientSecret }).
-const admin = new AdminClient(URL, "dev-admin-token-change-me");
+const admin = new AdminClient(URL, process.env.ATTENUO_ADMIN_TOKEN!); // the token the server was started with
 const root = await admin.mintRootDev("alice", "https://idp.example", "planner", {
   capabilities: ["github:*"],
 });
@@ -89,7 +89,7 @@ A `Token` carries `lease`, `expiresAt`, `chain` (user and hops with capabilities
 These wrap the read-only operator routes the admin console uses. None of them signs, changes or audits anything.
 
 ```ts
-const admin = new AdminClient(URL, "dev-admin-token-change-me");
+const admin = new AdminClient(URL, process.env.ATTENUO_ADMIN_TOKEN!);
 
 // Newest denials first. A filtered page can come back short (even empty) with nextCursor
 // still set, so iterate rather than reading one page: auditIter follows the cursor to the end.
@@ -207,7 +207,7 @@ An allowed call is charged to its run's limits before it goes upstream. When its
 ```ts
 import { AdminClient, ApiError } from "@attenuo/sdk";
 
-const admin = new AdminClient(URL, "dev-admin-token-change-me");
+const admin = new AdminClient(URL, process.env.ATTENUO_ADMIN_TOKEN!);
 try {
   const r = await admin.refundBudget(result.decisionId!, "upstream returned 502");
   console.log(r.refunded, r.auditId); // counters credited; the admin.budget.refund record
