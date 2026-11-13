@@ -10,5 +10,5 @@ It is a draft and has not been submitted anywhere. Places marked `[verify]` are 
 docs/report/build.sh
 ```
 
-This writes `attenuo-2026-11.html` (pandoc, standalone, numbered sections, embedded CSS) and `attenuo-2026-11.pdf` (A4, printed by Chromium through Playwright) next to the Markdown. It needs pandoc 3 and Node with the `playwright` package and its Chromium. No LaTeX is used. Both outputs are git-ignored. The Mermaid figure renders as a diagram in the mdBook site, and as its source text in the PDF.
+This writes `attenuo-2026-11.html` (pandoc, standalone, numbered sections, embedded CSS) and `attenuo-2026-11.pdf` (A4, printed by Chromium through Playwright) next to the Markdown. It needs pandoc 3 and Node with the `playwright` package and its Chromium. No LaTeX is used. Both outputs are git-ignored. The Mermaid figure renders as a diagram in the mdBook site, and as its source text in the PDF. Relative links to other docs are rewritten to the repository on GitHub in the HTML and the PDF, since those are read on their own.
 

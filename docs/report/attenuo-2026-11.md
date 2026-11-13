@@ -156,7 +156,7 @@ sequenceDiagram
     Note over A: actor authenticated, C1 ⊑ C0, expiry and depth checked, L1 under L0
     A-->>C: child token (user, hop 0, hop 1) and lease L1
     C->>A: tools/call on /mcp/github (bearer or DPoP)
-    Note over A: token and chain, leases L0 and L1, capabilities, limits, Cedar, approval, audit append
+    Note over A: token, leases L0 and L1, capabilities, limits, Cedar, approval, audit append
     A->>M: the allowed call only
     M-->>A: result
     Note over A: tool_result record and run taint label
