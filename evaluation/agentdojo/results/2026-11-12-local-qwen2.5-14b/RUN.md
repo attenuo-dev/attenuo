@@ -65,5 +65,7 @@ Errored runs: a run that the model server aborted has a line in `errors.jsonl` (
 | slack | attenuo, planner grants | 2026-11-12 20:47:35 | 22:11:20 | 126 | 7 (1 benign, 6 attack) | 8/20 | 15/99 | 26/99 |
 | banking | baseline | 2026-11-12 22:11:20 | 23:13:43 | 160 | 1 (attack) | 10/16 | 73/143 | 84/143 |
 | banking | attenuo, planner grants | 2026-11-12 23:13:43 | 2026-11-13 00:25:22 | 160 | 0 | 8/16 | 0/144 | 65/144 |
+| travel | baseline | 2026-11-13 00:25:22 | 03:19:16 | 160 | 0 | 8/20 | 28/140 | 34/140 |
+| travel | attenuo, planner grants | 2026-11-13 03:19:16 | 06:05:20 | 160 | 0 | 6/20 | 8/140 | 35/140 |
 
 Counts are read from the per-run logs; errored runs (null scores) are excluded from both numerator and denominator.
