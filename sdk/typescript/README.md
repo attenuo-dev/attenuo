@@ -82,6 +82,8 @@ Wherever a token is expected you can pass a `Token` or its JWT string; leave it 
 
 A `Token` carries `lease`, `expiresAt`, `chain` (user and hops with capabilities), `agents`, `agent`, `subject`, and `verified`. The JWT is available as `token.jwt` and `String(token)`, but it is not an enumerable property, so `console.log(token)` and `JSON.stringify(token)` do not print it. Everything decoded from a token is untrusted unless `verified` is true.
 
+`AdminClient` talks to the admin API (`/admin/*`). A server with `[admin] listen` serves it on that address only, so give `AdminClient` that listener's URL, not the main one ([network exposure](https://github.com/attenuo-dev/attenuo/blob/main/docs/guides/deploying.md#network-exposure)).
+
 ### Admin: querying the audit log, lease trees, policies
 
 These wrap the read-only operator routes the admin console uses. None of them signs, changes or audits anything.
