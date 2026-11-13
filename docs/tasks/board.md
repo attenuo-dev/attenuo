@@ -153,7 +153,7 @@ How to read it:
 
 ### Security reviews and fuzzing
 
-- [x] Security review passes 1 to 12 (SR-01 to SR-111): every finding fixed or accepted with its reasoning, except SR-109 and SR-110 (open above) ([README status](https://github.com/attenuo-dev/attenuo#status)). Passes with pull requests: 5 (#71, #72), 6 (#104), 7 (#124, with SR-81 #128, SR-82 #125 and #126, SR-83 #273), 8 (#151, SR-87 #160), 9 (#192, SR-91 #193, SR-92 and SR-93 #195), 10 (#209, SR-97 #214, SR-100 and SR-101 #238), 11 (#255), 12 (`fix/security-pass-12`, [report](../research/security-review-2026-11-13-pass12.md): SR-108 Low and SR-111 Info fixed there). The per-principal session cap SR-36 suggested is `[proxy] max_sessions_per_principal` (SR-49).
+- [x] Security review passes 1 to 12 (SR-01 to SR-111): every finding fixed or accepted with its reasoning, except SR-109 and SR-110 (open above) ([README status](https://github.com/attenuo-dev/attenuo#status)). Passes with pull requests: 5 (#71, #72), 6 (#104), 7 (#124, with SR-81 #128, SR-82 #125 and #126, SR-83 #273), 8 (#151, SR-87 #160), 9 (#192, SR-91 #193, SR-92 and SR-93 #195), 10 (#209, SR-97 #214, SR-100 and SR-101 #238), 11 (#255), 12 (#299, [report](../research/security-review-2026-11-13-pass12.md): SR-108 Low and SR-111 Info fixed there). The per-principal session cap SR-36 suggested is `[proxy] max_sessions_per_principal` (SR-49).
 - [x] Fuzz targets ([fuzzing](../design/fuzzing.md)), round 2 (#74, FZ2-2 #75), round 3 over the SSE parsing (#130), `decimal` inputs in `policy_context` (#205); fuzz targets compile-checked on every PR (#262).
 
 ### Code quality and CI
