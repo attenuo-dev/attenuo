@@ -127,7 +127,7 @@ async def test_audit_page_and_tail(make: Any) -> None:
         q = dict(r.url.params)
         start = int(q["from"])
         entries = [_entry(s) for s in range(start, 8)][: int(q["limit"])]
-        return httpx.Response(200, json={"entries": entries, "next": None, "head": 7})
+        return httpx.Response(200, json={"entries": entries, "next_cursor": None, "head": 7})
 
     client, seen = make(handler)
     entries = await call(client, "audit_tail", 3)
@@ -145,28 +145,35 @@ async def test_audit_page_and_tail(make: Any) -> None:
     assert seen[-1].url.path == "/admin/audit/checkpoint"
 
 
-async def test_audit_tail_follows_next(make: Any) -> None:
+async def test_audit_tail_follows_next_cursor(make: Any) -> None:
     def handler(r: httpx.Request) -> httpx.Response:
         assert not r.url.path.endswith("checkpoint")
         q = r.url.params
-        start = int(q["from"])
+        assert q["from"] == "1"
         if q["limit"] == "1":
-            return httpx.Response(200, json={"entries": [_entry(1)], "next": 2, "head": 3})
-        if start == 1:
+            return httpx.Response(200, json={"entries": [_entry(1)], "next_cursor": "c", "head": 3})
+        if "cursor" not in q:
             return httpx.Response(
-                200, json={"entries": [_entry(1), _entry(2)], "next": 3, "head": 3}
+                200, json={"entries": [_entry(1), _entry(2)], "next_cursor": "c3", "head": 3}
             )
-        return httpx.Response(200, json={"entries": [_entry(3)], "next": None, "head": 3})
+        assert q["cursor"] == "c3"
+        return httpx.Response(200, json={"entries": [_entry(3)], "next_cursor": None, "head": 3})
 
-    client, _ = make(handler)
+    client, seen = make(handler)
     assert [e.seq for e in await call(client, "audit_tail", 10)] == [1, 2, 3]
+    page, nxt = await call(client, "audit", 1, 5)
+    assert nxt == "c3" and [e.seq for e in page] == [1, 2]
+    page, nxt = await call(client, "audit", 1, 5, cursor="c3")
+    assert nxt is None and dict(seen[-1].url.params)["cursor"] == "c3"
 
 
 async def test_audit_head_empty_log_and_missing_field(make: Any) -> None:
-    client, _ = make(lambda r: httpx.Response(200, json={"entries": [], "next": None, "head": 0}))
+    client, _ = make(
+        lambda r: httpx.Response(200, json={"entries": [], "next_cursor": None, "head": 0})
+    )
     assert await call(client, "audit_head") == 0
     assert await call(client, "audit_tail", 5) == []
-    client, _ = make(lambda r: httpx.Response(200, json={"entries": [], "next": None}))
+    client, _ = make(lambda r: httpx.Response(200, json={"entries": []}))
     assert await call(client, "audit_head") == 0
 
 
@@ -420,42 +427,49 @@ async def _iter(client: Any, *args: Any, **kwargs: Any) -> list[AuditEntry]:
 
 
 async def test_audit_query_filter_and_desc_paging(make: Any) -> None:
-    # Newest first, filtered: the first page comes back short but `prev` says read on.
+    # Newest first, filtered: the first page comes back short but `next_cursor` says read on.
     def handler(r: httpx.Request) -> httpx.Response:
         q = dict(r.url.params)
-        if "before" not in q:
+        if "cursor" not in q:
             return httpx.Response(
-                200, json={"entries": [_entry(9, "deny")], "next": None, "prev": 9, "head": 12}
+                200, json={"entries": [_entry(9, "deny")], "next_cursor": "d9", "head": 12}
             )
-        assert q["before"] == "9"
+        assert q["cursor"] == "d9"
         return httpx.Response(
             200,
-            json={"entries": [_entry(4, "deny"), _entry(2, "deny")], "next": 10, "prev": None,
+            json={"entries": [_entry(4, "deny"), _entry(2, "deny")], "next_cursor": None,
                   "head": 12},
         )  # fmt: skip
 
     client, seen = make(handler)
     flt = AuditFilter(decision="deny", kind=["decision", "exchange"], lease="l 1")
-    page = await call(client, "audit_query", flt, order="desc", limit=3)
-    assert (page.next, page.prev, page.head) == (None, 9, 12)
+    page = await call(client, "audit_query", flt, order="desc", to_seq=11, limit=3)
+    assert (page.next_cursor, page.head) == ("d9", 12)
     assert dict(seen[-1].url.params) == {
         "order": "desc",
         "limit": "3",
+        "to": "11",
         "decision": "deny",
         "kind": "decision,exchange",
         "lease": "l 1",
     }
-    entries = await _iter(client, flt, order="desc", limit=3)
+    entries = await _iter(client, flt, order="desc", to_seq=11, limit=3)
     assert [e.seq for e in entries] == [9, 4, 2]
     assert all(e.decision == "deny" for e in entries)
-    assert dict(seen[-1].url.params)["before"] == "9"
+    # The cursor is sent with the same filter and range.
+    assert dict(seen[-1].url.params)["cursor"] == "d9"
+    assert dict(seen[-1].url.params)["to"] == "11"
+    assert dict(seen[-1].url.params)["decision"] == "deny"
 
 
-async def test_audit_iter_asc_follows_next_and_formats_times(make: Any) -> None:
+async def test_audit_iter_asc_follows_next_cursor_and_formats_times(make: Any) -> None:
     def handler(r: httpx.Request) -> httpx.Response:
-        start = int(r.url.params.get("from", "1"))
-        nxt = None if start >= 5 else start + 4
-        return httpx.Response(200, json={"entries": [_entry(start)], "next": nxt, "head": 5})
+        cursor = r.url.params.get("cursor")
+        if cursor is None:
+            return httpx.Response(
+                200, json={"entries": [_entry(1)], "next_cursor": "a5", "head": 5}
+            )
+        return httpx.Response(200, json={"entries": [_entry(5)], "next_cursor": None, "head": 5})
 
     client, seen = make(handler)
     since = datetime(2026, 10, 23, 9, 0, tzinfo=timezone.utc)
@@ -467,14 +481,17 @@ async def test_audit_iter_asc_follows_next_and_formats_times(make: Any) -> None:
         "since": "2026-10-23T09:00:00+00:00",
         "until": "2026-10-24T00:00:00Z",
     }
+    assert dict(seen[1].url.params)["cursor"] == "a5"
     with pytest.raises(ValueError):
         await _iter(client, AuditFilter(since=datetime(2026, 10, 23)))
 
 
 async def test_audit_iter_refuses_a_cursor_that_does_not_move(make: Any) -> None:
-    client, _ = make(lambda r: httpx.Response(200, json={"entries": [], "prev": 5, "head": 9}))
+    client, _ = make(
+        lambda r: httpx.Response(200, json={"entries": [], "next_cursor": "same", "head": 9})
+    )
     with pytest.raises(AttenuoError):
-        await _iter(client, order="desc", before=5)
+        await _iter(client, order="desc")
 
 
 def _detail(seq: int) -> dict[str, Any]:
@@ -520,13 +537,22 @@ async def test_audit_entry_not_found(make: Any) -> None:
 
 async def test_audit_checkpoints(make: Any) -> None:
     cps = [{"seq": 20, "head_hash": "a"}, {"seq": 10, "head_hash": "b"}]
-    client, seen = make(lambda r: httpx.Response(200, json={"checkpoints": cps, "prev": 10}))
-    page = await call(client, "audit_checkpoints", 30, 2)
+
+    def handler(r: httpx.Request) -> httpx.Response:
+        if r.url.params.get("cursor") == "k10":
+            return httpx.Response(200, json={"checkpoints": [{"seq": 5}], "next_cursor": None})
+        return httpx.Response(200, json={"checkpoints": cps, "next_cursor": "k10"})
+
+    client, seen = make(handler)
+    page = await call(client, "audit_checkpoints", "k30", 2)
     assert seen[-1].url.path == "/admin/audit/checkpoints"
-    assert dict(seen[-1].url.params) == {"before": "30", "limit": "2"}
-    assert page.checkpoints == cps and page.prev == 10
+    assert dict(seen[-1].url.params) == {"cursor": "k30", "limit": "2"}
+    assert page.checkpoints == cps and page.next_cursor == "k10"
     await call(client, "audit_checkpoints")
     assert dict(seen[-1].url.params) == {}
+    it = client.audit_checkpoints_iter(2)
+    got = [c async for c in it] if hasattr(it, "__aiter__") else list(it)
+    assert [c["seq"] for c in got] == [20, 10, 5]
 
 
 def _node(lease: str, parent: str | None, active: bool = True) -> dict[str, Any]:
@@ -795,19 +821,35 @@ def _approval_body(state: str = "pending", **extra: Any) -> dict[str, Any]:
 async def test_approvals_list_and_get(make: Any) -> None:
     def handler(r: httpx.Request) -> httpx.Response:
         if r.url.path == "/admin/approvals":
-            return httpx.Response(200, json={"approvals": [_approval_body()]})
+            if r.url.params.get("cursor") == "p2":
+                body = _approval_body()
+                body["approval_id"] = "a0"
+                return httpx.Response(200, json={"approvals": [body], "next_cursor": None})
+            return httpx.Response(200, json={"approvals": [_approval_body()], "next_cursor": "p2"})
         return httpx.Response(200, json=_approval_body())
 
     client, seen = make(handler)
-    items = await call(client, "approvals", "c1", state="pending", limit=10)
+    page = await call(client, "approvals", "c1", state="pending", limit=10)
     assert (seen[-1].method, seen[-1].url.path) == ("GET", "/admin/approvals")
     assert dict(seen[-1].url.params) == {"chain_id": "c1", "state": "pending", "limit": "10"}
     assert seen[-1].headers["authorization"] == "Bearer adm"
+    assert page.next_cursor == "p2"
+    items = page.approvals
     assert [a.approval_id for a in items] == ["a1"]
     assert items[0].tool == "delete_repo" and items[0].arguments == {"repo": "x"}
     assert items[0].raw["decision_id"] == "d1" and not items[0].usable
     await call(client, "approvals")
     assert dict(seen[-1].url.params) == {}
+    # Every page, with the same filters on each.
+    it = client.approvals_iter("c1", state="pending", limit=1)
+    got = [a async for a in it] if hasattr(it, "__aiter__") else list(it)
+    assert [a.approval_id for a in got] == ["a1", "a0"]
+    assert dict(seen[-1].url.params) == {
+        "chain_id": "c1",
+        "state": "pending",
+        "limit": "1",
+        "cursor": "p2",
+    }
 
     a = await call(client, "approval", "a1")
     assert (seen[-1].method, seen[-1].url.path) == ("GET", "/admin/approvals/a1")

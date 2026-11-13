@@ -125,10 +125,12 @@ export interface AuditEntry {
 
 export interface AuditPage {
   entries: AuditEntry[];
-  /** The `from` for the next page, or undefined at the end. */
-  next: number | undefined;
-  /** With `order: "desc"`: the `before` of the next (older) page, undefined at seq 1. */
-  prev?: number | undefined;
+  /**
+   * The opaque cursor of the next page in the same order (send it as `cursor` with the same
+   * filters and range), or undefined once the range has been read. A filtered page can be
+   * short, even empty, with a cursor still set.
+   */
+  nextCursor: string | undefined;
   /** The newest `seq` in the log (0 for an empty log). */
   head: number;
 }
@@ -158,10 +160,14 @@ export interface PolicyReload {
  * pattern; the ones you set combine with AND.
  */
 export interface AuditQuery {
-  /** `asc` (oldest first from `from`, the default) or `desc` (newest first, `seq < before`). */
+  /** `asc` (oldest first, the default) or `desc` (newest first). */
   order?: "asc" | "desc";
+  /** Lowest seq of the range (default 1). */
   from?: number;
-  before?: number;
+  /** Highest seq of the range (default: the head). */
+  to?: number;
+  /** The `nextCursor` of the previous page, sent with the same filters, range and order. */
+  cursor?: string;
   /** Page size (server default 100, at most 1000). */
   limit?: number;
   /** One kind or several: `decision`, `exchange`, `root_token`, `lease_renew`, `lease_revoke`, `admin`. */
@@ -222,8 +228,15 @@ export interface AuditEntryDetail {
 export interface CheckpointPage {
   /** Newest first. */
   checkpoints: StoredCheckpoint[];
-  /** The `before` of the next (older) page, undefined after the oldest. */
-  prev: number | undefined;
+  /** The opaque cursor of the next (older) page, undefined after the oldest. */
+  nextCursor: string | undefined;
+}
+
+/** One page of `approvals`, newest first. */
+export interface ApprovalPage {
+  approvals: w.Approval[];
+  /** The opaque cursor of the next (older) page with the same filters, undefined after the last. */
+  nextCursor: string | undefined;
 }
 
 /** One lease of a `LeaseTree`; `agent`, `issuedAt`, `issuedSeq` come from its issuance record. */
@@ -472,8 +485,10 @@ export interface ApprovalQuery {
   chainId?: string;
   /** Only approvals in this state: `pending`, `granted`, `declined` or `consumed`. */
   state?: string;
-  /** At most this many (server default and maximum 500). */
+  /** Page size (server default 100, at most 500). */
   limit?: number;
+  /** The `nextCursor` of the previous page, sent with the same filters. */
+  cursor?: string;
 }
 
 export interface MintRootOptions {
@@ -539,6 +554,19 @@ function exportParams(
   return query;
 }
 
+/** `next_cursor` of a list answer; undefined when absent or null. */
+function nextCursorOf(b: Record<string, unknown>): string | undefined {
+  return typeof b.next_cursor === "string" ? b.next_cursor : undefined;
+}
+
+/** `cur` to follow next, refusing one that repeats the cursor just sent (it would page forever). */
+function advance(cur: string | undefined, last: string | undefined): string | undefined {
+  if (cur !== undefined && cur === last) {
+    throw new AttenuoError("paging did not advance (the server sent the same cursor again)");
+  }
+  return cur;
+}
+
 function rfc3339(v: string | Date): string {
   return typeof v === "string" ? v : v.toISOString();
 }
@@ -547,7 +575,8 @@ function auditParams(q: AuditQuery): Record<string, string | number> {
   const out: Record<string, string | number> = { order: q.order ?? "asc" };
   if (q.limit !== undefined) out.limit = q.limit;
   if (q.from !== undefined) out.from = q.from;
-  if (q.before !== undefined) out.before = q.before;
+  if (q.to !== undefined) out.to = q.to;
+  if (q.cursor !== undefined) out.cursor = q.cursor;
   for (const [key, param] of AUDIT_FILTERS) {
     const v = q[key];
     if (v !== undefined) out[param] = v;
@@ -846,11 +875,16 @@ export class AdminClient {
     };
   }
 
-  /** One page of entries from `fromSeq`, and the `from` for the next page (or undefined). */
-  async audit(fromSeq = 1, limit = 100): Promise<AuditPage> {
-    const res = await this.http.get("/admin/audit", { query: { from: fromSeq, limit } });
+  /**
+   * One page of entries from `fromSeq`, oldest first, with the cursor of the next page
+   * (undefined at the head). Pass it back as `cursor` with the same `fromSeq`.
+   */
+  async audit(fromSeq = 1, limit = 100, cursor?: string): Promise<AuditPage> {
+    const query: Record<string, string | number> = { from: fromSeq, limit };
+    if (cursor !== undefined) query.cursor = cursor;
+    const res = await this.http.get("/admin/audit", { query });
     const page = w.asObject(await w.jsonBody(res), "audit");
-    return { entries: entriesOf(page), next: opt<number>(page.next), head: headOf(page) };
+    return { entries: entriesOf(page), nextCursor: nextCursorOf(page), head: headOf(page) };
   }
 
   /**
@@ -914,13 +948,14 @@ export class AdminClient {
   /** The last `n` audit entries, oldest first. */
   async auditTail(n = 20): Promise<AuditEntry[]> {
     const head = await this.auditHead();
-    let start = Math.max(1, head + 1 - n);
+    const start = Math.max(1, head + 1 - n);
     const out: AuditEntry[] = [];
+    let cursor: string | undefined;
     for (;;) {
-      const page = await this.audit(start, MAX_PAGE);
+      const page = await this.audit(start, MAX_PAGE, cursor);
       out.push(...page.entries);
-      if (page.next === undefined) return out;
-      start = page.next;
+      cursor = advance(page.nextCursor, cursor);
+      if (cursor === undefined) return out;
     }
   }
 
@@ -977,37 +1012,30 @@ export class AdminClient {
   }
 
   /**
-   * One filtered page of `GET /admin/audit`. `order: "desc"` reads newest first (`seq <
-   * before`); the answer's `prev` is the `before` of the next older page. A filtered page can
-   * come back short, even empty, with a link still set: `auditIter` follows the links.
+   * One filtered page of `GET /admin/audit`: the range `from`..`to` (default the whole log),
+   * oldest first or with `order: "desc"` newest first. `cursor` is the `nextCursor` of the
+   * previous page. A filtered page can come back short, even empty, with `nextCursor` still
+   * set: `auditIter` follows it.
    */
   async auditQuery(query: AuditQuery = {}): Promise<AuditPage> {
     const res = await this.http.get("/admin/audit", { query: auditParams(query) });
     const page = w.asObject(await w.jsonBody(res), "audit");
-    return {
-      entries: entriesOf(page),
-      next: opt<number>(page.next),
-      prev: opt<number>(page.prev),
-      head: headOf(page),
-    };
+    return { entries: entriesOf(page), nextCursor: nextCursorOf(page), head: headOf(page) };
   }
 
   /**
-   * Every matching entry in `query.order`, following `next` (asc) or `prev` (desc) until it is
-   * null. Pages lazily (default 1000 per page): stop iterating to stop reading.
+   * Every matching entry of the range in `query.order`, following `nextCursor` until it is
+   * undefined. Pages lazily (default 1000 per page): stop iterating to stop reading. Entries
+   * appended meanwhile do not shift the ones not read yet.
    */
   async *auditIter(query: AuditQuery = {}): AsyncGenerator<AuditEntry> {
-    const desc = query.order === "desc";
     let q: AuditQuery = { limit: MAX_PAGE, ...query };
     for (;;) {
       const page = await this.auditQuery(q);
       yield* page.entries;
-      const cur = desc ? page.prev : page.next;
+      const cur = advance(page.nextCursor, q.cursor);
       if (cur === undefined) return;
-      if (cur === (desc ? q.before : q.from)) {
-        throw new AttenuoError(`audit paging did not advance (cursor ${cur})`);
-      }
-      q = desc ? { ...q, before: cur } : { ...q, from: cur };
+      q = { ...q, cursor: cur };
     }
   }
 
@@ -1027,19 +1055,30 @@ export class AdminClient {
   }
 
   /**
-   * Stored checkpoints with `seq < before`, newest first. Read-only: unlike `auditCheckpoint` it
-   * never signs.
+   * Stored checkpoints, newest first; `cursor` is the `nextCursor` of the previous page (server
+   * default page 100, at most 1000). Read-only: unlike `auditCheckpoint` it never signs.
    */
-  async auditCheckpoints(opts: { before?: number; limit?: number } = {}): Promise<CheckpointPage> {
-    const query: Record<string, number> = {};
-    if (opts.before !== undefined) query.before = opts.before;
+  async auditCheckpoints(opts: { cursor?: string; limit?: number } = {}): Promise<CheckpointPage> {
+    const query: Record<string, string | number> = {};
+    if (opts.cursor !== undefined) query.cursor = opts.cursor;
     if (opts.limit !== undefined) query.limit = opts.limit;
     const res = await this.http.get("/admin/audit/checkpoints", { query });
     const b = w.asObject(await w.jsonBody(res), "checkpoints");
     return {
       checkpoints: Array.isArray(b.checkpoints) ? (b.checkpoints as StoredCheckpoint[]) : [],
-      prev: opt<number>(b.prev),
+      nextCursor: nextCursorOf(b),
     };
+  }
+
+  /** Every stored checkpoint, newest first, following `nextCursor`. */
+  async *auditCheckpointsIter(opts: { limit?: number } = {}): AsyncGenerator<StoredCheckpoint> {
+    let cursor: string | undefined;
+    for (;;) {
+      const page = await this.auditCheckpoints({ ...opts, cursor });
+      yield* page.checkpoints;
+      cursor = advance(page.nextCursor, cursor);
+      if (cursor === undefined) return;
+    }
   }
 
   /** The policy set in force: file, digest, load time, ids, warnings and texts. */
@@ -1109,17 +1148,36 @@ export class AdminClient {
   }
 
   /**
-   * The newest approvals, newest first, filtered by `query`. An unknown `state` is an `ApiError`
-   * (400).
+   * One page of approvals, newest first, filtered by `query`; `query.cursor` is the
+   * `nextCursor` of the previous page, sent with the same filters (`approvalsIter` follows
+   * it). An unknown `state` is an `ApiError` (400).
    */
-  async approvals(query: ApprovalQuery = {}): Promise<w.Approval[]> {
+  async approvals(query: ApprovalQuery = {}): Promise<ApprovalPage> {
     const q: Record<string, string | number> = {};
     if (query.chainId) q.chain_id = query.chainId;
     if (query.state) q.state = query.state;
     if (query.limit !== undefined) q.limit = query.limit;
+    if (query.cursor !== undefined) q.cursor = query.cursor;
     const res = await this.http.get("/admin/approvals", { query: q });
     const b = w.asObject(await w.jsonBody(res), "approvals");
-    return Array.isArray(b.approvals) ? b.approvals.map(w.approvalFromJson) : [];
+    return {
+      approvals: Array.isArray(b.approvals) ? b.approvals.map(w.approvalFromJson) : [],
+      nextCursor: nextCursorOf(b),
+    };
+  }
+
+  /**
+   * Every matching approval, newest first, following `nextCursor`. Approvals created meanwhile
+   * sort above the first page and do not shift the rest.
+   */
+  async *approvalsIter(query: Omit<ApprovalQuery, "cursor"> = {}): AsyncGenerator<w.Approval> {
+    let cursor: string | undefined;
+    for (;;) {
+      const page = await this.approvals({ ...query, cursor });
+      yield* page.approvals;
+      cursor = advance(page.nextCursor, cursor);
+      if (cursor === undefined) return;
+    }
   }
 
   /**

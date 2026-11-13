@@ -175,13 +175,13 @@ class AuditFilter:
 class AuditPage:
     """One page of :meth:`AdminClient.audit_query`.
 
-    ``next`` is the ``from`` of the following page read oldest first, ``prev`` the ``before``
-    of the following page read newest first; each is ``None`` at its end. A filtered page can
-    be short, even empty, with a link still set: use :meth:`AdminClient.audit_iter`."""
+    ``next_cursor`` fetches the following page in the same ``order`` (pass it back as
+    ``cursor`` with the same filter and range); ``None`` once the range has been read. It is
+    opaque. A filtered page can be short, even empty, with ``next_cursor`` still set: use
+    :meth:`AdminClient.audit_iter`, which follows it."""
 
     entries: list[AuditEntry]
-    next: int | None
-    prev: int | None
+    next_cursor: str | None
     head: int
 
 
@@ -217,10 +217,20 @@ class AuditEntryDetail:
 
 @dataclass(frozen=True)
 class CheckpointPage:
-    """Stored checkpoints, newest first; ``prev`` is the ``before`` of the next (older) page."""
+    """Stored checkpoints, newest first; ``next_cursor`` fetches the next (older) page, ``None``
+    after the oldest."""
 
     checkpoints: list[dict[str, Any]]
-    prev: int | None
+    next_cursor: str | None
+
+
+@dataclass(frozen=True)
+class ApprovalPage:
+    """One page of :meth:`AdminClient.approvals`, newest first; ``next_cursor`` fetches the
+    next (older) page with the same filters, ``None`` after the last."""
+
+    approvals: list[w.Approval]
+    next_cursor: str | None
 
 
 @dataclass(frozen=True)
@@ -579,14 +589,17 @@ def _audit_params(
     flt: AuditFilter | None,
     order: str,
     from_seq: int | None,
-    before: int | None,
+    to_seq: int | None,
+    cursor: str | None,
     limit: int,
 ) -> dict[str, Any]:
     params: dict[str, Any] = {"order": order, "limit": limit}
     if from_seq is not None:
         params["from"] = from_seq
-    if before is not None:
-        params["before"] = before
+    if to_seq is not None:
+        params["to"] = to_seq
+    if cursor is not None:
+        params["cursor"] = cursor
     if flt is None:
         return params
     for name in ("decision", "reason", "subject", "agent", "lease", "server", "tool", "chain_id"):
@@ -603,14 +616,19 @@ def _audit_params(
 
 
 def _audit_page(page: Any) -> AuditPage:
-    return AuditPage(_entries(page), page.get("next"), page.get("prev"), _head(page))
+    return AuditPage(_entries(page), _next_cursor(page), _head(page))
 
 
-def _cursor(page: AuditPage, order: str, last: int | None) -> int | None:
-    """The link to follow after ``page``: ``prev`` newest first, ``next`` oldest first."""
-    cur = page.prev if order == "desc" else page.next
+def _next_cursor(page: Any) -> str | None:
+    cur = page.get("next_cursor") if isinstance(page, dict) else None
+    return cur if isinstance(cur, str) else None
+
+
+def _advance(cur: str | None, last: str | None) -> str | None:
+    """``cur`` to follow next, refusing a cursor that repeats the one just sent (which would
+    page forever)."""
     if cur is not None and cur == last:
-        raise AttenuoError(f"audit paging did not advance (cursor {cur})")
+        raise AttenuoError("paging did not advance (the server sent the same cursor again)")
     return cur
 
 
@@ -635,17 +653,17 @@ def _entry_detail(b: Any) -> AuditEntryDetail:
     )
 
 
-def _checkpoint_params(before: int | None, limit: int | None) -> dict[str, Any]:
+def _checkpoint_params(cursor: str | None, limit: int | None) -> dict[str, Any]:
     params: dict[str, Any] = {}
-    if before is not None:
-        params["before"] = before
+    if cursor is not None:
+        params["cursor"] = cursor
     if limit is not None:
         params["limit"] = limit
     return params
 
 
 def _checkpoint_page(b: Any) -> CheckpointPage:
-    return CheckpointPage(list(b.get("checkpoints") or []), b.get("prev"))
+    return CheckpointPage(list(b.get("checkpoints") or []), _next_cursor(b))
 
 
 def _lease_node(n: Any) -> LeaseNode:
@@ -797,8 +815,12 @@ def _revoke_result(b: Any) -> RevokeResult:
     )
 
 
-def _approval_params(chain_id: str | None, state: str | None, limit: int | None) -> dict[str, Any]:
+def _approval_params(
+    chain_id: str | None, state: str | None, limit: int | None, cursor: str | None
+) -> dict[str, Any]:
     params: dict[str, Any] = {}
+    if cursor is not None:
+        params["cursor"] = cursor
     if chain_id:
         params["chain_id"] = chain_id
     if state:
@@ -808,9 +830,9 @@ def _approval_params(chain_id: str | None, state: str | None, limit: int | None)
     return params
 
 
-def _approvals(b: Any) -> list[w.Approval]:
+def _approvals(b: Any) -> ApprovalPage:
     items = b.get("approvals") if isinstance(b, dict) else None
-    return [w.approval_from_json(a) for a in items or []]
+    return ApprovalPage([w.approval_from_json(a) for a in items or []], _next_cursor(b))
 
 
 def _refund_body(decision_id: str, reason: str | None) -> dict[str, Any]:
@@ -929,12 +951,17 @@ class AdminClient:
             b.get("revoke_reason"),
         )
 
-    def audit(self, from_seq: int = 1, limit: int = 100) -> tuple[list[AuditEntry], int | None]:
-        """One page of entries from ``from_seq``, and the ``from`` for the next page (or None)."""
-        page = w.json_body(
-            self._http.get("/admin/audit", params={"from": from_seq, "limit": limit})
-        )
-        return _entries(page), page.get("next")
+    def audit(
+        self, from_seq: int = 1, limit: int = 100, *, cursor: str | None = None
+    ) -> tuple[list[AuditEntry], str | None]:
+        """One page of entries from ``from_seq`` oldest first, and the ``next_cursor`` for the
+        next page (``None`` at the head). Pass it back as ``cursor`` with the same
+        ``from_seq``."""
+        params: dict[str, Any] = {"from": from_seq, "limit": limit}
+        if cursor is not None:
+            params["cursor"] = cursor
+        page = w.json_body(self._http.get("/admin/audit", params=params))
+        return _entries(page), _next_cursor(page)
 
     def audit_head(self) -> int:
         """The newest audit ``seq`` (0 for an empty log). Reads ``head`` from
@@ -946,12 +973,13 @@ class AdminClient:
         head = self.audit_head()
         start = max(1, head + 1 - n)
         out: list[AuditEntry] = []
+        cursor: str | None = None
         while True:
-            page, nxt = self.audit(start, _MAX_PAGE)
+            page, nxt = self.audit(start, _MAX_PAGE, cursor=cursor)
             out.extend(page)
-            if nxt is None:
+            cursor = _advance(nxt, cursor)
+            if cursor is None:
                 return out
-            start = nxt
 
     def audit_checkpoint(self) -> dict[str, Any]:
         """The signed checkpoint of the log head (``seq``, ``head_hash``, ``hash``, ``at``,
@@ -1012,15 +1040,18 @@ class AdminClient:
         *,
         order: str = "asc",
         from_seq: int | None = None,
-        before: int | None = None,
+        to_seq: int | None = None,
+        cursor: str | None = None,
         limit: int = 100,
     ) -> AuditPage:
         """One filtered page of ``GET /admin/audit``.
 
-        ``order="asc"`` reads oldest first from ``from_seq``; ``order="desc"`` reads newest
-        first, entries with ``seq < before`` (default: from the head). A filtered page can come
-        back short or empty with a link still set; :meth:`audit_iter` follows the links."""
-        params = _audit_params(filter, order, from_seq, before, limit)
+        ``from_seq`` and ``to_seq`` (inclusive) select a range, by default the whole log;
+        ``order="asc"`` reads it oldest first, ``order="desc"`` newest first. ``cursor`` is the
+        ``next_cursor`` of the previous page, sent with the same filter, range and order. A
+        filtered page can come back short or empty with ``next_cursor`` still set;
+        :meth:`audit_iter` follows it."""
+        params = _audit_params(filter, order, from_seq, to_seq, cursor, limit)
         return _audit_page(w.json_body(self._http.get("/admin/audit", params=params)))
 
     def audit_iter(
@@ -1029,24 +1060,21 @@ class AdminClient:
         *,
         order: str = "asc",
         from_seq: int | None = None,
-        before: int | None = None,
+        to_seq: int | None = None,
         limit: int = _MAX_PAGE,
     ) -> Iterator[AuditEntry]:
-        """Every matching entry, in ``order``, following ``next`` (asc) or ``prev`` (desc)
-        until it is null. Pages lazily: stop iterating to stop reading."""
+        """Every matching entry of the range, in ``order``, following ``next_cursor`` until it
+        is null. Pages lazily: stop iterating to stop reading. Entries appended meanwhile do
+        not shift the ones not read yet."""
+        cursor: str | None = None
         while True:
             page = self.audit_query(
-                filter, order=order, from_seq=from_seq, before=before, limit=limit
+                filter, order=order, from_seq=from_seq, to_seq=to_seq, cursor=cursor, limit=limit
             )
             yield from page.entries
-            last = before if order == "desc" else from_seq
-            cur = _cursor(page, order, last)
-            if cur is None:
+            cursor = _advance(page.next_cursor, cursor)
+            if cursor is None:
                 return
-            if order == "desc":
-                before = cur
-            else:
-                from_seq = cur
 
     def audit_entry(self, seq: int) -> AuditEntryDetail:
         """The entry at ``seq`` with its context. ``ApiError`` (404) when there is none."""
@@ -1059,14 +1087,25 @@ class AdminClient:
         return _entry_detail(w.json_body(self._http.get(path)))
 
     def audit_checkpoints(
-        self, before: int | None = None, limit: int | None = None
+        self, cursor: str | None = None, limit: int | None = None
     ) -> CheckpointPage:
-        """Stored checkpoints with ``seq < before``, newest first. Read-only: unlike
+        """Stored checkpoints, newest first; ``cursor`` is the ``next_cursor`` of the previous
+        page (server default page 100, at most 1000). Read-only: unlike
         :meth:`audit_checkpoint` it never signs."""
-        params = _checkpoint_params(before, limit)
+        params = _checkpoint_params(cursor, limit)
         return _checkpoint_page(
             w.json_body(self._http.get("/admin/audit/checkpoints", params=params))
         )
+
+    def audit_checkpoints_iter(self, limit: int | None = None) -> Iterator[dict[str, Any]]:
+        """Every stored checkpoint, newest first, following ``next_cursor``."""
+        cursor: str | None = None
+        while True:
+            page = self.audit_checkpoints(cursor, limit)
+            yield from page.checkpoints
+            cursor = _advance(page.next_cursor, cursor)
+            if cursor is None:
+                return
 
     def policies(self) -> PolicySet:
         """The policy set in force: file, digest, load time, ids, warnings and texts."""
@@ -1119,12 +1158,32 @@ class AdminClient:
         *,
         state: str | None = None,
         limit: int | None = None,
-    ) -> list[w.Approval]:
-        """The newest approvals, newest first: of one delegation run with ``chain_id``, in one
-        ``state`` (``pending``, ``granted``, ``declined``, ``consumed``), at most ``limit``
-        (server default and maximum 500). An unknown state is an ``ApiError`` (400)."""
-        params = _approval_params(chain_id, state, limit)
+        cursor: str | None = None,
+    ) -> ApprovalPage:
+        """One page of approvals, newest first: of one delegation run with ``chain_id``, in
+        one ``state`` (``pending``, ``granted``, ``declined``, ``consumed``), at most ``limit``
+        (server default 100, maximum 500). ``cursor`` is the ``next_cursor`` of the previous
+        page, sent with the same filters; :meth:`approvals_iter` follows it. An unknown state
+        is an ``ApiError`` (400)."""
+        params = _approval_params(chain_id, state, limit, cursor)
         return _approvals(w.json_body(self._http.get("/admin/approvals", params=params)))
+
+    def approvals_iter(
+        self,
+        chain_id: str | None = None,
+        *,
+        state: str | None = None,
+        limit: int | None = None,
+    ) -> Iterator[w.Approval]:
+        """Every matching approval, newest first, following ``next_cursor``. Approvals created
+        meanwhile sort above the first page and do not shift the rest."""
+        cursor: str | None = None
+        while True:
+            page = self.approvals(chain_id, state=state, limit=limit, cursor=cursor)
+            yield from page.approvals
+            cursor = _advance(page.next_cursor, cursor)
+            if cursor is None:
+                return
 
     def approval(self, approval_id: str) -> w.Approval:
         """One approval: the exact call, the run's labels, state, approver and expiry.
@@ -1251,12 +1310,13 @@ class AsyncAdminClient:
         )
 
     async def audit(
-        self, from_seq: int = 1, limit: int = 100
-    ) -> tuple[list[AuditEntry], int | None]:
-        page = w.json_body(
-            await self._http.get("/admin/audit", params={"from": from_seq, "limit": limit})
-        )
-        return _entries(page), page.get("next")
+        self, from_seq: int = 1, limit: int = 100, *, cursor: str | None = None
+    ) -> tuple[list[AuditEntry], str | None]:
+        params: dict[str, Any] = {"from": from_seq, "limit": limit}
+        if cursor is not None:
+            params["cursor"] = cursor
+        page = w.json_body(await self._http.get("/admin/audit", params=params))
+        return _entries(page), _next_cursor(page)
 
     async def audit_head(self) -> int:
         return _head(
@@ -1267,12 +1327,13 @@ class AsyncAdminClient:
         head = await self.audit_head()
         start = max(1, head + 1 - n)
         out: list[AuditEntry] = []
+        cursor: str | None = None
         while True:
-            page, nxt = await self.audit(start, _MAX_PAGE)
+            page, nxt = await self.audit(start, _MAX_PAGE, cursor=cursor)
             out.extend(page)
-            if nxt is None:
+            cursor = _advance(nxt, cursor)
+            if cursor is None:
                 return out
-            start = nxt
 
     async def audit_checkpoint(self) -> dict[str, Any]:
         body = w.json_body(await self._http.get("/admin/audit/checkpoint"))
@@ -1315,10 +1376,11 @@ class AsyncAdminClient:
         *,
         order: str = "asc",
         from_seq: int | None = None,
-        before: int | None = None,
+        to_seq: int | None = None,
+        cursor: str | None = None,
         limit: int = 100,
     ) -> AuditPage:
-        params = _audit_params(filter, order, from_seq, before, limit)
+        params = _audit_params(filter, order, from_seq, to_seq, cursor, limit)
         return _audit_page(w.json_body(await self._http.get("/admin/audit", params=params)))
 
     async def audit_iter(
@@ -1327,23 +1389,19 @@ class AsyncAdminClient:
         *,
         order: str = "asc",
         from_seq: int | None = None,
-        before: int | None = None,
+        to_seq: int | None = None,
         limit: int = _MAX_PAGE,
     ) -> AsyncIterator[AuditEntry]:
+        cursor: str | None = None
         while True:
             page = await self.audit_query(
-                filter, order=order, from_seq=from_seq, before=before, limit=limit
+                filter, order=order, from_seq=from_seq, to_seq=to_seq, cursor=cursor, limit=limit
             )
             for entry in page.entries:
                 yield entry
-            last = before if order == "desc" else from_seq
-            cur = _cursor(page, order, last)
-            if cur is None:
+            cursor = _advance(page.next_cursor, cursor)
+            if cursor is None:
                 return
-            if order == "desc":
-                before = cur
-            else:
-                from_seq = cur
 
     async def audit_entry(self, seq: int) -> AuditEntryDetail:
         return _entry_detail(w.json_body(await self._http.get(f"/admin/audit/entries/{int(seq)}")))
@@ -1353,12 +1411,24 @@ class AsyncAdminClient:
         return _entry_detail(w.json_body(await self._http.get(path)))
 
     async def audit_checkpoints(
-        self, before: int | None = None, limit: int | None = None
+        self, cursor: str | None = None, limit: int | None = None
     ) -> CheckpointPage:
-        params = _checkpoint_params(before, limit)
+        params = _checkpoint_params(cursor, limit)
         return _checkpoint_page(
             w.json_body(await self._http.get("/admin/audit/checkpoints", params=params))
         )
+
+    async def audit_checkpoints_iter(
+        self, limit: int | None = None
+    ) -> AsyncIterator[dict[str, Any]]:
+        cursor: str | None = None
+        while True:
+            page = await self.audit_checkpoints(cursor, limit)
+            for cp in page.checkpoints:
+                yield cp
+            cursor = _advance(page.next_cursor, cursor)
+            if cursor is None:
+                return
 
     async def policies(self) -> PolicySet:
         return _policy_set(w.json_body(await self._http.get("/admin/policies")))
@@ -1392,9 +1462,26 @@ class AsyncAdminClient:
         *,
         state: str | None = None,
         limit: int | None = None,
-    ) -> list[w.Approval]:
-        params = _approval_params(chain_id, state, limit)
+        cursor: str | None = None,
+    ) -> ApprovalPage:
+        params = _approval_params(chain_id, state, limit, cursor)
         return _approvals(w.json_body(await self._http.get("/admin/approvals", params=params)))
+
+    async def approvals_iter(
+        self,
+        chain_id: str | None = None,
+        *,
+        state: str | None = None,
+        limit: int | None = None,
+    ) -> AsyncIterator[w.Approval]:
+        cursor: str | None = None
+        while True:
+            page = await self.approvals(chain_id, state=state, limit=limit, cursor=cursor)
+            for a in page.approvals:
+                yield a
+            cursor = _advance(page.next_cursor, cursor)
+            if cursor is None:
+                return
 
     async def approval(self, approval_id: str) -> w.Approval:
         return w.approval_from_json(w.json_body(await self._http.get(_approval_path(approval_id))))
