@@ -172,6 +172,8 @@ allowed_algs = ["RS256", "ES256", "EdDSA"]
 attribute_claims = ["email", "groups", "amr"]
 # jwks_ttl_seconds = 300
 # clock_skew_seconds = 60
+# Multi-tenant issuer: an ID-JAG must carry this `tenant` claim (ID tokens are not affected).
+# tenant = "acme"
 
 # Agents (OAuth clients) that may present user credentials at POST /token, authenticated with
 # client_id/client_secret (form or HTTP Basic). secret_sha256 = `printf %s "$SECRET" | sha256sum`.

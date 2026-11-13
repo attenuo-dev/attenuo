@@ -253,7 +253,7 @@ impl ActorTrustRegistry {
     ) -> Result<VerifiedActor, ActorTokenError> {
         let (header, payload) = peek(token)?;
         if let Some(typ) = header.get("typ").and_then(Value::as_str) {
-            if FOREIGN_TYPS.iter().any(|t| t.eq_ignore_ascii_case(typ)) {
+            if FOREIGN_TYPS.iter().any(|t| crate::idp::typ_is(typ, t)) {
                 return Err(ActorTokenError::TypMismatch(typ.to_owned()));
             }
         }

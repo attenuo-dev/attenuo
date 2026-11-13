@@ -228,6 +228,7 @@ impl Harness {
             attribute_claims: vec!["email".into(), "groups".into(), "amr".into()],
             jwks_ttl_seconds: 300,
             clock_skew_seconds: 60,
+            tenant: None,
             client_ids: ["planner", "coder"]
                 .map(|a| (a.to_string(), CLIENT_AUD.to_string()))
                 .into(),
@@ -901,6 +902,204 @@ async fn id_jag_yields_root_token_and_typ_is_enforced() {
         StatusCode::BAD_REQUEST,
         "invalid_grant",
         "missing_claim",
+    );
+}
+
+/// An ID-JAG request as `planner` (jwt-bearer, form client credentials), with a `DPoP` header
+/// when `dpop` is given.
+async fn jag_bearer(h: &Harness, jag: &str, dpop: Option<String>) -> (StatusCode, Value) {
+    let body = serde_urlencoded::to_string([
+        ("grant_type", JWT_BEARER),
+        ("assertion", jag),
+        ("client_id", "planner"),
+        ("client_secret", PLANNER_SECRET),
+        ("scope", "github:read_file"),
+    ])
+    .unwrap();
+    let mut req = h
+        .client
+        .post(h.url("/token"))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(body);
+    if let Some(p) = dpop {
+        req = req.header("DPoP", p);
+    }
+    let resp = req.send().await.unwrap();
+    let status = resp.status();
+    (status, resp.json().await.unwrap_or(Value::Null))
+}
+
+/// The checks draft-ietf-oauth-identity-assertion-authz-grant-06 §4.4.1 adds to (or states more
+/// plainly than) what -04 had: the `typ` media type in either spelling, a one-element `aud`,
+/// `jti` required.
+#[tokio::test]
+async fn id_jag_draft_06_claim_rules() {
+    let h = Harness::start().await;
+    let idp = &h.idp;
+    let ok = |got: &(StatusCode, Value)| assert_eq!(got.0, StatusCode::OK, "{}", got.1);
+
+    // `typ` with the `application/` prefix is the same media type (RFC 7515 §4.1.9).
+    for typ in ["application/oauth-id-jag+jwt", "OAuth-ID-JAG+JWT"] {
+        let jag = idp.sign(&idp.key, Some(typ), &idp.id_jag_claims("alice", "planner"));
+        ok(&jag_bearer(&h, &jag, None).await);
+    }
+    // Another `+jwt` type with the prefix is still refused.
+    let jag = idp.sign(
+        &idp.key,
+        Some("application/at+jwt"),
+        &idp.id_jag_claims("alice", "planner"),
+    );
+    assert_error(
+        &jag_bearer(&h, &jag, None).await,
+        StatusCode::BAD_REQUEST,
+        "invalid_grant",
+        "typ_mismatch",
+    );
+
+    // `aud` as a one-element array is accepted; with a second audience it is refused, even
+    // when attenuo is one of them.
+    let mut c = idp.id_jag_claims("alice", "planner");
+    c["aud"] = json!([ISSUER]);
+    ok(&jag_bearer(&h, &idp.sign(&idp.key, Some("oauth-id-jag+jwt"), &c), None).await);
+    for aud in [json!([ISSUER, "https://other-as.example"]), json!([])] {
+        let mut c = idp.id_jag_claims("alice", "planner");
+        c["aud"] = aud;
+        assert_error(
+            &jag_bearer(&h, &idp.sign(&idp.key, Some("oauth-id-jag+jwt"), &c), None).await,
+            StatusCode::BAD_REQUEST,
+            "invalid_grant",
+            "audience_mismatch",
+        );
+    }
+
+    // `jti` is REQUIRED.
+    let mut c = idp.id_jag_claims("alice", "planner");
+    c.as_object_mut().unwrap().remove("jti");
+    assert_error(
+        &jag_bearer(&h, &idp.sign(&idp.key, Some("oauth-id-jag+jwt"), &c), None).await,
+        StatusCode::BAD_REQUEST,
+        "invalid_grant",
+        "missing_claim",
+    );
+
+    // Without `[[idps]] tenant`, a `tenant` claim is not checked.
+    let mut c = idp.id_jag_claims("alice", "planner");
+    c["tenant"] = json!("acme");
+    ok(&jag_bearer(&h, &idp.sign(&idp.key, Some("oauth-id-jag+jwt"), &c), None).await);
+}
+
+/// `[[idps]] tenant`: the issuer is multi-tenant, and an ID-JAG must carry that `tenant`
+/// (draft -06 §4.4.1). ID tokens are not affected.
+#[tokio::test]
+async fn id_jag_tenant_is_checked_when_configured() {
+    let h = Harness::start_with(|cfg| cfg.idps[0].tenant = Some("acme".into())).await;
+    let idp = &h.idp;
+    let jag = |tenant: Option<Value>| {
+        let mut c = idp.id_jag_claims("alice", "planner");
+        if let Some(t) = tenant {
+            c["tenant"] = t;
+        }
+        idp.sign(&idp.key, Some("oauth-id-jag+jwt"), &c)
+    };
+    let got = jag_bearer(&h, &jag(Some(json!("acme"))), None).await;
+    assert_eq!(got.0, StatusCode::OK, "{}", got.1);
+    for (tenant, code) in [
+        (None, "missing_claim"),
+        (Some(json!("globex")), "tenant_mismatch"),
+        (Some(json!(["acme"])), "tenant_mismatch"),
+    ] {
+        assert_error(
+            &jag_bearer(&h, &jag(tenant), None).await,
+            StatusCode::BAD_REQUEST,
+            "invalid_grant",
+            code,
+        );
+    }
+    let (status, body) = h.intake(&idp.id_token("alice"), "github:read_file").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// A sender-constrained ID-JAG (`cnf.jkt`, draft -04 §9.8.1.2, -06 §4.4.1) is accepted only
+/// with a DPoP proof by that key, and the root token is bound to it.
+#[tokio::test]
+async fn id_jag_bound_to_a_dpop_key_needs_its_proof() {
+    use attenuo_token::DpopKey;
+    // `[token] dpop` is "optional" by default.
+    let h = Harness::start().await;
+    let idp = &h.idp;
+    let (key, other) = (DpopKey::generate().unwrap(), DpopKey::generate().unwrap());
+    let bound = |cnf: Value| {
+        let mut c = idp.id_jag_claims("alice", "planner");
+        c["cnf"] = cnf;
+        idp.sign(&idp.key, Some("oauth-id-jag+jwt"), &c)
+    };
+    let url = h.url("/token");
+    let proof = |k: &DpopKey| Some(k.proof("POST", &url, None, OffsetDateTime::now_utc()));
+    let jkt = json!({ "jkt": key.thumbprint() });
+
+    // No proof, or a proof by another key: refused.
+    assert_error(
+        &jag_bearer(&h, &bound(jkt.clone()), None).await,
+        StatusCode::BAD_REQUEST,
+        "invalid_grant",
+        "credential_pop_required",
+    );
+    assert_error(
+        &jag_bearer(&h, &bound(jkt.clone()), proof(&other)).await,
+        StatusCode::BAD_REQUEST,
+        "invalid_grant",
+        "credential_pop_mismatch",
+    );
+    // A binding this server cannot check (not a DPoP key) is refused, not ignored.
+    assert_error(
+        &jag_bearer(&h, &bound(json!({"x5t#S256": "abc"})), proof(&key)).await,
+        StatusCode::BAD_REQUEST,
+        "invalid_grant",
+        "credential_pop_required",
+    );
+    // With the right proof: issued, and bound to the same key.
+    let (status, body) = jag_bearer(&h, &bound(jkt.clone()), proof(&key)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["token_type"], "DPoP", "{body}");
+    let verified = h
+        .state
+        .verifier
+        .verify(
+            body["access_token"].as_str().unwrap(),
+            OffsetDateTime::now_utc(),
+        )
+        .unwrap();
+    assert_eq!(
+        verified.claims.cnf.map(|c| c.jkt).as_deref(),
+        Some(key.thumbprint())
+    );
+    // An unbound ID-JAG still works without a proof.
+    let jag = idp.sign(
+        &idp.key,
+        Some("oauth-id-jag+jwt"),
+        &idp.id_jag_claims("alice", "planner"),
+    );
+    let got = jag_bearer(&h, &jag, None).await;
+    assert_eq!(got.0, StatusCode::OK, "{}", got.1);
+}
+
+/// With `[token] dpop = "off"` the server checks no proofs, so a bound ID-JAG is refused.
+#[tokio::test]
+async fn id_jag_bound_to_a_key_is_refused_when_dpop_is_off() {
+    use attenuo_server::config::DpopMode;
+    use attenuo_token::DpopKey;
+    let h = Harness::start_with(|cfg| cfg.token.dpop = DpopMode::Off).await;
+    let idp = &h.idp;
+    let key = DpopKey::generate().unwrap();
+    let mut c = idp.id_jag_claims("alice", "planner");
+    c["cnf"] = json!({ "jkt": key.thumbprint() });
+    let jag = idp.sign(&idp.key, Some("oauth-id-jag+jwt"), &c);
+    let p = key.proof("POST", &h.url("/token"), None, OffsetDateTime::now_utc());
+    assert_error(
+        &jag_bearer(&h, &jag, Some(p)).await,
+        StatusCode::BAD_REQUEST,
+        "invalid_grant",
+        "credential_pop_required",
     );
 }
 

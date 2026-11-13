@@ -6,7 +6,7 @@
 //! | `subject_token_type` | Credential | `aud` must be |
 //! |---|---|---|
 //! | `urn:ietf:params:oauth:token-type:id_token` | OIDC ID token | `[[idps]] audience` |
-//! | `urn:ietf:params:oauth:token-type:id-jag` | ID-JAG (draft-ietf-oauth-identity-assertion-authz-grant-04), header `typ` = `oauth-id-jag+jwt` | `[issuer] issuer` |
+//! | `urn:ietf:params:oauth:token-type:id-jag` | ID-JAG (draft-ietf-oauth-identity-assertion-authz-grant, checked against -06), header `typ` = `oauth-id-jag+jwt` (or `application/oauth-id-jag+jwt`) | `[issuer] issuer` |
 //!
 //! An ID-JAG may also be presented as the draft describes it, with
 //! `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer` and `assertion=<ID-JAG>`.
@@ -17,8 +17,9 @@
 //! # Verification ([`IdpRegistry::verify`])
 //!
 //! 1. Header and payload decode; the header `typ` is checked: an ID-JAG must say
-//!    `oauth-id-jag+jwt`; an ID token must not carry any other explicit `…+jwt` type
-//!    (RFC 8725 §3.11), so an access token or an ID-JAG cannot be replayed as an ID token.
+//!    `oauth-id-jag+jwt` (case-insensitive, with or without `application/`, RFC 7515
+//!    §4.1.9); an ID token must not carry any other explicit `…+jwt` type (RFC 8725 §3.11),
+//!    so an access token or an ID-JAG cannot be replayed as an ID token.
 //! 2. The unverified `iss` selects the `[[idps]]` entry; unknown issuers are rejected before
 //!    any network call.
 //! 3. `alg` must be in that IdP's `allowed_algs` (asymmetric only).
@@ -27,6 +28,13 @@
 //! 5. Signature, then `iss` (exact), `aud` (string or array containing the expected value),
 //!    `exp` (required), `iat` (required, not in the future), `nbf` (optional), all with
 //!    `clock_skew_seconds` of leeway, then `sub` (required, non-empty).
+//! 6. For an ID-JAG only: `aud` must be a string or a one-element array, and with
+//!    `[[idps]] tenant` set, `tenant` must equal it (draft -06 §4.4.1).
+//!
+//! The intake handler then reads the ID-JAG's own claims ([`claims::map_id_jag`]: `client_id`
+//! and `jti` required, `cnf.jkt` if bound) and, for a bound ID-JAG, requires a DPoP proof by
+//! that key on the request (`credential_pop_required`, `credential_pop_mismatch`; draft -04
+//! §9.8.1.2, -06 §4.4.1).
 //!
 //! `nonce` is ignored: it binds an ID token to the browser session that requested it, and the
 //! agent presenting the token here is not that session. Replay is bounded instead by requiring
@@ -119,6 +127,12 @@ pub enum IntakeError {
     CredentialAudienceMismatch(String),
     #[error("ID-JAG client_id `{assertion}` does not match the authenticated client `{client}`")]
     ClientIdMismatch { assertion: String, client: String },
+    #[error("ID-JAG tenant {0:?} is not the [[idps]] tenant")]
+    TenantMismatch(Option<String>),
+    #[error("proof of possession required: {0}")]
+    PopRequired(String),
+    #[error("the DPoP proof's key is not the key the ID-JAG is bound to (cnf.jkt)")]
+    PopMismatch,
     #[error("cannot fetch the issuer's keys: {0}")]
     JwksUnavailable(String),
 }
@@ -140,6 +154,9 @@ impl IntakeError {
             IntakeError::MissingClaim(_) => "missing_claim",
             IntakeError::CredentialAudienceMismatch(_) => "credential_audience_mismatch",
             IntakeError::ClientIdMismatch { .. } => "client_id_mismatch",
+            IntakeError::TenantMismatch(_) => "tenant_mismatch",
+            IntakeError::PopRequired(_) => "credential_pop_required",
+            IntakeError::PopMismatch => "credential_pop_mismatch",
             IntakeError::JwksUnavailable(_) => "jwks_unavailable",
         }
     }
@@ -360,7 +377,7 @@ impl IdpRegistry {
 
         let typ = header.get("typ").and_then(Value::as_str);
         let typ_ok = match kind {
-            CredentialKind::IdJag => typ.is_some_and(|t| t.eq_ignore_ascii_case(ID_JAG_TYP)),
+            CredentialKind::IdJag => typ.is_some_and(|t| typ_is(t, ID_JAG_TYP)),
             CredentialKind::IdToken => {
                 !typ.is_some_and(|t| t.to_ascii_lowercase().ends_with("+jwt"))
             }
@@ -421,6 +438,9 @@ impl IdpRegistry {
             now,
             idp.config.clock_skew_seconds,
         )?;
+        if kind == CredentialKind::IdJag {
+            check_id_jag(&claims, &idp.config, expected_aud)?;
+        }
         // `check_claims` required a numeric `exp`; read it the same way (a JSON float is a
         // valid NumericDate, and `as_i64` alone would turn it into 0).
         let expires_at = numeric_date(&claims, "exp").unwrap_or(0);
@@ -434,6 +454,36 @@ impl IdpRegistry {
             clock_skew_seconds: idp.config.clock_skew_seconds,
         })
     }
+}
+
+/// The ID-JAG checks beyond [`check_claims`] (draft -06 §4.4.1):
+///
+/// - `aud` names this server and nothing else: a string, or an array with exactly one element
+///   ("If the aud claim is an array, it MUST contain exactly one element", also in -04). An
+///   ID-JAG for several authorization servers could be redeemed at each of them.
+/// - With `[[idps]] tenant` set (a multi-tenant issuer), the `tenant` claim must be present and
+///   equal to it, so that `iss` and `tenant` together name the tenant whose users the
+///   `[[root_grants]]` cover (-06 §4.4.1, §6.1).
+fn check_id_jag(
+    claims: &Map<String, Value>,
+    cfg: &IdpConfig,
+    audience: &str,
+) -> Result<(), IntakeError> {
+    if let Some(Value::Array(list)) = claims.get("aud") {
+        if list.len() != 1 {
+            return Err(IntakeError::AudienceMismatch(audience.to_owned()));
+        }
+    }
+    if let Some(expected) = &cfg.tenant {
+        let tenant = claims.get("tenant");
+        match tenant.and_then(Value::as_str) {
+            Some(t) if t == expected => {}
+            Some(t) => return Err(IntakeError::TenantMismatch(Some(t.to_owned()))),
+            None if tenant.is_none() => return Err(IntakeError::MissingClaim("tenant")),
+            None => return Err(IntakeError::TenantMismatch(None)),
+        }
+    }
+    Ok(())
 }
 
 /// Which client an ID token must have been issued to.
@@ -483,6 +533,19 @@ fn parse_asymmetric_alg(name: &str) -> Result<Algorithm, String> {
         }
         a => Ok(a),
     }
+}
+
+/// Does the JWT header `typ` value `typ` name the media type `expected` (given without its
+/// `application/` prefix)? RFC 7515 §4.1.9: the comparison is case-insensitive, and a value
+/// with no `/` is read as if `application/` were prepended, so `oauth-id-jag+jwt` and
+/// `application/oauth-id-jag+jwt` are the same type.
+pub(crate) fn typ_is(typ: &str, expected: &str) -> bool {
+    const PREFIX: &str = "application/";
+    let bare = match typ.get(..PREFIX.len()) {
+        Some(p) if p.eq_ignore_ascii_case(PREFIX) => &typ[PREFIX.len()..],
+        _ => typ,
+    };
+    bare.eq_ignore_ascii_case(expected)
 }
 
 type JsonObject = Map<String, Value>;
@@ -594,6 +657,32 @@ mod tests {
     }
 
     #[test]
+    fn typ_media_type_comparison_rfc7515() {
+        for t in [
+            "oauth-id-jag+jwt",
+            "OAUTH-ID-JAG+JWT",
+            "application/oauth-id-jag+jwt",
+            "Application/OAuth-ID-JAG+JWT",
+        ] {
+            assert!(typ_is(t, ID_JAG_TYP), "{t}");
+        }
+        for t in [
+            "",
+            "JWT",
+            "at+jwt",
+            "application/",
+            "text/oauth-id-jag+jwt",
+            "application/application/oauth-id-jag+jwt",
+            "oauth-id-jag+jwt ",
+            "applicatio\u{20ac}x",
+        ] {
+            assert!(!typ_is(t, ID_JAG_TYP), "{t}");
+        }
+        // The actor-token check uses the same comparison.
+        assert!(typ_is("application/attenuo+jwt", attenuo_token::TOKEN_TYPE));
+    }
+
+    #[test]
     fn float_numeric_dates_round_down_and_refuse_out_of_range() {
         assert_eq!(float_seconds(f64::NAN), None);
         assert_eq!(float_seconds(f64::INFINITY), None);
@@ -702,6 +791,7 @@ mod tests {
             attribute_claims: vec![],
             jwks_ttl_seconds: 300,
             clock_skew_seconds: 60,
+            tenant: None,
             client_ids: Default::default(),
         };
         assert!(IdpRegistry::from_config(std::slice::from_ref(&cfg), "me").is_err());
@@ -724,6 +814,7 @@ mod tests {
             attribute_claims: vec![],
             jwks_ttl_seconds: 300,
             clock_skew_seconds: 60,
+            tenant: None,
             client_ids: Default::default(),
         };
         for ok in [

@@ -2364,6 +2364,12 @@ pub struct IdpConfig {
     /// client id equal to its agent id; the server warns at startup for each such agent.
     #[serde(default)]
     pub client_ids: BTreeMap<String, String>,
+    /// For a multi-tenant issuer (one `iss` for several tenants): the tenant whose users this
+    /// entry trusts. When set, an ID-JAG must carry a `tenant` claim equal to it
+    /// (draft-ietf-oauth-identity-assertion-authz-grant-06 §4.4.1), else `missing_claim` or
+    /// `tenant_mismatch`. ID tokens are not affected. Default: unset, `tenant` is not checked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
 }
 
 fn default_idp_algs() -> Vec<String> {

@@ -38,6 +38,7 @@ allowed_algs = ["RS256", "ES256", "EdDSA"]        # default
 attribute_claims = ["email", "groups", "amr"]     # default
 jwks_ttl_seconds = 300                            # default
 clock_skew_seconds = 60                           # default
+# tenant = "acme"                                 # optional, ID-JAG only
 ```
 
 | Key | Meaning |
@@ -50,6 +51,7 @@ clock_skew_seconds = 60                           # default
 | `attribute_claims` | Claims copied verbatim into `originating_user.attributes`, when present and not null. |
 | `jwks_ttl_seconds` | How long fetched keys are used before refetching. A token with an unknown `kid` triggers one early refetch, at most once per 30 seconds. |
 | `clock_skew_seconds` | Leeway for `exp`, `iat` and `nbf`. |
+| `tenant` | Optional. For a multi-tenant issuer: the tenant whose users this entry trusts. An ID-JAG must then carry a `tenant` claim equal to it, else `missing_claim` or `tenant_mismatch` ([ID-JAG](#id-jag)). ID tokens are not affected. Unset by default: `tenant` is not checked. |
 
 You can list several IdPs. The unverified `iss` selects the entry. An issuer that is not listed is rejected without any network call.
 
@@ -246,17 +248,32 @@ Anything that publishes `/.well-known/openid-configuration` and signs ID tokens 
 
 ## ID-JAG
 
-An ID-JAG (Identity Assertion JWT Authorization Grant, `draft-ietf-oauth-identity-assertion-authz-grant`) is a JWT an IdP issues to say: this client may act for this user toward this resource. attenuo accepts it as an alternative to an ID token at hop 0. It follows **draft -04**. Drafts change. The claim mapping is isolated in one function (`idp::claims::map_id_jag`) so it can follow the draft.
+An ID-JAG (Identity Assertion JWT Authorization Grant, `draft-ietf-oauth-identity-assertion-authz-grant`) is a JWT an IdP issues to say: this client may act for this user toward this resource. attenuo accepts it as an alternative to an ID token at hop 0. It was written against draft -04 and checked on 2026-11-13 against **draft -06** (31 October 2026); [the standards note](../research/standards.md#id-jag-conformance-against--06) has the conformance table. Drafts change. The claim mapping is isolated in one function (`idp::claims::map_id_jag`) so it can follow the draft.
 
 What attenuo checks:
 
-- Header `typ` is `oauth-id-jag+jwt`.
-- `iss` is a configured `[[idps]]` issuer, and the signature verifies with that IdP's keys.
-- `aud` equals attenuo's own `[issuer] issuer`. This is not `[[idps]] audience`. The IdP has to be set up to issue assertions addressed to attenuo.
+- Header `typ` is `oauth-id-jag+jwt`, in any case, with or without the `application/` prefix (RFC 7515 §4.1.9).
+- `iss` is a configured `[[idps]]` issuer, and the signature verifies with that IdP's keys and one of its `allowed_algs`.
+- `aud` equals attenuo's own `[issuer] issuer`, as a string or as an array with exactly one element (draft §4.4.1). An array that also names another authorization server is refused. This is not `[[idps]] audience`. The IdP has to be set up to issue assertions addressed to attenuo.
 - `client_id` is present and equals the authenticated agent, so `[[agents]] id` must be the client id the IdP knows the agent by.
+- `jti` is present (REQUIRED in the draft); each ID-JAG is accepted once.
 - `exp`, `iat`, `nbf`, `sub` as for an ID token.
+- With `[[idps]] tenant` set, `tenant` is present and equal to it (see below).
+- With a `cnf` claim (a sender-constrained ID-JAG), the request carries a DPoP proof by the key in `cnf.jkt`, and the root token is bound to that key. Without a proof the request fails with `credential_pop_required`, with a proof by another key with `credential_pop_mismatch`. A `cnf` without `jkt` (for example an mTLS certificate binding) is refused with `credential_pop_required`, because attenuo cannot check it, and so is any `cnf` when `[token] dpop = "off"`.
 
-The draft's `resource` and `scope` claims are not used. What the root token may carry comes from `[[root_grants]]`.
+The agent always authenticates (client secret or actor token), even for a sender-constrained ID-JAG; the draft only requires one or the other.
+
+The draft's `resource`, `scope` and `authorization_details` claims are not used: what the root token may carry comes from `[[root_grants]]` and the request. An IdP that narrows an ID-JAG to one resource does not narrow the root token; `[[root_grants]]` is the only ceiling. Nor are `aud_tenant`, `aud_sub` or `sub_id`: the user is `sub`.
+
+**Multi-tenant issuers.** When one IdP issuer serves several tenants and tells them apart with the `tenant` claim, the draft says the authorization server must require `tenant` and trust `iss` and `tenant` together. Set `tenant` on the `[[idps]]` entry to the one tenant whose users it trusts:
+
+```toml
+[[idps]]
+issuer = "https://idp.example.com"
+tenant = "acme"          # ID-JAGs without tenant = "acme" are refused
+```
+
+An ID-JAG without `tenant` is refused with `missing_claim`, one for another tenant with `tenant_mismatch`. ID tokens are not affected. One entry trusts one tenant, because `[[idps]] issuer` is unique and `[[root_grants]]` match on the issuer and `sub` alone, so two tenants' users with the same `sub` would share a grant. Without `tenant`, the claim is not checked, as before.
 
 Two ways to send it:
 
@@ -409,11 +426,14 @@ Errors carry a stable `code` (the same value as `error_description`, which older
 | `401 invalid_client` / `no_agents_configured` | `[[agents]]` is empty |
 | `400 invalid_grant` / `untrusted_issuer` | `iss` is not in `[[idps]]`. Look for a trailing slash, `http` against `https`, or a tenant id mismatch |
 | `400 invalid_grant` / `credential_audience_mismatch` | An ID token's `aud` (or `azp`) does not name the presenting agent's client id: the token was issued to another client, or `client_ids` has no entry for this agent and the id differs from the agent id |
-| `400 invalid_grant` / `audience_mismatch` | An ID-JAG's `aud` is not `[issuer] issuer` |
+| `400 invalid_grant` / `audience_mismatch` | An ID-JAG's `aud` is not `[issuer] issuer`, or is an array with more than one element |
+| `400 invalid_grant` / `tenant_mismatch` | An ID-JAG's `tenant` is not the `[[idps]] tenant` of its issuer |
+| `400 invalid_grant` / `credential_pop_required`, `credential_pop_mismatch` | The ID-JAG has a `cnf` claim and the request has no DPoP proof, a proof by another key, or `[token] dpop = "off"` |
 | `400 invalid_grant` / `unsupported_alg` | The token's `alg` is not in `allowed_algs` |
 | `400 invalid_grant` / `unknown_kid` | The signing key is not in the IdP's JWKS, even after a refetch |
 | `400 invalid_grant` / `bad_signature`, `expired`, `not_yet_valid` | The token is bad, stale, or your clock is off by more than `clock_skew_seconds` |
 | `400 invalid_grant` / `client_id_mismatch` | ID-JAG `client_id` is not the authenticated agent |
+| `400 invalid_grant` / `missing_claim` | A required claim is missing: `sub`, `exp`, `iat`; for an ID-JAG also `client_id` and `jti`, and `tenant` when `[[idps]] tenant` is set |
 | `400 invalid_grant` / `typ_mismatch` | Wrong credential type for the `subject_token_type` you sent |
 | `400 invalid_scope` / `no_root_grant` | No `[[root_grants]]` entry for this issuer and agent |
 | `400 invalid_scope` / `scope_exceeds_grant` | The request asks for more than the entry allows |
