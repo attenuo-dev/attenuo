@@ -357,7 +357,8 @@ pub trait ApprovalStore: Send + Sync {
     /// given.
     ///
     /// The position is a number the store gives an approval when it creates it: larger than
-    /// that of every approval stored at that moment, and kept until the approval is removed.
+    /// that of every approval the store has ever created, including removed and pruned ones,
+    /// so no position is given twice, and kept until the approval is removed.
     /// Passing the position of the last approval of one call as `before` of the next lists
     /// the following ones (keyset paging, used by `GET /admin/approvals`): every approval
     /// that existed when the first call was made is listed exactly once, whatever is created
