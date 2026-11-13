@@ -65,36 +65,51 @@ function rfc3339ToLocal(value) {
 
 // ---- fetching -----------------------------------------------------------------------------
 
-/** Newest first, below `before` (or from the head), following short filtered pages. */
-async function fetchOlder(filters, before) {
+/**
+ * Newest first, following the server's next_cursor across short filtered pages. `start` is
+ * `{}` (from the head), `{ to }` (entries at or below a seq) or `{ cursor }` (an older page).
+ * Returns the entries, `older` (how to fetch the next older page, null at seq 1) and `head`.
+ */
+async function fetchOlder(filters, start) {
   let entries = [];
-  let cursor = before;
+  let cursor = start.cursor;
   let first = null;
   let last = null;
   for (let hop = 0; hop < MAX_HOPS; hop++) {
-    const page = await api(`/admin/audit${qs({ ...filters, order: 'desc', limit: PAGE - entries.length, before: cursor })}`);
+    const page = await api(`/admin/audit${qs({ ...filters, order: 'desc', limit: PAGE - entries.length, to: start.to, cursor })}`);
     first = first || page;
     last = page;
     entries = entries.concat(page.entries);
-    if (entries.length >= PAGE || page.prev === null) break;
-    cursor = page.prev;
+    if (entries.length >= PAGE || page.next_cursor === null) break;
+    cursor = page.next_cursor;
   }
-  return { entries, prev: last.prev, next: first.next, head: first.head };
+  const older = last.next_cursor === null ? null : { to: start.to, cursor: last.next_cursor };
+  return { entries, older, head: first.head };
 }
 
-/** Oldest first from `from`, following short filtered pages; returns at most `limit`. */
-async function fetchNewer(filters, from, limit = PAGE) {
+/**
+ * Oldest first from seq `from`, following next_cursor; returns at most `limit` entries and
+ * `newer`, how to fetch what follows (null when the read reached the head).
+ */
+async function fetchNewer(filters, start, limit = PAGE) {
   let entries = [];
-  let cursor = from;
+  let cursor = start.cursor;
   let last = null;
   for (let hop = 0; hop < MAX_HOPS; hop++) {
-    const page = await api(`/admin/audit${qs({ ...filters, order: 'asc', limit: limit - entries.length, from: cursor })}`);
+    const page = await api(`/admin/audit${qs({ ...filters, order: 'asc', limit: limit - entries.length, from: start.from, cursor })}`);
     last = page;
     entries = entries.concat(page.entries);
-    if (entries.length >= limit || page.next === null) break;
-    cursor = page.next;
+    if (entries.length >= limit || page.next_cursor === null) break;
+    cursor = page.next_cursor;
   }
-  return { entries, next: last.next, head: last.head };
+  const newer = last.next_cursor === null ? null : { from: start.from, cursor: last.next_cursor };
+  return { entries, newer, head: last.head };
+}
+
+/** How to read below the lowest of these (newest-first) entries: `to` just under it. */
+function olderThan(entries) {
+  const lowest = entries[entries.length - 1].seq;
+  return lowest > 1 ? { to: lowest - 1 } : null;
 }
 
 // ---- rendering ----------------------------------------------------------------------------
@@ -174,8 +189,8 @@ export async function auditView(root, params) {
 
   const state = {
     entries: [], // newest first, as shown
-    prev: null, // `before` for older entries
-    next: null, // `from` for newer entries; null when the page reaches the head
+    older: null, // how fetchOlder reads the entries below the page; null at seq 1
+    newer: null, // how fetchNewer reads the entries above it; null when it reaches the head
     head: 0,
     timer: null,
     polling: false,
@@ -205,9 +220,9 @@ export async function auditView(root, params) {
   }
 
   function render() {
-    olderBtn.disabled = state.prev === null;
-    newerBtn.disabled = state.next === null;
-    newestBtn.disabled = state.next === null;
+    olderBtn.disabled = state.older === null;
+    newerBtn.disabled = state.newer === null;
+    newestBtn.disabled = state.newer === null;
     exportBtn.disabled = state.entries.length === 0;
     const n = state.entries.length;
     info.textContent = n
@@ -226,20 +241,22 @@ export async function auditView(root, params) {
     stopFollow();
     replace(tableBox, loading());
     try {
-      if (which === 'newer' && state.next !== null) {
-        const res = await fetchNewer(filters, state.next);
+      if (which === 'newer' && state.newer !== null) {
+        const res = await fetchNewer(filters, state.newer);
         if (res.entries.length === 0) return load('newest');
         state.entries = res.entries.slice().reverse();
-        state.next = res.next;
         state.head = res.head;
-        const lowest = state.entries[state.entries.length - 1].seq;
-        state.prev = lowest > 1 ? lowest : null;
+        state.newer = res.newer && { from: state.entries[0].seq + 1 };
+        state.older = olderThan(state.entries);
       } else {
-        const res = await fetchOlder(filters, which === 'older' ? state.prev : undefined);
+        // The entries above the page being left are what "Newer" brings back.
+        const shownLowest = state.entries.length ? state.entries[state.entries.length - 1].seq : null;
+        const res = await fetchOlder(filters, which === 'older' ? state.older : {});
         state.entries = res.entries;
-        state.prev = res.prev;
-        state.next = res.next;
+        state.older = res.older;
         state.head = res.head;
+        if (which !== 'older') state.newer = null;
+        else if (shownLowest !== null) state.newer = { from: shownLowest };
       }
       state.fresh.clear();
       render();
@@ -263,7 +280,7 @@ export async function auditView(root, params) {
       stopFollow();
       return;
     }
-    if (state.next !== null) await load('newest');
+    if (state.newer !== null) await load('newest');
     followBtn.setAttribute('aria-pressed', 'true');
     followBtn.textContent = 'Following';
     state.timer = setInterval(poll, FOLLOW_MS);
@@ -277,13 +294,12 @@ export async function auditView(root, params) {
     try {
       const top = await api('/admin/audit?order=desc&limit=1');
       if (top.head > state.head) {
-        const res = await fetchNewer(filters, state.head + 1, FOLLOW_CAP);
+        const res = await fetchNewer(filters, { from: state.head + 1 }, FOLLOW_CAP);
         state.head = res.head;
         if (res.entries.length) {
           for (const e of res.entries) state.fresh.add(e.seq);
           state.entries = res.entries.slice().reverse().concat(state.entries).slice(0, FOLLOW_CAP);
-          const lowest = state.entries[state.entries.length - 1].seq;
-          state.prev = lowest > 1 ? lowest : null;
+          state.older = olderThan(state.entries);
         }
         render();
       }
