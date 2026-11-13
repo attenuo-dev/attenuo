@@ -4,8 +4,9 @@
 //!
 //! - **REST** (every route but `/mcp/{server}`, the AuthZEN routes included):
 //!   `{"error": <OAuth-style error>, "code": <code>, "detail": <text>}`, plus
-//!   `error_description` where one is set. `code` is `error_description` when the answer has
-//!   one and `error` otherwise.
+//!   `error_description` where one is set. `code` is the refusal's specific reason: a reason
+//!   the route names (sent with no `error_description`), else `error_description` when the
+//!   answer has one, else `error` when no more specific reason exists.
 //! - **JSON-RPC** (the MCP proxy): `{"error": {"code": <number>, "message": <text>,
 //!   "data": {"code": <code>, ...}}}`. Where `data.reason` is present it equals `data.code`.
 //! - **AuthZEN batch entry**: `{"decision": false, "context": {"error": {"status", "code",
@@ -341,8 +342,8 @@ mod tests {
     }
 
     /// A REST `error` that is itself a code names the same condition: it is listed, with that
-    /// status, as a form of its own entry, so that `code == error` holds whenever an answer
-    /// has no `error_description`.
+    /// status, as a form of its own entry, so that `code == error` is valid for an answer with
+    /// no `error_description` and no more specific reason.
     #[test]
     fn every_rest_error_member_is_a_code_of_its_own() {
         for e in ERROR_CODES {
