@@ -28,26 +28,57 @@ pub const OU_SIG_CONTEXT: &str = "attenuo-ou-v3";
 /// The outermost `ActClaim` is the agent currently acting (the last hop of the chain); each
 /// nested `act` is the party that delegated to it, down to the root agent that received the
 /// grant directly from the user, whose `act` is `None`.
+///
+/// Each level also carries `iss`, the namespace in which `sub` was assigned, as the OAuth
+/// Actor Profile asks (draft-mcguinness-oauth-actor-profile-01 §3.4, an individual
+/// Internet-Draft, not a standard). An agent id is assigned by this token service's
+/// `[[agents]]` (an actor token only maps a workload identity onto one), so `iss` is always
+/// the token's own `iss`, whichever way the agent authenticated. Tokens issued before it was
+/// added have no `iss` here and still verify.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActClaim {
     /// Agent identifier of this actor.
     pub sub: String,
+    /// The namespace of `sub`: the issuer of the token service that assigned the agent id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iss: Option<String>,
     /// The actor that delegated to this one, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub act: Option<Box<ActClaim>>,
 }
 
 impl ActClaim {
-    /// Build the nested actor claim from a chain (last hop outermost, root hop innermost).
+    /// Build the nested actor claim from a chain (last hop outermost, root hop innermost),
+    /// without `iss`: the form of tokens issued before `act.iss` was added.
     ///
     /// Returns `None` for a chain with no hops.
     pub fn from_chain(chain: &DelegationChain) -> Option<ActClaim> {
+        Self::build(chain, None)
+    }
+
+    /// [`from_chain`](Self::from_chain) with `iss` = `issuer` at every level: the form the
+    /// issuer writes, `issuer` being the token's `iss`.
+    pub fn from_chain_with_issuer(chain: &DelegationChain, issuer: &str) -> Option<ActClaim> {
+        Self::build(chain, Some(issuer))
+    }
+
+    fn build(chain: &DelegationChain, issuer: Option<&str>) -> Option<ActClaim> {
         chain.hops.iter().fold(None, |inner, hop| {
             Some(ActClaim {
                 sub: hop.agent.0.clone(),
+                iss: issuer.map(str::to_owned),
                 act: inner.map(Box::new),
             })
         })
+    }
+
+    /// Does this claim agree with `chain` for a token issued by `issuer`? Either every level
+    /// carries `iss` = `issuer` (current tokens) or none carries `iss` (older tokens); a mix,
+    /// another `iss`, or another agent order does not.
+    pub fn matches_chain(&self, chain: &DelegationChain, issuer: &str) -> bool {
+        let this = Some(self);
+        Self::from_chain_with_issuer(chain, issuer).as_ref() == this
+            || Self::from_chain(chain).as_ref() == this
     }
 
     /// Depth of the nesting: number of actors represented.

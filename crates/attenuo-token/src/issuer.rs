@@ -386,7 +386,7 @@ impl Issuer {
             .last()
             .map(|h| h.expires_at)
             .ok_or(TokenError::Chain(attenuo_core::ChainError::NoHops))?;
-        let act = ActClaim::from_chain(&chain)
+        let act = ActClaim::from_chain_with_issuer(&chain, &self.config.issuer)
             .ok_or(TokenError::Chain(attenuo_core::ChainError::NoHops))?;
         let claims = Claims {
             iss: self.config.issuer.clone(),

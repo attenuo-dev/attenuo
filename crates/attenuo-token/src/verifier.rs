@@ -214,7 +214,7 @@ impl Verifier {
                 "`sub` does not match the chain's originating user".into(),
             ));
         }
-        if ActClaim::from_chain(&claims.chain).as_ref() != Some(&claims.act) {
+        if !claims.act.matches_chain(&claims.chain, &claims.iss) {
             return Err(TokenError::Malformed(
                 "`act` does not match the chain's hops".into(),
             ));
