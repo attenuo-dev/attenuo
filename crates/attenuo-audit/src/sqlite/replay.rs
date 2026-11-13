@@ -196,10 +196,9 @@ mod tests {
     fn expired_markers_are_pruned_a_batch_per_call() {
         let s = SqliteLeaseStore::open_in_memory().unwrap();
         let n = crate::REPLAY_PRUNE_BATCH * 2 + 10;
-        for i in 0..n {
+        for (i, exp) in (1_000..).take(n).enumerate() {
             let key = format!("old-{i}");
-            s.use_all_once(&[(&key, 1_000 + i as i64)], 900, n + 10)
-                .unwrap();
+            s.use_all_once(&[(&key, exp)], 900, n + 10).unwrap();
         }
         s.use_all_once(&[("live", 10_000)], 900, n + 10).unwrap();
         assert_eq!(s.replay_markers().unwrap(), n + 1);
