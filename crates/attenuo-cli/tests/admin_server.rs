@@ -162,3 +162,79 @@ async fn other_commands_ignore_the_admin_server() {
     let out = run(c).await;
     assert_eq!(out.status.code(), Some(1), "{out:?}");
 }
+
+const HINT: &str = "hint: the server may serve its admin API on a separate listener";
+
+/// `attenuo <global> <args>` with the admin token in the environment.
+fn admin_cmd(global: &[&str], args: &[&str]) -> Command {
+    let mut c = attenuo();
+    c.env("ATTENUO_ADMIN_TOKEN", ADMIN).args(global).args(args);
+    c
+}
+
+#[tokio::test]
+async fn a_bare_404_from_the_main_listener_hints_at_admin_server() {
+    let s = split().await;
+    let unknown_record = "00000000-0000-4000-8000-000000000000";
+
+    // No admin base given: the main listener answers `/admin/*` as an unknown route (404,
+    // empty body), and the error says where the admin API may be.
+    for args in [
+        &["audit", "verify"][..],
+        &["lease", "show", "no-such-lease"],
+        &["audit", "show", "--id", unknown_record],
+    ] {
+        let out = run(admin_cmd(&["--server", &s.main], args)).await;
+        assert_eq!(out.status.code(), Some(1), "{out:?}");
+        let err = text(&out.stderr);
+        assert!(err.contains("server answered 404 Not Found\n"), "{err}");
+        assert!(err.contains(HINT), "{err}");
+        assert!(
+            err.contains("pass --admin-server URL (or set ATTENUO_ADMIN_SERVER)"),
+            "{err}"
+        );
+    }
+    // An empty `ATTENUO_ADMIN_SERVER` counts as unset, so it gets the hint too.
+    let mut empty = admin_cmd(&["--server", &s.main], &["audit", "verify"]);
+    empty.env("ATTENUO_ADMIN_SERVER", "");
+    let out = run(empty).await;
+    assert!(text(&out.stderr).contains(HINT), "{out:?}");
+
+    // A genuine 404 for a missing item is the server's JSON `not_found`: no hint, whether the
+    // admin API was reached through `--server` or through `--admin-server`.
+    for global in [
+        vec!["--server", s.admin.as_str()],
+        vec![
+            "--server",
+            s.main.as_str(),
+            "--admin-server",
+            s.admin.as_str(),
+        ],
+    ] {
+        for args in [
+            &["lease", "show", "no-such-lease"][..],
+            &["audit", "show", "--id", unknown_record],
+        ] {
+            let out = run(admin_cmd(&global, args)).await;
+            assert_eq!(out.status.code(), Some(1), "{out:?}");
+            let err = text(&out.stderr);
+            assert!(err.contains("404 Not Found: not_found"), "{err}");
+            assert!(!err.contains("hint:"), "{err}");
+        }
+    }
+
+    // An admin base that was given explicitly gets no hint, even when it is the wrong one.
+    let out = run(admin_cmd(
+        &["--server", &s.main, "--admin-server", &s.main],
+        &["audit", "verify"],
+    ))
+    .await;
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let err = text(&out.stderr);
+    assert!(err.contains("server answered 404 Not Found"), "{err}");
+    assert!(!err.contains("hint:"), "{err}");
+    let mut env = admin_cmd(&["--server", &s.main], &["audit", "verify"]);
+    env.env("ATTENUO_ADMIN_SERVER", &s.main);
+    let out = run(env).await;
+    assert!(!text(&out.stderr).contains("hint:"), "{out:?}");
+}

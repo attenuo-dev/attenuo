@@ -307,8 +307,8 @@ async fn admin_reads_against_a_real_server() {
     assert!(text.starts_with(&format!("seq {newest}")), "{text}");
     let cursor = text
         .lines()
-        .find_map(|l| l.strip_prefix("older: audit checkpoints --cursor "))
-        .unwrap_or_else(|| panic!("no cursor hint: {text}"))
+        .find_map(|l| l.strip_prefix("older: audit checkpoints --limit 1 --cursor "))
+        .unwrap_or_else(|| panic!("no cursor hint with the --limit given: {text}"))
         .to_string();
     let mut c = f.admin();
     c.args([

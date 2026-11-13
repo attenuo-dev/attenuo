@@ -11,7 +11,7 @@ attenuo [--server URL] [--json] <command>
 | Option | Environment | Default | Meaning |
 | --- | --- | --- | --- |
 | `--server`, `--url` | `ATTENUO_SERVER` | `http://127.0.0.1:8080` | Base URL of the attenuo server. Goes before the subcommand. Every request goes here, except requests to `/admin/*` when `--admin-server` is set. |
-| `--admin-server URL` | `ATTENUO_ADMIN_SERVER` | `--server` | Base URL of the admin API, for a server with `[admin] listen` ([network exposure](../guides/deploying.md#network-exposure)): the main listener answers `/admin/*` as an unknown path. Every request to `/admin/*` goes here. Those are the requests of `token root`, `lease`, `audit` other than `audit verify --file`, `approval list`, `show`, `grant` and `decline`, `budget refund`, `policy reload`, `show`, `check` and `evaluate`, and `policy test --via admin-evaluate`. Everything else, including `health` and the JWKS that `token inspect --verify`, `approval verify` and `audit verify --file` fetch, still goes to `--server`, so one invocation can use both. Unset or empty, `/admin/*` goes to `--server` as well. Goes before or after the subcommand. |
+| `--admin-server URL` | `ATTENUO_ADMIN_SERVER` | `--server` | Base URL of the admin API, for a server with `[admin] listen` ([network exposure](../guides/deploying.md#network-exposure)): the main listener answers `/admin/*` as an unknown path. Every request to `/admin/*` goes here. Those are the requests of `token root`, `lease`, `audit` other than `audit verify --file`, `approval list`, `show`, `grant` and `decline`, `budget refund`, `policy reload`, `show`, `check` and `evaluate`, and `policy test --via admin-evaluate`. Everything else, including `health` and the JWKS that `token inspect --verify`, `approval verify` and `audit verify --file` fetch, still goes to `--server`, so one invocation can use both. Unset or empty, `/admin/*` goes to `--server` as well, and a `404` without an error code from it (the main listener's answer to a path it does not serve) gets a second line, `hint: the server may serve its admin API on a separate listener ([admin] listen); pass --admin-server URL (or set ATTENUO_ADMIN_SERVER)`. A JSON `404` `not_found` (an unknown lease, approval or audit record) gets no hint. Goes before or after the subcommand. |
 | `--admin-token-stdin` | | off | Read the admin token from the first line of standard input. The three admin token options go before or after the subcommand. |
 | `--admin-token-file PATH` | | none | Read the admin token from the first line of a file. |
 | `--admin-token TOKEN` | `ATTENUO_ADMIN_TOKEN` | none | Bearer for `/admin/*`. Prefer the environment variable, stdin or a file: an argument is readable by other local users (`ps`, `/proc/<pid>/cmdline`) and lands in shell history, so the CLI prints a warning to stderr when it is used. |
@@ -285,7 +285,7 @@ Show the most recent audit entries, oldest of them first. Filters keep only matc
 | `-f`, `--follow` | off | Keep polling for new matching entries. |
 | `--interval-ms` | 1000 | Polling interval with `--follow`. |
 | `--kind` | all | Record kind: `decision`, `tool_result`, `approval_request`, `approval_grant`, `exchange`, `root_token`, `lease_renew`, `lease_revoke` or `admin`. Repeatable, or comma-separated; any of them matches. |
-| `--decision` | all | `allow` or `deny`. |
+| `--decision` | all | `allow` or `deny`. It matches every kind whose record carries that decision: the `tool_result` record of an allowed call is `allow` too, so add `--kind decision` to get only decision records (for example to find the `id=` for `budget refund`). |
 | `--reason` | all | The record's `reason` (`policy_deny`, `lease_revoked`, ...). |
 | `--subject` | all | The originating user. |
 | `--agent` | all | An agent anywhere in the record's chain. |
@@ -327,7 +327,7 @@ One entry with its context, from `GET /admin/audit/entries/{seq}` or, with `--id
 
 ### `audit checkpoints [--cursor CURSOR] [--limit N]`
 
-List stored checkpoints, newest first, one line each (`seq`, time, `kid`, head hash), from `GET /admin/audit/checkpoints`. When more are older, the last line is `older: audit checkpoints --cursor <next_cursor>`, the command for the next page. Read-only: unlike `GET /admin/audit/checkpoint` it never signs a new checkpoint. `--limit` defaults to the server's 100, at most 1000. Needs the admin token.
+List stored checkpoints, newest first, one line each (`seq`, time, `kid`, head hash), from `GET /admin/audit/checkpoints`. When more are older, the last line is `older: audit checkpoints --cursor <next_cursor>` (with the `--limit` you gave, if any), the command for the next page. Read-only: unlike `GET /admin/audit/checkpoint` it never signs a new checkpoint. `--limit` defaults to the server's 100, at most 1000. Needs the admin token.
 
 ### `audit verify`
 
@@ -435,7 +435,7 @@ Approvals of gated calls, as the operator (admin token, `ATTENUO_ADMIN_TOKEN`).
 
 | Command | Does |
 | --- | --- |
-| `approval list [--chain-id ID] [--state pending\|granted\|declined\|consumed] [--limit N] [--cursor CURSOR \| --all]` | `GET /admin/approvals`: one line per approval, newest first (id, state, call, run, expiry). One page (`--limit` 1 to 500, server default 100); when more exist the last line names the `--cursor` for the next page, to be sent with the same filters. `--all` follows the cursor and lists every match (`--json` then prints `{approvals, next_cursor: null}` with all of them). |
+| `approval list [--chain-id ID] [--state pending\|granted\|declined\|consumed] [--limit N] [--cursor CURSOR \| --all]` | `GET /admin/approvals`: one line per approval, newest first (id, state, call, run, expiry). One page (`--limit` 1 to 500, server default 100); when more exist the last line is `more: approval list ... --cursor <next_cursor>, or --all`, the command for the next page with the filters and `--limit` you gave. `--all` follows the cursor and lists every match (`--json` then prints `{approvals, next_cursor: null}` with all of them). |
 | `approval show <ID>` | `GET /admin/approvals/{id}`: the exact call with its arguments, the call hash, user, agents, run and lease, the labels the run carried with their audit seqs, the times, and who decided. |
 | `approval grant <ID>` | `POST /admin/approvals/{id}` with `grant`. The agent's identical retry then runs once. Recorded as `by = "operator"`. |
 | `approval decline <ID>` | The same with `decline`. |

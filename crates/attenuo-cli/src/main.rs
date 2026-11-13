@@ -350,6 +350,12 @@ async fn run(cli: Cli) -> Result<Outcome> {
             all,
         }) => {
             let mut q = Vec::new();
+            // What the next page's command must repeat (the hint after a page).
+            let flags = render::repeat_flags(&[
+                ("--chain-id", chain_id.clone()),
+                ("--state", state.clone()),
+                ("--limit", limit.map(|n| n.to_string())),
+            ]);
             if let Some(c) = chain_id {
                 q.push(format!("chain_id={}", query_escape(&c)));
             }
@@ -392,7 +398,7 @@ async fn run(cli: Cli) -> Result<Outcome> {
             if json {
                 print_json(&resp);
             } else {
-                print!("{}", render::render_approvals(&resp));
+                print!("{}", render::render_approvals(&resp, &flags));
             }
             Ok(Outcome::Ok)
         }
@@ -490,7 +496,8 @@ async fn run(cli: Cli) -> Result<Outcome> {
             if json {
                 print_json(&resp);
             } else {
-                print!("{}", render::render_checkpoints(&resp));
+                let flags = render::repeat_flags(&[("--limit", limit.map(|l| l.to_string()))]);
+                print!("{}", render::render_checkpoints(&resp, &flags));
             }
             Ok(Outcome::Ok)
         }
