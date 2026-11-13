@@ -261,10 +261,10 @@ async def test_rpc_error_stable_code(
     data: Any,
     stable: str | None,
 ) -> None:
-    client, _ = make(lambda r: rpc_err(-32002, "attenuo: unknown server", data, status=404))
+    client, _ = make(lambda r: rpc_err(-32004, "attenuo: unknown server", data, status=404))
     with pytest.raises(RpcError) as e:
         await call(client, "call_tool", "TOK", "nope", "read_file")
-    assert e.value.code == -32002  # the JSON-RPC number is unchanged
+    assert e.value.code == -32004  # the JSON-RPC number is unchanged
     assert e.value.stable_code == stable
     assert e.value.data == data
 

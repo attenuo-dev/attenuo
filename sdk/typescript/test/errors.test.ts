@@ -203,10 +203,10 @@ describe("the stable code of a JSON-RPC error (stableCode)", () => {
     [["not", "an", "object"], undefined],
     ["text", undefined],
   ])("is read from data (%#)", async (data, stable) => {
-    const { ob } = client(() => rpcErr(-32002, "attenuo: unknown server", data, 404));
+    const { ob } = client(() => rpcErr(-32004, "attenuo: unknown server", data, 404));
     const e = (await caught(ob.callTool("TOK", "nope", "read_file"))) as RpcError;
     expect(e).toBeInstanceOf(RpcError);
-    expect(e.code).toBe(-32002); // the JSON-RPC number is unchanged
+    expect(e.code).toBe(-32004); // the JSON-RPC number is unchanged
     expect(e.stableCode).toBe(stable);
     expect(e.data).toEqual(data);
   });

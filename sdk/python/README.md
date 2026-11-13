@@ -442,16 +442,16 @@ All SDK errors derive from `AttenuoError`, transport failures included.
 
 | Exception | When |
 | --- | --- |
-| `Denied` (`.reason`, `.decision_id`, `.data`, `.limit`, `.usage`, `.untrusted_args`) | The proxy said no (JSON-RPC `-32003` with the `X-Attenuo-Decision-Id` header naming `data.decision_id`; an upstream's own `-32003` without that proof is an `RpcError`). Also raised by `call_tool_stream` when the proxy cuts a stream for a lease or token reason ([Streaming a call](#streaming-a-call)). Branch on `reason`: `capability_denied`, `policy_deny`, `budget_exhausted`, `lease_revoked`, `lease_expired`, ... See the [integration guide](https://github.com/attenuo-dev/attenuo/blob/main/docs/guides/integrating-mcp-clients.md#handling-denied-responses). `data` is the error's whole `data` object; what the server adds to it is typed too (below). |
+| `Denied` (`.reason`, `.stable_code`, `.decision_id`, `.data`, `.limit`, `.usage`, `.untrusted_args`) | The proxy said no (JSON-RPC `-32003` with the `X-Attenuo-Decision-Id` header naming `data.decision_id`; an upstream's own `-32003` without that proof is an `RpcError`). Also raised by `call_tool_stream` when the proxy cuts a stream for a lease or token reason ([Streaming a call](#streaming-a-call)). Branch on `reason`: `capability_denied`, `policy_deny`, `budget_exhausted`, `lease_revoked`, `lease_expired`, ... See the [integration guide](https://github.com/attenuo-dev/attenuo/blob/main/docs/guides/integrating-mcp-clients.md#handling-denied-responses). `data` is the error's whole `data` object; what the server adds to it is typed too (below). |
 | `ApprovalRequired` (`.approval_id`, `.expires_at`, `.call_hash`) | A `Denied` for JSON-RPC `-32008`: a policy holds the call until it is approved. See [Approvals](#approvals). |
 | `ApprovalNotGranted` (`.approval_id`, `.state`) | Waiting for an approval ended without a grant: `declined`, `expired`, `consumed` or `timeout`. |
 | `Unauthorized` (`.reason`, `.decision_id`, `.data`) | HTTP 401 or JSON-RPC `-32001`: missing, bad or expired bearer, a DPoP failure, or (from the proxy) a lease that is no longer live. A subclass of `ApiError`. Branch on `reason` (below). |
 | `Unavailable` (`.reason`, `.retry_after`, `.data`) | HTTP 503 from the server itself (REST `temporarily_unavailable`, or the proxy's JSON-RPC `-32006`): `overloaded`, `request_timeout`, `session_registry_full`, ... A subclass of `ApiError`, not a denial. See [Load refusals](#load-refusals). |
 | `RateLimited` (`.reason`, `.retry_after`, `.data`) | HTTP 429 (REST `rate_limited`, or the proxy's JSON-RPC `-32007`): `rate_limited` or `too_many_sessions`. A subclass of `ApiError`, not a denial. See [Load refusals](#load-refusals). |
-| `ApiError` (`.status`, `.code`, `.error`, `.detail`, `.decision_id`) | Any other non-success from the server: `invalid_scope`, `invalid_grant`, 404, 408 `request_timeout`, 422. Branch on `code`, the server's stable code (`audience_mismatch`, `replayed`, `invalid_cursor`, ...; every code is listed under [Errors](https://github.com/attenuo-dev/attenuo/blob/main/docs/reference/http-api.md#errors)), not on `detail`, which is text for people. `error` is the broader OAuth-style error and `description` the deprecated `error_description`. Every subclass has `code` too. `decision_id` names the audit record of a refused exchange or renewal. |
+| `ApiError` (`.status`, `.code`, `.error`, `.detail`, `.decision_id`) | Any other non-success from the server: `invalid_scope`, `invalid_grant`, 404, 408 `request_timeout`, 422. Branch on `code`, the server's stable code (`audience_mismatch`, `replayed`, `invalid_cursor`, ...; every code is listed under [Errors](https://github.com/attenuo-dev/attenuo/blob/main/docs/reference/http-api.md#errors)), not on `detail`, which is text for people. `error` is the broader OAuth-style error and `description` the deprecated `error_description`. Every subclass has `code` too, and `stable_code`, the same string. `decision_id` names the audit record of a refused exchange or renewal. |
 | `TransportError` | No answer: the connection was refused or dropped, a timeout ran out, TLS or a proxy failed. `__cause__` is the `httpx` error. |
 | `TransportTimeout` | A `TransportError` because a timeout ran out: the client's `timeout` (`__cause__` is the `httpx.TimeoutException`) or a streamed call's `deadline`. Also an `httpx.TimeoutException`. |
-| `RpcError` | A JSON-RPC error that is not a denial (unknown upstream, upstream down). |
+| `RpcError` (`.code`, `.stable_code`, `.message`, `.data`) | A JSON-RPC error that is not a denial (unknown upstream, upstream down). `code` is the JSON-RPC number (`-32004`, `-32005`, ...); `stable_code` is the server's stable code (below). |
 | `RefreshError` (`.reason`) | A `TokenRefresher` gave up: `lease_revoked`, `lease_lost`, `token_expired`, `refused`, `key_mismatch`. |
 | `VerificationError` | `inspect(verify=True)` failed. |
 
@@ -475,6 +475,26 @@ except Denied as d:
     raise
 except TransportError as e:
     print("server unreachable:", e.__cause__)
+```
+
+**Branching on the stable code.** Every error the server answers with names a stable code, listed under [Errors](https://github.com/attenuo-dev/attenuo/blob/main/docs/reference/http-api.md#errors). On an `ApiError` (and its subclasses) it is `code`. On an `RpcError`, `code` is the JSON-RPC number, so the stable code is `stable_code`: the proxy's `data["code"]`, or `data["reason"]` for a server older than `code`, else `None`. `Denied` carries it as `stable_code` too (the same string as `reason`), and `ApiError.stable_code` is `code`, so `stable_code` reads the same on all three. An error the proxy relays from the upstream keeps the upstream's `data`, so its `stable_code` is what the upstream sent there, usually `None`.
+
+```python
+from attenuo import ApiError, RpcError
+
+try:
+    ob.call_tool(token, "github", "read_file", {"repo": "alice/docs"})
+except ApiError as e:
+    if e.code == "token_expired":  # an Unauthorized; e.stable_code is the same string
+        token = new_token()
+    else:
+        raise
+except RpcError as e:
+    if e.stable_code == "unknown_server":  # e.code is the JSON-RPC number, -32004
+        raise RuntimeError("no [[upstreams]] entry named github") from e
+    if e.stable_code == "upstream_timeout":  # the upstream may have acted: do not resend blindly
+        report(e)
+    raise
 ```
 
 **What a denial carries.** `Denied.limit` is the run limit a `budget_exhausted` call would take past its `max`, as a `BudgetLimit` (the same type a dry run's `limit` is, so it can be stated back to `policy_evaluate`); `None` otherwise. `Denied.usage` is set for a tool the catalog marks destructive or gives an `outbound` input: a `RunUsage(calls, amount, destination_seen, user_window)`, the run's usage before this call as the policy saw it, with `user_window` a `UserWindow(hour, day)` of `WindowUsage(calls, amount)` when a policy reads per-user windows and a figure is not zero. `Denied.untrusted_args` lists the arguments that copy an untrusted result of the run as `UntrustedArg(arg, kind, seq)`, empty when the server sent none. `ApprovalRequired` carries the same three next to its approval fields. The shapes are in the [HTTP API reference](https://github.com/attenuo-dev/attenuo/blob/main/docs/reference/http-api.md#mcp-proxy).

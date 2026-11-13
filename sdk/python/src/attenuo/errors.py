@@ -361,7 +361,7 @@ class RateLimited(ApiError):
 class RpcError(AttenuoError):
     """A JSON-RPC error that is not a denial (unknown upstream, upstream down, ...).
 
-    ``code`` is the JSON-RPC error number (``-32002``, ``-32005``, ...). ``stable_code`` is the
+    ``code`` is the JSON-RPC error number (``-32004``, ``-32005``, ...). ``stable_code`` is the
     server's stable machine-readable code (``unknown_server``, ``upstream_unreachable``, ...;
     the list is in the HTTP reference under "Errors"): ``data["code"]``, or ``data["reason"]``
     for a server that sends no ``code``, else ``None``. Branch on it, not on ``message``. An
