@@ -43,13 +43,13 @@ What this view cannot show, by design of the log: tool arguments (the log stores
 
 - Granting tokens. Agents get tokens through exchange; the dev root mint (`POST /admin/root-token`) is never called by the console.
 - Editing policy files in the browser in v1. The console reads, checks, reloads and evaluates; the file is edited where it lives, under review.
-- Multi-tenant RBAC or per-operator identity in v1. There is one static admin bearer today (`[admin] token`); the console uses it and adds no roles.
+- Multi-tenant RBAC or per-operator identity in v1. There is one static admin bearer today (`[admin] token`); the console uses it and adds no roles. (Since [ADR-0016](../decisions/0016-admin-operators.md): named operator tokens with three fixed roles; the console logs in with `GET /admin/whoami`, shows the operator and role, and disables what the role cannot do. The server enforces the role.)
 - Replacing the CLI. Every console action stays possible from the CLI, and scripted use stays on the CLI.
 - Charts and metrics dashboards. `/metrics` stays a Prometheus endpoint for existing tooling.
 
 ## 2. The existing admin API
 
-Routes are registered in `router()` in `crates/attenuo-server/src/lib.rs`. The admin routes share one `route_layer` running `admin::require_admin` (`crates/attenuo-server/src/routes/admin.rs`): `Authorization: Bearer <[admin] token>` (or `DPoP <token>`, parsed by `routes::bearer_of`), compared in constant time; 403 `admin_disabled` when no token is configured; 401 with `WWW-Authenticate: Bearer realm="attenuo-admin"` otherwise. No route sets CORS headers (the workspace enables `tower-http`'s `cors` feature but no `CorsLayer` is used), and no route sets CSP, `X-Frame-Options` or `X-Content-Type-Options`.
+Routes are registered in `router()` in `crates/attenuo-server/src/lib.rs`. The admin routes share one `route_layer` running `admin::require_admin` (`crates/attenuo-server/src/routes/admin.rs`): `Authorization: Bearer <[admin] token>` (or `DPoP <token>`, parsed by `routes::bearer_of`), compared in constant time; 403 `admin_disabled` when no token is configured; 401 with `WWW-Authenticate: Bearer realm="attenuo-admin"` otherwise. (Since [ADR-0016](../decisions/0016-admin-operators.md) the bearer may also be a named operator's token, matched by SHA-256 digest against every credential in constant time, and the route's least role from `operators::ROUTE_ROLES` is checked: 403 `admin_role_insufficient` below it.) No route sets CORS headers (the workspace enables `tower-http`'s `cors` feature but no `CorsLayer` is used), and no route sets CSP, `X-Frame-Options` or `X-Content-Type-Options`.
 
 | Endpoint | Method | Auth | Handler | Returns | UI use |
 |---|---|---|---|---|---|
@@ -133,7 +133,7 @@ Two candidates:
 - Browsers do not attach `Authorization` headers on their own, so there is no ambient credential and CSRF does not arise. A cookie brings CSRF back and needs SameSite, a CSRF token and an Origin check to remove it again.
 - No session store, no session expiry logic, no logout endpoint, no cookie `Secure` handling on a plain-HTTP loopback listener (where `__Host-` cookies do not work).
 
-The cost, stated plainly: a script injected into the console could read the static token and send it out, while with an `HttpOnly` cookie it could only act during the session. The mitigations are the strict CSP below (no inline script, `connect-src 'self'`, Trusted Types), rendering by `textContent` only, a short idle timeout, and the fact that the token is already rotatable through `ATTENUO_ADMIN_TOKEN`. When admin authentication becomes per-operator (OIDC or similar, the "replace with real operator authentication" note on `AdminSection::token`), the console should switch to a short-lived server session in a `__Host-`, `HttpOnly`, `SameSite=Strict` cookie with CSRF token and Origin check. Only the console's single `api()` fetch wrapper changes.
+The cost, stated plainly: a script injected into the console could read the static token and send it out, while with an `HttpOnly` cookie it could only act during the session. The mitigations are the strict CSP below (no inline script, `connect-src 'self'`, Trusted Types), rendering by `textContent` only, a short idle timeout, and the fact that the token is already rotatable through `ATTENUO_ADMIN_TOKEN`. When operators log in through an identity provider (OIDC or similar; ADR-0016 added named operator tokens with roles, but no login), the console should switch to a short-lived server session in a `__Host-`, `HttpOnly`, `SameSite=Strict` cookie with CSRF token and Origin check. Only the console's single `api()` fetch wrapper changes.
 
 ### CORS
 

@@ -7,7 +7,7 @@
 import {
   h, append, replace, link, mono, time, pill, empty, loading, kv, table, jsonTree,
 } from './dom.js';
-import { api, qs, showNotice } from './api.js';
+import { api, qs, showNotice, needsRole } from './api.js';
 import { untrustedArgs } from './view-entry.js';
 
 // Approvals per page; the server's maximum is 500.
@@ -109,13 +109,13 @@ function render(root, a) {
         ? 'Writes are disabled on this listener. Set [admin_ui] allow_write = true to decide from the console, or use `attenuo approval grant` against the main listener.'
         : `Could not ${decision}: ${e.message}`;
       err.hidden = false;
-      for (const b of buttons) b.disabled = false;
+      for (const b of buttons) needsRole(Object.assign(b, { disabled: false }), 'operator');
     }
   };
   const buttons = open ? [
     h('button', { type: 'button', class: 'primary', on: { click: decide('grant') } }, 'Grant'),
     h('button', { type: 'button', class: 'danger', on: { click: decide('decline') } }, 'Decline'),
-  ] : [];
+  ].map((b) => needsRole(b, 'operator')) : [];
   const labels = a.labels.length
     ? h('ul', null, a.labels.map((l) => h('li', null, mono(l.source), ' ', link(['entry', l.seq], `tool_result at seq ${l.seq}`))))
     : h('span', { class: 'muted' }, 'none');

@@ -150,6 +150,15 @@ export interface AuditCheckpoint {
   [key: string]: unknown;
 }
 
+/**
+ * Who the admin token is (`GET /admin/whoami`, ADR-0016): the operator's `name` (`admin` for
+ * the server's `[admin] token`) and `role`.
+ */
+export interface AdminIdentity {
+  name: string;
+  role: "viewer" | "operator" | "admin" | string;
+}
+
 export interface PolicyReload {
   policyIds: string[];
   warnings: string[];
@@ -1079,6 +1088,13 @@ export class AdminClient {
       cursor = advance(page.nextCursor, cursor);
       if (cursor === undefined) return;
     }
+  }
+
+  /** The name and role of the admin token this client sends (`GET /admin/whoami`). */
+  async whoami(): Promise<AdminIdentity> {
+    const res = await this.http.get("/admin/whoami");
+    const b = w.asObject(await w.jsonBody(res), "whoami");
+    return { name: String(b.name ?? ""), role: String(b.role ?? "") };
   }
 
   /** The policy set in force: file, digest, load time, ids, warnings and texts. */

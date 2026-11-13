@@ -212,9 +212,28 @@ The admin API (`/admin/*`: revoke, reload, approve, export, the dev root mint) a
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `token` | unset | Static bearer for `/admin/*`. `ATTENUO_ADMIN_TOKEN`, when set, replaces it (setting it together with `ATTENUO__ADMIN__TOKEN` refuses to start). With no token configured, admin routes answer 403 `admin_disabled`. When `[server] listen`, `[admin] listen` or an enabled `[admin_ui] listen` is not a loopback address, the server refuses to start if the token is missing, shorter than 32 bytes or a published placeholder (`change-me`, `admin`, ...); on loopback it only warns. Generate one with `openssl rand -hex 32`. Do not expose `/admin` publicly. |
+| `token` | unset | Static bearer for `/admin/*`: the operator named `admin`, with role `admin`, recorded in the audit log as `urn:attenuo:admin`. `ATTENUO_ADMIN_TOKEN`, when set, replaces it (setting it together with `ATTENUO__ADMIN__TOKEN` refuses to start). With no token and no `operators` configured, admin routes answer 403 `admin_disabled`. When `[server] listen`, `[admin] listen` or an enabled `[admin_ui] listen` is not a loopback address, the server refuses to start if there is no admin credential at all (neither `token` nor `operators`), or if `token` is set and is shorter than 32 bytes or a published placeholder (`change-me`, `admin`, ...); on loopback it only warns. Generate one with `openssl rand -hex 32`. Do not expose `/admin` publicly. |
 | `listen` | unset | Serve the admin API on a listener of its own at this address (suggested `127.0.0.1:9102`), behind the same `token`, and not on `[server] listen`. The main listener then answers `/admin/*` exactly as it answers any unknown path (404, empty body). `/healthz`, `/readyz`, discovery and everything agents call stay on the main listener; the admin listener serves `/admin/*` only. It is drained and stopped with the main listener on shutdown. Off loopback the server logs a warning: keep it on a network only operators reach. Point the CLI's `--admin-server` (or `ATTENUO_ADMIN_SERVER`) and the SDKs' `AdminClient` at it. `[dev] allow_root_mint` is then judged by this address, not by `[server] listen`. Must differ from `[server] listen`. |
 | `serve_on_main_listener` | `false` | Keep the admin API on `[server] listen` although that address is not loopback. Without it (and without `listen`) the server refuses to start off loopback. Set it only when something in front of the server keeps `/admin/` away from agents and the internet (a reverse proxy that does not forward `/admin/`, or a container that binds `0.0.0.0` behind a loopback-only published port); the server logs a warning. Cannot be combined with `listen`. No effect on loopback, where the admin API is on the main listener anyway. |
+
+### `[[admin.operators]]`
+
+Named admin credentials, each with a role ([ADR-0016](../decisions/0016-admin-operators.md)), next to `token` or instead of it. The file holds only the SHA-256 of each operator's token; `attenuo admin operator new --name alice --role operator` generates a token and prints the entry ([CLI](cli.md#admin-operator-new---name-name---role-role--admin-operator-hash)).
+
+```toml
+[[admin.operators]]
+name = "alice"
+token_sha256 = "<64 lowercase hex characters>"
+role = "operator"
+```
+
+| Key | Meaning |
+| --- | --- |
+| `name` | `[a-z0-9_-]{1,64}`, unique, not `admin` (the name of `token`). The audit log records the operator's actions with `originating_subject` `urn:attenuo:admin:<name>`, and an approval it decides with that subject as approver. |
+| `token_sha256` | SHA-256 of the operator's bearer token, 64 lowercase hex characters (`attenuo admin operator hash` computes it from a token on stdin). |
+| `role` | `viewer`: read-only routes (lease state and tree, the audit log, its checkpoints and export, the loaded policies and their check, the `POST /admin/policies/evaluate` dry run, approvals, `GET /admin/whoami`). `operator`: a viewer that may also revoke leases (by id, user, chain or session, the preview included) and decide approvals. `admin`: every admin route (also policy reload, budget refunds and the dev root mint). The route table is in the [HTTP reference](http-api.md#admin). |
+
+The server refuses to start on a name that breaks the rules or appears twice, a `token_sha256` that is not 64 lowercase hex characters, two operators with the same `token_sha256`, and an operator whose `token_sha256` is the SHA-256 of `token`. Operators are read from the file at startup only: a change takes a restart (`POST /admin/policies/reload` reloads policies, not the config). They cannot be set from the environment, as no `[[...]]` entry can ([environment overrides](#environment-overrides)); to keep tokens out of the file, keep only their digests in it, which is all it holds. A bearer is compared against every credential's digest in constant time. Removing an entry and restarting is how an operator's access is withdrawn.
 
 ## `[[idps]]`
 

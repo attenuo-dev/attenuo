@@ -52,6 +52,7 @@ export type {
   VerifyExportOptions,
 } from "./audit.js";
 export type {
+  AdminIdentity,
   ApprovalBy,
   ApprovalQuery,
   AuditCheckpoint,

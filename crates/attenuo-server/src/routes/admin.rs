@@ -1,5 +1,6 @@
-//! `/admin/*`: leases, audit log and policy reload. Every route requires the static admin
-//! bearer from `[admin] token` (v0; see [`require_admin`]). The read-only policy routes
+//! `/admin/*`: leases, audit log and policy reload. Every route requires an admin
+//! credential (`[admin] token` or an `[[admin.operators]]` entry) whose role reaches the
+//! route's (see [`require_admin`] and [`crate::operators`]). The read-only policy routes
 //! (`GET /admin/policies`, `/check`, `POST /admin/policies/evaluate`) are in
 //! [`super::policies`].
 
@@ -12,11 +13,11 @@ use attenuo_audit::{
 };
 use attenuo_core::{AgentId, LeaseId, RecordKind};
 use axum::body::Bytes;
-use axum::extract::{Request, State};
+use axum::extract::{MatchedPath, Request, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
+use axum::{Extension, Json};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use time::format_description::well_known::Rfc3339;
@@ -27,6 +28,7 @@ use super::page;
 use super::{audit_admin, bearer_of, REASON_ADMIN_ACTION};
 use crate::error::ApiError;
 use crate::metrics::RefundSource;
+use crate::operators::{required_role, AdminIdentity};
 use crate::state::AppState;
 use attenuo_core::Decision;
 use attenuo_proxy::session::{session_digest, session_tag};
@@ -38,41 +40,71 @@ pub const MAX_AUDIT_PAGE: usize = 1000;
 /// Page size of `GET /admin/audit` and `GET /admin/audit/checkpoints` without `limit`.
 pub const DEFAULT_AUDIT_PAGE: usize = 100;
 
-/// Middleware: the request must carry `Authorization: Bearer <[admin] token>`.
+/// Middleware: the request must carry `Authorization: Bearer <token>` with the token of an
+/// admin credential whose role is at least the one the route needs.
 ///
-/// When no admin token is configured every admin route answers 403, so a forgotten setting
-/// fails closed rather than open.
+/// - No credential configured: 403 `admin_disabled` on every route, so a forgotten setting
+///   fails closed rather than open.
+/// - No bearer, or one that matches no credential: 401 with
+///   `WWW-Authenticate: Bearer realm="attenuo-admin"`. The bearer is hashed and compared with
+///   every credential in constant time ([`AdminCredentials::authenticate`]).
+/// - A role below [`required_role`] of the matched route (a route with no entry in
+///   [`crate::operators::ROUTE_ROLES`] needs `admin`): 403 `admin_role_insufficient`, naming
+///   the role needed.
+///
+/// Otherwise the request goes on with an [`AdminIdentity`] in its extensions, which the
+/// handlers record as the actor.
+///
+/// [`AdminCredentials::authenticate`]: crate::operators::AdminCredentials::authenticate
 pub async fn require_admin(
     State(state): State<Arc<AppState>>,
-    req: Request,
+    mut req: Request,
     next: Next,
 ) -> Response {
-    let Some(expected) = state.admin_token.as_deref() else {
+    if state.admin_credentials.is_empty() {
         return ApiError::new(
             StatusCode::FORBIDDEN,
             "admin_disabled",
-            "no [admin] token is configured",
+            "no admin credential is configured ([admin] token or [[admin.operators]])",
         )
         .into_response();
-    };
-    match bearer_of(req.headers()) {
-        Ok(Some(token)) if constant_time_eq(token.as_bytes(), expected.as_bytes()) => {
-            next.run(req).await
-        }
-        other => {
-            let reason = match other {
-                Ok(None) => crate::error::REASON_MISSING_TOKEN,
-                _ => crate::error::REASON_INVALID_TOKEN,
-            };
-            let mut resp =
-                ApiError::unauthorized(reason, "admin bearer token required").into_response();
-            resp.headers_mut().insert(
-                header::WWW_AUTHENTICATE,
-                HeaderValue::from_static("Bearer realm=\"attenuo-admin\""),
-            );
-            resp
-        }
     }
+    let identity = match bearer_of(req.headers()) {
+        Ok(Some(token)) => state.admin_credentials.authenticate(token),
+        _ => None,
+    };
+    let Some(identity) = identity else {
+        let reason = match bearer_of(req.headers()) {
+            Ok(None) => crate::error::REASON_MISSING_TOKEN,
+            _ => crate::error::REASON_INVALID_TOKEN,
+        };
+        let mut resp =
+            ApiError::unauthorized(reason, "admin bearer token required").into_response();
+        resp.headers_mut().insert(
+            header::WWW_AUTHENTICATE,
+            HeaderValue::from_static("Bearer realm=\"attenuo-admin\""),
+        );
+        return resp;
+    };
+    let route = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|p| p.as_str().to_owned());
+    let needed = required_role(req.method(), route.as_deref());
+    if identity.role < needed {
+        return ApiError::new(
+            StatusCode::FORBIDDEN,
+            "admin_role_insufficient",
+            format!(
+                "this route needs the `{needed}` role; the credential presented has the `{}` \
+                 role",
+                identity.role
+            ),
+        )
+        .into_response();
+    }
+    req.extensions_mut().insert(identity);
+    next.run(req).await
 }
 
 pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -80,6 +112,13 @@ pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         return false;
     }
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// `GET /admin/whoami`: the name and role of the credential that sent the request,
+/// `{"name": ..., "role": "viewer" | "operator" | "admin"}`. The operator of `[admin] token`
+/// is `{"name": "admin", "role": "admin"}`. Reads nothing else and records nothing.
+pub async fn whoami(Extension(who): Extension<AdminIdentity>) -> Json<Value> {
+    Json(json!({ "name": who.name, "role": who.role }))
 }
 
 /// Body of `POST /admin/leases/{lease_id}/revoke`; an empty body is allowed.
@@ -102,6 +141,7 @@ pub struct RevokeBody {
 /// write the audit record is not an error (`audit_id` is null).
 pub async fn revoke_lease(
     State(state): State<Arc<AppState>>,
+    Extension(who): Extension<AdminIdentity>,
     Path(lease_id): Path<String>,
     Body(body): Body,
 ) -> Result<Json<Value>, ApiError> {
@@ -112,7 +152,7 @@ pub async fn revoke_lease(
     };
     let reason = body
         .reason
-        .unwrap_or_else(|| "revoked by admin".to_string());
+        .unwrap_or_else(|| format!("revoked by {}", who.name));
     let lease = LeaseId::new(lease_id);
     let now = state.now();
     state
@@ -124,6 +164,7 @@ pub async fn revoke_lease(
             // unsafe direction. The response says whether it was audited.
             let audit_id = audit_admin(
                 state,
+                &who,
                 "admin.lease.revoke",
                 Decision::Allow,
                 REASON_ADMIN_ACTION,
@@ -312,6 +353,7 @@ fn selector_response(
 /// errors.
 pub async fn revoke_by_selector(
     State(state): State<Arc<AppState>>,
+    Extension(who): Extension<AdminIdentity>,
     Query(q): Query<SelectorRevokeQuery>,
     Body(body): Body,
 ) -> Result<Json<Value>, ApiError> {
@@ -323,7 +365,7 @@ pub async fn revoke_by_selector(
     let (selector, mut shown) = selector_of(&body)?;
     let reason = body
         .reason
-        .unwrap_or_else(|| "revoked by admin".to_string());
+        .unwrap_or_else(|| format!("revoked by {}", who.name));
     let now = state.now();
     state
         .blocking(move |state| {
@@ -352,6 +394,7 @@ pub async fn revoke_by_selector(
             let listed = audited.len();
             let audit_id = audit_admin(
                 state,
+                &who,
                 "admin.lease.revoke",
                 Decision::Allow,
                 REASON_ADMIN_ACTION,
@@ -407,12 +450,13 @@ pub struct RefundBody {
 /// audit lookup fails.
 pub async fn refund_budget(
     State(state): State<Arc<AppState>>,
+    Extension(who): Extension<AdminIdentity>,
     Body(body): Body,
 ) -> Result<Json<Value>, ApiError> {
     let body: RefundBody = super::parse_json(&body)?;
     let reason = body
         .reason
-        .unwrap_or_else(|| "refunded by admin".to_string());
+        .unwrap_or_else(|| format!("refunded by {}", who.name));
     let decision_id = body.decision_id;
     let now = state.now();
     state
@@ -430,6 +474,7 @@ pub async fn refund_budget(
             tracing::warn!(decision = ?decision_id, reason = ?reason, refunded, "budget refunded");
             let audit_id = audit_admin(
                 state,
+                &who,
                 "admin.budget.refund",
                 Decision::Allow,
                 REASON_ADMIN_ACTION,
@@ -1364,7 +1409,10 @@ pub async fn audit_export(
 /// 409 `reload_unavailable` when `policy.policies_path` is not configured, 500 `server_error` when
 /// the file cannot be read or the loaded policy info lock is poisoned, and 422 when the file does not parse or
 /// validate (the previous set stays in force).
-pub async fn reload_policies(State(state): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
+pub async fn reload_policies(
+    State(state): State<Arc<AppState>>,
+    Extension(who): Extension<AdminIdentity>,
+) -> Result<Json<Value>, ApiError> {
     let path = state.policies_path.as_ref().ok_or_else(|| {
         ApiError::new(
             StatusCode::CONFLICT,
@@ -1420,6 +1468,7 @@ pub async fn reload_policies(State(state): State<Arc<AppState>>) -> Result<Json<
                 .blocking(move |state| {
                     audit_admin(
                         state,
+                        &who,
                         "admin.policies.reload",
                         Decision::Deny,
                         "policy_invalid",
@@ -1445,6 +1494,7 @@ pub async fn reload_policies(State(state): State<Arc<AppState>>) -> Result<Json<
         .blocking(move |state| {
             audit_admin(
                 state,
+                &who,
                 "admin.policies.reload",
                 Decision::Allow,
                 REASON_ADMIN_ACTION,

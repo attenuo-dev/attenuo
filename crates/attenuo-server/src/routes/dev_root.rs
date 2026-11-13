@@ -73,17 +73,19 @@ pub struct RootTokenRequest {
 /// registered or audited.
 pub async fn mint_root(
     State(state): State<Arc<AppState>>,
+    axum::Extension(who): axum::Extension<crate::operators::AdminIdentity>,
     headers: axum::http::HeaderMap,
     Body(body): Body,
 ) -> Result<Response, ApiError> {
     let req: RootTokenRequest = parse_json(&body)?;
     state
-        .blocking(move |s| mint_root_sync(s, &headers, req))
+        .blocking(move |s| mint_root_sync(s, &who, &headers, req))
         .await
 }
 
 fn mint_root_sync(
     state: &AppState,
+    who: &crate::operators::AdminIdentity,
     headers: &axum::http::HeaderMap,
     req: RootTokenRequest,
 ) -> Result<Response, ApiError> {
@@ -154,6 +156,7 @@ fn mint_root_sync(
         .and_then(|_| {
             audit_admin(
                 state,
+                who,
                 "admin.root_token",
                 Decision::Allow,
                 REASON_ADMIN_ACTION,

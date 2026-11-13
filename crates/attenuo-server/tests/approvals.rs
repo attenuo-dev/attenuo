@@ -732,6 +732,68 @@ async fn revoked_lease_kills_pending_and_granted_approvals() {
 }
 
 #[tokio::test]
+async fn a_named_operator_decides_and_is_recorded_a_viewer_cannot_adr0016() {
+    use attenuo_server::config::AdminOperator;
+    use attenuo_server::operators::{token_sha256_hex, AdminRole};
+    let h = Harness::start_with(|cfg| {
+        cfg.admin.operators = vec![
+            AdminOperator {
+                name: "bob".into(),
+                token_sha256: token_sha256_hex("bob-token"),
+                role: AdminRole::Operator,
+            },
+            AdminOperator {
+                name: "vera".into(),
+                token_sha256: token_sha256_hex("vera-token"),
+                role: AdminRole::Viewer,
+            },
+        ];
+    })
+    .await;
+    let token = h.root().await;
+    h.taint(&token).await;
+    let g = h.gated(&token, "alice/site").await;
+    let decide = |bearer: &'static str| {
+        h.client
+            .post(h.server.url(&format!("/admin/approvals/{}", g.approval_id)))
+            .bearer_auth(bearer)
+            .json(&json!({ "decision": "grant" }))
+            .send()
+    };
+    // A viewer may read the approval but not decide it.
+    let resp = h
+        .client
+        .get(h.server.url(&format!("/admin/approvals/{}", g.approval_id)))
+        .bearer_auth("vera-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = decide("vera-token").await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(v["error"], "admin_role_insufficient");
+    assert_eq!(v["code"], "admin_role_insufficient");
+    assert!(v["detail"].as_str().unwrap().contains("`operator`"), "{v}");
+    assert!(!v.to_string().contains("vera-token"), "{v}");
+    // The operator decides; the approval and its audit record name bob.
+    let resp = decide("bob-token").await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(v["approver"]["by"], "operator");
+    assert_eq!(v["approver"]["subject"], "urn:attenuo:admin:bob");
+    let records = h.records().await;
+    let grant = records
+        .iter()
+        .find(|r| r["kind"] == "approval_grant")
+        .unwrap();
+    assert_eq!(grant["approval"]["approver"], "urn:attenuo:admin:bob");
+    assert_eq!(grant["approval"]["by"], "operator");
+    assert!(allowed(&h.delete(&token, "alice/site").await));
+    h.verify_ok().await;
+}
+
+#[tokio::test]
 async fn operator_grant_on_the_admin_listener() {
     let h = Harness::start().await;
     let token = h.root().await;

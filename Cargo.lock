@@ -181,6 +181,7 @@ dependencies = [
  "clap",
  "hex",
  "reqwest",
+ "ring",
  "serde_json",
  "sha2",
  "tempfile",

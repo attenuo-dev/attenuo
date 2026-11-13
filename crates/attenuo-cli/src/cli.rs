@@ -170,6 +170,9 @@ pub(crate) enum Command {
     /// Generate keys.
     #[command(subcommand)]
     Key(KeyCmd),
+    /// Make admin credentials offline (ADR-0016).
+    #[command(subcommand)]
+    Admin(AdminCmd),
     /// Check that the server is up (`GET /healthz`), or ready with `--ready` (`GET /readyz`).
     /// Exits 0 when it is and 1 when it is not or cannot be reached, never 2, so it can be a
     /// container `HEALTHCHECK` (Docker reserves exit status 2 there). Needs no token.
@@ -186,6 +189,56 @@ pub(crate) struct HealthArgs {
     /// Give up after this many seconds, connect and answer together.
     #[arg(long, value_name = "SECS", default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..=300))]
     pub timeout: u64,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum AdminCmd {
+    /// Named admin operators (`[[admin.operators]]`).
+    #[command(subcommand)]
+    Operator(OperatorCmd),
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum OperatorCmd {
+    /// Generate a token for a new operator: 32 random bytes, base64url. Prints the token once
+    /// on stdout, then the `[[admin.operators]]` entry to add to the server's config, which
+    /// holds only the token's SHA-256. Writes nothing to disk and sends nothing to a server;
+    /// the server picks the entry up when it restarts.
+    New {
+        /// The operator's name, `[a-z0-9_-]{1,64}` and not `admin`; recorded in the audit
+        /// log as `urn:attenuo:admin:<name>`.
+        #[arg(long)]
+        name: String,
+        /// What the operator may do: `viewer` (reads), `operator` (also revoke leases and
+        /// decide approvals) or `admin` (everything).
+        #[arg(long)]
+        role: OperatorRole,
+    },
+    /// Print the `token_sha256` of a token read from the first line of standard input, for
+    /// a token made some other way.
+    Hash,
+}
+
+/// The role of an admin operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum OperatorRole {
+    /// Read-only admin routes.
+    Viewer,
+    /// A viewer that may also revoke leases and decide approvals.
+    Operator,
+    /// Every admin route.
+    Admin,
+}
+
+impl OperatorRole {
+    /// The config spelling.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            OperatorRole::Viewer => "viewer",
+            OperatorRole::Operator => "operator",
+            OperatorRole::Admin => "admin",
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
