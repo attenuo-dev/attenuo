@@ -145,7 +145,7 @@ export ATTENUO_ADMIN_TOKEN=$(openssl rand -hex 32)   # the /admin bearer; overri
 cargo run -p attenuo-server -- --config config/example.toml   # or ATTENUO_CONFIG=config/example.toml
 ```
 
-The example ships no admin token. On a loopback `listen` address a missing, short or placeholder token only produces a warning (and without one the admin routes answer 403); on any other address the server refuses to start unless the token is at least 32 bytes and not a published placeholder. Revocations, policy reloads and dev root mints are written to the audit log as admin actions.
+The example ships no admin token. On a loopback `listen` address a missing, short or placeholder token only produces a warning (and without one the admin routes answer 403); on any other address the server refuses to start unless the token is at least 32 bytes and not a published placeholder, or named operators with their own tokens and roles are configured instead (`[[admin.operators]]`, `attenuo admin operator new`). Revocations, policy reloads and dev root mints are written to the audit log as admin actions, under the operator who took them.
 
 The flows below use `curl` and `jq`. [Getting started](docs/guides/getting-started.md) covers the same ground step by step.
 
