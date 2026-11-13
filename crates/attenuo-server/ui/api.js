@@ -28,7 +28,10 @@ export function forgetToken() {
   token = null;
 }
 
-/** An error answer from the admin API: status, the API's `error` code and its message. */
+/**
+ * An error answer from the admin API: status, the API's stable `code` (its `error` for a server
+ * that sends no `code`) and its human-readable message.
+ */
 export class ApiError extends Error {
   constructor(status, code, message) {
     super(message);
@@ -49,8 +52,10 @@ async function errorFrom(resp) {
   try {
     const body = await resp.json();
     if (body && typeof body === 'object') {
-      code = body.error || code;
-      message = body.error_description || body.message || body.detail || message;
+      // `code` is the stable machine code; `detail` is text for people. `error_description`
+      // is a deprecated copy of the code, read only from a server that sends neither.
+      code = body.code || body.error_description || body.error || code;
+      message = body.detail || body.message || body.error_description || message;
     }
   } catch {
     // Not JSON: keep the status text.

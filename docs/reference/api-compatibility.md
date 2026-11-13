@@ -56,7 +56,7 @@ Being honest about the gaps:
 - **Digests.** The chain digest, the argument digest in audit records, the approval call hash (`ch`, SHA-256 of the RFC 8785 JSON of `{server, tool, arguments}`) and the session tag are plain SHA-256 values with no version tag. SR-20 changed the bytes of the chain and argument digests without a marker; a future change would need a new member name or a version next to them.
 - **Audit record schema.** The hash construction is versioned; the shape of `record` inside it is not.
 - **Config file.** There is no schema version key.
-- **Error envelope.** REST errors carry sub-codes in `error_description` in places, a member RFC 6749 meant for people. If a separate machine-readable member is added, `error_description` will keep its current values until the next minor release after that. Until then, branch on `error` and on the documented sub-codes only.
+- **Error envelope.** Every error carries a stable machine-readable `code` (`code` in a REST body, `data.code` in the proxy's JSON-RPC errors; [the list](http-api.md#errors)). Branch on it. Before it existed, sub-codes were sent in `error_description`, a member RFC 6749 meant for people, and on some 401s in `detail`; both keep their current values at least until the next minor release, and their removal will be announced here first.
 - **No machine-readable contract.** There is no OpenAPI document or JSON Schema; the reference pages and the SDK types are written by hand.
 
 ## Routes and the `/v1` prefix

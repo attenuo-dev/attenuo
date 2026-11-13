@@ -564,6 +564,8 @@ async fn unknown_server_is_404_and_bad_json_is_400() -> anyhow::Result<()> {
     assert_eq!(resp.status(), 404);
     let body: Value = resp.json().await?;
     assert_eq!(body["error"]["code"], CODE_UNKNOWN_SERVER);
+    // K-8: the stable code is in `data.code`.
+    assert_eq!(body["error"]["data"], json!({"code": "unknown_server"}));
 
     let resp = h
         .client
@@ -574,6 +576,8 @@ async fn unknown_server_is_404_and_bad_json_is_400() -> anyhow::Result<()> {
         .send()
         .await?;
     assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await?;
+    assert_eq!(body["error"]["data"]["code"], "parse_error");
 
     // tools/call without a name is rejected locally with invalid params
     let resp = h
@@ -584,6 +588,7 @@ async fn unknown_server_is_404_and_bad_json_is_400() -> anyhow::Result<()> {
         .await?;
     let body: Value = resp.json().await?;
     assert_eq!(body["error"]["code"], -32602);
+    assert_eq!(body["error"]["data"]["code"], "invalid_params");
     assert!(h.upstream.recorded_calls().is_empty());
     Ok(())
 }

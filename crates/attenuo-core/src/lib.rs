@@ -41,6 +41,7 @@ pub mod clock;
 pub mod decision;
 pub mod digest;
 pub mod error;
+pub mod error_codes;
 pub mod fingerprint;
 pub mod jcs;
 pub mod jsonrpc;
