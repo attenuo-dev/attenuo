@@ -2,7 +2,7 @@
 # Local pre-push checks: fmt, clippy, tests, and the two scripted demos.
 #
 #   scripts/dev.sh            # everything
-#   scripts/dev.sh fmt|clippy|test|demo|policy|docs|deny|links   # one step
+#   scripts/dev.sh fmt|clippy|test|demo|policy|docs|deny|links|fuzz   # one step
 #
 # Mirrors .github/workflows/ci.yml. Steps whose tool is not installed (cargo-deny) are skipped
 # with a note rather than failing.
@@ -22,6 +22,7 @@ policy() {
 }
 docs()   { RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps; }
 links()  { python3 scripts/check-links.py; }
+fuzz()   { RUSTFLAGS="--cfg fuzzing" cargo check --manifest-path fuzz/Cargo.toml --bins --examples --locked; }
 deny() {
   if cargo deny --version >/dev/null 2>&1; then cargo deny check
   else echo "cargo-deny not installed, skipping (cargo install cargo-deny)"; fi
@@ -34,11 +35,11 @@ run() {
 
 if [ "$#" -eq 0 ]; then
   for step in fmt clippy test demo; do run "$step"; done
-  printf '\nfmt, clippy, test and demo passed. CI also runs: policy docs links deny\n'
+  printf '\nfmt, clippy, test and demo passed. CI also runs: policy docs links deny fuzz\n'
 else
   for step in "$@"; do
     case "$step" in
-      fmt|clippy|test|demo|policy|docs|links|deny) run "$step" ;;
+      fmt|clippy|test|demo|policy|docs|links|deny|fuzz) run "$step" ;;
       *) echo "unknown step: $step" >&2; exit 2 ;;
     esac
   done

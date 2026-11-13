@@ -44,12 +44,16 @@ links:
 hygiene:
     python3 scripts/check-public-hygiene.py
 
+# the fuzz targets compile on stable against fuzz/Cargo.lock (no fuzzing; see fuzz/README.md)
+fuzz-check:
+    RUSTFLAGS="--cfg fuzzing" cargo check --manifest-path fuzz/Cargo.toml --bins --examples --locked
+
 # cargo-deny (cargo install cargo-deny)
 deny:
     cargo deny check
 
 # everything CI runs that can run locally
-ci: fmt clippy test demo policy docs links hygiene deny
+ci: fmt clippy test demo policy docs links hygiene deny fuzz-check
 
 # print a random admin token
 admin-token:

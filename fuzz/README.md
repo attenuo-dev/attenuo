@@ -9,6 +9,20 @@ verification. Each target calls public APIs only. Why, how they are built and wh
 This crate is not a member of the main workspace (the root `Cargo.toml` excludes it): it
 needs a nightly toolchain and has its own `Cargo.lock`.
 
+## Checking that the targets compile
+
+No nightly needed: this is what CI's `fuzz-check` job runs on every pull request that can
+change Rust (also `just fuzz-check` or `scripts/dev.sh fuzz`).
+
+```sh
+RUSTFLAGS="--cfg fuzzing" cargo check --manifest-path fuzz/Cargo.toml --bins --examples --locked
+```
+
+It fails when a library change breaks a target or leaves `fuzz/Cargo.lock` stale. cargo-fuzz
+has no `--locked` and rewrites the lockfile silently, so after a dependency change in the
+workspace refresh it with `cargo update --manifest-path fuzz/Cargo.toml --workspace` (or
+`-p <crate> --precise <version>` to match the root `Cargo.lock`) and commit the result.
+
 ## Running
 
 ```sh

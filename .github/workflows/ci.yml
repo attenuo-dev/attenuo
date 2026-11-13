@@ -1,10 +1,10 @@
 name: CI
 
 # Where each check runs (docs/research/ci-minutes-2026-11-05.md has the numbers):
-# - every pull request: everything below except the macOS tests, the fuzz build and the
-#   docker compose demo (those two run on a pull request that changes their files); a pull
+# - every pull request: everything below except the macOS tests, the nightly fuzz build and
+#   the docker compose demo (those two run on a pull request that changes their files); a pull
 #   request that only touches documentation (see the `changes` job) runs only the link check.
-# - every push to main: the same, plus the fuzz build and the docker compose demo.
+# - every push to main: the same, plus the nightly fuzz build and the docker compose demo.
 # - weekly (Monday) and on manual dispatch: everything, including the macOS tests.
 # macOS minutes are billed at 10x on a private repository and the hosted macOS arm64 pool often
 # cannot start the job within 15 minutes, so macOS is weekly, not per push.
@@ -313,11 +313,31 @@ jobs:
       - name: attenuo policy test (config/policies)
         run: cargo run --locked -q -p attenuo-cli -- policy test --fail-on-unexercised config/policies/*_test.yaml
 
+  # Compiles every fuzz target and example on stable with `--cfg fuzzing` (as cargo-fuzz sets
+  # it), against fuzz/Cargo.lock with `--locked`, on every pull request that can change Rust. A
+  # library change that breaks a fuzz target, or leaves the fuzz crate's lockfile stale, fails
+  # here; the nightly build below runs on fewer events and cargo-fuzz has no `--locked`.
+  fuzz-check:
+    name: fuzz targets compile (stable)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      RUSTFLAGS: --cfg fuzzing -D warnings
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: fuzz
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo check --manifest-path fuzz/Cargo.toml --bins --examples --locked
+
   # Builds the cargo-fuzz targets (nightly, outside the workspace) and runs each over its seed
-  # corpus once, so a target that stops compiling or a seed that crashes fails CI. Long fuzzing
-  # runs are manual; see docs/design/fuzzing.md. Runs on main, weekly, on dispatch, and on a
-  # pull request that changes fuzz/ or this workflow; a library change that breaks a fuzz target
-  # shows up on the main push after the merge.
+  # corpus once, so a seed that crashes fails CI. Long fuzzing runs are manual; see
+  # docs/design/fuzzing.md. Runs on main, weekly, on dispatch, and on a pull request that changes
+  # fuzz/ or this workflow; `fuzz-check` above catches a target that stops compiling sooner.
   fuzz-build:
     name: fuzz targets build
     needs: changes
@@ -378,7 +398,7 @@ jobs:
   ci-ok:
     name: ci-ok
     if: always()
-    needs: [changes, fmt, clippy, test, msrv, deny, audit, demo, compose, console-browser, policy-tests, fuzz-build, docs]
+    needs: [changes, fmt, clippy, test, msrv, deny, audit, demo, compose, console-browser, policy-tests, fuzz-check, fuzz-build, docs]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
