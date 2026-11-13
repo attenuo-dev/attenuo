@@ -3,7 +3,7 @@
 //! writes no usage counter and records no `usage`.
 
 use super::*;
-use attenuo_audit::{AuditSink, LeaseStore};
+use attenuo_audit::{AuditSink, LeaseRegistry};
 use attenuo_audit::{MemoryAudit, SqliteLeaseStore};
 use attenuo_core::{AgentId, Capability, CapabilitySet, OriginatingUser};
 use attenuo_core::{DelegationChain, LeaseId, ToolCall};

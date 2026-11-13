@@ -6,7 +6,7 @@ mod common;
 
 use std::sync::Arc;
 
-use attenuo_audit::LeaseStore;
+use attenuo_audit::LeaseRegistry;
 use attenuo_core::LeaseId;
 use attenuo_proxy::testing::{spawn_router, Spawned};
 use attenuo_server::{AppState, Config};

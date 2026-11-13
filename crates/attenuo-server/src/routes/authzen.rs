@@ -15,7 +15,7 @@
 //!   (HTTP Basic, or `pep_id` and `pep_secret` in the body; 401 `invalid_client` otherwise), and
 //!   `subject.properties.chain` is then checked structurally (`validate_at`) and hop by hop
 //!   against what this server issued: each hop's lease must carry a binding equal to the digest
-//!   of the chain up to that hop (`LeaseStore::bind`). A chain that does not match (a forged
+//!   of the chain up to that hop (`LeaseRegistry::bind`). A chain that does not match (a forged
 //!   user, widened attributes, a lease reused on another hop) is refused with 403
 //!   `chain_not_issued` *before* any audit record is written, so it cannot put records in a
 //!   victim's name. Lease ids alone are not secret (they are in every token), which is why they
@@ -39,7 +39,7 @@
 
 use std::sync::Arc;
 
-use attenuo_audit::LeaseStore;
+use attenuo_audit::LeaseRegistry;
 use attenuo_core::DelegationChain;
 use attenuo_policy::authzen::{self, EvaluationRequest, EvaluationResponse};
 use axum::body::Bytes;

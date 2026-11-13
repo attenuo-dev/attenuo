@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::*;
 use attenuo_audit::{
-    AuditEntry, AuditError, Durability, MemoryAudit, MemoryLeaseStore, SqliteAudit,
+    AuditEntry, AuditError, Durability, LeaseRegistry, MemoryAudit, MemoryLeaseStore, SqliteAudit,
     SqliteLeaseStore, VerifyReport,
 };
 use attenuo_audit::{AuditSink, LeaseStore};

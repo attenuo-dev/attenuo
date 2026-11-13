@@ -984,7 +984,7 @@ async fn dry_run_with_a_stated_budget_refuses_as_the_live_run_does() {
     // Nothing was written: no audit record, no counter, and the fresh run's whole budget is
     // still there for a live call.
     assert_eq!(h.state.audit.len().unwrap(), audit_before);
-    use attenuo_audit::LeaseStore;
+    use attenuo_audit::RunLimits;
     let lease = attenuo_core::LeaseId::new(fresh.lease.clone());
     assert!(h.state.leases.budget_summary(&lease).unwrap().is_empty());
     assert!(allowed(&h.pay(&fresh.token, 50).await));

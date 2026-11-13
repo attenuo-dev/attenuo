@@ -13,8 +13,8 @@ use std::path::Path;
 use std::sync::{Arc, Barrier};
 
 use attenuo_audit::{
-    Approval, ApprovalState, AuditError, AuditSink, CheckpointKeys, LeaseStore, NewNotice,
-    SqliteAudit, SqliteLeaseStore, ENTRY_HASH_VERSION, SCHEMA_VERSION,
+    Approval, ApprovalState, ApprovalStore, AuditError, AuditSink, CheckpointKeys, LeaseRegistry,
+    NewNotice, RunState, SqliteAudit, SqliteLeaseStore, ENTRY_HASH_VERSION, SCHEMA_VERSION,
 };
 use attenuo_core::LeaseId;
 use attenuo_token::{Issuer, IssuerConfig};

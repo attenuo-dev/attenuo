@@ -76,7 +76,7 @@ use std::sync::Arc;
 
 use std::collections::HashMap;
 
-use attenuo_audit::LeaseStore;
+use attenuo_audit::{LeaseRegistry, RunLimits};
 use attenuo_core::{CapabilitySet, Charge, Hop, LimitKind, ToolCall};
 use attenuo_token::{ExchangeRequest, AUTHORIZATION_DETAILS_TYPE};
 use axum::body::Bytes;

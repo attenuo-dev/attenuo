@@ -10,6 +10,8 @@
 //! - **Leases** ([`LeaseStore`]): every delegation hop holds a lease. Revoking a lease revokes
 //!   every lease delegated from it, and an unknown lease is treated as inactive so a store that
 //!   lost data fails closed. [`MemoryLeaseStore`] and [`SqliteLeaseStore`] mirror the two sinks.
+//!   The store also keeps run state, approvals and run-limit counters; [`LeaseStore`] is the sum
+//!   of one trait per concern, listed in [`store`].
 //!
 //! Nothing here evaluates policy; the sibling crates call into this one after deciding.
 
@@ -35,6 +37,7 @@ pub mod query;
 pub mod shipped;
 pub mod spans;
 pub mod sqlite;
+pub mod store;
 pub mod window;
 
 pub use approval::{
@@ -53,8 +56,8 @@ pub use export::{
 };
 pub use lease::{
     approval_last_touched, lease_end, run_state_prunable, session_prunable, tree_prunable,
-    LeaseNode, LeasePrune, LeaseSelector, LeaseStatus, LeaseStore, LeaseSubtree, MemoryLeaseStore,
-    RunLabel, RunStatePrune, SelectorRevocation, SessionBinding, SessionPrune,
+    LeaseNode, LeasePrune, LeaseSelector, LeaseStatus, LeaseSubtree, MemoryLeaseStore, RunLabel,
+    RunStatePrune, SelectorRevocation, SessionBinding, SessionPrune,
 };
 pub use log::{
     canonical_record_json, compute_entry_hash, entry_hash_from_json, verify_entries, AuditEntry,
@@ -76,4 +79,5 @@ pub use sqlite::{
 #[cfg(feature = "testing")]
 #[doc(hidden)]
 pub use sqlite::{WalRound, WalTimings};
+pub use store::{ApprovalStore, LeaseRegistry, LeaseStore, RunLimits, RunState, StoreRetention};
 pub use window::{window_prunable, WindowPrune};

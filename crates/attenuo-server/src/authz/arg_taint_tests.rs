@@ -3,7 +3,7 @@
 //! named in `context.untrusted_args` and in the record.
 
 use super::*;
-use attenuo_audit::{AuditSink, LeaseStore};
+use attenuo_audit::{ApprovalStore, AuditSink, LeaseStore};
 use attenuo_audit::{MemoryAudit, MemoryLeaseStore, SqliteLeaseStore};
 use attenuo_core::fingerprint::{fingerprints, pinned_arguments};
 use attenuo_core::{AgentId, ArgConstraint, Capability, CapabilitySet, OriginatingUser};

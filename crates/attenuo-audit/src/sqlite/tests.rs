@@ -9,9 +9,9 @@ use crate::budget::ChargeOutcome;
 use crate::checkpoint::Checkpoint;
 use crate::error::AuditError;
 use crate::export::RecordFilter;
-use crate::lease::LeaseStore;
 use crate::log::{AuditSink, ENTRY_HASH_VERSION};
 use crate::query::{EntryFilter, Order};
+use crate::store::{LeaseRegistry, RunLimits, RunState};
 
 use super::connection::{
     open_connection, with_full_sync, Durability, Ticket, WriteGate, SYNC_FULL, SYNC_NORMAL,

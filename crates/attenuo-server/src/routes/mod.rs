@@ -11,7 +11,7 @@ pub mod renew;
 pub mod token;
 pub mod wellknown;
 
-use attenuo_audit::{HopLimit, LeaseStore};
+use attenuo_audit::{HopLimit, LeaseRegistry, RunLimits};
 use attenuo_core::{Decision, DecisionRecord, DelegationChain, LeaseId, RecordKind, ToolCall};
 use axum::body::Bytes;
 use axum::http::{header, HeaderMap, HeaderValue};
@@ -63,11 +63,11 @@ pub(crate) fn no_store(headers: &mut HeaderMap) {
 }
 
 /// Register the lease of a token this server just minted, bind it to the token's chain, and
-/// record the chain's originating user (`LeaseStore::record_subject`) so the lease can be
+/// record the chain's originating user (`LeaseRegistry::record_subject`) so the lease can be
 /// revoked by user.
 ///
 /// The lease expiry is [`AppState::initial_lease_expiry`]. The binding is the digest of the
-/// chain exactly as the signed token carries it (`LeaseStore::bind`), so an AuthZEN body chain
+/// chain exactly as the signed token carries it (`LeaseRegistry::bind`), so an AuthZEN body chain
 /// can later be matched against what was issued (SR-08).
 pub(crate) fn register_issued(
     state: &AppState,

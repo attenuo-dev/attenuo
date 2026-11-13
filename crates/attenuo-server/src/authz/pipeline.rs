@@ -115,7 +115,7 @@ pub struct Pipeline {
     /// The lease store and the audit log are the same database file, so the synced append of
     /// a decision also makes its `sum` charge durable: the charge leaves its sync to the
     /// append (one `fsync` per call instead of a synced charge then an append, and under load
-    /// the append's group commit shares it). See [`LeaseStore::charge_sync_deferred`].
+    /// the append's group commit shares it). See [`RunLimits::charge_sync_deferred`].
     pub(super) charge_sync_on_append: bool,
     /// Serialises, per delegation run, the decisions whose policy input includes run usage or
     /// budget figures, from reading those figures to charging them (SR-55). See
@@ -1440,7 +1440,7 @@ impl Pipeline {
     }
 
     /// Record that upstream `server` opened the MCP session whose digest is `session` for a
-    /// caller of `chain` (`LeaseStore::record_session` with the chain id), so
+    /// caller of `chain` (`RunState::record_session` with the chain id), so
     /// `POST /admin/leases/revoke` can find the chain by session. Best effort: a failure is
     /// logged and the session stays usable; revoking by chain id still works.
     pub fn record_session(

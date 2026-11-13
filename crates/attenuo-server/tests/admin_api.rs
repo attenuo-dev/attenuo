@@ -7,7 +7,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use attenuo_audit::{AuditSink, LeaseStore};
+use attenuo_audit::{AuditSink, LeaseRegistry};
 use attenuo_core::{AgentId, Decision, DecisionRecord, LeaseId, RecordKind};
 use attenuo_proxy::testing::{spawn_router, Spawned};
 use attenuo_server::{AppState, Config};

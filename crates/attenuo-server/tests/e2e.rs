@@ -1314,7 +1314,7 @@ async fn jwks_verifies_issued_tokens_and_health_is_ok() {
 // Scenario 7: lease renewal and expiry.
 // ---------------------------------------------------------------------------------------------
 
-use attenuo_audit::LeaseStore;
+use attenuo_audit::LeaseRegistry;
 use attenuo_core::LeaseId;
 use time::{Duration, OffsetDateTime};
 

@@ -36,7 +36,9 @@
 
 use std::sync::Arc;
 
-use attenuo_audit::{Approval, ApprovalMethod, ApprovalState, Approver, AuditError, LeaseStore};
+use attenuo_audit::{
+    Approval, ApprovalMethod, ApprovalState, ApprovalStore, Approver, AuditError, LeaseRegistry,
+};
 use attenuo_core::{
     ApprovalInfo, Decision, DecisionRecord, LeaseId, RecordKind, ToolCall,
     REASON_APPROVAL_DECLINED, REASON_APPROVAL_GRANTED,

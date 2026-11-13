@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use attenuo_audit::LeaseStore;
+use attenuo_audit::ApprovalStore;
 use attenuo_core::{Clock, ManualClock, ToolCall};
 use attenuo_policy::ToolAttrs;
 use attenuo_proxy::testing::{spawn_router, FakeMcpServer, Spawned};

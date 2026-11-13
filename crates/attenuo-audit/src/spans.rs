@@ -4,7 +4,7 @@
 //! For every untrusted result a run reads, the server stores the result's fingerprints
 //! ([`attenuo_core::fingerprint`]) under the run's `chain_id`, tagged with the audit `seq` of
 //! the result's `tool_result` record. A later call (a destructive one, or any call when a
-//! policy reads argument taint) looks its arguments' fingerprints up here ([`LeaseStore::find_spans`](crate::LeaseStore::find_spans)); a hit names the result.
+//! policy reads argument taint) looks its arguments' fingerprints up here ([`RunState::find_spans`](crate::RunState::find_spans)); a hit names the result.
 //!
 //! - **Keyed.** The store hashes every fingerprint again with HMAC-SHA-256 under a key it
 //!   generates once and keeps (the SQLite store in its key table, the memory store in memory),
@@ -33,7 +33,7 @@ use crate::error::AuditError;
 /// entry, about 1 MB of index rows per run in SQLite; ten results at the per-result cap.
 pub const MAX_SPANS_PER_RUN: usize = 20_000;
 
-/// Most results [`LeaseStore::find_spans`](crate::LeaseStore::find_spans) returns for one
+/// Most results [`RunState::find_spans`](crate::RunState::find_spans) returns for one
 /// probe: the lowest `seq`s. A decision record keeps 64 `untrusted_args` entries and Cedar
 /// only sees which arguments matched, so more results per fingerprint add nothing a decision
 /// uses; without a bound, a short string that hundreds of results hold made one lookup return

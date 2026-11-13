@@ -6,7 +6,7 @@
 //! the agent retries the identical call, which consumes a granted approval once. Instead of
 //! relying on the identical-retry lookup, a retry may present the signed approval token
 //! (`attenuo-approval+jwt`) the grant returned; the server then takes the approval by its id
-//! ([`crate::LeaseStore::take_approval_by_id`]), with the same checks.
+//! ([`crate::ApprovalStore::take_approval_by_id`]), with the same checks.
 //!
 //! Approvals live in the lease store, next to the leases they are bound to, so that every
 //! state change checks the lease in the same transaction. The life of one approval:
@@ -30,7 +30,7 @@ use crate::lease::LeaseRow;
 
 /// Most approvals one delegation run may have pending (unexpired, of a hop whose lease is not
 /// revoked) at once (SR-92, SR-97). Past it,
-/// [`crate::LeaseStore::create_approval`] refuses a new one with
+/// [`crate::ApprovalStore::create_approval`] refuses a new one with
 /// [`AuditError::TooManyPendingApprovals`], and the gated call is denied with no approval to
 /// grant, as when the store fails. A repeat of a call that already has a pending approval
 /// reuses it and is not refused.

@@ -40,7 +40,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use attenuo_audit::{
-    AuditSink, Durability, LeaseStore, SqliteAudit, SqliteLeaseStore,
+    AuditSink, Durability, LeaseRegistry, RunState, SqliteAudit, SqliteLeaseStore,
     DEFAULT_WAL_CHECKPOINT_INTERVAL,
 };
 use attenuo_core::{Decision, DecisionRecord, LeaseId};

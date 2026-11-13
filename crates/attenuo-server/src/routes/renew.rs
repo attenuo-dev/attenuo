@@ -30,7 +30,7 @@
 
 use std::sync::Arc;
 
-use attenuo_audit::{AuditError, LeaseStore};
+use attenuo_audit::{AuditError, LeaseRegistry};
 use attenuo_core::{DelegationChain, RecordKind, ToolCall};
 use axum::extract::State;
 use axum::http::HeaderMap;
