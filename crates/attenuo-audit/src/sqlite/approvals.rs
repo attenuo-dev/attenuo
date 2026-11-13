@@ -14,6 +14,9 @@ pub(super) const APPROVAL_COLUMNS: &str =
      decision_id, chain, created_at, expires_at, state, approver_subject, approver_method, \
      decided_at, consumed_by, jkt, untrusted_args";
 
+/// How many columns [`APPROVAL_COLUMNS`] names: the index of a column selected after them.
+pub(super) const APPROVAL_COLUMN_COUNT: usize = 19;
+
 pub(super) fn approval_from_row(r: &Row<'_>) -> Result<Approval, AuditError> {
     let text = |i: usize| -> Result<String, AuditError> { Ok(r.get::<_, String>(i)?) };
     let opt =
@@ -102,4 +105,14 @@ pub(super) fn pending_of_run(
         }
     }
     Ok(n)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn column_count_matches_the_column_list() {
+        assert_eq!(APPROVAL_COLUMNS.split(',').count(), APPROVAL_COLUMN_COUNT);
+    }
 }

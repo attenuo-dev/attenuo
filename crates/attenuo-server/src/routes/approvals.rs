@@ -473,15 +473,11 @@ pub async fn admin_list(
     state
         .blocking(move |s| {
             let chain = q.chain_id.filter(|c| !c.is_empty()).map(LeaseId::new);
-            // A state filter is applied after the store's limit; ask for the most it gives.
-            let fetch = if want.is_some() { MAX_LIST } else { limit };
             let approvals: Vec<Value> = s
                 .leases
-                .approvals(chain.as_ref(), fetch)?
+                .approvals(chain.as_ref(), want, None, limit)?
                 .iter()
-                .filter(|a| want.is_none_or(|w| a.state == w))
-                .take(limit)
-                .map(|a| approval_json(a, now))
+                .map(|(_, a)| approval_json(a, now))
                 .collect();
             Ok(Json(json!({ "approvals": approvals })))
         })

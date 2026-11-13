@@ -135,8 +135,14 @@ impl ApprovalStore for Rendezvous {
         self.inner.approval(id)
     }
 
-    fn approvals(&self, c: Option<&LeaseId>, n: usize) -> Result<Vec<Approval>, AuditError> {
-        self.inner.approvals(c, n)
+    fn approvals(
+        &self,
+        c: Option<&LeaseId>,
+        s: Option<attenuo_audit::ApprovalState>,
+        b: Option<u64>,
+        n: usize,
+    ) -> Result<Vec<(u64, Approval)>, AuditError> {
+        self.inner.approvals(c, s, b, n)
     }
 
     fn decide_approval(
