@@ -746,7 +746,8 @@ pub struct MemoryLeaseStore {
     spans: Mutex<Spans>,
     /// Approvals by id, each with its position (see [`ApprovalStore::approvals`]).
     approvals: Mutex<BTreeMap<String, (u64, Approval)>>,
-    /// The position the last created approval got; read and bumped under `approvals`.
+    /// The position the last created approval got; read and bumped under `approvals`, never
+    /// lowered (removing or pruning approvals leaves it), so no position is given twice.
     approval_pos: std::sync::atomic::AtomicU64,
     /// Run-limit counters and the charges of each decision, under one lock (ADR-0010).
     budgets: Mutex<Budgets>,

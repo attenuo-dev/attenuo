@@ -1132,14 +1132,16 @@ impl ApprovalStore for SqliteLeaseStore {
     ) -> Result<Vec<(u64, Approval)>, AuditError> {
         let conn = self.conn.lock()?;
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        // The position is the `rowid`: it follows insertion order, which is creation order,
-        // and a row keeps it (the store never runs VACUUM). A bound is always passed, so the
-        // scan is a range of the rowid b-tree from `before` down, however deep the page is.
+        // The position is the `position` column (schema version 2), an `INTEGER PRIMARY KEY
+        // AUTOINCREMENT`: it follows insertion order, which is creation order, a row keeps it
+        // (it is the rowid, which `VACUUM` keeps for such a column), and SQLite never gives it
+        // again, even after the newest rows are deleted. A bound is always passed, so the scan
+        // is a range of the table's b-tree from `before` down, however deep the page is.
         let before = before.map_or(i64::MAX, |b| i64::try_from(b).unwrap_or(i64::MAX));
         let mut stmt = conn.prepare_cached(&format!(
-            "SELECT {APPROVAL_COLUMNS}, rowid FROM approvals \
-             WHERE rowid < ?3 AND (?1 IS NULL OR chain_id = ?1) AND (?2 IS NULL OR state = ?2) \
-             ORDER BY rowid DESC LIMIT ?4"
+            "SELECT {APPROVAL_COLUMNS}, position FROM approvals \
+             WHERE position < ?3 AND (?1 IS NULL OR chain_id = ?1) \
+             AND (?2 IS NULL OR state = ?2) ORDER BY position DESC LIMIT ?4"
         ))?;
         let mut rows = stmt.query(params![
             chain_id.map(|c| c.0.as_str()),

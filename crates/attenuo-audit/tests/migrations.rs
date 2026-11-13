@@ -147,9 +147,14 @@ fn dump(path: &Path) -> BTreeMap<String, (Vec<String>, Vec<String>)> {
     out
 }
 
+/// Columns a migration adds with a value in every existing row, as `(table, column)`:
+/// `approvals.position` (migration 2) is each row's rowid, which
+/// `a_version_1_file_keeps_its_approvals_in_order` checks value for value.
+const FILLED_COLUMNS: &[(&str, &str)] = &[("approvals", "position")];
+
 /// Every row of `before` is still in `after`, value for value: every table of `before` is
-/// still there, its columns first and in order, any added column NULL in the old rows. Rows
-/// written after the open may be added.
+/// still there, its columns first and in order, any added column NULL in the old rows (set,
+/// for the columns of [`FILLED_COLUMNS`]). Rows written after the open may be added.
 fn assert_rows_kept(
     before: &BTreeMap<String, (Vec<String>, Vec<String>)>,
     after: &BTreeMap<String, (Vec<String>, Vec<String>)>,
@@ -159,12 +164,16 @@ fn assert_rows_kept(
             .get(table)
             .unwrap_or_else(|| panic!("table {table} is gone"));
         assert_eq!(&now_cols[..cols.len()], &cols[..], "columns of {table}");
+        let filled = |c: &str| FILLED_COLUMNS.contains(&(table.as_str(), c));
         let mut now: Vec<(String, bool)> = now_rows
             .iter()
             .map(|r| {
                 let vals: Vec<&str> = r.split('|').collect();
-                let added_null = vals[cols.len()..].iter().all(|v| *v == "NULL");
-                (vals[..cols.len()].join("|"), added_null)
+                let added_ok = vals[cols.len()..]
+                    .iter()
+                    .zip(&now_cols[cols.len()..])
+                    .all(|(v, c)| (*v == "NULL") != filled(c));
+                (vals[..cols.len()].join("|"), added_ok)
             })
             .collect();
         for row in rows {
@@ -172,7 +181,10 @@ fn assert_rows_kept(
                 .iter()
                 .position(|(r, _)| r == row)
                 .unwrap_or_else(|| panic!("a row of {table} changed or is gone: {row}"));
-            assert!(now[at].1, "an added column of {table} is set on an old row");
+            assert!(
+                now[at].1,
+                "an added column of {table} is set (or a filled one unset) on an old row"
+            );
             now.swap_remove(at);
         }
     }
@@ -190,8 +202,8 @@ fn head(path: &Path) -> (i64, String) {
         .unwrap()
 }
 
-/// Every table and index of schema version 1, as a new file has them.
-fn v1_objects() -> Vec<String> {
+/// Every table and index of the current schema version, as a new file has them.
+fn current_objects() -> Vec<String> {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("v1.db");
     drop(SqliteAudit::open(&path).unwrap());
@@ -280,7 +292,7 @@ fn a_new_file_is_migrated_once_by_the_first_store_to_open_it() {
         assert_eq!(second.version, SCHEMA_VERSION);
         assert_eq!(second.migrated_from, None, "audit_first={audit_first}");
         assert_eq!(user_version(&path), i64::from(SCHEMA_VERSION));
-        assert_eq!(objects(&path), v1_objects());
+        assert_eq!(objects(&path), current_objects());
         let again = SqliteAudit::open(&path).unwrap();
         assert_eq!(again.schema().migrated_from, None);
         assert!(again.verify_chain().unwrap().ok);
@@ -304,7 +316,7 @@ fn separate_files_are_each_migrated_once() {
     }
     for p in [&audit_path, &lease_path] {
         assert_eq!(user_version(p), i64::from(SCHEMA_VERSION));
-        assert_eq!(objects(p), v1_objects());
+        assert_eq!(objects(p), current_objects());
     }
     let a = SqliteAudit::open(&audit_path).unwrap();
     let l = SqliteLeaseStore::open(&lease_path).unwrap();
@@ -399,19 +411,23 @@ fn a_file_from_a_newer_build_is_refused_and_left_alone() {
 // --- adoption: files from before schema versions ---------------------------------------------
 
 /// A file written by the code before schema versions (the same tables as version 1, and
-/// `user_version` 0) is adopted: nothing is created or changed but `user_version`, every row
-/// and the hash chain read the same byte for byte, the head is the same, and the signed
-/// checkpoints still verify.
+/// `user_version` 0) is adopted, and then migrated to the current version: no table is
+/// created and no row changes, except that `approvals` gains `position` from each row's
+/// rowid (migration 2); the hash chain reads the same byte for byte, the head is the same,
+/// and the signed checkpoints still verify.
 #[test]
 fn a_file_from_the_pre_versioning_code_is_adopted_unchanged() {
     let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source.sqlite");
     let path = dir.path().join("attenuo.sqlite");
     let issuer = issuer();
-    write_log(&path, &issuer, 25);
-    write_leases(&SqliteLeaseStore::open(&path).unwrap());
+    write_log(&source, &issuer, 25);
+    write_leases(&SqliteLeaseStore::open(&source).unwrap());
     // The pre-versioning code wrote exactly version 1's tables, and never set user_version.
+    version_1_copy(&source, &path);
     set_user_version(&path, 0);
-    let (rows, schema, before_head) = (dump(&path), master(&path), head(&path));
+    let (rows, before_head) = (dump(&path), head(&path));
+    let approvals_before = approval_rowids(&path, "rowid");
     assert_eq!(before_head.0, 25);
     assert_eq!(rows["checkpoints"].1.len(), 3);
 
@@ -432,9 +448,238 @@ fn a_file_from_the_pre_versioning_code_is_adopted_unchanged() {
     drop((log, leases));
 
     assert_eq!(user_version(&path), i64::from(SCHEMA_VERSION));
-    assert_eq!(dump(&path), rows, "adoption must not change a row");
-    assert_eq!(master(&path), schema, "adoption must not change the schema");
+    let after = dump(&path);
+    assert_rows_kept(&rows, &after);
+    for (table, content) in &rows {
+        if table != "approvals" {
+            assert_eq!(
+                &after[table], content,
+                "adoption must not change a row of {table}"
+            );
+        }
+    }
+    assert_eq!(approval_rowids(&path, "position"), approvals_before);
+    assert_eq!(
+        master(&path),
+        master(&source),
+        "the schema is the current one"
+    );
     assert_eq!(head(&path), before_head);
+}
+
+/// The `approvals` table as schema version 1 has it (`schema.rs`, migration 1), with its
+/// index.
+const V1_APPROVALS: &str = "
+CREATE TABLE approvals (
+    id               TEXT PRIMARY KEY,
+    chain_id         TEXT NOT NULL,
+    lease            TEXT NOT NULL,
+    call_hash        TEXT NOT NULL,
+    server           TEXT NOT NULL,
+    tool             TEXT NOT NULL,
+    arguments        TEXT NOT NULL,
+    labels           TEXT NOT NULL,
+    decision_id      TEXT NOT NULL,
+    chain            TEXT NOT NULL,
+    created_at       TEXT NOT NULL,
+    expires_at       TEXT NOT NULL,
+    state            TEXT NOT NULL,
+    approver_subject TEXT NULL,
+    approver_method  TEXT NULL,
+    decided_at       TEXT NULL,
+    consumed_by      TEXT NULL,
+    jkt              TEXT NULL,
+    untrusted_args   TEXT NULL
+);
+CREATE INDEX approvals_call_idx ON approvals(chain_id, call_hash, state);
+";
+
+/// The columns `approvals` has in both versions.
+const APPROVAL_COLUMNS: &str = "id, chain_id, lease, call_hash, server, tool, arguments, labels, \
+     decision_id, chain, created_at, expires_at, state, approver_subject, approver_method, \
+     decided_at, consumed_by, jkt, untrusted_args";
+
+/// Write `path` as a file at schema version 1 with the content of the current-version file
+/// `source`: every table and index as `source` has it (from its own `CREATE` statements),
+/// except `approvals`, which has version 1's shape and gets each approval's position as its
+/// rowid; every row of every table; and `user_version` 1. No `sqlite_sequence`, as in a real
+/// version 1 file.
+fn version_1_copy(source: &Path, path: &Path) {
+    let conn = Connection::open(path).unwrap();
+    let statements: Vec<String> = {
+        let src = Connection::open(source).unwrap();
+        let mut stmt = src
+            .prepare(
+                "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL \
+                 AND name NOT LIKE 'sqlite_%' AND tbl_name <> 'approvals' \
+                 ORDER BY type DESC, name",
+            )
+            .unwrap();
+        let rows = stmt.query_map([], |r| r.get(0)).unwrap();
+        rows.collect::<Result<_, _>>().unwrap()
+    };
+    for sql in statements {
+        conn.execute_batch(&sql).unwrap();
+    }
+    conn.execute_batch(V1_APPROVALS).unwrap();
+    let tables: Vec<String> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'table' \
+                 AND name NOT LIKE 'sqlite_%' AND name <> 'approvals'",
+            )
+            .unwrap();
+        let rows = stmt.query_map([], |r| r.get(0)).unwrap();
+        rows.collect::<Result<_, _>>().unwrap()
+    };
+    for t in tables {
+        copy_rows(&conn, source, &t);
+    }
+    conn.execute(
+        "ATTACH DATABASE ?1 AS cur",
+        [source.to_string_lossy().as_ref()],
+    )
+    .unwrap();
+    conn.execute_batch(&format!(
+        "INSERT INTO main.approvals (rowid, {APPROVAL_COLUMNS}) \
+         SELECT position, {APPROVAL_COLUMNS} FROM cur.approvals; DETACH DATABASE cur;"
+    ))
+    .unwrap();
+    conn.pragma_update(None, "user_version", 1).unwrap();
+    assert!(
+        !master(path)
+            .iter()
+            .any(|(_, name, _)| name == "sqlite_sequence"),
+        "a version 1 file has no AUTOINCREMENT table"
+    );
+}
+
+/// `(position, id)` of every approval in the file, in table order, with the position read
+/// from `column` (`rowid` in a version 1 file, `position` after migration 2).
+fn approval_rowids(path: &Path, column: &str) -> Vec<(i64, String)> {
+    let conn = Connection::open(path).unwrap();
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {column}, id FROM approvals ORDER BY {column}"
+        ))
+        .unwrap();
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    rows.collect::<Result<_, _>>().unwrap()
+}
+
+/// Migration 2 on a version 1 file with approvals that have gaps in their rowids (removed
+/// rows): each approval keeps its rowid as its position and every value, the table keeps its
+/// index and the uniqueness of `id`, every other table is untouched, and from then on a
+/// position is never given again, even after the newest approval is removed.
+#[test]
+fn a_version_1_file_keeps_its_approvals_in_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source.sqlite");
+    let path = dir.path().join("v1.sqlite");
+    {
+        let store = SqliteLeaseStore::open(&source).unwrap();
+        write_leases(&store);
+        for n in 2..=6 {
+            let mut a = approval(n);
+            a.call_hash = format!("h{n}");
+            let (a, _) = store.create_approval(&a).unwrap();
+            store
+                .decide_approval(
+                    &a.id,
+                    n % 2 == 0,
+                    &attenuo_audit::Approver {
+                        subject: "alice".into(),
+                        method: attenuo_audit::ApprovalMethod::IdToken,
+                    },
+                    t0(),
+                )
+                .unwrap();
+        }
+        // Gaps: one in the middle, and the newest.
+        store.remove_approval(&approval(3).id).unwrap();
+        store.remove_approval(&approval(6).id).unwrap();
+    }
+    version_1_copy(&source, &path);
+    let before = approval_rowids(&path, "rowid");
+    assert_eq!(
+        before.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
+        [1, 2, 4, 5]
+    );
+    let rows = dump(&path);
+
+    let store = SqliteLeaseStore::open(&path).unwrap();
+    assert_eq!(store.schema().version, SCHEMA_VERSION);
+    assert_eq!(store.schema().migrated_from, Some(1));
+    // In store order, newest first, with the old rowids as positions and every field kept.
+    let listed = store.approvals(None, None, None, 10).unwrap();
+    assert_eq!(
+        listed
+            .iter()
+            .map(|(p, a)| (*p as i64, a.id.clone()))
+            .collect::<Vec<_>>(),
+        before.iter().rev().cloned().collect::<Vec<_>>()
+    );
+    let old = SqliteLeaseStore::open(&source).unwrap();
+    for (_, a) in &listed {
+        assert_eq!(Some(a), old.approval(&a.id).unwrap().as_ref());
+    }
+    drop(old);
+
+    let after = dump(&path);
+    assert_rows_kept(&rows, &after);
+    for (table, content) in &rows {
+        if table != "approvals" {
+            assert_eq!(&after[table], content, "{table} is untouched");
+        }
+    }
+    assert_eq!(approval_rowids(&path, "position"), before);
+    assert_eq!(
+        master(&path),
+        master(&source),
+        "the schema is the current one"
+    );
+    assert_eq!(objects(&path), current_objects());
+    {
+        let conn = Connection::open(&path).unwrap();
+        // `id` is still unique, and the call index is there.
+        let dup = conn.execute(
+            &format!(
+                "INSERT INTO approvals ({APPROVAL_COLUMNS}) \
+                 SELECT {APPROVAL_COLUMNS} FROM approvals WHERE id = ?1"
+            ),
+            [&approval(1).id],
+        );
+        assert!(dup.is_err(), "a second row with the same id: {dup:?}");
+        let indexes: Vec<(String, bool)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name, \"unique\" FROM pragma_index_list('approvals') ORDER BY name",
+                )
+                .unwrap();
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+            rows.collect::<Result<_, _>>().unwrap()
+        };
+        assert_eq!(
+            indexes,
+            [
+                ("approvals_call_idx".to_string(), false),
+                ("sqlite_autoindex_approvals_1".to_string(), true)
+            ]
+        );
+    }
+
+    // Above every kept position; and once given, never again, even when removed at once.
+    let mut a = approval(7);
+    a.call_hash = "h7".into();
+    store.create_approval(&a).unwrap();
+    let first = store.approvals(None, None, None, 1).unwrap()[0].0;
+    assert_eq!(first, 6);
+    store.remove_approval(&a.id).unwrap();
+    let mut b = approval(8);
+    b.call_hash = "h8".into();
+    store.create_approval(&b).unwrap();
+    let (second, got) = store.approvals(None, None, None, 1).unwrap().remove(0);
+    assert_eq!((second, got.id), (7, b.id));
 }
 
 /// The tables as of commit 3593549 (`kind` and `chain_id` on records, before the record-id
@@ -566,7 +811,7 @@ fn an_audit_file_from_before_the_lease_tables_is_adopted() {
     leases.record_subject(&id("l2"), "bob").unwrap();
     drop((log, leases));
 
-    assert_eq!(objects(&path), v1_objects());
+    assert_eq!(objects(&path), current_objects());
     assert_rows_kept(&rows, &dump(&path));
     let conn = Connection::open(&path).unwrap();
     let old_head: String = conn
@@ -669,10 +914,10 @@ fn a_lease_file_from_before_the_approval_columns_is_adopted() {
     assert_rows_kept(&rows, &after);
     let approval_cols = &after["approvals"].0;
     assert_eq!(
-        &approval_cols[approval_cols.len() - 2..],
-        ["jkt", "untrusted_args"]
+        &approval_cols[approval_cols.len() - 3..],
+        ["jkt", "untrusted_args", "position"]
     );
-    assert_eq!(objects(&path), v1_objects());
+    assert_eq!(objects(&path), current_objects());
     assert_eq!(
         after["audit_meta"].1,
         [format!(
@@ -806,7 +1051,7 @@ fn a_lease_file_with_run_limits_keeps_its_keys_and_counters() {
         let row = format!("t:{}|t:{}", hex::encode(key), hex::encode(value));
         assert!(meta.contains(&row), "{key} changed: {meta:?}");
     }
-    assert_eq!(objects(&path), v1_objects());
+    assert_eq!(objects(&path), current_objects());
 }
 
 /// The refusals adoption keeps from the ad-hoc code: a log from before records had `kind`

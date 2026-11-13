@@ -42,7 +42,7 @@ use crate::log::ENTRY_HASH_VERSION;
 
 /// The schema version this build writes and reads: the number of the last migration in the
 /// crate's list. A file above it is refused ([`AuditError::SchemaTooNew`]).
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// One step of the schema: from version `version - 1` to `version`.
 pub(super) struct Migration {
@@ -55,13 +55,22 @@ pub(super) struct Migration {
 }
 
 /// Every migration, oldest first. Append only.
-pub(super) const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    description: "the schema as first versioned: audit log, checkpoints, audit_meta, leases and \
-                  their bindings, subjects and sessions, run labels, approvals, run-limit \
-                  counters and charges, hop limits, span index, per-user windows, notice outbox",
-    apply: v1_initial_schema,
-}];
+pub(super) const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        description: "the schema as first versioned: audit log, checkpoints, audit_meta, leases \
+                      and their bindings, subjects and sessions, run labels, approvals, run-limit \
+                      counters and charges, hop limits, span index, per-user windows, notice \
+                      outbox",
+        apply: v1_initial_schema,
+    },
+    Migration {
+        version: 2,
+        description: "approvals get a `position` that is never reused (INTEGER PRIMARY KEY \
+                      AUTOINCREMENT, from each row's rowid); `id` stays unique",
+        apply: v2_approval_position,
+    },
+];
 
 const _: () = assert!(
     MIGRATIONS[MIGRATIONS.len() - 1].version == SCHEMA_VERSION,
@@ -194,6 +203,62 @@ fn v1_initial_schema(conn: &Connection) -> Result<(), AuditError> {
     conn.execute(
         "INSERT OR IGNORE INTO audit_meta (key, value) VALUES ('entry_hash', ?1)",
         [ENTRY_HASH_VERSION],
+    )?;
+    Ok(())
+}
+
+/// Migration 2: the `approvals` table rebuilt with `position INTEGER PRIMARY KEY AUTOINCREMENT`.
+///
+/// The position of an approval is what `GET /admin/approvals` pages by. In version 1 it was the
+/// implicit `rowid`, which SQLite gives as one more than the largest rowid in the table: once
+/// the newest approvals are deleted (`remove_approval` after a failed audit append, or the
+/// run-state prune) the next approval gets a position a client may already hold a cursor
+/// above, and `VACUUM` may renumber an implicit rowid. `AUTOINCREMENT` gives each new row a
+/// position above every one the table has ever had (kept in `sqlite_sequence`), and an
+/// `INTEGER PRIMARY KEY` is the rowid itself, so `VACUUM` keeps it.
+///
+/// The steps are SQLite's procedure for a table change `ALTER TABLE` cannot make: create the
+/// new table, copy every row with its rowid as its position, drop the old table (and with it
+/// `approvals_call_idx`), rename the new one, create the index again. Every column keeps its
+/// name, type, nullability and place; `position` comes last. `id` was the `TEXT PRIMARY KEY`
+/// and is now `NOT NULL UNIQUE`, which SQLite enforces with the same kind of automatic index.
+/// No other table refers to `approvals`. A position given before this migration and freed
+/// before it ran is not known to it and can be given once more; every one given after it is
+/// never given again.
+fn v2_approval_position(conn: &Connection) -> Result<(), AuditError> {
+    conn.execute_batch(
+        "CREATE TABLE approvals_v2 (
+             id               TEXT NOT NULL UNIQUE,
+             chain_id         TEXT NOT NULL,
+             lease            TEXT NOT NULL,
+             call_hash        TEXT NOT NULL,
+             server           TEXT NOT NULL,
+             tool             TEXT NOT NULL,
+             arguments        TEXT NOT NULL,
+             labels           TEXT NOT NULL,
+             decision_id      TEXT NOT NULL,
+             chain            TEXT NOT NULL,
+             created_at       TEXT NOT NULL,
+             expires_at       TEXT NOT NULL,
+             state            TEXT NOT NULL,
+             approver_subject TEXT NULL,
+             approver_method  TEXT NULL,
+             decided_at       TEXT NULL,
+             consumed_by      TEXT NULL,
+             jkt              TEXT NULL,
+             untrusted_args   TEXT NULL,
+             position         INTEGER PRIMARY KEY AUTOINCREMENT
+         );
+         INSERT INTO approvals_v2 (position, id, chain_id, lease, call_hash, server, tool,
+             arguments, labels, decision_id, chain, created_at, expires_at, state,
+             approver_subject, approver_method, decided_at, consumed_by, jkt, untrusted_args)
+         SELECT rowid, id, chain_id, lease, call_hash, server, tool, arguments, labels,
+             decision_id, chain, created_at, expires_at, state, approver_subject,
+             approver_method, decided_at, consumed_by, jkt, untrusted_args
+         FROM approvals ORDER BY rowid;
+         DROP TABLE approvals;
+         ALTER TABLE approvals_v2 RENAME TO approvals;
+         CREATE INDEX approvals_call_idx ON approvals(chain_id, call_hash, state);",
     )?;
     Ok(())
 }

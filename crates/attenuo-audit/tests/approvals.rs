@@ -611,3 +611,103 @@ fn approvals_page_by_position_each_exactly_once() {
         assert_ne!(next[0].1.id, last.id);
     }
 }
+
+/// Every position of a store, newest first.
+fn positions(store: &dyn LeaseStore) -> Vec<(u64, String)> {
+    store
+        .approvals(None, None, None, 1000)
+        .unwrap()
+        .into_iter()
+        .map(|(pos, a)| (pos, a.id))
+        .collect()
+}
+
+/// A position is never given twice: removing the newest approvals (as the server does when
+/// it cannot record a request) leaves the next approval above every position given before,
+/// so a client's cursor never has a new approval below it.
+#[test]
+fn a_position_is_never_given_again_after_the_newest_are_removed() {
+    for (name, store) in stores() {
+        let store = store.as_ref();
+        leases(store);
+        let mut given = Vec::new();
+        for i in 0..4u32 {
+            let (a, created) = store
+                .create_approval(&pending(i, &format!("h{i}"), Duration::seconds(600)))
+                .unwrap();
+            assert!(created, "{name}");
+            given.push(positions(store)[0].0);
+            store.decide_approval(&a.id, false, &user(), t0()).unwrap();
+        }
+        // Remove the newest two, then the only remaining ones too: an empty table.
+        for i in [3u32, 2] {
+            store
+                .remove_approval(&format!("00000000-0000-4000-8000-{i:012}"))
+                .unwrap();
+        }
+        let (a, _) = store
+            .create_approval(&pending(10, "h10", Duration::seconds(600)))
+            .unwrap();
+        let (pos, id) = positions(store)[0].clone();
+        assert_eq!(id, a.id, "{name}");
+        assert!(
+            given.iter().all(|g| pos > *g),
+            "{name}: {pos} is not above {given:?}"
+        );
+        given.push(pos);
+        for (_, id) in positions(store) {
+            store.remove_approval(&id).unwrap();
+        }
+        assert!(positions(store).is_empty(), "{name}");
+        store
+            .create_approval(&pending(11, "h11", Duration::seconds(600)))
+            .unwrap();
+        let (pos, _) = positions(store)[0].clone();
+        assert!(
+            given.iter().all(|g| pos > *g),
+            "{name}: {pos} after emptying the store is not above {given:?}"
+        );
+    }
+}
+
+/// The file store's positions also survive a delete of the newest row in SQL (what the
+/// run-state prune does, by rowid), a `VACUUM` and a reopen: kept rows keep theirs, and the
+/// next approval is above every one given before.
+#[test]
+fn file_store_positions_survive_delete_vacuum_and_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("leases.sqlite");
+    let before = {
+        let store = SqliteLeaseStore::open(&path).unwrap();
+        leases(&store);
+        for i in 0..5u32 {
+            let (a, _) = store
+                .create_approval(&pending(i, &format!("h{i}"), Duration::seconds(600)))
+                .unwrap();
+            store.decide_approval(&a.id, false, &user(), t0()).unwrap();
+        }
+        positions(&store)
+    };
+    let highest = before[0].0;
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "DELETE FROM approvals WHERE rowid IN (?1, ?2)",
+            [highest as i64, before[2].0 as i64],
+        )
+        .unwrap();
+        conn.execute_batch("VACUUM").unwrap();
+    }
+    let store = SqliteLeaseStore::open(&path).unwrap();
+    let kept: Vec<(u64, String)> = before
+        .iter()
+        .filter(|(p, _)| *p != highest && *p != before[2].0)
+        .cloned()
+        .collect();
+    assert_eq!(positions(&store), kept, "kept rows keep their positions");
+    store
+        .create_approval(&pending(9, "h9", Duration::seconds(600)))
+        .unwrap();
+    let (pos, _) = positions(&store)[0].clone();
+    assert!(pos > highest, "{pos} is not above the deleted {highest}");
+}
