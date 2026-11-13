@@ -1,0 +1,9 @@
+name = "attenuo-proofs"
+version = "0.1.0"
+defaultTargets = ["Attenuo"]
+
+[leanOptions]
+autoImplicit = false
+
+[[lean_lib]]
+name = "Attenuo"

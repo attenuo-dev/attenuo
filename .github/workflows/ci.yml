@@ -57,6 +57,7 @@ jobs:
       fuzz: ${{ github.event_name != 'pull_request' || steps.filter.outputs.fuzz == 'true' }}
       docker: ${{ github.event_name != 'pull_request' || steps.filter.outputs.docker == 'true' }}
       guide: ${{ github.event_name != 'pull_request' || steps.filter.outputs.guide == 'true' }}
+      lean: ${{ github.event_name != 'pull_request' || steps.filter.outputs.lean == 'true' }}
     steps:
       - id: filter
         if: github.event_name == 'pull_request'
@@ -84,6 +85,9 @@ jobs:
             # out, but their commands are checked by running them (the `getting-started` job).
             guide:
               - "{docs/guides/getting-started.md,README.md,scripts/check-getting-started.sh,scripts/check-doc-commands.sh}"
+            # The Lean proof of the covering rule and its check.
+            lean:
+              - "{proofs/lean/**,scripts/check-lean.sh,.github/workflows/ci.yml}"
 
   fmt:
     name: rustfmt
@@ -393,6 +397,24 @@ jobs:
             cargo +nightly fuzz run "$t" -- -runs=0
           done
 
+  # Builds the Lean model of the covering rule (proofs/lean) and checks that it has no `sorry`
+  # and only Lean's standard axioms. elan's installer is pinned to the v4.2.4 commit; elan then
+  # installs the toolchain proofs/lean/lean-toolchain names. Core Lean only, no Mathlib.
+  lean:
+    name: Lean proof of the covering rule
+    needs: changes
+    if: needs.changes.outputs.lean == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install elan
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/leanprover/elan/227caca133724d5516bee25c2aeb3e609478f2d8/elan-init.sh -o "$RUNNER_TEMP/elan-init.sh"
+          sh "$RUNNER_TEMP/elan-init.sh" -y --default-toolchain none --no-modify-path
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+      - run: bash scripts/check-lean.sh
+
   # The Markdown link check runs on every pull request, documentation-only ones included;
   # rustdoc runs when Rust can have changed.
   docs:
@@ -425,7 +447,7 @@ jobs:
   ci-ok:
     name: ci-ok
     if: always()
-    needs: [changes, fmt, clippy, test, msrv, deny, audit, demo, getting-started, compose, console-browser, policy-tests, fuzz-check, fuzz-build, docs]
+    needs: [changes, fmt, clippy, test, msrv, deny, audit, demo, getting-started, compose, console-browser, policy-tests, fuzz-check, fuzz-build, lean, docs]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

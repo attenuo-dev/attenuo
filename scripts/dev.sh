@@ -2,10 +2,10 @@
 # Local pre-push checks: fmt, clippy, tests, and the three scripted demos.
 #
 #   scripts/dev.sh            # everything
-#   scripts/dev.sh fmt|clippy|test|demo|guide|readme|snippets|policy|docs|deny|links|fuzz   # one step
+#   scripts/dev.sh fmt|clippy|test|demo|guide|readme|snippets|policy|docs|deny|links|fuzz|lean   # one step
 #
-# Mirrors .github/workflows/ci.yml. Steps whose tool is not installed (cargo-deny) are skipped
-# with a note rather than failing.
+# Mirrors .github/workflows/ci.yml. Steps whose tool is not installed (cargo-deny, Lean) are
+# skipped with a note rather than failing.
 set -euo pipefail
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
@@ -36,6 +36,8 @@ policy() {
 docs()   { RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps; }
 links()  { python3 scripts/check-links.py; }
 fuzz()   { RUSTFLAGS="--cfg fuzzing -D warnings" cargo check --manifest-path fuzz/Cargo.toml --bins --examples --locked; }
+# The Lean proof of the covering rule (proofs/lean/README.md); skipped when Lean is not installed.
+lean()   { bash scripts/check-lean.sh --if-installed; }
 deny() {
   if cargo deny --version >/dev/null 2>&1; then cargo deny check
   else echo "cargo-deny not installed, skipping (cargo install cargo-deny)"; fi
@@ -48,11 +50,11 @@ run() {
 
 if [ "$#" -eq 0 ]; then
   for step in fmt clippy test demo; do run "$step"; done
-  printf '\nfmt, clippy, test and demo passed. CI also runs: guide readme snippets policy docs links deny fuzz\n'
+  printf '\nfmt, clippy, test and demo passed. CI also runs: guide readme snippets policy docs links deny fuzz lean\n'
 else
   for step in "$@"; do
     case "$step" in
-      fmt|clippy|test|demo|guide|readme|snippets|policy|docs|links|deny|fuzz) run "$step" ;;
+      fmt|clippy|test|demo|guide|readme|snippets|policy|docs|links|deny|fuzz|lean) run "$step" ;;
       *) echo "unknown step: $step" >&2; exit 2 ;;
     esac
   done

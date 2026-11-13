@@ -39,6 +39,8 @@ The three reference pages are checked against the code by tests that fail with t
 
 The MSRV (`rust-version` in `Cargo.toml`) is checked in CI only.
 
+`scripts/check-lean.sh` (`scripts/dev.sh lean`, `just lean`, the `lean` CI job) builds the Lean model and proof of the covering rule in `proofs/lean/` and fails on `sorry` or a non-standard axiom. It needs Lean, installed with elan ([proofs/lean/README.md](proofs/lean/README.md#running-it)); `scripts/dev.sh lean` skips it when Lean is missing. If you change `covers`, `implies`, `permits`, `attenuate` or a constraint kind in `crates/attenuo-core/src/capability.rs`, change the model to match and run it.
+
 ### Property tests
 
 The property tests (`crates/attenuo-core/tests/*_props.rs`, `crates/attenuo-audit/tests/budget_props.rs`) take their settings from two environment variables, read by the `proptest_config` helper in each crate's `tests/proptest_seed/mod.rs`:
