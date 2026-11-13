@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Local pre-push checks: fmt, clippy, tests, and the two scripted demos.
+# Local pre-push checks: fmt, clippy, tests, and the three scripted demos.
 #
 #   scripts/dev.sh            # everything
 #   scripts/dev.sh fmt|clippy|test|demo|policy|docs|deny|links|fuzz   # one step
