@@ -72,6 +72,7 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 
 ### Changed
 
+- Server: the verified-token cache keeps each token's claims once, shared, instead of a `VerifiedToken` holding the chain twice, so a hit copies the chain once and outside the cache lock: 6.6 to 4.3 us at 1 hop, 18.8 to 12.7 us at 3 and 58.9 to 32.1 us at 8 (new `token_cache` bench; [performance](docs/design/performance.md#verified-token-cache-hit-2026-11-13)). Same checks on a hit; no API change.
 - BREAKING (HTTP API): a client assertion that does not verify with one of the named client's keys gets one answer, whatever the reason (SR-110, see "Security"). The HTTP status (401), `error` (`invalid_client`), headers (`WWW-Authenticate: Basic realm="attenuo"`) and audit (none, as before) are unchanged; `code`, `error_description` and `detail` change. Before → after `code` (and `error_description`), on `POST /token` (hop 0 and exchange) and the AuthZEN endpoints:
   - the signature does not verify with the client's key: `client_assertion_bad_signature` → `client_authentication_failed`.
   - the `kid` names none of the client's keys, or is missing and the client has several: `client_assertion_unknown_kid` → `client_authentication_failed`.
