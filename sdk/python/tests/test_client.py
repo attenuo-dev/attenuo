@@ -12,8 +12,10 @@ import httpx
 import pytest
 
 from attenuo import (
+    AdminClient,
     ApiError,
     ArgLimit,
+    AsyncAdminClient,
     AsyncClient,
     AttenuoError,
     AuthzenConfiguration,
@@ -733,3 +735,13 @@ async def test_close_session_signs_a_delete_with_dpop(make: Any) -> None:
     assert await call(client, "close_session", "TOK", "github", "s-1") is True
     claims = json.loads(base64.urlsafe_b64decode(rec.last.headers["dpop"].split(".")[1] + "=="))
     assert (claims["htm"], claims["htu"]) == ("DELETE", f"{BASE}/mcp/github")
+
+
+@pytest.mark.parametrize("cls", [Client, AsyncClient, AdminClient, AsyncAdminClient])
+def test_no_client_follows_redirects_sr112(cls: Any) -> None:
+    """A redirect from the server URL is not followed, so a token request body (client secret,
+    client assertion, subject token) never goes to another origin. The TypeScript SDK and the
+    CLI follow them (SR-112, open); this pins the Python side."""
+    admin = cls in (AdminClient, AsyncAdminClient)
+    client = cls("http://ob.test", "t") if admin else cls("http://ob.test")
+    assert client._http.follow_redirects is False
