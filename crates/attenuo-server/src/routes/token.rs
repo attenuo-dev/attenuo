@@ -123,6 +123,15 @@ pub async fn exchange(
     // Set by `crate::limits::token_peer_limit`, which `crate::router` mounts on this route.
     let mark = extensions.get::<CallerMark>().cloned();
     let value = parse_body(&headers, &body)?;
+    // A request from a new address on a full per-peer table goes on only to authenticate an
+    // agent with client credentials (SR-109, `crate::limits::refuse_on_full_table`).
+    if mark.as_ref().is_some_and(CallerMark::on_full_table) {
+        let present = |k: &str| value.get(k).is_some_and(|v| !v.is_null());
+        let client = present("client_secret")
+            || present("client_assertion")
+            || clientauth::basic_credentials(&headers).is_ok_and(|b| b.is_some());
+        crate::limits::refuse_on_full_table(mark.as_ref(), client, present("actor_token"))?;
+    }
     let now = state.now();
     if crate::idp::intake::is_intake(&value) {
         // Hop 0 from an IdP credential: the exported span (`crate::telemetry::trace_route`)

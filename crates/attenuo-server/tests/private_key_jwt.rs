@@ -520,7 +520,7 @@ async fn exchange_with_a_client_assertion_and_a_rotated_key() {
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "{v}");
-    assert_eq!(code(&v), ("invalid_client", "client_assertion_unknown_kid"));
+    assert_eq!(code(&v), ("invalid_client", "client_authentication_failed"));
 }
 
 #[tokio::test]
@@ -924,52 +924,185 @@ async fn a_nonce_retry_can_resend_its_assertion_sr111() {
     assert_eq!(status, StatusCode::OK, "the retry with the nonce: {v}");
 }
 
-/// SR-110 (proposed, not fixed): pins what a caller with no credential learns today. An
-/// assertion signed with a key of the caller's own, naming a client id, is refused with
-/// `client_authentication_failed` when no entry with keys has that id, and with a code of
-/// the key checks (`client_assertion_bad_signature`, `client_assertion_unknown_kid`) when
-/// one does. The secret path answers `client_authentication_failed` either way, so it does
-/// not tell which ids exist; the assertion path does, and says whether the entry has one
-/// key or several. When the maintainer picks one of the options in the pass 12 report,
-/// this test changes with it.
+/// The status, the headers (all but `date`) and the body bytes of an answer.
+async fn whole(resp: reqwest::Response) -> (StatusCode, Vec<(String, String)>, String) {
+    let status = resp.status();
+    let mut headers: Vec<(String, String)> = resp
+        .headers()
+        .iter()
+        .filter(|(k, _)| *k != reqwest::header::DATE)
+        .map(|(k, v)| (k.to_string(), v.to_str().unwrap().to_owned()))
+        .collect();
+    headers.sort();
+    (status, headers, resp.text().await.unwrap())
+}
+
+/// SR-110: a caller that holds no key of a client learns nothing about it from a refused
+/// assertion. An unknown id, an entry with a secret only, an unknown `kid` (several keys and
+/// none named, or a `kid` that is not there), a key of another algorithm and a bad signature
+/// get the same answer, byte for byte apart from `Date`, at an exchange and at hop 0, as
+/// `client_authentication_failed` does for a wrong secret. Before the fix the first two were
+/// `client_authentication_failed` and the others `client_assertion_bad_signature`,
+/// `client_assertion_unknown_kid` or `client_assertion_unsupported_alg`, which told which ids
+/// have keys and whether one or several. Nothing is recorded in the replay store.
 #[tokio::test]
-async fn an_assertion_refusal_tells_which_client_ids_have_keys_sr110() {
+async fn an_assertion_refusal_does_not_tell_which_client_ids_have_keys_sr110() {
     let h = Harness::start(|_| {}).await;
     let stranger = DpopKey::generate().unwrap();
-    let probe = |client: &str| {
+    let probe = |client: &str, header: Value| {
         let t = now().unix_timestamp();
         stranger.sign_jws(
-            &json!({"alg": "EdDSA"}),
+            &header,
             &json!({"iss": client, "sub": client, "aud": ISSUER,
                     "jti": uuid::Uuid::new_v4().to_string(), "exp": t + 60}),
         )
     };
-    let mut seen = Vec::new();
-    for client in ["planner", "coder", "reviewer", "nobody"] {
-        let (root, _) = h.root().await;
-        let (status, _, v) = answer(
+    let cases = [
+        // No such entry.
+        ("nobody", json!({"alg": "EdDSA"})),
+        // A secret only.
+        ("reviewer", json!({"alg": "EdDSA"})),
+        // Several keys and no kid; a kid that is not there.
+        ("coder", json!({"alg": "EdDSA"})),
+        ("coder", json!({"alg": "EdDSA", "kid": "nope"})),
+        // An allowed algorithm the key is not for.
+        ("planner", json!({"alg": "ES256", "kid": "planner-1"})),
+        // The right kid, another key's signature.
+        ("planner", json!({"alg": "EdDSA", "kid": "planner-1"})),
+    ];
+    let (root, _) = h.root().await;
+    let mut exchange = Vec::new();
+    let mut hop0 = Vec::new();
+    for (client, header) in &cases {
+        let resp = h
+            .post(
+                "/token",
+                &exchange_body(
+                    &root,
+                    client,
+                    assertion_fields(&probe(client, header.clone())),
+                ),
+            )
+            .await;
+        exchange.push(whole(resp).await);
+        let resp = h
+            .post(
+                "/token",
+                &intake_body(
+                    &h.idp.id_token("alice"),
+                    assertion_fields(&probe(client, header.clone())),
+                ),
+            )
+            .await;
+        hop0.push(whole(resp).await);
+    }
+    for answers in [&exchange, &hop0] {
+        let (status, headers, body) = &answers[0];
+        assert_eq!(*status, StatusCode::UNAUTHORIZED, "{body}");
+        let v: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(
+            v,
+            json!({"error": "invalid_client", "code": "client_authentication_failed",
+                   "error_description": "client_authentication_failed",
+                   "detail": "unknown client, or the client_assertion is not signed by one of the client's keys"})
+        );
+        assert!(
+            headers.contains(&(
+                "www-authenticate".to_owned(),
+                "Basic realm=\"attenuo\"".to_owned()
+            )),
+            "{headers:?}"
+        );
+        for (i, a) in answers.iter().enumerate() {
+            assert_eq!(a, &answers[0], "case {i}: {:?}", cases[i]);
+        }
+    }
+    assert_eq!(exchange[0], hop0[0]);
+    // Nothing was recorded for any of them.
+    assert_eq!(h.state.replay.len(), 0);
+}
+
+/// SR-110: the refusals that only a holder of the client's key can reach, because they come
+/// after the signature verified, keep their specific codes: they tell a legitimate client
+/// what to fix in its assertion. So do the checks made before the client is looked up, which
+/// are the same whether it exists or not.
+#[tokio::test]
+async fn refusals_after_the_signature_keep_their_codes_sr110() {
+    let h = Harness::start(|_| {}).await;
+    let t = now().unix_timestamp();
+    let claims = |patch: Value| {
+        let mut c = json!({"iss": "planner", "sub": "planner", "aud": ISSUER,
+                           "jti": uuid::Uuid::new_v4().to_string(), "exp": t + 60});
+        for (k, v) in patch.as_object().unwrap() {
+            if v.is_null() {
+                c.as_object_mut().unwrap().remove(k);
+            } else {
+                c[k] = v.clone();
+            }
+        }
+        c
+    };
+    let planner = &h.keys.planner;
+    let reused = planner.sign(&claims(json!({"jti": "used-once"})));
+    let cases = [
+        (
+            planner.sign(&claims(json!({"aud": format!("{ISSUER}/token")}))),
+            "client_assertion_audience_mismatch",
+        ),
+        (
+            planner.sign(&claims(json!({"exp": t - 3600}))),
+            "client_assertion_expired",
+        ),
+        (
+            planner.sign(&claims(json!({"exp": t + 3600}))),
+            "client_assertion_lifetime_too_long",
+        ),
+        (
+            planner.sign(&claims(json!({"iat": t + 3600}))),
+            "client_assertion_not_yet_valid",
+        ),
+        (
+            planner.sign(&claims(json!({"jti": null}))),
+            "client_assertion_missing_claim",
+        ),
+        (
+            planner.sign(&claims(json!({"iss": "coder"}))),
+            "client_assertion_subject_mismatch",
+        ),
+        (
+            planner.key.sign_jws(
+                &json!({"alg": "HS256", "kid": "planner-1"}),
+                &claims(json!({})),
+            ),
+            "client_assertion_unsupported_alg",
+        ),
+        (
+            planner
+                .key
+                .sign_jws(&json!({"alg": "EdDSA", "kid": 1}), &claims(json!({}))),
+            "client_assertion_malformed",
+        ),
+    ];
+    for (assertion, want) in &cases {
+        let (status, challenge, v) = answer(
             h.post(
                 "/token",
-                &exchange_body(&root, client, assertion_fields(&probe(client))),
+                &intake_body(&h.idp.id_token("alice"), assertion_fields(assertion)),
             )
             .await,
         )
         .await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{v}");
-        seen.push((client, code(&v).1.to_owned()));
+        assert_eq!(code(&v), ("invalid_client", *want), "{v}");
+        assert_eq!(v["code"], *want);
+        assert_eq!(challenge.as_deref(), Some("Basic realm=\"attenuo\""));
     }
-    assert_eq!(
-        seen,
-        [
-            // One key: the signature is checked.
-            ("planner", "client_assertion_bad_signature".to_owned()),
-            // Several keys and no kid.
-            ("coder", "client_assertion_unknown_kid".to_owned()),
-            // A secret only, and no such entry: the same answer as a wrong secret.
-            ("reviewer", "client_authentication_failed".to_owned()),
-            ("nobody", "client_authentication_failed".to_owned()),
-        ]
-    );
-    // Nothing was recorded for any of them.
-    assert_eq!(h.state.replay.len(), 0);
+    // A replay: the first use authenticates, the second is refused as such.
+    let body = intake_body(&h.idp.id_token("alice"), assertion_fields(&reused));
+    let (status, _, v) = answer(h.post("/token", &body).await).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let body = intake_body(&h.idp.id_token("alice"), assertion_fields(&reused));
+    let (status, _, v) = answer(h.post("/token", &body).await).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{v}");
+    assert_eq!(code(&v), ("invalid_client", "client_assertion_replayed"));
 }
