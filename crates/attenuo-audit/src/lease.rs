@@ -753,6 +753,8 @@ pub struct MemoryLeaseStore {
     budgets: Mutex<Budgets>,
     /// The limited capabilities of each hop, as issued (display only).
     hop_limits: Mutex<BTreeMap<LeaseId, Vec<HopLimit>>>,
+    /// Single-use credential markers ([`crate::replay`]).
+    used_credentials: crate::replay::MemoryReplay,
 }
 
 /// Where a memory store's `prune_run_state` pass resumes: the table, and the last key a pass
@@ -1691,6 +1693,21 @@ impl RunLimits for MemoryLeaseStore {
             counters.insert(key, total);
         }
         Ok(restored)
+    }
+}
+
+impl crate::replay::ReplayStore for MemoryLeaseStore {
+    fn use_all_once(
+        &self,
+        keys: &[(&str, i64)],
+        now: i64,
+        capacity: usize,
+    ) -> Result<crate::replay::ReplayOutcome, AuditError> {
+        self.used_credentials.use_all_once(keys, now, capacity)
+    }
+
+    fn replay_markers(&self) -> Result<usize, AuditError> {
+        self.used_credentials.len()
     }
 }
 

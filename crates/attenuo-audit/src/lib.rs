@@ -34,6 +34,7 @@ pub mod lease;
 pub mod log;
 pub mod memory;
 pub mod query;
+pub mod replay;
 pub mod shipped;
 pub mod spans;
 pub mod sqlite;
@@ -69,6 +70,7 @@ pub use shipped::{
     checkpoint_sha256, cross_check, parse_shipped, CrossCheckReport, ShippedCheckpoint,
     ShippedLine, ShippedMismatch, SHIPPED_FORMAT,
 };
+pub use replay::{ReplayOutcome, ReplayStore, REPLAY_PRUNE_BATCH};
 pub use spans::{SpanHit, MAX_SEQS_PER_PROBE, MAX_SPANS_PER_RUN};
 pub use sqlite::{
     AppendStats, Durability, NewNotice, OutboxNotice, SchemaState, SqliteAudit, SqliteLeaseStore,

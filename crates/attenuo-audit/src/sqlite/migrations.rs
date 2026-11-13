@@ -34,6 +34,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
 use super::connection::{file_of, WriteGate};
 use super::outbox::OUTBOX_SCHEMA;
+use super::replay::REPLAY_SCHEMA;
 use super::schema::{
     create_record_id_index, AUDIT_SCHEMA, CHECKPOINT_SCHEMA, LEASE_SCHEMA, META_SCHEMA,
 };
@@ -42,7 +43,7 @@ use crate::log::ENTRY_HASH_VERSION;
 
 /// The schema version this build writes and reads: the number of the last migration in the
 /// crate's list. A file above it is refused ([`AuditError::SchemaTooNew`]).
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// One step of the schema: from version `version - 1` to `version`.
 pub(super) struct Migration {
@@ -69,6 +70,13 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         description: "approvals get a `position` that is never reused (INTEGER PRIMARY KEY \
                       AUTOINCREMENT, from each row's rowid); `id` stays unique",
         apply: v2_approval_position,
+    },
+    Migration {
+        version: 3,
+        description: "single-use credential markers: `used_credentials` (SHA-256 of the replay \
+                      key, expiry) and its expiry index, so a credential redeemed before a \
+                      restart stays redeemed",
+        apply: v3_used_credentials,
     },
 ];
 
@@ -260,6 +268,16 @@ fn v2_approval_position(conn: &Connection) -> Result<(), AuditError> {
          ALTER TABLE approvals_v2 RENAME TO approvals;
          CREATE INDEX approvals_call_idx ON approvals(chain_id, call_hash, state);",
     )?;
+    Ok(())
+}
+
+/// Migration 3: the `used_credentials` table of the credential replay cache
+/// ([`crate::replay`]): one row per single-use credential redeemed, keyed by the SHA-256 of
+/// its replay key, with the Unix second after which it could not be accepted anyway. It starts
+/// empty: a credential redeemed by the build before the upgrade was only in that process's
+/// memory, so the upgrade itself is the last restart that forgets one.
+fn v3_used_credentials(conn: &Connection) -> Result<(), AuditError> {
+    conn.execute_batch(REPLAY_SCHEMA)?;
     Ok(())
 }
 

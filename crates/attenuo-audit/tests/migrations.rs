@@ -14,7 +14,8 @@ use std::sync::{Arc, Barrier};
 
 use attenuo_audit::{
     Approval, ApprovalState, ApprovalStore, AuditError, AuditSink, CheckpointKeys, LeaseRegistry,
-    NewNotice, RunState, SqliteAudit, SqliteLeaseStore, ENTRY_HASH_VERSION, SCHEMA_VERSION,
+    NewNotice, ReplayOutcome, ReplayStore, RunState, SqliteAudit, SqliteLeaseStore,
+    ENTRY_HASH_VERSION, SCHEMA_VERSION,
 };
 use attenuo_core::LeaseId;
 use attenuo_token::{Issuer, IssuerConfig};
@@ -502,7 +503,8 @@ const APPROVAL_COLUMNS: &str = "id, chain_id, lease, call_hash, server, tool, ar
 /// Write `path` as a file at schema version 1 with the content of the current-version file
 /// `source`: every table and index as `source` has it (from its own `CREATE` statements),
 /// except `approvals`, which has version 1's shape and gets each approval's position as its
-/// rowid; every row of every table; and `user_version` 1. No `sqlite_sequence`, as in a real
+/// rowid, and `used_credentials` (version 3), which is left out; every row of every other
+/// table; and `user_version` 1. No `sqlite_sequence`, as in a real
 /// version 1 file.
 fn version_1_copy(source: &Path, path: &Path) {
     let conn = Connection::open(path).unwrap();
@@ -511,7 +513,7 @@ fn version_1_copy(source: &Path, path: &Path) {
         let mut stmt = src
             .prepare(
                 "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL \
-                 AND name NOT LIKE 'sqlite_%' AND tbl_name <> 'approvals' \
+                 AND name NOT LIKE 'sqlite_%' AND tbl_name NOT IN ('approvals', 'used_credentials') \
                  ORDER BY type DESC, name",
             )
             .unwrap();
@@ -526,7 +528,7 @@ fn version_1_copy(source: &Path, path: &Path) {
         let mut stmt = conn
             .prepare(
                 "SELECT name FROM sqlite_master WHERE type = 'table' \
-                 AND name NOT LIKE 'sqlite_%' AND name <> 'approvals'",
+                 AND name NOT LIKE 'sqlite_%' AND name NOT IN ('approvals', 'used_credentials')",
             )
             .unwrap();
         let rows = stmt.query_map([], |r| r.get(0)).unwrap();
@@ -680,6 +682,60 @@ fn a_version_1_file_keeps_its_approvals_in_order() {
     store.create_approval(&b).unwrap();
     let (second, got) = store.approvals(None, None, None, 1).unwrap().remove(0);
     assert_eq!((second, got.id), (7, b.id));
+}
+
+/// Migration 3 on a version 2 file with a log, checkpoints, leases, an approval and an outbox
+/// notice: every row is kept, the file gains an empty `used_credentials` table and its expiry
+/// index (the schema of a new file), and markers written after it survive a reopen.
+#[test]
+fn a_version_2_file_gains_the_replay_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v2.sqlite");
+    let issuer = issuer();
+    write_log(&path, &issuer, 20);
+    {
+        let store = SqliteLeaseStore::open(&path).unwrap();
+        write_leases(&store);
+    }
+    {
+        // Version 2 is the current schema without migration 3's table and index.
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("DROP TABLE used_credentials; PRAGMA user_version = 2;")
+            .unwrap();
+    }
+    assert!(!objects(&path).iter().any(|o| o.starts_with("used_credentials")));
+    let rows = dump(&path);
+    let head_before = head(&path);
+
+    let log = SqliteAudit::open(&path).unwrap();
+    assert_eq!(log.schema().version, SCHEMA_VERSION);
+    assert_eq!(log.schema().migrated_from, Some(2));
+    let store = SqliteLeaseStore::open(&path).unwrap();
+    assert_eq!(store.schema().migrated_from, None);
+    assert_eq!(user_version(&path), 3);
+    assert_eq!(objects(&path), current_objects());
+
+    let after = dump(&path);
+    assert_rows_kept(&rows, &after);
+    for (table, content) in &rows {
+        assert_eq!(&after[table], content, "{table} is untouched");
+    }
+    assert_eq!(after["used_credentials"].1, Vec::<String>::new());
+    assert_eq!(head(&path), head_before);
+    let report = log.verify_chain_signed(&keys(&issuer)).unwrap();
+    assert!(report.ok, "{report:?}");
+
+    assert_eq!(
+        store.use_all_once(&[("iss\njti", 2_000)], 1_000, 10).unwrap(),
+        ReplayOutcome::Recorded
+    );
+    drop((log, store));
+    let store = SqliteLeaseStore::open(&path).unwrap();
+    assert_eq!(
+        store.use_all_once(&[("iss\njti", 2_000)], 1_500, 10).unwrap(),
+        ReplayOutcome::Replayed,
+        "the marker survives the reopen"
+    );
 }
 
 /// The tables as of commit 3593549 (`kind` and `chain_id` on records, before the record-id
