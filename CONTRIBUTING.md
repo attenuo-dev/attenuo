@@ -29,7 +29,7 @@ cargo deny check          # cargo install cargo-deny
 cargo audit               # cargo install cargo-audit (optional locally; CI runs it)
 ```
 
-`scripts/dev.sh` runs fmt, clippy, the tests and the two scripted demos (the GitHub leak demo and the multi-hop delegation demo) in one go (`scripts/dev.sh policy docs links deny` runs the other CI steps). The `justfile` has the same targets if you use [just](https://github.com/casey/just): `just dev`, `just ci`, `just demo`, `just policy`. `scripts/gen-admin-token.sh` prints a random admin token for a local server config. The MSRV (`rust-version` in `Cargo.toml`) is checked in CI only.
+`scripts/dev.sh` runs fmt, clippy, the tests and the three scripted demos (the GitHub leak demo, the multi-hop delegation demo and the IdP exchange demo) in one go (`scripts/dev.sh policy docs links deny` runs the other CI steps). The `justfile` has the same targets if you use [just](https://github.com/casey/just): `just dev`, `just ci`, `just demo`, `just policy`. `scripts/gen-admin-token.sh` prints a random admin token for a local server config. The MSRV (`rust-version` in `Cargo.toml`) is checked in CI only.
 
 ### Property tests
 
