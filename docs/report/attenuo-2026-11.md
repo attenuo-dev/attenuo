@@ -84,7 +84,7 @@ Every proxied request is checked against every lease in its chain before policy 
 
 ## Per-tool-call policy
 
-For every call, `Pipeline::decide` runs these steps in order. It checks every hop's lease and reads the run's taint and limit counters. It takes a granted approval for exactly this call, if one exists. It runs the capability stage, in which every hop's capabilities must cover the call and no hop's run limit may be exceeded. It then runs Cedar, charges the run limits of an allowed call, appends the decision to the audit log, and answers. The first failure denies, and the proxy returns a JSON-RPC error with the reason and a decision id (`docs/concepts/enforcement-points.md`). The MCP proxy and an AuthZEN endpoint both call this one pipeline, so a gateway can use attenuo as its decision point.
+For every call, `Pipeline::decide` runs these steps in order. It checks every hop's lease and reads the run's taint and limit counters. It takes a granted approval for exactly this call, if one exists. It runs the capability stage, in which every hop's capabilities must cover the call and no hop's run limit may be exceeded. It then runs Cedar, charges the run limits of an allowed call, appends the decision to the audit log, and answers. The first failure denies, and the proxy returns a JSON-RPC error with the reason and a decision id (`docs/concepts/enforcement-points.md`). Every error body, on the proxy and on the REST routes, also carries a stable `code` that clients may match on (`docs/reference/http-api.md`, "Errors"). The MCP proxy and an AuthZEN endpoint both call this one pipeline, so a gateway can use attenuo as its decision point.
 
 The capability stage is a predicate over the signed lineage, and no policy can override it (ADR-0005, `docs/decisions/0005-policy-decision-point.md`). Cedar [18] is the only policy language exposed (ADR-0002, `docs/decisions/0002-cedar-for-policy.md`). It evaluates in process, denies by default with `forbid` overriding `permit`, and has an analysable logical encoding; delegation, revocation and relationships stay outside the language.
 
@@ -108,7 +108,7 @@ Every decision, issuance, renewal, revocation, approval and admin action is appe
 
 A hash chain alone cannot show that the newest entries were removed or that the chain was rebuilt. Signed checkpoints narrow that gap. A checkpoint is an Ed25519 signature by the issuer key over `[seq, head_hash, at, kid]` under a context string, written by default every 1,000 entries and every 300 s, synced before it is handed on. A sink ships each checkpoint off the host (webhook, append-only file, or S3 with SigV4). `attenuo audit verify --file` checks an exported slice offline with only the published keys. It re-hashes and re-links every entry and verifies each checkpoint. It fails a file that falls short of its declared range, has entries outside it, or has entries after its last valid checkpoint. With `--checkpoints` it also compares the export with the shipped checkpoints. A history rewritten and re-signed with a stolen key is then detected as long as one covering checkpoint left the host first. Both SDKs implement the same check.
 
-The limits are stated in the threat model. The key lives on the host, so an attacker who controls the host can re-sign history, and entries after the last shipped checkpoint rest on the hash chain alone. At the default `durability = "normal"` a power failure can lose the newest records, including those of forwarded calls. `"full"` closes that window at one `fsync` per decision (SR-48).
+The limits are stated in the threat model. The key lives on the host, so an attacker who controls the host can re-sign history, and entries after the last shipped checkpoint rest on the hash chain alone. At the default `durability = "normal"` a power failure can lose the newest records, including those of forwarded calls. `"full"` closes that window at one `fsync` per decision (SR-48). Nothing prunes the log, so it grows without bound. ADR-0015 proposes a prune that archives a prefix at a signed checkpoint and leaves a signed anchor; it is not built (`docs/concepts/audit-log.md`).
 
 ## Two controls on top: output labelling and run limits
 
@@ -120,25 +120,25 @@ Capabilities and static policy cannot separate an injected call that uses a tool
 
 # Implementation
 
-attenuo is a Rust workspace of eight crates, plus two SDKs. Table 1 counts lines of the files `git ls-files` lists on commit 2eb0508: `.rs` for the crates, `.py` and `.ts` for the SDKs. `src/` lines include inline unit tests, and the last column is `tests/` and `benches/`.
+attenuo is a Rust workspace of eight crates, plus two SDKs. Table 1 counts lines (`wc -l`) of the files `git ls-files` lists on commit d1e7f5a (2026-11-13): `.rs` for the crates, `.py` and `.ts` for the SDKs. `src/` lines include inline unit tests. The last column is `tests/` and `benches/` for the crates, `tests/` for the Python SDK and `test/` for the TypeScript SDK.
 
 | Component | Responsibility | Lines, `src/` | Lines, tests |
 |----------------|----------------------------------------------|-------:|-------:|
-| `attenuo-core` | chain, capabilities, `⊑`, RFC 8785 JSON | 5,739 | 1,093 |
-| `attenuo-token` | tokens, `ou_sig`, issuer, verifier, DPoP | 2,952 | 1,323 |
-| `attenuo-policy` | capability stage, Cedar translation and cache, catalog, AuthZEN types | 6,141 | 2,582 |
-| `attenuo-audit` | hash-chained SQLite log, checkpoints, export verification, lease store | 9,507 | 7,164 |
-| `attenuo-proxy` | MCP reverse proxy, SSE handling, list filter, result labelling | 8,427 | 5,965 |
-| `attenuo-server` | token endpoint, IdP intake, actor auth, AuthZEN, admin API, sink, console | 19,616 | 17,184 |
-| `attenuo-cli` | the `attenuo` command line | 7,219 | 3,663 |
-| `attenuo-bench` | end-to-end benchmark harness | 4,928 | 304 |
-| Rust total | | 64,529 | 39,278 |
-| Python SDK | sync and async clients, admin client, offline audit verification | 5,604 | 5,202 |
-| TypeScript SDK | the same API for Node 20+, no runtime dependencies | 5,108 | 5,178 |
+| `attenuo-core` | chain, capabilities, `⊑`, RFC 8785 JSON, error codes | 8,043 | 1,307 |
+| `attenuo-token` | tokens, `ou_sig`, issuer, verifier, DPoP | 3,102 | 1,323 |
+| `attenuo-policy` | capability stage, Cedar translation and cache, catalog, AuthZEN types | 8,307 | 3,530 |
+| `attenuo-audit` | hash-chained SQLite log, checkpoints, export verification, lease store, schema migrations | 13,075 | 9,358 |
+| `attenuo-proxy` | MCP reverse proxy, SSE handling, list filter, result labelling | 9,900 | 7,204 |
+| `attenuo-server` | token endpoint, IdP intake, actor auth, AuthZEN, admin API and its listener, request limits, sink, console | 31,572 | 23,331 |
+| `attenuo-cli` | the `attenuo` command line | 8,040 | 4,177 |
+| `attenuo-bench` | end-to-end benchmark harness | 5,102 | 304 |
+| Rust total | | 87,141 | 50,534 |
+| Python SDK | sync and async clients, admin client, offline audit verification | 6,861 | 7,289 |
+| TypeScript SDK | the same API for Node 20+, no runtime dependencies | 6,223 | 7,272 |
 
-Table: Table 1. Code size by component, counted on 2eb0508.
+Table: Table 1. Code size by component, counted on d1e7f5a (2026-11-13).
 
-The fuzz targets add 5,515 lines of Rust outside the workspace (`fuzz/`), and the injection-suite runner and oracle add 4,972 lines of Python (`evaluation/injection-suite/`). An admin console of about 3,100 lines of plain JavaScript, HTML and CSS is embedded in the server (ADR-0008). All state lives in one SQLite file in WAL mode with group commit (`docs/design/performance.md`). On `main` at 23e027b (2026-11-06), 1,313 Rust tests passed (7 ignored), as did 404 Python SDK tests and 259 TypeScript SDK tests (2 skipped). The Rust count includes the three tests of PR #217, taken on its branch over 23e027b; the SDK counts are from 2026-11-06 06:10 UTC.
+The fuzz targets add 5,906 lines of Rust outside the workspace (`fuzz/`), and the injection-suite runner and oracle add 5,259 lines of Python (`evaluation/injection-suite/`). An admin console of about 3,100 lines of plain JavaScript, HTML and CSS is embedded in the server (ADR-0008). All state lives in one SQLite file in WAL mode with group commit (`docs/design/performance.md`). At 7493efb (#272), 1,518 Rust workspace tests passed and 7 were ignored; the later commits up to d1e7f5a change no Rust source. At d1e7f5a, 650 Python SDK tests and 370 TypeScript SDK tests passed. The integration tests that need built server binaries (22 Python, 18 TypeScript) were skipped in that SDK run.
 
 **The MCP proxy** mounts each upstream at `/mcp/{server}`, mediates `tools/call`, `resources/read`, `prompts/get` and a few other methods over streamable HTTP, and denies unknown methods. It forwards only allowed calls, without the attenuo token. Because it labels upstream output, it must parse it: it filters list results to the tools the chain covers, and it parses SSE events under the rule that the proxy reads what clients read (security pass 7, section 5.3). **AuthZEN** evaluation and batch endpoints take the chain from the bearer token. An authenticated enforcement point may instead send it in the body, but then every hop must match what the server issued for its lease. Conformance with AuthZEN 1.0 is checked against the project's own fixtures (`crates/attenuo-server/tests/authzen_conformance.rs`); it has not been tested against another implementation.
 
@@ -302,11 +302,11 @@ The Mediums of pass 7 are typical of later passes. The proxy and MCP clients rea
 
 ## Reproducibility
 
-**Demo.** `examples/github-leak-demo/run.sh` replays the GitHub leak offline against a fake GitHub MCP server, in nine steps. A public read is allowed. The injected private read is denied by policy, and the never-delegated `create_issue` at the capability check. After a lease revocation the sub-agent's next call is `lease_revoked`, and the audit chain verifies over 9 entries. The script exits non-zero on any difference. From a fresh clone with nothing prebuilt it exited 0 in 102 s on the 4-core container, nearly all of it compiling, and matched the committed transcript (`examples/github-leak-demo/transcript.md`).
+**Demo.** `examples/github-leak-demo/run.sh` replays the GitHub leak offline against a fake GitHub MCP server, in nine steps. A public read is allowed. The injected private read is denied by policy, and the never-delegated `create_issue` at the capability check. After a lease revocation the sub-agent's next call is `lease_revoked`, and the audit chain verifies over 9 entries. The script exits non-zero on any difference from the committed transcript (`examples/github-leak-demo/transcript.md`). From an empty target directory, with crates already downloaded, it took 1 min 31 s on the 4-core container, nearly all of it compiling (`examples/github-leak-demo/README.md`, "How long it takes").
 
 **Suite.** `python3 evaluation/injection-suite/run.py --split all` runs against release binaries. It writes a report and a JSON file with every call's outcome, reason, stage, decision id and upstream delivery, and the SHA-256 of every case, policy and binary (`evaluation/injection-suite/README.md`).
 
-**One script.** [`scripts/reproduce.sh`](https://github.com/attenuo-dev/attenuo/blob/main/scripts/reproduce.sh) prints the commit and toolchain versions, builds the release binaries, runs both demos and both splits of the suite, and compares the 24 per-arm rows and the problem lists with the committed `evaluation/injection-suite/results/2026-11-05-type-check-stage.md`. It exits 0 with a `REPRODUCED` line or 1 with a diff. From an empty target directory on the same container it reproduced all 24 rows in 345 s (against the earlier baseline, `2026-11-05-final-main.md`, with its 18 problem lines), 276 s of it the release build ([`docs/evaluation/reproduce.md`](../evaluation/reproduce.md)). It has been run only on Linux with Python 3.13.
+**One script.** [`scripts/reproduce.sh`](https://github.com/attenuo-dev/attenuo/blob/main/scripts/reproduce.sh) prints the commit and toolchain versions, builds the release binaries, runs both demos and both splits of the suite, and compares the 24 per-arm rows and the problem lists with the committed `evaluation/injection-suite/results/2026-11-05-type-check-stage.md`. It exits 0 with a `REPRODUCED` line or 1 with a diff. From an empty target directory on the same container it reproduced all 24 rows in 345 s (against the earlier baseline, `2026-11-05-final-main.md`, with its 18 problem lines), 276 s of it the release build ([`docs/evaluation/reproduce.md`](../evaluation/reproduce.md)). It has been run on Linux with Python 3.13, and once from a fresh clone on macOS (arm64, Python 3.13) on 2026-11-06, where it also reproduced all 24 rows [verify: the record of the macOS run is no longer in the repository]. CI runs the Rust workspace tests on macOS weekly and on manual dispatch, not on every push, and does not run this script there (`.github/workflows/ci.yml`).
 
 # Limitations
 
