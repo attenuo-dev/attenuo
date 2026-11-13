@@ -707,3 +707,64 @@ async fn an_actor_token_mapped_to_the_reserved_agent_id_is_refused_sr45() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
     assert_eq!(code(&v), ("invalid_request", "reserved_agent"), "{v}");
 }
+
+/// `actor_auth = "either"` with a `private_key_jwt` client assertion and an actor token sent
+/// together: both are checked and must name the same agent, as with a client secret.
+#[tokio::test]
+async fn either_mode_checks_an_assertion_and_an_actor_token_together() {
+    let key = attenuo_token::DpopKey::generate().unwrap();
+    let jwks = json!({ "keys": [key.public_jwk()] }).to_string();
+    let h = Harness::start(|cfg| {
+        cfg.agents
+            .push(AgentConfig::with_jwks("coder", jwks.clone()));
+        cfg.agents
+            .push(AgentConfig::with_jwks("wl:reviewer", jwks.clone()));
+    })
+    .await;
+    let assertion = |client: &str| {
+        attenuo_token::client_assertion::sign(
+            &key,
+            None,
+            client,
+            "https://attenuo.test",
+            attenuo_token::client_assertion::DEFAULT_LIFETIME,
+            OffsetDateTime::now_utc(),
+        )
+    };
+    let fields = |svid: String, a: String| {
+        json!({"actor_token": svid, "actor_token_type": JWT,
+               "client_assertion_type": attenuo_token::client_assertion::CLIENT_ASSERTION_TYPE,
+               "client_assertion": a})
+    };
+    let root = h.root_token().await;
+    let (status, v) = h
+        .exchange(
+            &root,
+            "coder",
+            fields(h.keys.svid(CODER_ID), assertion("coder")),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    // The assertion names another agent than the actor token.
+    let root = h.root_token().await;
+    let (status, v) = h
+        .exchange(
+            &root,
+            "coder",
+            fields(h.keys.svid(CODER_ID), assertion("wl:reviewer")),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(code(&v), ("invalid_request", "actor_mismatch"));
+    // A bad assertion fails the request even with a good actor token.
+    let root = h.root_token().await;
+    let (status, v) = h
+        .exchange(
+            &root,
+            "coder",
+            fields(h.keys.svid(CODER_ID), "not.a.jwt".into()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{v}");
+    assert_eq!(code(&v), ("invalid_client", "client_assertion_malformed"));
+}

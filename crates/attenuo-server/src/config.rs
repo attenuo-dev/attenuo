@@ -3495,6 +3495,56 @@ mod tests {
         assert!(cfg.actor_trust.is_empty());
     }
 
+    /// `[[agents]]` and `[[peps]]` take `jwks` (an inline JWK Set) next to or instead of
+    /// `secret_sha256`; `[token]` has the client assertion bounds.
+    #[test]
+    fn client_keys_and_assertion_settings_parse() {
+        let cfg = Config::from_toml(
+            r#"
+            [token]
+            client_assertion_max_lifetime_seconds = 120
+
+            [[agents]]
+            id = "coder"
+            jwks = '''{"keys": [{"kty": "OKP", "crv": "Ed25519", "kid": "k1",
+                       "x": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"}]}'''
+
+            [[agents]]
+            id = "planner"
+            secret_sha256 = "00"
+
+            [[peps]]
+            id = "gw"
+            secret_sha256 = "00"
+            jwks = '{"keys": []}'
+            "#,
+        )
+        .unwrap();
+        assert!(cfg.agents[0].secret_sha256.is_none());
+        assert!(cfg.agents[0].jwks.as_deref().unwrap().contains("Ed25519"));
+        assert!(cfg.agents[1].jwks.is_none());
+        assert!(cfg.peps[0].secret_sha256.is_some() && cfg.peps[0].jwks.is_some());
+        assert_eq!(cfg.token.client_assertion_max_lifetime_seconds, 120);
+        assert_eq!(cfg.token.client_assertion_clock_skew_seconds, 60);
+        cfg.token.check_client_assertion().unwrap();
+        let d = TokenSection::default();
+        assert_eq!(
+            d.client_assertion_max_lifetime_seconds,
+            DEFAULT_CLIENT_ASSERTION_MAX_LIFETIME_SECONDS
+        );
+        d.check_client_assertion().unwrap();
+        for bad in [
+            "[token]\nclient_assertion_max_lifetime_seconds = 0\n",
+            "[token]\nclient_assertion_max_lifetime_seconds = 3601\n",
+            "[token]\nclient_assertion_clock_skew_seconds = 601\n",
+        ] {
+            let cfg = Config::from_toml(bad).unwrap();
+            assert!(cfg.token.check_client_assertion().is_err(), "{bad}");
+        }
+        // A jwks given as a table instead of JSON text is refused when parsing.
+        assert!(Config::from_toml("[[agents]]\nid = \"a\"\njwks = { keys = [] }\n").is_err());
+    }
+
     #[test]
     fn actor_trust_and_actor_auth_parse() {
         let cfg = Config::from_toml(

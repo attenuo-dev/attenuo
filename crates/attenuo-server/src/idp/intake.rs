@@ -688,6 +688,67 @@ mod tests {
         );
     }
 
+    /// Hop 0 with a `private_key_jwt` assertion: alone, or with an actor token that must name
+    /// the same agent; refused under `actor_auth = "actor_token"`.
+    #[test]
+    fn agent_auth_with_a_client_assertion() {
+        let key = attenuo_token::DpopKey::generate().unwrap();
+        let agents = validate_agents(&[
+            AgentConfig::with_jwks("planner", json!({ "keys": [key.public_jwk()] }).to_string()),
+            AgentConfig::with_jwks("coder", json!({ "keys": [key.public_jwk()] }).to_string()),
+        ])
+        .unwrap();
+        let assertion = |client: &str| {
+            attenuo_token::client_assertion::sign(
+                &key,
+                None,
+                client,
+                &policy().audience,
+                attenuo_token::client_assertion::DEFAULT_LIFETIME,
+                now(),
+            )
+        };
+        let h = HeaderMap::new();
+        let auth = |mode, a: &str, actor: Option<&VerifiedActor>| {
+            authenticate_agent(&agents, mode, &h, &req(None, None), Some(a), actor, now())
+                .map(|(a, how, c)| (a, how, c.is_some()))
+        };
+        let desc = |r: Result<(String, &'static str, bool), ApiError>| r.unwrap_err().description;
+        assert_eq!(
+            auth(ActorAuth::Either, &assertion("planner"), None).unwrap(),
+            ("planner".into(), "private_key_jwt", true)
+        );
+        assert_eq!(
+            auth(ActorAuth::Secret, &assertion("planner"), None).unwrap(),
+            ("planner".into(), "private_key_jwt", true)
+        );
+        assert_eq!(
+            auth(
+                ActorAuth::Either,
+                &assertion("planner"),
+                Some(&verified("planner"))
+            )
+            .unwrap(),
+            ("planner".into(), "actor_token+private_key_jwt", true)
+        );
+        assert_eq!(
+            desc(auth(
+                ActorAuth::Either,
+                &assertion("coder"),
+                Some(&verified("planner"))
+            )),
+            Some("actor_mismatch")
+        );
+        assert_eq!(
+            desc(auth(
+                ActorAuth::ActorToken,
+                &assertion("planner"),
+                Some(&verified("planner"))
+            )),
+            Some("client_auth_not_accepted")
+        );
+    }
+
     #[test]
     fn intake_detection() {
         assert!(is_intake(&json!({"subject_token_type": ID_TOKEN_TYPE})));
