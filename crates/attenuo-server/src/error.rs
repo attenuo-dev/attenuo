@@ -359,6 +359,47 @@ impl From<attenuo_token::TokenError> for ApiError {
     }
 }
 
+/// `code` of a mint refused because a requested capability is not one a call can have (a
+/// server or tool name that breaks the naming rules, a malformed limit, or a shorthand that is
+/// not `server:tool`).
+pub const INVALID_CAPABILITY: &str = "invalid_capability";
+/// `code` of a mint refused because the agent id it names is empty.
+pub const INVALID_AGENT: &str = "invalid_agent";
+/// `code` of a root-token mint refused because the user's subject is empty.
+pub const INVALID_SUBJECT: &str = "invalid_subject";
+/// `code` of a mint refused because the requested lifetime gives no representable expiry.
+pub const TTL_OUT_OF_RANGE: &str = "ttl_out_of_range";
+/// `code` of an exchange that asks for more than the subject token holds.
+pub const SCOPE_EXCEEDS_PARENT: &str = "scope_exceeds_parent";
+/// `code` of an exchange whose chain would be deeper than `[issuer] max_depth`.
+pub const CHAIN_TOO_DEEP: &str = "chain_too_deep";
+
+/// The answer to a token the server was asked to mint (an exchange's child, a root token) and
+/// could not. As [`From<TokenError>`](attenuo_token::TokenError), with the request's own fault
+/// named in `code` (by [`ApiError::with_code`]: status, `error` and `detail` are those of the
+/// `From` mapping, with no `error_description`): a widening is `scope_exceeds_parent`, a chain
+/// too deep `chain_too_deep` (both `invalid_scope`), and an invalid capability, an empty agent
+/// or subject, or a lifetime out of range `invalid_capability`, `invalid_agent`,
+/// `invalid_subject` or `ttl_out_of_range` (`invalid_grant`).
+///
+/// Only for errors of minting: a subject token whose own chain breaks these rules fails
+/// verification, and [`From<TokenError>`](attenuo_token::TokenError) answers it as a grant that
+/// does not verify.
+pub fn mint_refusal(e: attenuo_token::TokenError) -> ApiError {
+    use attenuo_core::ChainError as C;
+    use attenuo_token::TokenError;
+    let code = match &e {
+        TokenError::Chain(C::AttenuationViolated { .. }) => SCOPE_EXCEEDS_PARENT,
+        TokenError::Chain(C::TooDeep { .. }) => CHAIN_TOO_DEEP,
+        TokenError::Chain(C::InvalidName { .. } | C::InvalidLimit { .. }) => INVALID_CAPABILITY,
+        TokenError::Chain(C::EmptyAgentId { .. }) => INVALID_AGENT,
+        TokenError::Chain(C::EmptySubject) => INVALID_SUBJECT,
+        TokenError::Chain(C::TtlOutOfRange) => TTL_OUT_OF_RANGE,
+        _ => return ApiError::from(e),
+    };
+    ApiError::from(e).with_code(code)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -468,6 +509,97 @@ mod tests {
         let e = ApiError::from(TokenError::InvalidSignature);
         assert_eq!(e.stable_code(), "invalid_grant");
         e.debug_check();
+    }
+
+    /// A refused mint names the request's fault in `code` and keeps status, `error` and
+    /// `detail` of the plain mapping, with no `error_description`; anything else maps as
+    /// before.
+    #[test]
+    fn a_refused_mint_names_its_reason_in_code() {
+        use attenuo_core::{AttenuationError, ChainError as C, NameError, NameKind};
+        use attenuo_token::TokenError as T;
+        type Case = (fn() -> T, &'static str, &'static str);
+        let cases: [Case; 7] = [
+            (
+                || {
+                    T::Chain(C::AttenuationViolated {
+                        index: 1,
+                        parent: 0,
+                        source: AttenuationError::Empty,
+                    })
+                },
+                "invalid_scope",
+                SCOPE_EXCEEDS_PARENT,
+            ),
+            (
+                || T::Chain(C::TooDeep { depth: 9, max: 8 }),
+                "invalid_scope",
+                CHAIN_TOO_DEEP,
+            ),
+            (
+                || {
+                    T::Chain(C::InvalidName {
+                        index: 1,
+                        source: NameError::Empty {
+                            kind: NameKind::Server,
+                        },
+                    })
+                },
+                "invalid_grant",
+                INVALID_CAPABILITY,
+            ),
+            (
+                || {
+                    T::Chain(C::InvalidLimit {
+                        index: 1,
+                        source: attenuo_core::limits::LimitError {
+                            capability: "github:x".into(),
+                            kind: attenuo_core::LimitKind::Calls,
+                            detail: "x".into(),
+                        },
+                    })
+                },
+                "invalid_grant",
+                INVALID_CAPABILITY,
+            ),
+            (
+                || T::Chain(C::EmptyAgentId { index: 1 }),
+                "invalid_grant",
+                INVALID_AGENT,
+            ),
+            (
+                || T::Chain(C::EmptySubject),
+                "invalid_grant",
+                INVALID_SUBJECT,
+            ),
+            (
+                || T::Chain(C::TtlOutOfRange),
+                "invalid_grant",
+                TTL_OUT_OF_RANGE,
+            ),
+        ];
+        for (make, error, code) in cases {
+            let plain = ApiError::from(make());
+            let got = mint_refusal(make());
+            assert_eq!(
+                (got.status, got.code.as_str(), got.stable_code()),
+                (StatusCode::BAD_REQUEST, error, code),
+                "{}",
+                got.detail
+            );
+            assert_eq!(got, plain.with_code(code));
+            got.debug_check();
+        }
+        // Not one of these: exactly as `From`.
+        for make in [
+            || T::ActorNotPermitted("x".into()),
+            || T::Expired,
+            || T::InvalidSignature,
+            || T::Chain(C::NoHops),
+            || T::Key("x".into()),
+        ] {
+            assert_eq!(mint_refusal(make()), ApiError::from(make()));
+        }
     }
 
     /// Debug builds refuse to send a code the table does not list, or lists with another

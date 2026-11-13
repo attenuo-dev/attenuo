@@ -92,11 +92,11 @@ use serde_json::{json, Map, Value};
 use time::OffsetDateTime;
 
 use super::extract::Body;
-use super::{audit_issuance, no_store, parse_json, register_issued};
+use super::{audit_issuance, no_store, register_issued};
 use crate::actor::{VerifiedActor, ACTOR_TOKEN_TYPE};
 use crate::clientauth;
 use crate::config::{capability_set, ActorAuth, CapSpec};
-use crate::error::ApiError;
+use crate::error::{mint_refusal, ApiError, INVALID_CAPABILITY};
 use crate::limits::CallerMark;
 use crate::replay::ReplayRefusal;
 use crate::state::AppState;
@@ -238,6 +238,9 @@ pub const EXCHANGE_REFUSAL_REASONS: [&str; 13] = [
 
 /// `code` of a request that asks for no capability (as at hop-0 intake).
 pub(crate) const NO_CAPABILITIES_REQUESTED: &str = "no_capabilities_requested";
+/// `code` of a `POST /token` body, form parameter or field that does not parse or is missing
+/// (as at hop-0 intake).
+pub(crate) const MALFORMED_REQUEST: &str = "malformed_request";
 /// `code` of an exchange whose `subject_token_type` is not the JWT URN (as at hop-0 intake).
 const UNSUPPORTED_TOKEN_TYPE: &str = "unsupported_token_type";
 
@@ -517,8 +520,8 @@ fn exchange_verified(
     let resp = req
         .execute_with(&state.issuer, now, not_after, cnf)
         .map_err(|e| match refusal_reason(&e) {
-            Some(reason) => Failure::Refused(reason, e.into()),
-            None => Failure::Other(e.into()),
+            Some(reason) => Failure::Refused(reason, mint_refusal(e)),
+            None => Failure::Other(mint_refusal(e)),
         })?;
     // A parent token delegates to a given actor once, and an actor token authenticates one
     // exchange, keyed by its `jti` (see `crate::replay`). Recorded only once the exchange has
@@ -685,8 +688,13 @@ impl From<attenuo_token::ExchangeRequestError> for RequestError {
 impl From<RequestError> for ApiError {
     fn from(e: RequestError) -> Self {
         match e {
-            RequestError::Malformed(detail) => ApiError::bad_request("invalid_request", detail),
-            RequestError::InvalidScope(detail) => ApiError::bad_request("invalid_scope", detail),
+            // As hop-0 intake names it (there also as `error_description`).
+            RequestError::Malformed(detail) => {
+                ApiError::bad_request("invalid_request", detail).with_code(MALFORMED_REQUEST)
+            }
+            RequestError::InvalidScope(detail) => {
+                ApiError::bad_request("invalid_scope", detail).with_code(INVALID_CAPABILITY)
+            }
             RequestError::UnsupportedGrantType(detail) => {
                 ApiError::bad_request("unsupported_grant_type", detail)
             }
@@ -703,7 +711,7 @@ fn parse_body(headers: &HeaderMap, body: &Bytes) -> Result<Value, ApiError> {
     if is_form(headers) {
         Ok(form_to_json(body)?)
     } else {
-        parse_json::<Value>(body)
+        serde_json::from_slice(body).map_err(|e| RequestError::Malformed(e.to_string()).into())
     }
 }
 

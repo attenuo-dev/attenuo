@@ -89,6 +89,7 @@ The table is generated from `attenuo_core::error_codes::ERROR_CODES`, the one pl
 | `capability_denied` |  | `-32003` (200) | yes | The token's capabilities do not permit the call. |
 | `chain_mismatch` | 400 |  |  | The chain in the body is not the bearer token's chain. |
 | `chain_not_issued` | 403 |  |  | A PEP's unsigned body chain was not issued by this server. |
+| `chain_too_deep` | 400 `invalid_scope` |  |  | An exchange's chain would be deeper than `[issuer] max_depth`. |
 | `charge_pruned` | 410 |  |  | The budget charge of the decision was pruned. |
 | `check_unavailable` | 409 |  |  | The policy check cannot run in this configuration. |
 | `client_assertion_audience_mismatch` | 401 `invalid_client` |  |  | The client assertion's `aud` is not exactly this server's issuer identifier (`[issuer] issuer`). |
@@ -117,6 +118,8 @@ The table is generated from `attenuo_core::error_codes::ERROR_CODES`, the one pl
 | `duplicate_actor` | 400 `invalid_request` |  |  | The `actor` is already in the chain. |
 | `expired` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The credential has expired. |
 | `input_type_mismatch` |  | `-32003` (200) | yes | A call argument does not have the type the catalog declares. |
+| `invalid_agent` | 400 `invalid_grant` |  |  | The agent id of the token to mint is empty (an exchange's `actor`, or `agent` at `POST /admin/root-token`). |
+| `invalid_capability` | 400 `invalid_grant`, 400 `invalid_scope` |  |  | A requested capability is not one a call can have: a server or tool name that breaks the naming rules, or a malformed limit (sent with `error` `invalid_grant`); or a shorthand that is not `server:tool` (a form `scope` at `POST /token`, `capabilities` at `POST /admin/root-token`; sent with `error` `invalid_scope`). |
 | `invalid_chain` | 400, 400 `invalid_request` |  |  | The chain in the body does not validate (`POST /admin/policies/check`, or a PEP's unsigned chain at AuthZEN, sent with `error` `invalid_request`). |
 | `invalid_client` | 401 |  |  | Client authentication failed. |
 | `invalid_cursor` | 400 |  |  | The paging cursor is malformed or belongs to another list or order. |
@@ -126,7 +129,8 @@ The table is generated from `attenuo_core::error_codes::ERROR_CODES`, the one pl
 | `invalid_name` |  | `-32003` (200) | yes | The call's server or tool name breaks the naming rules. |
 | `invalid_params` |  | `-32602` (200) |  | The JSON-RPC params of a decided method are not valid. |
 | `invalid_request` | 400 | `-32600` (400) |  | The request is malformed: a missing or invalid parameter or body. |
-| `invalid_scope` | 400 |  |  | The request asks for more than the parent token holds, or a chain deeper than allowed. |
+| `invalid_scope` | 400 |  |  | A subject token whose own chain widens a hop or is deeper than `[issuer] max_depth`; a request that asks for more is `scope_exceeds_parent`, `chain_too_deep` or `scope_exceeds_grant`. |
+| `invalid_subject` | 400 `invalid_grant` |  |  | The user subject of the root token to mint is empty. |
 | `invalid_token` | 401 `unauthorized`, 400 | `-32001` (401) |  | The token is malformed, not issued here, or does not verify. |
 | `jwks_unavailable` | 503 `temporarily_unavailable`, 401 `invalid_token` |  |  | The issuer's keys cannot be fetched; retry later. |
 | `label_error` |  | `-32003` (200) | yes | The call's result could not be recorded, so it is withheld. |
@@ -136,7 +140,7 @@ The table is generated from `attenuo_core::error_codes::ERROR_CODES`, the one pl
 | `lease_unknown` | 400 `invalid_grant` | `-32001` (401), `-32001` (200), `-32003` (200) | yes | A lease of the chain is unknown to the lease store (fail closed); at `POST /token` and `POST /token/renew`, the token's own lease or an ancestor's. |
 | `limit_arg_invalid` |  | `-32003` (200) | yes | The call lacks an argument a run limit counts, or has a value it cannot count. |
 | `malformed_client_auth` | 401 `invalid_client` |  |  | The HTTP Basic credentials are malformed. |
-| `malformed_request` | 400 `invalid_request` |  |  | The token request is missing a field or has an invalid one. |
+| `malformed_request` | 400 `invalid_request` |  |  | The token request is missing a field or has an invalid one (at `POST /token`, also a body that is not JSON or a well-formed form). |
 | `malformed_token` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The credential is not a well-formed JWT. |
 | `may_act_exceeds_grant` | 400 `invalid_request` |  |  | `may_act` names agents the grant does not allow. |
 | `missing_claim` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The credential lacks a required claim. |
@@ -167,6 +171,7 @@ The table is generated from `attenuo_core::error_codes::ERROR_CODES`, the one pl
 | `reserved_agent` | 400 `invalid_request` |  |  | The `actor` is the reserved agent `attenuo`. |
 | `reserved_subject` | 400 `invalid_request`, 400 `invalid_grant` |  |  | The subject is reserved. |
 | `scope_exceeds_grant` | 400 `invalid_scope` |  |  | The hop-0 request (an IdP credential at `POST /token`, or `POST /admin/root-token`) asks for more than the root grant allows. |
+| `scope_exceeds_parent` | 400 `invalid_scope` |  |  | An exchange asks for more than the subject token holds. |
 | `server_error` | 500 |  |  | An internal error; the cause is in the server log only. |
 | `session_mismatch` |  | `-32003` (403) |  | The `Mcp-Session-Id` belongs to another principal. |
 | `session_registry_full` |  | `-32006` (503) |  | No free session slot (`[proxy] max_sessions`). |
@@ -177,6 +182,7 @@ The table is generated from `attenuo_core::error_codes::ERROR_CODES`, the one pl
 | `too_many_sessions` |  | `-32007` (429) |  | The principal holds `[proxy] max_sessions_per_principal` live sessions. |
 | `tool_not_in_catalog` |  | `-32003` (200) | yes | The tool is not in the catalog and unknown tools are denied. |
 | `tool_not_listed` |  | `-32003` (200) | yes | The upstream never listed the tool and the catalog does not know it. |
+| `ttl_out_of_range` | 400 `invalid_grant` |  |  | The requested lifetime gives no representable expiry (`POST /admin/root-token`; an exchange clamps it to the parent's instead). |
 | `typ_mismatch` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The credential's `typ` header does not match its kind. |
 | `unknown_kid` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The credential's `kid` is not in its issuer's keys. |
 | `unknown_server` |  | `-32004` (404) |  | No `[[upstreams]]` entry has this name. |
