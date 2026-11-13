@@ -1,6 +1,6 @@
 # AgentDojo with a local open-weight model: raw outputs
 
-Raw output of a full AgentDojo run on one laptop, with no API key and no paid service. There are two arms per suite: the stock agent (baseline) and the agent with attenuo between it and the suite's tools, using the frozen planner-written grants. Suites are added here as both of their arms finish. Statistics are computed from these files separately. Nothing here was edited by hand.
+Raw output of a full AgentDojo run on one laptop, with no API key and no paid service. There are two arms per suite: the stock agent (baseline) and the agent with attenuo between it and the suite's tools, using the frozen planner-written grants. All four suites are complete (both arms); the run ended 2026-11-13 19:39:56 UTC. Statistics are computed from these files separately. Nothing here was edited by hand.
 
 ## Setup
 
@@ -67,5 +67,7 @@ Errored runs: a run that the model server aborted has a line in `errors.jsonl` (
 | banking | attenuo, planner grants | 2026-11-12 23:13:43 | 2026-11-13 00:25:22 | 160 | 0 | 8/16 | 0/144 | 65/144 |
 | travel | baseline | 2026-11-13 00:25:22 | 03:19:16 | 160 | 0 | 8/20 | 28/140 | 34/140 |
 | travel | attenuo, planner grants | 2026-11-13 03:19:16 | 06:05:20 | 160 | 0 | 6/20 | 8/140 | 35/140 |
+| workspace | baseline | 2026-11-13 06:05:20 | 13:13:10 | 600 | 5 (attack) | 21/40 | 28/555 | 221/555 |
+| workspace | attenuo, planner grants | 2026-11-13 13:13:10 | 19:39:56 | 600 | 4 (attack) | 16/40 | 2/556 | 200/556 |
 
 Counts are read from the per-run logs; errored runs (null scores) are excluded from both numerator and denominator.

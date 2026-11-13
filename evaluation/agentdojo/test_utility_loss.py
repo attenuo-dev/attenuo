@@ -95,7 +95,7 @@ def test_lost_and_gained_cases_are_paired_and_checked_against_the_totals(tmp_pat
             },
         ],
     )
-    for suite in ("banking", "travel"):
+    for suite in ("banking", "travel", "workspace"):
         write_lines(tmp_path / suite / "enforced" / "decisions-grants-0.jsonl", [])
     report = utility_loss.analyse(tmp_path)
     attack = report["kinds"]["attack"]["total"]
@@ -106,4 +106,10 @@ def test_lost_and_gained_cases_are_paired_and_checked_against_the_totals(tmp_pat
     benign = report["kinds"]["benign"]["total"]
     assert benign["pairs"] == 1
     assert benign["lost"]["no refusal"] == 1
-    assert "| **Lost** | **1** | **0** | **0** | **1** |" in utility_loss.markdown(report)
+    md = utility_loss.markdown(report)
+    assert "| | slack | banking | travel | workspace | total |" in md
+    assert "| **Lost** | **1** | **0** | **0** | **0** | **1** |" in md
+
+
+def test_every_agentdojo_suite_is_read():
+    assert utility_loss.SUITES == ("slack", "banking", "travel", "workspace")

@@ -51,7 +51,7 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
-SUITES = ("slack", "banking", "travel")
+SUITES = ("slack", "banking", "travel", "workspace")
 REASONS = (
     "capability_denied",
     "policy_deny",
