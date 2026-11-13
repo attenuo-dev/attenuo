@@ -32,7 +32,7 @@
 #   - npm: `npm ci --ignore-scripts` in both npm jobs, so no dependency's install script runs,
 #     least of all in `typescript-publish`, which holds `id-token: write` and `NPM_TOKEN`. The
 #     package's own `prepack` (the build) still runs at publish.
-#   How to regenerate the hashed file: sdk/python/README.md, "Release tooling".
+#   How to regenerate the hashed file: CONTRIBUTING.md, "Release tooling".
 #
 # Every action is pinned to a full commit SHA, the tag it was taken from in the comment (SR-30);
 # checkout, setup-python, setup-node and the artifact actions use the pins of the other workflows.

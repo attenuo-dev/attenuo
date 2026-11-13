@@ -152,6 +152,20 @@ Maintainers only. Versions follow [SemVer 2.0](https://semver.org/). Pre-1.0, a 
 3. Merge, then tag the merge commit `vX.Y.Z` (annotated, signed if you have a key) and push the tag. `.github/workflows/release.yml` builds `attenuo` and `attenuo-server` for Linux (musl, x86_64 and aarch64) and macOS (arm64, x86_64), pushes a signed multi-arch image to GHCR (cosign keyless, SBOM attached), and opens a **draft** GitHub release with the archives, `SHA256SUMS` and the git-cliff changelog section. Review the draft and publish it by hand. It needs only the automatic `GITHUB_TOKEN`; set the GHCR package to public after the first push.
 4. Crate publishing to crates.io is manual until the public API settles; the plan is to adopt release-plz once it does.
 
+### Release tooling
+
+The Python package that PyPI receives is built only with the tools in `sdk/python/release-requirements.txt`: `build`, `twine` and the build backend `hatchling` with their dependencies, each pinned to a version and its sha256 hashes. `.github/workflows/release-packages.yml` installs the file with `pip install --require-hashes --only-binary :all:` into a fresh venv and runs `python -m build --no-isolation`, so nothing is resolved from the index at release time (SR-83). The file is compiled from `sdk/python/release-requirements.in` for Python 3.12 on Linux, the workflow's interpreter and runner. The hashes cover every wheel and sdist PyPI has for each pinned version; the set of packages is the one Linux needs (Windows-only dependencies of `twine` are left out).
+
+Dependabot (the `pip` entry for `/sdk/python` in `.github/dependabot.yml`) checks weekly and opens a PR that recompiles the file when a pinned tool has a newer release. To do it by hand, or after changing the `.in` file or the `[build-system] requires` in `pyproject.toml`, run in `sdk/python` with Python 3.12:
+
+```sh
+python3.12 -m venv /tmp/piptools && /tmp/piptools/bin/pip install pip-tools
+/tmp/piptools/bin/pip-compile --upgrade --generate-hashes --allow-unsafe --strip-extras \
+  --no-emit-index-url --output-file=release-requirements.txt release-requirements.in
+```
+
+Then check it the way the workflow uses it: in a fresh Python 3.12 venv, `pip install --require-hashes --only-binary :all: -r release-requirements.txt`, then `python -m build --no-isolation --outdir dist .` and `twine check --strict dist/*`. A Dependabot PR's header line must still say "with Python 3.12"; if it names another version, recompile by hand. The npm jobs need no file of their own: `package-lock.json` pins every package by integrity hash, and both jobs run `npm ci --ignore-scripts`, so no dependency's install script runs in the job that holds the publish token; a dependency that gains one shows up as a lockfile change in review.
+
 ## AI-assisted contributions
 
 AI coding tools are welcome; most of this repository was written with them (see [How this project is built](README.md#how-this-project-is-built)). The rules are the same as for any change: you are responsible for every line you submit, you must understand it well enough to answer review questions about it, and it must pass the same tests and review. Say in the pull request description which parts a tool wrote. Do not paste output you have not read, and do not submit code a tool generated from sources whose licence you cannot check. A `Co-Authored-By:` trailer for the tool is welcome; links to private tool sessions (such as `Claude-Session:` URLs) do not belong in commit messages.
