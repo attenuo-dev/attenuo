@@ -703,7 +703,9 @@ fn a_version_2_file_gains_the_replay_table() {
         conn.execute_batch("DROP TABLE used_credentials; PRAGMA user_version = 2;")
             .unwrap();
     }
-    assert!(!objects(&path).iter().any(|o| o.starts_with("used_credentials")));
+    assert!(!objects(&path)
+        .iter()
+        .any(|o| o.starts_with("used_credentials")));
     let rows = dump(&path);
     let head_before = head(&path);
 
@@ -726,13 +728,17 @@ fn a_version_2_file_gains_the_replay_table() {
     assert!(report.ok, "{report:?}");
 
     assert_eq!(
-        store.use_all_once(&[("iss\njti", 2_000)], 1_000, 10).unwrap(),
+        store
+            .use_all_once(&[("iss\njti", 2_000)], 1_000, 10)
+            .unwrap(),
         ReplayOutcome::Recorded
     );
     drop((log, store));
     let store = SqliteLeaseStore::open(&path).unwrap();
     assert_eq!(
-        store.use_all_once(&[("iss\njti", 2_000)], 1_500, 10).unwrap(),
+        store
+            .use_all_once(&[("iss\njti", 2_000)], 1_500, 10)
+            .unwrap(),
         ReplayOutcome::Replayed,
         "the marker survives the reopen"
     );

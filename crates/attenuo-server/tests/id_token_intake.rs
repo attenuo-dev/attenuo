@@ -461,6 +461,9 @@ async fn an_id_token_whose_use_cannot_be_recorded_is_refused() {
     let (status, body) = intake(&server, &idp.id_token("alice")).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     assert_eq!(body["error"], "temporarily_unavailable", "{body}");
-    assert_eq!(body["error_description"], "replay_store_unavailable", "{body}");
+    assert_eq!(
+        body["error_description"], "replay_store_unavailable",
+        "{body}"
+    );
     assert!(body.get("access_token").is_none(), "{body}");
 }

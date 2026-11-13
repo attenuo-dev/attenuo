@@ -85,7 +85,10 @@ mod tests {
 
     fn stores() -> Vec<(&'static str, Box<dyn ReplayStore>)> {
         vec![
-            ("sqlite", Box::new(SqliteLeaseStore::open_in_memory().unwrap())),
+            (
+                "sqlite",
+                Box::new(SqliteLeaseStore::open_in_memory().unwrap()),
+            ),
             ("memory", Box::new(MemoryLeaseStore::new())),
         ]
     }
@@ -132,7 +135,11 @@ mod tests {
                 ReplayOutcome::Replayed,
                 "{name}"
             );
-            assert_eq!(s.replay_markers().unwrap(), 1, "{name}: `fresh` rolled back");
+            assert_eq!(
+                s.replay_markers().unwrap(),
+                1,
+                "{name}: `fresh` rolled back"
+            );
             assert_eq!(
                 s.use_all_once(&[("dup", 1_100), ("dup", 1_100)], 1_000, 3)
                     .unwrap(),

@@ -170,7 +170,7 @@ The server keeps no nonce state. A nonce is an HMAC of the current time bucket (
 
 ## Limits
 
-- Replay protection is in memory, per process. With several server replicas, a proof could be replayed against another replica within the `iat` window.
+- Proof replay protection is in memory, per process. With several server replicas, a proof could be replayed against another replica within the `iat` window, and after a restart a proof made before it can be replayed once until its `iat` is older than `dpop_max_age_seconds`. Proof `jti`s are not written to the database because every proxied call with a bound token checks one, and a write per call would slow every call; the single-use credentials of `POST /token` and approvals are written there and survive a restart.
 - Server nonces are off by default; freshness then rests on `iat` and the `jti` cache. With nonces on, a nonce is shared by every client of the server for its lifetime, so it limits how far ahead a proof can be made. It does not stop the cross-replica replay above.
 - Binding is checked by the server and the built-in proxy. An external enforcement point that verifies tokens itself must check proofs too, or ask the AuthZEN endpoint with the token and a proof.
 - Cedar policies cannot see whether a call was bound yet; only the audit record says so.

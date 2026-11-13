@@ -66,11 +66,11 @@ pub use log::{
 };
 pub use memory::MemoryAudit;
 pub use query::{EntryFilter, Order};
+pub use replay::{ReplayOutcome, ReplayStore, REPLAY_PRUNE_BATCH};
 pub use shipped::{
     checkpoint_sha256, cross_check, parse_shipped, CrossCheckReport, ShippedCheckpoint,
     ShippedLine, ShippedMismatch, SHIPPED_FORMAT,
 };
-pub use replay::{ReplayOutcome, ReplayStore, REPLAY_PRUNE_BATCH};
 pub use spans::{SpanHit, MAX_SEQS_PER_PROBE, MAX_SPANS_PER_RUN};
 pub use sqlite::{
     AppendStats, Durability, NewNotice, OutboxNotice, SchemaState, SqliteAudit, SqliteLeaseStore,
