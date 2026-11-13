@@ -3536,6 +3536,31 @@ async fn every_refusal_names_its_specific_reason_in_code() {
         .await;
     assert_eq!(b["error"], "invalid_grant");
     assert!(b["decision_id"].is_string(), "still audited: {b}");
+    // A limit that parses but is malformed is the same refusal.
+    let mut bad_limit = exchange_body(EXCHANGE, JWT);
+    bad_limit["subject_token"] = json!(any.token);
+    bad_limit["authorization_details"][0]["capabilities"] = json!([{"server": "github",
+        "tool": "x", "limits": {"sum": {"arg": "n", "max": 1, "derive": "host"}}}]);
+    let b = a
+        .rest(
+            "token: capability with a malformed limit",
+            post_token(bad_limit).await.unwrap(),
+            StatusCode::BAD_REQUEST,
+            Some("invalid_capability"),
+        )
+        .await;
+    assert_eq!(b["error"], "invalid_grant");
+    // An unknown limit kind does not parse: the request is malformed.
+    let mut unknown_limit = exchange_body(EXCHANGE, JWT);
+    unknown_limit["authorization_details"][0]["capabilities"] =
+        json!([{"server": "github", "tool": "read_file", "limits": {"often": 1}}]);
+    a.rest(
+        "token: capability with an unknown limit kind",
+        post_token(unknown_limit).await.unwrap(),
+        StatusCode::BAD_REQUEST,
+        Some("malformed_request"),
+    )
+    .await;
     a.rest(
         "token: actor already in the chain",
         h.exchange_raw(&narrow.token, "coder", &read).await,
