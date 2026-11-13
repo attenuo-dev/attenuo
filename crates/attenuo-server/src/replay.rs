@@ -42,9 +42,6 @@ use crate::error::ApiError;
 /// Default number of markers held.
 pub(crate) const DEFAULT_REPLAY_CAPACITY: usize = 100_000;
 
-/// `error_description` of a request refused because its markers could not be written.
-pub(crate) const REPLAY_STORE_UNAVAILABLE: &str = "replay_store_unavailable";
-
 /// The replay cache: single use of credentials, over the lease store's markers.
 pub struct ReplayCache {
     store: Arc<dyn ReplayStore>,
@@ -107,7 +104,7 @@ impl ReplayCache {
                     "temporarily_unavailable",
                     "the server cannot record the use of this credential; retry later",
                 )
-                .with_description(REPLAY_STORE_UNAVAILABLE))
+                .with_description("replay_store_unavailable"))
             }
         }
     }
@@ -215,7 +212,7 @@ mod tests {
         let e = c.use_once("a", 1_100, t).unwrap_err();
         assert_eq!(e.status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(e.code, "temporarily_unavailable");
-        assert_eq!(e.description, Some(REPLAY_STORE_UNAVAILABLE));
+        assert_eq!(e.description, Some("replay_store_unavailable"));
         e.debug_check();
     }
 }

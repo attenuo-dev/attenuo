@@ -363,6 +363,7 @@ Every answer for one grant carries the same token. To use it, retry the call wit
 | 403 | `wrong_user` | the ID token belongs to someone other than the run's originating user |
 | 404 | `not_found` | unknown approval, or a delegation token of another run |
 | 409 | `approval_not_pending`, `approval_expired`, `lease_revoked` | already decided or used, past `expires_at`, or the lease it is bound to is no longer live |
+| 503 | `temporarily_unavailable` (`error_description` `replay_cache_full` or `replay_store_unavailable`) | the ID token's single use could not be recorded (too many in flight, or a database error); nothing was decided, retry |
 
 ## Admin
 

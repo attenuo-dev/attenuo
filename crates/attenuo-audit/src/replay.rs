@@ -6,14 +6,13 @@
 //! both decides "first use" and records it: a key whose marker is live is refused, and a
 //! request with several keys records all of them or none.
 //!
-//! [`SqliteLeaseStore`] keeps the markers in the `used_credentials`
-//! table of its file (schema version 3), so they survive a restart. The decision is the
-//! `INSERT` itself: in one `BEGIN IMMEDIATE` transaction each key is inserted, or its expired
-//! marker overwritten, and an insert that changes no row (a live marker) rolls the whole
-//! transaction back. Nothing is cached in front of it, so there is no second copy that could
-//! disagree with the file. The key is stored as its SHA-256, so the table holds no issuer,
-//! `jti` or agent id. [`MemoryLeaseStore`] keeps a map, lost with
-//! the process.
+//! [`SqliteLeaseStore`] keeps the markers in the `used_credentials` table of its file (schema
+//! version 3), so they survive a restart. The decision is the `INSERT` itself: in one `BEGIN
+//! IMMEDIATE` transaction each key is inserted, or its expired marker overwritten, and an
+//! insert that changes no row (a live marker) rolls the whole transaction back. Nothing is
+//! cached in front of it, so there is no second copy that could disagree with the file. The
+//! key is stored as its SHA-256, so the table holds no issuer, `jti` or agent id.
+//! [`MemoryLeaseStore`] keeps a map, lost with the process.
 //!
 //! Both are bounded: a call that would leave more than `capacity` markers is refused with
 //! [`ReplayOutcome::Full`] instead of forgetting a live one. The file store deletes up to
