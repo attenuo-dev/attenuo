@@ -644,6 +644,35 @@ impl Authenticated {
         self.method
     }
 
+    /// For an agent at `POST /token`, the refusals that come before any work and leave the
+    /// request to be sent again unchanged, made before [`commit`](Self::commit) uses an
+    /// assertion up: the agent's `[limits] token_requests_per_minute` (checked, not counted;
+    /// SR-108) and, for an assertion, a `DPoP` header proof that will be refused, such as one
+    /// without the current server nonce (SR-111). Without them, a rate-limited agent wrote a
+    /// replay marker on every request, and a client that sent its request again as told
+    /// (`Retry-After`, `use_dpop_nonce`) was refused as a replay.
+    ///
+    /// # Errors
+    ///
+    /// `429` `rate_limited`, and the DPoP refusals of [`crate::dpop::Dpop::check_header_first`].
+    pub(crate) fn check_before_commit(
+        &self,
+        state: &crate::state::AppState,
+        headers: &HeaderMap,
+        mark: Option<&crate::limits::CallerMark>,
+        now: OffsetDateTime,
+    ) -> Result<(), ApiError> {
+        state.limits.check_agent(mark, &self.id)?;
+        if self.replay.is_some() {
+            state.dpop.check_header_first(
+                crate::dpop::header_proof(headers)?,
+                &state.dpop.expected_url_for(headers, "/token"),
+                now,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Record the assertion's `jti` as used (nothing for a secret) and return the client id.
     /// A store write: call it on the blocking pool.
     ///

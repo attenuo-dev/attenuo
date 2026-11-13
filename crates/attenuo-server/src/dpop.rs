@@ -394,6 +394,30 @@ impl Dpop {
         }
     }
 
+    /// The checks [`bind_new`](Self::bind_new) and [`bind_exchange`](Self::bind_exchange) make
+    /// on the request's `DPoP` header proof for `POST url`, the server nonce included, without
+    /// using up its `jti`; nothing when there is no header or `dpop = "off"`. For a `POST
+    /// /token` that is about to use up a client assertion before the binding runs: a proof
+    /// that will be refused, `use_dpop_nonce` above all, is refused first, so the client can
+    /// send the same request again with a new proof (SR-111). It only refuses: the binding
+    /// still checks the proof and records it.
+    ///
+    /// # Errors
+    ///
+    /// As [`bind_new`](Self::bind_new) for a proof that is sent, except the replay-cache
+    /// failures.
+    pub fn check_header_first(
+        &self,
+        header: Option<&str>,
+        url: &str,
+        now: OffsetDateTime,
+    ) -> Result<(), DpopFailure> {
+        match (self.mode, header) {
+            (DpopMode::Off, _) | (_, None) => Ok(()),
+            (_, Some(p)) => self.check(p, "POST", url, None, now).map(|_| ()),
+        }
+    }
+
     /// The binding of a child token in an exchange for `actor`, and whether the requester
     /// proved possession of a bound parent's key. `header` is the request's `DPoP` header and
     /// `subject_proof` the body's `subject_token_dpop`; see the module docs for the rule.

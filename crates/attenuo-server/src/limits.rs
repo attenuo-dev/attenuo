@@ -155,23 +155,51 @@ impl Limits {
         };
         match limiter.admit(agent, Instant::now()) {
             Verdict::Admit => Ok(()),
-            refused => {
-                let retry = self.refused(RateLimitedBy::Token, &refused);
-                if refused.first() {
-                    tracing::warn!(
-                        limit = "token_requests_per_minute",
-                        agent,
-                        retry_after_seconds = retry,
-                        "rate limit reached; further token requests of this agent are refused \
-                         until the minute ends"
-                    );
-                }
-                Err(rate_limited(
-                    "too many token requests for this agent; retry later",
-                    retry,
-                ))
-            }
+            refused => Err(self.agent_refused(&refused, agent)),
         }
+    }
+
+    /// [`admit_agent`](Self::admit_agent) without counting: refuse the authenticated agent
+    /// `agent` when it is over `token_requests_per_minute`, and mark the request as
+    /// authenticated. For a request whose credential is used up when it is accepted (a client
+    /// assertion): it runs before that credential is recorded, so an agent over its limit
+    /// writes nothing to the replay store and can send the same assertion again after
+    /// `Retry-After` (SR-108). The request is counted by `admit_agent` afterwards.
+    ///
+    /// # Errors
+    ///
+    /// As [`admit_agent`](Self::admit_agent).
+    pub(crate) fn check_agent(
+        &self,
+        mark: Option<&CallerMark>,
+        agent: &str,
+    ) -> Result<(), ApiError> {
+        if let Some(mark) = mark {
+            mark.0.store(true, Ordering::Release);
+        }
+        let Some(limiter) = &self.token else {
+            return Ok(());
+        };
+        match limiter.check(agent, Instant::now()) {
+            Verdict::Admit => Ok(()),
+            refused => Err(self.agent_refused(&refused, agent)),
+        }
+    }
+
+    /// The `429` of an agent over `token_requests_per_minute`, counted in the metrics and
+    /// logged on its first refusal in the minute.
+    fn agent_refused(&self, refused: &Verdict, agent: &str) -> ApiError {
+        let retry = self.refused(RateLimitedBy::Token, refused);
+        if refused.first() {
+            tracing::warn!(
+                limit = "token_requests_per_minute",
+                agent,
+                retry_after_seconds = retry,
+                "rate limit reached; further token requests of this agent are refused until \
+                 the minute ends"
+            );
+        }
+        rate_limited("too many token requests for this agent; retry later", retry)
     }
 
     /// Count a refusal in the metrics; returns its `Retry-After` in seconds.
@@ -348,6 +376,29 @@ impl RateLimiter {
             }
         }
         Verdict::Admit
+    }
+
+    /// [`peek`](Self::peek), except that a refusal of a key over its limit is remembered as
+    /// [`admit`](Self::admit) remembers it: `first` is set on the key's first refusal in its
+    /// window, whichever of the two made it. Counts nothing.
+    pub(crate) fn check(&self, key: &str, now: Instant) -> Verdict {
+        let window = self.window;
+        {
+            let mut t = self.lock();
+            if let Some(slot) = t.slots.get_mut(key) {
+                let end = slot.start + window;
+                if now < end && slot.count >= self.limit {
+                    let first = !slot.warned;
+                    slot.warned = true;
+                    return Verdict::Limited {
+                        retry_after: end.saturating_duration_since(now),
+                        first,
+                    };
+                }
+                return Verdict::Admit;
+            }
+        }
+        self.peek(key, now)
     }
 
     /// How many keys are tracked.
@@ -607,6 +658,38 @@ mod tests {
 
     /// A limit of N admits N in a window, refuses the N+1st (and every later one, uncounted),
     /// and admits N again once the window has ended.
+    /// `check` counts nothing, refuses what `admit` would refuse, and shares the first-refusal
+    /// flag with `admit`, so the warning is logged once a minute whichever of them refused
+    /// first (SR-108).
+    #[test]
+    fn check_counts_nothing_and_shares_the_first_refusal() {
+        let l = RateLimiter::new(2, W, 100);
+        let t0 = Instant::now();
+        for _ in 0..5 {
+            assert_eq!(l.check("agent", t0), Verdict::Admit);
+        }
+        assert_eq!(l.tracked(), 0, "check adds no key");
+        assert_eq!(l.admit("agent", t0), Verdict::Admit);
+        assert_eq!(l.admit("agent", t0), Verdict::Admit);
+        assert!(matches!(
+            l.check("agent", t0),
+            Verdict::Limited { first: true, .. }
+        ));
+        assert!(matches!(
+            l.check("agent", t0),
+            Verdict::Limited { first: false, .. }
+        ));
+        assert!(matches!(
+            l.admit("agent", t0),
+            Verdict::Limited { first: false, .. }
+        ));
+        assert_eq!(l.check("agent", t0 + W), Verdict::Admit);
+        // A new key on a full table is refused as `admit` would refuse it.
+        let full = RateLimiter::new(1, W, 1);
+        assert_eq!(full.admit("a", t0), Verdict::Admit);
+        assert!(matches!(full.check("b", t0), Verdict::Full { .. }));
+    }
+
     #[test]
     fn admits_n_refuses_n_plus_one_and_recovers_after_the_window() {
         let l = RateLimiter::new(3, W, 100);
@@ -778,6 +861,78 @@ mod tests {
             .await
             .unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// SR-109 (proposed, not fixed): pins what a full peer table does today. Requests that
+    /// authenticate an agent are never counted against their peer address, so an agent's
+    /// address is never in the table; once `rate_limit_max_keys` other addresses each sent one
+    /// unauthenticated request within their minute, `peek` answers `Full` for every new
+    /// address, and an agent with good credentials is refused `429` before it can
+    /// authenticate. When the maintainer picks one of the options in the pass 12 report, this
+    /// test changes with it.
+    #[tokio::test]
+    async fn a_full_peer_table_refuses_an_authenticated_agent_sr109() {
+        use axum::extract::Extension;
+        use axum::routing::post;
+        use tower::ServiceExt as _;
+        let (limits, metrics) = limits(|l| {
+            l.token_unauthenticated_requests_per_minute = 5;
+            l.rate_limit_max_keys = 100;
+        });
+        // A stand-in for `POST /token`: `x-agent` stands for credentials that authenticate.
+        let app = axum::Router::new()
+            .route(
+                "/token",
+                post(
+                    |State(limits): State<Arc<Limits>>,
+                     Extension(mark): Extension<CallerMark>,
+                     headers: axum::http::HeaderMap| async move {
+                        match headers.get("x-agent").and_then(|v| v.to_str().ok()) {
+                            Some(agent) => match limits.admit_agent(Some(&mark), agent) {
+                                Ok(()) => StatusCode::OK.into_response(),
+                                Err(e) => e.into_response(),
+                            },
+                            None => StatusCode::UNAUTHORIZED.into_response(),
+                        }
+                    },
+                )
+                .layer(axum::middleware::from_fn_with_state(
+                    limits.clone(),
+                    token_peer_limit,
+                )),
+            )
+            .with_state(limits.clone());
+        let send = |peer: [u8; 4], agent: Option<&'static str>| {
+            let app = app.clone();
+            async move {
+                let mut req = Request::builder().method("POST").uri("/token");
+                if let Some(agent) = agent {
+                    req = req.header("x-agent", agent);
+                }
+                let mut req = req.body(Body::empty()).unwrap();
+                req.extensions_mut()
+                    .insert(ConnectInfo(SocketAddr::from((peer, 40000))));
+                app.oneshot(req).await.unwrap().status()
+            }
+        };
+        // The agent's own address, before the flood: authenticated, never counted.
+        assert_eq!(send([192, 0, 2, 1], Some("coder")).await, StatusCode::OK);
+        // One unauthenticated request from each of 100 other addresses fills the table.
+        for i in 0..100u8 {
+            assert_eq!(
+                send([198, 51, 100, i], None).await,
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        // The agent, from the same address and good credentials: refused before it can
+        // authenticate, because its address is a new key on a full table.
+        assert_eq!(
+            send([192, 0, 2, 1], Some("coder")).await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert!(metrics.render().contains(
+            "attenuo_requests_rate_limited_total{limit=\"token_unauthenticated\",cause=\"table_full\"} 1\n"
+        ));
     }
 
     /// With `max_in_flight` requests running, the next one is refused at once with `503`,

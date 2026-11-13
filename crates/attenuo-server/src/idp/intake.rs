@@ -142,8 +142,11 @@ pub(crate) async fn handle(
     )?;
     // A client assertion authenticates this one request, whatever its outcome: its `jti` is
     // recorded now (`crate::clientauth`), unlike the actor token and the IdP credential, which
-    // are recorded together once the root token is issued.
+    // are recorded together once the root token is issued. The rate limit and a DPoP proof
+    // that will be refused come first, so that a request the client is told to send again
+    // does not use its assertion up (SR-108, SR-111).
     if let Some(client) = client {
+        client.check_before_commit(state, headers, mark, now)?;
         state
             .blocking(move |s| client.commit(&s.replay, now))
             .await?;
