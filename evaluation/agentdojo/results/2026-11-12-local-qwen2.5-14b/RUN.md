@@ -37,7 +37,7 @@ PYTHONPATH=sdk/python/src "$PY" evaluation/agentdojo/enforced.py --out "$OUT/enf
 
 ## Layout
 
-Each `<suite>/` directory has two arms.
+Each `<suite>/` directory has two arms. `workspace/` has only `baseline/` until its attenuo arm finishes.
 
 `baseline/`, the output of `pilot.py` for this suite:
 - `results-<suite>-0.json`
@@ -67,5 +67,6 @@ Errored runs: a run that the model server aborted has a line in `errors.jsonl` (
 | banking | attenuo, planner grants | 2026-11-12 23:13:43 | 2026-11-13 00:25:22 | 160 | 0 | 8/16 | 0/144 | 65/144 |
 | travel | baseline | 2026-11-13 00:25:22 | 03:19:16 | 160 | 0 | 8/20 | 28/140 | 34/140 |
 | travel | attenuo, planner grants | 2026-11-13 03:19:16 | 06:05:20 | 160 | 0 | 6/20 | 8/140 | 35/140 |
+| workspace | baseline | 2026-11-13 06:05:20 | 13:13:10 | 600 | 5 (attack) | 21/40 | 28/555 | 221/555 |
 
 Counts are read from the per-run logs; errored runs (null scores) are excluded from both numerator and denominator.
