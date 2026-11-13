@@ -345,6 +345,22 @@ describe("DPoP server nonces", () => {
     expect(claims.htu).toBe(`${BASE}/mcp/github`);
   });
 
+  it("sends an exchange's client assertion again on the nonce retry", async () => {
+    // `use_dpop_nonce` leaves the assertion unused (the server checks the header proof first),
+    // so the retry sends the same body, assertion included, with a new proof.
+    const key = await DpopKey.generate();
+    const child = await bound(key.thumbprint, ["planner", "coder"]);
+    const server = nonceServer(okForEveryRoute(child));
+    const { fetch, calls } = mockFetch(server.handler);
+    const ob = new AttenuoClient(BASE, { fetch, dpopKey: key });
+    const assertion = await (await DpopKey.generate()).clientAssertion("reviewer", "https://a");
+    await ob.exchange(child, "reviewer", ["github:read_file"], { clientAssertion: assertion });
+    expect(server.state.seen).toEqual([undefined, "n-1"]);
+    const [first, retry] = calls as [Seen, Seen];
+    expect(retry.body).toEqual(first.body);
+    expect((first.body as { client_assertion: string }).client_assertion).toBe(assertion);
+  });
+
   it("retries only once", async () => {
     const key = await DpopKey.generate();
     const child = await bound(key.thumbprint);

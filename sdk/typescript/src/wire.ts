@@ -13,7 +13,7 @@ import {
   UnavailableError,
 } from "./errors.js";
 import type { DpopKeyLike } from "./dpop.js";
-import { bearer, decodeToken, parseTime, type Token } from "./token.js";
+import { b64urlDecode, bearer, decodeToken, parseTime, type Token } from "./token.js";
 
 export const TOKEN_EXCHANGE_GRANT = "urn:ietf:params:oauth:grant-type:token-exchange";
 export const TYPE_JWT = "urn:ietf:params:oauth:token-type:jwt";
@@ -416,7 +416,13 @@ export interface ExchangeOptions {
    * agent whose `[[agents]]` entry lists public keys (`jwks`). Make one per request with
    * `DpopKey.clientAssertion(agentId, serverIssuer)` from the agent's private key. Sent with
    * `client_assertion_type` `urn:ietf:params:oauth:client-assertion-type:jwt-bearer`; never
-   * together with a client secret.
+   * together with a client secret. The `use_dpop_nonce` retry and the `maxRetries` retry of a load
+   * refusal send the same assertion again, which the server allows because those refusals leave
+   * it unused; the load retry is not made when its wait would reach the assertion's `exp`, and the
+   * `RateLimitedError` (or `UnavailableError`) is thrown instead. Then mint a new assertion and
+   * call again, or mint it with a `lifetime` that covers the waits (at most the server's
+   * `client_assertion_max_lifetime_seconds`, 300 by default). Treat an assertion as spent after
+   * any other answer.
    */
   clientAssertion?: string;
   /** RFC 8693 §4.4 `may_act` for the new token: the agents allowed to exchange it next. */
@@ -490,6 +496,30 @@ export function exchangeBody(
   }
   if (mayAct !== undefined) body.may_act = mayAct;
   return body;
+}
+
+/**
+ * The `exp` (Unix seconds) of the `client_assertion` in a `POST /token` `body`, read without
+ * verifying anything; undefined when the body has none or its `exp` cannot be read.
+ *
+ * A load refusal (429 `rate_limited`, 503 `overloaded`) leaves the assertion unspent, so the
+ * retry may send it again, but only before it expires: the client's retry does not wait past
+ * this time.
+ */
+export function assertionExpiry(body: Json): number | undefined {
+  const assertion: unknown = body.client_assertion;
+  if (typeof assertion !== "string") return undefined;
+  const parts = assertion.split(".");
+  if (parts.length !== 3) return undefined;
+  let claims: unknown;
+  try {
+    claims = JSON.parse(new TextDecoder().decode(b64urlDecode(parts[1]!)));
+  } catch {
+    return undefined;
+  }
+  if (typeof claims !== "object" || claims === null || Array.isArray(claims)) return undefined;
+  const exp = (claims as { exp?: unknown }).exp;
+  return typeof exp === "number" && Number.isFinite(exp) ? Math.trunc(exp) : undefined;
 }
 
 /** The RFC 8693 §4.4 `may_act` claim for a list of agent ids. */

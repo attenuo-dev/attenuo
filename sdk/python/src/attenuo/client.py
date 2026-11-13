@@ -52,9 +52,11 @@ class Client:
     has none), up to 20 % longer so refused clients spread out; a ``Retry-After`` over
     ``max_retry_delay`` seconds (default 10) is not waited out and the error is raised at once,
     so all retries of one call wait at most ``max_retries * max_retry_delay`` seconds. Every
-    retry is a new request with new DPoP proofs. Nothing else is retried: not a
-    ``request_timeout`` (the server may have done the work), not a denial, not an
-    :class:`~attenuo.Unauthorized`, not a transport error. A streamed call is retried only
+    retry is a new request with new DPoP proofs; an exchange sends its ``client_assertion``
+    again (a refused load leaves it unused), but not once it has expired: a wait that would
+    reach the assertion's ``exp`` is not made and the refusal is raised at once. Nothing else
+    is retried: not a ``request_timeout`` (the server may have done the work), not a denial,
+    not an :class:`~attenuo.Unauthorized`, not a transport error. A streamed call is retried only
     before its stream starts, and not past its ``deadline``. When the retries run out, the last
     refusal is raised. ``max_retries`` is at most 10 and ``max_retry_delay`` at most 300.
     """
@@ -131,7 +133,13 @@ class Client:
         ``client_assertion``: a ``private_key_jwt`` assertion (RFC 7523) made with
         ``DpopKey.client_assertion(agent_id, server_issuer)`` from the agent's private key; each
         one authenticates one request. ``client_secret`` and ``client_assertion`` are never
-        sent together.
+        sent together. The ``use_dpop_nonce`` retry and the ``max_retries`` retry of a load
+        refusal send the same assertion again, which the server allows because those refusals
+        leave it unused; the load retry is not made when its wait would reach the assertion's
+        ``exp``, and :class:`~attenuo.RateLimited` (or :class:`~attenuo.Unavailable`) is raised
+        instead. Then mint a new assertion and call again, or mint it with a ``lifetime`` that
+        covers the waits (at most the server's ``client_assertion_max_lifetime_seconds``, 300 by
+        default). Treat an assertion as spent after any other answer.
         ``may_act`` lists the agents allowed to exchange the new token next (RFC 8693 §4.4).
 
         With a ``dpop_key`` on the client, the new token is bound to it. When ``subject_token`` is
@@ -162,6 +170,7 @@ class Client:
                 self.server_url, self.dpop_key, body, subject_dpop_key, subject_token_dpop, nonce
             ),
             json=body,
+            resend_until=w.assertion_expiry(body),
         )
         return w.token_from_response(w.json_body(resp))
 
@@ -175,11 +184,13 @@ class Client:
         method: str,
         path: str,
         headers: Callable[[str | None], dict[str, str]],
+        *,
+        resend_until: float | None = None,
         **kwargs: Any,
     ) -> httpx.Response:
         """``method path`` with ``headers(nonce)``; once more with the server's new nonce when
         it answers ``use_dpop_nonce``; again, with new headers, on a load refusal while
-        ``max_retries`` allows (:meth:`_retrying`)."""
+        ``max_retries`` allows and the wait ends before ``resend_until`` (:meth:`_retrying`)."""
 
         def send() -> httpx.Response:
             resp = self._http.request(method, path, headers=headers(self._nonce.value), **kwargs)
@@ -190,15 +201,19 @@ class Client:
                 self._nonce.update(resp)
             return resp
 
-        return self._retrying(send)
+        return self._retrying(send, resend_until)
 
-    def _retrying(self, send: Callable[[], httpx.Response]) -> httpx.Response:
+    def _retrying(
+        self, send: Callable[[], httpx.Response], resend_until: float | None = None
+    ) -> httpx.Response:
         """``send()``, and again after a wait while it answers a load refusal the client's
-        retry policy retries (``max_retries``)."""
+        retry policy retries (``max_retries``). ``resend_until`` (Unix seconds) is when what
+        ``send`` sends stops being good, a client assertion's ``exp``: a wait that would reach
+        it is not made, and the refusal is handed back."""
         retries = 0
         while True:
             resp = send()
-            wait = self._retry.delay(resp, retries)
+            wait = self._retry.delay(resp, retries, _retry.left_until(resend_until))
             if wait is None:
                 return resp
             resp.close()
@@ -616,6 +631,7 @@ class AsyncClient:
                 self.server_url, self.dpop_key, body, subject_dpop_key, subject_token_dpop, nonce
             ),
             json=body,
+            resend_until=w.assertion_expiry(body),
         )
         return w.token_from_response(w.json_body(resp))
 
@@ -629,6 +645,8 @@ class AsyncClient:
         method: str,
         path: str,
         headers: Callable[[str | None], dict[str, str]],
+        *,
+        resend_until: float | None = None,
         **kwargs: Any,
     ) -> httpx.Response:
 
@@ -641,14 +659,16 @@ class AsyncClient:
                 self._nonce.update(resp)
             return resp
 
-        return await self._retrying(send)
+        return await self._retrying(send, resend_until)
 
-    async def _retrying(self, send: Callable[[], Awaitable[httpx.Response]]) -> httpx.Response:
+    async def _retrying(
+        self, send: Callable[[], Awaitable[httpx.Response]], resend_until: float | None = None
+    ) -> httpx.Response:
         """:meth:`Client._retrying`."""
         retries = 0
         while True:
             resp = await send()
-            wait = self._retry.delay(resp, retries)
+            wait = self._retry.delay(resp, retries, _retry.left_until(resend_until))
             if wait is None:
                 return resp
             await resp.aclose()

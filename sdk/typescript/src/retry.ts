@@ -23,6 +23,7 @@ const JITTER = 0.2;
 /** Indirections so tests can replace the clock and the randomness. Not part of the API. */
 export const retryHooks = {
   random: (): number => Math.random(),
+  now: (): number => Date.now(),
   sleep: (ms: number, signal?: AbortSignal): Promise<void> =>
     new Promise<void>((resolve, reject) => {
       if (signal?.aborted) {

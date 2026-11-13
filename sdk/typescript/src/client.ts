@@ -44,11 +44,13 @@ export interface ClientOptions extends HttpOptions {
    * (`RateLimitedError`). Each retry waits the answer's `Retry-After` (1 s when it has none), up
    * to 20 % longer so refused clients spread out; a `Retry-After` over `maxRetryDelayMs` is not
    * waited out and the error is thrown at once, so all retries of one call wait at most
-   * `maxRetries * maxRetryDelayMs`. Every retry is a new request with new DPoP proofs. Nothing
-   * else is retried: not a `request_timeout` (the server may have done the work), not a denial,
-   * not an `UnauthorizedError`, not a transport error. A streamed call is retried only before its
-   * stream starts, and not past its `deadlineMs`; its `signal` aborts the wait. When the retries
-   * run out, the last refusal is thrown.
+   * `maxRetries * maxRetryDelayMs`. Every retry is a new request with new DPoP proofs; an
+   * exchange sends its `clientAssertion` again (a refused load leaves it unused), but not once it
+   * has expired: a wait that would reach the assertion's `exp` is not made and the refusal is
+   * thrown at once. Nothing else is retried: not a `request_timeout` (the server may have done
+   * the work), not a denial, not an `UnauthorizedError`, not a transport error. A streamed call is
+   * retried only before its stream starts, and not past its `deadlineMs`; its `signal` aborts the
+   * wait. When the retries run out, the last refusal is thrown.
    */
   maxRetries?: number;
   /** The longest `Retry-After` a retry waits out, in milliseconds (default 10000, at most 300000). */
@@ -116,12 +118,15 @@ export interface CallWithApprovalOptions extends McpOptions, ApprovalWaitOptions
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
-/** How a streamed call bounds the retry of its request. */
-interface StreamRetry {
-  /** Milliseconds left of the call's deadline, undefined without one. */
+/**
+ * How a call bounds the retry of its request: a streamed call by its deadline, an exchange by
+ * its client assertion's `exp`.
+ */
+interface RetryBound {
+  /** Milliseconds left before the request may no longer be sent, undefined without a bound. */
   leftMs: () => number | undefined;
-  /** Called before a wait of `ms`, so the idle timer allows for it. */
-  waiting: (ms: number) => void;
+  /** Called before a wait of `ms`, so a streamed call's idle timer allows for it. */
+  waiting?: (ms: number) => void;
 }
 
 /**
@@ -183,7 +188,7 @@ export class AttenuoClient {
     json?: unknown,
     method = "POST",
     signal?: AbortSignal,
-    stream?: StreamRetry,
+    stream?: RetryBound,
   ): Promise<Response> {
     const send = (h: Record<string, string>) =>
       this.http.request(method, path, { headers: h, json, ...(signal ? { signal } : {}) });
@@ -208,14 +213,14 @@ export class AttenuoClient {
   private async retrying(
     send: () => Promise<Response>,
     signal?: AbortSignal,
-    stream?: StreamRetry,
+    stream?: RetryBound,
   ): Promise<Response> {
     for (let retries = 0; ; retries++) {
       const res = await send();
       const wait = await this.retry.delayMs(res, retries, stream?.leftMs());
       if (wait === undefined) return res;
       await res.body?.cancel();
-      stream?.waiting(wait);
+      stream?.waiting?.(wait);
       await retryHooks.sleep(wait, signal);
     }
   }
@@ -266,7 +271,13 @@ export class AttenuoClient {
       if (given !== undefined) body.subject_token_dpop = given;
       return header === undefined ? {} : { dpop: header };
     };
-    return w.tokenFromResponse(await w.jsonBody(await this.post("/token", headers, body)));
+    // A load refusal leaves the assertion unspent, so the retry sends it again, but not once it
+    // has expired: the server would refuse it, so the refusal is thrown instead.
+    const exp = w.assertionExpiry(body);
+    const bound: RetryBound | undefined =
+      exp === undefined ? undefined : { leftMs: () => exp * 1000 - retryHooks.now() };
+    const res = await this.post("/token", headers, body, "POST", undefined, bound);
+    return w.tokenFromResponse(await w.jsonBody(res));
   }
 
   /** Extend the lease of the token's last hop (`POST /token/renew`). */

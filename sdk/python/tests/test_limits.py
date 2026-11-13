@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 from collections.abc import Callable
 from typing import Any
@@ -424,6 +425,131 @@ async def test_rest_routes_are_retried_too(make: Any, sleeps: list[float]) -> No
     assert tok.lease == "lease-1"
     assert sleeps == [1.0, 2.0]
     assert [r.url.path for r in rec.requests] == ["/token"] * 3
+
+
+@pytest.fixture
+def clock(monkeypatch: pytest.MonkeyPatch, sleeps: list[float]) -> list[float]:
+    """A wall clock at 1,000,000 that the client's retry waits move forward; ``sleeps`` still
+    records each wait. Returns a one-item list holding the time."""
+    now = [1_000_000.0]
+
+    def sleep(s: float) -> None:
+        sleeps.append(s)
+        now[0] += s
+
+    async def asleep(s: float) -> None:
+        sleep(s)
+
+    monkeypatch.setattr(_retry, "_sleep", sleep)
+    monkeypatch.setattr(_retry, "_asleep", asleep)
+    monkeypatch.setattr(_retry, "_now", lambda: now[0])
+    return now
+
+
+def assertions_sent(rec: Any) -> list[str]:
+    return [json.loads(r.content)["client_assertion"] for r in rec.requests]
+
+
+async def test_an_exchange_resends_its_unexpired_client_assertion(
+    make: Any,  # noqa: F811
+    sleeps: list[float],
+    clock: list[float],
+) -> None:
+    """A load refusal leaves the assertion unused (the server checks the limits first), so
+    the retry sends the same one while it has not expired."""
+    child = Signer().mint(("planner", "coder"))
+    client, rec = make(
+        sequence(
+            rest_rate_limited("20"),
+            rest_overloaded("1"),
+            httpx.Response(200, json=token_response(child, "lease-1")),
+        ),
+        max_retries=3,
+        max_retry_delay=60,
+    )
+    assertion = DpopKey.generate().client_assertion("coder", "https://a", iat=1_000_000)
+    tok = await call(
+        client, "exchange", Signer().mint(), "coder", "github:read_file", client_assertion=assertion
+    )
+    assert tok.lease == "lease-1"
+    assert sleeps == [20.0, 1.0]
+    assert assertions_sent(rec) == [assertion] * 3
+
+
+async def test_an_exchange_does_not_resend_a_client_assertion_that_would_expire(
+    make: Any,  # noqa: F811
+    sleeps: list[float],
+    clock: list[float],
+) -> None:
+    """The server would refuse an expired assertion (``client_assertion_expired``), so a wait
+    that reaches its ``exp`` is not made: the refusal is raised for the caller to mint a new
+    assertion. Here the first wait (30 s) fits the 60 s assertion, the second (30 s more,
+    reaching ``exp`` exactly) does not."""
+    client, rec = make(lambda r: rest_rate_limited("30"), max_retries=5, max_retry_delay=60)
+    assertion = DpopKey.generate().client_assertion("coder", "https://a", iat=1_000_000)
+    with pytest.raises(RateLimited) as e:
+        await call(
+            client,
+            "exchange",
+            Signer().mint(),
+            "coder",
+            "github:read_file",
+            client_assertion=assertion,
+        )
+    assert e.value.retry_after == 30
+    assert sleeps == [30.0]
+    assert assertions_sent(rec) == [assertion] * 2
+
+    # An assertion already past its `exp` by the client's clock is not sent again at all.
+    rec.requests.clear()
+    sleeps.clear()
+    old = DpopKey.generate().client_assertion("coder", "https://a", iat=900_000)
+    with pytest.raises(RateLimited):
+        await call(
+            client, "exchange", Signer().mint(), "coder", "github:read_file", client_assertion=old
+        )
+    assert sleeps == []
+    assert len(rec.requests) == 1
+
+
+async def test_an_exchange_without_a_readable_assertion_exp_retries_as_before(
+    make: Any,  # noqa: F811
+    sleeps: list[float],
+    clock: list[float],
+) -> None:
+    """Without an ``exp`` the client can read, the server is left to judge the assertion; a
+    secret is retried as before."""
+    child = Signer().mint(("planner", "coder"))
+    for auth in ({"client_assertion": "a.b.c"}, {"client_secret": "s"}):
+        ok = httpx.Response(200, json=token_response(child, "lease-1"))
+        client, _ = make(sequence(rest_rate_limited("50"), ok), max_retries=1, max_retry_delay=60)
+        await call(client, "exchange", Signer().mint(), "coder", "github:read_file", **auth)
+    assert sleeps == [50.0, 50.0]
+
+
+@pytest.mark.parametrize(
+    "claims,exp",
+    [
+        ({"exp": 1_000_060}, 1_000_060),
+        ({"exp": 1_000_060.9}, 1_000_060),
+        ({"exp": True}, None),
+        ({"exp": "1000060"}, None),
+        ({"exp": float("inf")}, None),
+        ({}, None),
+        ([1], None),
+    ],
+)
+def test_assertion_expiry_reads_exp_without_verifying(claims: Any, exp: int | None) -> None:
+    from attenuo import _wire
+
+    def b64(v: Any) -> str:
+        return base64.urlsafe_b64encode(json.dumps(v).encode()).decode().rstrip("=")
+
+    jwt = f"{b64({'alg': 'EdDSA'})}.{b64(claims)}.sig"
+    assert _wire.assertion_expiry({"client_assertion": jwt}) == exp
+    assert _wire.assertion_expiry({"client_assertion": "a.!.c"}) is None
+    assert _wire.assertion_expiry({"client_assertion": "a.b"}) is None
+    assert _wire.assertion_expiry({"client_secret": "s"}) is None
 
 
 @pytest.mark.parametrize(
