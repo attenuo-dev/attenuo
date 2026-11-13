@@ -33,7 +33,7 @@ Go through this before pointing anything real at the server.
 - [ ] `[issuer] issuer` is the URL clients will use, for example `https://attenuo.example.com`. It becomes the `iss` of every token, and changing it later invalidates tokens. `[server] public_url` is set to the same base URL so the AuthZEN discovery document points at the right host. Off a loopback `listen` address the server refuses to start without it.
 - [ ] `[policy] policies_path` points at your policy, and the catalog lists every tool a policy names.
 - [ ] Every tool on the upstream that agents should call is in the catalog. With the default `[policy] unknown_tools = "deny"`, a tool missing from the catalog is denied with `tool_not_in_catalog`; with `"allow"` it is neither `readonly` nor `sensitive`, so rules that depend on those attributes do not see it.
-- [ ] The config file is mode 0600. It holds secret hashes and possibly the admin token. The admin token can come from `ATTENUO_ADMIN_TOKEN` instead, and `[telemetry]` reads the standard `OTEL_*` variables ([observability](observability.md)); there is no other environment-variable substitution, so inject the file at deploy time.
+- [ ] The config file is mode 0600. It holds secret hashes and possibly the admin token. The admin token can come from `ATTENUO_ADMIN_TOKEN` instead, `[telemetry]` reads the standard `OTEL_*` variables ([observability](observability.md)), and any scalar key can be set with an `ATTENUO__<SECTION>__<KEY>` variable ([environment overrides](../reference/config.md#environment-overrides)). The file is still read, and lists and arrays of tables (`[[agents]]`, `[[upstreams]]`, ...) come only from it. Nothing is substituted inside the file.
 - [ ] You have read the [threat model](../spec/threat-model.md) section "What attenuo does not prevent" and have decided how the agents' other routes (direct API keys, local STDIO servers) are closed.
 - [ ] `[limits]` fits your load: `max_in_flight` above your peak of concurrent requests, and the rate limits (off by default) set for your busiest legitimate run and agent if you want one caller kept from crowding out the rest. See [Load limits](#load-limits).
 - [ ] Something checks `attenuo audit verify` on a schedule, and `[audit.sink]` ships checkpoints off the host ([audit log](../concepts/audit-log.md#shipping-checkpoints-off-the-host)). The server signs checkpoints itself (`[audit] checkpoint_every`, `checkpoint_interval_seconds`); `audit verify` reports the last signed `seq`.
@@ -310,6 +310,20 @@ services:
 volumes:
   attenuo-data:
 ```
+
+Keys that differ between deployments of the same file can come from the environment instead, as `ATTENUO__<SECTION>__<KEY>` ([environment overrides](../reference/config.md#environment-overrides)). The container-specific addresses are the usual ones:
+
+```yaml
+services:
+  attenuo:
+    environment:
+      ATTENUO__SERVER__LISTEN: "0.0.0.0:8080"        # inside the container only
+      ATTENUO__ADMIN__LISTEN: "0.0.0.0:9102"         # not published
+      ATTENUO__SERVER__PUBLIC_URL: "https://attenuo.example.com"
+      ATTENUO_ADMIN_TOKEN: ${ATTENUO_ADMIN_TOKEN:?set ATTENUO_ADMIN_TOKEN}
+```
+
+The server applies them before its startup checks, logs the names of the keys they set (never the values), and refuses to start on a variable it cannot apply: a misspelt name, a value of the wrong type, an empty value, a list or `[[...]]` entry, or any `[dev]` key. The same file can then run on a workstation with its loopback defaults. A plain `docker run` takes them as `-e ATTENUO__SERVER__LISTEN=0.0.0.0:8080`.
 
 Matching settings in `attenuo.toml`: `policies_path = "/etc/attenuo/policy.cedar"`, `private_key_pem_path = "/etc/attenuo/issuer.pem"`, `sqlite_path = "/var/lib/attenuo/attenuo.sqlite"`, `listen = "0.0.0.0:8080"` (inside the container only; the published port stays on loopback), `public_url` set to the URL clients use, which a non-loopback `listen` requires, and `[admin] listen` on a port of its own (the server refuses to start with the admin API on a non-loopback main listener otherwise). The demo's `examples/github-leak-demo/config.docker.toml` binds `[admin] listen = "0.0.0.0:9102"` and does not publish it. This production layout itself (volume, key file, restart policy) has not been run; the demo's compose file, which shares the image, ports, health check and hardening options, is what `scripts/compose-smoke.sh` tests.
 

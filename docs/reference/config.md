@@ -1,6 +1,6 @@
 # Configuration keys
 
-The server reads one TOML file: `attenuo-server --config <file>` or `ATTENUO_CONFIG=<file>`. Unknown keys are rejected at start-up. Relative paths resolve against the working directory.
+The server reads one TOML file: `attenuo-server --config <file>` or `ATTENUO_CONFIG=<file>`. Unknown keys are rejected at start-up. Relative paths resolve against the working directory. `ATTENUO__<SECTION>__<KEY>` environment variables override single keys of the file; see [Environment overrides](#environment-overrides).
 
 The annotated source of truth is [config/example.toml](https://github.com/attenuo-dev/attenuo/blob/main/config/example.toml). Never use its example agent secrets for anything real; it ships no admin token. [Deploying](../guides/deploying.md) covers what to change before you expose a server.
 
@@ -211,7 +211,7 @@ The admin API (`/admin/*`: revoke, reload, approve, export, the dev root mint) a
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `token` | unset | Static bearer for `/admin/*`. `ATTENUO_ADMIN_TOKEN`, when set, replaces it. With no token configured, admin routes answer 403 `admin_disabled`. When `[server] listen`, `[admin] listen` or an enabled `[admin_ui] listen` is not a loopback address, the server refuses to start if the token is missing, shorter than 32 bytes or a published placeholder (`change-me`, `admin`, ...); on loopback it only warns. Generate one with `openssl rand -hex 32`. Do not expose `/admin` publicly. |
+| `token` | unset | Static bearer for `/admin/*`. `ATTENUO_ADMIN_TOKEN`, when set, replaces it (setting it together with `ATTENUO__ADMIN__TOKEN` refuses to start). With no token configured, admin routes answer 403 `admin_disabled`. When `[server] listen`, `[admin] listen` or an enabled `[admin_ui] listen` is not a loopback address, the server refuses to start if the token is missing, shorter than 32 bytes or a published placeholder (`change-me`, `admin`, ...); on loopback it only warns. Generate one with `openssl rand -hex 32`. Do not expose `/admin` publicly. |
 | `listen` | unset | Serve the admin API on a listener of its own at this address (suggested `127.0.0.1:9102`), behind the same `token`, and not on `[server] listen`. The main listener then answers `/admin/*` exactly as it answers any unknown path (404, empty body). `/healthz`, `/readyz`, discovery and everything agents call stay on the main listener; the admin listener serves `/admin/*` only. It is drained and stopped with the main listener on shutdown. Off loopback the server logs a warning: keep it on a network only operators reach. Point the CLI's `--server` (or `ATTENUO_SERVER`) and the SDKs' `AdminClient` at it for admin commands. `[dev] allow_root_mint` is then judged by this address, not by `[server] listen`. Must differ from `[server] listen`. |
 | `serve_on_main_listener` | `false` | Keep the admin API on `[server] listen` although that address is not loopback. Without it (and without `listen`) the server refuses to start off loopback. Set it only when something in front of the server keeps `/admin/` away from agents and the internet (a reverse proxy that does not forward `/admin/`, or a container that binds `0.0.0.0` behind a loopback-only published port); the server logs a warning. Cannot be combined with `listen`. No effect on loopback, where the admin API is on the main listener anyway. |
 
@@ -307,6 +307,8 @@ Basic protection of one server process against too much work at once: a cap on r
 
 ## `[dev]`
 
+These keys cannot be set from the environment: `ATTENUO__DEV__...` refuses to start ([Environment overrides](#environment-overrides)).
+
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `allow_root_mint` | `false` | Mounts `POST /admin/root-token`, which mints root tokens for a user nobody verified. Development only. The server logs a warning when it is on, and refuses to start with it when the admin API's listener (`[admin] listen` when set, else `[server] listen`) is not a loopback address. |
@@ -329,7 +331,7 @@ The log the server writes to standard output ([deploying guide](../guides/deploy
 | `format` | `"text"` | `"text"`: human-readable lines. `"json"`: one JSON object per line with `timestamp`, `level`, `target`, `message` and the event's own fields at the top level, plus `span` (the innermost span, with its fields) and `spans` (every span the event is in, outermost first), the context the text format prints before the message. Any other value refuses to start. |
 | `redact_subjects` | `false` | Write user subjects into log lines as `hmac:` and 16 hex digits instead of in clear: the same keyed digest (HMAC-SHA256, key derived from the issuer's private key) that trace export puts in `attenuo.subject_digest`, so a log line and a trace of one user can be matched. It covers every log line that names a user: the decision and rejection lines, token issuance (dev root mint, IdP intake, exchange), approval decisions (the approver), and the proxy's `mcp_request` span and stream lines. The audit log is not affected and keeps the subject; find the user behind a digest there. The digest changes when the issuer key does. |
 
-**Environment.** `ATTENUO_LOG_FORMAT=text|json` overrides `format`, so one config file can log text on a workstation and JSON in a cluster. Empty counts as unset; any other value refuses to start with `ATTENUO_LOG_FORMAT: unknown log format "...": expected "text" or "json"`.
+**Environment.** `ATTENUO_LOG_FORMAT=text|json` overrides `format`, so one config file can log text on a workstation and JSON in a cluster (setting it together with `ATTENUO__LOGGING__FORMAT` refuses to start). Empty counts as unset; any other value refuses to start with `ATTENUO_LOG_FORMAT: unknown log format "...": expected "text" or "json"`.
 
 **Colour.** ANSI colour codes are written only in the `text` format, only when standard output is a terminal, and never when `NO_COLOR` is set to a non-empty value. Redirected to a file or a pipe, or under Docker or systemd without a TTY, the output has none.
 
@@ -379,3 +381,31 @@ The admin console, on its own opt-in listener so it never shares an origin with 
 | `listen` | `127.0.0.1:9101` | Address of the console listener. Keep it on loopback and reach it over an SSH tunnel. |
 | `allow_public` | `false` | Without it, the server refuses to start when `enabled` and `listen` is not a loopback address. With it, the server starts and logs a warning, and `[admin] token` must then pass the strength check that a public `[server] listen` needs. |
 | `allow_write` | `false` | Also mount `POST /admin/leases/{id}/revoke`, `POST /admin/policies/reload`, `POST /admin/approvals/{id}` and `POST /admin/budgets/refund` on the console listener; they require `Content-Type: application/json` there (415 otherwise). Without it those paths are 404 on this listener, so the console is read-only by the server's rule. `POST /admin/leases/revoke` (revoke by user or chain) is mounted in full with it; without it only its `?preview=true` dry run is served, and a revocation is 404. The read routes, always mounted, are `GET /admin/audit`, `/admin/audit/entries/{seq}`, `/admin/audit/records/{id}`, `/admin/audit/checkpoints`, `/admin/audit/verify`, `/admin/audit/checkpoint` (which signs a checkpoint of the head when it has none) and `/admin/audit/export`; `GET /admin/leases/{id}` and `/admin/leases/{id}/tree`; `GET /admin/policies` and `/admin/policies/check`; `GET /admin/approvals` and `/admin/approvals/{id}`; and the `POST /admin/policies/evaluate` dry run (JSON `Content-Type` required). The admin API's own listener (`[admin] listen`, or the main listener without it) keeps every admin route either way; the console listener serves its routes itself, so the console works whether or not `[admin] listen` is set. See [the admin console guide](../guides/admin-console.md). |
+
+## Environment overrides
+
+Any scalar key of the file can be set from the environment, so one image and one config file serve several deployments, and a container can change a listen address or a path without a file of its own. The variable is `ATTENUO__`, the section, `__`, the key, with nested sections as more `__` segments:
+
+| Variable | Sets |
+| --- | --- |
+| `ATTENUO__SERVER__LISTEN=0.0.0.0:8080` | `[server] listen` |
+| `ATTENUO__SERVER__PUBLIC_URL=https://attenuo.example.com` | `[server] public_url` |
+| `ATTENUO__ADMIN__LISTEN=0.0.0.0:9102` | `[admin] listen` |
+| `ATTENUO__AUDIT__SQLITE_PATH=/var/lib/attenuo/attenuo.sqlite` | `[audit] sqlite_path` |
+| `ATTENUO__METRICS__ENABLED=true` | `[metrics] enabled` |
+| `ATTENUO__LIMITS__MCP_REQUESTS_PER_MINUTE=600` | `[limits] mcp_requests_per_minute` |
+| `ATTENUO__TELEMETRY__TRACES__SAMPLE_RATIO=0.1` | `[telemetry.traces] sample_ratio` |
+| `ATTENUO__AUDIT__SINK__MAX_LAG_SECONDS=60` | `[audit.sink] max_lag_seconds`, when the file has `[audit.sink]` |
+
+The rules:
+
+- **Two underscores.** The prefix is `ATTENUO__` and the separator is `__`. The variables with one underscore that the server, the CLI and the SDKs read (`ATTENUO_CONFIG`, `ATTENUO_ADMIN_TOKEN`, `ATTENUO_LOG_FORMAT`, `ATTENUO_SERVER`, `ATTENUO_TOKEN`, `ATTENUO_CLIENT_SECRET`, ...) are never read as overrides, and an override is never read by them. Section and key names are matched without regard to case (`ATTENUO__SERVER__LISTEN` and `attenuo__server__listen` are the same key; two variables for one key refuse to start).
+- **When.** The overrides are applied after the file is read and before any startup check, so every check and range applies to the final value exactly as if it had been written in the file. The file must still exist (an empty file is a valid config of defaults), and it must parse on its own: an override does not repair a broken file.
+- **Types.** The value is read as the type of the key it replaces: `true` or `false` (lower case) for a bool, a decimal integer for an integer, a number for a float, the text as it is for a string. Addresses, paths, URLs and choices such as `[token] dpop` are strings. The text is never parsed as TOML, so quotes are part of the value. An optional key that the file leaves unset (`public_url`, `[admin] listen`, `[admin] token`) takes the type the key takes.
+- **Scalars only.** Lists (`allowed_algs`, `previous_key_paths`), tables of names (`[policy.catalog]`, `[policy] user_attributes`, `[telemetry] resource_attributes`, `[approvals.notify] headers`) and arrays of tables (`[[upstreams]]`, `[[agents]]`, `[[idps]]`, `[[root_grants]]`, `[[peps]]`, `[[actor_trust]]`) cannot be set; a variable that names one refuses to start. There is no encoding of a list in one variable that would not be ambiguous for some value, and entries of an array of tables have no stable name. An optional section that the file does not have (`[audit.sink]`, `[approvals.notify]`) is not created: put it in the file, and override its keys.
+- **Strict.** A variable that starts with `ATTENUO__` and cannot be applied stops the server: it names no key, its value is empty or does not parse as the key's type, another variable sets the same key, or the key is one of the refused kinds above. Every such variable is listed in one error, by name; the value is never printed, since it may be a secret. A typo in the name of a security setting is an error, never a silently ignored variable.
+- **`[dev]` is refused.** `ATTENUO__DEV__ALLOW_ROOT_MINT` and every other `[dev]` key refuse to start, whatever the value. The unverified root mint is switched on in the file, where a review sees it, and never by a variable that can come in from a shared environment file, an orchestrator default or a CI job.
+- **The older variables.** `ATTENUO_ADMIN_TOKEN` keeps replacing `[admin] token` and `ATTENUO_LOG_FORMAT` keeps overriding `[logging] format`, as before. Setting one of them together with the matching override (`ATTENUO__ADMIN__TOKEN`, `ATTENUO__LOGGING__FORMAT`) refuses to start, so two sources never disagree silently. The `*_env` keys (`[approvals.notify] secret_env`, `headers`), `ATTENUO_AUDIT_SINK_TOKEN`, the `AWS_*` fallbacks of an S3 sink and the `OTEL_*` variables of `[telemetry]` work as they did; they are applied after the overrides, to the values the overrides produced.
+- **Logged by name.** At startup the server logs, at `info`, `config keys overridden from the environment` with the keys and variables (`[server] listen (ATTENUO__SERVER__LISTEN), ...`), never their values.
+
+`attenuo policy lint --config` reads the file only: it runs in the operator's shell, whose environment is not the server's.
