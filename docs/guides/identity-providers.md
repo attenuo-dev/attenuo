@@ -100,7 +100,7 @@ Notes:
 - Secrets are static. There is no `private_key_jwt` and no mTLS in v0. Rotating one means editing the config and restarting.
 - If an `actor` is sent on an intake request it must equal the authenticated agent.
 - The same `[[agents]]` entries authenticate sub-agents: a token exchange must authenticate as its `actor`. Give every agent that receives delegated tokens an entry, or a workload identity under [`[[actor_trust]]`](#workload-identity-for-sub-agents).
-- Each ID token or ID-JAG mints one root token. A second presentation, by any agent, is `invalid_grant` / `replayed` (keyed by `iss` and `jti`, or by the whole token when it has no `jti`). The root token expires no later than the credential, and a credential accepted only thanks to `clock_skew_seconds` is refused with `credential_expired`. The record of used credentials is in memory, so it is per server process.
+- Each ID token or ID-JAG mints one root token. A second presentation, by any agent, is `invalid_grant` / `replayed` (keyed by `iss` and `jti`, or by the whole token when it has no `jti`). The root token expires no later than the credential, and a credential accepted only thanks to `clock_skew_seconds` is refused with `credential_expired`. The record of used credentials is kept in the server's database (`[audit] sqlite_path`), so it survives a restart; it is not shared with a server on another database file.
 
 ## `[[root_grants]]`
 
@@ -133,7 +133,7 @@ capabilities = [
 
 ID tokens are bearer credentials, bound to the agent that presents them only through `aud`/`azp` (SR-37): a token issued for agent A is refused from agent B with `credential_audience_mismatch`. `nonce` is not checked, because it binds a token to the browser session that requested it and the agent presenting the token here is not that session; the bearer risk remains until sender-constrained tokens exist.
 
-Root tokens last `requested_ttl_seconds`, or `[issuer] default_ttl_seconds` (900 by default), capped at the ID token's remaining lifetime: a root token never outlives the credential it came from. Each credential mints one root token (`replayed` on a second presentation, see [`[[agents]]`](#agents)); the record of used credentials is in memory, per server process. Prefer short-lived ID tokens.
+Root tokens last `requested_ttl_seconds`, or `[issuer] default_ttl_seconds` (900 by default), capped at the ID token's remaining lifetime: a root token never outlives the credential it came from. Each credential mints one root token (`replayed` on a second presentation, see [`[[agents]]`](#agents)); the record of used credentials is in the server's database and survives a restart. Prefer short-lived ID tokens.
 
 ## Provider recipes
 

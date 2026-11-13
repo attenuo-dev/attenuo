@@ -34,6 +34,7 @@ pub mod lease;
 pub mod log;
 pub mod memory;
 pub mod query;
+pub mod replay;
 pub mod shipped;
 pub mod spans;
 pub mod sqlite;
@@ -65,6 +66,7 @@ pub use log::{
 };
 pub use memory::MemoryAudit;
 pub use query::{EntryFilter, Order};
+pub use replay::{ReplayOutcome, ReplayStore, REPLAY_PRUNE_BATCH};
 pub use shipped::{
     checkpoint_sha256, cross_check, parse_shipped, CrossCheckReport, ShippedCheckpoint,
     ShippedLine, ShippedMismatch, SHIPPED_FORMAT,

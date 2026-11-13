@@ -315,7 +315,7 @@ async fn verify_user(
 /// `decline`; 401 `unauthorized` when no bearer token is sent, and 401 `invalid_token` when the ID
 /// token does not verify; 403 `agent_token_refused` for a delegation token and 403 `wrong_user` for
 /// another user's ID token; 400 `invalid_grant` (`replayed`) for an ID token already used, and 503
-/// when the replay cache is full; 404 `not_found` for an unknown approval; 409
+/// when its use cannot be recorded (`replay_cache_full`, `replay_store_unavailable`); 404 `not_found` for an unknown approval; 409
 /// `approval_not_pending`, `approval_expired` or `lease_revoked` when it cannot be decided; 500
 /// `server_error` when the store fails or the decision cannot be audited (the decision is then
 /// dropped).

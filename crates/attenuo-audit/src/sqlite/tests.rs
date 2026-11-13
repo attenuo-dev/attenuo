@@ -864,9 +864,12 @@ fn the_record_id_index_is_added_to_an_existing_log_without_touching_rows() {
             log.append(record(i)).unwrap();
         }
         // Make the file look like one written before the index existed (and so before
-        // schema versions).
+        // schema versions, and before the replay table of version 3).
         log.with_connection(|c| {
-            Ok(c.execute_batch("DROP INDEX audit_record_id_idx; PRAGMA user_version = 0;")?)
+            Ok(c.execute_batch(
+                "DROP INDEX audit_record_id_idx; DROP TABLE used_credentials; \
+                 PRAGMA user_version = 0;",
+            )?)
         })
         .unwrap();
         assert!(!index_exists(&log));
@@ -881,7 +884,7 @@ fn the_record_id_index_is_added_to_an_existing_log_without_touching_rows() {
     // A row whose JSON was damaged while the index did not exist.
     log.with_connection(|c| {
         c.execute_batch(
-            "DROP INDEX audit_record_id_idx; \
+            "DROP INDEX audit_record_id_idx; DROP TABLE used_credentials; \
              UPDATE audit SET record_json = '{not json' WHERE seq = 2; \
              PRAGMA user_version = 0;",
         )?;

@@ -48,7 +48,7 @@ Chosen: (a), as a manual, admin-only operation in phase 1 (`POST /admin/audit/pr
 - Bad, because a prune by a legitimate admin destroys the entries on the host. If the archive is lost, the record of what was in it is gone; the anchor and shipped checkpoints prove only that a prefix of a stated length and hash existed.
 - Bad, because `DELETE` does not shrink a SQLite file: freed pages are reused for new rows, so the file stops growing once pruning keeps pace, but it does not get smaller without `VACUUM`, which rewrites the whole file while holding the write lock. Shrinking is deferred.
 - Bad, because answers that read old records change: a refund of a decision whose record was pruned can no longer be told apart from an unknown decision (today's 410 `charge_pruned` versus 404), and `GET /admin/audit/entries/{seq}` for a pruned seq answers 410 `audit_pruned` instead of the entry. The age guard (below) makes this happen only after run state is gone anyway.
-- Neutral, because the schema goes to version 3 (one new table, `audit_anchors`), so a binary from before this change refuses the file, as for every migration; that also keeps an old binary from reporting a pruned log as broken.
+- Neutral, because the schema goes to version 4 (one new table, `audit_anchors`), so a binary from before this change refuses the file, as for every migration; that also keeps an old binary from reporting a pruned log as broken.
 - Neutral, because statements that the audit log is never pruned (threat model, configuration reference, concepts page) stay true while `prune = "off"` and must say "unless pruned" once this is built.
 
 ### Confirmation

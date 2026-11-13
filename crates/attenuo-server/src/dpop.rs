@@ -63,6 +63,15 @@
 //! holds `[token] dpop_replay_capacity` live entries, new proofs are refused with 503
 //! `temporarily_unavailable` (`dpop_replay_cache_full`): fail closed, as the credential replay
 //! cache does (`crate::replay`).
+//!
+//! Unlike the credential markers, proof `jti`s are not written to the database. A proof is
+//! checked on every proxied call with a bound token, so persisting them would put a write,
+//! through the file's write gate and behind the audit appends, on the per-call path; and a
+//! proof is accepted for only `dpop_max_age_seconds` (300 by default) after its `iat`. So a
+//! restart forgets the proofs of that window: one captured together with its access token can
+//! be replayed once more, for the same method, URL and token, until its `iat` is too old.
+//! Server nonces do not close this, because they are derived from the issuer key and the time
+//! and so stay valid across a restart; a shorter `dpop_max_age_seconds` narrows it.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Mutex;
