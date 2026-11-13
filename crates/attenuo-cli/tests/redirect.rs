@@ -1,8 +1,7 @@
-//! What the CLI does when the server URL answers a `307` to another origin (SR-112, security
-//! review pass 13). Today it follows the redirect, as `reqwest` does by default: the request
-//! body, client secret included, is sent again to the other origin; only `Authorization` is
-//! dropped. The finding is open; this test pins today's behaviour and changes with the
-//! maintainer's choice (the proposal is not to follow redirects, as the Python SDK does not).
+//! The CLI follows no redirect (SR-112, security review pass 13). It used to follow a `307`
+//! from the server URL, as `reqwest` does by default, and send the request body again to the
+//! other origin, client secret and subject token included. Now the other origin gets no
+//! request and the CLI exits non-zero with an error naming the status and the `Location`.
 
 mod common;
 
@@ -78,10 +77,26 @@ fn redirector(location: String) -> String {
     url
 }
 
+/// The CLI's standard error, after checking that it failed and that the other origin got no
+/// request.
+fn refused(out: &std::process::Output, seen: &mpsc::Receiver<String>, location: &str) -> String {
+    let err = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(!out.status.success(), "{err}");
+    assert!(
+        seen.recv_timeout(Duration::from_millis(500)).is_err(),
+        "the other origin got a request"
+    );
+    assert!(err.contains("307 Temporary Redirect"), "{err}");
+    assert!(err.contains(&format!("Location {location}")), "{err}");
+    assert!(err.contains("does not follow redirects"), "{err}");
+    err
+}
+
 #[test]
-fn a_307_sends_the_client_secret_to_the_other_origin_sr112() {
+fn a_307_does_not_send_the_client_secret_to_the_other_origin_sr112() {
     let (other, seen) = collector();
-    let front = redirector(format!("{other}/collect"));
+    let location = format!("{other}/collect");
+    let front = redirector(location.clone());
     let dir = tempfile::tempdir().unwrap();
     let secret = dir.path().join("secret");
     std::fs::write(&secret, "sr112-client-secret\n").unwrap();
@@ -93,33 +108,38 @@ fn a_307_sends_the_client_secret_to_the_other_origin_sr112() {
         .env("ATTENUO_TOKEN", "a.b.c")
         .output()
         .unwrap();
-    assert!(!out.status.success());
-    let req = seen
-        .recv_timeout(Duration::from_secs(10))
-        .expect("the redirect was followed");
-    assert!(req.starts_with("POST /collect "), "{req}");
-    // Today: the body crosses to the other origin, client secret and subject token included.
-    assert!(req.contains("sr112-client-secret"), "{req}");
-    assert!(req.contains(r#""subject_token":"a.b.c""#), "{req}");
+    let err = refused(&out, &seen, &location);
+    assert!(err.contains("--server must be the final URL"), "{err}");
+    assert!(!err.contains("sr112-client-secret"), "{err}");
 }
 
 #[test]
-fn a_307_drops_the_admin_token_but_sends_the_body_sr112() {
+fn a_307_on_an_admin_request_is_refused_sr112() {
     let (other, seen) = collector();
-    let front = redirector(format!("{other}/collect"));
+    let location = format!("{other}/collect");
+    let front = redirector(location.clone());
     let out = attenuo()
-        .args(["--server", &front, "lease", "revoke"])
+        .args(["--admin-server", &front, "lease", "revoke"])
         .args(["--chain-id", "00000000-0000-4000-8000-000000000000"])
         .env("ATTENUO_ADMIN_TOKEN", "sr112-admin-token-0123456789abcdef")
         .output()
         .unwrap();
-    assert!(!out.status.success());
-    let req = seen
-        .recv_timeout(Duration::from_secs(10))
-        .expect("the redirect was followed");
-    assert!(!req.contains("sr112-admin-token"), "{req}");
+    let err = refused(&out, &seen, &location);
     assert!(
-        req.contains(r#""chain_id":"00000000-0000-4000-8000-000000000000""#),
-        "{req}"
+        err.contains("--admin-server must be the final URL"),
+        "{err}"
     );
+}
+
+#[test]
+fn health_reports_a_redirect_and_exits_1_sr112() {
+    let (other, seen) = collector();
+    let location = format!("{other}/healthz");
+    let front = redirector(location.clone());
+    let out = attenuo()
+        .args(["--server", &front, "health"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    refused(&out, &seen, &location);
 }

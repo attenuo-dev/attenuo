@@ -95,9 +95,7 @@ impl Client {
             None => base.clone(),
         };
         Ok(Self {
-            http: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .build()?,
+            http: http_client()?,
             base,
             admin_base,
             admin_base_given,
@@ -135,6 +133,7 @@ impl Client {
                 .execute(req)
                 .await
                 .with_context(|| format!("could not reach the server at {base}"))?;
+            refuse_redirect(&resp, self.flag_for(resp.url().path()))?;
             let status = resp.status();
             let headers = resp.headers().clone();
             let text = resp.text().await?;
@@ -169,6 +168,15 @@ impl Client {
             &self.admin_base
         } else {
             &self.base
+        }
+    }
+
+    /// The flag that sets the base URL serving `path`, for [`refuse_redirect`]'s message.
+    fn flag_for(&self, path: &str) -> &'static str {
+        if is_admin_path(path) && self.admin_base_given {
+            "--admin-server"
+        } else {
+            "--server"
         }
     }
 
@@ -213,6 +221,7 @@ impl Client {
             .send()
             .await
             .with_context(|| format!("could not reach the server at {}", self.base_for(path)))?;
+        refuse_redirect(&resp, self.flag_for(path))?;
         let status = resp.status();
         Ok((status, resp.text().await?))
     }
@@ -236,6 +245,7 @@ impl Client {
             .send()
             .await
             .with_context(|| format!("could not reach the server at {}", self.base_for(path)))?;
+        refuse_redirect(&resp, self.flag_for(path))?;
         let status = resp.status();
         if status.is_success() {
             return Ok(resp);
@@ -451,6 +461,37 @@ pub(crate) fn stable_code(body: &Value) -> Option<&str> {
 
 /// A server error as `{"error": error, "code": code, "detail": text}`, or the raw body when it
 /// is not that.
+/// The HTTP client of every CLI request: a 30 s timeout and no redirects followed (SR-112).
+/// A followed `307` or `308` sends the body again to wherever `Location` names, client
+/// secret, client assertion and subject token included; [`refuse_redirect`] reports it
+/// instead.
+pub(crate) fn http_client() -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?)
+}
+
+/// An error for a 3xx answer, naming its status and `Location` (SR-112): the client follows
+/// no redirect, so `flag` (`--server`, `--admin-server`, or the URL given) must be the URL
+/// that answers without one.
+pub(crate) fn refuse_redirect(resp: &reqwest::Response, flag: &str) -> Result<()> {
+    let status = resp.status();
+    if !status.is_redirection() {
+        return Ok(());
+    }
+    let location = resp
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .map_or_else(|| "no Location".to_owned(), |l| format!("Location {l}"));
+    Err(anyhow!(
+        "{} answered {status} ({location}); attenuo does not follow redirects, so {flag} \
+         must be the final URL, the one that answers without a redirect",
+        resp.url()
+    ))
+}
+
 pub(crate) fn api_error(status: StatusCode, body: &str) -> anyhow::Error {
     let mut detail = None;
     let (code, message) = match serde_json::from_str::<Value>(body) {
