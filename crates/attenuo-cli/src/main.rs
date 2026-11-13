@@ -344,6 +344,8 @@ async fn run(cli: Cli) -> Result<Outcome> {
             chain_id,
             state,
             limit,
+            cursor,
+            all,
         }) => {
             let mut q = Vec::new();
             if let Some(c) = chain_id {
@@ -355,12 +357,36 @@ async fn run(cli: Cli) -> Result<Outcome> {
             if let Some(n) = limit {
                 q.push(format!("limit={n}"));
             }
-            let mut path = "/admin/approvals".to_string();
-            if !q.is_empty() {
-                path.push('?');
-                path.push_str(&q.join("&"));
-            }
-            let resp = client?.admin_get(&path).await?;
+            let client = client?;
+            let mut cursor = cursor;
+            let mut approvals = Vec::new();
+            let resp = loop {
+                let mut page_q = q.clone();
+                if let Some(c) = &cursor {
+                    page_q.push(format!("cursor={}", query_escape(c)));
+                }
+                let mut path = "/admin/approvals".to_string();
+                if !page_q.is_empty() {
+                    path.push('?');
+                    path.push_str(&page_q.join("&"));
+                }
+                let mut page = client.admin_get(&path).await?;
+                if !all {
+                    break page;
+                }
+                approvals.extend(
+                    page["approvals"]
+                        .as_array_mut()
+                        .map(std::mem::take)
+                        .unwrap_or_default(),
+                );
+                match page["next_cursor"].as_str() {
+                    Some(next) => cursor = Some(next.to_string()),
+                    None => {
+                        break serde_json::json!({ "approvals": approvals, "next_cursor": null })
+                    }
+                }
+            };
             if json {
                 print_json(&resp);
             } else {
@@ -445,11 +471,11 @@ async fn run(cli: Cli) -> Result<Outcome> {
             }
             Ok(Outcome::Ok)
         }
-        Command::Audit(AuditCmd::Checkpoints { before, limit }) => {
+        Command::Audit(AuditCmd::Checkpoints { cursor, limit }) => {
             // The list route only reads; `/admin/audit/checkpoint` (singular) would sign one.
             let mut query = Vec::new();
-            if let Some(b) = before {
-                query.push(format!("before={b}"));
+            if let Some(c) = cursor {
+                query.push(format!("cursor={}", query_escape(&c)));
             }
             if let Some(l) = limit {
                 query.push(format!("limit={l}"));
@@ -1325,9 +1351,11 @@ const MAX_AUDIT_PAGE: u64 = 1000;
 /// `audit tail`: the newest `lines` matching entries (below `before` when given), read newest
 /// first and printed oldest first, then with `follow` every new matching entry as it comes.
 ///
-/// A filtered page may come back short, even empty, with `prev`/`next` set (the server bounds
-/// how far one page scans), so both loops keep following the link rather than stopping at
-/// the first short page.
+/// A filtered page may come back short, even empty, with `next_cursor` set (the server bounds
+/// how far one page scans), so both loops keep following the cursor rather than stopping at
+/// the first short page. `--before N` is the range `to=N-1`; following polls with `from` just
+/// above the last seq seen, since an oldest-first listing ends (`next_cursor` null) at the
+/// head.
 async fn audit_tail(
     client: &Client,
     lines: u64,
@@ -1345,17 +1373,23 @@ async fn audit_tail(
         }
     };
     let q = filter.query();
+    let range = match before {
+        // `--before 1` asks for nothing; clap keeps it at 1 or more.
+        Some(1) => return Ok(Outcome::Ok),
+        Some(b) => format!("&to={}", b - 1),
+        None => String::new(),
+    };
     let want = usize::try_from(lines).unwrap_or(usize::MAX);
     let mut newest_first: Vec<Value> = Vec::new();
-    let mut cursor = before;
+    let mut cursor: Option<String> = None;
     // `head` comes with any page; unlike `/admin/audit/checkpoint` it signs nothing, so polling
     // with `--follow` does not add a checkpoint per new entry.
     let mut head = None;
     loop {
         let limit = (lines - newest_first.len() as u64).clamp(1, MAX_AUDIT_PAGE);
-        let mut path = format!("/admin/audit?order=desc&limit={limit}{q}");
-        if let Some(b) = cursor {
-            path.push_str(&format!("&before={b}"));
+        let mut path = format!("/admin/audit?order=desc&limit={limit}{range}{q}");
+        if let Some(c) = &cursor {
+            path.push_str(&format!("&cursor={}", query_escape(c)));
         }
         let page = client.admin_get(&path).await?;
         head.get_or_insert(page["head"].as_u64().unwrap_or(0));
@@ -1364,8 +1398,8 @@ async fn audit_tail(
                 newest_first.push(e.clone());
             }
         }
-        match page["prev"].as_u64() {
-            Some(prev) if newest_first.len() < want => cursor = Some(prev),
+        match page["next_cursor"].as_str() {
+            Some(next) if newest_first.len() < want => cursor = Some(next.to_string()),
             _ => break,
         }
     }
@@ -1378,22 +1412,30 @@ async fn audit_tail(
     // The first descending page read up to `head` (clap keeps `--before` away from
     // `--follow`), so everything after it is new.
     let mut from = head.unwrap_or(0) + 1;
+    let mut cursor: Option<String> = None;
     loop {
-        let page = client
-            .admin_get(&format!(
-                "/admin/audit?from={from}&limit={MAX_AUDIT_PAGE}{q}"
-            ))
-            .await?;
+        let mut path = format!("/admin/audit?from={from}&limit={MAX_AUDIT_PAGE}{q}");
+        if let Some(c) = &cursor {
+            path.push_str(&format!("&cursor={}", query_escape(c)));
+        }
+        let page = client.admin_get(&path).await?;
+        let mut last = None;
         for e in page["entries"].as_array().into_iter().flatten() {
             show(e);
-            if let Some(seq) = e["seq"].as_u64() {
-                from = seq + 1;
-            }
+            last = e["seq"].as_u64().or(last);
         }
-        // `next` is past the entries shown, or past the seqs a short filtered page scanned.
-        match page["next"].as_u64() {
-            Some(next) => from = from.max(next),
-            None => tokio::time::sleep(Duration::from_millis(interval_ms.max(50))).await,
+        match page["next_cursor"].as_str() {
+            // More to read now, from the same `from`.
+            Some(next) => cursor = Some(next.to_string()),
+            None => {
+                // At the head: next time start just above what was shown, or, after a short
+                // filtered page, above the head this page saw.
+                cursor = None;
+                from = from
+                    .max(last.map_or(0, |s| s + 1))
+                    .max(page["head"].as_u64().map_or(0, |h| h + 1));
+                tokio::time::sleep(Duration::from_millis(interval_ms.max(50))).await;
+            }
         }
     }
 }

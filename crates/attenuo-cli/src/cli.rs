@@ -628,7 +628,7 @@ fn parse_reason(s: &str) -> Result<String, String> {
 /// grants with an ID token at `POST /approvals/{id}` instead.
 #[derive(Debug, Subcommand)]
 pub(crate) enum ApprovalCmd {
-    /// The newest approvals, newest first.
+    /// Approvals, newest first, one page at a time (`--all` for every page).
     List {
         /// Only the approvals of this delegation run (its first hop's lease).
         #[arg(long)]
@@ -636,9 +636,15 @@ pub(crate) enum ApprovalCmd {
         /// Only approvals in this state.
         #[arg(long, value_parser = ["pending", "granted", "declined", "consumed"])]
         state: Option<String>,
-        /// At most this many (server maximum 500).
+        /// Page size (server default 100, at most 500).
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..=500))]
         limit: Option<u64>,
+        /// Start at this page: the `next_cursor` of an earlier listing with the same filters.
+        #[arg(long, conflicts_with = "all")]
+        cursor: Option<String>,
+        /// Follow `next_cursor` and list every matching approval.
+        #[arg(long)]
+        all: bool,
     },
     /// Show one approval: the exact call, the run's labels, state and expiry.
     Show { id: String },
@@ -716,11 +722,11 @@ pub(crate) enum AuditCmd {
     },
     /// List stored checkpoints, newest first. Read-only: never signs a new one.
     Checkpoints {
-        /// Only checkpoints with a seq below this (the next page of an earlier listing).
-        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
-        before: Option<u64>,
+        /// The next (older) page: the `next_cursor` of an earlier listing.
+        #[arg(long)]
+        cursor: Option<String>,
         /// Page size (server default 100, at most 1000).
-        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=1000))]
         limit: Option<u64>,
     },
     /// Walk the whole hash chain and verify the signed checkpoints. Exits 2 if the chain is
@@ -1678,6 +1684,7 @@ mod tests {
         assert_eq!(state.as_deref(), Some("pending"));
         assert!(parse(&["approval", "list", "--state", "maybe"]).is_err());
         assert!(parse(&["approval", "list", "--limit", "0"]).is_err());
+        assert!(parse(&["approval", "list", "--cursor", "c", "--all"]).is_err());
         assert!(parse(&["approval", "show", "A"]).is_ok());
         assert!(parse(&["approval", "grant", "A"]).is_ok());
         assert!(parse(&["approval", "decline", "A"]).is_ok());
@@ -1876,17 +1883,18 @@ mod tests {
             let mut a = vec!["audit", "checkpoints"];
             a.extend_from_slice(extra);
             parse(&a).map(|c| match c.command {
-                Command::Audit(AuditCmd::Checkpoints { before, limit }) => (before, limit),
+                Command::Audit(AuditCmd::Checkpoints { cursor, limit }) => (cursor, limit),
                 _ => panic!("not checkpoints"),
             })
         };
         assert_eq!(cps(&[]).unwrap(), (None, None));
         assert_eq!(
-            cps(&["--before", "9", "--limit", "3"]).unwrap(),
-            (Some(9), Some(3))
+            cps(&["--cursor", "AQIC", "--limit", "3"]).unwrap(),
+            (Some("AQIC".to_string()), Some(3))
         );
-        assert!(cps(&["--before", "0"]).is_err());
+        assert!(cps(&["--before", "9"]).is_err(), "removed: use --cursor");
         assert!(cps(&["--limit", "0"]).is_err());
+        assert!(cps(&["--limit", "1001"]).is_err());
     }
 
     #[test]
