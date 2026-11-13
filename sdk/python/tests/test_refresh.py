@@ -75,8 +75,11 @@ class Server:
         )
 
 
-def error(status: int, code: str, detail: str = "") -> httpx.Response:
-    return httpx.Response(status, json={"error": code, "detail": detail})
+def error(status: int, code: str, detail: str = "", stable: str | None = None) -> httpx.Response:
+    body = {"error": code, "detail": detail}
+    if stable is not None:
+        body["code"] = stable
+    return httpx.Response(status, json=body)
 
 
 def make(
@@ -223,6 +226,22 @@ def test_lease_revoked_is_terminal_and_does_not_loop() -> None:
         (error(400, "invalid_grant", "an ancestor lease is not live: lease_expired"), "lease_lost"),
         (error(401, "unauthorized", "token_expired"), "token_expired"),
         (error(401, "unauthorized", "invalid_token"), "refused"),
+        # A server that sends the lease reason as `code`: read it, whatever `detail` says.
+        (error(400, "invalid_grant", "lease_revoked", "lease_revoked"), "lease_revoked"),
+        (error(400, "invalid_grant", "gone", "lease_unknown"), "lease_revoked"),
+        (
+            error(400, "invalid_grant", "an ancestor lease is not live: x", "lease_expired"),
+            "lease_lost",
+        ),
+        (
+            error(400, "invalid_grant", "an ancestor lease is not live: x", "lease_revoked"),
+            "lease_revoked",
+        ),
+        # `code` wins over `detail` when they disagree.
+        (error(400, "invalid_grant", "lease_revoked", "lease_expired"), "lease_lost"),
+        # A server that sends the generic class as `code` still has the reason in `detail`.
+        (error(400, "invalid_grant", "lease_revoked", "invalid_grant"), "lease_revoked"),
+        (error(401, "unauthorized", "expired", "token_expired"), "token_expired"),
     ],
 )
 def test_renew_refusals_are_terminal(resp: httpx.Response, reason: str) -> None:
