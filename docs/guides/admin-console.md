@@ -33,7 +33,7 @@ Then open `http://127.0.0.1:9101/` on your laptop. The page and the API it calls
 
 ## Log in
 
-The login screen asks for an admin token: the value of `[admin] token`, or an operator's token from `attenuo admin operator new` ([admin operators](deploying.md#admin-operators)). The console checks it with `GET /admin/whoami` and keeps it only if the server accepts it. The header then shows the operator's name and role (`alice · operator`; `admin · admin` for `[admin] token`), and the buttons the role cannot use are disabled: revoking and deciding approvals need `operator`, reloading the policy needs `admin`. The server checks the role on every request either way; a disabled button only saves a refused request.
+The login screen asks for an admin token: the value of `[admin] token`, or an operator's token from `attenuo admin operator new` ([admin operators](deploying.md#admin-operators)). The console checks it with `GET /admin/whoami` and keeps it only if the server accepts it. The header then shows the operator's name and role (`alice · operator`; `admin · admin` for `[admin] token`), followed by `expires <date>` when the token has an `expires_at` (an expired token is refused at login with "That token has expired."), and the buttons the role cannot use are disabled: revoking and deciding approvals need `operator`, reloading the policy needs `admin`. The server checks the role on every request either way; a disabled button only saves a refused request.
 
 The token stays in the memory of that browser tab. It is not written to `localStorage`, `sessionStorage`, a cookie or the URL. It is forgotten when you:
 
