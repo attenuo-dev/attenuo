@@ -50,7 +50,7 @@ printf '%s\n' "$CODER" | attenuo call --token - --upstream github --tool read_fi
 
 ## Argument forms
 
-- `--cap server:tool` is a capability. Globs are allowed. Repeat the flag, or comma-separate plain values. A value that starts with `{` is a full capability as JSON, which can carry constraints and run `limits` (`{"server":"banking","tool":"send_money","limits":{"calls":1,"sum":{"arg":"amount","max":100}}}`). Commands that print capabilities show limits after the constraints: `banking:send_money [calls <= 1, sum(amount) <= 100]`. `distinct` and a derived value work the same way: `--cap '{"server":"web","tool":"get_webpage","limits":{"distinct":{"arg":"url","derive":"host","max":2}}}'` prints as `web:get_webpage [distinct url#host <= 2]`. A limit kind or derivation the CLI does not know is refused before anything is sent. Constraints use the same JSON form as in a token, `{"op": ..., "value": ...}`; there is no separate `--constraint` flag. A `range` bounds an integer argument, both ends inclusive, either end optional: `--cap '{"server":"banking","tool":"send_money","constraints":{"amount":{"op":"range","value":{"min":0,"max":2000}}}}'` prints as `banking:send_money {0 <= amount <= 2000}` (`amount <= 2000` or `amount >= 0` with one bound). A range with no bound, `min` greater than `max`, a non-integer bound or a member other than `min` and `max` is refused before anything is sent. On exchange the child's range must sit inside the parent's, or the server answers `invalid_scope` (`exchange_widening`). A `path_prefix` holds a file path compared by `/` segment: `--cap '{"server":"fs","tool":"read_file","constraints":{"path":{"op":"path_prefix","value":"/workspace/"}}}'` prints as `fs:read_file {path is a path under "/workspace/"}`; a path with a `.` or `..` segment, `//`, a backslash, a control character or `%2e`, `%2f` or `%5c` is refused before anything is sent. `token root` and `token exchange` print `warning: ...` on stderr for a `prefix` on an argument that looks like a file path, and send the request anyway ([`prefix` or `path_prefix`](../concepts/capabilities-and-attenuation.md#prefixes-of-strings-and-of-paths)).
+- `--cap server:tool` is a capability. Globs are allowed. Repeat the flag, or comma-separate plain values. A value that starts with `{` is a full capability as JSON, which can carry constraints and run `limits` (`{"server":"banking","tool":"send_money","limits":{"calls":1,"sum":{"arg":"amount","max":100}}}`). Commands that print capabilities show limits after the constraints: `banking:send_money [calls <= 1, sum(amount) <= 100]`. `distinct` and a derived value work the same way: `--cap '{"server":"web","tool":"get_webpage","limits":{"distinct":{"arg":"url","derive":"host","max":2}}}'` prints as `web:get_webpage [distinct url#host <= 2]`. A limit kind or derivation the CLI does not know is refused before anything is sent. Constraints use the same JSON form as in a token, `{"op": ..., "value": ...}`; there is no separate flag for constraints. A `range` bounds an integer argument, both ends inclusive, either end optional: `--cap '{"server":"banking","tool":"send_money","constraints":{"amount":{"op":"range","value":{"min":0,"max":2000}}}}'` prints as `banking:send_money {0 <= amount <= 2000}` (`amount <= 2000` or `amount >= 0` with one bound). A range with no bound, `min` greater than `max`, a non-integer bound or a member other than `min` and `max` is refused before anything is sent. On exchange the child's range must sit inside the parent's, or the server answers `invalid_scope` (`exchange_widening`). A `path_prefix` holds a file path compared by `/` segment: `--cap '{"server":"fs","tool":"read_file","constraints":{"path":{"op":"path_prefix","value":"/workspace/"}}}'` prints as `fs:read_file {path is a path under "/workspace/"}`; a path with a `.` or `..` segment, `//`, a backslash, a control character or `%2e`, `%2f` or `%5c` is refused before anything is sent. `token root` and `token exchange` print `warning: ...` on stderr for a `prefix` on an argument that looks like a file path, and send the request anyway ([`prefix` or `path_prefix`](../concepts/capabilities-and-attenuation.md#prefixes-of-strings-and-of-paths)).
 - `--arg key=value` sets a string argument. `--arg key:=json` sets any JSON value, such as a number or an object.
 - `--attr key=value` follows the same rule for user attributes.
 
@@ -127,7 +127,7 @@ decision 6685bd7f-cbb3-48e5-ab05-f2b8ceae9a61
 
 ### `token sign-off`
 
-Made by the holder of a bound parent token, to consent to one exchange that binds the child to another key. Prints a proof by `--dpop-key` (the parent's key) for `POST` to the server's `/token`, with `ath` of the parent token and the claims `child_jkt` and `child_actor`; with `--json`, `{"subject_token_dpop": ...}`. The server accepts it only for an exchange whose `DPoP` key and `actor` are the ones it names, within `[token] dpop_max_age_seconds`, once. Hand it to the sub-agent, which passes it with `--subject-token-dpop-file`; the parent's key stays with the parent.
+Made by the holder of a bound parent token, to consent to one exchange that binds the child to another key. Prints a proof by `--dpop-key` (the parent's key) for `POST` to the server's `/token`, with `ath` of the parent token and the claims `child_jkt` and `child_actor`; with `--json`, `{"subject_token_dpop": ...}`. The server accepts it only for an exchange whose `DPoP` key and `actor` are the ones it names, within `[token] dpop_max_age_seconds`, once. Hand it to the sub-agent, which passes it with `token exchange --subject-token-dpop-file`; the parent's key stays with the parent.
 
 | Option | Meaning |
 | --- | --- |
@@ -143,7 +143,7 @@ ATTENUO_TOKEN="$ROOT" attenuo token sign-off --dpop-key assistant.jwk \
 
 ### `key gen --dpop <PATH>`
 
-Write a new Ed25519 DPoP key (RFC 9449) to `PATH` as a private JWK, mode 0600, and print its thumbprint (`jkt`, what a bound token's `cnf.jkt` will be). An existing file is never overwritten (exit code 1). Pass the file to `--dpop-key`; the Python and TypeScript SDKs read the same format. See [Binding tokens to keys](../guides/binding-tokens-to-keys.md).
+Write a new Ed25519 DPoP key (RFC 9449) to `PATH` as a private JWK, mode 0600, and print its thumbprint (`jkt`, what a bound token's `cnf.jkt` will be). An existing file is never overwritten (exit code 1). Pass the file to the command that uses the key (`token root --dpop-key`, `token exchange --dpop-key`, `call --dpop-key`); the Python and TypeScript SDKs read the same format. See [Binding tokens to keys](../guides/binding-tokens-to-keys.md).
 
 ```console
 $ attenuo key gen --dpop coder.jwk
@@ -241,7 +241,7 @@ A call that needs an approval prints `APPROVAL REQUIRED` followed by the approva
 
 ### `tools`
 
-List the tools the token may see (`tools/list`). Takes `--token` (or `--token-file`, or `ATTENUO_TOKEN`) and `--upstream` (`--server` after `tools` is a deprecated spelling).
+List the tools the token may see (`tools/list`). Takes `--token` (or `--token-file`, or `ATTENUO_TOKEN`) and `--upstream` (`--server` after `tools` is a deprecated spelling), and `--dpop-key PATH` (`ATTENUO_DPOP_KEY`) for a token bound to a key, as `call` does.
 
 ### `lease revoke <ID> [--reason TEXT]`
 
@@ -400,12 +400,12 @@ With `--file` it verifies an export offline instead and needs no admin token. Th
 
 | Option | Meaning |
 | --- | --- |
-| `--file <PATH>` | An export from `audit export` (JSON Lines, or the `--format json` object, format `attenuo-audit-export-v2`; older `v1` exports are refused). Re-hashes every entry, checks the links, verifies each checkpoint signature and its head hash. Fails a file that is shorter than the range in its header, one that holds entries outside it, and one with entries after its last valid checkpoint. A filtered export (`audit export --kind`, `--chain-id`, `--tool` or `--decision`) is refused with an error: its chain has gaps, so nothing shows it is complete. |
+| `--file <PATH>` | An export from `audit export` (JSON Lines, or the object of `audit export --format json`, format `attenuo-audit-export-v2`; older `v1` exports are refused). Re-hashes every entry, checks the links, verifies each checkpoint signature and its head hash. Fails a file that is shorter than the range in its header, one that holds entries outside it, and one with entries after its last valid checkpoint. A filtered export (`audit export --kind`, `--chain-id`, `--tool` or `--decision`) is refused with an error: its chain has gaps, so nothing shows it is complete. |
 | `--jwks <PATH>` | JWKS file with the issuer keys (what `/.well-known/jwks.json` returns). Without it, the JWKS is fetched from `--server`. Only with `--file`. |
 | `--checkpoints <PATH>` | Checkpoints shipped off the host by `[audit.sink]`: the file sink's JSON Lines, webhook bodies one per line, or bare checkpoint lines. Each one inside the export's range must equal the export's checkpoint at that `seq` and match the entry hash there; a checkpoint signed again after it was shipped, or deleted, is a mismatch (exit 2). Two different shipped checkpoints for one `seq` and shipped copies that do not verify against the JWKS are reported too. The Python SDK (`attenuo.audit.cross_check`) and the TypeScript SDK (`crossCheck`) report the same findings. With `--json` the report gains a `shipped` object (`in_range`, `matched`, `beyond_range`, `mismatches`) and the top-level `ok` covers both checks. Only with `--file`. |
 | `--allow-unsigned-tail` | Accept entries after the file's last valid checkpoint, which only the hash chain covers: an export taken while the log was ahead of its newest checkpoint. They are still reported (`unsigned_tail`). Entries outside the header's range fail either way. Only with `--file`. |
 
-To get an export that passes without the flag, sign the head first (`GET /admin/audit/checkpoint`) and export up to it, or export up to an existing checkpoint with `--to`.
+To get an export that passes without the flag, sign the head first (`GET /admin/audit/checkpoint`) and export up to it, or export up to an existing checkpoint with `audit export --to`.
 
 ### `audit export`
 
