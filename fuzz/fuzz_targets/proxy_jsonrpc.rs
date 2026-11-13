@@ -339,6 +339,10 @@ fn world() -> &'static World {
                     record_window: attenuo_proxy::records::DEFAULT_RECORD_WINDOW,
                     record_window_max_keys: attenuo_proxy::records::DEFAULT_RECORD_WINDOW_MAX_KEYS,
                     list_filter: attenuo_proxy::ListFilterMode::Capabilities,
+                    upstream_connect_timeout:
+                        attenuo_proxy::config::DEFAULT_UPSTREAM_CONNECT_TIMEOUT,
+                    upstream_response_timeout:
+                        attenuo_proxy::config::DEFAULT_UPSTREAM_RESPONSE_TIMEOUT,
                 };
                 attenuo_proxy::router(config, auth.clone())
             })
