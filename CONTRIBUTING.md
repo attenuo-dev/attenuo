@@ -139,7 +139,7 @@ A change is done when all of the following hold:
 3. Public items have doc comments; new configuration or CLI flags are documented.
 4. `CHANGELOG.md` has an entry under `Unreleased` if the change is visible to users (new feature, behaviour change, fix, security fix).
 5. An ADR or RFC exists for any design decision the change embodies, and its status is updated if the change implements it.
-6. The task is moved on `docs/tasks/board.md` if it is on the board. The durable record of a change is its `CHANGELOG.md` entry and its pull request description, so say there what changed and why.
+6. If the task is on `docs/tasks/board.md`, it moves from Open to Done there as one line with the pull request number (or is cut down to what is left). The durable record of a change is its `CHANGELOG.md` entry and its pull request description, so say there what changed and why.
 7. Commits are signed off and in conventional form; the PR has at least one maintainer approval.
 
 ## Releases
