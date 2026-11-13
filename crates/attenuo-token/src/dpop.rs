@@ -636,7 +636,7 @@ impl DpopKey {
     pub fn sign_jws(&self, header: &Value, claims: &Value) -> String {
         // Serializing a `Value` cannot fail.
         let enc = |v: &Value| URL_SAFE_NO_PAD.encode(serde_json::to_vec(v).unwrap_or_default());
-        let input = format!("{}.{}", enc(&header), enc(claims));
+        let input = format!("{}.{}", enc(header), enc(claims));
         let sig = match &self.secret {
             Secret::Ed25519 { pair, .. } => pair.sign(input.as_bytes()).as_ref().to_vec(),
             Secret::P256 { pair, .. } => pair

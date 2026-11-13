@@ -438,8 +438,7 @@ async fn exchange_with_a_client_assertion_and_a_rotated_key() {
             .audit()
             .await
             .into_iter()
-            .filter(|e| e["record"]["tool"] == "token.exchange")
-            .last()
+            .rfind(|e| e["record"]["tool"] == "token.exchange")
             .unwrap()["record"]["arguments_digest"]
             .clone();
         assert_eq!(

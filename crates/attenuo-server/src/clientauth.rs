@@ -1451,7 +1451,7 @@ mod tests {
     fn replay_keys_are_namespaced_by_list() {
         let key = ed_key();
         let entry = AgentConfig::with_jwks("gw", jwks(&[public(&key, None)]));
-        let agents = Clients::agents(&[entry.clone()], policy()).unwrap();
+        let agents = Clients::agents(std::slice::from_ref(&entry), policy()).unwrap();
         let peps = Clients::peps(&[entry], policy()).unwrap();
         let a = Signer { key, kid: None }.sign(&claims("gw"));
         let ka = verify(&agents, &a, None).unwrap().replay_key;
