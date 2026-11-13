@@ -120,7 +120,7 @@ The table is generated from `attenuo_core::error_codes::ERROR_CODES`, the one pl
 | `input_type_mismatch` |  | `-32003` (200) | yes | A call argument does not have the type the catalog declares. |
 | `invalid_agent` | 400 `invalid_grant` |  |  | The agent id of the token to mint is empty (an exchange's `actor`, or `agent` at `POST /admin/root-token`). |
 | `invalid_capability` | 400 `invalid_grant`, 400 `invalid_scope` |  |  | A requested capability is not one a call can have: a server or tool name that breaks the naming rules, or a malformed limit (sent with `error` `invalid_grant`); or a shorthand that is not `server:tool` (a form `scope` at `POST /token`, `capabilities` at `POST /admin/root-token`; sent with `error` `invalid_scope`). |
-| `invalid_chain` | 400, 400 `invalid_request` |  |  | The chain in the body does not validate (`POST /admin/policies/check`, or a PEP's unsigned chain at AuthZEN, sent with `error` `invalid_request`). |
+| `invalid_chain` | 400, 400 `invalid_request` |  |  | The chain in the body does not validate (`POST /admin/policies/evaluate`, or a PEP's unsigned chain at AuthZEN, sent with `error` `invalid_request`). |
 | `invalid_client` | 401 |  |  | Client authentication failed. |
 | `invalid_cursor` | 400 |  |  | The paging cursor is malformed or belongs to another list or order. |
 | `invalid_dpop_proof` | 401 | `-32001` (401) |  | The DPoP proof does not verify, is replayed, or is for another key, method or URL. |
@@ -463,6 +463,18 @@ Where they are served: on the main listener by default; with `[admin] listen` se
 | `POST /admin/policies/evaluate` | Dry run: what the loaded policies decide for one call, given a token or a chain, and optionally the run-limit state to assume (`budget`). No lease check, no charge, no audit record, no decision metric. |
 | `POST /admin/budgets/refund` | Body `{"decision_id": "<uuid>", "reason": "..."}`: give back to every run-limit counter what that decision charged, once, for an allowed call whose effect did not happen. Answers `{decision_id, refunded, reason, audit_id}` (`refunded` counts the token-limit counters credited; the run usage and the per-user windows the decision charged are returned too (each window to the window it was charged to, even one that has ended) but not counted, so a call that charged only usage answers 0; a `distinct` value is freed, and counted, only when no other unrefunded decision used it, SR-62) and appends an `admin.budget.refund` record. When there is nothing to refund, the audit log says why: 410 `charge_pruned` when the decision's record shows a run-limit charge whose charge-log entry was pruned, 404 `not_found` for a decision that charged nothing or an unknown id, 409 `already_refunded`; see [Budget refund](#budget-refund). Also on the console listener with `[admin_ui] allow_write = true`. |
 | `POST /admin/root-token` | Development root mint. Mounted only when `[dev] allow_root_mint = true`, which refuses to start when the admin API's listener (`[admin] listen`, else `[server] listen`) is not a loopback address. |
+
+### Console listener
+
+The console listener (`[admin_ui] enabled = true`, [config](config.md#adminui)) serves the console's own files besides the admin routes above that it mounts. They need no bearer: the page asks for the admin token and sends it with each API call. Each file answers with `Cache-Control: no-cache` and a SHA-256 `ETag`, and `If-None-Match` with 304. An unknown file is 404 `not_found`.
+
+| Method and path | Purpose |
+| --- | --- |
+| `GET /admin/ui/` | The console page. |
+| `GET /admin/ui/{file}` | A file of the console (script, style sheet, icon). |
+| `GET /` | Redirects (303) to `/admin/ui/`. |
+| `GET /admin/ui` | Redirects (303) to `/admin/ui/`. |
+| `GET /favicon.svg` | The favicon, the same file as `/admin/ui/favicon.svg`. |
 
 ### Operators reload
 
