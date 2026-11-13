@@ -49,6 +49,7 @@ from attenuo import (
     EvaluationLabels,
     EvaluationUsage,
     Prefix,
+    RateLimited,
     RefreshError,
     RpcError,
     StatedApproval,
@@ -58,6 +59,7 @@ from attenuo import (
     Token,
     TokenRefresher,
     Unauthorized,
+    _retry,
     call_hash,
 )
 from attenuo.audit import entry_hash
@@ -134,11 +136,16 @@ def binaries() -> tuple[Path, Path]:
 
 
 class Stack:
-    def __init__(self, url: str, work: Path) -> None:
+    def __init__(self, url: str, work: Path, restart: Callable[[], None]) -> None:
         self.url = url
         self.work = work
         #: The issuer's private key, when the test generated it (``sink_stack``).
         self.issuer_key: Ed25519PrivateKey | None = None
+        #: The ``signer`` agent's client key, when its entry lists it (``assertion_stack``).
+        self.client_key: DpopKey | None = None
+        #: Stop the server and start it again on the same port and config (a server with
+        #: an ephemeral issuer key or ``:memory:`` audit store forgets its tokens).
+        self.restart = restart
 
     def upstream_calls(self) -> list[str]:
         log = (self.work / "fake-mcp.log").read_text()
@@ -248,23 +255,17 @@ def run_stack(
     fake_out = (work / "fake-mcp.out").open("wb")
     fake_log = (work / "fake-mcp.log").open("wb")
     server_log = (work / "server.log").open("wb")
-    try:
-        procs.append(
-            subprocess.Popen(
-                [str(fake_bin), "--port", str(mcp_port), *(fake_args or [])],
-                stdout=fake_out,
-                stderr=fake_log,
-            )
+    url = f"http://127.0.0.1:{ob_port}"
+
+    def start_server() -> subprocess.Popen[bytes]:
+        return subprocess.Popen(
+            [str(server_bin), "--config", str(work / "config.toml")],
+            stdout=server_log,
+            stderr=subprocess.STDOUT,
+            env={**os.environ, "RUST_LOG": "warn"},
         )
-        procs.append(
-            subprocess.Popen(
-                [str(server_bin), "--config", str(work / "config.toml")],
-                stdout=server_log,
-                stderr=subprocess.STDOUT,
-                env={**os.environ, "RUST_LOG": "warn"},
-            )
-        )
-        url = f"http://127.0.0.1:{ob_port}"
+
+    def wait_ready() -> None:
         deadline = time.monotonic() + 20
         while time.monotonic() < deadline:
             try:
@@ -280,7 +281,24 @@ def run_stack(
             time.sleep(0.1)
         else:
             pytest.fail(f"server did not start:\n{(work / 'server.log').read_text()}")
-        yield Stack(url, work)
+
+    def restart() -> None:
+        procs[1].terminate()
+        procs[1].wait(timeout=10)
+        procs[1] = start_server()
+        wait_ready()
+
+    try:
+        procs.append(
+            subprocess.Popen(
+                [str(fake_bin), "--port", str(mcp_port), *(fake_args or [])],
+                stdout=fake_out,
+                stderr=fake_log,
+            )
+        )
+        procs.append(start_server())
+        wait_ready()
+        yield Stack(url, work, restart)
     finally:
         for p in procs:
             p.terminate()
@@ -635,6 +653,232 @@ async def test_dpop_server_nonce_async(nonce_stack: Stack) -> None:
             assert res.decision_id
             assert (await ob.renew(root)).expires_in > 0
         admin.revoke_lease(root.lease)
+
+
+# ---- private_key_jwt client assertions and the retries that send them again ---------------
+#
+# The server leaves a client assertion unused when it refuses the request with
+# `use_dpop_nonce` or `429 rate_limited` (SR-108, SR-111), because the client is told to send
+# the same request again. These tests check that the SDK's retries then succeed against the
+# real server, and that the load retry does not send an assertion that will have expired.
+
+
+def signer_agent(key: DpopKey) -> str:
+    """An `[[agents]]` entry for `signer` that authenticates with `key`'s client assertions."""
+    jwks = json.dumps({"keys": [key.public_jwk]})
+    return f"[[agents]]\nid = \"signer\"\njwks = '{jwks}'\n\n"
+
+
+@pytest.fixture(scope="module")
+def assertion_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Stack]:
+    """The stack with `[token] dpop_nonce = "required"` and the `signer` agent, which has a
+    client key and no secret."""
+    key = DpopKey.generate()
+    work = tmp_path_factory.mktemp("attenuo-it-assertion")
+    for s in run_stack(work, '[token]\ndpop_nonce = "required"\n\n' + signer_agent(key)):
+        s.client_key = key
+        yield s
+
+
+@pytest.fixture(scope="module")
+def limited_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Stack]:
+    """The stack with `[limits] token_requests_per_minute = 1` and the `signer` agent. Its
+    issuer key and audit store (leases, spent credentials) are files, so a restart keeps the
+    tokens and every spent assertion and forgets only the rate limit's minute: the tests
+    restart it in place of waiting the minute out."""
+    key = DpopKey.generate()
+    work = tmp_path_factory.mktemp("attenuo-it-limited")
+    pem = work / "issuer.pem"
+    issuer = Ed25519PrivateKey.generate()
+    pem.write_bytes(issuer.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()))
+    pem.chmod(0o600)
+    for s in run_stack(
+        work,
+        "[limits]\ntoken_requests_per_minute = 1\n\n" + signer_agent(key),
+        issuer_key=pem,
+        edits={'sqlite_path = ":memory:"': f'sqlite_path = "{work / "audit.sqlite"}"'},
+    ):
+        s.client_key = key
+        yield s
+
+
+class Sent:
+    """One `POST /token` a :class:`Recording` transport passed on, and the answer."""
+
+    def __init__(self, request: httpx.Request, response: httpx.Response) -> None:
+        self.assertion = json.loads(request.content).get("client_assertion")
+        self.status = response.status_code
+        body = response.json()
+        self.error = body.get("error") if isinstance(body, dict) else None
+
+
+class Recording(httpx.BaseTransport):
+    """The real HTTP transport, keeping each `/token` request and its answer."""
+
+    def __init__(self) -> None:
+        self.inner = httpx.HTTPTransport()
+        self.sent: list[Sent] = []
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        response = self.inner.handle_request(request)
+        if request.url.path == "/token":
+            response.read()
+            self.sent.append(Sent(request, response))
+        return response
+
+
+class AsyncRecording(httpx.AsyncBaseTransport):
+    """:class:`Recording` for the async client."""
+
+    def __init__(self) -> None:
+        self.inner = httpx.AsyncHTTPTransport()
+        self.sent: list[Sent] = []
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        response = await self.inner.handle_async_request(request)
+        if request.url.path == "/token":
+            await response.aread()
+            self.sent.append(Sent(request, response))
+        return response
+
+
+def roots_for(url: str, n: int, key: DpopKey | None = None) -> list[Token]:
+    with AdminClient(url, ADMIN_TOKEN) as admin:
+        return [
+            admin.mint_root_dev(
+                "alice", "https://idp.example", "assistant", ["github:*"], dpop_key=key
+            )
+            for _ in range(n)
+        ]
+
+
+def test_client_assertion_survives_the_nonce_retry(assertion_stack: Stack) -> None:
+    """A fresh client's first exchange is refused `use_dpop_nonce`; the retry sends the same
+    assertion with a proof that carries the nonce, and the server accepts it. The next
+    exchange has the nonce already: one request."""
+    url, client_key = assertion_stack.url, assertion_stack.client_key
+    assert client_key is not None
+    key = DpopKey.generate()
+    first_root, later_root = roots_for(url, 2, key)
+    rec = Recording()
+    caps = ["github:read_file"]
+    with Client(url, dpop_key=key, transport=rec) as ob:
+        assertion = client_key.client_assertion("signer", url)
+        child = ob.exchange(first_root, "signer", caps, client_assertion=assertion)
+        assert child.dpop_jkt == key.thumbprint
+        assert child.chain.hops[-1].agent == "signer"
+        assert [(x.status, x.error) for x in rec.sent] == [(401, "use_dpop_nonce"), (200, None)]
+        assert [x.assertion for x in rec.sent] == [assertion, assertion]
+
+        rec.sent.clear()
+        assertion = client_key.client_assertion("signer", url)
+        child = ob.exchange(later_root, "signer", caps, client_assertion=assertion)
+        assert child.dpop_jkt == key.thumbprint
+        assert [(x.status, x.assertion) for x in rec.sent] == [(200, assertion)]
+        # The bound child works through the proxy.
+        res = ob.call_tool(child, "github", "read_file", {"repo": "alice/public-docs"})
+        assert res.decision_id
+
+
+async def test_client_assertion_survives_the_nonce_retry_async(assertion_stack: Stack) -> None:
+    """The async client, as :func:`test_client_assertion_survives_the_nonce_retry`."""
+    url, client_key = assertion_stack.url, assertion_stack.client_key
+    assert client_key is not None
+    key = DpopKey.generate()
+    first_root, later_root = roots_for(url, 2, key)
+    rec = AsyncRecording()
+    caps = ["github:read_file"]
+    async with AsyncClient(url, dpop_key=key, transport=rec) as ob:
+        assertion = client_key.client_assertion("signer", url)
+        child = await ob.exchange(first_root, "signer", caps, client_assertion=assertion)
+        assert child.dpop_jkt == key.thumbprint
+        assert [(x.status, x.error) for x in rec.sent] == [(401, "use_dpop_nonce"), (200, None)]
+        assert [x.assertion for x in rec.sent] == [assertion, assertion]
+
+        rec.sent.clear()
+        assertion = client_key.client_assertion("signer", url)
+        await ob.exchange(later_root, "signer", caps, client_assertion=assertion)
+        assert [(x.status, x.assertion) for x in rec.sent] == [(200, assertion)]
+
+
+def test_rate_limited_exchange_resends_its_assertion_only_while_it_lasts(
+    limited_stack: Stack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`max_retries` against `token_requests_per_minute = 1`. Over the limit, the server
+    answers 429 with `Retry-After` until the agent's minute ends. With an assertion that lasts
+    past that, the client waits and sends the same assertion again, and it is accepted: the
+    429 did not spend it (the restart that stands in for the wait keeps spent assertions).
+    With one that would expire first, the client raises `RateLimited` at once, and the caller
+    mints a new one."""
+    s = limited_stack
+    s.restart()  # a minute of its own
+    client_key = s.client_key
+    assert client_key is not None
+    roots = roots_for(s.url, 3)
+    waits: list[float] = []
+
+    def wait_out_the_minute(seconds: float) -> None:
+        waits.append(seconds)
+        s.restart()
+
+    monkeypatch.setattr(_retry, "_sleep", wait_out_the_minute)
+    monkeypatch.setattr(_retry, "_random", lambda: 0.0)
+    rec = Recording()
+    caps = ["github:read_file"]
+    with Client(s.url, transport=rec, max_retries=1, max_retry_delay=120) as ob:
+        first = client_key.client_assertion("signer", s.url)
+        ob.exchange(roots[0], "signer", caps, client_assertion=first)
+        assert waits == []
+
+        rec.sent.clear()
+        lasting = client_key.client_assertion("signer", s.url, lifetime=300)
+        child = ob.exchange(roots[1], "signer", caps, client_assertion=lasting)
+        assert child.chain.hops[-1].agent == "signer"
+        assert len(waits) == 1 and 1 <= waits[0] <= 60
+        assert [(x.status, x.error) for x in rec.sent] == [(429, "rate_limited"), (200, None)]
+        assert [x.assertion for x in rec.sent] == [lasting, lasting]
+
+        rec.sent.clear()
+        short = client_key.client_assertion("signer", s.url, lifetime=5)
+        with pytest.raises(RateLimited) as e:
+            ob.exchange(roots[2], "signer", caps, client_assertion=short)
+        assert e.value.retry_after is not None and e.value.retry_after > 5
+        assert len(waits) == 1  # no wait, no second request
+        assert [(x.status, x.assertion) for x in rec.sent] == [(429, short)]
+
+        # What the caller does: wait out `retry_after` (here: restart), mint, call again.
+        s.restart()
+        fresh = client_key.client_assertion("signer", s.url)
+        ob.exchange(roots[2], "signer", caps, client_assertion=fresh)
+        assert [x.status for x in rec.sent] == [429, 200]
+
+
+async def test_rate_limited_exchange_resends_its_assertion_async(
+    limited_stack: Stack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The async client's load retry sends the same assertion again, and it is accepted."""
+    s = limited_stack
+    s.restart()
+    client_key = s.client_key
+    assert client_key is not None
+    roots = roots_for(s.url, 2)
+    waits: list[float] = []
+
+    async def wait_out_the_minute(seconds: float) -> None:
+        waits.append(seconds)
+        s.restart()
+
+    monkeypatch.setattr(_retry, "_asleep", wait_out_the_minute)
+    rec = AsyncRecording()
+    caps = ["github:read_file"]
+    async with AsyncClient(s.url, transport=rec, max_retries=1, max_retry_delay=120) as ob:
+        first = client_key.client_assertion("signer", s.url)
+        await ob.exchange(roots[0], "signer", caps, client_assertion=first)
+        rec.sent.clear()
+        lasting = client_key.client_assertion("signer", s.url, lifetime=300)
+        await ob.exchange(roots[1], "signer", caps, client_assertion=lasting)
+        assert len(waits) == 1
+        assert [(x.status, x.assertion) for x in rec.sent] == [(429, lasting), (200, lasting)]
 
 
 def test_too_many_pending_approvals(stack: Stack) -> None:
@@ -1592,3 +1836,47 @@ def test_user_decides_an_approval_with_their_id_token(idp_stack: tuple[Stack, Id
     admin.revoke_lease(root.lease)
     ob.close()
     admin.close()
+
+
+@pytest.fixture(scope="module")
+def idp_assertion_stack(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[Stack, Idp]]:
+    """The stack with `[token] dpop_nonce = "required"`, `[[idps]]` trusting a local issuer,
+    and the `signer` agent (client key, no secret) granted alice's root tokens."""
+    idp, key = Idp(), DpopKey.generate()
+    section = (
+        '[token]\ndpop_nonce = "required"\n\n'
+        f'[[idps]]\nissuer = "{Idp.ISSUER}"\njwks_url = "{idp.url}"\n\n'
+        f"{signer_agent(key)}"
+        f'[[root_grants]]\nsubject = "alice"\nissuer = "{Idp.ISSUER}"\nagent = "signer"\n'
+        'capabilities = ["github:*"]\n\n'
+    )
+    try:
+        for s in run_stack(tmp_path_factory.mktemp("attenuo-it-idp-assertion"), section):
+            s.client_key = key
+            yield s, idp
+    finally:
+        idp.server.shutdown()
+
+
+def test_hop0_client_assertion_survives_the_nonce_retry(
+    idp_assertion_stack: tuple[Stack, Idp],
+) -> None:
+    """Hop 0 (IdP intake) authenticated by a client assertion, DPoP-bound, against a server
+    that requires its nonce: the first request is refused `use_dpop_nonce`, the retry sends
+    the same assertion and the same ID token and gets the root token (SR-111 in
+    `idp/intake.rs`)."""
+    stack, idp = idp_assertion_stack
+    client_key = stack.client_key
+    assert client_key is not None
+    key = DpopKey.generate()
+    rec = Recording()
+    with Client(stack.url, dpop_key=key, transport=rec) as ob:
+        assertion = client_key.client_assertion("signer", stack.url)
+        id_token = idp.id_token("alice", "signer", "hop0-1")
+        root = ob.exchange(id_token, "signer", ["github:read_file"], client_assertion=assertion)
+        assert root.dpop_jkt == key.thumbprint
+        assert root.chain.hops[-1].agent == "signer"
+        assert [(x.status, x.error) for x in rec.sent] == [(401, "use_dpop_nonce"), (200, None)]
+        assert [x.assertion for x in rec.sent] == [assertion, assertion]
