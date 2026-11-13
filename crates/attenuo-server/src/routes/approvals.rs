@@ -8,7 +8,7 @@
 //! | `POST /approvals/{id}` | an ID token of the run's originating user, from a trusted `[[idps]]` | grant or decline (`by = "user"`) |
 //! | `GET /approvals/{id}` | that user's ID token, or a delegation token of the same run with live leases | the exact call, labels (and matched arguments, `untrusted_args`), state and expiry |
 //! | `POST /admin/approvals/{id}` | admin bearer | grant or decline as an operator (`by = "operator"`) |
-//! | `GET /admin/approvals/{id}`, `GET /admin/approvals?chain_id=` | admin bearer | one approval; the newest approvals of a run (console, CLI) |
+//! | `GET /admin/approvals/{id}`, `GET /admin/approvals?chain_id=&state=&cursor=` | admin bearer | one approval; approvals newest first, paged with a cursor (console, CLI) |
 //!
 //! The ID token is checked as hop-0 intake checks it (signature, `iss`, `aud`/`azp` bound to
 //! the run's root agent's client id or to `[approvals] client_id`, expiry), its `sub` and
@@ -52,12 +52,15 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use super::extract::{Body, Path, Query};
+use super::page;
 use super::{bearer_of, parse_json, ADMIN_SUBJECT};
 use crate::error::{ApiError, REASON_MISSING_TOKEN};
 use crate::state::AppState;
 
-/// Most approvals `GET /admin/approvals` returns.
+/// Most approvals one `GET /admin/approvals` page returns; a larger `limit` is a 400.
 pub const MAX_LIST: usize = 500;
+/// Page size of `GET /admin/approvals` without `limit`.
+pub const DEFAULT_LIST: usize = 100;
 
 /// Body of a decision: `{"decision": "grant" | "decline"}`.
 #[derive(Debug, Deserialize)]
@@ -87,7 +90,9 @@ pub struct ListQuery {
     pub chain_id: Option<String>,
     /// Only approvals in this state (`pending`, `granted`, `declined`, `consumed`).
     pub state: Option<String>,
-    /// At most this many (default and maximum [`MAX_LIST`]).
+    /// The `next_cursor` of the previous page ([`super::page`]).
+    pub cursor: Option<String>,
+    /// Page size (default [`DEFAULT_LIST`], at most [`MAX_LIST`]).
     pub limit: Option<usize>,
 }
 
@@ -451,12 +456,18 @@ pub async fn admin_get(
         .await
 }
 
-/// `GET /admin/approvals?chain_id=&state=&limit=`: the newest approvals, of one run when
-/// `chain_id` is given.
+/// `GET /admin/approvals?chain_id=&state=&cursor=&limit=`: approvals newest first, of one run
+/// when `chain_id` is given and in one state when `state` is, as `{approvals, next_cursor}`.
+/// Paging is the one style of [`super::page`]; the cursor's position is the store's approval
+/// position, so every approval is reachable however many there are, and approvals created
+/// while a client pages sort above the first page instead of shifting the rest. Both filters
+/// are applied by the store before the limit; send the same ones with each cursor.
 ///
 /// # Errors
 ///
-/// 400 `invalid_request` for an unknown `state`, and 500 `server_error` when the store fails.
+/// 400 `invalid_request` for an unknown `state` or a `limit` of 0 or above [`MAX_LIST`], 400
+/// `invalid_cursor` for a cursor that is malformed or of another route, and 500 `server_error`
+/// when the store fails.
 pub async fn admin_list(
     State(state): State<Arc<AppState>>,
     Query(q): Query<ListQuery>,
@@ -468,18 +479,24 @@ pub async fn admin_list(
                 .map_err(|_| ApiError::bad_request("invalid_request", "unknown state"))?,
         ),
     };
-    let limit = q.limit.unwrap_or(MAX_LIST).clamp(1, MAX_LIST);
+    let limit = page::limit(q.limit, DEFAULT_LIST, MAX_LIST)?;
+    let dir = page::Direction::Descending;
+    let before = page::decode(q.cursor.as_deref(), page::List::Approvals, dir)?;
     let now = state.now();
     state
         .blocking(move |s| {
             let chain = q.chain_id.filter(|c| !c.is_empty()).map(LeaseId::new);
-            let approvals: Vec<Value> = s
+            // One more than the page, to tell whether anything follows it.
+            let mut listed = s
                 .leases
-                .approvals(chain.as_ref(), want, None, limit)?
-                .iter()
-                .map(|(_, a)| approval_json(a, now))
-                .collect();
-            Ok(Json(json!({ "approvals": approvals })))
+                .approvals(chain.as_ref(), want, before, limit + 1)?;
+            let next = (listed.len() > limit).then(|| listed[limit - 1].0);
+            listed.truncate(limit);
+            let approvals: Vec<Value> = listed.iter().map(|(_, a)| approval_json(a, now)).collect();
+            Ok(Json(json!({
+                "approvals": approvals,
+                "next_cursor": next.map(|p| page::encode(page::List::Approvals, dir, p)),
+            })))
         })
         .await
 }

@@ -1,5 +1,6 @@
-//! The audit query API: `GET /admin/audit` filters and two-way paging, the single-entry
-//! routes, the read-only checkpoint list, and the headers every admin answer carries.
+//! The audit query API: `GET /admin/audit` filters and cursor paging both ways, the
+//! single-entry routes, the read-only checkpoint list, and the headers every admin answer
+//! carries.
 //!
 //! The fixture appends records straight to the server's audit store, so every field is known
 //! and the expected pages are computed from the fixture table, not from the filter code.
@@ -310,23 +311,42 @@ fn keys(body: &Value) -> BTreeSet<&str> {
 }
 
 #[tokio::test]
-async fn without_new_parameters_the_page_is_unchanged() {
+async fn a_page_is_entries_next_cursor_and_head() {
     let h = Harness::with_fixture().await;
     let (status, body) = h
         .get("/admin/audit", &[("from", "3"), ("limit", "4")])
         .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(keys(&body), BTreeSet::from(["entries", "next", "head"]));
+    assert_eq!(
+        keys(&body),
+        BTreeSet::from(["entries", "next_cursor", "head"])
+    );
     let expected = serde_json::to_value(h.state.audit.range(3, 4).unwrap()).unwrap();
     assert_eq!(body["entries"], expected);
-    assert_eq!(body["next"], 7);
     assert_eq!(body["head"], 12);
+    let cursor = body["next_cursor"].as_str().unwrap().to_string();
+    let (_, body) = h
+        .get(
+            "/admin/audit",
+            &[("from", "3"), ("limit", "4"), ("cursor", &cursor)],
+        )
+        .await;
+    assert_eq!(seqs_of(&body), [7, 8, 9, 10]);
 
+    // Without parameters: the whole (small) log, and nothing after it.
     let (_, body) = h.get("/admin/audit", &[]).await;
     assert_eq!(seqs_of(&body), (1..=12).collect::<Vec<_>>());
-    assert_eq!(body["next"], Value::Null);
-    let (_, body) = h.get("/admin/audit", &[("order", "asc")]).await;
-    assert_eq!(keys(&body), BTreeSet::from(["entries", "next", "head"]));
+    assert_eq!(body["next_cursor"], Value::Null);
+    // A page that ends exactly at the head says so: no cursor to an empty page.
+    let (_, body) = h
+        .get("/admin/audit", &[("from", "9"), ("limit", "4")])
+        .await;
+    assert_eq!(seqs_of(&body), [9, 10, 11, 12]);
+    assert_eq!(body["next_cursor"], Value::Null);
+    let (_, body) = h
+        .get("/admin/audit", &[("order", "desc"), ("limit", "12")])
+        .await;
+    assert_eq!(body["next_cursor"], Value::Null);
 }
 
 #[tokio::test]
@@ -436,11 +456,13 @@ async fn values_match_literally() {
     }
 }
 
-/// Follow `next` (ascending) or `prev` (descending) until it is null; return every seq seen.
-async fn page_through(
+/// Follow `next_cursor` until it is null, with `limit=2` and the same filter (and `order`)
+/// on every page; return every seq seen. `between` runs after each page but the last.
+async fn page_through_with(
     h: &Harness,
     filter: &[(&'static str, &'static str)],
     desc: bool,
+    mut between: impl FnMut(),
 ) -> Vec<u64> {
     let mut seen = Vec::new();
     let mut cursor: Option<String> = None;
@@ -451,18 +473,26 @@ async fn page_through(
             q.push(("order", "desc"));
         }
         if let Some(c) = cursor.as_deref() {
-            q.push((if desc { "before" } else { "from" }, c));
+            q.push(("cursor", c));
         }
         let (status, body) = h.get("/admin/audit", &q).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         seen.extend(seqs_of(&body));
-        let link = if desc { &body["prev"] } else { &body["next"] };
-        match link.as_u64() {
-            Some(n) => cursor = Some(n.to_string()),
+        match body["next_cursor"].as_str() {
+            Some(c) => cursor = Some(c.to_string()),
             None => return seen,
         }
+        between();
     }
     panic!("paging did not end");
+}
+
+async fn page_through(
+    h: &Harness,
+    filter: &[(&'static str, &'static str)],
+    desc: bool,
+) -> Vec<u64> {
+    page_through_with(h, filter, desc, || {}).await
 }
 
 #[tokio::test]
@@ -481,36 +511,57 @@ async fn paging_both_ways_has_no_gaps_or_repeats() {
     back.reverse();
     assert_eq!(back, want);
 
-    // A descending page carries both links: `prev` goes on back, `next` reads forward.
+    // `from` and `to` select a range in either order, and the cursor stays inside it.
+    let range = [("from", "4"), ("to", "9")];
+    assert_eq!(page_through(&h, &range, false).await, [4, 5, 6, 7, 8, 9]);
+    assert_eq!(page_through(&h, &range, true).await, [9, 8, 7, 6, 5, 4]);
+    let ranged = [("from", "2"), ("to", "11"), ("agent", "l10")];
+    let want: Vec<u64> = fixture_seqs(|r| r.agent == "l10")
+        .into_iter()
+        .filter(|s| (2..=11).contains(s))
+        .collect();
+    assert_eq!(page_through(&h, &ranged, false).await, want);
+    // `to` past the head is the same as no `to`.
     let (_, body) = h
-        .get(
-            "/admin/audit",
-            &[("order", "desc"), ("before", "9"), ("limit", "3")],
-        )
-        .await;
-    assert_eq!(
-        keys(&body),
-        BTreeSet::from(["entries", "next", "head", "prev"])
-    );
-    assert_eq!(seqs_of(&body), [8, 7, 6]);
-    assert_eq!(body["prev"], 6);
-    assert_eq!(body["next"], 9);
-    let (_, body) = h
-        .get("/admin/audit", &[("from", "9"), ("limit", "100")])
-        .await;
-    assert_eq!(seqs_of(&body), [9, 10, 11, 12]);
-    // The newest page has nothing newer.
-    let (_, body) = h
-        .get("/admin/audit", &[("order", "desc"), ("limit", "3")])
-        .await;
-    assert_eq!(seqs_of(&body), [12, 11, 10]);
-    assert_eq!(body["next"], Value::Null);
-    // `before` past the head is the same as no `before`.
-    let (_, body) = h
-        .get("/admin/audit", &[("order", "desc"), ("before", "1000")])
+        .get("/admin/audit", &[("order", "desc"), ("to", "1000")])
         .await;
     assert_eq!(seqs_of(&body).len(), 12);
-    assert_eq!(body["prev"], Value::Null);
+    assert_eq!(body["next_cursor"], Value::Null);
+    // A range above the head is empty.
+    let (status, body) = h.get("/admin/audit", &[("from", "13")]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(seqs_of(&body), Vec::<u64>::new());
+    assert_eq!(body["next_cursor"], Value::Null);
+}
+
+/// Entries appended while a client pages do not shift the entries it has not read yet: newest
+/// first, the new ones sort above the first page and are not seen; oldest first, they come
+/// after everything that was there, once each.
+#[tokio::test]
+async fn appends_during_paging_cause_no_repeats_or_gaps() {
+    let h = Harness::with_fixture().await;
+    let head = |h: &Harness| h.state.audit.head().unwrap().unwrap().seq;
+    let state = h.state.clone();
+    let mut next = 13u64;
+    let back = page_through_with(&h, &[], true, || {
+        state.audit.append(FIXTURE[1].record(next)).unwrap();
+        next += 1;
+    })
+    .await;
+    assert_eq!(back, (1..=12).rev().collect::<Vec<_>>());
+    assert!(head(&h) > 12, "entries were appended while paging");
+
+    let before = head(&h);
+    let state = h.state.clone();
+    let mut next = before + 1;
+    let forward = page_through_with(&h, &[], false, || {
+        state.audit.append(FIXTURE[1].record(next)).unwrap();
+        next += 1;
+    })
+    .await;
+    // Every entry that existed, in order, once; then each one appended while paging, once.
+    assert!(head(&h) > before);
+    assert_eq!(forward, (1..=head(&h)).collect::<Vec<_>>());
 }
 
 /// A filtered page stops after `MAX_AUDIT_SCAN` seqs even when nothing matched, and says
@@ -539,14 +590,13 @@ async fn a_filtered_page_reads_a_bounded_window() {
     let (status, body) = h.get("/admin/audit", &[("agent", "l1")]).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(seqs_of(&body), Vec::<u64>::new());
-    let window = attenuo_server::routes::admin::MAX_AUDIT_SCAN;
-    assert_eq!(body["next"], window + 1);
-    let next = (window + 1).to_string();
+    // Short (empty) but not the end: the cursor goes on past the window read.
+    let next = body["next_cursor"].as_str().unwrap().to_string();
     let (_, body) = h
-        .get("/admin/audit", &[("agent", "l1"), ("from", &next)])
+        .get("/admin/audit", &[("agent", "l1"), ("cursor", &next)])
         .await;
     assert_eq!(seqs_of(&body), [head]);
-    assert_eq!(body["next"], Value::Null);
+    assert_eq!(body["next_cursor"], Value::Null);
 
     let (_, body) = h
         .get(
@@ -555,17 +605,15 @@ async fn a_filtered_page_reads_a_bounded_window() {
         )
         .await;
     assert_eq!(seqs_of(&body), [head]);
-    let prev = head - window + 1;
-    assert_eq!(body["prev"], prev);
-    let before = prev.to_string();
+    let prev = body["next_cursor"].as_str().unwrap().to_string();
     let (_, body) = h
         .get(
             "/admin/audit",
-            &[("agent", "l1"), ("order", "desc"), ("before", &before)],
+            &[("agent", "l1"), ("order", "desc"), ("cursor", &prev)],
         )
         .await;
     assert_eq!(seqs_of(&body), Vec::<u64>::new());
-    assert_eq!(body["prev"], Value::Null);
+    assert_eq!(body["next_cursor"], Value::Null);
 }
 
 #[tokio::test]
@@ -580,16 +628,75 @@ async fn bad_parameters_are_400() {
         vec![("until", "2026-10-23")],
         vec![("agent", "")],
         vec![("chain_id", "")],
+        // Removed paging parameters are refused, not ignored.
         vec![("before", "5")],
-        vec![("order", "desc"), ("from", "5")],
         vec![("order", "desc"), ("before", "0")],
+        vec![("from", "0")],
+        vec![("to", "0")],
+        vec![("from", "5"), ("to", "4")],
+        // Out-of-range limits are refused, not clamped.
+        vec![("limit", "0")],
+        vec![("limit", "1001")],
     ] {
         let (status, body) = h.get("/admin/audit", &query).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{query:?}");
         assert_eq!(body["error"], "invalid_request", "{query:?}");
     }
-    let (status, _) = h.get("/admin/audit/checkpoints", &[("before", "0")]).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = h.get("/admin/audit", &[("limit", "1000")]).await;
+    assert_eq!(status, StatusCode::OK);
+    for query in [
+        vec![("before", "0")],
+        vec![("limit", "0")],
+        vec![("limit", "1001")],
+    ] {
+        let (status, body) = h.get("/admin/audit/checkpoints", &query).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query:?}");
+        assert_eq!(body["error"], "invalid_request", "{query:?}");
+    }
+}
+
+#[tokio::test]
+async fn malformed_or_foreign_cursors_are_400_invalid_cursor() {
+    let h = Harness::with_fixture().await;
+    let (_, asc) = h.get("/admin/audit", &[("limit", "2")]).await;
+    let asc = asc["next_cursor"].as_str().unwrap().to_string();
+    let (_, desc) = h
+        .get("/admin/audit", &[("limit", "2"), ("order", "desc")])
+        .await;
+    let desc = desc["next_cursor"].as_str().unwrap().to_string();
+    assert_ne!(asc, desc);
+    // The cursor carries no filter value: the same page position under a filter on a
+    // subject gives the same cursor as without it.
+    let (_, filtered) = h
+        .get("/admin/audit", &[("limit", "1"), ("subject", "alice")])
+        .await;
+    let c = filtered["next_cursor"].as_str().unwrap();
+    assert!(!c.contains("alice"));
+
+    let mut tampered = asc.clone().into_bytes();
+    tampered[0] = if tampered[0] == b'B' { b'C' } else { b'B' };
+    let tampered = String::from_utf8(tampered).unwrap();
+    let cases: Vec<(&str, Vec<(&str, &str)>)> = vec![
+        ("/admin/audit", vec![("cursor", "")]),
+        ("/admin/audit", vec![("cursor", "not-a-cursor")]),
+        ("/admin/audit", vec![("cursor", "%%%")]),
+        ("/admin/audit", vec![("cursor", &tampered)]),
+        // Issued for the other order.
+        ("/admin/audit", vec![("cursor", &desc)]),
+        ("/admin/audit", vec![("cursor", &asc), ("order", "desc")]),
+        // Issued by another list.
+        ("/admin/audit/checkpoints", vec![("cursor", &desc)]),
+        ("/admin/approvals", vec![("cursor", &desc)]),
+    ];
+    for (path, query) in cases {
+        let (status, body) = h.get(path, &query).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path} {query:?}: {body}");
+        assert_eq!(body["error"], "invalid_cursor", "{path} {query:?}");
+        let detail = body["detail"].as_str().unwrap();
+        for (_, v) in &query {
+            assert!(v.len() < 4 || !detail.contains(v), "{detail} quotes {v}");
+        }
+    }
 }
 
 #[tokio::test]
@@ -698,21 +805,25 @@ async fn listing_checkpoints_never_signs_one() {
         .map(|c| c["seq"].as_u64().unwrap())
         .collect();
     assert_eq!(seqs, [13, 12]);
-    assert_eq!(body["prev"], Value::Null);
+    assert_eq!(body["next_cursor"], Value::Null);
     for field in ["seq", "head_hash", "at", "kid", "signature"] {
         assert!(body["checkpoints"][0].get(field).is_some(), "{field}");
     }
     let (_, page) = h.get("/admin/audit/checkpoints", &[("limit", "1")]).await;
     assert_eq!(page["checkpoints"][0]["seq"], 13);
-    assert_eq!(page["prev"], 13);
+    let cursor = page["next_cursor"].as_str().unwrap().to_string();
+    // A checkpoint signed while paging sorts above the first page and does not shift it.
+    h.state.audit.append(FIXTURE[0].record(15)).unwrap();
+    h.get("/admin/audit/checkpoint", &[]).await;
     let (_, page) = h
         .get(
             "/admin/audit/checkpoints",
-            &[("limit", "1"), ("before", "13")],
+            &[("limit", "1"), ("cursor", &cursor)],
         )
         .await;
     assert_eq!(page["checkpoints"][0]["seq"], 12);
-    assert_eq!(h.checkpoint_rows(), 2, "listing must not sign");
+    assert_eq!(page["next_cursor"], Value::Null, "12 is the oldest");
+    assert_eq!(h.checkpoint_rows(), 3, "listing must not sign");
 }
 
 #[tokio::test]
@@ -769,4 +880,158 @@ async fn the_new_routes_need_the_admin_bearer() {
         let body: Value = r.json().await.unwrap();
         assert_eq!(body["error"], "admin_disabled");
     }
+}
+
+/// Approvals created straight in the store: `runs` runs (root leases `run0`, `run1`, ...) of
+/// `per_run` approvals each, created round-robin, every one decided at once (even index
+/// granted, odd declined) so no run reaches the pending cap. Returns the ids in creation
+/// order.
+fn seed_approvals(h: &Harness, runs: usize, per_run: usize, first: usize) -> Vec<String> {
+    use attenuo_audit::{Approval, ApprovalMethod, ApprovalState, ApprovalStore, Approver};
+    use attenuo_core::{Capability, CapabilitySet, DelegationChain, OriginatingUser};
+    let now = time::OffsetDateTime::now_utc();
+    let far = datetime!(2099-01-01 00:00 UTC);
+    let mut ids = Vec::new();
+    for i in first..first + runs * per_run {
+        let run = format!("run{}", i % runs);
+        let lease = LeaseId::new(&run);
+        h.state.leases.register(&lease, None, far).unwrap();
+        let chain = DelegationChain::root(
+            OriginatingUser {
+                subject: "alice".into(),
+                issuer: "https://idp.example".into(),
+                authenticated_at: now,
+                attributes: Default::default(),
+            },
+            AgentId::new("planner"),
+            CapabilitySet::from_iter(vec![Capability::new("github", "*")]),
+            now,
+            time::Duration::hours(1),
+            lease.clone(),
+        )
+        .unwrap();
+        let a = Approval {
+            id: uuid::Uuid::new_v4().to_string(),
+            chain_id: lease.clone(),
+            lease,
+            call_hash: format!("{i:064x}"),
+            server: "github".into(),
+            tool: "delete_repo".into(),
+            arguments: serde_json::json!({ "n": i }),
+            labels: Vec::new(),
+            untrusted_args: Vec::new(),
+            decision_id: uuid::Uuid::new_v4().to_string(),
+            chain,
+            created_at: now,
+            expires_at: now + time::Duration::minutes(10),
+            state: ApprovalState::Pending,
+            approver: None,
+            decided_at: None,
+            consumed_by: None,
+            jkt: None,
+        };
+        let (a, created) = h.state.leases.create_approval(&a).unwrap();
+        assert!(created);
+        let approver = Approver {
+            subject: "urn:attenuo:admin".into(),
+            method: ApprovalMethod::AdminToken,
+        };
+        h.state
+            .leases
+            .decide_approval(&a.id, i.is_multiple_of(2), &approver, now)
+            .unwrap();
+        ids.push(a.id);
+    }
+    ids
+}
+
+/// Follow `next_cursor` of `GET /admin/approvals` with `query` until it is null; the ids seen.
+async fn approval_pages(
+    h: &Harness,
+    query: &[(&str, &str)],
+    mut between: impl FnMut(),
+) -> Vec<String> {
+    let mut seen = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..1000 {
+        let mut q = query.to_vec();
+        if let Some(c) = cursor.as_deref() {
+            q.push(("cursor", c));
+        }
+        let (status, body) = h.get("/admin/approvals", &q).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(keys(&body), BTreeSet::from(["approvals", "next_cursor"]));
+        seen.extend(
+            body["approvals"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|a| a["approval_id"].as_str().unwrap().to_string()),
+        );
+        match body["next_cursor"].as_str() {
+            Some(c) => cursor = Some(c.to_string()),
+            None => return seen,
+        }
+        between();
+    }
+    panic!("paging did not end");
+}
+
+/// K-7: the list stopped at the newest 500. Every approval is reachable now, newest first,
+/// once each, under the filters, and approvals created while paging do not shift the rest.
+#[tokio::test]
+async fn every_approval_is_reachable_past_500() {
+    let h = Harness::with_fixture().await;
+    let mut ids = seed_approvals(&h, 3, 220, 0);
+    ids.reverse();
+    assert_eq!(ids.len(), 660);
+
+    // The default page (100) and the largest (500) both reach every one.
+    assert_eq!(approval_pages(&h, &[], || {}).await, ids);
+    assert_eq!(approval_pages(&h, &[("limit", "500")], || {}).await, ids);
+    let (_, first) = h.get("/admin/approvals", &[]).await;
+    assert_eq!(first["approvals"].as_array().unwrap().len(), 100);
+
+    // New approvals while paging sort above the first page.
+    let mut next = 10_000;
+    let state_h = &h;
+    let mut added = 0;
+    let got = approval_pages(&h, &[("limit", "250")], || {
+        seed_approvals(state_h, 1, 1, next);
+        next += 1;
+        added += 1;
+    })
+    .await;
+    assert_eq!(got, ids);
+    assert_eq!(added, 2);
+
+    // chain_id and state still filter, before the limit, with the cursor.
+    let want: Vec<String> = ids
+        .iter()
+        .enumerate()
+        .filter(|(k, _)| {
+            let i = 659 - k;
+            i % 3 == 1 && i.is_multiple_of(2)
+        })
+        .map(|(_, id)| id.clone())
+        .collect();
+    assert_eq!(want.len(), 110);
+    let got = approval_pages(
+        &h,
+        &[("chain_id", "run1"), ("state", "granted"), ("limit", "7")],
+        || {},
+    )
+    .await;
+    assert_eq!(got, want);
+
+    for limit in ["0", "501"] {
+        let (status, body) = h.get("/admin/approvals", &[("limit", limit)]).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{limit}");
+        assert_eq!(body["error"], "invalid_request");
+    }
+    let (status, body) = h
+        .get("/admin/approvals", &[("cursor", "AAAAAAAAAAAAAAA")])
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "invalid_cursor");
 }

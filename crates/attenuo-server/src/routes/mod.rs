@@ -6,6 +6,7 @@ pub mod authzen;
 pub mod dev_root;
 pub mod extract;
 pub mod ops;
+pub mod page;
 pub mod policies;
 pub mod renew;
 pub mod token;
