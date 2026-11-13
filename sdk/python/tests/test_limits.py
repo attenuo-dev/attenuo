@@ -553,6 +553,51 @@ def test_assertion_expiry_reads_exp_without_verifying(claims: Any, exp: int | No
 
 
 @pytest.mark.parametrize(
+    "payload",
+    [
+        b'{"exp": 1' + b"0" * 400 + b"}",  # an int no float holds
+        b'{"exp": -1' + b"0" * 400 + b"}",
+        b"[" * 100_000 + b"]" * 100_000,  # deeper than Python's JSON decoder recurses
+    ],
+    ids=["huge", "huge-negative", "deep"],
+)
+def test_assertion_expiry_of_a_payload_it_cannot_use_is_none_sr113(payload: bytes) -> None:
+    """An assertion the caller did not mint can carry any payload. One whose ``exp`` no
+    deadline can be made of, or that the JSON decoder cannot read, is read as having no
+    ``exp`` (the server judges it), instead of raising ``OverflowError`` after the request
+    was sent or ``RecursionError`` before (SR-113)."""
+    from attenuo import _retry, _wire
+
+    part = base64.urlsafe_b64encode(payload).decode().rstrip("=")
+    exp = _wire.assertion_expiry({"client_assertion": f"e30.{part}.sig"})
+    assert exp is None
+    assert _retry.left_until(exp) is None
+
+
+async def test_an_exchange_with_an_unusable_assertion_exp_gets_the_servers_answer_sr113(
+    make: Any,  # noqa: F811
+    sleeps: list[float],
+    clock: list[float],
+) -> None:
+    """The deadline was computed on every answer, a success too, so an ``exp`` beyond the
+    float range raised ``OverflowError`` whatever the server said (SR-113)."""
+    child = Signer().mint(("planner", "coder"))
+    part = base64.urlsafe_b64encode(b'{"exp": 1' + b"0" * 400 + b"}").decode().rstrip("=")
+    ok = httpx.Response(200, json=token_response(child, "lease-1"))
+    client, _ = make(sequence(rest_rate_limited("5"), ok), max_retries=1, max_retry_delay=60)
+    tok = await call(
+        client,
+        "exchange",
+        Signer().mint(),
+        "coder",
+        "github:read_file",
+        client_assertion=f"e30.{part}.sig",
+    )
+    assert tok.lease == "lease-1"
+    assert sleeps == [5.0]
+
+
+@pytest.mark.parametrize(
     "name,args,path",
     [
         ("authzen_configuration", (), "/.well-known/authzen-configuration"),

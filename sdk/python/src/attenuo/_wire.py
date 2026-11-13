@@ -406,6 +406,10 @@ def exchange_body(
     return body
 
 
+# The largest ``exp`` magnitude :func:`assertion_expiry` reads: the server's ``i64`` seconds.
+_EXP_LIMIT = 2**63 - 1
+
+
 def assertion_expiry(body: dict[str, Any]) -> int | None:
     """The ``exp`` of the ``client_assertion`` in a ``POST /token`` ``body``, read without
     verifying anything; ``None`` when the body has none or its ``exp`` cannot be read.
@@ -421,14 +425,17 @@ def assertion_expiry(body: dict[str, Any]) -> int | None:
         return None
     try:
         claims = json.loads(_b64url_decode(parts[1]))
-    except (AttenuoError, ValueError):
+    except (AttenuoError, ValueError, RecursionError):
+        # RecursionError: nesting deeper than the decoder recurses (SR-113).
         return None
     exp = claims.get("exp") if isinstance(claims, dict) else None
     if isinstance(exp, bool):
         return None
     if isinstance(exp, int):
-        return exp
-    if isinstance(exp, float) and math.isfinite(exp):
+        # One no float holds would make the retry's deadline raise OverflowError (SR-113);
+        # the server's `numeric_date` refuses it anyway.
+        return exp if -_EXP_LIMIT <= exp <= _EXP_LIMIT else None
+    if isinstance(exp, float) and math.isfinite(exp) and -_EXP_LIMIT <= exp <= _EXP_LIMIT:
         return int(exp)
     return None
 
