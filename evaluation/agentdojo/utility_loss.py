@@ -52,8 +52,16 @@ from collections import defaultdict
 from pathlib import Path
 
 SUITES = ("slack", "banking", "travel")
-REASONS = ("capability_denied", "policy_deny", "budget_exhausted", "input_type_mismatch")
-CAUSES = tuple(f"needed: {r}" for r in REASONS) + ("derailed after a refusal", "no refusal")
+REASONS = (
+    "capability_denied",
+    "policy_deny",
+    "budget_exhausted",
+    "input_type_mismatch",
+)
+CAUSES = tuple(f"needed: {r}" for r in REASONS) + (
+    "derailed after a refusal",
+    "no refusal",
+)
 LABELS = {
     "needed: capability_denied": "Needed tool denied: outside the grant",
     "needed: policy_deny": "Needed tool denied: suite policy",
@@ -62,7 +70,9 @@ LABELS = {
     "derailed after a refusal": "Only unneeded calls denied, task still failed",
     "no refusal": "No refusal (different model path)",
 }
-GAINED_LABELS = dict(LABELS, **{"derailed after a refusal": "Only unneeded calls denied"})
+GAINED_LABELS = dict(
+    LABELS, **{"derailed after a refusal": "Only unneeded calls denied"}
+)
 VERSION = "v1.2.2"
 # Arguments not compared when matching a call to the ground truth, as in replay.py.
 FREE_TEXT = {"subject", "body", "title", "description", "content", "location", "query"}
@@ -85,13 +95,18 @@ def write_ground_truth(results: Path) -> None:
         out["suites"][name] = {
             "user": {
                 tid: [
-                    {"tool": c.function, "args": json.loads(json.dumps(dict(c.args), default=str))}
+                    {
+                        "tool": c.function,
+                        "args": json.loads(json.dumps(dict(c.args), default=str)),
+                    }
                     for c in task.ground_truth(env.model_copy(deep=True))
                 ]
                 for tid, task in sorted(suite.user_tasks.items())
             },
             "injection": {
-                tid: sorted({c.function for c in task.ground_truth(env.model_copy(deep=True))})
+                tid: sorted(
+                    {c.function for c in task.ground_truth(env.model_copy(deep=True))}
+                )
                 for tid, task in sorted(suite.injection_tasks.items())
             },
         }
@@ -106,7 +121,9 @@ def load_rows(path: Path) -> dict:
     for line in path.read_text(encoding="utf-8").splitlines():
         row = json.loads(line)
         kind = "attack" if row.get("attack") else "benign"
-        out[row["arm"]][(kind, row["suite"], row["user"], row.get("attack"))] = bool(row["utility"])
+        out[row["arm"]][(kind, row["suite"], row["user"], row.get("attack"))] = bool(
+            row["utility"]
+        )
     return out
 
 
@@ -134,7 +151,9 @@ def classify(denied: list, truth: list) -> tuple[str, str | None, bool]:
         if tool in needed:
             if reason not in REASONS:
                 raise SystemExit(f"unknown denial reason {reason!r}")
-            match = any(c["tool"] == tool and pinned(c["args"]) == pinned(args) for c in truth)
+            match = any(
+                c["tool"] == tool and pinned(c["args"]) == pinned(args) for c in truth
+            )
             return f"needed: {reason}", tool, match
     if denied:
         return "derailed after a refusal", None, False
@@ -201,6 +220,9 @@ def analyse(results: Path) -> dict:
             lost, gained = sum(cell["lost"].values()), sum(cell["gained"].values())
             cell["lost_total"], cell["gained_total"] = lost, gained
             cell["lost_user_tasks"] = len(cell["lost_user_tasks"])
+            # Sanity check: lost minus gained is the difference of the two arms' totals.
+            if lost - gained != cell["stock"] - cell["attenuo"]:
+                raise SystemExit(f"lost - gained != stock - attenuo: {cell}")
         by_user: dict = defaultdict(int)
         for case in report["cases"]:
             if case["kind"] == kind and case["direction"] == "lost":
@@ -208,8 +230,6 @@ def analyse(results: Path) -> dict:
         per["total"]["lost_by_user_task"] = dict(
             sorted(by_user.items(), key=lambda kv: (-kv[1], kv[0]))
         )
-            # Sanity check: lost minus gained is the difference of the two arms' totals.
-            assert lost - gained == cell["stock"] - cell["attenuo"], cell
         report["kinds"][kind] = per
     return report
 
@@ -231,7 +251,8 @@ def markdown(report: dict) -> str:
         lines.append(
             "| Finished, stock / attenuo (of pairs) | "
             + " | ".join(
-                f"{per[c]['stock']} / {per[c]['attenuo']} (of {per[c]['pairs']})" for c in cols
+                f"{per[c]['stock']} / {per[c]['attenuo']} (of {per[c]['pairs']})"
+                for c in cols
             )
             + " |"
         )
@@ -264,12 +285,16 @@ def markdown(report: dict) -> str:
                     )
                 for key, text in extra:
                     lines.append(
-                        f"| *{text}* | " + " | ".join(str(per[c][key]) for c in cols) + " |"
+                        f"| *{text}* | "
+                        + " | ".join(str(per[c][key]) for c in cols)
+                        + " |"
                     )
         lines += [
             "",
             "Lost cases by user task: "
-            + ", ".join(f"{u} {n}" for u, n in per["total"]["lost_by_user_task"].items())
+            + ", ".join(
+                f"{u} {n}" for u, n in per["total"]["lost_by_user_task"].items()
+            )
             + ".",
             "",
         ]
@@ -277,7 +302,9 @@ def markdown(report: dict) -> str:
 
 
 def main(argv: list[str]) -> None:
-    if len(argv) not in (2, 3) or (len(argv) == 3 and argv[2] != "--write-ground-truth"):
+    if len(argv) not in (2, 3) or (
+        len(argv) == 3 and argv[2] != "--write-ground-truth"
+    ):
         sys.exit(__doc__)
     results = Path(argv[1])
     if len(argv) == 3:
