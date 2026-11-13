@@ -165,17 +165,47 @@ impl From<ExchangeRequest> for ExchangeRequestWire {
     }
 }
 
+/// Why a JSON value is not an [`ExchangeRequest`] ([`ExchangeRequest::from_json`]). The
+/// variant tells the cases apart; the text is for people. Deserializing through `serde` gives
+/// the same text, with the variant lost.
+#[derive(Debug, thiserror::Error)]
+pub enum ExchangeRequestError {
+    /// A field is missing or does not have its type.
+    #[error("{0}")]
+    Malformed(serde_json::Error),
+    /// `grant_type` is not [`TOKEN_EXCHANGE_GRANT_TYPE`].
+    #[error("unsupported grant_type `{0}`")]
+    UnsupportedGrantType(String),
+    /// `subject_token_type` is not the JWT token type URN.
+    #[error("unsupported subject_token_type `{0}`")]
+    UnsupportedSubjectTokenType(String),
+}
+
+impl ExchangeRequest {
+    /// Read a request from its RFC 8693 JSON shape, saying why when it is not one.
+    ///
+    /// # Errors
+    ///
+    /// [`ExchangeRequestError::Malformed`] for a missing or ill-typed field, else
+    /// [`ExchangeRequestError::UnsupportedGrantType`] or
+    /// [`ExchangeRequestError::UnsupportedSubjectTokenType`].
+    pub fn from_json(value: serde_json::Value) -> Result<Self, ExchangeRequestError> {
+        let wire: ExchangeRequestWire =
+            serde_json::from_value(value).map_err(ExchangeRequestError::Malformed)?;
+        Self::try_from(wire)
+    }
+}
+
 impl TryFrom<ExchangeRequestWire> for ExchangeRequest {
-    type Error = String;
+    type Error = ExchangeRequestError;
 
     fn try_from(wire: ExchangeRequestWire) -> Result<Self, Self::Error> {
         if wire.grant_type != TOKEN_EXCHANGE_GRANT_TYPE {
-            return Err(format!("unsupported grant_type `{}`", wire.grant_type));
+            return Err(ExchangeRequestError::UnsupportedGrantType(wire.grant_type));
         }
         if wire.subject_token_type != JWT_TOKEN_TYPE_URN {
-            return Err(format!(
-                "unsupported subject_token_type `{}`",
-                wire.subject_token_type
+            return Err(ExchangeRequestError::UnsupportedSubjectTokenType(
+                wire.subject_token_type,
             ));
         }
         let requested = wire
@@ -264,7 +294,52 @@ mod tests {
             "subject_token_type": JWT_TOKEN_TYPE_URN,
             "actor": "a",
         });
-        assert!(serde_json::from_value::<ExchangeRequest>(v).is_err());
+        assert!(serde_json::from_value::<ExchangeRequest>(v.clone()).is_err());
+        assert!(matches!(
+            ExchangeRequest::from_json(v),
+            Err(ExchangeRequestError::UnsupportedGrantType(g)) if g == "client_credentials"
+        ));
+    }
+
+    /// `from_json` names the case by its variant, with the text `serde` gives; a field whose
+    /// own error quotes another case's text is still malformed.
+    #[test]
+    fn from_json_tells_the_cases_apart_by_type() {
+        let base = json!({
+            "grant_type": TOKEN_EXCHANGE_GRANT_TYPE,
+            "subject_token": "x",
+            "subject_token_type": JWT_TOKEN_TYPE_URN,
+            "actor": "a",
+        });
+        let with = |k: &str, v: serde_json::Value| {
+            let mut b = base.clone();
+            b[k] = v;
+            b
+        };
+        let cases = [
+            with("subject_token_type", json!("urn:example:saml")),
+            with("grant_type", json!("password")),
+            with("requested_ttl_seconds", json!("unsupported grant_type")),
+        ];
+        for v in cases {
+            let serde_text = serde_json::from_value::<ExchangeRequest>(v.clone())
+                .unwrap_err()
+                .to_string();
+            let e = ExchangeRequest::from_json(v).unwrap_err();
+            assert_eq!(e.to_string(), serde_text);
+        }
+        assert!(matches!(
+            ExchangeRequest::from_json(with("subject_token_type", json!("t"))),
+            Err(ExchangeRequestError::UnsupportedSubjectTokenType(t)) if t == "t"
+        ));
+        assert!(matches!(
+            ExchangeRequest::from_json(with(
+                "requested_ttl_seconds",
+                json!("unsupported grant_type")
+            )),
+            Err(ExchangeRequestError::Malformed(_))
+        ));
+        assert!(ExchangeRequest::from_json(base).is_ok());
     }
 
     #[test]

@@ -35,7 +35,7 @@ pub(crate) use attenuo_token::client_assertion::CLIENT_ASSERTION_TYPE;
 
 use crate::config::{AgentConfig, CLIENT_ASSERTION_ALGS};
 use crate::error::ApiError;
-use crate::replay::ReplayCache;
+use crate::replay::{ReplayCache, ReplayRefusal};
 use crate::routes::admin::constant_time_eq;
 
 /// Which list is being authenticated against; only changes error texts and sub-codes.
@@ -658,12 +658,9 @@ impl Authenticated {
         now: OffsetDateTime,
     ) -> Result<String, ApiError> {
         if let Some((key, until)) = &self.replay {
-            replay.use_once(key, *until, now).map_err(|e| {
-                if e.description == Some("replayed") {
-                    AssertionError::Replayed.into()
-                } else {
-                    e
-                }
+            replay.use_once(key, *until, now).map_err(|r| match r {
+                ReplayRefusal::Replayed => ApiError::from(AssertionError::Replayed),
+                ReplayRefusal::Full | ReplayRefusal::Unavailable => ApiError::from(r),
             })?;
         }
         Ok(self.id)
