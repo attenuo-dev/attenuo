@@ -83,9 +83,11 @@ impl Harness {
         cfg.dev.allow_root_mint = true;
         cfg.agents = AGENTS
             .iter()
-            .map(|id| attenuo_server::config::AgentConfig {
-                id: (*id).into(),
-                secret_sha256: sha256_hex(&format!("{id}-secret")),
+            .map(|id| {
+                attenuo_server::config::AgentConfig::with_secret_sha256(
+                    *id,
+                    sha256_hex(&format!("{id}-secret")),
+                )
             })
             .collect();
         let (router, state) = attenuo_server::build(&cfg).unwrap();

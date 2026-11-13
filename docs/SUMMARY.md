@@ -84,6 +84,7 @@
   - [ADR-0014: Request limits](decisions/0014-request-limits.md)
   - [ADR-0015: Audit retention](decisions/0015-audit-retention.md)
   - [ADR-0016: Admin operators](decisions/0016-admin-operators.md)
+  - [ADR-0017: Client authentication with private_key_jwt](decisions/0017-private-key-jwt.md)
 
 # Research
 

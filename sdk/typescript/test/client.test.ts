@@ -171,6 +171,34 @@ describe("exchange", () => {
     ).rejects.toThrow(TypeError);
   });
 
+  it("sends a client assertion instead of a secret", async () => {
+    const { fetch, calls } = mockFetch(() => jsonResponse(tokenResponse(coderJwt)));
+    const ob = new AttenuoClient(URL_, { fetch });
+    await ob.exchange(rootJwt, "coder", "github:read_file", { clientAssertion: " a.b.c\n" });
+    const body = calls[0]!.body as Record<string, unknown>;
+    expect(body).toMatchObject({
+      subject_token_type: "urn:ietf:params:oauth:token-type:jwt",
+      client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+      client_assertion: "a.b.c",
+    });
+    expect(body).not.toHaveProperty("client_id");
+    expect(body).not.toHaveProperty("client_secret");
+    // Hop 0, with a client id next to the assertion.
+    await ob.exchange("idtoken", "planner", "github:*", {
+      clientId: "planner",
+      clientAssertion: "a.b.c",
+    });
+    expect(calls[1]!.body).toMatchObject({
+      subject_token_type: "urn:ietf:params:oauth:token-type:id_token",
+      client_id: "planner",
+    });
+    for (const bad of [{ clientSecret: "s", clientAssertion: "a.b.c" }, { clientAssertion: " " }]) {
+      await expect(ob.exchange(rootJwt, "coder", "github:read_file", bad)).rejects.toThrow(
+        TypeError,
+      );
+    }
+  });
+
   it("requires clientId and clientSecret together", async () => {
     const ob = new AttenuoClient(URL_, { fetch: mockFetch(() => jsonResponse({})).fetch });
     await expect(ob.exchange("t", "a", "g:t", { clientId: "c" })).rejects.toThrow(TypeError);

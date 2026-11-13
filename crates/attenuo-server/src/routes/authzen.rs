@@ -51,7 +51,7 @@ use serde_json::{json, Value};
 
 use super::extract::Body;
 use super::parse_json;
-use crate::clientauth::{self, ClientKind};
+use crate::clientauth;
 use crate::error::{ApiError, REASON_INVALID_TOKEN, REASON_MISSING_TOKEN};
 use crate::state::AppState;
 
@@ -143,7 +143,8 @@ fn evaluate_batch(state: &AppState, headers: &HeaderMap, body: &Bytes) -> Result
         // as a single Access Evaluation request, and so does its answer.
         obj.remove("options");
         let bearer = bearer_auth(state, headers, "/access/v1/evaluations")?;
-        let r = evaluate_value(state, headers, bearer.as_ref(), raw)?;
+        let pep = pep_assertion(state, headers, &mut raw)?;
+        let r = evaluate_value(state, headers, bearer.as_ref(), pep.as_deref(), raw)?;
         return serde_json::to_value(r).map_err(ApiError::internal);
     }
     // Refuse before any evaluation runs, so an oversized batch writes nothing to the audit log.
@@ -160,6 +161,12 @@ fn evaluate_batch(state: &AppState, headers: &HeaderMap, body: &Bytes) -> Result
     let semantic = Semantic::from_options(obj.get("options"))?;
     obj.remove("options");
     let bearer = bearer_auth(state, headers, "/access/v1/evaluations")?;
+    // A PEP's client assertion authenticates the whole request once, like the bearer: its
+    // `jti` can be used only once, so the entries cannot each check it.
+    let pep = pep_assertion(state, headers, &mut raw)?;
+    let Some(obj) = raw.as_object_mut() else {
+        return Err(ApiError::internal("request body is no longer an object"));
+    };
 
     let mut results = Vec::with_capacity(items.len());
     for item in items {
@@ -178,8 +185,13 @@ fn evaluate_batch(state: &AppState, headers: &HeaderMap, body: &Bytes) -> Result
         for (k, v) in item {
             merged.insert(k, v);
         }
-        let decision = match evaluate_value(state, headers, bearer.as_ref(), Value::Object(merged))
-        {
+        let decision = match evaluate_value(
+            state,
+            headers,
+            bearer.as_ref(),
+            pep.as_deref(),
+            Value::Object(merged),
+        ) {
             Ok(r) => {
                 let decision = r.decision;
                 results.push(serde_json::to_value(r).map_err(ApiError::internal)?);
@@ -312,9 +324,38 @@ fn evaluate(
     headers: &HeaderMap,
     body: &Bytes,
 ) -> Result<EvaluationResponse, ApiError> {
-    let value = parse_json(body)?;
+    let mut value = parse_json(body)?;
     let bearer = bearer_auth(state, headers, "/access/v1/evaluation")?;
-    evaluate_value(state, headers, bearer.as_ref(), value)
+    let pep = pep_assertion(state, headers, &mut value)?;
+    evaluate_value(state, headers, bearer.as_ref(), pep.as_deref(), value)
+}
+
+/// A PEP's `private_key_jwt` client assertion (`client_assertion_type` and
+/// `client_assertion` at the top level of the body), verified against `[[peps]]` and used
+/// once: the PEP's id, or `None` when the body has no assertion. The fields are removed from
+/// the body. `pep_id`, when sent, must equal the assertion's `sub`; a `pep_secret` or HTTP
+/// Basic credentials alongside it are `multiple_client_auth`.
+fn pep_assertion(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: &mut Value,
+) -> Result<Option<String>, ApiError> {
+    let Some(obj) = body.as_object_mut() else {
+        return Ok(None);
+    };
+    let Some(assertion) = clientauth::take_client_assertion(obj)? else {
+        return Ok(None);
+    };
+    let field = |k: &str| obj.get(k).and_then(Value::as_str);
+    let now = state.now();
+    let pep = state.peps.authenticate(
+        headers,
+        field("pep_id"),
+        field("pep_secret"),
+        Some(&assertion),
+        now,
+    )?;
+    pep.commit(&state.replay, now).map(Some)
 }
 
 /// The bearer's chain and DPoP binding, checked once per HTTP request: a batch's entries share
@@ -368,14 +409,30 @@ fn bearer_auth(
     }))
 }
 
+/// Decide one evaluation. `pep_by_assertion` is the PEP a client assertion of the request
+/// authenticated ([`pep_assertion`]); without one, a PEP authenticates with its secret.
 fn evaluate_value(
     state: &AppState,
     headers: &HeaderMap,
     bearer: Option<&Bearer>,
+    pep_by_assertion: Option<&str>,
     raw: Value,
 ) -> Result<EvaluationResponse, ApiError> {
+    if raw.get("client_assertion").is_some() || raw.get("client_assertion_type").is_some() {
+        // Only the request's top level may carry an assertion (see `pep_assertion`).
+        return Err(clientauth::invalid_request(
+            "malformed_request",
+            "client_assertion goes at the top level of the request, not in an evaluation",
+        ));
+    }
     let pep_field = |k: &str| raw.get(k).and_then(Value::as_str).map(str::to_owned);
     let (pep_id, pep_secret) = (pep_field("pep_id"), pep_field("pep_secret"));
+    if pep_by_assertion.is_some() && pep_secret.is_some() {
+        return Err(clientauth::invalid_request(
+            "multiple_client_auth",
+            "use either pep_secret or client_assertion, not both (RFC 6749 §2.3)",
+        ));
+    }
     let mut req: EvaluationRequest = serde_json::from_value(raw)
         .map_err(|e| ApiError::bad_request("invalid_request", e.to_string()))?;
     let now = state.now();
@@ -387,15 +444,15 @@ fn evaluate_value(
             attach_chain(&mut req, &b.chain)?;
             // A PEP forwarding an agent's token may authenticate itself in the body (the
             // `Authorization` header holds the bearer) to receive diagnostics.
-            let pep = match pep_secret.as_deref() {
-                Some(secret) => Some(clientauth::authenticate(
-                    ClientKind::Pep,
-                    &state.peps,
-                    headers,
-                    pep_id.as_deref(),
-                    Some(secret),
-                )?),
-                None => None,
+            let pep = match (pep_by_assertion, pep_secret.as_deref()) {
+                (Some(pep), _) => Some(pep.to_owned()),
+                (None, Some(secret)) => Some(
+                    state
+                        .peps
+                        .authenticate(headers, pep_id.as_deref(), Some(secret), None, now)?
+                        .commit(&state.replay, now)?,
+                ),
+                (None, None) => None,
             };
             (None, pep.is_some())
         }
@@ -407,13 +464,13 @@ fn evaluate_value(
                      ([authzen] allow_unsigned_chain is off)",
                 ));
             }
-            let id = clientauth::authenticate(
-                ClientKind::Pep,
-                &state.peps,
-                headers,
-                pep_id.as_deref(),
-                pep_secret.as_deref(),
-            )?;
+            let id = match pep_by_assertion {
+                Some(pep) => pep.to_owned(),
+                None => state
+                    .peps
+                    .authenticate(headers, pep_id.as_deref(), pep_secret.as_deref(), None, now)?
+                    .commit(&state.replay, now)?,
+            };
             (Some(id), true)
         }
     };

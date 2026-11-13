@@ -77,6 +77,7 @@
 
 pub mod approval;
 pub mod claims;
+pub mod client_assertion;
 pub mod detached;
 pub mod dpop;
 pub mod error;

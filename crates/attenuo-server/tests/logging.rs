@@ -141,13 +141,13 @@ async fn start(redact: bool) -> Running {
     cfg.upstreams = vec![UpstreamConfig::new("github", upstream.url("/mcp"))];
     cfg.admin.token = Some(ADMIN.into());
     cfg.dev.allow_root_mint = true;
-    cfg.agents = vec![attenuo_server::config::AgentConfig {
-        id: AGENT.into(),
-        secret_sha256: {
+    cfg.agents = vec![attenuo_server::config::AgentConfig::with_secret_sha256(
+        AGENT,
+        {
             use sha2::Digest;
             hex::encode(sha2::Sha256::digest(AGENT_SECRET.as_bytes()))
         },
-    }];
+    )];
     cfg.logging.redact_subjects = redact;
     let (router, state) = attenuo_server::build(&cfg).unwrap();
     let server = spawn_router(router).await.unwrap();

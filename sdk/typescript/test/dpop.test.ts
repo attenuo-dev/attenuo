@@ -90,6 +90,42 @@ describe("DPoP keys", () => {
     }
   });
 
+  it("makes private_key_jwt client assertions", async () => {
+    const ed = await DpopKey.generate();
+    const key = await DpopKey.fromJwk({ ...ed.privateJwk(), kid: "coder-1" });
+    expect(key.kid).toBe("coder-1");
+    const a = await key.clientAssertion("coder", "https://attenuo.example", { iat: 1_000_000 });
+    const [h, p, s] = a.split(".") as [string, string, string];
+    const header = JSON.parse(Buffer.from(h, "base64url").toString()) as Json;
+    const claims = JSON.parse(Buffer.from(p, "base64url").toString()) as Json;
+    expect(header).toEqual({ alg: "EdDSA", typ: "client-authentication+jwt", kid: "coder-1" });
+    const pub = await crypto.subtle.importKey(
+      "jwk",
+      { ...ed.publicJwk } as JsonWebKey,
+      "Ed25519",
+      false,
+      ["verify"],
+    );
+    expect(
+      await crypto.subtle.verify("Ed25519", pub, unb64(s), new TextEncoder().encode(`${h}.${p}`)),
+    ).toBe(true);
+    expect(claims).toMatchObject({
+      iss: "coder",
+      sub: "coder",
+      aud: "https://attenuo.example",
+      iat: 1_000_000,
+      exp: 1_000_060,
+    });
+    const b = await key.clientAssertion("coder", "x", { kid: "other", lifetime: 30 });
+    const hb = JSON.parse(Buffer.from(b.split(".")[0]!, "base64url").toString()) as Json;
+    const pb = JSON.parse(Buffer.from(b.split(".")[1]!, "base64url").toString()) as Json;
+    expect(hb.kid).toBe("other");
+    expect(Number(pb.exp) - Number(pb.iat)).toBe(30);
+    expect(pb.jti).not.toBe(claims.jti);
+    const noKid = await ed.clientAssertion("c", "a");
+    expect(Buffer.from(noKid.split(".")[0]!, "base64url").toString()).not.toContain("kid");
+  });
+
   it("refuses public, mismatched and unsupported keys", async () => {
     const ed = await DpopKey.generate();
     const other = await DpopKey.generate();

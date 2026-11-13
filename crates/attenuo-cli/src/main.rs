@@ -14,6 +14,7 @@
 
 mod cli;
 mod client;
+mod client_key;
 mod dpop_key;
 mod health;
 mod jwt;
@@ -144,7 +145,9 @@ async fn run(cli: Cli) -> Result<Outcome> {
             print!("{}", operator_cmd::hash_output(&token, json));
             Ok(Outcome::Ok)
         }
-        Command::Key(KeyCmd::Gen { dpop }) => {
+        Command::Key(KeyCmd::Gen {
+            dpop: Some(dpop), ..
+        }) => {
             let key = dpop_key::generate(&dpop)?;
             if json {
                 print_json(&json!({"path": dpop, "jkt": key.thumbprint(), "alg": key.alg()}));
@@ -153,6 +156,33 @@ async fn run(cli: Cli) -> Result<Outcome> {
                 println!("jkt  {}", key.thumbprint());
             }
             Ok(Outcome::Ok)
+        }
+        Command::Key(KeyCmd::Gen {
+            client: Some(path),
+            kid,
+            ..
+        }) => {
+            let (key, kid) = client_key::generate(&path, kid.as_deref())?;
+            let jwks = client_key::jwks_line(&key, &kid);
+            if json {
+                print_json(&json!({
+                    "path": path, "kid": kid, "alg": key.alg(),
+                    "jwk": client_key::public_jwk(&key, &kid),
+                }));
+            } else {
+                println!(
+                    "wrote client key {} ({}, kid {kid})",
+                    path.display(),
+                    key.alg()
+                );
+                println!("add to the agent's [[agents]] (or the PEP's [[peps]]) entry:");
+                println!("{jwks}");
+            }
+            Ok(Outcome::Ok)
+        }
+        Command::Key(KeyCmd::Gen { .. }) => {
+            // clap requires one of --dpop and --client.
+            anyhow::bail!("pass --dpop <PATH> or --client <PATH>")
         }
         Command::Token(TokenCmd::Root(a)) => {
             let client = client?;
@@ -222,17 +252,37 @@ async fn run(cli: Cli) -> Result<Outcome> {
             if let Some(may_act) = a.may_act_claim()? {
                 body["may_act"] = json!({ "sub": may_act });
             }
-            let secret = secrets::resolve(
-                "client secret",
-                a.client_secret,
-                a.client_secret_stdin,
-                a.client_secret_file.as_deref(),
-                secrets::CLIENT_SECRET_ENV,
-                &mut stdin,
-            )?;
-            if let Some(secret) = secret {
-                body["client_id"] = a.client_id.unwrap_or_else(|| a.actor.clone()).into();
-                body["client_secret"] = secret.into();
+            let client_id = a.client_id.clone().unwrap_or_else(|| a.actor.clone());
+            if let Some(path) = &a.client_key {
+                // private_key_jwt: an assertion instead of a secret (the env secret is not
+                // read, so it cannot be sent alongside).
+                let audience = match &a.client_assertion_audience {
+                    Some(aud) => aud.clone(),
+                    None => client_key::token_issuer(&subject_token).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "cannot read the subject token's `iss` for the client assertion's \
+                             audience; pass --client-assertion-audience <the server's [issuer] issuer>"
+                        )
+                    })?,
+                };
+                let assertion = client_key::assertion(path, &client_id, &audience)?;
+                body["client_id"] = client_id.into();
+                body["client_assertion_type"] =
+                    attenuo_token::client_assertion::CLIENT_ASSERTION_TYPE.into();
+                body["client_assertion"] = assertion.into();
+            } else {
+                let secret = secrets::resolve(
+                    "client secret",
+                    a.client_secret,
+                    a.client_secret_stdin,
+                    a.client_secret_file.as_deref(),
+                    secrets::CLIENT_SECRET_ENV,
+                    &mut stdin,
+                )?;
+                if let Some(secret) = secret {
+                    body["client_id"] = client_id.into();
+                    body["client_secret"] = secret.into();
+                }
             }
             let given = a
                 .subject_token_dpop_file

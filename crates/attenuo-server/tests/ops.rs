@@ -29,10 +29,11 @@ impl Harness {
         cfg.admin.token = Some("admin".into());
         cfg.dev.allow_root_mint = true;
         // Exchanges authenticate as their actor (SR-10).
-        cfg.agents.push(attenuo_server::config::AgentConfig {
-            id: "coder".into(),
-            secret_sha256: hex::encode(sha2::Sha256::digest(CODER_SECRET.as_bytes())),
-        });
+        cfg.agents
+            .push(attenuo_server::config::AgentConfig::with_secret_sha256(
+                "coder",
+                hex::encode(sha2::Sha256::digest(CODER_SECRET.as_bytes())),
+            ));
         let (router, state) = attenuo_server::build(&cfg).unwrap();
         let server = spawn_router(router).await.unwrap();
         Self {

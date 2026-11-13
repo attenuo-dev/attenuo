@@ -118,7 +118,9 @@ How the caller of an exchange (hop n to n+1) proves it is the `actor` it names, 
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `require_actor_auth` | `true` | The actor of an exchange must authenticate with a method `actor_auth` accepts. When `false`, `actor` is asserted (the server warns at start-up), but credentials that are sent are still checked. Hop 0 always needs an authenticated agent, whatever this says. |
-| `actor_auth` | `"either"` | `"secret"`: `[[agents]]` client credentials only; an `actor_token` is refused with `actor_token_not_accepted`. `"actor_token"`: an `actor_token` from an `[[actor_trust]]` issuer only; client credentials are refused with `client_auth_not_accepted`, and the server will not start without an `[[actor_trust]]` entry. `"either"`: both are accepted, and when both are sent both are checked and must name the same agent. The same rule applies to the agent at hop 0, where `"actor_token"` without a token fails with `actor_token_required`. |
+| `actor_auth` | `"either"` | `"secret"`: `[[agents]]` client credentials only, which means the client secret or a `private_key_jwt` client assertion, whichever the agent's entry holds; an `actor_token` is refused with `actor_token_not_accepted`. `"actor_token"`: an `actor_token` from an `[[actor_trust]]` issuer only; client credentials of both kinds are refused with `client_auth_not_accepted`, and the server will not start without an `[[actor_trust]]` entry. `"either"`: both are accepted, and when both are sent both are checked and must name the same agent. The same rule applies to the agent at hop 0, where `"actor_token"` without a token fails with `actor_token_required`. |
+| `client_assertion_max_lifetime_seconds` | 300 | How far ahead of the server's clock a `private_key_jwt` client assertion's `exp` may be. A later `exp` is refused with `client_assertion_lifetime_too_long`, so a leaked assertion is worth little even before it is used. 1 to 3600. |
+| `client_assertion_clock_skew_seconds` | 60 | Leeway for a client assertion's `exp`, `nbf` and `iat`, either way (the default of `[[idps]]` and `[[actor_trust]]` `clock_skew_seconds`). At most 600. |
 
 It also sets sender-constrained tokens (DPoP, RFC 9449; see [Binding tokens to keys](../guides/binding-tokens-to-keys.md)):
 
@@ -257,10 +259,17 @@ Every key fetch (`jwks_url`, or the discovery document at `issuer` and the `jwks
 
 Agents (OAuth clients) that may present user credentials at `POST /token`, and that authenticate as the `actor` of an exchange with client credentials. With none configured, every request that authenticates with client credentials is rejected (`no_agents_configured`); an agent that authenticates with an `actor_token` from `[[actor_trust]]` needs no entry here.
 
+An entry holds a secret, public keys, or both; the server refuses to start with an entry that has neither. The agent can only authenticate with what its entry holds: a secret sent for a key-only agent, or an assertion for a secret-only agent, is `client_authentication_failed`. One request uses one method; a secret and an assertion together are `multiple_client_auth`.
+
 | Key | Meaning |
 | --- | --- |
 | `id` | Client id. Must match the `actor` if one is sent. |
-| `secret_sha256` | SHA-256 of the client secret, in hex. Make it with `printf %s "$SECRET" \| sha256sum`. |
+| `secret_sha256` | Optional. SHA-256 of the client secret, in hex. Make it with `printf %s "$SECRET" \| sha256sum`. |
+| `jwks` | Optional. The agent's public keys for `private_key_jwt` (RFC 7523 §2.2) client assertions: a JWK Set as JSON text, usually in a TOML literal string (`jwks = '''{"keys": [...]}'''`). `attenuo key gen --client <path>` writes a new key and prints this line. Read once at start; changing keys takes a restart. See below. |
+
+A `jwks` must hold 1 to 8 public signing keys: RSA (2048 bits or more; `RS256`), EC P-256 (`ES256`) or OKP Ed25519 (`EdDSA`), the asymmetric algorithms the server accepts from identity providers. A key's `alg`, if given, must be that of its type; `use`, if given, must be `sig`. With more than one key every key needs a distinct `kid`. The server refuses to start, naming the entry and the key, on: text that is not a JWK Set, an empty set, a key with a private member (`d`, `p`, `q`, `dp`, `dq`, `qi`, `oth`; the message names the member, never its value), a symmetric (`oct`) key, another algorithm or curve, a short RSA modulus, or a `kid` listed twice. To rotate, add the new key with a new `kid`, restart, move the agent to it, then remove the old key and restart again. Keys are never fetched from a URL.
+
+A client assertion is checked as [the HTTP API](http-api.md#client-authentication) describes: signed by one of these keys, `iss` = `sub` = `id`, `aud` = `[issuer] issuer` and nothing else, a bounded `exp` (`[token] client_assertion_max_lifetime_seconds`), and a `jti` used once.
 
 ## `[[root_grants]]`
 
@@ -283,12 +292,13 @@ With no matching entry, no root token is issued.
 
 ## `[[peps]]`
 
-Policy enforcement points that call the AuthZEN endpoints. Same shape as `[[agents]]`; `attenuo` is reserved as an id.
+Policy enforcement points that call the AuthZEN endpoints. Same shape as `[[agents]]`, including `jwks` for `private_key_jwt`; `attenuo` is reserved as an id.
 
 | Key | Meaning |
 | --- | --- |
-| `id` | PEP id, sent as the HTTP Basic user or as `pep_id` in an evaluation body. |
-| `secret_sha256` | SHA-256 of the PEP's secret, in hex. |
+| `id` | PEP id, sent as the HTTP Basic user or as `pep_id` in an evaluation body, or as the `sub` of a client assertion. |
+| `secret_sha256` | Optional. SHA-256 of the PEP's secret, in hex. |
+| `jwks` | Optional. The PEP's public keys for client assertions, as for `[[agents]]`. A PEP sends `client_assertion_type` and `client_assertion` at the top level of the evaluation body; one assertion authenticates one HTTP request (a whole batch). |
 
 A request that authenticates as a PEP gets `context.diagnostics` under `[authzen] diagnostics = "peps"`, and only such a request may send an unsigned chain when `[authzen] allow_unsigned_chain = true` (the server refuses to start with that set and no `[[peps]]`).
 
@@ -376,7 +386,7 @@ OpenTelemetry trace export over OTLP/HTTP ([observability guide](../guides/obser
 | --- | --- | --- |
 | `sample_ratio` | `0.1` | Head sampling of new traces, 0 to 1. In `parent` mode the parent's sampled flag decides instead. Keeping every deny is a job for the collector's tail sampling. |
 | `inbound_mcp` | `"link"` | What a W3C `traceparent` on `/mcp/{server}`, `POST /token` and `POST /token/renew` does: `"link"` starts a new trace with a span link to the caller's (the caller cannot pick attenuo's trace id or force sampling), `"parent"` adopts it, `"ignore"` drops it. A missing, repeated or malformed header starts a new trace and is never a refusal. |
-| `inbound_authzen` | `"parent"` | The same for the AuthZEN routes, when the caller authenticates as a `[[peps]]` entry with HTTP Basic. Any other AuthZEN caller (a bearer, or PEP credentials in the body) gets `inbound_mcp`. |
+| `inbound_authzen` | `"parent"` | The same for the AuthZEN routes, when the caller authenticates as a `[[peps]]` entry with HTTP Basic. Any other AuthZEN caller (a bearer, or PEP credentials in the body, a client assertion included) gets `inbound_mcp`. |
 | `propagate_upstream` | `true` | Insert attenuo's own `traceparent` (its `attenuo.upstream` span) on the request to the upstream MCP server. The client's header is never forwarded. |
 | `max_queue_spans` | `2048` | Most finished spans waiting for export, 1 to 1000000. One more is dropped and counted. |
 | `max_export_batch` | `512` | Most spans in one export request, 1 to `max_queue_spans`. |

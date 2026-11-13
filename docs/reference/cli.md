@@ -1,6 +1,6 @@
 # CLI commands
 
-The `attenuo` binary comes from the `attenuo-cli` crate. It talks to a running attenuo server over HTTP, except for `key gen`, `admin operator new` and `admin operator hash`, `policy lint`, `policy test` with `--via local` (the default), `token inspect` without `--verify`, `audit verify --file` with `--jwks`, and `approval verify` with a `--jwks` file, which run offline.
+The `attenuo` binary comes from the `attenuo-cli` crate. It talks to a running attenuo server over HTTP, except for `key gen` (`--dpop` and `--client`), `admin operator new` and `admin operator hash`, `policy lint`, `policy test` with `--via local` (the default), `token inspect` without `--verify`, `audit verify --file` with `--jwks`, and `approval verify` with a `--jwks` file, which run offline.
 
 ```
 attenuo [--server URL] [--json] <command>
@@ -100,6 +100,8 @@ RFC 8693 exchange: delegate a subset of a token's capabilities to a sub-agent.
 | `--client-secret-file PATH` | Read it from the first line of a file. |
 | `--client-secret` (`ATTENUO_CLIENT_SECRET`) | The agent's client secret, required when the server has `require_actor_auth` (the default). Prefer the environment variable, stdin or a file; the flag prints a warning. |
 | `--client-id` | Client id to authenticate with. Defaults to `--actor`. |
+| `--client-key PATH` | Authenticate with `private_key_jwt` (RFC 7523) instead of a secret, for an agent whose `[[agents]]` entry has `jwks`: sign a client assertion with this private JWK (Ed25519 or P-256, as `key gen --client` writes). The assertion's `iss` and `sub` are the client id, its `kid` the file's, its `jti` fresh, and it lives one minute. Cannot be combined with the `--client-secret` forms; `ATTENUO_CLIENT_SECRET` is then ignored. |
+| `--client-assertion-audience ISSUER` | The assertion's `aud`, which must be the server's `[issuer] issuer`. Defaults to the subject token's `iss`. Needs `--client-key`. |
 | `--cap` | Capability to hand over. Required, repeatable. Must be covered by the parent. |
 | `--ttl-seconds` | Requested lifetime, clamped to the parent's expiry. |
 | `--actor-token <JWT\|->` | Authenticate `--actor` with an RFC 8693 actor token, such as a SPIFFE JWT-SVID from an `[[actor_trust]]` issuer, instead of a client secret. `-` reads it from stdin. Each token works for one exchange. |
@@ -147,6 +149,17 @@ Write a new Ed25519 DPoP key (RFC 9449) to `PATH` as a private JWK, mode 0600, a
 $ attenuo key gen --dpop coder.jwk
 wrote DPoP key coder.jwk (EdDSA)
 jkt  4MMDxQj9pafXPrWH6dxBeoSk2DpHFpEZvXvsmr6JibU
+```
+
+### `key gen --client <PATH> [--kid KID]`
+
+Write a new Ed25519 client key for `private_key_jwt` (RFC 7523) to `PATH` as a private JWK, mode 0600, and print the `jwks` line, with only its public half, to paste into the agent's `[[agents]]` entry (or a PEP's `[[peps]]` entry). The `kid` is `--kid`, or the key's RFC 7638 thumbprint. An existing file is never overwritten (exit code 1). Pass the file to `token exchange --client-key`; the SDKs read the same format. With `--json`: `{path, kid, alg, jwk}`. To rotate, generate a key with a new `kid`, add it to the entry's `jwks` next to the old one, restart, move the agent over, then remove the old key ([config](config.md#agents)).
+
+```console
+$ attenuo key gen --client coder-client.jwk --kid coder-2026-11
+wrote client key coder-client.jwk (EdDSA, kid coder-2026-11)
+add to the agent's [[agents]] (or the PEP's [[peps]]) entry:
+jwks = '''{"keys":[{"kty":"OKP","crv":"Ed25519","x":"…","kid":"coder-2026-11","alg":"EdDSA","use":"sig"}]}'''
 ```
 
 ### `admin operator new --name <NAME> --role <ROLE>` / `admin operator hash`

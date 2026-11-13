@@ -19,6 +19,7 @@
 //! | `subject_token_type` | `urn:ietf:params:oauth:token-type:jwt` |
 //! | `actor` | the sub-agent's id; the request must authenticate as this agent (below) |
 //! | `client_id`, `client_secret` | the actor's `[[agents]]` credentials; HTTP Basic also accepted |
+//! | `client_assertion_type`, `client_assertion` | instead of a secret: a `private_key_jwt` client assertion (RFC 7523 §2.2) signed by one of the actor's `[[agents]] jwks` keys (`crate::clientauth`) |
 //! | `actor_token`, `actor_token_type` | RFC 8693 §2.1: a workload-identity JWT for the actor, type `urn:ietf:params:oauth:token-type:jwt` (`crate::actor`) |
 //! | `authorization_details` | RFC 9396 list with one `{"type":"attenuo_capabilities","capabilities":[...]}`; a JSON string in form encoding |
 //! | `scope` | form only, alternative to `authorization_details`: space-separated `server:tool` |
@@ -29,8 +30,11 @@
 //! caller must authenticate as `actor`, with whichever methods `[token] actor_auth` accepts
 //! (`either` by default):
 //!
-//! - client credentials from `[[agents]]` (HTTP Basic, or `client_id` / `client_secret`); the
-//!   client id must equal `actor`. Failures are 401 `invalid_client` (sub-codes as for intake).
+//! - client credentials from `[[agents]]` (HTTP Basic, `client_id` / `client_secret`, or a
+//!   `private_key_jwt` assertion, as the agent's entry allows); the client id must equal
+//!   `actor`. Failures are 401 `invalid_client` (sub-codes as for intake, and
+//!   `client_assertion_*`). An assertion is used up as soon as it authenticates, even when the
+//!   exchange is then refused.
 //! - an `actor_token` from an `[[actor_trust]]` issuer (a SPIFFE JWT-SVID, or any JWT with a
 //!   JWKS), verified by `crate::actor::ActorTrustRegistry::verify`; the agent its `sub` maps
 //!   to must equal `actor`. Failures are 400 `invalid_request` with `actor_token_*` sub-codes.
@@ -90,7 +94,7 @@ use time::OffsetDateTime;
 use super::extract::Body;
 use super::{audit_issuance, no_store, parse_json, register_issued};
 use crate::actor::{VerifiedActor, ACTOR_TOKEN_TYPE};
-use crate::clientauth::{self, ClientKind};
+use crate::clientauth;
 use crate::config::{capability_set, ActorAuth, CapSpec};
 use crate::error::ApiError;
 use crate::limits::CallerMark;
@@ -279,13 +283,15 @@ fn exchange_sync(
     let (client_id, client_secret) = (field("client_id"), field("client_secret"));
     let subject_proof = field("subject_token_dpop");
     let mut value = value;
+    let mut assertion = None;
     if let Some(obj) = value.as_object_mut() {
         obj.remove("client_id");
         obj.remove("client_secret");
         obj.remove("subject_token_dpop");
+        assertion = clientauth::take_client_assertion(obj)?;
     }
     let mut req = parse_request(value)?;
-    let presented = client_secret.is_some() || clientauth::basic_credentials(headers)?.is_some();
+    let presented = clientauth::presented(headers, client_secret.as_deref(), assertion.as_deref())?;
     if presented && state.actor_auth == ActorAuth::ActorToken {
         return Err(clientauth::invalid_request(
             "client_auth_not_accepted",
@@ -317,13 +323,17 @@ fn exchange_sync(
                 format!("an actor_token (actor_token_type `{ACTOR_TOKEN_TYPE}`) is required"),
             ));
         }
-        let agent = clientauth::authenticate(
-            ClientKind::Agent,
-            &state.agents,
+        let client = state.agents.authenticate(
             headers,
             client_id.as_deref(),
             client_secret.as_deref(),
+            assertion.as_deref(),
+            now,
         )?;
+        let method = client.method();
+        // An assertion authenticates this one request, whatever its outcome: its `jti` is
+        // recorded now (`crate::clientauth`).
+        let agent = client.commit(&state.replay, now)?;
         if agent != req.actor.0 && mismatch.is_none() {
             mismatch = Some(clientauth::invalid_request(
                 "actor_mismatch",
@@ -334,9 +344,9 @@ fn exchange_sync(
             ));
         }
         actor_auth = if actor.is_some() {
-            "actor_token+client_secret"
+            method.with_actor_token()
         } else {
-            "client_secret"
+            method.as_str()
         };
         caller = Some(agent);
     }

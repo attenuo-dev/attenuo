@@ -141,10 +141,10 @@ impl Harness {
             tenant: None,
             client_ids: BTreeMap::new(),
         }];
-        cfg.agents = vec![AgentConfig {
-            id: "planner".into(),
-            secret_sha256: sha256_hex(PLANNER_SECRET),
-        }];
+        cfg.agents = vec![AgentConfig::with_secret_sha256(
+            "planner",
+            sha256_hex(PLANNER_SECRET),
+        )];
         cfg.actor_trust = vec![ActorTrustConfig {
             issuer: None,
             jwks_url: None,

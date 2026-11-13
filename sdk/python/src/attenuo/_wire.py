@@ -28,6 +28,8 @@ from .token import Token, decode_token, parse_time
 TOKEN_EXCHANGE_GRANT = "urn:ietf:params:oauth:grant-type:token-exchange"
 TYPE_JWT = "urn:ietf:params:oauth:token-type:jwt"
 TYPE_ID_TOKEN = "urn:ietf:params:oauth:token-type:id_token"
+#: RFC 7523 §2.2 ``client_assertion_type`` of a ``private_key_jwt`` client assertion.
+CLIENT_ASSERTION_TYPE = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
 AUTHORIZATION_DETAILS_TYPE = "attenuo_capabilities"
 
 CODE_UNAUTHORIZED = -32001
@@ -347,11 +349,17 @@ def exchange_body(
     subject_token_type: str | None,
     actor_token: str | None = None,
     may_act: Iterable[str] | None = None,
+    client_assertion: str | None = None,
 ) -> dict[str, Any]:
     if actor_token is not None and not actor_token.strip():
         raise ValueError("actor_token is empty")
-    if client_id is not None and not client_secret:
-        raise ValueError("client_id and client_secret go together")
+    if client_assertion is not None and not client_assertion.strip():
+        raise ValueError("client_assertion is empty")
+    if client_assertion is not None and client_secret:
+        # RFC 6749 §2.3: one client authentication method per request.
+        raise ValueError("use client_secret or client_assertion, not both")
+    if client_id is not None and not client_secret and client_assertion is None:
+        raise ValueError("client_id goes with client_secret or client_assertion")
     if client_secret and client_id is None:
         # A hop n+1 exchange authenticates as its actor.
         client_id = actor
@@ -360,7 +368,9 @@ def exchange_body(
         # Agent credentials (a client secret or an actor token) alone do not make this hop 0:
         # the server also requires them, as the actor's, on a hop n+1 exchange. Hop 0 is an
         # IdP credential, which is not an attenuo delegation token.
-        authenticated = client_secret is not None or actor_token is not None
+        authenticated = (
+            client_secret is not None or actor_token is not None or client_assertion is not None
+        )
         intake = authenticated and not is_delegation_token(subject_token)
         subject_token_type = TYPE_ID_TOKEN if intake else TYPE_JWT
     body: dict[str, Any] = {
@@ -380,6 +390,12 @@ def exchange_body(
     if client_secret:
         body["client_id"] = client_id
         body["client_secret"] = client_secret
+    if client_assertion is not None:
+        # RFC 7523 §2.2 private_key_jwt; the server reads the client id from its `sub`.
+        if client_id is not None:
+            body["client_id"] = client_id
+        body["client_assertion_type"] = CLIENT_ASSERTION_TYPE
+        body["client_assertion"] = client_assertion.strip()
     if actor_token is not None:
         # RFC 8693 §2.1: a workload-identity JWT (e.g. a SPIFFE JWT-SVID) for the actor.
         body["actor_token"] = actor_token.strip()
