@@ -863,6 +863,78 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
+    /// SR-109 (proposed, not fixed): pins what a full peer table does today. Requests that
+    /// authenticate an agent are never counted against their peer address, so an agent's
+    /// address is never in the table; once `rate_limit_max_keys` other addresses each sent one
+    /// unauthenticated request within their minute, `peek` answers `Full` for every new
+    /// address, and an agent with good credentials is refused `429` before it can
+    /// authenticate. When the maintainer picks one of the options in the pass 12 report, this
+    /// test changes with it.
+    #[tokio::test]
+    async fn a_full_peer_table_refuses_an_authenticated_agent_sr109() {
+        use axum::extract::Extension;
+        use axum::routing::post;
+        use tower::ServiceExt as _;
+        let (limits, metrics) = limits(|l| {
+            l.token_unauthenticated_requests_per_minute = 5;
+            l.rate_limit_max_keys = 100;
+        });
+        // A stand-in for `POST /token`: `x-agent` stands for credentials that authenticate.
+        let app = axum::Router::new()
+            .route(
+                "/token",
+                post(
+                    |State(limits): State<Arc<Limits>>,
+                     Extension(mark): Extension<CallerMark>,
+                     headers: axum::http::HeaderMap| async move {
+                        match headers.get("x-agent").and_then(|v| v.to_str().ok()) {
+                            Some(agent) => match limits.admit_agent(Some(&mark), agent) {
+                                Ok(()) => StatusCode::OK.into_response(),
+                                Err(e) => e.into_response(),
+                            },
+                            None => StatusCode::UNAUTHORIZED.into_response(),
+                        }
+                    },
+                )
+                .layer(axum::middleware::from_fn_with_state(
+                    limits.clone(),
+                    token_peer_limit,
+                )),
+            )
+            .with_state(limits.clone());
+        let send = |peer: [u8; 4], agent: Option<&'static str>| {
+            let app = app.clone();
+            async move {
+                let mut req = Request::builder().method("POST").uri("/token");
+                if let Some(agent) = agent {
+                    req = req.header("x-agent", agent);
+                }
+                let mut req = req.body(Body::empty()).unwrap();
+                req.extensions_mut()
+                    .insert(ConnectInfo(SocketAddr::from((peer, 40000))));
+                app.oneshot(req).await.unwrap().status()
+            }
+        };
+        // The agent's own address, before the flood: authenticated, never counted.
+        assert_eq!(send([192, 0, 2, 1], Some("coder")).await, StatusCode::OK);
+        // One unauthenticated request from each of 100 other addresses fills the table.
+        for i in 0..100u8 {
+            assert_eq!(
+                send([198, 51, 100, i], None).await,
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        // The agent, from the same address and good credentials: refused before it can
+        // authenticate, because its address is a new key on a full table.
+        assert_eq!(
+            send([192, 0, 2, 1], Some("coder")).await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert!(metrics.render().contains(
+            "attenuo_requests_rate_limited_total{limit=\"token_unauthenticated\",cause=\"table_full\"} 1\n"
+        ));
+    }
+
     /// With `max_in_flight` requests running, the next one is refused at once with `503`,
     /// `Retry-After` and the route's error shape, while `/healthz` is still answered; once a
     /// request ends its permit is free again.
