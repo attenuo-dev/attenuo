@@ -923,3 +923,53 @@ async fn a_nonce_retry_can_resend_its_assertion_sr111() {
     let (status, _, v) = answer(send(body, nonce).await.unwrap()).await;
     assert_eq!(status, StatusCode::OK, "the retry with the nonce: {v}");
 }
+
+/// SR-110 (proposed, not fixed): pins what a caller with no credential learns today. An
+/// assertion signed with a key of the caller's own, naming a client id, is refused with
+/// `client_authentication_failed` when no entry with keys has that id, and with a code of
+/// the key checks (`client_assertion_bad_signature`, `client_assertion_unknown_kid`) when
+/// one does. The secret path answers `client_authentication_failed` either way, so it does
+/// not tell which ids exist; the assertion path does, and says whether the entry has one
+/// key or several. When the maintainer picks one of the options in the pass 12 report,
+/// this test changes with it.
+#[tokio::test]
+async fn an_assertion_refusal_tells_which_client_ids_have_keys_sr110() {
+    let h = Harness::start(|_| {}).await;
+    let stranger = DpopKey::generate().unwrap();
+    let probe = |client: &str| {
+        let t = now().unix_timestamp();
+        stranger.sign_jws(
+            &json!({"alg": "EdDSA"}),
+            &json!({"iss": client, "sub": client, "aud": ISSUER,
+                    "jti": uuid::Uuid::new_v4().to_string(), "exp": t + 60}),
+        )
+    };
+    let mut seen = Vec::new();
+    for client in ["planner", "coder", "reviewer", "nobody"] {
+        let (root, _) = h.root().await;
+        let (status, _, v) = answer(
+            h.post(
+                "/token",
+                &exchange_body(&root, client, assertion_fields(&probe(client))),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{v}");
+        seen.push((client, code(&v).1.to_owned()));
+    }
+    assert_eq!(
+        seen,
+        [
+            // One key: the signature is checked.
+            ("planner", "client_assertion_bad_signature".to_owned()),
+            // Several keys and no kid.
+            ("coder", "client_assertion_unknown_kid".to_owned()),
+            // A secret only, and no such entry: the same answer as a wrong secret.
+            ("reviewer", "client_authentication_failed".to_owned()),
+            ("nobody", "client_authentication_failed".to_owned()),
+        ]
+    );
+    // Nothing was recorded for any of them.
+    assert_eq!(h.state.replay.len(), 0);
+}
