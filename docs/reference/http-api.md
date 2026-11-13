@@ -421,7 +421,7 @@ Every answer for one grant carries the same token. To use it, retry the call wit
 
 ## Admin
 
-All admin routes need `Authorization: Bearer <admin token>`: the `[admin] token` or the token of an `[[admin.operators]]` entry ([config](config.md#admin), [ADR-0016](../decisions/0016-admin-operators.md)). They answer 401 without a bearer or with one that matches no credential, 403 `admin_disabled` when no admin credential is configured, and 403 `admin_role_insufficient` when the credential's role is below the route's (`detail` names the role needed, never the token). Every admin answer, errors included, carries `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`.
+All admin routes need `Authorization: Bearer <admin token>`: the `[admin] token` or the token of an `[[admin.operators]]` entry ([config](config.md#admin), [ADR-0016](../decisions/0016-admin-operators.md)). They answer 401 without a bearer or with one that matches no credential (`missing_token`, `invalid_token`), 401 `admin_credential_expired` for an operator's token whose `expires_at` has passed (all three with `WWW-Authenticate: Bearer realm="attenuo-admin"`), 403 `admin_disabled` when no admin credential is configured, and 403 `admin_role_insufficient` when the credential's role is below the route's (`detail` names the role needed, never the token). Every admin answer, errors included, carries `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`.
 
 Each route needs at least one role; a role includes the ones below it. The table is `attenuo_server::operators::ROUTE_ROLES`, and a route missing from it needs `admin`.
 
@@ -429,7 +429,7 @@ Each route needs at least one role; a role includes the ones below it. The table
 | --- | --- |
 | `viewer` | `GET /admin/whoami`, `GET /admin/leases/{lease_id}`, `GET /admin/leases/{lease_id}/tree`, every `GET /admin/audit...` route (`/admin/audit/checkpoint` included: it signs a checkpoint of the head when there is none, which records no new fact), `GET /admin/policies`, `GET /admin/policies/check`, `POST /admin/policies/evaluate` (a dry run that writes nothing), `GET /admin/approvals`, `GET /admin/approvals/{id}` |
 | `operator` | `POST /admin/leases/{lease_id}/revoke`, `POST /admin/leases/revoke` (its `?preview=true` dry run included), `POST /admin/approvals/{id}` |
-| `admin` | `POST /admin/budgets/refund`, `POST /admin/policies/reload`, `POST /admin/root-token` |
+| `admin` | `POST /admin/budgets/refund`, `POST /admin/policies/reload`, `POST /admin/operators/reload`, `POST /admin/root-token` |
 
 `[admin] token` is the operator `admin` with role `admin`. The audit log records an admin action with `originating_subject` `urn:attenuo:admin` for `[admin] token`, as before operators existed, and `urn:attenuo:admin:<name>` for a named operator; an approval decided by an operator has that subject as `approver.subject` and as the approval token's `sub`.
 
@@ -437,7 +437,7 @@ Where they are served: on the main listener by default; with `[admin] listen` se
 
 | Method and path | Purpose |
 | --- | --- |
-| `GET /admin/whoami` | The credential that sent the request, `{"name": "<operator>", "role": "viewer" \| "operator" \| "admin"}`; `[admin] token` is `{"name": "admin", "role": "admin"}`. Reads nothing else and records nothing. Also on the console listener. |
+| `GET /admin/whoami` | The credential that sent the request, `{"name": "<operator>", "role": "viewer" \| "operator" \| "admin", "expires_at": "<RFC 3339>" \| null}` (`expires_at` is the operator entry's, null when it has none); `[admin] token` is `{"name": "admin", "role": "admin", "expires_at": null}`. Reads nothing else and records nothing. Also on the console listener. |
 | `GET /admin/leases/{lease_id}` | Lease state. |
 | `POST /admin/leases/{lease_id}/revoke` | Revoke the lease and all descendants. Body `{"reason": "..."}` (optional). Answers `{lease_id, revoked, reason, audit_id}`: `revoked` counts the leases that changed, `audit_id` is the `admin.lease.revoke` record (null when it could not be written; the revocation stands). The SDKs return it: Python `revoke_lease(...).audit_id`, TypeScript `(await revokeLease(...)).auditId`. |
 | `POST /admin/leases/revoke?preview` | Revoke every lease of one originating user, one delegation chain or the chain that opened one MCP session, each with its descendants, in one transaction; `preview=true` is a dry run. See [Revoke by user or chain](#revoke-by-user-or-chain) and [Revoke by session](#revoke-by-session). |
@@ -450,11 +450,26 @@ Where they are served: on the main listener by default; with `[admin] listen` se
 | `GET /admin/audit/checkpoint` | The signed checkpoint of the head, `{seq, head_hash, at, kid, signature}` (signing it now if the head has none). For keeping outside the host. `hash` repeats `head_hash` for older clients. |
 | `GET /admin/audit/export?from&to` | Entries `from..=to` (default: the whole log) and the checkpoints in that range, streamed as `application/x-ndjson`: a `header` line, `entry` lines, then `checkpoint` lines. Verify offline with `attenuo audit verify --file`. `kind`, `chain_id`, `tool` and `decision` keep only the matching entries; the header then has a `filter` member naming them and the file cannot be verified. The SDKs take the same four: Python `audit_export(kind=, chain_id=, tool=, decision=)`, TypeScript `auditExport(from, to, { kind, chainId, tool, decision })`. 400 if `from` is 0 or `to < from`, for an unknown kind or decision, more than one kind, or an empty filter value. |
 | `POST /admin/policies/reload` | Re-read the policy file. On failure the old policy stays. |
+| `POST /admin/operators/reload` | Re-read `[[admin.operators]]`, and nothing else, from the config file the server was started with, and swap them in at once. See [Operators reload](#operators-reload). Also on the console listener with `[admin_ui] allow_write = true`. |
 | `GET /admin/policies` | The policy set in force: file path, its `sha256` and `loaded_at` (startup or last successful reload), `policy_ids`, validation `warnings`, and `policies: [{id, text}]`. |
 | `GET /admin/policies/check` | Lint the policy file as it is on disk now against the running schema, with line and column for each issue, and say whether it differs from the loaded one. Loads nothing, audits nothing. 409 `check_unavailable` without `policy.policies_path`. |
 | `POST /admin/policies/evaluate` | Dry run: what the loaded policies decide for one call, given a token or a chain, and optionally the run-limit state to assume (`budget`). No lease check, no charge, no audit record, no decision metric. |
 | `POST /admin/budgets/refund` | Body `{"decision_id": "<uuid>", "reason": "..."}`: give back to every run-limit counter what that decision charged, once, for an allowed call whose effect did not happen. Answers `{decision_id, refunded, reason, audit_id}` (`refunded` counts the token-limit counters credited; the run usage and the per-user windows the decision charged are returned too (each window to the window it was charged to, even one that has ended) but not counted, so a call that charged only usage answers 0; a `distinct` value is freed, and counted, only when no other unrefunded decision used it, SR-62) and appends an `admin.budget.refund` record. When there is nothing to refund, the audit log says why: 410 `charge_pruned` when the decision's record shows a run-limit charge whose charge-log entry was pruned, 404 `not_found` for a decision that charged nothing or an unknown id, 409 `already_refunded`; see [Budget refund](#budget-refund). Also on the console listener with `[admin_ui] allow_write = true`. |
 | `POST /admin/root-token` | Development root mint. Mounted only when `[dev] allow_root_mint = true`, which refuses to start when the admin API's listener (`[admin] listen`, else `[server] listen`) is not a loopback address. |
+
+### Operators reload
+
+`POST /admin/operators/reload` (role `admin`, no body) re-reads the `[[admin.operators]]` array from the config file the server was started with (`--config` or `ATTENUO_CONFIG`), checks it with the startup rules ([config](config.md#adminoperators)) against the `[admin] token` in force, and puts it in force in one step. `[admin] token` (and `ATTENUO_ADMIN_TOKEN`) and the rest of the file are not reloaded, nor checked: only the operators are read, though the file must be TOML. Reloads run one at a time.
+
+It answers `{"added": [...], "removed": [...], "changed": [...], "audit_id": "<uuid>"}`: operator names, never a digest, `changed` meaning a different role, `token_sha256` or `expires_at`. The `admin.operators.reload` audit record names the caller as `originating_subject` and has `{path, added, removed, changed}` as its arguments (kept as their digest, as for every record). A refused reload is recorded as a `deny` whose `reason` is the refusal's code.
+
+- The caller's own entry may be removed or demoted: the request that does it completes, and the caller's next request is checked against the new list. Requests admitted before the swap complete as admitted.
+- 422 `operators_no_admin`: the new list would leave no credential with role `admin` that has not expired (there is no `[admin] token` and no such operator). Refused so that a typo cannot lock everyone out until a restart.
+- 422 `operators_invalid`: the file is not TOML, or an entry breaks a startup rule (a name, a duplicate, a digest, the `[admin] token` digest, an `expires_at` that does not parse, an unknown key or role). `detail` says which, and never quotes the file.
+- 409 `reload_unavailable`: the server was not started from a config file (a program that builds its config in code and calls `serve`).
+- 500 `config_unreadable`: the file cannot be read; the cause is in the server log only.
+
+On every refusal the operators in force are unchanged. An entry whose `expires_at` has already passed is accepted, with a warning naming it, and its token is refused.
 
 ### Budget refund
 
