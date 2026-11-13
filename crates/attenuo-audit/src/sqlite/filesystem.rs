@@ -202,7 +202,7 @@ mod tests {
     /// classifies by its low 32 bits.
     #[test]
     fn sign_extended_magic_keeps_its_low_bits() {
-        let word: i64 = i64::from(0xFF53_4D42_u32 as i32);
+        let word: i64 = i64::from(0xFF53_4D42_u32.cast_signed());
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let magic = word as u32;
         assert_eq!(classify_magic(magic), Filesystem::Network("cifs"));
