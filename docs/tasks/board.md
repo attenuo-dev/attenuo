@@ -165,7 +165,7 @@ How to read it:
 ### Evaluation and performance
 
 - [x] Injection suite: synthetic AgentDojo- and InjecAgent-shaped replay, v2 with frozen policies, dev and test splits, five arms and Wilson intervals; per-call outputs and the `attenuo_labels` arm (#41); retry after approval (#46); run-limits arms (#51, #67).
-- [x] AgentDojo replay: argument-taint arms (#161), read-side arms (#194), banking cap on the `decimal` amount (#198), planner-written grants (#233, #235, #239); a local open-weight model on slack, banking, travel and workspace (#252, #260, #282, #283).
+- [x] AgentDojo replay: argument-taint arms (#161), read-side arms (#194), banking cap on the `decimal` amount (#198), planner-written grants (#233, #235, #239); a local open-weight model on slack, banking, travel and workspace (#252, #260, #282, #283, #301).
 - [x] End-to-end benchmark (`attenuo-bench`, `scripts/bench-e2e.sh`); criterion benches for `authorize` and `covers`; proxy stage timing (`attenuo_proxy_stage_seconds`); exchange throughput, lease renewal and open-loop arrivals for the allow call.
 - [x] Policy stage cache and background WAL checkpoints; the upstream hop and blocking pool investigated (the pool stays).
 - [x] Performance measurements: WAL backstop pause (#33), limit kinds (#69), run lock (#78), token verification miss (#92), per-value limits (#113), cheaper `distinct` list charges tried and not adopted (#122); bench outputs committed behind every quoted figure (#32).
