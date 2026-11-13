@@ -213,6 +213,11 @@ impl AppState {
             metrics.clone(),
             checkpoint_sink.as_ref().map(|s| s.handle()),
         )?;
+        // Single use of credentials, in the same file as the leases it guards (`crate::replay`).
+        let replay = crate::replay::ReplayCache::new(
+            leases.clone(),
+            crate::replay::DEFAULT_REPLAY_CAPACITY,
+        );
         let approval_notifier = match &config.approvals.notify {
             Some(cfg) => Some(crate::notify::ApprovalNotifier::start(
                 cfg,
@@ -352,7 +357,7 @@ impl AppState {
             lease_interval: lease_interval(config)?,
             jwks,
             metrics,
-            replay: crate::replay::ReplayCache::default(),
+            replay,
             dpop,
             checkpoint_sink,
             sink_fails_readiness: config.audit.sink.as_ref().is_some_and(|s| s.fail_readiness),

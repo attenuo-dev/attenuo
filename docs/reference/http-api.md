@@ -139,6 +139,7 @@ The table is generated from `attenuo_core::error_codes::ERROR_CODES`, the one pl
 | `rate_limited` | 429 | `-32007` (429) |  | A rate limit is used up; retry after `Retry-After`. |
 | `reload_unavailable` | 409 |  |  | The policy cannot be reloaded in this configuration. |
 | `replay_cache_full` | 503 `temporarily_unavailable` |  |  | Too many single-use credentials are in flight; retry later. |
+| `replay_store_unavailable` | 503 `temporarily_unavailable` |  |  | The use of a single-use credential could not be recorded, so it is refused (fail closed); retry later. |
 | `replayed` | 400 `invalid_grant` |  |  | The credential or delegation was already used. |
 | `request_timeout` | 408, 503 `temporarily_unavailable` |  |  | The body did not arrive in time (408), or the route did not answer in time (503). |
 | `request_too_large` | 413 | `-32600` (413) |  | The request body is over the size limit. |

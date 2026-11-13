@@ -211,6 +211,7 @@ pub const ERROR_CODES: &[ErrorCode] = &[
     e("rate_limited", &[r(429, "rate_limited")], &[j(TOO_MANY, 429)], "A rate limit is used up; retry after `Retry-After`."),
     e("reload_unavailable", &[r(409, "reload_unavailable")], NO_RPC, "The policy cannot be reloaded in this configuration."),
     e("replay_cache_full", UNAVAILABLE_503, NO_RPC, "Too many single-use credentials are in flight; retry later."),
+    e("replay_store_unavailable", UNAVAILABLE_503, NO_RPC, "The use of a single-use credential could not be recorded, so it is refused (fail closed); retry later."),
     e("replayed", BAD_GRANT, NO_RPC, "The credential or delegation was already used."),
     e("request_timeout", &[r(408, "request_timeout"), r(503, "temporarily_unavailable")], NO_RPC, "The body did not arrive in time (408), or the route did not answer in time (503)."),
     e("request_too_large", &[r(413, "request_too_large")], &[j(INVALID_REQUEST, 413)], "The request body is over the size limit."),
