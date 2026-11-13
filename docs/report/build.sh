@@ -13,7 +13,19 @@ src="$here/$name.md"
 html="$here/$name.html"
 pdf="$here/$name.pdf"
 css="$(mktemp --suffix=.css)"
-trap 'rm -f "$css"' EXIT
+links="$(mktemp --suffix=.lua)"
+trap 'rm -f "$css" "$links"' EXIT
+
+# The Markdown links to other docs relatively (../research/x.md), which the mdBook site
+# resolves. A PDF is read on its own, so point those links at the repository instead.
+cat >"$links" <<'LUA'
+local base = "https://github.com/attenuo-dev/attenuo/blob/main/docs/"
+function Link(el)
+  local rest = el.target:match("^%.%./(.*)$")
+  if rest then el.target = base .. rest end
+  return el
+end
+LUA
 
 cat >"$css" <<'CSS'
 @page { size: A4; }
@@ -61,6 +73,7 @@ pandoc "$src" \
   --number-sections \
   --embed-resources \
   --css "$css" \
+  --lua-filter "$links" \
   --metadata lang=en \
   --output "$html"
 echo "wrote $html"
