@@ -28,3 +28,8 @@ open Attenuo
 #print axioms chain_permits_all
 #print axioms chain_root_permits
 #print axioms chainValid_extend
+#print axioms JVal.admitsAllEqual_iff
+#print axioms jsonValueJVal
+#print axioms limitsModelCallsLimit
+#print axioms concrete_covers_sound
+#print axioms concrete_attenuate_sound
