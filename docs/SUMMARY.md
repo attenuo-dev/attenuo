@@ -44,6 +44,7 @@
 - [OpenTelemetry export (built, off by default)](design/otel-export.md)
 - [Run limits phase 3 (proposed, step 1 built)](design/run-limits-phase3.md)
 - [Read-side exfiltration (proposed, steps 1 and 2 built)](design/read-side-exfiltration.md)
+- [Audit retention (proposed)](design/audit-retention.md)
 
 # Policy
 
@@ -81,6 +82,7 @@
   - [ADR-0012: OpenTelemetry export](decisions/0012-opentelemetry-export.md)
   - [ADR-0013: Admin API listener](decisions/0013-admin-api-listener.md)
   - [ADR-0014: Request limits](decisions/0014-request-limits.md)
+  - [ADR-0015: Audit retention](decisions/0015-audit-retention.md)
 
 # Research
 
