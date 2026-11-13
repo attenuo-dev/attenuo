@@ -25,8 +25,11 @@
 //! `rate_limit_max_keys`: a key whose window has ended is dropped first, and a key inside its
 //! window is never dropped, so dropping cannot reset a count. When every tracked key is inside
 //! its window, a new key is refused until the oldest window ends (`table_full`), so a flood of
-//! distinct callers cannot push out the count of the one being limited. Keys are run ids
-//! (root lease ids), agent ids and peer addresses, never a user subject.
+//! distinct callers cannot push out the count of the one being limited. The per-peer table of
+//! `POST /token` is the exception: requests that authenticate an agent never enter it, so a
+//! new address with client credentials is let through to authenticate, and refused only if it
+//! does not ([`token_peer_limit`], SR-109). Keys are run ids (root lease ids), agent ids and
+//! peer addresses, never a user subject.
 
 use std::collections::HashMap;
 use std::future::Future as _;
@@ -148,7 +151,7 @@ impl Limits {
         agent: &str,
     ) -> Result<(), ApiError> {
         if let Some(mark) = mark {
-            mark.0.store(true, Ordering::Release);
+            mark.set_authenticated();
         }
         let Some(limiter) = &self.token else {
             return Ok(());
@@ -175,7 +178,7 @@ impl Limits {
         agent: &str,
     ) -> Result<(), ApiError> {
         if let Some(mark) = mark {
-            mark.0.store(true, Ordering::Release);
+            mark.set_authenticated();
         }
         let Some(limiter) = &self.token else {
             return Ok(());
@@ -581,11 +584,67 @@ impl http_body::Body for Deadlined {
     }
 }
 
-/// Set by the `POST /token` handler once it has authenticated an agent
-/// ([`Limits::admit_agent`]), so that [`token_peer_limit`] does not count the request against
-/// its peer address.
+/// What [`token_peer_limit`] and the `POST /token` handler tell each other about a request.
+/// The handler sets it once it has authenticated an agent ([`Limits::admit_agent`],
+/// [`Limits::check_agent`]), so that the request is not counted against its peer address, and
+/// reads whether the request came in on a full peer table ([`Self::on_full_table`]).
 #[derive(Debug, Clone, Default)]
-pub(crate) struct CallerMark(Arc<AtomicBool>);
+pub(crate) struct CallerMark {
+    authenticated: Arc<AtomicBool>,
+    on_full_table: bool,
+}
+
+impl CallerMark {
+    /// The request authenticated an agent.
+    fn set_authenticated(&self) {
+        self.authenticated.store(true, Ordering::Release);
+    }
+
+    fn authenticated(&self) -> bool {
+        self.authenticated.load(Ordering::Acquire)
+    }
+
+    /// The peer is not in the per-peer table and the table is full (SR-109): the request runs
+    /// only so that it may authenticate an agent, and is refused `429` afterwards if it does
+    /// not. The handler refuses it at once, before any work, unless it carries client
+    /// credentials and no actor token ([`refuse_on_full_table`]).
+    pub(crate) fn on_full_table(&self) -> bool {
+        self.on_full_table
+    }
+}
+
+/// The `429` of a request refused by the per-peer limit, up front or after it authenticated no
+/// agent: one answer for both, so a request on a full table learns nothing more than one
+/// refused before it ran.
+fn peer_refusal(retry: u64) -> ApiError {
+    rate_limited(
+        "too many unauthenticated token requests from this address; retry later",
+        retry,
+    )
+}
+
+/// For the `POST /token` handler, before any work: on a full peer table
+/// ([`CallerMark::on_full_table`]) a request goes on only when it carries client credentials
+/// (`has_client_credentials`: a secret or a client assertion) and no actor token
+/// (`has_actor_token`). Client authentication costs a digest compare or one signature
+/// verification against keys in the config; an actor token may need a JWKS fetch from its
+/// issuer, and a request with no credential would go on to work that does not authenticate an
+/// agent at all, so neither is opened (SR-109). The refusal returned here is replaced by
+/// [`token_peer_limit`] with the counted one.
+///
+/// # Errors
+///
+/// `429` `rate_limited`.
+pub(crate) fn refuse_on_full_table(
+    mark: Option<&CallerMark>,
+    has_client_credentials: bool,
+    has_actor_token: bool,
+) -> Result<(), ApiError> {
+    if mark.is_some_and(CallerMark::on_full_table) && (!has_client_credentials || has_actor_token) {
+        return Err(peer_refusal(1));
+    }
+    Ok(())
+}
 
 /// The key of a peer address: the address itself for IPv4 (and IPv4-mapped IPv6), the /64 for
 /// IPv6, since one host commonly holds a whole /64. `unknown` when the request came without
@@ -609,14 +668,22 @@ pub(crate) fn peer_key(peer: Option<SocketAddr>) -> String {
 /// minute is refused before any work; otherwise the request runs, and counts against the peer
 /// only when the handler did not authenticate an agent ([`CallerMark`]). The peer address is
 /// never logged.
+///
+/// A peer that is not in the table when the table is full is not refused up front (SR-109):
+/// requests that authenticate an agent are never in the table, so that would refuse every
+/// agent during a flood from many addresses. The request runs with
+/// [`CallerMark::on_full_table`] set; the handler refuses at once one that carries no client
+/// credential or an actor token ([`refuse_on_full_table`]), and lets one with client
+/// credentials authenticate. If it authenticated an agent it is answered as usual and not
+/// counted here; if not, its answer is replaced by the same `429` it would have got up front,
+/// counted as `table_full`, so a failed authentication learns nothing past the refusal.
 pub(crate) async fn token_peer_limit(
     State(limits): State<Arc<Limits>>,
     mut req: Request,
     next: Next,
 ) -> Response {
-    let mark = CallerMark::default();
-    req.extensions_mut().insert(mark.clone());
     let Some(limiter) = &limits.token_peer else {
+        req.extensions_mut().insert(CallerMark::default());
         return next.run(req).await;
     };
     let peer = req
@@ -625,17 +692,29 @@ pub(crate) async fn token_peer_limit(
         .map(|c| c.0);
     let key = peer_key(peer);
     let verdict = limiter.peek(&key, Instant::now());
-    if verdict != Verdict::Admit {
-        let retry = limits.refused(RateLimitedBy::TokenUnauthenticated, &verdict);
-        tracing::debug!("token request refused: the peer is over its unauthenticated limit");
-        return rate_limited(
-            "too many unauthenticated token requests from this address; retry later",
-            retry,
-        )
-        .into_response();
-    }
+    let on_full_table = match verdict {
+        Verdict::Admit => false,
+        Verdict::Full { .. } => true,
+        Verdict::Limited { .. } => {
+            let retry = limits.refused(RateLimitedBy::TokenUnauthenticated, &verdict);
+            tracing::debug!("token request refused: the peer is over its unauthenticated limit");
+            return peer_refusal(retry).into_response();
+        }
+    };
+    let mark = CallerMark {
+        authenticated: Arc::default(),
+        on_full_table,
+    };
+    req.extensions_mut().insert(mark.clone());
     let resp = next.run(req).await;
-    if !mark.0.load(Ordering::Acquire) {
+    if on_full_table && !mark.authenticated() {
+        let retry = limits.refused(RateLimitedBy::TokenUnauthenticated, &verdict);
+        tracing::debug!(
+            "token request refused: the peer table is full and the request authenticated no agent"
+        );
+        return peer_refusal(retry).into_response();
+    }
+    if !mark.authenticated() {
         let now = Instant::now();
         // Not counted when the table filled up meanwhile: the request has run already, and
         // the next one from this peer is refused by the `peek` above.
@@ -863,76 +942,133 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
-    /// SR-109 (proposed, not fixed): pins what a full peer table does today. Requests that
-    /// authenticate an agent are never counted against their peer address, so an agent's
-    /// address is never in the table; once `rate_limit_max_keys` other addresses each sent one
-    /// unauthenticated request within their minute, `peek` answers `Full` for every new
-    /// address, and an agent with good credentials is refused `429` before it can
-    /// authenticate. When the maintainer picks one of the options in the pass 12 report, this
-    /// test changes with it.
+    /// SR-109: a full peer table does not refuse agents. Requests that authenticate an agent
+    /// are never counted against their peer address, so an agent's address is never in the
+    /// table. Once `rate_limit_max_keys` other addresses each sent one unauthenticated request
+    /// within their minute, a request from an address not in the table still runs if it
+    /// carries client credentials: an agent that authenticates is served (and not counted), one
+    /// that does not is refused with the same `429` as before, counted as `table_full`. A
+    /// request with no client credential, or with an actor token, is refused before any work.
+    /// A peer that is in the table and over its limit is still refused before the handler
+    /// runs. Before the fix the agent was refused `429` too.
     #[tokio::test]
-    async fn a_full_peer_table_refuses_an_authenticated_agent_sr109() {
+    async fn a_full_peer_table_still_serves_an_authenticated_agent_sr109() {
         use axum::extract::Extension;
         use axum::routing::post;
+        use std::sync::atomic::AtomicUsize;
         use tower::ServiceExt as _;
         let (limits, metrics) = limits(|l| {
-            l.token_unauthenticated_requests_per_minute = 5;
+            l.token_unauthenticated_requests_per_minute = 2;
             l.rate_limit_max_keys = 100;
         });
-        // A stand-in for `POST /token`: `x-agent` stands for credentials that authenticate.
+        // How many requests the handler saw, and how many it tried to authenticate.
+        let runs = Arc::new(AtomicUsize::new(0));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        // A stand-in for `POST /token`: `x-agent` stands for credentials that authenticate,
+        // `x-secret` for client credentials that do not, `x-actor` for an actor token.
+        let handler = {
+            let (runs, attempts) = (runs.clone(), attempts.clone());
+            move |State(limits): State<Arc<Limits>>,
+                  Extension(mark): Extension<CallerMark>,
+                  headers: axum::http::HeaderMap| {
+                let (runs, attempts) = (runs.clone(), attempts.clone());
+                async move {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    let has = |h: &str| headers.contains_key(h);
+                    if let Err(e) = refuse_on_full_table(
+                        Some(&mark),
+                        has("x-agent") || has("x-secret"),
+                        has("x-actor"),
+                    ) {
+                        return e.into_response();
+                    }
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    match headers.get("x-agent").and_then(|v| v.to_str().ok()) {
+                        Some(agent) => match limits.admit_agent(Some(&mark), agent) {
+                            Ok(()) => StatusCode::OK.into_response(),
+                            Err(e) => e.into_response(),
+                        },
+                        None => StatusCode::UNAUTHORIZED.into_response(),
+                    }
+                }
+            }
+        };
         let app = axum::Router::new()
             .route(
                 "/token",
-                post(
-                    |State(limits): State<Arc<Limits>>,
-                     Extension(mark): Extension<CallerMark>,
-                     headers: axum::http::HeaderMap| async move {
-                        match headers.get("x-agent").and_then(|v| v.to_str().ok()) {
-                            Some(agent) => match limits.admit_agent(Some(&mark), agent) {
-                                Ok(()) => StatusCode::OK.into_response(),
-                                Err(e) => e.into_response(),
-                            },
-                            None => StatusCode::UNAUTHORIZED.into_response(),
-                        }
-                    },
-                )
-                .layer(axum::middleware::from_fn_with_state(
+                post(handler).layer(axum::middleware::from_fn_with_state(
                     limits.clone(),
                     token_peer_limit,
                 )),
             )
             .with_state(limits.clone());
-        let send = |peer: [u8; 4], agent: Option<&'static str>| {
+        let send = |peer: [u8; 4], header: Option<(&'static str, &'static str)>| {
             let app = app.clone();
             async move {
                 let mut req = Request::builder().method("POST").uri("/token");
-                if let Some(agent) = agent {
-                    req = req.header("x-agent", agent);
+                if let Some((k, v)) = header {
+                    req = req.header(k, v);
                 }
                 let mut req = req.body(Body::empty()).unwrap();
                 req.extensions_mut()
                     .insert(ConnectInfo(SocketAddr::from((peer, 40000))));
-                app.oneshot(req).await.unwrap().status()
+                app.oneshot(req).await.unwrap()
             }
         };
+        let agent = Some(("x-agent", "coder"));
         // The agent's own address, before the flood: authenticated, never counted.
-        assert_eq!(send([192, 0, 2, 1], Some("coder")).await, StatusCode::OK);
+        assert_eq!(send([192, 0, 2, 1], agent).await.status(), StatusCode::OK);
         // One unauthenticated request from each of 100 other addresses fills the table.
         for i in 0..100u8 {
-            assert_eq!(
-                send([198, 51, 100, i], None).await,
-                StatusCode::UNAUTHORIZED
-            );
+            let status = send([198, 51, 100, i], None).await.status();
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
         }
-        // The agent, from the same address and good credentials: refused before it can
-        // authenticate, because its address is a new key on a full table.
+        let full = || {
+            metrics.render().lines().find_map(|l| {
+                l.strip_prefix(
+                    "attenuo_requests_rate_limited_total{limit=\"token_unauthenticated\",cause=\"table_full\"} ",
+                )
+                .map(|n| n.parse::<u64>().unwrap())
+            })
+            .unwrap_or(0)
+        };
+        assert_eq!(full(), 0);
+        // The agent, from its address and from one never seen: served, and not counted.
+        assert_eq!(send([192, 0, 2, 1], agent).await.status(), StatusCode::OK);
+        assert_eq!(send([192, 0, 2, 2], agent).await.status(), StatusCode::OK);
+        assert_eq!(limits.token_peer.as_ref().unwrap().tracked(), 100);
+        // Client credentials that do not authenticate, from a new address: they are tried,
+        // and the answer is the 429 a peer over its limit gets, not the handler's 401.
+        let before = attempts.load(Ordering::SeqCst);
+        let bad = send([203, 0, 113, 1], Some(("x-secret", "wrong"))).await;
+        assert_eq!(attempts.load(Ordering::SeqCst), before + 1);
+        assert_eq!(bad.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(bad.headers().contains_key(header::RETRY_AFTER));
+        let bad = json_of(bad).await;
+        // No client credential, or an actor token: refused before any authentication work.
+        for header in [None, Some(("x-actor", "token"))] {
+            let resp = send([203, 0, 113, 2], header).await;
+            assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(json_of(resp).await, bad);
+        }
+        assert_eq!(attempts.load(Ordering::SeqCst), before + 1);
+        assert_eq!(full(), 3);
+        // A peer that is in the table and over its limit (2): refused before the handler runs,
+        // with the same body, counted as `limit`.
         assert_eq!(
-            send([192, 0, 2, 1], Some("coder")).await,
-            StatusCode::TOO_MANY_REQUESTS
+            send([198, 51, 100, 7], None).await.status(),
+            StatusCode::UNAUTHORIZED
         );
+        let ran = runs.load(Ordering::SeqCst);
+        let over = send([198, 51, 100, 7], agent).await;
+        assert_eq!(over.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(runs.load(Ordering::SeqCst), ran);
+        assert_eq!(json_of(over).await, bad);
         assert!(metrics.render().contains(
-            "attenuo_requests_rate_limited_total{limit=\"token_unauthenticated\",cause=\"table_full\"} 1\n"
+            "attenuo_requests_rate_limited_total{limit=\"token_unauthenticated\",cause=\"limit\"} 1\n"
         ));
+        assert_eq!(full(), 3);
+        assert_eq!(limits.token_peer.as_ref().unwrap().tracked(), 100);
     }
 
     /// With `max_in_flight` requests running, the next one is refused at once with `503`,

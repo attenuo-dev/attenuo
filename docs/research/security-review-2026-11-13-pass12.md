@@ -30,13 +30,13 @@ Denial of service is out of scope as a security property in the threat model. SR
 | High | 0 | 0 | 0 | 0 |
 | Medium | 0 | 0 | 0 | 0 |
 | Low | 1 | 1 | 0 | 0 |
-| Info | 3 | 2 (SR-111; SR-110 after the pass) | 1 | 0 |
-| **Total** | **4** | **3** | **1** | **0** |
+| Info | 3 | 3 (SR-111; SR-109, SR-110 after the pass) | 0 | 0 |
+| **Total** | **4** | **4** | **0** | **0** |
 
 | ID | Severity | Component | Title | Status |
 |---|---|---|---|---|
 | SR-108 | Low | server (`routes/token.rs`, `idp/intake.rs`, `limits.rs`) | An agent over `token_requests_per_minute` still had its client assertion recorded, one replay-store write per refused request | Fixed, test `a_rate_limited_agent_does_not_spend_its_assertion_sr108` |
-| SR-109 | Info | server (`limits.rs` `token_peer_limit`) | A full per-peer table refuses every new address, so agents with good credentials are refused before they can authenticate | Proposed, test `a_full_peer_table_refuses_an_authenticated_agent_sr109` pins today's behaviour |
+| SR-109 | Info | server (`limits.rs` `token_peer_limit`) | A full per-peer table refuses every new address, so agents with good credentials are refused before they can authenticate | Fixed after the pass (`fix/sr-109-sr-110`, option 2), tests `a_full_peer_table_still_serves_an_authenticated_agent_sr109`, `a_full_peer_table_lets_agents_authenticate_sr109` |
 | SR-110 | Info | server (`clientauth.rs` `verify_assertion`) | A refused client assertion tells an unauthenticated caller which client ids have keys, and whether one key or several | Fixed after the pass (`fix/sr-109-sr-110`, option 1), test `an_assertion_refusal_does_not_tell_which_client_ids_have_keys_sr110` |
 | SR-111 | Info | server (`routes/token.rs`, `idp/intake.rs`, `dpop.rs`) | With `dpop_nonce = "required"`, the `use_dpop_nonce` retry of a request with a client assertion was refused as a replay | Fixed, test `a_nonce_retry_can_resend_its_assertion_sr111` |
 
@@ -53,7 +53,7 @@ Denial of service is out of scope as a security property in the threat model. SR
 - **Rejected.** Counting the request before the assertion is recorded (`admit_agent` first): a replayed assertion would then count against the agent, so whoever captured one assertion could use up the agent's minute until it expires. With the check first and the count after, a replay is refused at the store and not counted.
 - **Test.** `private_key_jwt::a_rate_limited_agent_does_not_spend_its_assertion_sr108` (exchange and hop 0: the `429` adds no marker, and the metric counts two refusals); `limits::tests::check_counts_nothing_and_shares_the_first_refusal`. The first failed before the fix.
 
-### SR-109: a full per-peer table refuses every agent that is not in it (Info, proposed)
+### SR-109: a full per-peer table refuses every agent that is not in it (Info, fixed)
 
 - **Confirmed by reading.** `limits.rs` (at `a0712f2`) `token_peer_limit` calls `limiter.peek(&key, ...)` at line 576 and refuses anything but `Admit` at line 577, before the handler runs. A request that authenticated an agent is not counted (line 587), so an agent's address is never a key of the table. `RateLimiter::peek` answers `Full` for a key it does not hold when the table holds `rate_limit_max_keys` keys inside their minute (lines 341 to 345).
 - **Attacker.** Anyone who can reach `POST /token` from `rate_limit_max_keys` addresses (10,000 by default, at least 100; an IPv6 address counts by its /64) within one minute, on a server with `token_unauthenticated_requests_per_minute` set (off by default).
@@ -67,6 +67,7 @@ Denial of service is out of scope as a security property in the threat model. SR
 
   Option 2 is the closest to what the limit promises; option 4 is the smallest change.
 - **Test.** `limits::tests::a_full_peer_table_refuses_an_authenticated_agent_sr109` pins today's behaviour and will change with the option chosen.
+- **Fixed after the pass** on `fix/sr-109-sr-110`, with option 2 ([ADR-0014 update](../decisions/0014-request-limits.md#update-2026-11-13-a-full-peer-table-lets-agents-authenticate-sr-109)). A request from an address not in a full peer table is not refused before the handler; the handler refuses it before any work unless it carries client credentials and no actor token, and one that then authenticates no agent gets the same `429` as before, counted as `table_full`. Agents with client credentials are served during the flood; an agent that sends an actor token is still refused, because verifying one may fetch its issuer's keys. A peer in the table over its limit is still refused up front. The cost: on a full table a new address gets one client authentication per request (a digest compare or one signature verification), bounded in concurrency by `max_in_flight` and not in rate. Tests `limits::tests::a_full_peer_table_still_serves_an_authenticated_agent_sr109` and `tests/limits.rs` `a_full_peer_table_lets_agents_authenticate_sr109` (the server's handler, simulated peer addresses).
 
 ### SR-110: a refused client assertion tells which client ids have keys (Info, fixed)
 

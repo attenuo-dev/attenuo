@@ -40,6 +40,32 @@ struct Harness {
     _dir: tempfile::TempDir,
 }
 
+/// The servers' config: the agents, the dev root mint and the `github` upstream.
+fn base_config(dir: &tempfile::TempDir, upstream: &Spawned) -> Config {
+    let policy_path = dir.path().join("policies.cedar");
+    std::fs::write(&policy_path, POLICY).unwrap();
+    let mut cfg = Config::default();
+    cfg.issuer.issuer = "https://attenuo.test".into();
+    cfg.issuer.audience = "attenuo-test".into();
+    cfg.issuer.private_key_pem_path = Some(dir.path().join("keys/issuer.pem"));
+    cfg.policy.policies_path = Some(policy_path);
+    cfg.policy.catalog = BTreeMap::from([(
+        "github".to_string(),
+        BTreeMap::from([(
+            "read_file".to_string(),
+            ToolAttrs::new()
+                .with_input("repo", ArgType::String)
+                .readonly(true),
+        )]),
+    )]);
+    cfg.audit.sqlite_path = ":memory:".into();
+    cfg.upstreams = vec![UpstreamConfig::new("github", upstream.url("/mcp"))];
+    cfg.admin.token = Some(ADMIN.into());
+    cfg.dev.allow_root_mint = true;
+    cfg.agents = agent_configs(AGENTS, secret);
+    cfg
+}
+
 impl Harness {
     async fn start(tweak: impl FnOnce(&mut Config)) -> Self {
         Self::start_against(FakeMcpServer::new(&["read_file"]), tweak).await
@@ -47,28 +73,8 @@ impl Harness {
 
     async fn start_against(upstream: FakeMcpServer, tweak: impl FnOnce(&mut Config)) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let policy_path = dir.path().join("policies.cedar");
-        std::fs::write(&policy_path, POLICY).unwrap();
         let upstream = upstream.spawn().await.unwrap();
-        let mut cfg = Config::default();
-        cfg.issuer.issuer = "https://attenuo.test".into();
-        cfg.issuer.audience = "attenuo-test".into();
-        cfg.issuer.private_key_pem_path = Some(dir.path().join("keys/issuer.pem"));
-        cfg.policy.policies_path = Some(policy_path);
-        cfg.policy.catalog = BTreeMap::from([(
-            "github".to_string(),
-            BTreeMap::from([(
-                "read_file".to_string(),
-                ToolAttrs::new()
-                    .with_input("repo", ArgType::String)
-                    .readonly(true),
-            )]),
-        )]);
-        cfg.audit.sqlite_path = ":memory:".into();
-        cfg.upstreams = vec![UpstreamConfig::new("github", upstream.url("/mcp"))];
-        cfg.admin.token = Some(ADMIN.into());
-        cfg.dev.allow_root_mint = true;
-        cfg.agents = agent_configs(AGENTS, secret);
+        let mut cfg = base_config(&dir, &upstream);
         tweak(&mut cfg);
         let (router, state) = attenuo_server::build(&cfg).unwrap();
         let running = Running::start(cfg, state.clone(), router).await;
@@ -271,6 +277,141 @@ async fn unauthenticated_token_requests_are_limited_per_peer() {
         "attenuo_requests_rate_limited_total{limit=\"token_unauthenticated\",cause=\"limit\"} 2\n"
     ));
     h.stop().await;
+}
+
+/// SR-109 through the server's own `POST /token` handler, with simulated peer addresses (the
+/// router is driven directly, with the address the accept loop would give it). Once one
+/// unauthenticated request from each of `rate_limit_max_keys` addresses has filled the
+/// per-peer table, an agent from an address not in the table still gets its token, at an
+/// exchange and with either agent. A request from such an address that does not authenticate
+/// gets the `429` a peer over its limit gets, whether its secret was wrong, it carried no
+/// client credential, or it carried an actor token; so does hop 0 with a wrong secret. A peer
+/// in the table and over its limit is refused before the handler runs, credentials or not.
+#[tokio::test]
+async fn a_full_peer_table_lets_agents_authenticate_sr109() {
+    use axum::extract::ConnectInfo;
+    use tower::ServiceExt as _;
+    let dir = tempfile::tempdir().unwrap();
+    let upstream = FakeMcpServer::new(&["read_file"]).spawn().await.unwrap();
+    let mut cfg = base_config(&dir, &upstream);
+    cfg.limits.token_unauthenticated_requests_per_minute = 2;
+    cfg.limits.rate_limit_max_keys = 100;
+    let (router, state) = attenuo_server::build(&cfg).unwrap();
+    let send = |peer: [u8; 4], path: &'static str, body: Value| {
+        let router = router.clone();
+        async move {
+            let mut req = axum::http::Request::post(path)
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {ADMIN}"))
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap();
+            req.extensions_mut()
+                .insert(ConnectInfo(std::net::SocketAddr::from((peer, 40000))));
+            let resp = router.oneshot(req).await.unwrap();
+            let status = resp.status();
+            let retry = resp.headers().get("retry-after").is_some();
+            let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+            (status.as_u16(), retry, v)
+        }
+    };
+    let (_, _, minted) = send(
+        [127, 0, 0, 1],
+        "/admin/root-token",
+        json!({"subject": "alice", "issuer": "https://idp.example", "agent": "planner",
+               "capabilities": ["github:read_file"]}),
+    )
+    .await;
+    let root = minted["access_token"].as_str().unwrap().to_owned();
+    let exchange = |actor: &str, extra: Value| {
+        let mut body = json!({
+            "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+            "subject_token": root,
+            "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+            "actor": actor,
+            "authorization_details": [{"type": "attenuo_capabilities",
+                "capabilities": [{"server": "github", "tool": "read_file"}]}],
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            body[k] = v.clone();
+        }
+        body
+    };
+    let creds = |id: &str, secret: &str| json!({"client_id": id, "client_secret": secret});
+    // One request with a wrong secret from each of 100 addresses fills the table.
+    for i in 0..100u8 {
+        let (status, _, v) = send(
+            [198, 51, 100, i],
+            "/token",
+            exchange("coder", creds("coder", "wrong")),
+        )
+        .await;
+        assert_eq!(status, 401, "{v}");
+    }
+    // Agents from addresses never seen: served.
+    let (status, _, v) = send(
+        [192, 0, 2, 1],
+        "/token",
+        exchange("coder", creds("coder", &secret("coder"))),
+    )
+    .await;
+    assert_eq!(status, 200, "{v}");
+    let (status, _, v) = send(
+        [192, 0, 2, 2],
+        "/token",
+        exchange("reviewer", creds("reviewer", &secret("reviewer"))),
+    )
+    .await;
+    assert_eq!(status, 200, "{v}");
+    // From new addresses, whatever does not authenticate gets one answer.
+    let refusals = [
+        exchange("coder", creds("coder", "wrong")),
+        exchange("coder", creds("nobody", "wrong")),
+        exchange("coder", json!({})),
+        exchange(
+            "coder",
+            json!({"actor_token": "x.y.z",
+                   "actor_token_type": "urn:ietf:params:oauth:token-type:jwt"}),
+        ),
+        json!({"grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+               "subject_token": "x.y.z",
+               "subject_token_type": "urn:ietf:params:oauth:token-type:id_token",
+               "client_id": "coder", "client_secret": "wrong"}),
+    ];
+    let mut answers = Vec::new();
+    for (i, body) in refusals.iter().enumerate() {
+        let (status, retry, v) = send([203, 0, 113, i as u8], "/token", body.clone()).await;
+        assert_eq!((status, retry), (429, true), "{body}: {v}");
+        answers.push(v);
+    }
+    assert_eq!(answers[0]["code"], "rate_limited");
+    assert!(answers.iter().all(|v| *v == answers[0]), "{answers:?}");
+    let render = state.metrics.render();
+    assert!(render.contains(
+        "attenuo_requests_rate_limited_total{limit=\"token_unauthenticated\",cause=\"table_full\"} 5\n"
+    ), "{render}");
+    // A peer in the table over its limit (2 a minute): refused up front, good secret or not,
+    // with the same body.
+    let (status, _, _) = send(
+        [198, 51, 100, 7],
+        "/token",
+        exchange("coder", creds("coder", "wrong")),
+    )
+    .await;
+    assert_eq!(status, 401);
+    let (status, _, v) = send(
+        [198, 51, 100, 7],
+        "/token",
+        exchange("coder", creds("coder", &secret("coder"))),
+    )
+    .await;
+    assert_eq!(status, 429);
+    assert_eq!(v, answers[0]);
+    assert!(state.metrics.render().contains(
+        "attenuo_requests_rate_limited_total{limit=\"token_unauthenticated\",cause=\"limit\"} 1\n"
+    ));
 }
 
 /// With the defaults no rate limit is on, and many requests of one run and one agent pass.
