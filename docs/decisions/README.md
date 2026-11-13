@@ -54,5 +54,6 @@ Only the `status` and `date` fields and the More Information section of an accep
 | [0012](0012-opentelemetry-export.md) | OpenTelemetry export: allow-listed decision spans over OTLP/HTTP, off by default, linked not adopted, joined to the signed record by decision id | accepted |
 | [0013](0013-admin-api-listener.md) | Admin API listener: `/admin/*` on an opt-in listener of its own, and refused on a main listener off loopback unless the operator opts in | proposed |
 | [0014](0014-request-limits.md) | Request limits: an in-flight cap and deadlines on by default, per-run and per-agent rate limits in process and off by default | proposed |
+| [0015](0015-audit-retention.md) | Audit retention: archive a prefix of the log at a signed checkpoint, prune it in the server behind a signed anchor, off by default | proposed |
 
 Add a row for each new ADR.

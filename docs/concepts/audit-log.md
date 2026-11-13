@@ -174,6 +174,8 @@ Entries after the last checkpoint are protected by the hash chain only, and the 
 
 The checkpoint sink ships what the server signs; entries after the newest checkpoint are not covered until the next one is signed (at most `checkpoint_every` entries or `checkpoint_interval_seconds`).
 
+The log is never pruned and there is no rotation, so it grows without bound. A prune that archives a prefix at a signed checkpoint and leaves a signed anchor is proposed in [ADR-0015](../decisions/0015-audit-retention.md); not built.
+
 Revocations, policy reloads, budget refunds (`admin.budget.refund`, naming the refunded decision) and dev root mints are appended to the log as admin actions (reason `admin_action`, server `attenuo`, subject `urn:attenuo:admin`, which no user can have). To pick out server events, filter on `kind` (anything but `decision`), or on `server = "attenuo"` and the tool (`token.*`, `lease.renew`, `admin.*`); no upstream or agent can use the name `attenuo`. The revoke response carries the `audit_id` of that record, or says that the append failed.
 
 More detail: [RFC-0001 section 7](../spec/rfc-0001-attenuo.md#7-audit-record-and-hash-chaining) and [design/server.md](../design/server.md#audit-convention-for-issuance).
