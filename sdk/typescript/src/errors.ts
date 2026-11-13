@@ -184,6 +184,84 @@ export class UnauthorizedError extends ApiError {
   }
 }
 
+/**
+ * HTTP 503 from the server itself: it refused the request for its own load or state, not for
+ * anything about the request or its token. It is not a `DeniedError`, nor an
+ * `UnauthorizedError`: no decision was made, so code that catches denials does not catch it.
+ *
+ * `reason` is the server's stable code: on a REST route the `error_description` of its
+ * `temporarily_unavailable` answer, on `/mcp/{server}` the `data.reason` of JSON-RPC `-32006`.
+ * `retryAfter` is the `Retry-After` header in whole seconds, undefined when it is missing or not
+ * a number. `status` is 503 and `error` is `"temporarily_unavailable"`; `data` is the proxy's
+ * JSON-RPC error `data` (`{}` for a REST route).
+ *
+ * - `overloaded`: `[limits] max_in_flight` requests were already running. The request was
+ *   refused before any work (no decision, no audit record, nothing sent upstream), so it is safe
+ *   to retry after `retryAfter`. The client's `maxRetries` retries it.
+ * - `request_timeout` (REST routes): no answer within `[limits] request_timeout_seconds`. The
+ *   handler may have done its work (an issued token, a decision and its audit record), so it is
+ *   never retried for you.
+ * - Others: `jwks_unavailable`, `dpop_replay_cache_full` and, on the proxy,
+ *   `session_registry_full` (the upstream answered `initialize` and the proxy then closed that
+ *   session). Not retried for you.
+ *
+ * On `/mcp/{server}` a `-32006` counts as the proxy's own only with a `Retry-After` header,
+ * which the proxy sets on its refusals and never relays from an upstream; without it, it stays
+ * an `RpcError`, as an upstream's error.
+ */
+export class UnavailableError extends ApiError {
+  readonly data: Json;
+
+  constructor(
+    readonly reason: string,
+    readonly retryAfter?: number,
+    detail = "",
+    data?: Json,
+    status = 503,
+  ) {
+    super(status, "temporarily_unavailable", detail, reason);
+    this.data = data ?? {};
+  }
+}
+
+/**
+ * HTTP 429: the caller is over a rate limit of the server. It is not a `DeniedError`, nor an
+ * `UnauthorizedError`: the token is good and no decision was made, so code that catches denials
+ * does not catch it.
+ *
+ * `reason` is the server's stable code: `error_description` on a REST route, the `data.reason`
+ * of JSON-RPC `-32007` on `/mcp/{server}`. `retryAfter` is the `Retry-After` header in whole
+ * seconds (until the caller's minute ends), undefined when it is missing or not a number.
+ * `status` is 429 and `error` is `"rate_limited"`; `data` is the proxy's JSON-RPC error `data`
+ * (`{}` for a REST route).
+ *
+ * - `rate_limited`: `POST /token` over `[limits] token_requests_per_minute` (per agent) or
+ *   `token_unauthenticated_requests_per_minute` (per address), or `/mcp/{server}` over
+ *   `mcp_requests_per_minute` (per run). The request was refused before the server did the work
+ *   (no token issued, no decision, no audit record, nothing sent upstream), so it is safe to
+ *   retry after `retryAfter`. The client's `maxRetries` retries it.
+ * - `too_many_sessions` (proxy): the principal holds `[proxy] max_sessions_per_principal` live
+ *   sessions; the upstream answered `initialize` and the proxy then closed that session. Close a
+ *   session first; not retried for you.
+ *
+ * On `/mcp/{server}` a `-32007` counts as the proxy's own only with a `Retry-After` header (see
+ * `UnavailableError`).
+ */
+export class RateLimitedError extends ApiError {
+  readonly data: Json;
+
+  constructor(
+    readonly reason: string,
+    readonly retryAfter?: number,
+    detail = "",
+    data?: Json,
+    status = 429,
+  ) {
+    super(status, "rate_limited", detail, reason);
+    this.data = data ?? {};
+  }
+}
+
 /** A JSON-RPC error that is not a denial (unknown upstream, upstream down, ...). */
 export class RpcError extends AttenuoError {
   constructor(

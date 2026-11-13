@@ -21,6 +21,7 @@ import {
   TransportTimeoutError,
 } from "./errors.js";
 import { Http, type HttpOptions } from "./http.js";
+import { RetryPolicy, retryHooks } from "./retry.js";
 import { bearer, decodeToken, verifyToken, type Jwks, type Token } from "./token.js";
 import { mcpHeaders } from "./mcp.js";
 import { DEFAULT_MAX_EVENT_BYTES, callStream, type StreamEvent } from "./sse.js";
@@ -37,6 +38,21 @@ export interface ClientOptions extends HttpOptions {
    * the latest one, puts it in every proof, and retries a request once on `use_dpop_nonce`.
    */
   dpopKey?: DpopKeyLike;
+  /**
+   * Retry a request the server refused for its load before doing any work, up to this many times
+   * (default 0: off; at most 10): 503 `overloaded` (`UnavailableError`) and 429 `rate_limited`
+   * (`RateLimitedError`). Each retry waits the answer's `Retry-After` (1 s when it has none), up
+   * to 20 % longer so refused clients spread out; a `Retry-After` over `maxRetryDelayMs` is not
+   * waited out and the error is thrown at once, so all retries of one call wait at most
+   * `maxRetries * maxRetryDelayMs`. Every retry is a new request with new DPoP proofs. Nothing
+   * else is retried: not a `request_timeout` (the server may have done the work), not a denial,
+   * not an `UnauthorizedError`, not a transport error. A streamed call is retried only before its
+   * stream starts, and not past its `deadlineMs`; its `signal` aborts the wait. When the retries
+   * run out, the last refusal is thrown.
+   */
+  maxRetries?: number;
+  /** The longest `Retry-After` a retry waits out, in milliseconds (default 10000, at most 300000). */
+  maxRetryDelayMs?: number;
 }
 
 export interface InspectOptions {
@@ -100,6 +116,14 @@ export interface CallWithApprovalOptions extends McpOptions, ApprovalWaitOptions
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
+/** How a streamed call bounds the retry of its request. */
+interface StreamRetry {
+  /** Milliseconds left of the call's deadline, undefined without one. */
+  leftMs: () => number | undefined;
+  /** Called before a wait of `ms`, so the idle timer allows for it. */
+  waiting: (ms: number) => void;
+}
+
 /**
  * `value` as one percent-encoded URL path segment; `.` and `..` are refused because URL
  * normalization removes them even when encoded (SR-31).
@@ -120,8 +144,10 @@ export class AttenuoClient {
   private readonly dpopKeyLike: DpopKeyLike | undefined;
   private dpopKeyPromise: Promise<DpopKey | undefined> | undefined;
   private readonly nonce = new NonceCache();
+  private readonly retry: RetryPolicy;
 
   constructor(serverUrl: string, opts: ClientOptions = {}) {
+    this.retry = new RetryPolicy(opts.maxRetries, opts.maxRetryDelayMs);
     this.http = new Http(serverUrl, opts);
     this.serverUrl = this.http.base;
     this.token = opts.token;
@@ -147,24 +173,51 @@ export class AttenuoClient {
       presented(jwt, await this.dpopKey(), method, `${this.serverUrl}${path}`, nonce);
   }
 
-  /** `POST path` with `headers(nonce)`; once more with the server's new nonce on `use_dpop_nonce`. */
+  /**
+   * `POST path` with `headers(nonce)`; once more with the server's new nonce on `use_dpop_nonce`;
+   * again, with new headers, on a load refusal while `maxRetries` allows (`retrying`).
+   */
   private async post(
     path: string,
     headers: (nonce?: string) => Promise<Record<string, string>>,
     json?: unknown,
     method = "POST",
     signal?: AbortSignal,
+    stream?: StreamRetry,
   ): Promise<Response> {
     const send = (h: Record<string, string>) =>
       this.http.request(method, path, { headers: h, json, ...(signal ? { signal } : {}) });
-    let res = await send(await headers(this.nonce.value));
-    if ((await this.dpopKey()) !== undefined && (await this.nonce.update(res))) {
+    const once = async () => {
+      let res = await send(await headers(this.nonce.value));
+      if ((await this.dpopKey()) !== undefined && (await this.nonce.update(res))) {
+        await res.body?.cancel();
+        const h = await headers(this.nonce.value);
+        res = await resendOnce(() => send(h));
+        await this.nonce.update(res);
+      }
+      return res;
+    };
+    return this.retrying(once, signal, stream);
+  }
+
+  /**
+   * `send()`, and again after a wait while it answers a load refusal the client's retry policy
+   * retries (`maxRetries`). `signal` aborts the wait; `stream` bounds it by a streamed call's
+   * deadline and tells the call's idle timer about it.
+   */
+  private async retrying(
+    send: () => Promise<Response>,
+    signal?: AbortSignal,
+    stream?: StreamRetry,
+  ): Promise<Response> {
+    for (let retries = 0; ; retries++) {
+      const res = await send();
+      const wait = await this.retry.delayMs(res, retries, stream?.leftMs());
+      if (wait === undefined) return res;
       await res.body?.cancel();
-      const h = await headers(this.nonce.value);
-      res = await resendOnce(() => send(h));
-      await this.nonce.update(res);
+      stream?.waiting(wait);
+      await retryHooks.sleep(wait, signal);
     }
-    return res;
   }
 
   /**
@@ -340,17 +393,18 @@ export class AttenuoClient {
     // The reason the idle timer aborted with, told apart from the caller's own abort by identity:
     // the client's timeout is a `TransportTimeoutError`, the caller's abort is thrown as it came.
     let idle: DOMException | undefined;
-    const restart = () => {
+    const restart = (extra = 0) => {
       if (ms <= 0) return;
       clearTimeout(timer);
       timer = setTimeout(() => {
         idle = new DOMException("no data within the timeout", "TimeoutError");
         ctl.abort(idle);
-      }, ms);
+      }, ms + extra);
     };
     // The optional total deadline (SR-82): not restarted by reads, so keep-alives cannot hold
     // the stream open past it. A read that still completes after it throws too.
     const deadlineMs = opts.deadlineMs;
+    const started = Date.now();
     let expired = false;
     const deadlineAbort = new DOMException("stream deadline elapsed", "TimeoutError");
     const deadlineError = () =>
@@ -368,12 +422,17 @@ export class AttenuoClient {
     };
     try {
       restart();
+      // A load refusal is retried in `post`, before anything of the stream has been yielded.
       const res = await this.post(
         path,
         async (nonce) => ({ ...headers, ...(await auth(nonce)) }),
         body,
         "POST",
         ctl.signal,
+        {
+          leftMs: () => (deadlineMs === undefined ? undefined : started + deadlineMs - Date.now()),
+          waiting: (wait) => restart(wait),
+        },
       );
       onChunk();
       yield* callStream(res, id, maxEventBytes, onChunk);
@@ -521,10 +580,9 @@ export class AttenuoClient {
     decision: "grant" | "decline",
   ): Promise<w.Approval> {
     const path = `/approvals/${pathSegment(approvalId, "approvalId")}`;
-    const res = await this.http.post(path, {
-      headers: w.idTokenHeaders(idToken),
-      json: w.approvalDecisionBody(decision),
-    });
+    const headers = w.idTokenHeaders(idToken);
+    const json = w.approvalDecisionBody(decision);
+    const res = await this.retrying(() => this.http.post(path, { headers, json }));
     return w.approvalFromJson(await w.jsonBody(res));
   }
 
@@ -567,13 +625,15 @@ export class AttenuoClient {
 
   /** `GET /.well-known/authzen-configuration`: the AuthZEN discovery document. No credential is sent. */
   async authzenConfiguration(): Promise<w.AuthzenConfiguration> {
-    const res = await this.http.get("/.well-known/authzen-configuration");
+    const res = await this.retrying(() => this.http.get("/.well-known/authzen-configuration"));
     return w.authzenConfigurationFromJson(await w.jsonBody(res));
   }
 
   /** `GET /.well-known/jwks.json`. */
   async jwks(url?: string): Promise<Jwks> {
-    const res = url ? await this.http.getUrl(url) : await this.http.get("/.well-known/jwks.json");
+    const res = url
+      ? await this.http.getUrl(url)
+      : await this.retrying(() => this.http.get("/.well-known/jwks.json"));
     return w.asObject(await w.jsonBody(res), "JWKS") as Jwks;
   }
 

@@ -143,11 +143,13 @@ export {
   ApprovalRequiredError,
   DeniedError,
   AttenuoError,
+  RateLimitedError,
   RefreshError,
   RpcError,
   TransportError,
   TransportTimeoutError,
   UnauthorizedError,
+  UnavailableError,
   VerificationError,
 } from "./errors.js";
 export type { RunUsage, UntrustedArg, UserWindow, WindowUsage } from "./errors.js";
