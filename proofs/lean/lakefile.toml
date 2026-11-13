@@ -1,9 +1,14 @@
 name = "attenuo-proofs"
 version = "0.1.0"
-defaultTargets = ["Attenuo"]
+defaultTargets = ["Attenuo", "differential"]
 
 [leanOptions]
 autoImplicit = false
 
 [[lean_lib]]
 name = "Attenuo"
+
+# Runs the model on the cases of the differential test (scripts/check-lean-differential.sh).
+[[lean_exe]]
+name = "differential"
+root = "Differential"
