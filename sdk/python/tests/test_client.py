@@ -739,9 +739,68 @@ async def test_close_session_signs_a_delete_with_dpop(make: Any) -> None:
 
 @pytest.mark.parametrize("cls", [Client, AsyncClient, AdminClient, AsyncAdminClient])
 def test_no_client_follows_redirects_sr112(cls: Any) -> None:
-    """A redirect from the server URL is not followed, so a token request body (client secret,
-    client assertion, subject token) never goes to another origin. The TypeScript SDK and the
-    CLI follow them (SR-112, open); this pins the Python side."""
+    """No client follows a redirect (SR-112), whatever it was constructed with."""
     admin = cls in (AdminClient, AsyncAdminClient)
     client = cls("http://ob.test", "t") if admin else cls("http://ob.test")
     assert client._http.follow_redirects is False
+
+
+@pytest.fixture
+def redirecting() -> Any:
+    """A server answering every request ``307`` to a second one, which records what it gets.
+    Yields the first one's URL, the ``Location`` and the list of requests the second got."""
+    import http.server
+    import threading
+
+    seen: list[bytes] = []
+
+    class Collect(http.server.BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            seen.append(self.rfile.read(int(self.headers.get("content-length", 0))))
+            self.send_response(400)
+            self.end_headers()
+
+        def log_message(self, *args: Any) -> None:
+            pass
+
+    other = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Collect)
+    location = f"http://127.0.0.1:{other.server_address[1]}/collect"
+
+    class Redirect(http.server.BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            self.rfile.read(int(self.headers.get("content-length", 0)))
+            self.send_response(307)
+            self.send_header("location", location)
+            self.send_header("content-length", "0")
+            self.end_headers()
+
+        def log_message(self, *args: Any) -> None:
+            pass
+
+    front = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Redirect)
+    for srv in (other, front):
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+    yield f"http://127.0.0.1:{front.server_address[1]}", location, seen
+    for srv in (other, front):
+        srv.shutdown()
+        srv.server_close()
+
+
+@pytest.mark.parametrize("cls", [Client, AsyncClient])
+async def test_a_redirect_is_an_error_naming_its_location_sr112(cls: Any, redirecting: Any) -> None:
+    """A ``307`` from the server URL raises ``ApiError`` ``redirect_not_followed`` naming the
+    ``Location``, and the other origin gets nothing, client secret included (SR-112)."""
+    url, location, seen = redirecting
+    client = cls(url)
+    with pytest.raises(ApiError) as e:
+        out = client.exchange(
+            "a.b.c", "coder", "github:read_file", client_id="coder", client_secret="sr112-secret"
+        )
+        if inspect.isawaitable(out):
+            await out
+    assert e.value.status == 307
+    assert e.value.code == "redirect_not_followed"
+    assert f"Location {location}" in str(e.value)
+    assert "does not follow redirects" in str(e.value)
+    assert "sr112-secret" not in str(e.value)
+    assert seen == []
