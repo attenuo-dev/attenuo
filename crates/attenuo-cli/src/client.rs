@@ -34,6 +34,18 @@ fn present(
     }
 }
 
+/// `url` without a trailing `/`, if it is an `http://` or `https://` URL.
+fn base_url(url: &str) -> Result<String> {
+    let base = url.trim_end_matches('/').to_string();
+    if !(base.starts_with("http://") || base.starts_with("https://")) {
+        bail!(
+            "--server must be the attenuo server's base URL (http://host:port), got `{base}`. \
+             To name an MCP upstream, use `--upstream <name>` after the subcommand."
+        );
+    }
+    Ok(base)
+}
+
 /// A response read in full: status, headers and body text.
 struct Reply {
     status: StatusCode,
@@ -44,6 +56,8 @@ struct Reply {
 pub(crate) struct Client {
     http: reqwest::Client,
     base: String,
+    /// Where `/admin/*` goes: `--admin-server` when given, else `base`.
+    admin_base: String,
     admin_token: Option<String>,
     /// The latest `DPoP-Nonce` this server sent (RFC 9449 §8), for the next proof. Never
     /// printed or logged.
@@ -51,19 +65,30 @@ pub(crate) struct Client {
 }
 
 impl Client {
-    pub(crate) fn new(base: &str, admin_token: Option<String>) -> Result<Self> {
-        let base = base.trim_end_matches('/').to_string();
-        if !(base.starts_with("http://") || base.starts_with("https://")) {
-            bail!(
-                "--server must be the attenuo server's base URL (http://host:port), got `{base}`. \
-                 To name an MCP upstream, use `--upstream <name>` after the subcommand."
-            );
-        }
+    /// A client for the server at `base`, sending `/admin/*` to `admin_base` instead when
+    /// given (`--admin-server`, for a server with `[admin] listen`).
+    pub(crate) fn new(
+        base: &str,
+        admin_base: Option<&str>,
+        admin_token: Option<String>,
+    ) -> Result<Self> {
+        let base = base_url(base)?;
+        let admin_base = match admin_base {
+            Some(a) => base_url(a).map_err(|_| {
+                anyhow!(
+                    "--admin-server must be the base URL of the server's admin listener \
+                     (http://host:port), got `{}`",
+                    a.trim_end_matches('/')
+                )
+            })?,
+            None => base.clone(),
+        };
         Ok(Self {
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()?,
             base,
+            admin_base,
             admin_token,
             nonce: Mutex::new(None),
         })
@@ -90,10 +115,13 @@ impl Client {
     ) -> Result<Reply> {
         let mut retried = false;
         loop {
-            let resp = build(self.current_nonce().as_deref())?
-                .send()
+            let req = build(self.current_nonce().as_deref())?.build()?;
+            let base = self.base_for(req.url().path()).to_owned();
+            let resp = self
+                .http
+                .execute(req)
                 .await
-                .with_context(|| format!("could not reach the server at {}", self.base))?;
+                .with_context(|| format!("could not reach the server at {base}"))?;
             let status = resp.status();
             let headers = resp.headers().clone();
             let text = resp.text().await?;
@@ -120,8 +148,19 @@ impl Client {
         }
     }
 
+    /// The base URL that serves `path`: the admin listener's for `/admin` and everything
+    /// under it, the main listener's for the rest. The only place that chooses between them.
+    fn base_for(&self, path: &str) -> &str {
+        let rest = path.strip_prefix("/admin").unwrap_or("x");
+        if rest.is_empty() || rest.starts_with(['/', '?']) {
+            &self.admin_base
+        } else {
+            &self.base
+        }
+    }
+
     fn url(&self, path: &str) -> String {
-        format!("{}{}", self.base, path)
+        format!("{}{}", self.base_for(path), path)
     }
 
     fn admin(&self, req: RequestBuilder) -> Result<RequestBuilder> {
@@ -154,7 +193,7 @@ impl Client {
             .timeout(timeout)
             .send()
             .await
-            .with_context(|| format!("could not reach the server at {}", self.base))?;
+            .with_context(|| format!("could not reach the server at {}", self.base_for(path)))?;
         let status = resp.status();
         Ok((status, resp.text().await?))
     }
@@ -177,7 +216,7 @@ impl Client {
             .timeout(std::time::Duration::from_secs(3600))
             .send()
             .await
-            .with_context(|| format!("could not reach the server at {}", self.base))?;
+            .with_context(|| format!("could not reach the server at {}", self.base_for(path)))?;
         let status = resp.status();
         if status.is_success() {
             return Ok(resp);
@@ -491,7 +530,37 @@ mod tests {
 
     #[test]
     fn server_must_be_a_url() {
-        assert!(Client::new("github", None).is_err());
-        assert!(Client::new("http://127.0.0.1:8080/", None).is_ok());
+        assert!(Client::new("github", None, None).is_err());
+        assert!(Client::new("http://127.0.0.1:8080/", None, None).is_ok());
+        let err = Client::new("http://127.0.0.1:8080", Some("admin"), None)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.starts_with("--admin-server must be"), "{err}");
+    }
+
+    #[test]
+    fn admin_paths_go_to_the_admin_server_when_given() {
+        let split = Client::new("http://main:8080/", Some("http://adm:9102/"), None).unwrap();
+        for path in [
+            "/admin/audit?from=1",
+            "/admin/root-token",
+            "/admin",
+            "/admin?x=1",
+        ] {
+            assert_eq!(split.url(path), format!("http://adm:9102{path}"));
+        }
+        for path in [
+            "/token",
+            "/.well-known/jwks.json",
+            "/healthz",
+            "/mcp/admin",
+            "/administer",
+        ] {
+            assert_eq!(split.url(path), format!("http://main:8080{path}"));
+        }
+        let one = Client::new("http://main:8080", None, None).unwrap();
+        assert_eq!(one.url("/admin/audit"), "http://main:8080/admin/audit");
+        assert_eq!(one.url("/token"), "http://main:8080/token");
     }
 }
