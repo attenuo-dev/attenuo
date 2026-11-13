@@ -1077,6 +1077,89 @@ async fn id_jag_bound_to_a_dpop_key_needs_its_proof() {
     assert_eq!(got.0, StatusCode::OK, "{}", got.1);
 }
 
+/// The rest of draft -06 §9.11.1.2 at the Resource Authorization Server: a DPoP proof that is
+/// sent is validated as RFC 9449 §4 says whether or not the ID-JAG has a `cnf` (a proof for
+/// another URL, or one used before, is refused), an ID-JAG without `cnf` sent with a valid
+/// proof gets a root token bound to the proof's key (the MAY), and with `[token] dpop =
+/// "required"` an ID-JAG without `cnf` and without a proof is refused (as 401 `dpop_required`,
+/// not the draft's `invalid_grant`; see the standards note).
+#[tokio::test]
+async fn id_jag_dpop_proofs_follow_draft_06_section_9_11() {
+    use attenuo_server::config::DpopMode;
+    use attenuo_token::DpopKey;
+    let h = Harness::start().await;
+    let idp = &h.idp;
+    let key = DpopKey::generate().unwrap();
+    let url = h.url("/token");
+    let jag = |cnf: Option<Value>| {
+        let mut c = idp.id_jag_claims("alice", "planner");
+        if let Some(cnf) = cnf {
+            c["cnf"] = cnf;
+        }
+        idp.sign(&idp.key, Some("oauth-id-jag+jwt"), &c)
+    };
+    let jkt = json!({ "jkt": key.thumbprint() });
+    let now = OffsetDateTime::now_utc;
+
+    // `cnf` and a proof by the right key, but for another URL: the proof is checked first.
+    let wrong_url = key.proof("POST", "https://elsewhere.test/token", None, now());
+    assert_error(
+        &jag_bearer(&h, &jag(Some(jkt.clone())), Some(wrong_url)).await,
+        StatusCode::UNAUTHORIZED,
+        "invalid_dpop_proof",
+        "invalid_dpop_proof",
+    );
+
+    // No `cnf`, a valid proof: issued, bound to the proof's key.
+    let p = key.proof("POST", &url, None, now());
+    let (status, body) = jag_bearer(&h, &jag(None), Some(p.clone())).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["token_type"], "DPoP", "{body}");
+    let verified = h
+        .state
+        .verifier
+        .verify(body["access_token"].as_str().unwrap(), now())
+        .unwrap();
+    assert_eq!(
+        verified.claims.cnf.map(|c| c.jkt).as_deref(),
+        Some(key.thumbprint())
+    );
+    // The same proof again (no `cnf`, and with `cnf`): refused as replayed.
+    for cnf in [None, Some(jkt.clone())] {
+        assert_error(
+            &jag_bearer(&h, &jag(cnf), Some(p.clone())).await,
+            StatusCode::UNAUTHORIZED,
+            "invalid_dpop_proof",
+            "invalid_dpop_proof",
+        );
+    }
+    // No `cnf`, a proof for another URL: refused, not ignored.
+    let wrong_url = key.proof("POST", "https://elsewhere.test/token", None, now());
+    assert_error(
+        &jag_bearer(&h, &jag(None), Some(wrong_url)).await,
+        StatusCode::UNAUTHORIZED,
+        "invalid_dpop_proof",
+        "invalid_dpop_proof",
+    );
+
+    // Sender-constrained tokens required: no `cnf` and no proof is refused.
+    let h = Harness::start_with(|cfg| cfg.token.dpop = DpopMode::Required).await;
+    let unbound = {
+        let idp = &h.idp;
+        idp.sign(
+            &idp.key,
+            Some("oauth-id-jag+jwt"),
+            &idp.id_jag_claims("alice", "planner"),
+        )
+    };
+    assert_error(
+        &jag_bearer(&h, &unbound, None).await,
+        StatusCode::UNAUTHORIZED,
+        "dpop_required",
+        "dpop_required",
+    );
+}
+
 /// With `[token] dpop = "off"` the server checks no proofs, so a bound ID-JAG is refused.
 #[tokio::test]
 async fn id_jag_bound_to_a_key_is_refused_when_dpop_is_off() {

@@ -544,8 +544,8 @@ async fn actor_auth_actor_token_refuses_client_secrets() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(code(&v), ("invalid_request", "client_auth_not_accepted"));
     let (status, v) = h.exchange(&root, "coder", json!({})).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(code(&v), ("invalid_request", "actor_token_required"));
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(code(&v), ("invalid_client", "actor_token_required"));
     let (status, v) = h
         .with_actor_token(&root, "coder", &h.keys.svid(CODER_ID))
         .await;
@@ -767,4 +767,65 @@ async fn either_mode_checks_an_assertion_and_an_actor_token_together() {
         .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "{v}");
     assert_eq!(code(&v), ("invalid_client", "client_assertion_malformed"));
+}
+
+/// An exchange that sends no credential at all is 401 `invalid_client` in every
+/// `[token] actor_auth` mode (RFC 6749 §5.2), with a `WWW-Authenticate` challenge, and the
+/// whole answer is the same for an `actor` that is a configured agent and one that is not
+/// (SR-110).
+#[tokio::test]
+async fn exchange_without_any_credential_is_invalid_client_in_every_mode() {
+    for (mode, expected) in [
+        (ActorAuth::Either, "client_auth_missing"),
+        (ActorAuth::Secret, "client_auth_missing"),
+        (ActorAuth::ActorToken, "actor_token_required"),
+    ] {
+        let h = Harness::start(|cfg| cfg.token.actor_auth = mode).await;
+        let root = h.root_token().await;
+        let mut answers = Vec::new();
+        for (actor, client_id) in [
+            ("reviewer", None),
+            ("nobody", None),
+            ("reviewer", Some("reviewer")),
+            ("nobody", Some("nobody")),
+        ] {
+            let mut body = json!({
+                "grant_type": EXCHANGE,
+                "subject_token": root,
+                "subject_token_type": JWT,
+                "actor": actor,
+                "authorization_details": [{"type": "attenuo_capabilities",
+                    "capabilities": [{"server": "github", "tool": "read_file"}]}],
+            });
+            if let Some(id) = client_id {
+                body["client_id"] = json!(id);
+            }
+            let resp = h
+                .client
+                .post(h.server.url("/token"))
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            let status = resp.status();
+            let challenge = resp
+                .headers()
+                .get("www-authenticate")
+                .map(|v| v.to_str().unwrap().to_owned());
+            let v: Value = resp.json().await.unwrap();
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{mode:?} {actor}: {v}");
+            assert_eq!(code(&v), ("invalid_client", expected), "{mode:?} {actor}");
+            assert_eq!(v["code"], expected, "{mode:?} {actor}");
+            assert!(challenge.is_some(), "{mode:?} {actor}: no WWW-Authenticate");
+            answers.push((status, challenge, v));
+        }
+        assert_eq!(
+            answers[0], answers[1],
+            "{mode:?}: known and unknown actor differ"
+        );
+        assert_eq!(
+            answers[2], answers[3],
+            "{mode:?}: known and unknown client_id differ"
+        );
+    }
 }

@@ -131,7 +131,7 @@ pub const ERROR_CODES: &[ErrorCode] = &[
     e("actor_token_missing_kid", BAD_REQUEST, NO_RPC, "The actor token names no `kid`."),
     e("actor_token_not_accepted", BAD_REQUEST, NO_RPC, "`[token] actor_auth` does not accept actor tokens."),
     e("actor_token_not_yet_valid", BAD_REQUEST, NO_RPC, "The actor token is not valid yet."),
-    e("actor_token_required", BAD_REQUEST, NO_RPC, "`[token] actor_auth` requires an actor token."),
+    e("actor_token_required", BAD_CLIENT, NO_RPC, "`[token] actor_auth` requires an actor token."),
     e("actor_token_typ_mismatch", BAD_REQUEST, NO_RPC, "The actor token's `typ` header is not accepted."),
     e("actor_token_type_unsupported", BAD_REQUEST, NO_RPC, "`actor_token_type` is not `urn:ietf:params:oauth:token-type:jwt`."),
     e("actor_token_unknown_kid", BAD_REQUEST, NO_RPC, "The actor token's `kid` is not in its issuer's keys."),
