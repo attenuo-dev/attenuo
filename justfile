@@ -31,6 +31,14 @@ demo:
 guide:
     bash scripts/check-getting-started.sh
 
+# run the README's server, curl and CLI commands as written and check their outputs
+readme:
+    bash scripts/check-doc-commands.sh README.md
+
+# compile and type-check the SDK READMEs' Python and TypeScript snippets
+snippets:
+    bash scripts/dev.sh snippets
+
 # the Cedar policy tests (both demos' and config/policies/), offline
 policy:
     cargo run -q -p attenuo-cli -- policy test examples/github-leak-demo/policy_test.yaml examples/multi-hop-demo/policy_test.yaml
@@ -57,7 +65,7 @@ deny:
     cargo deny check
 
 # everything CI runs that can run locally
-ci: fmt clippy test demo guide policy docs links hygiene deny fuzz-check
+ci: fmt clippy test demo guide readme snippets policy docs links hygiene deny fuzz-check
 
 # print a random admin token
 admin-token:

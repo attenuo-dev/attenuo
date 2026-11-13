@@ -80,10 +80,10 @@ jobs:
             # The image and compose files, the compose demo's config and its test.
             docker:
               - "{Dockerfile,.dockerignore,docker-compose.yml,examples/github-leak-demo/config.docker.toml,scripts/compose-smoke.sh,.github/workflows/ci.yml}"
-            # The getting-started guide is documentation, which `rust` leaves out, but its
-            # commands are checked by running them (the `getting-started` job).
+            # The getting-started guide and the README are documentation, which `rust` leaves
+            # out, but their commands are checked by running them (the `getting-started` job).
             guide:
-              - "{docs/guides/getting-started.md,scripts/check-getting-started.sh}"
+              - "{docs/guides/getting-started.md,README.md,scripts/check-getting-started.sh,scripts/check-doc-commands.sh}"
 
   fmt:
     name: rustfmt
@@ -251,10 +251,11 @@ jobs:
 
   # Runs every command of docs/guides/getting-started.md in order, as a reader would, against
   # the debug binaries its step 1 builds, and checks the outputs the guide shows
-  # (scripts/check-getting-started.sh). On every pull request that can change Rust, and on one
-  # that changes only the guide or the script.
+  # (scripts/check-getting-started.sh); then the same for the README's server, curl and CLI
+  # sections (scripts/check-doc-commands.sh README.md). On every pull request that can change
+  # Rust, and on one that changes only the guide, the README or the scripts.
   getting-started:
-    name: getting-started guide
+    name: getting-started guide and README
     needs: changes
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.guide == 'true'
     runs-on: ubuntu-latest
@@ -267,6 +268,7 @@ jobs:
           shared-key: debug
           save-if: false
       - run: bash scripts/check-getting-started.sh
+      - run: bash scripts/check-doc-commands.sh README.md
 
   # Builds the release and demo images and plays the leak demo through docker-compose.yml
   # (scripts/compose-smoke.sh): release image contents, `attenuo health` as the HEALTHCHECK, the
