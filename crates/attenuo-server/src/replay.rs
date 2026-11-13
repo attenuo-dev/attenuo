@@ -42,6 +42,45 @@ use crate::error::ApiError;
 /// Default number of markers held.
 pub(crate) const DEFAULT_REPLAY_CAPACITY: usize = 100_000;
 
+/// Why [`ReplayCache::use_once`] refused a credential. Callers decide on the variant, never on
+/// the answer's text or sub-code; `From<ReplayRefusal> for ApiError` is the answer each one
+/// gets when the caller sends it as it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayRefusal {
+    /// The key was already used and has not expired: `400 invalid_grant` / `replayed`.
+    Replayed,
+    /// The store is full of live markers: `503 temporarily_unavailable` /
+    /// `replay_cache_full` (logged).
+    Full,
+    /// The marker could not be written: `503 temporarily_unavailable` /
+    /// `replay_store_unavailable` (logged, with the store's error).
+    Unavailable,
+}
+
+impl From<ReplayRefusal> for ApiError {
+    fn from(r: ReplayRefusal) -> Self {
+        match r {
+            ReplayRefusal::Replayed => ApiError::bad_request(
+                "invalid_grant",
+                "this credential was already used; present a fresh one",
+            )
+            .with_description("replayed"),
+            ReplayRefusal::Full => ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "temporarily_unavailable",
+                "too many credentials in flight; retry later",
+            )
+            .with_description("replay_cache_full"),
+            ReplayRefusal::Unavailable => ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "temporarily_unavailable",
+                "the server cannot record the use of this credential; retry later",
+            )
+            .with_description("replay_store_unavailable"),
+        }
+    }
+}
+
 /// The replay cache: single use of credentials, over the lease store's markers.
 pub struct ReplayCache {
     store: Arc<dyn ReplayStore>,
@@ -60,51 +99,50 @@ impl ReplayCache {
     /// expired, if the store is full of live markers, or if it cannot be written. Check and
     /// insert are one step, so two concurrent requests with the same key cannot both pass.
     /// Runs a store write: call it on the blocking pool.
+    ///
+    /// # Errors
+    ///
+    /// The [`ReplayRefusal`]; a caller that refuses a replay in its own words matches on
+    /// [`ReplayRefusal::Replayed`], and `?` sends any other as its [`ApiError`].
     pub fn use_once(
         &self,
         key: &str,
         expires_at: i64,
         now: OffsetDateTime,
-    ) -> Result<(), ApiError> {
+    ) -> Result<(), ReplayRefusal> {
         self.use_all_once(&[(key, expires_at)], now)
     }
 
     /// [`ReplayCache::use_once`] for several keys at once: either every key is recorded, or
     /// none is (so a request refused for one credential does not use up the others).
-    pub fn use_all_once(&self, keys: &[(&str, i64)], now: OffsetDateTime) -> Result<(), ApiError> {
+    ///
+    /// # Errors
+    ///
+    /// As [`ReplayCache::use_once`].
+    pub fn use_all_once(
+        &self,
+        keys: &[(&str, i64)],
+        now: OffsetDateTime,
+    ) -> Result<(), ReplayRefusal> {
         match self
             .store
             .use_all_once(keys, now.unix_timestamp(), self.capacity)
         {
             Ok(ReplayOutcome::Recorded) => Ok(()),
-            Ok(ReplayOutcome::Replayed) => Err(ApiError::bad_request(
-                "invalid_grant",
-                "this credential was already used; present a fresh one",
-            )
-            .with_description("replayed")),
+            Ok(ReplayOutcome::Replayed) => Err(ReplayRefusal::Replayed),
             Ok(ReplayOutcome::Full) => {
                 tracing::error!(
                     capacity = self.capacity,
                     "replay cache full of live entries; refusing issuance"
                 );
-                Err(ApiError::new(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "temporarily_unavailable",
-                    "too many credentials in flight; retry later",
-                )
-                .with_description("replay_cache_full"))
+                Err(ReplayRefusal::Full)
             }
             Err(e) => {
                 tracing::error!(
                     error = %e,
                     "could not record a single-use credential; refusing it"
                 );
-                Err(ApiError::new(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "temporarily_unavailable",
-                    "the server cannot record the use of this credential; retry later",
-                )
-                .with_description("replay_store_unavailable"))
+                Err(ReplayRefusal::Unavailable)
             }
         }
     }
@@ -141,9 +179,7 @@ mod tests {
         for c in caches(10) {
             let t = OffsetDateTime::from_unix_timestamp(1_000).unwrap();
             c.use_once("a", 1_100, t).unwrap();
-            let e = c.use_once("a", 1_100, t).unwrap_err();
-            assert_eq!(e.status, StatusCode::BAD_REQUEST);
-            assert_eq!(e.description, Some("replayed"));
+            assert_eq!(c.use_once("a", 1_100, t), Err(ReplayRefusal::Replayed));
             c.use_once("b", 1_100, t).unwrap();
             // Once the credential has expired it cannot be accepted anyway, so the key is free.
             let later = OffsetDateTime::from_unix_timestamp(1_100).unwrap();
@@ -157,17 +193,12 @@ mod tests {
             let t = OffsetDateTime::from_unix_timestamp(1_000).unwrap();
             c.use_once("a", 1_010, t).unwrap();
             c.use_once("b", 1_100, t).unwrap();
-            let e = c.use_once("c", 1_100, t).unwrap_err();
-            assert_eq!(e.status, StatusCode::SERVICE_UNAVAILABLE);
-            assert_eq!(e.description, Some("replay_cache_full"));
+            assert_eq!(c.use_once("c", 1_100, t), Err(ReplayRefusal::Full));
             // `a` expires; its slot is reused.
             let later = OffsetDateTime::from_unix_timestamp(1_050).unwrap();
             c.use_once("c", 1_100, later).unwrap();
             assert_eq!(c.len(), 2);
-            assert_eq!(
-                c.use_once("b", 1_100, later).unwrap_err().description,
-                Some("replayed")
-            );
+            assert_eq!(c.use_once("b", 1_100, later), Err(ReplayRefusal::Replayed));
         }
     }
 
@@ -177,25 +208,59 @@ mod tests {
             let t = OffsetDateTime::from_unix_timestamp(1_000).unwrap();
             c.use_once("used", 1_100, t).unwrap();
             // One key replayed: the other is not recorded.
-            let e = c
-                .use_all_once(&[("fresh", 1_100), ("used", 1_100)], t)
-                .unwrap_err();
-            assert_eq!(e.description, Some("replayed"));
+            assert_eq!(
+                c.use_all_once(&[("fresh", 1_100), ("used", 1_100)], t),
+                Err(ReplayRefusal::Replayed)
+            );
             assert_eq!(c.len(), 1);
             // The same key twice in one call is a replay.
-            let e = c
-                .use_all_once(&[("dup", 1_100), ("dup", 1_100)], t)
-                .unwrap_err();
-            assert_eq!(e.description, Some("replayed"));
+            assert_eq!(
+                c.use_all_once(&[("dup", 1_100), ("dup", 1_100)], t),
+                Err(ReplayRefusal::Replayed)
+            );
             // Two keys that do not both fit: neither is recorded.
             c.use_once("b", 1_100, t).unwrap();
-            let e = c
-                .use_all_once(&[("x", 1_100), ("y", 1_100)], t)
-                .unwrap_err();
-            assert_eq!(e.description, Some("replay_cache_full"));
+            assert_eq!(
+                c.use_all_once(&[("x", 1_100), ("y", 1_100)], t),
+                Err(ReplayRefusal::Full)
+            );
             assert_eq!(c.len(), 2);
             c.use_all_once(&[("x", 1_100)], t).unwrap();
             assert_eq!(c.len(), 3);
+        }
+    }
+
+    /// Each outcome as the client receives it, whole: the callers (`crate::clientauth`, the
+    /// exchange, intake, approvals) send these unchanged or map a replay to their own refusal.
+    #[test]
+    fn refusals_are_pinned() {
+        for c in caches(1) {
+            let t = OffsetDateTime::from_unix_timestamp(1_000).unwrap();
+            c.use_once("a", 1_100, t).unwrap();
+            assert_eq!(
+                ApiError::from(c.use_once("a", 1_100, t).unwrap_err()),
+                ApiError {
+                    status: StatusCode::BAD_REQUEST,
+                    code: "invalid_grant".into(),
+                    detail: "this credential was already used; present a fresh one".into(),
+                    description: Some("replayed"),
+                    code_only: false,
+                    decision_id: None,
+                    retry_after: None,
+                }
+            );
+            assert_eq!(
+                ApiError::from(c.use_once("b", 1_100, t).unwrap_err()),
+                ApiError {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    code: "temporarily_unavailable".into(),
+                    detail: "too many credentials in flight; retry later".into(),
+                    description: Some("replay_cache_full"),
+                    code_only: false,
+                    decision_id: None,
+                    retry_after: None,
+                }
+            );
         }
     }
 
@@ -209,7 +274,7 @@ mod tests {
             .unwrap();
         let c = ReplayCache::new(store, 10);
         let t = OffsetDateTime::from_unix_timestamp(1_000).unwrap();
-        let e = c.use_once("a", 1_100, t).unwrap_err();
+        let e = ApiError::from(c.use_once("a", 1_100, t).unwrap_err());
         assert_eq!(e.status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(e.code, "temporarily_unavailable");
         assert_eq!(e.description, Some("replay_store_unavailable"));

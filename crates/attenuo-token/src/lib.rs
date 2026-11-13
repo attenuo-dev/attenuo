@@ -94,7 +94,8 @@ pub use detached::{verify_detached, DetachedSigner};
 pub use dpop::{Confirmation, DpopError, DpopKey};
 pub use error::TokenError;
 pub use exchange::{
-    ExchangeRequest, ExchangeResponse, AUTHORIZATION_DETAILS_TYPE, TOKEN_EXCHANGE_GRANT_TYPE,
+    ExchangeRequest, ExchangeRequestError, ExchangeResponse, AUTHORIZATION_DETAILS_TYPE,
+    TOKEN_EXCHANGE_GRANT_TYPE,
 };
 pub use issuer::{IssueOptions, IssuedToken, Issuer, IssuerConfig};
 pub use verifier::{VerifiedToken, Verifier};

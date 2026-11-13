@@ -92,12 +92,13 @@ use serde_json::{json, Map, Value};
 use time::OffsetDateTime;
 
 use super::extract::Body;
-use super::{audit_issuance, no_store, parse_json, register_issued};
+use super::{audit_issuance, no_store, register_issued};
 use crate::actor::{VerifiedActor, ACTOR_TOKEN_TYPE};
 use crate::clientauth;
 use crate::config::{capability_set, ActorAuth, CapSpec};
-use crate::error::ApiError;
+use crate::error::{mint_refusal, ApiError, INVALID_CAPABILITY};
 use crate::limits::CallerMark;
+use crate::replay::ReplayRefusal;
 use crate::state::AppState;
 
 /// `POST /token`: RFC 8693 exchange from hop n to n+1, or hop-0 IdP intake (see the module
@@ -237,6 +238,9 @@ pub const EXCHANGE_REFUSAL_REASONS: [&str; 13] = [
 
 /// `code` of a request that asks for no capability (as at hop-0 intake).
 pub(crate) const NO_CAPABILITIES_REQUESTED: &str = "no_capabilities_requested";
+/// `code` of a `POST /token` body, form parameter or field that does not parse or is missing
+/// (as at hop-0 intake).
+pub(crate) const MALFORMED_REQUEST: &str = "malformed_request";
 /// `code` of an exchange whose `subject_token_type` is not the JWT URN (as at hop-0 intake).
 const UNSUPPORTED_TOKEN_TYPE: &str = "unsupported_token_type";
 
@@ -516,8 +520,8 @@ fn exchange_verified(
     let resp = req
         .execute_with(&state.issuer, now, not_after, cnf)
         .map_err(|e| match refusal_reason(&e) {
-            Some(reason) => Failure::Refused(reason, e.into()),
-            None => Failure::Other(e.into()),
+            Some(reason) => Failure::Refused(reason, mint_refusal(e)),
+            None => Failure::Other(mint_refusal(e)),
         })?;
     // A parent token delegates to a given actor once, and an actor token authenticates one
     // exchange, keyed by its `jti` (see `crate::replay`). Recorded only once the exchange has
@@ -532,12 +536,9 @@ fn exchange_verified(
     if let Some((key, until)) = &actor_key {
         keys.push((key.as_str(), *until));
     }
-    state.replay.use_all_once(&keys, now).map_err(|e| {
-        if e.description == Some("replayed") {
-            Failure::Refused(REASON_EXCHANGE_REPLAYED, e)
-        } else {
-            Failure::Other(e)
-        }
+    state.replay.use_all_once(&keys, now).map_err(|r| match r {
+        ReplayRefusal::Replayed => Failure::Refused(REASON_EXCHANGE_REPLAYED, r.into()),
+        ReplayRefusal::Full | ReplayRefusal::Unavailable => Failure::Other(r.into()),
     })?;
     // The response carries no chain; read it back from the token we just minted.
     let issued = state
@@ -657,62 +658,93 @@ fn is_form(headers: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
-/// The request body as JSON, from either encoding.
-fn parse_body(headers: &HeaderMap, body: &Bytes) -> Result<Value, ApiError> {
-    if is_form(headers) {
-        form_to_json(body)
-    } else {
-        parse_json::<Value>(body)
+/// Why a `POST /token` body is not a request. The OAuth class and the code of each case are
+/// chosen by variant, in one place (`From<RequestError> for ApiError`), never from the text,
+/// which is for people and is sent as `detail` unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RequestError {
+    /// The body, a form parameter or a field of the request does not parse, or is missing.
+    Malformed(String),
+    /// A form `scope` entry is not a capability (`server:tool`).
+    InvalidScope(String),
+    /// `grant_type` is not the token-exchange grant (hop-0 grants are dispatched before).
+    UnsupportedGrantType(String),
+    /// `subject_token_type` is not the JWT URN (hop-0 credential types are dispatched before).
+    UnsupportedTokenType(String),
+}
+
+impl From<attenuo_token::ExchangeRequestError> for RequestError {
+    fn from(e: attenuo_token::ExchangeRequestError) -> Self {
+        use attenuo_token::ExchangeRequestError as E;
+        let text = e.to_string();
+        match e {
+            E::Malformed(_) => RequestError::Malformed(text),
+            E::UnsupportedGrantType(_) => RequestError::UnsupportedGrantType(text),
+            E::UnsupportedSubjectTokenType(_) => RequestError::UnsupportedTokenType(text),
+        }
     }
 }
 
-fn parse_request(value: Value) -> Result<ExchangeRequest, ApiError> {
-    serde_json::from_value(value).map_err(|e| {
-        let msg = e.to_string();
-        if msg.contains("unsupported grant_type") {
-            ApiError::bad_request("unsupported_grant_type", msg)
-        } else if msg.contains("unsupported subject_token_type") {
+impl From<RequestError> for ApiError {
+    fn from(e: RequestError) -> Self {
+        match e {
+            // As hop-0 intake names it (there also as `error_description`).
+            RequestError::Malformed(detail) => {
+                ApiError::bad_request("invalid_request", detail).with_code(MALFORMED_REQUEST)
+            }
+            RequestError::InvalidScope(detail) => {
+                ApiError::bad_request("invalid_scope", detail).with_code(INVALID_CAPABILITY)
+            }
+            RequestError::UnsupportedGrantType(detail) => {
+                ApiError::bad_request("unsupported_grant_type", detail)
+            }
             // The code hop-0 intake answers an unknown type with.
-            ApiError::bad_request("invalid_request", msg).with_code(UNSUPPORTED_TOKEN_TYPE)
-        } else {
-            ApiError::bad_request("invalid_request", msg)
+            RequestError::UnsupportedTokenType(detail) => {
+                ApiError::bad_request("invalid_request", detail).with_code(UNSUPPORTED_TOKEN_TYPE)
+            }
         }
-    })
+    }
+}
+
+/// The request body as JSON, from either encoding.
+fn parse_body(headers: &HeaderMap, body: &Bytes) -> Result<Value, ApiError> {
+    if is_form(headers) {
+        Ok(form_to_json(body)?)
+    } else {
+        serde_json::from_slice(body).map_err(|e| RequestError::Malformed(e.to_string()).into())
+    }
+}
+
+fn parse_request(value: Value) -> Result<ExchangeRequest, RequestError> {
+    Ok(ExchangeRequest::from_json(value)?)
 }
 
 /// Turn RFC 8693 form fields into the JSON shape `ExchangeRequest` deserializes.
-fn form_to_json(body: &Bytes) -> Result<Value, ApiError> {
-    let pairs: Vec<(String, String)> = serde_urlencoded::from_bytes(body)
-        .map_err(|e| ApiError::bad_request("invalid_request", e.to_string()))?;
+fn form_to_json(body: &Bytes) -> Result<Value, RequestError> {
+    let pairs: Vec<(String, String)> =
+        serde_urlencoded::from_bytes(body).map_err(|e| RequestError::Malformed(e.to_string()))?;
     let mut obj = Map::new();
     let mut scope: Option<String> = None;
     for (k, v) in pairs {
         // `scope` is kept aside until the end, so it is checked here too (SR-88).
         if obj.contains_key(&k) || (k == "scope" && scope.is_some()) {
             // RFC 6749 §3.1: parameters must not be included more than once.
-            return Err(ApiError::bad_request(
-                "invalid_request",
-                format!("parameter `{k}` repeated"),
-            ));
+            return Err(RequestError::Malformed(format!("parameter `{k}` repeated")));
         }
         let value = match k.as_str() {
             "authorization_details" => serde_json::from_str(&v).map_err(|e| {
-                ApiError::bad_request(
-                    "invalid_request",
-                    format!("authorization_details is not JSON: {e}"),
-                )
+                RequestError::Malformed(format!("authorization_details is not JSON: {e}"))
             })?,
-            "requested_ttl_seconds" => Value::from(v.parse::<u64>().map_err(|e| {
-                ApiError::bad_request("invalid_request", format!("requested_ttl_seconds: {e}"))
-            })?),
+            "requested_ttl_seconds" => Value::from(
+                v.parse::<u64>()
+                    .map_err(|e| RequestError::Malformed(format!("requested_ttl_seconds: {e}")))?,
+            ),
             "scope" => {
                 scope = Some(v);
                 continue;
             }
             "may_act" if v.trim_start().starts_with(['[', '{']) => serde_json::from_str(&v)
-                .map_err(|e| {
-                    ApiError::bad_request("invalid_request", format!("may_act is not JSON: {e}"))
-                })?,
+                .map_err(|e| RequestError::Malformed(format!("may_act is not JSON: {e}")))?,
             "may_act" => Value::from(v.split_whitespace().collect::<Vec<_>>()),
             _ => Value::String(v),
         };
@@ -720,16 +752,15 @@ fn form_to_json(body: &Bytes) -> Result<Value, ApiError> {
     }
     if let Some(scope) = scope {
         if obj.contains_key("authorization_details") {
-            return Err(ApiError::bad_request(
-                "invalid_request",
-                "use either scope or authorization_details, not both",
+            return Err(RequestError::Malformed(
+                "use either scope or authorization_details, not both".into(),
             ));
         }
         let specs: Vec<CapSpec> = scope
             .split_whitespace()
             .map(|s| CapSpec::Short(s.to_string()))
             .collect();
-        let caps = capability_set(&specs).map_err(|e| ApiError::bad_request("invalid_scope", e))?;
+        let caps = capability_set(&specs).map_err(RequestError::InvalidScope)?;
         obj.insert(
             "authorization_details".into(),
             json!([{ "type": AUTHORIZATION_DETAILS_TYPE, "capabilities": caps }]),

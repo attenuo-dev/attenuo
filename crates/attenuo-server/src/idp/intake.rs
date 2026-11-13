@@ -276,18 +276,21 @@ pub(crate) async fn handle(
     // Everything from here on touches SQLite; run it on the blocking pool.
     let issued = state
         .blocking(move |state| {
-            let issued = state.issuer.issue_root_with(
-                user,
-                AgentId::new(agent_id.clone()),
-                capabilities,
-                ttl,
-                now,
-                &attenuo_token::IssueOptions {
-                    may_act,
-                    not_after: None,
-                    cnf,
-                },
-            )?;
+            let issued = state
+                .issuer
+                .issue_root_with(
+                    user,
+                    AgentId::new(agent_id.clone()),
+                    capabilities,
+                    ttl,
+                    now,
+                    &attenuo_token::IssueOptions {
+                        may_act,
+                        not_after: None,
+                        cnf,
+                    },
+                )
+                .map_err(crate::error::mint_refusal)?;
             // Used once, recorded only after issuance succeeded; a refused token is never
             // registered.
             // The actor token authenticates one request, hop 0 or exchange alike; both are

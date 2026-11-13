@@ -89,6 +89,7 @@ The table is generated from `attenuo_core::error_codes::ERROR_CODES`, the one pl
 | `capability_denied` |  | `-32003` (200) | yes | The token's capabilities do not permit the call. |
 | `chain_mismatch` | 400 |  |  | The chain in the body is not the bearer token's chain. |
 | `chain_not_issued` | 403 |  |  | A PEP's unsigned body chain was not issued by this server. |
+| `chain_too_deep` | 400 `invalid_scope` |  |  | An exchange's chain would be deeper than `[issuer] max_depth`. |
 | `charge_pruned` | 410 |  |  | The budget charge of the decision was pruned. |
 | `check_unavailable` | 409 |  |  | The policy check cannot run in this configuration. |
 | `client_assertion_audience_mismatch` | 401 `invalid_client` |  |  | The client assertion's `aud` is not exactly this server's issuer identifier (`[issuer] issuer`). |
@@ -117,6 +118,8 @@ The table is generated from `attenuo_core::error_codes::ERROR_CODES`, the one pl
 | `duplicate_actor` | 400 `invalid_request` |  |  | The `actor` is already in the chain. |
 | `expired` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The credential has expired. |
 | `input_type_mismatch` |  | `-32003` (200) | yes | A call argument does not have the type the catalog declares. |
+| `invalid_agent` | 400 `invalid_grant` |  |  | The agent id of the token to mint is empty (an exchange's `actor`, or `agent` at `POST /admin/root-token`). |
+| `invalid_capability` | 400 `invalid_grant`, 400 `invalid_scope` |  |  | A requested capability is not one a call can have: a server or tool name that breaks the naming rules, or a malformed limit (sent with `error` `invalid_grant`); or a shorthand that is not `server:tool` (a form `scope` at `POST /token`, `capabilities` at `POST /admin/root-token`; sent with `error` `invalid_scope`). |
 | `invalid_chain` | 400, 400 `invalid_request` |  |  | The chain in the body does not validate (`POST /admin/policies/check`, or a PEP's unsigned chain at AuthZEN, sent with `error` `invalid_request`). |
 | `invalid_client` | 401 |  |  | Client authentication failed. |
 | `invalid_cursor` | 400 |  |  | The paging cursor is malformed or belongs to another list or order. |
@@ -126,7 +129,8 @@ The table is generated from `attenuo_core::error_codes::ERROR_CODES`, the one pl
 | `invalid_name` |  | `-32003` (200) | yes | The call's server or tool name breaks the naming rules. |
 | `invalid_params` |  | `-32602` (200) |  | The JSON-RPC params of a decided method are not valid. |
 | `invalid_request` | 400 | `-32600` (400) |  | The request is malformed: a missing or invalid parameter or body. |
-| `invalid_scope` | 400 |  |  | The request asks for more than the parent token holds, or a chain deeper than allowed. |
+| `invalid_scope` | 400 |  |  | A subject token whose own chain widens a hop or is deeper than `[issuer] max_depth`; a request that asks for more is `scope_exceeds_parent`, `chain_too_deep` or `scope_exceeds_grant`. |
+| `invalid_subject` | 400 `invalid_grant` |  |  | The user subject of the root token to mint is empty. |
 | `invalid_token` | 401 `unauthorized`, 400 | `-32001` (401) |  | The token is malformed, not issued here, or does not verify. |
 | `jwks_unavailable` | 503 `temporarily_unavailable`, 401 `invalid_token` |  |  | The issuer's keys cannot be fetched; retry later. |
 | `label_error` |  | `-32003` (200) | yes | The call's result could not be recorded, so it is withheld. |
@@ -136,7 +140,7 @@ The table is generated from `attenuo_core::error_codes::ERROR_CODES`, the one pl
 | `lease_unknown` | 400 `invalid_grant` | `-32001` (401), `-32001` (200), `-32003` (200) | yes | A lease of the chain is unknown to the lease store (fail closed); at `POST /token` and `POST /token/renew`, the token's own lease or an ancestor's. |
 | `limit_arg_invalid` |  | `-32003` (200) | yes | The call lacks an argument a run limit counts, or has a value it cannot count. |
 | `malformed_client_auth` | 401 `invalid_client` |  |  | The HTTP Basic credentials are malformed. |
-| `malformed_request` | 400 `invalid_request` |  |  | The token request is missing a field or has an invalid one. |
+| `malformed_request` | 400 `invalid_request` |  |  | The token request is missing a field or has an invalid one (at `POST /token`, also a body that is not JSON or a well-formed form). |
 | `malformed_token` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The credential is not a well-formed JWT. |
 | `may_act_exceeds_grant` | 400 `invalid_request` |  |  | `may_act` names agents the grant does not allow. |
 | `missing_claim` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The credential lacks a required claim. |
@@ -167,6 +171,7 @@ The table is generated from `attenuo_core::error_codes::ERROR_CODES`, the one pl
 | `reserved_agent` | 400 `invalid_request` |  |  | The `actor` is the reserved agent `attenuo`. |
 | `reserved_subject` | 400 `invalid_request`, 400 `invalid_grant` |  |  | The subject is reserved. |
 | `scope_exceeds_grant` | 400 `invalid_scope` |  |  | The hop-0 request (an IdP credential at `POST /token`, or `POST /admin/root-token`) asks for more than the root grant allows. |
+| `scope_exceeds_parent` | 400 `invalid_scope` |  |  | An exchange asks for more than the subject token holds. |
 | `server_error` | 500 |  |  | An internal error; the cause is in the server log only. |
 | `session_mismatch` |  | `-32003` (403) |  | The `Mcp-Session-Id` belongs to another principal. |
 | `session_registry_full` |  | `-32006` (503) |  | No free session slot (`[proxy] max_sessions`). |
@@ -177,6 +182,7 @@ The table is generated from `attenuo_core::error_codes::ERROR_CODES`, the one pl
 | `too_many_sessions` |  | `-32007` (429) |  | The principal holds `[proxy] max_sessions_per_principal` live sessions. |
 | `tool_not_in_catalog` |  | `-32003` (200) | yes | The tool is not in the catalog and unknown tools are denied. |
 | `tool_not_listed` |  | `-32003` (200) | yes | The upstream never listed the tool and the catalog does not know it. |
+| `ttl_out_of_range` | 400 `invalid_grant` |  |  | The requested lifetime gives no representable expiry (`POST /admin/root-token`; an exchange clamps it to the parent's instead). |
 | `typ_mismatch` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The credential's `typ` header does not match its kind. |
 | `unknown_kid` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The credential's `kid` is not in its issuer's keys. |
 | `unknown_server` |  | `-32004` (404) |  | No `[[upstreams]]` entry has this name. |
@@ -264,30 +270,31 @@ The method shows in the server log and in the audit record's arguments: `agent_a
 | `POST /token` | agent client credentials (a secret or a [client assertion](#client-authentication)) at hop 0; at later hops the parent token, plus the actor's client credentials or an `actor_token` | RFC 8693 token exchange, as a form or JSON. Hop 0 takes an OIDC ID token or an ID-JAG. Later hops take a parent delegation token and `authorization_details`. Optional `may_act` (agent ids) sets who may exchange the new token next. A `DPoP` header binds the new token to a key (`token_type` `DPoP`); `subject_token_dpop` is the parent key's sign-off, naming the new key and `actor`, when the parent is bound to another key. |
 | `POST /token/renew` | bearer delegation token (and a DPoP proof if it is bound) | Extend the lease of the token's last hop. Returns `{lease, expires_at, expires_in}`. A refusal of a token that verified is audited (below). |
 
-A capability may carry run `limits` (`calls`, `sum: {arg, max}`, `calls_per: {arg, max}`, `distinct: {arg, max}`; [run limits](../design/server.md#run-limits)). `distinct` allows at most `max` different values of `arg`. `calls_per` and `distinct` may add `"derive": "host"` to count the host of a URL argument instead of the whole value (`{"arg": "url", "derive": "host", "max": 2}`). A value with no scheme is a bare host and is read as `http://` followed by the value, so `www.example.com/x` counts host `www.example.com` and `localhost:8080` counts `localhost`. A child must keep every limit of the parent capability that covers it, on the same argument and derivation, at most as large (`calls: m` also satisfies a parent's `calls_per` or `distinct` with `max >= m`); one it leaves out or asks larger is filled in or lowered (a `sum`, `calls_per` or `distinct` over another argument or derivation is refused as not covered), and its `calls` and `sum` are lowered further to what the parent hop has left. An unknown limit kind or derivation, or `derive` on a `sum`, is 400 `invalid_request`.
+A capability may carry run `limits` (`calls`, `sum: {arg, max}`, `calls_per: {arg, max}`, `distinct: {arg, max}`; [run limits](../design/server.md#run-limits)). `distinct` allows at most `max` different values of `arg`. `calls_per` and `distinct` may add `"derive": "host"` to count the host of a URL argument instead of the whole value (`{"arg": "url", "derive": "host", "max": 2}`). A value with no scheme is a bare host and is read as `http://` followed by the value, so `www.example.com/x` counts host `www.example.com` and `localhost:8080` counts `localhost`. A child must keep every limit of the parent capability that covers it, on the same argument and derivation, at most as large (`calls: m` also satisfies a parent's `calls_per` or `distinct` with `max >= m`); one it leaves out or asks larger is filled in or lowered (a `sum`, `calls_per` or `distinct` over another argument or derivation is refused as not covered), and its `calls` and `sum` are lowered further to what the parent hop has left. An unknown limit kind or derivation does not parse: 400 `invalid_request` (at `POST /token`, with `code` `malformed_request`). A limit that parses but is malformed (`derive` on a `sum`, an empty `arg`, a `max` over the cap) is 400 `invalid_grant` with `code` `invalid_capability`.
 
 A later-hop request authenticates its `actor` with `client_id` / `client_secret` (or HTTP Basic), with a client assertion (`client_assertion_type` and `client_assertion`, [above](#client-authentication)), or with `actor_token` and `actor_token_type` = `urn:ietf:params:oauth:token-type:jwt` (RFC 8693 §2.1): a workload-identity JWT, such as a SPIFFE JWT-SVID, from an `[[actor_trust]]` issuer. `[token] actor_auth` decides which are accepted: `"secret"` means client credentials, a secret or an assertion according to what the agent's entry holds. An actor token works for one exchange, and the child expires no later than it does. If the parent token carries `may_act`, the `actor` must be listed (`actor_not_permitted` otherwise). `may_act` on the request sets the new token's own list: absent means any authenticated agent may exchange the new token (it does not inherit the parent's list), and `[]` means none may.
 
 **Refused exchanges are audited.** When the subject token verified (signature, issuer, audience, expiry, chain) and so did its DPoP proof, a refusal the request caused is a `deny` record against the parent's chain: server `attenuo`, tool `token.exchange`, kind `decision`, the parent's subject, agents, leases and `chain_id`. The 400 carries the record id in `X-Attenuo-Decision-Id` and as `decision_id` in the body:
 
 ```json
-{"error": "invalid_scope", "code": "invalid_scope", "detail": "delegation chain is invalid: ...", "decision_id": "10ce6d75-b2e0-4aa7-a563-7b2fc5a8b223"}
+{"error": "invalid_scope", "code": "scope_exceeds_parent", "detail": "delegation chain is invalid: ...", "decision_id": "10ce6d75-b2e0-4aa7-a563-7b2fc5a8b223"}
 ```
 
 | Refusal | `error` / `error_description` | `code` | Audit `reason` |
 | --- | --- | --- | --- |
-| asks for more than the parent holds | `invalid_scope` | `invalid_scope` | `exchange_widening` |
-| chain deeper than `[issuer] max_depth` | `invalid_scope` | `invalid_scope` | `exchange_too_deep` |
+| asks for more than the parent holds | `invalid_scope` | `scope_exceeds_parent` | `exchange_widening` |
+| chain deeper than `[issuer] max_depth` | `invalid_scope` | `chain_too_deep` | `exchange_too_deep` |
 | actor not in the parent's `may_act` | `invalid_request` / `actor_not_permitted` | `actor_not_permitted` | `exchange_actor_not_permitted` |
 | authenticated agent or actor token is not `actor` | `invalid_request` / `actor_mismatch` | `actor_mismatch` | `exchange_actor_mismatch` |
 | `actor` already in the chain | `invalid_request` / `duplicate_actor` | `duplicate_actor` | `exchange_duplicate_actor` |
 | `actor` is `attenuo` | `invalid_request` / `reserved_agent` | `reserved_agent` | `exchange_reserved_agent` |
 | actor token expires now | `invalid_request` / `actor_token_expired`, `no_lifetime_left` | the same | `exchange_no_lifetime_left` |
 | parent already delegated to this actor, or actor token reused | `invalid_grant` / `replayed` | `replayed` | `exchange_replayed` |
-| a requested capability has an invalid name or limit | `invalid_grant` | `invalid_grant` | `exchange_invalid_capability` |
+| a requested capability has an invalid name or limit | `invalid_grant` | `invalid_capability` | `exchange_invalid_capability` |
+| `actor` is empty (possible only without actor authentication) | `invalid_grant` | `invalid_agent` | `exchange_refused` |
 | parent lease revoked, expired or unknown | `invalid_grant` | `lease_revoked`, `lease_expired`, `lease_unknown` | the same |
 
-A parent whose lease is not live is answered with the lease reason as `code`, and `detail` names it too (`subject token cannot delegate: lease_revoked (...)`); there is no `error_description`. Not recorded, a server log line only: a malformed request, failed client or actor-token authentication, a subject token or DPoP proof that does not verify (so an anonymous caller cannot write to the log, SR-18), and server errors. A subject token that verified but has expired (or a hop of its chain has) is 400 `invalid_grant` with `code` `token_expired`; any other subject token that does not verify is 400 `invalid_grant` with `code` `invalid_grant`. A request with no capability is 400 `invalid_request` with `code` `no_capabilities_requested`, and a `subject_token_type` other than the JWT URN (and not a hop-0 credential type) is 400 `invalid_request` with `code` `unsupported_token_type`. A `requested_ttl_seconds` beyond the parent's expiry is not a refusal: the child is clamped to the parent. A refused exchange uses up nothing: the parent can still delegate once to that actor, an actor token can be presented again, and no run limit is charged; only its DPoP proof (its `jti`) is spent. It is counted in `decisions_total{decision="deny",reason}`.
+A parent whose lease is not live is answered with the lease reason as `code`, and `detail` names it too (`subject token cannot delegate: lease_revoked (...)`); there is no `error_description`. Not recorded, a server log line only: a malformed request, failed client or actor-token authentication, a subject token or DPoP proof that does not verify (so an anonymous caller cannot write to the log, SR-18), and server errors. A subject token that verified but has expired (or a hop of its chain has) is 400 `invalid_grant` with `code` `token_expired`; any other subject token that does not verify is 400 `invalid_grant` with `code` `invalid_grant`. A body that is not JSON or a well-formed form, a repeated form parameter, or a field that is missing or does not parse is 400 `invalid_request` with `code` `malformed_request` and no `error_description` (hop-0 intake sends the same code, and for a field also as `error_description`), and a form `scope` entry that is not `server:tool` is 400 `invalid_scope` with `code` `invalid_capability`. A request with no capability is 400 `invalid_request` with `code` `no_capabilities_requested`, and a `subject_token_type` other than the JWT URN (and not a hop-0 credential type) is 400 `invalid_request` with `code` `unsupported_token_type`. A `requested_ttl_seconds` beyond the parent's expiry is not a refusal: the child is clamped to the parent. A refused exchange uses up nothing: the parent can still delegate once to that actor, an actor token can be presented again, and no run limit is charged; only its DPoP proof (its `jti`) is spent. It is counted in `decisions_total{decision="deny",reason}`.
 
 **Refused renewals are audited.** When the token of a `POST /token/renew` verified (signature, issuer, audience, expiry, chain) and so did its DPoP proof, a refusal is a `deny` record against the token's chain: server `attenuo`, tool `lease.renew` (the tool of a successful renewal, so `audit export --tool lease.renew --decision deny` lists the refused ones), kind `decision`, and the arguments digest of `{lease, ancestor, dpop_bound}`. The 400 carries the id in `X-Attenuo-Decision-Id` and `decision_id`:
 

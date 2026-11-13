@@ -31,7 +31,7 @@ use super::{
     audit_admin, audit_issuance, no_store, parse_json, register_issued, REASON_ADMIN_ACTION,
 };
 use crate::config::{capability_set, CapSpec, RootGrant};
-use crate::error::ApiError;
+use crate::error::{ApiError, INVALID_CAPABILITY};
 use crate::state::AppState;
 use attenuo_core::Decision;
 
@@ -125,18 +125,21 @@ fn mint_root_sync(
         authenticated_at: now,
         attributes,
     };
-    let issued = state.issuer.issue_root_with(
-        user,
-        AgentId::new(req.agent.clone()),
-        capabilities,
-        ttl,
-        now,
-        &IssueOptions {
-            may_act,
-            not_after: None,
-            cnf,
-        },
-    )?;
+    let issued = state
+        .issuer
+        .issue_root_with(
+            user,
+            AgentId::new(req.agent.clone()),
+            capabilities,
+            ttl,
+            now,
+            &IssueOptions {
+                may_act,
+                not_after: None,
+                cnf,
+            },
+        )
+        .map_err(crate::error::mint_refusal)?;
     register_issued(
         state,
         &issued.token,
@@ -195,7 +198,7 @@ fn resolve_grant(grants: &[RootGrant], req: &RootTokenRequest) -> Result<Granted
         .as_deref()
         .map(capability_set)
         .transpose()
-        .map_err(|e| ApiError::bad_request("invalid_scope", e))?;
+        .map_err(|e| ApiError::bad_request("invalid_scope", e).with_code(INVALID_CAPABILITY))?;
     if grants.is_empty() {
         let caps = requested.ok_or_else(|| {
             ApiError::bad_request("invalid_request", "capabilities are required")
