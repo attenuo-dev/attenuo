@@ -18,6 +18,8 @@ import { bearer, decodeToken, parseTime, type Token } from "./token.js";
 export const TOKEN_EXCHANGE_GRANT = "urn:ietf:params:oauth:grant-type:token-exchange";
 export const TYPE_JWT = "urn:ietf:params:oauth:token-type:jwt";
 export const TYPE_ID_TOKEN = "urn:ietf:params:oauth:token-type:id_token";
+/** RFC 7523 §2.2 `client_assertion_type` of a `private_key_jwt` client assertion. */
+export const CLIENT_ASSERTION_TYPE = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
 export const AUTHORIZATION_DETAILS_TYPE = "attenuo_capabilities";
 
 export const CODE_UNAUTHORIZED = -32001;
@@ -409,6 +411,14 @@ export interface ExchangeOptions {
    * token authenticates one exchange.
    */
   actorToken?: string;
+  /**
+   * A `private_key_jwt` client assertion (RFC 7523 §2.2) instead of `clientSecret`, for an
+   * agent whose `[[agents]]` entry lists public keys (`jwks`). Make one per request with
+   * `DpopKey.clientAssertion(agentId, serverIssuer)` from the agent's private key. Sent with
+   * `client_assertion_type` `urn:ietf:params:oauth:client-assertion-type:jwt-bearer`; never
+   * together with a client secret.
+   */
+  clientAssertion?: string;
   /** RFC 8693 §4.4 `may_act` for the new token: the agents allowed to exchange it next. */
   mayAct?: readonly string[];
   /**
@@ -430,8 +440,15 @@ export function exchangeBody(
   capabilities: CapabilityLike | readonly CapabilityLike[],
   opts: ExchangeOptions,
 ): Json {
-  if (opts.clientId !== undefined && !opts.clientSecret) {
-    throw new TypeError("clientId and clientSecret go together");
+  if (opts.clientAssertion !== undefined && opts.clientAssertion.trim() === "") {
+    throw new TypeError("clientAssertion is empty");
+  }
+  if (opts.clientAssertion !== undefined && opts.clientSecret) {
+    // RFC 6749 §2.3: one client authentication method per request.
+    throw new TypeError("use clientSecret or clientAssertion, not both");
+  }
+  if (opts.clientId !== undefined && !opts.clientSecret && opts.clientAssertion === undefined) {
+    throw new TypeError("clientId goes with clientSecret or clientAssertion");
   }
   if (opts.actorToken !== undefined && opts.actorToken.trim() === "") {
     throw new TypeError("actorToken is empty");
@@ -442,7 +459,10 @@ export function exchangeBody(
   // Agent credentials (a client secret or an actor token) alone do not make this hop 0: the
   // server also requires them, as the actor's, on a hop n+1 exchange. Hop 0 is an IdP
   // credential, not a delegation token.
-  const authenticated = Boolean(opts.clientSecret) || opts.actorToken !== undefined;
+  const authenticated =
+    Boolean(opts.clientSecret) ||
+    opts.actorToken !== undefined ||
+    opts.clientAssertion !== undefined;
   const intake = authenticated && !isDelegationToken(subjectToken);
   const body: Json = {
     grant_type: TOKEN_EXCHANGE_GRANT,
@@ -457,6 +477,12 @@ export function exchangeBody(
   if (opts.clientSecret) {
     body.client_id = clientId;
     body.client_secret = opts.clientSecret;
+  }
+  if (opts.clientAssertion !== undefined) {
+    // The server reads the client id from the assertion's `sub`.
+    if (opts.clientId !== undefined) body.client_id = opts.clientId;
+    body.client_assertion_type = CLIENT_ASSERTION_TYPE;
+    body.client_assertion = opts.clientAssertion.trim();
   }
   if (opts.actorToken !== undefined) {
     body.actor_token = opts.actorToken.trim();

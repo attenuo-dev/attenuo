@@ -221,6 +221,33 @@ async def test_exchange_with_actor_token_and_may_act(make: Any) -> None:
         await call(client, "exchange", parent, "coder", "github:read_file", may_act="reviewer")
 
 
+async def test_exchange_with_a_client_assertion(make: Any) -> None:
+    s = Signer()
+    parent = s.mint(("planner",))
+    child = s.mint(("planner", "coder"))
+    client, rec = make(lambda r: httpx.Response(200, json=token_response(child)))
+    await call(client, "exchange", parent, "coder", "github:read_file", client_assertion=" a.b.c\n")
+    body = rec.body()
+    assert body["client_assertion"] == "a.b.c"
+    assert body["client_assertion_type"] == (
+        "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+    )
+    assert "client_id" not in body and "client_secret" not in body
+    assert body["subject_token_type"] == "urn:ietf:params:oauth:token-type:jwt"
+    # Hop 0: an IdP credential with an assertion, client_id allowed alongside.
+    await call(
+        client, "exchange", "ID.TOKEN.JWT", "planner", "github:*",
+        client_id="planner", client_assertion="a.b.c",
+    )  # fmt: skip
+    body = rec.body()
+    assert body["subject_token_type"] == "urn:ietf:params:oauth:token-type:id_token"
+    assert body["client_id"] == "planner"
+    # One method per request (RFC 6749 §2.3), and never an empty assertion.
+    for bad in ({"client_secret": "cs", "client_assertion": "a.b.c"}, {"client_assertion": " "}):
+        with pytest.raises(ValueError):
+            await call(client, "exchange", parent, "coder", "github:read_file", **bad)
+
+
 async def test_exchange_errors(make: Any) -> None:
     body = {"error": "invalid_scope", "detail": "requested exceeds parent"}
     client, _ = make(lambda r: httpx.Response(400, json=body))

@@ -85,6 +85,28 @@ def test_keys_round_trip_and_sign_both_algorithms(tmp_path: Any) -> None:
         DpopKey({**ed.private_jwk(), "x": DpopKey.generate().public_jwk["x"]})
 
 
+def test_client_assertion_is_a_private_key_jwt(tmp_path: Any) -> None:
+    ed = DpopKey.generate()
+    path = tmp_path / "coder.jwk"
+    path.write_text(json.dumps({**ed.private_jwk(), "kid": "coder-1"}))
+    key = DpopKey.load(path)
+    a = key.client_assertion("coder", "https://attenuo.example", iat=1_000_000)
+    h, p, s = a.split(".")
+    header, claims = json.loads(unb64(h)), json.loads(unb64(p))
+    assert header == {"alg": "EdDSA", "typ": "client-authentication+jwt", "kid": "coder-1"}
+    Ed25519PublicKey.from_public_bytes(unb64(ed.public_jwk["x"])).verify(
+        unb64(s), f"{h}.{p}".encode()
+    )
+    assert claims["iss"] == claims["sub"] == "coder"
+    assert claims["aud"] == "https://attenuo.example"
+    assert (claims["iat"], claims["exp"]) == (1_000_000, 1_000_060)
+    b = key.client_assertion("coder", "https://attenuo.example", kid="other", lifetime=30)
+    hb, pb = (json.loads(unb64(x)) for x in b.split(".")[:2])
+    assert hb["kid"] == "other" and pb["exp"] - pb["iat"] == 30 and pb["jti"] != claims["jti"]
+    # A key loaded without a kid sends none.
+    assert "kid" not in json.loads(unb64(ed.client_assertion("c", "a").split(".")[0]))
+
+
 def bound(s: Signer, jkt: str, agents: tuple[str, ...] = ("planner",)) -> str:
     return s.mint(agents, claims={"cnf": {"jkt": jkt}})
 

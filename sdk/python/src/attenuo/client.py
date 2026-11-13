@@ -111,6 +111,7 @@ class Client:
         may_act: Iterable[str] | None = None,
         subject_dpop_key: DpopKey | dict[str, Any] | None = None,
         subject_token_dpop: str | None = None,
+        client_assertion: str | None = None,
     ) -> Token:
         """RFC 8693 token exchange: trade ``subject_token`` for a narrower token held by ``actor``.
 
@@ -126,6 +127,11 @@ class Client:
         ``actor_token``: a workload-identity JWT (for example a SPIFFE JWT-SVID) from an
         ``[[actor_trust]]`` issuer, sent with ``actor_token_type``
         ``urn:ietf:params:oauth:token-type:jwt``. Each actor token authenticates one request.
+        Or, for an agent whose ``[[agents]]`` entry lists public keys (``jwks``), with
+        ``client_assertion``: a ``private_key_jwt`` assertion (RFC 7523) made with
+        ``DpopKey.client_assertion(agent_id, server_issuer)`` from the agent's private key; each
+        one authenticates one request. ``client_secret`` and ``client_assertion`` are never
+        sent together.
         ``may_act`` lists the agents allowed to exchange the new token next (RFC 8693 §4.4).
 
         With a ``dpop_key`` on the client, the new token is bound to it. When ``subject_token`` is
@@ -148,6 +154,7 @@ class Client:
             subject_token_type,
             actor_token=actor_token,
             may_act=may_act,
+            client_assertion=client_assertion,
         )
         resp = self._post(
             "/token",
@@ -589,6 +596,7 @@ class AsyncClient:
         may_act: Iterable[str] | None = None,
         subject_dpop_key: DpopKey | dict[str, Any] | None = None,
         subject_token_dpop: str | None = None,
+        client_assertion: str | None = None,
     ) -> Token:
         body = w.exchange_body(
             subject_token,
@@ -600,6 +608,7 @@ class AsyncClient:
             subject_token_type,
             actor_token=actor_token,
             may_act=may_act,
+            client_assertion=client_assertion,
         )
         resp = await self._post(
             "/token",
