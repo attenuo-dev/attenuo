@@ -391,5 +391,5 @@ The source is Apache-2.0 and is to be published at <https://github.com/attenuo-d
 33. Z. Huang et al. My credentials, please: detecting filesystem capability laundering in MCP servers at scale. arXiv:2610.22301, 2026. <https://arxiv.org/abs/2610.22301>
 34. N. A. Niyikiza. Attenuating authorization tokens for agentic delegation chains, draft-niyikiza-oauth-attenuating-agent-tokens-02 (individual Internet-Draft). 26 October 2026. <https://datatracker.ietf.org/doc/html/draft-niyikiza-oauth-attenuating-agent-tokens-02>
 35. Model Context Protocol, ext-auth issue #32: Delegated / attenuated authority for MCP agent tool calls. <https://github.com/modelcontextprotocol/ext-auth/issues/32> [verify: open state and date not confirmed]
-36. Tenuo: task-scoped authorization for AI agents. Apache-2.0. <https://github.com/tenuo-ai/tenuo>, <https://pypi.org/project/tenuo/> (version 0.3.5, 31 October 2026)
+36. Tenuo: task-scoped authorization for AI agents. Apache-2.0. <https://github.com/tenuo-ai/tenuo>, <https://pypi.org/project/tenuo/> (version 0.3.7, 12 November 2026)
 37. K. McGuinness. OAuth actor profile for delegation, draft-mcguinness-oauth-actor-profile-01 (individual Internet-Draft). 9 October 2026. <https://datatracker.ietf.org/doc/draft-mcguinness-oauth-actor-profile/>
