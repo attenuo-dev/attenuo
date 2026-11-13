@@ -235,6 +235,11 @@ pub const EXCHANGE_REFUSAL_REASONS: [&str; 13] = [
     crate::authz::REASON_LEASE_UNKNOWN,
 ];
 
+/// `code` of a request that asks for no capability (as at hop-0 intake).
+pub(crate) const NO_CAPABILITIES_REQUESTED: &str = "no_capabilities_requested";
+/// `code` of an exchange whose `subject_token_type` is not the JWT URN (as at hop-0 intake).
+const UNSUPPORTED_TOKEN_TYPE: &str = "unsupported_token_type";
+
 /// The audit `tool` of an exchange, issued or refused.
 const EXCHANGE_TOOL: &str = "token.exchange";
 
@@ -358,7 +363,8 @@ fn exchange_sync(
         return Err(ApiError::bad_request(
             "invalid_request",
             format!("authorization_details must contain a `{AUTHORIZATION_DETAILS_TYPE}` entry with at least one capability"),
-        ));
+        )
+        .with_code(NO_CAPABILITIES_REQUESTED));
     }
     // A subject token that does not verify, or whose DPoP proof does not, is refused with a
     // server log line only, so an anonymous caller cannot write to the audit log (SR-18).
@@ -451,7 +457,8 @@ fn exchange_verified(
                     "subject token cannot delegate: {reason} ({})",
                     detail.join("; ")
                 ),
-            ),
+            )
+            .with_code(reason),
         ));
     }
 
@@ -662,12 +669,14 @@ fn parse_body(headers: &HeaderMap, body: &Bytes) -> Result<Value, ApiError> {
 fn parse_request(value: Value) -> Result<ExchangeRequest, ApiError> {
     serde_json::from_value(value).map_err(|e| {
         let msg = e.to_string();
-        let code = if msg.contains("unsupported grant_type") {
-            "unsupported_grant_type"
+        if msg.contains("unsupported grant_type") {
+            ApiError::bad_request("unsupported_grant_type", msg)
+        } else if msg.contains("unsupported subject_token_type") {
+            // The code hop-0 intake answers an unknown type with.
+            ApiError::bad_request("invalid_request", msg).with_code(UNSUPPORTED_TOKEN_TYPE)
         } else {
-            "invalid_request"
-        };
-        ApiError::bad_request(code, msg)
+            ApiError::bad_request("invalid_request", msg)
+        }
     })
 }
 

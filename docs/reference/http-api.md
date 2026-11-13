@@ -111,7 +111,7 @@ The table is generated from `attenuo_core::error_codes::ERROR_CODES`, the one pl
 | `duplicate_actor` | 400 `invalid_request` |  |  | The `actor` is already in the chain. |
 | `expired` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The credential has expired. |
 | `input_type_mismatch` |  | `-32003` (200) | yes | A call argument does not have the type the catalog declares. |
-| `invalid_chain` | 400 |  |  | The chain in the body does not validate. |
+| `invalid_chain` | 400, 400 `invalid_request` |  |  | The chain in the body does not validate (`POST /admin/policies/check`, or a PEP's unsigned chain at AuthZEN, sent with `error` `invalid_request`). |
 | `invalid_client` | 401 |  |  | Client authentication failed. |
 | `invalid_cursor` | 400 |  |  | The paging cursor is malformed or belongs to another list or order. |
 | `invalid_dpop_proof` | 401 | `-32001` (401) |  | The DPoP proof does not verify, is replayed, or is for another key, method or URL. |
@@ -125,9 +125,9 @@ The table is generated from `attenuo_core::error_codes::ERROR_CODES`, the one pl
 | `jwks_unavailable` | 503 `temporarily_unavailable`, 401 `invalid_token` |  |  | The issuer's keys cannot be fetched; retry later. |
 | `label_error` |  | `-32003` (200) | yes | The call's result could not be recorded, so it is withheld. |
 | `lease_error` |  | `-32001` (401), `-32003` (200) | yes | The lease store could not be read (fail closed). |
-| `lease_expired` |  | `-32001` (401), `-32001` (200), `-32003` (200) | yes | A lease of the chain has expired. |
-| `lease_revoked` | 409 | `-32001` (401), `-32001` (200), `-32003` (200) | yes | A lease of the chain, or the one an approval is bound to, has been revoked. |
-| `lease_unknown` |  | `-32001` (401), `-32001` (200), `-32003` (200) | yes | A lease of the chain is unknown to the lease store (fail closed). |
+| `lease_expired` | 400 `invalid_grant` | `-32001` (401), `-32001` (200), `-32003` (200) | yes | A lease of the chain has expired (at `POST /token` and `POST /token/renew`, an ancestor lease of the token). |
+| `lease_revoked` | 409, 400 `invalid_grant` | `-32001` (401), `-32001` (200), `-32003` (200) | yes | A lease of the chain (at `POST /token` and `POST /token/renew`, the token's own lease or an ancestor's), or the one an approval is bound to, has been revoked. |
+| `lease_unknown` | 400 `invalid_grant` | `-32001` (401), `-32001` (200), `-32003` (200) | yes | A lease of the chain is unknown to the lease store (fail closed); at `POST /token` and `POST /token/renew`, the token's own lease or an ancestor's. |
 | `limit_arg_invalid` |  | `-32003` (200) | yes | The call lacks an argument a run limit counts, or has a value it cannot count. |
 | `malformed_client_auth` | 401 `invalid_client` |  |  | The HTTP Basic credentials are malformed. |
 | `malformed_request` | 400 `invalid_request` |  |  | The token request is missing a field or has an invalid one. |
@@ -138,7 +138,7 @@ The table is generated from `attenuo_core::error_codes::ERROR_CODES`, the one pl
 | `missing_token` | 401 `unauthorized` | `-32001` (401) |  | No credential was sent. |
 | `multiple_client_auth` | 400 `invalid_request` |  |  | Client credentials were sent in more than one way (HTTP Basic and the body, or a secret and a client assertion). |
 | `no_agents_configured` | 401 `invalid_client` |  |  | No `[[agents]]` are configured, so no agent can authenticate. |
-| `no_capabilities_requested` | 400 `invalid_request` |  |  | The token request asks for no capability. |
+| `no_capabilities_requested` | 400 `invalid_request` |  |  | The token request (`POST /token`, `POST /admin/root-token`) asks for no capability. |
 | `no_lifetime_left` | 400 `invalid_request` |  |  | The new token would expire immediately. |
 | `no_peps_configured` | 401 `invalid_client` |  |  | No `[[peps]]` are configured, so no PEP can authenticate. |
 | `no_root_grant` | 403, 400 `invalid_scope` |  |  | No `[[root_grants]]` entry covers the agent and user. |
@@ -158,13 +158,13 @@ The table is generated from `attenuo_core::error_codes::ERROR_CODES`, the one pl
 | `request_too_large` | 413 | `-32600` (413) |  | The request body is over the size limit. |
 | `reserved_agent` | 400 `invalid_request` |  |  | The `actor` is the reserved agent `attenuo`. |
 | `reserved_subject` | 400 `invalid_request`, 400 `invalid_grant` |  |  | The subject is reserved. |
-| `scope_exceeds_grant` | 400 `invalid_scope` |  |  | The hop-0 request asks for more than the root grant allows. |
+| `scope_exceeds_grant` | 400 `invalid_scope` |  |  | The hop-0 request (an IdP credential at `POST /token`, or `POST /admin/root-token`) asks for more than the root grant allows. |
 | `server_error` | 500 |  |  | An internal error; the cause is in the server log only. |
 | `session_mismatch` |  | `-32003` (403) |  | The `Mcp-Session-Id` belongs to another principal. |
 | `session_registry_full` |  | `-32006` (503) |  | No free session slot (`[proxy] max_sessions`). |
 | `session_unknown` |  | `-32600` (404) |  | The `Mcp-Session-Id` is not bound; start a new session. |
 | `tenant_mismatch` | 400 `invalid_grant` |  |  | The ID-JAG's `tenant` is not the `[[idps]] tenant` of its issuer. |
-| `token_expired` | 401 `unauthorized` | `-32001` (401), `-32001` (200) |  | The token verified but has expired. |
+| `token_expired` | 401 `unauthorized`, 400 `invalid_grant` | `-32001` (401), `-32001` (200) |  | The token verified but has expired (a bearer, or at `POST /token` the subject token or a hop of its chain). |
 | `too_many_pending_approvals` | 429 |  |  | The run already has the maximum number of pending approvals. |
 | `too_many_sessions` |  | `-32007` (429) |  | The principal holds `[proxy] max_sessions_per_principal` live sessions. |
 | `tool_not_in_catalog` |  | `-32003` (200) | yes | The tool is not in the catalog and unknown tools are denied. |
@@ -175,7 +175,7 @@ The table is generated from `attenuo_core::error_codes::ERROR_CODES`, the one pl
 | `unsupported_alg` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The credential's signing algorithm is not accepted. |
 | `unsupported_grant_type` | 400 |  |  | The `grant_type` is not supported. |
 | `unsupported_media_type` | 415 |  |  | The console listener requires `Content-Type: application/json`. |
-| `unsupported_token_type` | 400 `invalid_request` |  |  | The `subject_token_type` is not supported. |
+| `unsupported_token_type` | 400 `invalid_request` |  |  | The `subject_token_type` is not supported (neither the JWT URN of an exchange nor a hop-0 credential type). |
 | `untrusted_issuer` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The credential's issuer is not an `[[idps]]` entry. |
 | `upstream_body_too_large` |  | `-32005` (502) |  | An upstream body the proxy buffers is over `[proxy] max_upstream_body_bytes`. |
 | `upstream_invalid_response` |  | `-32005` (502) |  | The upstream's answer is not one the proxy can filter or label. |

@@ -180,6 +180,10 @@ fn mint_root_sync(
     Ok(out)
 }
 
+/// `code` of a request that asks for more than its `[[root_grants]]` entry allows (as at hop-0
+/// intake).
+const SCOPE_EXCEEDS_GRANT: &str = "scope_exceeds_grant";
+
 /// What a grant allows: capabilities, attributes, `may_act`.
 type Granted = (CapabilitySet, BTreeMap<String, Value>, Option<MayAct>);
 
@@ -193,8 +197,10 @@ fn resolve_grant(grants: &[RootGrant], req: &RootTokenRequest) -> Result<Granted
         .transpose()
         .map_err(|e| ApiError::bad_request("invalid_scope", e))?;
     if grants.is_empty() {
-        let caps = requested
-            .ok_or_else(|| ApiError::bad_request("invalid_request", "capabilities are required"))?;
+        let caps = requested.ok_or_else(|| {
+            ApiError::bad_request("invalid_request", "capabilities are required")
+                .with_code(super::token::NO_CAPABILITIES_REQUESTED)
+        })?;
         return Ok((caps, BTreeMap::new(), req.may_act.clone()));
     }
     let grant =
@@ -211,9 +217,9 @@ fn resolve_grant(grants: &[RootGrant], req: &RootTokenRequest) -> Result<Granted
     let ceiling = capability_set(&grant.capabilities).map_err(ApiError::internal)?;
     let caps = match requested {
         None => ceiling,
-        Some(r) => ceiling
-            .attenuate(&r)
-            .map_err(|e| ApiError::bad_request("invalid_scope", e.to_string()))?,
+        Some(r) => ceiling.attenuate(&r).map_err(|e| {
+            ApiError::bad_request("invalid_scope", e.to_string()).with_code(SCOPE_EXCEEDS_GRANT)
+        })?,
     };
     let may_act = grant.may_act_for(req.may_act.clone()).map_err(|e| {
         ApiError::bad_request("invalid_request", e).with_description("may_act_exceeds_grant")
