@@ -15,10 +15,10 @@ No nightly needed: this is what CI's `fuzz-check` job runs on every pull request
 change Rust (also `just fuzz-check` or `scripts/dev.sh fuzz`).
 
 ```sh
-RUSTFLAGS="--cfg fuzzing" cargo check --manifest-path fuzz/Cargo.toml --bins --examples --locked
+RUSTFLAGS="--cfg fuzzing -D warnings" cargo check --manifest-path fuzz/Cargo.toml --bins --examples --locked
 ```
 
-It fails when a library change breaks a target or leaves `fuzz/Cargo.lock` stale. cargo-fuzz
+It fails when a library change breaks a target, makes one warn, or leaves `fuzz/Cargo.lock` stale. cargo-fuzz
 has no `--locked` and rewrites the lockfile silently, so after a dependency change in the
 workspace refresh it with `cargo update --manifest-path fuzz/Cargo.toml --workspace` (or
 `-p <crate> --precise <version>` to match the root `Cargo.lock`) and commit the result.

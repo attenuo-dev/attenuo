@@ -35,7 +35,7 @@ policy() {
 }
 docs()   { RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps; }
 links()  { python3 scripts/check-links.py; }
-fuzz()   { RUSTFLAGS="--cfg fuzzing" cargo check --manifest-path fuzz/Cargo.toml --bins --examples --locked; }
+fuzz()   { RUSTFLAGS="--cfg fuzzing -D warnings" cargo check --manifest-path fuzz/Cargo.toml --bins --examples --locked; }
 deny() {
   if cargo deny --version >/dev/null 2>&1; then cargo deny check
   else echo "cargo-deny not installed, skipping (cargo install cargo-deny)"; fi
