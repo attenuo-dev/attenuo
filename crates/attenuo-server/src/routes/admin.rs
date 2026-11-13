@@ -94,7 +94,7 @@ pub async fn require_admin(
     if identity.role < needed {
         return ApiError::new(
             StatusCode::FORBIDDEN,
-            ROLE_INSUFFICIENT,
+            "admin_role_insufficient",
             format!(
                 "this route needs the `{needed}` role; the credential presented has the `{}` \
                  role",
@@ -106,9 +106,6 @@ pub async fn require_admin(
     req.extensions_mut().insert(identity);
     next.run(req).await
 }
-
-/// `error` of an admin request whose credential's role is below the route's (403).
-pub const ROLE_INSUFFICIENT: &str = "admin_role_insufficient";
 
 pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
