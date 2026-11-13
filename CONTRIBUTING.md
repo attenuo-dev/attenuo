@@ -29,7 +29,9 @@ cargo deny check          # cargo install cargo-deny
 cargo audit               # cargo install cargo-audit (optional locally; CI runs it)
 ```
 
-`scripts/dev.sh` runs fmt, clippy, the tests and the three scripted demos (the GitHub leak demo, the multi-hop delegation demo and the IdP exchange demo) in one go (`scripts/dev.sh policy docs links deny` runs the other CI steps). The `justfile` has the same targets if you use [just](https://github.com/casey/just): `just dev`, `just ci`, `just demo`, `just policy`. `scripts/gen-admin-token.sh` prints a random admin token for a local server config. The MSRV (`rust-version` in `Cargo.toml`) is checked in CI only.
+`scripts/dev.sh` runs fmt, clippy, the tests and the three scripted demos (the GitHub leak demo, the multi-hop delegation demo and the IdP exchange demo) in one go (`scripts/dev.sh policy docs links deny` runs the other CI steps). The `justfile` has the same targets if you use [just](https://github.com/casey/just): `just dev`, `just ci`, `just demo`, `just policy`. `scripts/gen-admin-token.sh` prints a random admin token for a local server config.
+
+`scripts/check-getting-started.sh` (`scripts/dev.sh guide`, `just guide`, and the `getting-started` CI job) runs every `sh` block of [the getting-started guide](docs/guides/getting-started.md) in order, in one shell with a scratch `HOME` and free ports, and fails when a command fails or its output differs from the `text` or `json` block that follows it (times, UUIDs and key ids are masked). It reads the commands from the guide, so when you change a command or an output there, run it. A few blocks carry an HTML comment on the line before the fence (`<!-- check: build -->`, `<!-- check: background -->`, `<!-- check: exit 2 -->`) that says how to run them; the script's header explains each. It takes a few seconds after the build. The MSRV (`rust-version` in `Cargo.toml`) is checked in CI only.
 
 ### Property tests
 

@@ -27,6 +27,10 @@ demo:
     bash examples/multi-hop-demo/run.sh
     bash examples/idp-exchange-demo/run.sh
 
+# run docs/guides/getting-started.md as written and check its outputs
+guide:
+    bash scripts/check-getting-started.sh
+
 # the Cedar policy tests (both demos' and config/policies/), offline
 policy:
     cargo run -q -p attenuo-cli -- policy test examples/github-leak-demo/policy_test.yaml examples/multi-hop-demo/policy_test.yaml
@@ -53,7 +57,7 @@ deny:
     cargo deny check
 
 # everything CI runs that can run locally
-ci: fmt clippy test demo policy docs links hygiene deny fuzz-check
+ci: fmt clippy test demo guide policy docs links hygiene deny fuzz-check
 
 # print a random admin token
 admin-token:
