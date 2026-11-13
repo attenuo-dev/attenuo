@@ -1,7 +1,7 @@
 //! Run limits (ADR-0010): what the counters of a call's matching limits hold, and the
 //! figures stated for an admin dry run.
 
-use attenuo_audit::LeaseStore;
+use attenuo_audit::RunLimits;
 use attenuo_core::{Charge, LimitKind};
 use attenuo_policy::{BudgetContext, UsageContext};
 use serde_json::Value;
@@ -246,7 +246,7 @@ pub fn budget_json(b: &BudgetContext) -> Value {
 /// `distinct` charge also how many values its limit has seen (0 for any other charge). A
 /// `distinct` charge's own counter says whether its value was seen (1) or not (0).
 pub(super) fn read_counters(
-    leases: &dyn LeaseStore,
+    leases: &dyn RunLimits,
     charges: &[Charge],
 ) -> Result<(Vec<u64>, Vec<u64>), attenuo_audit::AuditError> {
     let distinct: Vec<usize> = (0..charges.len())

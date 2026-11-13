@@ -667,7 +667,7 @@ pub async fn lease_tree(
 ///   amount, destinations}`.
 ///
 /// Read only; value hashes are never shown.
-fn hop_budget(leases: &dyn attenuo_audit::LeaseStore, lease: &LeaseId) -> Result<Value, ApiError> {
+fn hop_budget(leases: &dyn RunLimits, lease: &LeaseId) -> Result<Value, ApiError> {
     let recorded = leases.hop_limits(lease)?;
     let counters = leases.budget_summary(lease)?;
     if recorded.is_none() && counters.is_empty() {
