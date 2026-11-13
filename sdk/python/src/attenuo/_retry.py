@@ -30,6 +30,7 @@ not all come back in the same instant."""
 _sleep = time.sleep
 _asleep = asyncio.sleep
 _random = random.random
+_now = time.time
 
 
 class RetryPolicy:
@@ -64,6 +65,13 @@ class RetryPolicy:
         if left is not None and wait >= left:
             return None
         return wait
+
+
+def left_until(deadline: float | None) -> float | None:
+    """Seconds from now (wall clock) to ``deadline`` in Unix seconds, ``None`` for none: the
+    ``left`` of :meth:`RetryPolicy.delay` for a request that must not be sent again at or after
+    ``deadline`` (an exchange whose client assertion expires then)."""
+    return None if deadline is None else deadline - _now()
 
 
 def sleep(seconds: float) -> None:

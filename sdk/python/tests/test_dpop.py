@@ -279,6 +279,25 @@ async def test_client_caches_the_nonce_and_retries_once_on_use_dpop_nonce(
     assert server.seen[7:] == ["n-2"]
 
 
+async def test_the_nonce_retry_of_an_exchange_resends_its_client_assertion(
+    make: Any,  # noqa: F811
+) -> None:
+    """``use_dpop_nonce`` leaves a client assertion unused (the server checks the header proof
+    first), so the retry sends the same body, assertion included, with a new proof."""
+    s, key = Signer(), DpopKey.generate()
+    child = bound(s, key.thumbprint, ("planner", "coder"))
+    server = NonceServer(ok_for_every_route(child))
+    client, rec = make(server, dpop_key=key)
+    assertion = DpopKey.generate().client_assertion("reviewer", "https://a")
+    await call(
+        client, "exchange", child, "reviewer", ["github:read_file"], client_assertion=assertion
+    )
+    assert server.seen == [None, "n-1"]
+    first, retry = (json.loads(r.content) for r in rec.requests)
+    assert first == retry
+    assert first["client_assertion"] == assertion
+
+
 async def test_client_retries_only_once(make: Any) -> None:  # noqa: F811
     s, key = Signer(), DpopKey.generate()
     child = bound(s, key.thumbprint)

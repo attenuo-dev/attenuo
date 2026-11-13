@@ -38,6 +38,7 @@ import {
   mcpUrl,
   AttenuoClient,
   prefix,
+  RateLimitedError,
   RefreshError,
   RpcError,
   type Token,
@@ -48,6 +49,7 @@ import {
   verifyExport,
   withLimits,
 } from "../src/index.js";
+import { retryHooks } from "../src/retry.js";
 
 // [[agents]] secrets in the demo config: an exchange authenticates as its actor.
 const CODER_SECRET = "demo-coder-secret";
@@ -87,6 +89,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
  * Start the fake upstream and the server with the demo config, plus `tokenSection` (a `[token]`
  * table) when given and `fakeArgs` for the upstream; resolves once both answer. `policyExtra` is
  * appended to the demo policy, and each `edits` key of the config is replaced by its value.
+ * `{work}` in the config stands for the stack's own directory.
  */
 async function startStack(
   tokenSection = "",
@@ -119,7 +122,7 @@ async function startStack(
     if (!config.includes(from)) throw new Error(`not in the demo config: ${from}`);
     config = config.replace(from, to);
   }
-  writeFileSync(join(work, "config.toml"), config);
+  writeFileSync(join(work, "config.toml"), config.replaceAll("{work}", work));
 
   const fakeOut = join(work, "fake-mcp.out");
   const fakeLog = join(work, "fake-mcp.log");
@@ -162,6 +165,46 @@ async function startStack(
     await sleep(100);
   }
   return { url, work, procs };
+}
+
+/** Wait until the server at `url` answers `/healthz`, or throw with its log. */
+async function waitHealthy(url: string, work: string, proc: ChildProcess): Promise<void> {
+  const deadline = Date.now() + 20_000;
+  for (;;) {
+    try {
+      if ((await fetch(`${url}/healthz`, { signal: AbortSignal.timeout(1000) })).ok) return;
+    } catch {
+      /* not up yet */
+    }
+    if (proc.exitCode !== null || Date.now() > deadline) {
+      throw new Error(`server did not start:\n${readFileSync(join(work, "server.log"), "utf8")}`);
+    }
+    await sleep(100);
+  }
+}
+
+/**
+ * Stop the stack's server and start it again on the same port and config. A server with an
+ * ephemeral issuer key or a `:memory:` audit store forgets its tokens; one with files keeps them
+ * and forgets only what lives in the process, such as the rate limits' minutes.
+ */
+async function restartServer(stack: { url: string; work: string; procs: ChildProcess[] }) {
+  const old = stack.procs[1]!;
+  const exited = new Promise((r) => old.once("exit", r));
+  old.kill("SIGTERM");
+  await exited;
+  const log = createWriteStream(join(stack.work, "server.log"), { flags: "a" });
+  await new Promise((r) => log.once("open", r));
+  const proc = spawn(
+    join(stack.work, "attenuo-server"),
+    ["--config", join(stack.work, "config.toml")],
+    {
+      stdio: ["ignore", log, log],
+      env: { ...process.env, RUST_LOG: "warn" },
+    },
+  );
+  stack.procs[1] = proc;
+  await waitHealthy(stack.url, stack.work, proc);
 }
 
 async function stopStack(procs: ChildProcess[], work: string): Promise<void> {
@@ -1260,3 +1303,180 @@ describe.skipIf(!enabled)(
     });
   },
 );
+
+// ---- private_key_jwt client assertions and the retries that send them again ---------------
+//
+// The server leaves a client assertion unused when it refuses the request with `use_dpop_nonce`
+// or `429 rate_limited` (SR-108, SR-111), because the client is told to send the same request
+// again. These tests check that the SDK's retries then succeed against the real server, and that
+// the load retry does not send an assertion that will have expired.
+
+/** An `[[agents]]` entry for `signer` that authenticates with `key`'s client assertions. */
+function signerAgent(key: DpopKey): string {
+  return `[[agents]]\nid = "signer"\njwks = '${JSON.stringify({ keys: [key.publicJwk] })}'\n\n`;
+}
+
+interface Sent {
+  assertion?: string;
+  status: number;
+  error?: string;
+}
+
+/** The global `fetch`, keeping each `POST /token` and its answer. */
+function recordingFetch() {
+  const sent: Sent[] = [];
+  const f = async (input: string, init?: RequestInit): Promise<Response> => {
+    const res = await fetch(input, init);
+    if (new URL(input).pathname === "/token") {
+      const body = JSON.parse(String(init?.body)) as { client_assertion?: string };
+      const answer = (await res.clone().json()) as { error?: string };
+      sent.push({ assertion: body.client_assertion, status: res.status, error: answer.error });
+    }
+    return res;
+  };
+  return { fetch: f, sent };
+}
+
+describe.skipIf(!enabled)("a client assertion across the nonce retry", () => {
+  let stack = { url: "", work: "", procs: [] as ChildProcess[] };
+  let clientKey: DpopKey;
+
+  beforeAll(async () => {
+    clientKey = await DpopKey.generate();
+    stack = await startStack(`[token]\ndpop_nonce = "required"\n\n${signerAgent(clientKey)}`);
+  });
+
+  afterAll(async () => {
+    await stopStack(stack.procs, stack.work);
+  });
+
+  it("is sent again with a proof that carries the nonce, and accepted", async () => {
+    // A fresh client's first exchange is refused `use_dpop_nonce`; the retry sends the same
+    // assertion with the nonce, and the server accepts it. The next exchange has the nonce
+    // already: one request.
+    const { url } = stack;
+    const key = await DpopKey.generate();
+    const admin = new AdminClient(url, ADMIN_TOKEN);
+    const root = () =>
+      admin.mintRootDev("alice", "https://idp.example", "assistant", {
+        capabilities: ["github:*"],
+        dpopKey: key,
+      });
+    const [firstRoot, laterRoot] = [await root(), await root()];
+    const rec = recordingFetch();
+    const ob = new AttenuoClient(url, { dpopKey: key, fetch: rec.fetch });
+
+    let assertion = await clientKey.clientAssertion("signer", url);
+    let child = await ob.exchange(firstRoot, "signer", ["github:read_file"], {
+      clientAssertion: assertion,
+    });
+    expect(child.dpopJkt).toBe(key.thumbprint);
+    expect(child.chain.hops.at(-1)?.agent).toBe("signer");
+    expect(rec.sent).toEqual([
+      { assertion, status: 401, error: "use_dpop_nonce" },
+      { assertion, status: 200, error: undefined },
+    ]);
+
+    rec.sent.length = 0;
+    assertion = await clientKey.clientAssertion("signer", url);
+    child = await ob.exchange(laterRoot, "signer", ["github:read_file"], {
+      clientAssertion: assertion,
+    });
+    expect(rec.sent).toEqual([{ assertion, status: 200, error: undefined }]);
+    // The bound child works through the proxy.
+    const res = await ob.callTool(child, "github", "read_file", { repo: "alice/public-docs" });
+    expect(res.decisionId).toBeTruthy();
+  });
+});
+
+describe.skipIf(!enabled)("a client assertion across the load retry", () => {
+  // `token_requests_per_minute = 1`, and an issuer key and audit store (leases, spent
+  // credentials) in files: a restart keeps the tokens and every spent assertion and forgets only
+  // the rate limit's minute, so the tests restart the server in place of waiting it out.
+  let stack = { url: "", work: "", procs: [] as ChildProcess[] };
+  let clientKey: DpopKey;
+  const original = { ...retryHooks };
+
+  beforeAll(async () => {
+    clientKey = await DpopKey.generate();
+    stack = await startStack(
+      `[limits]\ntoken_requests_per_minute = 1\n\n${signerAgent(clientKey)}`,
+      [],
+      {
+        edits: {
+          'sqlite_path = ":memory:"': 'sqlite_path = "{work}/audit.sqlite"',
+          "[issuer]\n": '[issuer]\nprivate_key_pem_path = "{work}/issuer.pem"\n',
+        },
+      },
+    );
+  });
+
+  afterAll(async () => {
+    Object.assign(retryHooks, original);
+    await stopStack(stack.procs, stack.work);
+  });
+
+  it("sends the same assertion while it lasts, and throws when it would expire", async () => {
+    const { url } = stack;
+    const admin = new AdminClient(url, ADMIN_TOKEN);
+    const roots: Token[] = [];
+    for (let i = 0; i < 3; i++) {
+      roots.push(
+        await admin.mintRootDev("alice", "https://idp.example", "assistant", {
+          capabilities: ["github:*"],
+        }),
+      );
+    }
+    const waits: number[] = [];
+    retryHooks.random = () => 0;
+    retryHooks.sleep = async (ms) => {
+      waits.push(ms);
+      await restartServer(stack);
+    };
+    const rec = recordingFetch();
+    const ob = new AttenuoClient(url, {
+      fetch: rec.fetch,
+      maxRetries: 1,
+      maxRetryDelayMs: 120_000,
+    });
+    const caps = ["github:read_file"];
+    await ob.exchange(roots[0]!, "signer", caps, {
+      clientAssertion: await clientKey.clientAssertion("signer", url),
+    });
+    expect(waits).toEqual([]);
+
+    // Over the limit: 429 with `Retry-After` until the minute ends. The assertion lasts longer,
+    // so the client waits (here: the restart) and sends it again, and it is accepted.
+    rec.sent.length = 0;
+    const lasting = await clientKey.clientAssertion("signer", url, { lifetime: 300 });
+    const child = await ob.exchange(roots[1]!, "signer", caps, { clientAssertion: lasting });
+    expect(child.chain.hops.at(-1)?.agent).toBe("signer");
+    expect(waits).toHaveLength(1);
+    expect(waits[0]).toBeGreaterThanOrEqual(1000);
+    expect(waits[0]).toBeLessThanOrEqual(60_000);
+    expect(rec.sent).toEqual([
+      { assertion: lasting, status: 429, error: "rate_limited" },
+      { assertion: lasting, status: 200, error: undefined },
+    ]);
+
+    // Over the limit again, with an assertion that would expire before the minute ends: not
+    // sent again; the refusal is thrown at once.
+    rec.sent.length = 0;
+    const short = await clientKey.clientAssertion("signer", url, { lifetime: 5 });
+    const err = await ob.exchange(roots[2]!, "signer", caps, { clientAssertion: short }).then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(RateLimitedError);
+    expect((err as RateLimitedError).retryAfter).toBeGreaterThan(5);
+    expect(waits).toHaveLength(1);
+    expect(rec.sent).toEqual([{ assertion: short, status: 429, error: "rate_limited" }]);
+
+    // What the caller does: wait out `retryAfter` (here: the restart), mint, call again.
+    await restartServer(stack);
+    await ob.exchange(roots[2]!, "signer", caps, {
+      clientAssertion: await clientKey.clientAssertion("signer", url),
+    });
+    expect(rec.sent.map((x) => x.status)).toEqual([429, 200]);
+  });
+});

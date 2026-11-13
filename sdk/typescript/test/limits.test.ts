@@ -16,6 +16,7 @@ import {
   type StreamEvent,
 } from "../src/index.js";
 import { retryHooks } from "../src/retry.js";
+import { assertionExpiry } from "../src/wire.js";
 import { jsonResponse, mockFetch, rpcErr, rpcOk, Signer, tokenResponse } from "./helpers.js";
 
 const BASE = "http://ob.test";
@@ -403,6 +404,86 @@ describe("the opt-in retry", () => {
     expect(calls.map((c) => c.url.pathname)).toEqual(["/token", "/token", "/token"]);
   });
 
+  describe("an exchange with a client assertion", () => {
+    let now: number;
+    beforeEach(() => {
+      // A wall clock at 1,000,000 s that the retry waits move forward.
+      now = 1_000_000_000;
+      retryHooks.now = () => now;
+      retryHooks.sleep = async (ms) => {
+        sleeps.push(ms);
+        now += ms;
+      };
+    });
+    const assertionsSent = (calls: { body?: unknown }[]) =>
+      calls.map((c) => (c.body as { client_assertion?: string }).client_assertion);
+
+    it("sends the same unexpired assertion again", async () => {
+      const child = await (await Signer.create()).mint({ agents: ["planner", "coder"] });
+      const { ob, calls } = client(
+        sequence(
+          () => restRateLimited("20"),
+          () => restOverloaded("1"),
+          () => jsonResponse(tokenResponse(child, "lease-1")),
+        ),
+        { maxRetries: 3, maxRetryDelayMs: 60_000 },
+      );
+      const key = await DpopKey.generate();
+      const assertion = await key.clientAssertion("coder", "https://a", { iat: 1_000_000 });
+      const tok = await ob.exchange(await (await Signer.create()).mint(), "coder", "github:x", {
+        clientAssertion: assertion,
+      });
+      expect(tok.lease).toBe("lease-1");
+      expect(sleeps).toEqual([20_000, 1000]);
+      expect(assertionsSent(calls)).toEqual([assertion, assertion, assertion]);
+    });
+
+    it("does not send an assertion again when the wait would reach its exp", async () => {
+      // The first wait (30 s) fits the 60 s assertion, the second (reaching `exp`) does not.
+      const { ob, calls } = client(() => restRateLimited("30"), {
+        maxRetries: 5,
+        maxRetryDelayMs: 60_000,
+      });
+      const key = await DpopKey.generate();
+      const assertion = await key.clientAssertion("coder", "https://a", { iat: 1_000_000 });
+      const parent = await (await Signer.create()).mint();
+      const err = (await caught(
+        ob.exchange(parent, "coder", "github:x", { clientAssertion: assertion }),
+      )) as RateLimitedError;
+      expect(err).toBeInstanceOf(RateLimitedError);
+      expect(err.retryAfter).toBe(30);
+      expect(sleeps).toEqual([30_000]);
+      expect(assertionsSent(calls)).toEqual([assertion, assertion]);
+
+      // One already past its `exp` by the client's clock is not sent again at all.
+      calls.length = 0;
+      sleeps.length = 0;
+      const old = await key.clientAssertion("coder", "https://a", { iat: 900_000 });
+      const again = await caught(
+        ob.exchange(parent, "coder", "github:x", { clientAssertion: old }),
+      );
+      expect(again).toBeInstanceOf(RateLimitedError);
+      expect(sleeps).toEqual([]);
+      expect(calls).toHaveLength(1);
+    });
+
+    it("retries as before without an exp it can read, or with a secret", async () => {
+      const child = await (await Signer.create()).mint({ agents: ["planner", "coder"] });
+      const parent = await (await Signer.create()).mint();
+      for (const auth of [{ clientAssertion: "a.b.c" }, { clientSecret: "s" }]) {
+        const { ob } = client(
+          sequence(
+            () => restRateLimited("50"),
+            () => jsonResponse(tokenResponse(child, "lease-1")),
+          ),
+          { maxRetries: 1, maxRetryDelayMs: 60_000 },
+        );
+        await ob.exchange(parent, "coder", "github:x", auth);
+      }
+      expect(sleeps).toEqual([50_000, 50_000]);
+    });
+  });
+
   it.each([
     ["authzenConfiguration", "/.well-known/authzen-configuration"],
     ["jwks", "/.well-known/jwks.json"],
@@ -586,5 +667,26 @@ describe("the opt-in retry", () => {
     [{ maxRetryDelayMs: Number.NaN }],
   ])("checks its options: %j", (opts) => {
     expect(() => new AttenuoClient(BASE, opts)).toThrow(RangeError);
+  });
+});
+
+describe("assertionExpiry", () => {
+  const b64 = (v: unknown) => Buffer.from(JSON.stringify(v)).toString("base64url");
+  it.each([
+    [{ exp: 1_000_060 }, 1_000_060],
+    [{ exp: 1_000_060.9 }, 1_000_060],
+    [{ exp: true }, undefined],
+    [{ exp: "1000060" }, undefined],
+    [{}, undefined],
+    [[1], undefined],
+  ] as const)("reads exp from %j without verifying", (claims, exp) => {
+    const jwt = `${b64({ alg: "EdDSA" })}.${b64(claims)}.sig`;
+    expect(assertionExpiry({ client_assertion: jwt })).toBe(exp);
+  });
+  it("is undefined for anything that is not a readable JWT", () => {
+    expect(assertionExpiry({ client_assertion: "a.!.c" })).toBeUndefined();
+    expect(assertionExpiry({ client_assertion: "a.b" })).toBeUndefined();
+    expect(assertionExpiry({ client_assertion: "a.e30x.c" })).toBeUndefined();
+    expect(assertionExpiry({ client_secret: "s" })).toBeUndefined();
   });
 });

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -23,7 +24,7 @@ from .errors import (
     Unauthorized,
     Unavailable,
 )
-from .token import Token, decode_token, parse_time
+from .token import Token, _b64url_decode, decode_token, parse_time
 
 TOKEN_EXCHANGE_GRANT = "urn:ietf:params:oauth:grant-type:token-exchange"
 TYPE_JWT = "urn:ietf:params:oauth:token-type:jwt"
@@ -403,6 +404,33 @@ def exchange_body(
     if may_act is not None:
         body["may_act"] = may_act_json(may_act)
     return body
+
+
+def assertion_expiry(body: dict[str, Any]) -> int | None:
+    """The ``exp`` of the ``client_assertion`` in a ``POST /token`` ``body``, read without
+    verifying anything; ``None`` when the body has none or its ``exp`` cannot be read.
+
+    A load refusal (429 ``rate_limited``, 503 ``overloaded``) leaves the assertion unspent, so
+    the retry may send it again, but only before it expires: the client's retry does not wait
+    past this time (:func:`attenuo._retry.left_until`)."""
+    assertion = body.get("client_assertion")
+    if not isinstance(assertion, str):
+        return None
+    parts = assertion.split(".")
+    if len(parts) != 3:
+        return None
+    try:
+        claims = json.loads(_b64url_decode(parts[1]))
+    except (AttenuoError, ValueError):
+        return None
+    exp = claims.get("exp") if isinstance(claims, dict) else None
+    if isinstance(exp, bool):
+        return None
+    if isinstance(exp, int):
+        return exp
+    if isinstance(exp, float) and math.isfinite(exp):
+        return int(exp)
+    return None
 
 
 def may_act_json(may_act: Iterable[str]) -> dict[str, list[str]]:
