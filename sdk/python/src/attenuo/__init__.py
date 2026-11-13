@@ -28,6 +28,7 @@ from ._wire import (
 )
 from .admin import (
     AdminClient,
+    ApprovalPage,
     AsyncAdminClient,
     AuditEntry,
     AuditEntryDetail,
@@ -146,6 +147,7 @@ __all__ = [
     "Approval",
     "ApprovalClaims",
     "ApprovalNotGranted",
+    "ApprovalPage",
     "ApprovalRequired",
     "ArgLimit",
     "AsyncAdminClient",

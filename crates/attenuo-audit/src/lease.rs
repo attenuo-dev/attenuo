@@ -744,8 +744,10 @@ pub struct MemoryLeaseStore {
     labels: Mutex<BTreeMap<LeaseId, BTreeMap<String, RunLabel>>>,
     /// Per run, the span index (ADR-0009 phase 2).
     spans: Mutex<Spans>,
-    /// Approvals by id.
-    approvals: Mutex<BTreeMap<String, Approval>>,
+    /// Approvals by id, each with its position (see [`ApprovalStore::approvals`]).
+    approvals: Mutex<BTreeMap<String, (u64, Approval)>>,
+    /// The position the last created approval got; read and bumped under `approvals`.
+    approval_pos: std::sync::atomic::AtomicU64,
     /// Run-limit counters and the charges of each decision, under one lock (ADR-0010).
     budgets: Mutex<Budgets>,
     /// The limited capabilities of each hop, as issued (display only).
@@ -1314,15 +1316,17 @@ impl ApprovalStore for MemoryLeaseStore {
         let now = approval.created_at;
         let lease_expiry = rules::live_lease(&approval.lease, rows.get(&approval.lease), now)?;
         let mut approvals = self.approvals.lock()?;
-        if let Some(existing) = approvals
+        if let Some((_, existing)) = approvals
             .values()
-            .find(|a| rules::reusable(a, approval, now))
+            .find(|(_, a)| rules::reusable(a, approval, now))
         {
             return Ok((existing.clone(), false));
         }
         let pending = approvals
             .values()
-            .filter(|a| rules::counts_as_pending(a, rows.get(&a.lease), &approval.chain_id, now))
+            .filter(|(_, a)| {
+                rules::counts_as_pending(a, rows.get(&a.lease), &approval.chain_id, now)
+            })
             .count();
         rules::below_pending_cap(&approval.chain_id, pending)?;
         let mut stored = approval.clone();
@@ -1331,27 +1335,38 @@ impl ApprovalStore for MemoryLeaseStore {
         stored.decided_at = None;
         stored.consumed_by = None;
         stored.expires_at = stored.expires_at.min(lease_expiry);
-        approvals.insert(stored.id.clone(), stored.clone());
+        // Bumped under the `approvals` lock, so positions follow insertion order.
+        let pos = self
+            .approval_pos
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        approvals.insert(stored.id.clone(), (pos, stored.clone()));
         Ok((stored, true))
     }
 
     fn approval(&self, id: &str) -> Result<Option<Approval>, AuditError> {
-        Ok(self.approvals.lock()?.get(id).cloned())
+        Ok(self.approvals.lock()?.get(id).map(|(_, a)| a.clone()))
     }
 
     fn approvals(
         &self,
         chain_id: Option<&LeaseId>,
+        state: Option<ApprovalState>,
+        before: Option<u64>,
         limit: usize,
-    ) -> Result<Vec<Approval>, AuditError> {
-        let mut out: Vec<Approval> = self
+    ) -> Result<Vec<(u64, Approval)>, AuditError> {
+        let mut out: Vec<(u64, Approval)> = self
             .approvals
             .lock()?
             .values()
-            .filter(|a| chain_id.is_none_or(|c| &a.chain_id == c))
+            .filter(|(pos, a)| {
+                before.is_none_or(|b| *pos < b)
+                    && chain_id.is_none_or(|c| &a.chain_id == c)
+                    && state.is_none_or(|s| a.state == s)
+            })
             .cloned()
             .collect();
-        out.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.id.cmp(&a.id)));
+        out.sort_by_key(|(pos, _)| std::cmp::Reverse(*pos));
         out.truncate(limit);
         Ok(out)
     }
@@ -1365,7 +1380,7 @@ impl ApprovalStore for MemoryLeaseStore {
     ) -> Result<Approval, AuditError> {
         let rows = self.rows.lock()?;
         let mut approvals = self.approvals.lock()?;
-        let a = approvals
+        let (_, a) = approvals
             .get_mut(id)
             .ok_or_else(|| AuditError::UnknownApproval(id.to_owned()))?;
         rules::decidable(a, now)?;
@@ -1395,6 +1410,7 @@ impl ApprovalStore for MemoryLeaseStore {
         let mut approvals = self.approvals.lock()?;
         let Some(a) = approvals
             .values_mut()
+            .map(|(_, a)| a)
             .filter(|a| rules::usable(a, chain_id, lease, call_hash, now))
             .min_by(|a, b| a.created_at.cmp(&b.created_at))
         else {
@@ -1421,6 +1437,7 @@ impl ApprovalStore for MemoryLeaseStore {
         let mut approvals = self.approvals.lock()?;
         let Some(a) = approvals
             .get_mut(id)
+            .map(|(_, a)| a)
             .filter(|a| rules::usable(a, chain_id, lease, call_hash, now))
         else {
             return Ok(None);
@@ -1431,7 +1448,7 @@ impl ApprovalStore for MemoryLeaseStore {
     }
 
     fn restore_approval(&self, id: &str, decision_id: &str) -> Result<(), AuditError> {
-        if let Some(a) = self.approvals.lock()?.get_mut(id) {
+        if let Some((_, a)) = self.approvals.lock()?.get_mut(id) {
             if a.state == ApprovalState::Consumed && a.consumed_by.as_deref() == Some(decision_id) {
                 a.state = ApprovalState::Granted;
                 a.consumed_by = None;
@@ -1840,7 +1857,7 @@ impl StoreRetention for MemoryLeaseStore {
                     let window: Vec<(String, bool)> = approvals
                         .range(after(&from))
                         .take(budget)
-                        .map(|(id, a)| {
+                        .map(|(id, (_, a))| {
                             let lease_known =
                                 rows.contains_key(&a.lease) || rows.contains_key(&a.chain_id);
                             let prunable = run_state_prunable(

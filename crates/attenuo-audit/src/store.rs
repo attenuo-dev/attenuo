@@ -26,7 +26,7 @@ use attenuo_core::fingerprint::Fingerprint;
 use attenuo_core::{Charge, LeaseId, WindowCharge};
 use time::OffsetDateTime;
 
-use crate::approval::{Approval, Approver};
+use crate::approval::{Approval, ApprovalState, Approver};
 use crate::budget::{ChargeOutcome, CounterSummary, HopLimit};
 use crate::error::AuditError;
 use crate::lease::{
@@ -352,7 +352,17 @@ pub trait ApprovalStore: Send + Sync {
     /// Only a store fault (see [`LeaseStore`]): an unknown id is `Ok(None)`.
     fn approval(&self, id: &str) -> Result<Option<Approval>, AuditError>;
 
-    /// Approvals newest first, at most `limit`; only those of the run `chain_id` when given.
+    /// Approvals newest first, each with its position, at most `limit`: only those of the run
+    /// `chain_id` and in `state` when given, and only those positioned below `before` when
+    /// given.
+    ///
+    /// The position is a number the store gives an approval when it creates it: larger than
+    /// that of every approval stored at that moment, and kept until the approval is removed.
+    /// Passing the position of the last approval of one call as `before` of the next lists
+    /// the following ones (keyset paging, used by `GET /admin/approvals`): every approval
+    /// that existed when the first call was made is listed exactly once, whatever is created
+    /// in between (it sorts above the first page), and the state filter is applied before
+    /// `limit`, so a filtered page is never cut short by approvals in other states.
     ///
     /// # Errors
     ///
@@ -360,8 +370,10 @@ pub trait ApprovalStore: Send + Sync {
     fn approvals(
         &self,
         chain_id: Option<&LeaseId>,
+        state: Option<ApprovalState>,
+        before: Option<u64>,
         limit: usize,
-    ) -> Result<Vec<Approval>, AuditError>;
+    ) -> Result<Vec<(u64, Approval)>, AuditError>;
 
     /// Grant (`grant = true`) or decline a pending approval; the checks and the write are one
     /// transaction.

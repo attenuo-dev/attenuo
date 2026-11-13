@@ -14,6 +14,7 @@ use time::OffsetDateTime;
 
 use super::approvals::{
     approval_from_row, approval_in, approvals_for_call, pending_of_run, APPROVAL_COLUMNS,
+    APPROVAL_COLUMN_COUNT,
 };
 use super::budgets::{counter_in, prune_windows_in, refund_in, window_in};
 use super::connection::{
@@ -1125,19 +1126,31 @@ impl ApprovalStore for SqliteLeaseStore {
     fn approvals(
         &self,
         chain_id: Option<&LeaseId>,
+        state: Option<ApprovalState>,
+        before: Option<u64>,
         limit: usize,
-    ) -> Result<Vec<Approval>, AuditError> {
+    ) -> Result<Vec<(u64, Approval)>, AuditError> {
         let conn = self.conn.lock()?;
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        // `rowid` follows insertion order, which is creation order.
+        // The position is the `rowid`: it follows insertion order, which is creation order,
+        // and a row keeps it (the store never runs VACUUM). A bound is always passed, so the
+        // scan is a range of the rowid b-tree from `before` down, however deep the page is.
+        let before = before.map_or(i64::MAX, |b| i64::try_from(b).unwrap_or(i64::MAX));
         let mut stmt = conn.prepare_cached(&format!(
-            "SELECT {APPROVAL_COLUMNS} FROM approvals \
-             WHERE ?1 IS NULL OR chain_id = ?1 ORDER BY rowid DESC LIMIT ?2"
+            "SELECT {APPROVAL_COLUMNS}, rowid FROM approvals \
+             WHERE rowid < ?3 AND (?1 IS NULL OR chain_id = ?1) AND (?2 IS NULL OR state = ?2) \
+             ORDER BY rowid DESC LIMIT ?4"
         ))?;
-        let mut rows = stmt.query(params![chain_id.map(|c| c.0.as_str()), limit])?;
+        let mut rows = stmt.query(params![
+            chain_id.map(|c| c.0.as_str()),
+            state.as_ref().map(ApprovalState::as_str),
+            before,
+            limit
+        ])?;
         let mut out = Vec::new();
         while let Some(r) = rows.next()? {
-            out.push(approval_from_row(r)?);
+            let pos: i64 = r.get(APPROVAL_COLUMN_COUNT)?;
+            out.push((u64::try_from(pos).unwrap_or(0), approval_from_row(r)?));
         }
         Ok(out)
     }

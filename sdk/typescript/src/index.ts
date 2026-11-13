@@ -58,6 +58,7 @@ export type {
   AuditEntry,
   AuditEntryDetail,
   AuditExportFilter,
+  ApprovalPage,
   AuditPage,
   AuditQuery,
   BudgetLimit,

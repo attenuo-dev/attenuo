@@ -8,6 +8,20 @@ A request the server cannot read is refused in the same shape on every non-MCP r
 
 An HTTP/1 answer sent before the request body was read to its end carries `Connection: close`, and the server closes the connection after it. Most refusals are decided on the headers alone: a missing or bad token on `/mcp/{server}` (401, `use_dpop_nonce` included), a declared body over `[proxy] max_request_body_bytes` (413), and a missing admin bearer (401). A client sends its retry on a new connection. Answers to requests whose body was read, and to requests with no body, keep the connection open. HTTP/2 answers never carry the header.
 
+## Paging
+
+Every route that returns a list a client may need to read past one answer pages the same way: `GET /admin/audit`, `GET /admin/audit/checkpoints` and `GET /admin/approvals`.
+
+- **Request.** `limit` is the page size; `cursor` is the `next_cursor` of the previous page, sent back unchanged with the same filters (and `order`, where there is one). Leave `cursor` out for the first page.
+- **Answer.** The items (`entries`, `checkpoints` or `approvals`) and `next_cursor`: a string for the next page, or `null` when there is nothing after this one. A page can hold fewer than `limit` items, even none, while `next_cursor` is set (a filtered audit page reads a bounded range of the log): keep following it until it is `null`.
+- **Limits.** Each route documents its default and maximum `limit`. A `limit` of 0 or above the maximum is 400 `invalid_request`; it is not clamped.
+- **Cursors are opaque.** Do not build or parse one; its encoding may change. A cursor that is malformed, was issued by another list route or for the other `order`, or comes from another format version is 400 `invalid_cursor`, with a `detail` that says which and never repeats the cursor. A cursor does not expire: it holds a position, not a server-side session, and still works after the item it points past has been removed.
+- **Stable under writes.** The cursor holds a keyset position (an audit or checkpoint `seq`, or the approval's position in the store), never an offset. Items appended or created while a client pages do not shift the items it has not read yet, so every item that existed when paging started is returned exactly once. Newest-first lists show new items only on a fresh first page; the oldest-first audit list returns entries appended before it reaches the head, once each.
+
+The cursor is the unpadded base64url form of 11 bytes: a format version, the list it belongs to, the direction it pages in, and the position. It carries no subject, filter value or query, and it has no integrity tag: every list route is an admin route whose caller may read the whole list anyway, so a forged cursor could only start a page at another position the caller could reach by paging. What the server checks is that the cursor is well-formed and belongs to this route and order.
+
+Two routes are not paged this way. `GET /admin/audit/export` streams a whole range (`from`, `to`) in one answer, because the export's header, hash chain and checkpoints are verified as one file; cut it into ranges instead. `GET /admin/leases/{lease_id}/tree` returns a bounded snapshot of one lease tree (`max_nodes`, `truncated`) next to a count of the whole subtree; a breadth-first walk has no stable key to resume from, and the revoke it previews acts on the whole tree anyway.
+
 ## DPoP (sender-constrained tokens)
 
 Optional, RFC 9449. See [Binding tokens to keys](../guides/binding-tokens-to-keys.md) and [RFC-0001 section 4.1](../spec/rfc-0001-attenuo.md#41-sender-constrained-tokens-dpop).
@@ -128,7 +142,7 @@ A call gated with `@obligation("approval")` gets an `approval_id` in its `-32008
 | --- | --- | --- |
 | `POST /approvals/{id}` | an OIDC ID token of the run's originating user (`Authorization: Bearer`) | Body `{"decision": "grant" \| "decline"}`. Answers the approval as below. |
 | `GET /approvals/{id}` | that user's ID token, or a delegation token of the same run whose leases are live (with a DPoP proof when bound) | The approval. Anyone else, including a hop whose lease was revoked or has expired, gets 404. |
-| `GET /admin/approvals?chain_id&state&limit` | admin | Approvals newest first, optionally of one run (`chain_id`, the first hop's lease) or in one state; `limit` default and maximum 500. `{"approvals": [...]}`. |
+| `GET /admin/approvals?chain_id&state&limit&cursor` | admin | Approvals newest first, optionally of one run (`chain_id`, the first hop's lease) and in one state; both filters apply before `limit`. `{"approvals": [...], "next_cursor": ...}`, paged as in [Paging](#paging): `limit` default 100, at most 500. Every approval is reachable. |
 | `GET /admin/approvals/{id}` | admin | One approval. |
 | `POST /admin/approvals/{id}` | admin | Body as above; decides as the operator (`by = "operator"`). Also on the console listener with `[admin_ui] allow_write = true`. |
 
@@ -196,10 +210,10 @@ Where they are served: on the main listener by default; with `[admin] listen` se
 | `POST /admin/leases/{lease_id}/revoke` | Revoke the lease and all descendants. Body `{"reason": "..."}` (optional). Answers `{lease_id, revoked, reason, audit_id}`: `revoked` counts the leases that changed, `audit_id` is the `admin.lease.revoke` record (null when it could not be written; the revocation stands). The SDKs return it: Python `revoke_lease(...).audit_id`, TypeScript `(await revokeLease(...)).auditId`. |
 | `POST /admin/leases/revoke?preview` | Revoke every lease of one originating user, one delegation chain or the chain that opened one MCP session, each with its descendants, in one transaction; `preview=true` is a dry run. See [Revoke by user or chain](#revoke-by-user-or-chain) and [Revoke by session](#revoke-by-session). |
 | `GET /admin/leases/{lease_id}/tree?max_nodes` | The lease, its descendants and its ancestors, and how many leases a revoke would change now. Read-only; see [Lease tree](#lease-tree). 404 for an unknown lease. |
-| `GET /admin/audit` | Audit entries in ascending `seq` order, paged with `from` and `limit` (default 100, at most 1000). Also returns `next` (when the page was full) and `head`, the newest `seq`. Filters and newest-first paging are below. |
+| `GET /admin/audit` | Audit entries, oldest first or with `order=desc` newest first, `{entries, next_cursor, head}` (`head` is the newest `seq`), paged as in [Paging](#paging): `limit` default 100, at most 1000. `from` and `to` select a `seq` range. Filters are below. |
 | `GET /admin/audit/entries/{seq}` | One entry with its context, `{entry, lease_states, covered_by_checkpoint, policy_reloaded_after}` (below). 404 when there is no entry at `seq`. |
 | `GET /admin/audit/records/{id}` | The same for the entry whose record id is `id`: the UUID that proxy denials and AuthZEN answers return as `decision_id`. 400 if `id` is not a UUID, 404 if no record has it. |
-| `GET /admin/audit/checkpoints?before&limit` | Stored checkpoints, newest first, `{checkpoints, prev}`; each is `{seq, head_hash, at, kid, signature}`. `prev` is the `before` of the next (older) page, null after the oldest. Read-only: it never signs, unlike `/admin/audit/checkpoint`. |
+| `GET /admin/audit/checkpoints?limit&cursor` | Stored checkpoints, newest first, `{checkpoints, next_cursor}`; each is `{seq, head_hash, at, kid, signature}`. Paged as in [Paging](#paging): `limit` default 100, at most 1000. Read-only: it never signs, unlike `/admin/audit/checkpoint`. |
 | `GET /admin/audit/verify` | Walk the whole hash chain, verify every checkpoint signature against the JWKS, and report `{entries, ok, first_bad_seq, checkpoints, last_signed_seq, unsigned_tail, bad_checkpoints}`. |
 | `GET /admin/audit/checkpoint` | The signed checkpoint of the head, `{seq, head_hash, at, kid, signature}` (signing it now if the head has none). For keeping outside the host. `hash` repeats `head_hash` for older clients. |
 | `GET /admin/audit/export?from&to` | Entries `from..=to` (default: the whole log) and the checkpoints in that range, streamed as `application/x-ndjson`: a `header` line, `entry` lines, then `checkpoint` lines. Verify offline with `attenuo audit verify --file`. `kind`, `chain_id`, `tool` and `decision` keep only the matching entries; the header then has a `filter` member naming them and the file cannot be verified. The SDKs take the same four: Python `audit_export(kind=, chain_id=, tool=, decision=)`, TypeScript `auditExport(from, to, { kind, chainId, tool, decision })`. 400 if `from` is 0 or `to < from`, for an unknown kind or decision, more than one kind, or an empty filter value. |
@@ -329,13 +343,14 @@ When the proxy binds a new MCP session (the upstream assigns an `Mcp-Session-Id`
 | `chain_id` | this `chain_id` (the lease id of the chain's first hop) |
 | `since`, `until` | `at` in `[since, until)`, both RFC 3339 times |
 
-Paging:
+Range and order:
 
-- `order=asc` (the default) with `from`: oldest first from `from`. The answer is `{entries, next, head}`; `next` is the `from` of the following page, null at the end. Without any of the new parameters the answer is exactly what it was before filters existed.
-- `order=desc` with `before`: newest first, entries with `seq < before` (default: from the head). The answer adds `prev`, the `before` of the following (older) page, null once seq 1 has been read; `next` is then the `from` for reading forward with `order=asc` from just above the page, null when the page reached the head. `before` with `order=asc`, or `from` with `order=desc`, is a 400.
-- A filtered page reads at most 50,000 seqs (`agent`, `lease`, `since` and `until` cannot use an index). It can therefore come back short, even empty, with `next` or `prev` set: keep following the link until it is null. Unfiltered pages are never cut short.
+- `from` and `to` (inclusive `seq`s, by default the whole log) select a range, as on `GET /admin/audit/export`. They are filters, not page links: send the same values with each cursor.
+- `order=asc` (the default) reads the range oldest first; `order=desc` newest first. A cursor works only with the `order` it was issued for.
+- Paging is as in [Paging](#paging). Oldest first, `next_cursor` is null once the page reached the head as it was when the page was read; to follow the log, ask again later with `from` just above the last `seq` seen (`attenuo audit tail --follow` does this).
+- A filtered page reads at most 50,000 seqs (`agent`, `lease`, `since` and `until` cannot use an index). It can therefore come back short, even empty, with `next_cursor` set: keep following it until it is null. Unfiltered pages are never cut short.
 
-An unknown `kind` or `decision`, a time that is not RFC 3339, an empty value or an unknown `order` is a 400 `invalid_request`. The renewal history of a lease, for example, is `kind=lease_renew&lease=<id>`.
+An unknown `kind` or `decision`, a time that is not RFC 3339, an empty value, an unknown `order`, `from` or `to` of 0, `to` below `from`, or the removed `before` is a 400 `invalid_request`; a bad cursor is 400 `invalid_cursor`. The renewal history of a lease, for example, is `kind=lease_renew&lease=<id>`.
 
 The single-entry routes (`/admin/audit/entries/{seq}`, `/admin/audit/records/{id}`) answer:
 

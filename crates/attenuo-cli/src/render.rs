@@ -372,8 +372,8 @@ pub(crate) fn render_checkpoints(v: &Value) -> String {
             s(c, "head_hash")
         ));
     }
-    if let Some(prev) = v["prev"].as_u64() {
-        out.push_str(&format!("older: audit checkpoints --before {prev}\n"));
+    if let Some(next) = v["next_cursor"].as_str() {
+        out.push_str(&format!("older: audit checkpoints --cursor {next}\n"));
     }
     out
 }
@@ -620,6 +620,11 @@ pub(crate) fn render_approvals(v: &Value) -> String {
             s(&a["call"], "tool"),
             s(a, "chain_id"),
             s(a, "expires_at"),
+        ));
+    }
+    if let Some(next) = v["next_cursor"].as_str() {
+        out.push_str(&format!(
+            "more: approval list --cursor {next} (with the same filters), or --all\n"
         ));
     }
     out

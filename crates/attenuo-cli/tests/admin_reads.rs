@@ -305,10 +305,23 @@ async fn admin_reads_against_a_real_server() {
     c.args(["audit", "checkpoints", "--limit", "1"]);
     let text = ok(&run(c).await);
     assert!(text.starts_with(&format!("seq {newest}")), "{text}");
-    assert!(
-        text.contains(&format!("older: audit checkpoints --before {newest}")),
-        "{text}"
-    );
+    let cursor = text
+        .lines()
+        .find_map(|l| l.strip_prefix("older: audit checkpoints --cursor "))
+        .unwrap_or_else(|| panic!("no cursor hint: {text}"))
+        .to_string();
+    let mut c = f.admin();
+    c.args([
+        "--json",
+        "audit",
+        "checkpoints",
+        "--limit",
+        "1",
+        "--cursor",
+        &cursor,
+    ]);
+    let older: Value = serde_json::from_str(&ok(&run(c).await)).unwrap();
+    assert_eq!(older["checkpoints"][0], cps["checkpoints"][1], "{older}");
     let mut c = f.admin();
     c.args(["--json", "audit", "checkpoints"]);
     let again: Value = serde_json::from_str(&ok(&run(c).await)).unwrap();
@@ -499,21 +512,21 @@ fn entry(seq: u64) -> String {
     )
 }
 
-/// A filtered page that comes back short with `prev` set (the server stopped scanning) does
-/// not end `audit tail`: it keeps paging back until it has `-n` entries.
+/// A filtered page that comes back short with `next_cursor` set (the server stopped scanning)
+/// does not end `audit tail`: it keeps paging back with the cursor until it has `-n` entries.
 #[test]
 fn tail_keeps_paging_across_a_short_filtered_page() {
     let first: &'static str = Box::leak(
         format!(
-            r#"{{"entries":[{}],"next":null,"prev":50,"head":120}}"#,
+            r#"{{"entries":[{}],"next_cursor":"c-50","head":120}}"#,
             entry(110)
         )
         .into_boxed_str(),
     );
-    let empty = r#"{"entries":[],"next":51,"prev":20,"head":120}"#;
+    let empty = r#"{"entries":[],"next_cursor":"c-20","head":120}"#;
     let last: &'static str = Box::leak(
         format!(
-            r#"{{"entries":[{},{}],"next":21,"prev":7,"head":120}}"#,
+            r#"{{"entries":[{},{}],"next_cursor":"c-7","head":120}}"#,
             entry(12),
             entry(8)
         )
@@ -540,10 +553,87 @@ fn tail_keeps_paging_across_a_short_filtered_page() {
         reqs,
         [
             "GET /admin/audit?order=desc&limit=3&decision=deny HTTP/1.1",
-            "GET /admin/audit?order=desc&limit=2&decision=deny&before=50 HTTP/1.1",
-            "GET /admin/audit?order=desc&limit=2&decision=deny&before=20 HTTP/1.1",
+            "GET /admin/audit?order=desc&limit=2&decision=deny&cursor=c-50 HTTP/1.1",
+            "GET /admin/audit?order=desc&limit=2&decision=deny&cursor=c-20 HTTP/1.1",
         ]
     );
     let shown: Vec<&str> = text.lines().map(|l| &l[..5]).collect();
     assert_eq!(shown, ["#8   ", "#12  ", "#110 "], "{text}");
+}
+
+/// `--before N` is the range `to=N-1`, kept on every page with the cursor.
+#[test]
+fn tail_before_is_a_range_not_a_page_link() {
+    let first: &'static str = Box::leak(
+        format!(
+            r#"{{"entries":[{}],"next_cursor":"c-9","head":120}}"#,
+            entry(9)
+        )
+        .into_boxed_str(),
+    );
+    let last: &'static str = Box::leak(
+        format!(
+            r#"{{"entries":[{}],"next_cursor":null,"head":120}}"#,
+            entry(3)
+        )
+        .into_boxed_str(),
+    );
+    let (url, server) = scripted(vec![first, last]);
+    let out = attenuo()
+        .env("ATTENUO_ADMIN_TOKEN", ADMIN)
+        .args([
+            "--server", &url, "audit", "tail", "-n", "5", "--before", "10",
+        ])
+        .output()
+        .unwrap();
+    let text = ok(&out);
+    assert_eq!(
+        server.join().unwrap(),
+        [
+            "GET /admin/audit?order=desc&limit=5&to=9 HTTP/1.1",
+            "GET /admin/audit?order=desc&limit=4&to=9&cursor=c-9 HTTP/1.1",
+        ]
+    );
+    let shown: Vec<&str> = text.lines().map(|l| &l[..3]).collect();
+    assert_eq!(shown, ["#3 ", "#9 "], "{text}");
+}
+
+/// `approval list --all` follows `next_cursor` with the same filters and prints every page.
+#[test]
+fn approval_list_all_follows_the_cursor() {
+    let a = |id: &str| {
+        format!(
+            r#"{{"approval_id":"{id}","state":"pending","expired":false,"chain_id":"run","call":{{"server":"github","tool":"t"}},"expires_at":"x"}}"#
+        )
+    };
+    let first: &'static str =
+        Box::leak(format!(r#"{{"approvals":[{}],"next_cursor":"p2"}}"#, a("a2")).into_boxed_str());
+    let last: &'static str =
+        Box::leak(format!(r#"{{"approvals":[{}],"next_cursor":null}}"#, a("a1")).into_boxed_str());
+    let (url, server) = scripted(vec![first, last]);
+    let out = attenuo()
+        .env("ATTENUO_ADMIN_TOKEN", ADMIN)
+        .args([
+            "--server", &url, "--json", "approval", "list", "--state", "pending", "--limit", "1",
+            "--all",
+        ])
+        .output()
+        .unwrap();
+    let text = ok(&out);
+    assert_eq!(
+        server.join().unwrap(),
+        [
+            "GET /admin/approvals?state=pending&limit=1 HTTP/1.1",
+            "GET /admin/approvals?state=pending&limit=1&cursor=p2 HTTP/1.1",
+        ]
+    );
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let ids: Vec<&str> = v["approvals"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["approval_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["a2", "a1"]);
+    assert_eq!(v["next_cursor"], serde_json::Value::Null);
 }

@@ -1844,15 +1844,9 @@ def audit_check(stack: Stack, results: list[CallResult]) -> dict[str, Any]:
     """Match each decision id to its audit entry, then verify the chain with the CLI."""
     admin = AdminClient(stack.url, ADMIN_TOKEN)
     entries: dict[str, Any] = {}
-    seq = 1
-    while True:
-        page, nxt = admin.audit(from_seq=seq, limit=500)
-        for e in page:
-            if e.id:
-                entries[e.id] = e
-        if not page or nxt is None:
-            break
-        seq = nxt
+    for e in admin.audit_iter(limit=500):
+        if e.id:
+            entries[e.id] = e
     mismatched = []
     checked = [r for r in results if r.audited]
     for r in checked:

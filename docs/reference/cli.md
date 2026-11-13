@@ -280,7 +280,7 @@ Show the most recent audit entries, oldest of them first. Filters keep only matc
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `-n`, `--lines` | 20 | How many entries. |
-| `--before SEQ` | the head | Show the `-n` matching entries just below `SEQ` instead of the newest. To page back, pass the oldest `seq` shown. Not with `--follow`. |
+| `--before SEQ` | the head | Show the `-n` matching entries just below `SEQ` instead of the newest (the range `to=SEQ-1` of `GET /admin/audit`). To page back, pass the oldest `seq` shown. Not with `--follow`. |
 | `-f`, `--follow` | off | Keep polling for new matching entries. |
 | `--interval-ms` | 1000 | Polling interval with `--follow`. |
 | `--kind` | all | Record kind: `decision`, `tool_result`, `approval_request`, `approval_grant`, `exchange`, `root_token`, `lease_renew`, `lease_revoke` or `admin`. Repeatable, or comma-separated; any of them matches. |
@@ -303,7 +303,7 @@ attenuo audit tail --tool token.exchange --reason exchange_widening
 attenuo audit show --id 6685bd7f-cbb3-48e5-ab05-f2b8ceae9a61
 ```
 
-The filters are the query parameters of `GET /admin/audit` (see [Querying the audit log](http-api.md#querying-the-audit-log)): exact matches, combined with AND. A bad kind, decision or time is refused before any request. The CLI reads newest first (`order=desc&before=N`) and keeps following `prev` until it has `-n` entries, because a filtered page can come back short, even empty, when the server stops scanning. `--follow` then reads forward from the head the same way, following `next`. With `--json` each entry is one JSON line.
+The filters are the query parameters of `GET /admin/audit` (see [Querying the audit log](http-api.md#querying-the-audit-log)): exact matches, combined with AND. A bad kind, decision or time is refused before any request. The CLI reads newest first (`order=desc`, with `to` for `--before`) and keeps following `next_cursor` until it has `-n` entries, because a filtered page can come back short, even empty, when the server stops scanning. `--follow` then reads forward with `from` just above the head, follows `next_cursor` while it is set, and polls again from above the last `seq` it read. With `--json` each entry is one JSON line.
 
 Every line starts with the sequence number and the time. Decisions, token issuance, lease and admin records show `ALLOW` or `DENY`, `server/tool`, the agents and user, the `reason` and the record id. Records that are not decisions show their kind where `ALLOW`/`DENY` would be, and the details of that kind in place of the reason. Shown here with ids and times shortened:
 
@@ -324,9 +324,9 @@ Every line starts with the sequence number and the time. Decisions, token issuan
 
 One entry with its context, from `GET /admin/audit/entries/{seq}` or, with `--id`, `GET /admin/audit/records/{id}` (the `decision_id` that denials and AuthZEN answers return). Prints the entry line as `audit tail` does, then the record's kind, chain, policies and hashes, the state of each lease in its chain now (root first; `unknown to the lease registry` for a lease the registry does not hold), the stored checkpoint that covers the entry (or that none does yet), and whether the policy was reloaded after it. A missing entry is a 404 and a malformed id a 400 (exit 1). `--json` prints the server's `{entry, lease_states, covered_by_checkpoint, policy_reloaded_after}`. Needs the admin token.
 
-### `audit checkpoints [--before SEQ] [--limit N]`
+### `audit checkpoints [--cursor CURSOR] [--limit N]`
 
-List stored checkpoints, newest first, one line each (`seq`, time, `kid`, head hash), from `GET /admin/audit/checkpoints`. When more are older, the last line gives the `--before` for the next page. Read-only: unlike `GET /admin/audit/checkpoint` it never signs a new checkpoint. `--limit` defaults to the server's 100, at most 1000. Needs the admin token.
+List stored checkpoints, newest first, one line each (`seq`, time, `kid`, head hash), from `GET /admin/audit/checkpoints`. When more are older, the last line is `older: audit checkpoints --cursor <next_cursor>`, the command for the next page. Read-only: unlike `GET /admin/audit/checkpoint` it never signs a new checkpoint. `--limit` defaults to the server's 100, at most 1000. Needs the admin token.
 
 ### `audit verify`
 
@@ -434,7 +434,7 @@ Approvals of gated calls, as the operator (admin token, `ATTENUO_ADMIN_TOKEN`).
 
 | Command | Does |
 | --- | --- |
-| `approval list [--chain-id ID] [--state pending\|granted\|declined\|consumed] [--limit N]` | `GET /admin/approvals`: one line per approval, newest first (id, state, call, run, expiry). `--limit` 1 to 500. |
+| `approval list [--chain-id ID] [--state pending\|granted\|declined\|consumed] [--limit N] [--cursor CURSOR \| --all]` | `GET /admin/approvals`: one line per approval, newest first (id, state, call, run, expiry). One page (`--limit` 1 to 500, server default 100); when more exist the last line names the `--cursor` for the next page, to be sent with the same filters. `--all` follows the cursor and lists every match (`--json` then prints `{approvals, next_cursor: null}` with all of them). |
 | `approval show <ID>` | `GET /admin/approvals/{id}`: the exact call with its arguments, the call hash, user, agents, run and lease, the labels the run carried with their audit seqs, the times, and who decided. |
 | `approval grant <ID>` | `POST /admin/approvals/{id}` with `grant`. The agent's identical retry then runs once. Recorded as `by = "operator"`. |
 | `approval decline <ID>` | The same with `decline`. |

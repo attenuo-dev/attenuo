@@ -91,8 +91,8 @@ These wrap the read-only operator routes the admin console uses. None of them si
 ```ts
 const admin = new AdminClient(URL, "dev-admin-token-change-me");
 
-// Newest denials first. A filtered page can come back short (even empty) with a link still
-// set, so iterate rather than reading one page: auditIter follows prev/next until null.
+// Newest denials first. A filtered page can come back short (even empty) with nextCursor
+// still set, so iterate rather than reading one page: auditIter follows the cursor to the end.
 for await (const e of admin.auditIter({ order: "desc", decision: "deny", agent: "coder" })) {
   console.log(e.seq, e.record.reason, e.record.tool);
 }
@@ -102,6 +102,7 @@ const detail = await admin.auditRecord(denied.decisionId); // or admin.auditEntr
 console.log(detail.leaseStates, detail.coveredByCheckpoint, detail.policyReloadedAfter);
 
 await admin.auditCheckpoints({ limit: 20 }); // stored checkpoints, newest first; never signs
+for await (const a of admin.approvalsIter({ state: "pending" })) console.log(a.approvalId);
 const tree = await admin.leaseTree(leaseId); // what a revoke would reach
 
 await admin.policies(); // the loaded set: path, sha256, loadedAt, { id: text }
@@ -112,19 +113,22 @@ console.log(ev.decision, ev.reason, ev.policyIds); // no lease check, no audit r
 
 | Call                                                                                            | Route                                                         | Returns                                                                                                 |
 | ----------------------------------------------------------------------------------------------- | ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
-| `auditQuery(query?)`                                                                            | `GET /admin/audit`                                            | `{ entries, next, prev, head }`                                                                         |
-| `auditIter(query?)` (`limit` defaults to 1000)                                                  | `GET /admin/audit`, repeated                                  | async iterator of `AuditEntry`, following `next` (asc) or `prev` (desc) until null                      |
+| `auditQuery(query?)`                                                                            | `GET /admin/audit`                                            | `{ entries, nextCursor, head }`                                                                         |
+| `auditIter(query?)` (`limit` defaults to 1000)                                                  | `GET /admin/audit`, repeated                                  | async iterator of `AuditEntry`, following `nextCursor` until undefined                                  |
 | `auditEntry(seq)`, `auditRecord(id)`                                                            | `GET /admin/audit/entries/{seq}`, `/admin/audit/records/{id}` | `{ entry, leaseStates, coveredByCheckpoint, policyReloadedAfter }`                                      |
-| `auditCheckpoints({ before?, limit? })`                                                         | `GET /admin/audit/checkpoints`                                | `{ checkpoints, prev }`                                                                                 |
+| `auditCheckpoints({ cursor?, limit? })`, `auditCheckpointsIter({ limit? })`                     | `GET /admin/audit/checkpoints`                                | `{ checkpoints, nextCursor }`; the iterator yields every checkpoint, newest first                       |
 | `leaseTree(leaseId, maxNodes?)`                                                                 | `GET /admin/leases/{id}/tree`                                 | `{ root, ancestors, nodes, wouldRevoke, truncated }`                                                    |
 | `policies()`                                                                                    | `GET /admin/policies`                                         | `{ path, sha256, loadedAt, policyIds, warnings, policies }`                                             |
 | `policyCheck()`                                                                                 | `GET /admin/policies/check`                                   | `{ ok, issues, differsFromLoaded, ... }`                                                                |
 | `policyEvaluate(server, tool, args?, { token?, chain?, budget?, session?, approval?, usage? })` | `POST /admin/policies/evaluate`                               | `{ decision, allowed, reason, policyIds, ..., tokenExpired, budget, limit, labels, usage, approvalBy }` |
-| `approvals({ chainId?, state?, limit? })`                                                       | `GET /admin/approvals`                                        | `Approval[]`, newest first                                                                              |
+| `approvals({ chainId?, state?, limit?, cursor? })`                                              | `GET /admin/approvals`                                        | `{ approvals, nextCursor }`, newest first (server default page 100, at most 500)                        |
+| `approvalsIter({ chainId?, state?, limit? })`                                                   | `GET /admin/approvals`, repeated                              | async iterator of every matching `Approval`, following `nextCursor`                                     |
 | `approval(approvalId)`                                                                          | `GET /admin/approvals/{id}`                                   | `Approval`                                                                                              |
 | `grantApproval(approvalId)`, `declineApproval(approvalId)`                                      | `POST /admin/approvals/{id}`                                  | `Approval` after the decision (`by = \"operator\"`); `ApiError` 409 when it is no longer pending        |
 
-`AuditQuery` takes `order` (`"asc"` with `from`, or `"desc"` with `before`), `limit`, and exact-match filters combined with AND: `kind` (one or an array), `decision` (a `Decision`, `"allow" | "deny"`), `reason`, `subject`, `agent`, `lease`, `server`, `tool`, `chainId`, and `since` / `until` (RFC 3339 strings or `Date`s). Errors map as everywhere else: a 404 for an unknown seq, record or lease is an `ApiError` with `status: 404`, a bad filter is a 400 `invalid_request`.
+`AuditQuery` takes `order` (`"asc"` or `"desc"`), a `seq` range `from` / `to`, `limit`, `cursor` (a page's `nextCursor`, sent with the same query), and exact-match filters combined with AND: `kind` (one or an array), `decision` (a `Decision`, `"allow" | "deny"`), `reason`, `subject`, `agent`, `lease`, `server`, `tool`, `chainId`, and `since` / `until` (RFC 3339 strings or `Date`s). Errors map as everywhere else: a 404 for an unknown seq, record or lease is an `ApiError` with `status: 404`, a bad filter is a 400 `invalid_request`, a bad cursor a 400 `invalid_cursor`.
+
+Every list pages with an opaque cursor ([Paging](https://github.com/attenuo-dev/attenuo/blob/main/docs/reference/http-api.md#paging)): pass a page's `nextCursor` back as `cursor` with the same filters, or use the `*Iter` methods, which do that and throw `AttenuoError` if the server ever repeats a cursor. `audit(fromSeq, limit, cursor?)` returns `{ entries, nextCursor, head }`. A `limit` above the route's maximum is the server's 400, not clamped.
 
 `auditExport(fromSeq?, toSeq?, filter?)` takes an `AuditExportFilter` with the same four filters as `GET /admin/audit/export`: `kind`, `chainId`, `tool` and `decision` (`"allow"` or `"deny"`), combined with AND. The header of a filtered export has a `filter` member naming them, and [`verifyExport`](#verifying-an-audit-export-offline) refuses it.
 

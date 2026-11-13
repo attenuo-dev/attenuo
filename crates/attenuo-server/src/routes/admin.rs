@@ -23,6 +23,7 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use super::extract::{Body, Path, Query};
+use super::page;
 use super::{audit_admin, bearer_of, REASON_ADMIN_ACTION};
 use crate::error::ApiError;
 use crate::metrics::RefundSource;
@@ -31,9 +32,11 @@ use attenuo_core::Decision;
 use attenuo_proxy::session::{session_digest, session_tag};
 use sha2::Digest;
 
-/// Largest page `GET /admin/audit` returns.
+/// Largest page `GET /admin/audit` and `GET /admin/audit/checkpoints` return; a larger
+/// `limit` is a 400.
 pub const MAX_AUDIT_PAGE: usize = 1000;
-const DEFAULT_AUDIT_PAGE: usize = 100;
+/// Page size of `GET /admin/audit` and `GET /admin/audit/checkpoints` without `limit`.
+pub const DEFAULT_AUDIT_PAGE: usize = 100;
 
 /// Middleware: the request must carry `Authorization: Bearer <[admin] token>`.
 ///
@@ -747,20 +750,23 @@ fn hop_budget(leases: &dyn RunLimits, lease: &LeaseId) -> Result<Value, ApiError
 
 /// Most seqs one filtered `GET /admin/audit` page reads. `agent`, `lease`, `since` and
 /// `until` cannot use an index, so without a bound one request could read the whole log. A
-/// page that reaches the bound before it fills comes back short (possibly empty) with `next`
-/// or `prev` set, and the client keeps paging. Unfiltered pages need no bound: they read
+/// page that reaches the bound before it fills comes back short (possibly empty) with
+/// `next_cursor` set, and the client keeps paging. Unfiltered pages need no bound: they read
 /// exactly the rows they return.
 pub const MAX_AUDIT_SCAN: u64 = 50_000;
 
-/// Query string of `GET /admin/audit`. Every field is optional; with none of the filter
-/// fields, `order` or `before`, the answer is the same as before filters existed.
+/// Query string of `GET /admin/audit`. Every field is optional.
 #[derive(Debug, Default, Deserialize)]
 pub struct AuditQuery {
-    /// First sequence number to return, for `order=asc` (default 1).
+    /// Lowest seq to return (default 1), as `from` of `GET /admin/audit/export`.
     pub from: Option<u64>,
-    /// Return entries with `seq < before`, for `order=desc` (default: up to the head).
-    pub before: Option<u64>,
-    /// Page size (default 100, at most [`MAX_AUDIT_PAGE`]).
+    /// Highest seq to return (default: the head), as `to` of `GET /admin/audit/export`.
+    pub to: Option<u64>,
+    /// Removed: refused with a message pointing at `cursor` and `to`.
+    pub before: Option<String>,
+    /// The `next_cursor` of the previous page ([`super::page`]).
+    pub cursor: Option<String>,
+    /// Page size (default [`DEFAULT_AUDIT_PAGE`], at most [`MAX_AUDIT_PAGE`]).
     pub limit: Option<usize>,
     /// `asc` (oldest first, the default) or `desc` (newest first).
     pub order: Option<String>,
@@ -846,33 +852,43 @@ fn entry_filter(q: &AuditQuery) -> Result<EntryFilter, ApiError> {
     })
 }
 
-/// `GET /admin/audit`: a page of audit entries, oldest first by default.
+/// `GET /admin/audit`: a page of audit entries, oldest first by default, as
+/// `{entries, next_cursor, head}`. Paging is the one style of [`super::page`].
 ///
-/// - `order=asc` (default) with `from`: entries with `seq >= from` ascending. `next` is the
-///   `from` of the following page, or null at the end.
-/// - `order=desc` with `before`: entries with `seq < before` (default: up to the head)
-///   newest first. `prev` is the `before` of the following (older) page, or null at seq 1;
-///   `next` is the `from` for reading forward (`order=asc`) from just above this page, or
-///   null when the page reached the head.
+/// - `from` and `to` (inclusive seqs, default the whole log) select a range, as on
+///   `GET /admin/audit/export`; they are filters, not page links.
+/// - `order=asc` (default) returns the range oldest first, `order=desc` newest first.
+/// - `cursor` continues where the previous page's `next_cursor` points; `next_cursor` is null
+///   once the range has been read (oldest first: up to the head as it was when the page was
+///   read; a later request with `from` just above the last seq reads what was appended since).
 /// - Filters (`kind`, `decision`, `reason`, `subject`, `agent`, `lease`, `server`, `tool`,
 ///   `chain_id`, `since`, `until`) keep only matching entries; all are exact matches. A
-///   filtered page reads at most [`MAX_AUDIT_SCAN`] seqs, so it can come back short with
-///   `next`/`prev` set: keep paging until it is null.
+///   filtered page reads at most [`MAX_AUDIT_SCAN`] seqs, so it can come back short, even
+///   empty, with `next_cursor` set: keep paging until it is null.
 ///
-/// `head` is the newest seq (0 for an empty log); reading it signs nothing, unlike
-/// `/admin/audit/checkpoint`. An ascending answer is `{entries, next, head}`, exactly as
-/// before filters existed; a descending one adds `prev`.
+/// The cursor's position is a seq, so entries appended while a client pages never shift the
+/// ones it has not read: each is returned once. `head` is the newest seq (0 for an empty log);
+/// reading it signs nothing, unlike `/admin/audit/checkpoint`.
 ///
 /// # Errors
 ///
-/// 400 `invalid_request` for an `order` other than `asc` or `desc`, `before` without `order=desc`,
-/// `from` with it, `before=0`, or a filter that is empty or does not parse (an unknown `kind`, a
-/// `decision` other than `allow` or `deny`, a `since` or `until` that is not RFC 3339); 500
-/// `server_error` when the audit log fails.
+/// 400 `invalid_cursor` for a cursor that is malformed, of another route or of the other
+/// `order`; 400 `invalid_request` for an `order` other than `asc` or `desc`, a `limit` of 0 or
+/// above [`MAX_AUDIT_PAGE`], `from` or `to` of 0, `to < from`, the removed `before`, or a
+/// filter that is empty or does not parse (an unknown `kind`, a `decision` other than `allow`
+/// or `deny`, a `since` or `until` that is not RFC 3339); 500 `server_error` when the audit
+/// log fails.
 pub async fn audit_range(
     State(state): State<Arc<AppState>>,
     Query(q): Query<AuditQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    if q.before.is_some() {
+        return Err(page::removed(
+            "before",
+            "page with `cursor` (the `next_cursor` of the previous page) and select a range \
+             with `from` and `to`",
+        ));
+    }
     let order = match q.order.as_deref() {
         None | Some("asc") => Order::Ascending,
         Some("desc") => Order::Descending,
@@ -883,86 +899,90 @@ pub async fn audit_range(
             ))
         }
     };
+    let dir = match order {
+        Order::Ascending => page::Direction::Ascending,
+        Order::Descending => page::Direction::Descending,
+    };
     let filter = entry_filter(&q)?;
-    let limit = q
-        .limit
-        .unwrap_or(DEFAULT_AUDIT_PAGE)
-        .clamp(1, MAX_AUDIT_PAGE);
-    // How many seqs a page may read below or above where it starts (see MAX_AUDIT_SCAN).
+    let limit = page::limit(q.limit, DEFAULT_AUDIT_PAGE, MAX_AUDIT_PAGE)?;
+    let cursor = page::decode(q.cursor.as_deref(), page::List::Audit, dir)?;
+    let (lo, hi) = seq_range(q.from, q.to)?;
+    // How many seqs a page may read past where it starts (see MAX_AUDIT_SCAN).
     let span = if filter.is_empty() {
         u64::MAX
     } else {
         MAX_AUDIT_SCAN - 1
     };
-    match order {
-        Order::Ascending => {
-            if q.before.is_some() {
-                return Err(ApiError::bad_request(
-                    "invalid_request",
-                    "`before` needs `order=desc`; use `from` to page forward",
-                ));
-            }
-            let from = q.from.unwrap_or(1).max(1);
-            let to = from.saturating_add(span);
-            let (entries, head) = state
-                .blocking(move |s| {
-                    let entries = s.audit.entries_matching(from, to, &filter, order, limit)?;
-                    let head = s.audit.head()?.map_or(0, |h| h.seq);
-                    Ok::<_, attenuo_audit::AuditError>((entries, head))
-                })
-                .await?;
-            let next = match entries.last() {
-                Some(last) if entries.len() == limit => Some(last.seq + 1),
-                _ if to < head => Some(to + 1),
-                _ => None,
-            };
-            Ok(Json(
-                json!({ "entries": entries, "next": next, "head": head }),
-            ))
-        }
-        Order::Descending => {
-            if q.from.is_some() {
-                return Err(ApiError::bad_request(
-                    "invalid_request",
-                    "`from` needs `order=asc`; use `before` to page backward",
-                ));
-            }
-            if q.before == Some(0) {
-                return Err(ApiError::bad_request(
-                    "invalid_request",
-                    "`before` must be at least 1",
-                ));
-            }
-            let (entries, head, top, bottom) = state
-                .blocking(move |s| {
-                    let head = s.audit.head()?.map_or(0, |h| h.seq);
-                    // The newest seq this page may return, and the oldest it may read.
-                    let top = q.before.map_or(head, |b| (b - 1).min(head));
-                    let bottom = top.saturating_sub(span).max(1);
-                    let entries = if top == 0 {
-                        Vec::new()
+    let (entries, next, head) = state
+        .blocking(move |s| {
+            // Read before the entries: entries appended after it are outside this page.
+            let head = s.audit.head()?.map_or(0, |h| h.seq);
+            let end = hi.min(head);
+            // One more than the page, to tell whether anything follows it.
+            let fetch = limit + 1;
+            let (mut entries, next) = match order {
+                Order::Ascending => {
+                    // The cursor is the first seq of this page.
+                    let start = cursor.map_or(lo, |c| c.max(lo));
+                    if start > end {
+                        (Vec::new(), None)
                     } else {
-                        s.audit
-                            .entries_matching(bottom, top, &filter, order, limit)?
-                    };
-                    Ok::<_, attenuo_audit::AuditError>((entries, head, top, bottom))
-                })
-                .await?;
-            let prev = match entries.last() {
-                Some(last) if entries.len() == limit => Some(last.seq),
-                _ if bottom > 1 => Some(bottom),
-                _ => None,
-            }
-            .filter(|&b| b > 1);
-            let next = (top < head).then_some(top + 1);
-            Ok(Json(json!({
-                "entries": entries,
-                "next": next,
-                "prev": prev,
-                "head": head,
-            })))
-        }
+                        let stop = start.saturating_add(span).min(end);
+                        let entries = s
+                            .audit
+                            .entries_matching(start, stop, &filter, order, fetch)?;
+                        let next = match entries.get(limit) {
+                            Some(_) => Some(entries[limit - 1].seq + 1),
+                            None => (stop < end).then_some(stop + 1),
+                        };
+                        (entries, next)
+                    }
+                }
+                Order::Descending => {
+                    // The cursor is the seq every entry of this page is below.
+                    let top = cursor.map_or(end, |c| (c - 1).min(end));
+                    if top < lo || top == 0 {
+                        (Vec::new(), None)
+                    } else {
+                        let bottom = top.saturating_sub(span).max(lo);
+                        let entries = s
+                            .audit
+                            .entries_matching(bottom, top, &filter, order, fetch)?;
+                        let next = match entries.get(limit) {
+                            Some(_) => Some(entries[limit - 1].seq),
+                            None => (bottom > lo).then_some(bottom),
+                        };
+                        (entries, next)
+                    }
+                }
+            };
+            entries.truncate(limit);
+            Ok::<_, attenuo_audit::AuditError>((entries, next, head))
+        })
+        .await?;
+    Ok(Json(json!({
+        "entries": entries,
+        "next_cursor": next.map(|p| page::encode(page::List::Audit, dir, p)),
+        "head": head,
+    })))
+}
+
+/// `from` and `to` of `GET /admin/audit`, as an inclusive range (`to` defaults to the
+/// largest seq).
+fn seq_range(from: Option<u64>, to: Option<u64>) -> Result<(u64, u64), ApiError> {
+    let bad = |m: &str| Err(ApiError::bad_request("invalid_request", m.to_string()));
+    let lo = from.unwrap_or(1);
+    let hi = to.unwrap_or(u64::MAX);
+    if lo == 0 {
+        return bad("`from` must be at least 1");
     }
+    if hi == 0 {
+        return bad("`to` must be at least 1");
+    }
+    if hi < lo {
+        return bad("`to` must not be below `from`");
+    }
+    Ok((lo, hi))
 }
 
 /// `GET /admin/audit/verify`: walk the whole chain and verify every stored checkpoint
@@ -1113,42 +1133,50 @@ pub async fn audit_record(
 /// Query string of `GET /admin/audit/checkpoints`.
 #[derive(Debug, Default, Deserialize)]
 pub struct CheckpointsQuery {
-    /// Only checkpoints with `seq < before` (default: all).
-    pub before: Option<u64>,
-    /// Page size (default 100, at most [`MAX_AUDIT_PAGE`]).
+    /// Removed: refused with a message pointing at `cursor`.
+    pub before: Option<String>,
+    /// The `next_cursor` of the previous page ([`super::page`]).
+    pub cursor: Option<String>,
+    /// Page size (default [`DEFAULT_AUDIT_PAGE`], at most [`MAX_AUDIT_PAGE`]).
     pub limit: Option<usize>,
 }
 
-/// `GET /admin/audit/checkpoints?before=&limit=`: stored checkpoints, newest first, as
-/// `{checkpoints, prev}`; `prev` is the `before` of the next (older) page, or null after the
-/// oldest. Read-only: unlike `GET /admin/audit/checkpoint` it never signs a new checkpoint.
+/// `GET /admin/audit/checkpoints?cursor=&limit=`: stored checkpoints, newest first, as
+/// `{checkpoints, next_cursor}`; `next_cursor` fetches the next (older) page and is null after
+/// the oldest. The cursor's position is a checkpoint seq, so checkpoints signed while a client
+/// pages do not shift the older ones. Read-only: unlike `GET /admin/audit/checkpoint` it never
+/// signs a new checkpoint.
 ///
 /// # Errors
 ///
-/// 400 `invalid_request` when `before` is 0, and 500 `server_error` when the audit log fails.
+/// 400 `invalid_cursor` for a cursor that is malformed or of another route, 400
+/// `invalid_request` for a `limit` of 0 or above [`MAX_AUDIT_PAGE`] or the removed `before`,
+/// and 500 `server_error` when the audit log fails.
 pub async fn audit_checkpoints(
     State(state): State<Arc<AppState>>,
     Query(q): Query<CheckpointsQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    if q.before == Some(0) {
-        return Err(ApiError::bad_request(
-            "invalid_request",
-            "`before` must be at least 1",
+    if q.before.is_some() {
+        return Err(page::removed(
+            "before",
+            "page with `cursor` (the `next_cursor` of the previous page)",
         ));
     }
-    let before = q.before.unwrap_or(u64::MAX);
-    let limit = q
-        .limit
-        .unwrap_or(DEFAULT_AUDIT_PAGE)
-        .clamp(1, MAX_AUDIT_PAGE);
-    let checkpoints = state
-        .blocking(move |s| s.audit.checkpoints_before(before, limit))
+    let dir = page::Direction::Descending;
+    let limit = page::limit(q.limit, DEFAULT_AUDIT_PAGE, MAX_AUDIT_PAGE)?;
+    let before = page::decode(q.cursor.as_deref(), page::List::Checkpoints, dir)?;
+    let mut checkpoints = state
+        .blocking(move |s| {
+            s.audit
+                .checkpoints_before(before.unwrap_or(u64::MAX), limit + 1)
+        })
         .await?;
-    let prev = match checkpoints.last() {
-        Some(last) if checkpoints.len() == limit && last.seq > 1 => Some(last.seq),
-        _ => None,
-    };
-    Ok(Json(json!({ "checkpoints": checkpoints, "prev": prev })))
+    let next = (checkpoints.len() > limit).then(|| checkpoints[limit - 1].seq);
+    checkpoints.truncate(limit);
+    Ok(Json(json!({
+        "checkpoints": checkpoints,
+        "next_cursor": next.map(|p| page::encode(page::List::Checkpoints, dir, p)),
+    })))
 }
 
 /// Middleware on every `/admin/*` route: `Cache-Control: no-store` (unless the handler chose

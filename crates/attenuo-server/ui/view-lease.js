@@ -231,7 +231,7 @@ async function loadRenewals(box, leaseId, root) {
     }
     replace(box, h('ul', null, mine.map((e) => h('li', null,
       link(['entry', e.seq], `seq ${e.seq}`), ' ', time(e.record.at), ' ', mono(e.record.reason)))),
-    page.prev !== null ? h('p', { class: 'muted' }, 'Older renewals exist; see the audit explorer.') : null);
+    page.next_cursor !== null ? h('p', { class: 'muted' }, 'Older renewals exist; see the audit explorer.') : null);
   } catch (e) {
     replace(box, h('span', { class: 'muted' }, `Could not load renewals: ${e.message}`));
   }
