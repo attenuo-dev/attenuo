@@ -69,6 +69,7 @@ The table is generated from `attenuo_core::error_codes::ERROR_CODES`, the one pl
 | `actor_token_unmapped_subject` | 400 `invalid_request` |  |  | The actor token's subject maps to no agent. |
 | `actor_token_unsupported_alg` | 400 `invalid_request` |  |  | The actor token's algorithm is not accepted. |
 | `actor_token_untrusted_issuer` | 400 `invalid_request` |  |  | The actor token's issuer is not an `[[actor_trust]]` entry. |
+| `admin_credential_expired` | 401 `unauthorized` |  |  | The admin bearer is an `[[admin.operators]]` credential whose `expires_at` has passed. |
 | `admin_disabled` | 403 |  |  | The admin API is turned off. |
 | `admin_role_insufficient` | 403 |  |  | The admin credential's role is below the one the route needs; the message names the role needed. |
 | `agent_token_refused` | 403 |  |  | A delegation token cannot decide an approval. |
@@ -106,6 +107,7 @@ The table is generated from `attenuo_core::error_codes::ERROR_CODES`, the one pl
 | `client_auth_not_accepted` | 400 `invalid_request` |  |  | `[token] actor_auth` does not accept client credentials. |
 | `client_authentication_failed` | 401 `invalid_client` |  |  | The client id or secret is wrong, or the client has no credential of the kind sent. |
 | `client_id_mismatch` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The credential was issued to another client. |
+| `config_unreadable` | 500 `server_error` |  |  | The config file the server was started with cannot be read, so the operators were not reloaded; the cause is in the server log only. |
 | `credential_audience_mismatch` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The ID token was not issued to the presenting agent: its `aud` or `azp` names another client. |
 | `credential_expired` | 400 `invalid_grant` |  |  | The hop-0 credential expires before the token could be issued. |
 | `credential_pop_mismatch` | 400 `invalid_grant` |  |  | The DPoP proof is by another key than the one the ID-JAG is bound to (`cnf.jkt`). |
@@ -148,13 +150,15 @@ The table is generated from `attenuo_core::error_codes::ERROR_CODES`, the one pl
 | `no_root_grant` | 403, 400 `invalid_scope` |  |  | No `[[root_grants]]` entry covers the agent and user. |
 | `not_found` | 404 |  |  | The resource does not exist, or is not visible to the caller. |
 | `not_yet_valid` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The credential is not valid yet. |
+| `operators_invalid` | 422 |  |  | The reloaded `[[admin.operators]]` list is not TOML or breaks a startup rule; the operators in force are unchanged. |
+| `operators_no_admin` | 422 |  |  | The reloaded `[[admin.operators]]` list would leave no unexpired credential with role `admin`; the operators in force are unchanged. |
 | `overloaded` | 503 `temporarily_unavailable` | `-32006` (503) |  | `[limits] max_in_flight` requests are already running; retry after `Retry-After`. |
 | `parse_error` |  | `-32700` (400) |  | The body is not JSON. |
 | `policy_deny` |  | `-32003` (200) | yes | The Cedar policy denies the call. |
 | `policy_error` |  | `-32003` (200) | yes | The call could not be evaluated safely (fail closed). |
 | `policy_invalid` | 422 |  |  | The policy set does not parse or validate. |
 | `rate_limited` | 429 | `-32007` (429) |  | A rate limit is used up; retry after `Retry-After`. |
-| `reload_unavailable` | 409 |  |  | The policy cannot be reloaded in this configuration. |
+| `reload_unavailable` | 409 |  |  | The policy, or the admin operators, cannot be reloaded in this configuration (no policy file; a server not started from a config file). |
 | `replay_cache_full` | 503 `temporarily_unavailable` |  |  | Too many single-use credentials are in flight; retry later. |
 | `replay_store_unavailable` | 503 `temporarily_unavailable` |  |  | The use of a single-use credential could not be recorded, so it is refused (fail closed); retry later. |
 | `replayed` | 400 `invalid_grant` |  |  | The credential or delegation was already used. |

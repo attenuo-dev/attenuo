@@ -51,6 +51,7 @@ const ADMIN_REQUESTS: &[(&str, &str)] = &[
     ("GET", "/admin/policies/check"),
     ("POST", "/admin/policies/evaluate"),
     ("POST", "/admin/policies/reload"),
+    ("POST", "/admin/operators/reload"),
     ("GET", "/admin/approvals"),
     ("GET", "/admin/approvals/a-1"),
     ("POST", "/admin/approvals/a-1"),

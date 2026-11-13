@@ -1537,18 +1537,17 @@ pub async fn reload_policies(
     })))
 }
 
-/// Audit a refused operators reload (`deny`, with the refusal's code as the reason) and build
-/// the refusal. A failure to audit is logged; the refusal is answered either way.
-async fn refuse_operators_reload(
+/// Audit a refused operators reload as a `deny` whose reason is the refusal's code, then
+/// hand the refusal back. A failure to audit is logged; the refusal is answered either way.
+async fn audited_refusal(
     state: &Arc<AppState>,
     who: AdminIdentity,
     path: &std::path::Path,
-    status: StatusCode,
-    code: &'static str,
-    detail: String,
+    refusal: ApiError,
     now: OffsetDateTime,
 ) -> ApiError {
     let p = path.to_path_buf();
+    let reason = refusal.stable_code().to_string();
     let _ = state
         .blocking(move |state| {
             audit_admin(
@@ -1556,7 +1555,7 @@ async fn refuse_operators_reload(
                 &who,
                 "admin.operators.reload",
                 Decision::Deny,
-                code,
+                &reason,
                 Vec::new(),
                 json!({ "path": p }),
                 now,
@@ -1564,7 +1563,7 @@ async fn refuse_operators_reload(
         })
         .await
         .inspect_err(|e| tracing::error!(error = ?e.detail, "failed reload was not audited"));
-    ApiError::new(status, code, detail)
+    refusal
 }
 
 /// `POST /admin/operators/reload`: re-read the `[[admin.operators]]` array, and nothing else,
@@ -1610,32 +1609,22 @@ pub async fn reload_operators(
     let new = match checked {
         Ok(new) => new,
         Err(e) => {
-            let detail = format!("{e:#}; the operators in force are unchanged");
-            return Err(refuse_operators_reload(
-                &state,
-                who,
-                &path,
+            let refusal = ApiError::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "operators_invalid",
-                detail,
-                now,
-            )
-            .await);
+                format!("{e:#}; the operators in force are unchanged"),
+            );
+            return Err(audited_refusal(&state, who, &path, refusal, now).await);
         }
     };
     if !new.has_live_admin(now) {
-        return Err(refuse_operators_reload(
-            &state,
-            who,
-            &path,
+        let refusal = ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "operators_no_admin",
             "the reloaded list leaves no unexpired credential with role `admin` (no [admin] \
-             token and no such operator); the operators in force are unchanged"
-                .into(),
-            now,
-        )
-        .await);
+             token and no such operator); the operators in force are unchanged",
+        );
+        return Err(audited_refusal(&state, who, &path, refusal, now).await);
     }
     let changes = current.changes_to(&new);
     new.warn_expired(now, "by the reload");
