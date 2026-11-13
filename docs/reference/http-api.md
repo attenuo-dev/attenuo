@@ -311,7 +311,7 @@ A call gated with `@obligation("approval")` gets an `approval_id` in its `-32008
 | `GET /approvals/{id}` | that user's ID token, or a delegation token of the same run whose leases are live (with a DPoP proof when bound) | The approval. Anyone else, including a hop whose lease was revoked or has expired, gets 404. |
 | `GET /admin/approvals?chain_id&state&limit&cursor` | admin | Approvals newest first, optionally of one run (`chain_id`, the first hop's lease) and in one state; both filters apply before `limit`. `{"approvals": [...], "next_cursor": ...}`, paged as in [Paging](#paging): `limit` default 100, at most 500. Every approval is reachable. |
 | `GET /admin/approvals/{id}` | admin | One approval. |
-| `POST /admin/approvals/{id}` | admin | Body as above; decides as the operator (`by = "operator"`). Also on the console listener with `[admin_ui] allow_write = true`. |
+| `POST /admin/approvals/{id}` | admin, role `operator` or `admin` | Body as above; decides as the operator (`by = "operator"`, `approver.subject` the operator's subject). Also on the console listener with `[admin_ui] allow_write = true`. |
 
 The ID token is verified as at hop 0: signature from a `[[idps]]` issuer, expiry, and `aud`/`azp` equal to `[approvals] client_id` or, when that is unset, to the client id intake expects for the run's root agent. Its `sub` and `iss` must match the run's originating user. A token can decide once; reads do not use it up.
 
@@ -346,7 +346,7 @@ An approval:
 | Claim | Value |
 |---|---|
 | `iss`, `aud` | the issuer and audience of delegation tokens |
-| `sub`, `by` | the approver (`sub` of the user, or `urn:attenuo:admin`), and `user` or `operator` |
+| `sub`, `by` | the approver (`sub` of the user, or `urn:attenuo:admin` for `[admin] token` and `urn:attenuo:admin:<name>` for a named operator), and `user` or `operator` |
 | `chain_id`, `lease` | the run (its first hop's lease) and the lease of the hop that made the call |
 | `ch` | the call hash, as in the `-32008` data |
 | `iat`, `exp`, `jti` | when it was granted, the approval's `expires_at`, the approval id |
@@ -368,12 +368,23 @@ Every answer for one grant carries the same token. To use it, retry the call wit
 
 ## Admin
 
-All admin routes need `Authorization: Bearer <admin token>`. They answer 401 without it and 403 `admin_disabled` when no admin token is configured. Every admin answer, errors included, carries `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`.
+All admin routes need `Authorization: Bearer <admin token>`: the `[admin] token` or the token of an `[[admin.operators]]` entry ([config](config.md#admin), [ADR-0016](../decisions/0016-admin-operators.md)). They answer 401 without a bearer or with one that matches no credential, 403 `admin_disabled` when no admin credential is configured, and 403 `admin_role_insufficient` when the credential's role is below the route's (`detail` names the role needed, never the token). Every admin answer, errors included, carries `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`.
+
+Each route needs at least one role; a role includes the ones below it. The table is `attenuo_server::operators::ROUTE_ROLES`, and a route missing from it needs `admin`.
+
+| Role | Routes |
+| --- | --- |
+| `viewer` | `GET /admin/whoami`, `GET /admin/leases/{lease_id}`, `GET /admin/leases/{lease_id}/tree`, every `GET /admin/audit...` route (`/admin/audit/checkpoint` included: it signs a checkpoint of the head when there is none, which records no new fact), `GET /admin/policies`, `GET /admin/policies/check`, `POST /admin/policies/evaluate` (a dry run that writes nothing), `GET /admin/approvals`, `GET /admin/approvals/{id}` |
+| `operator` | `POST /admin/leases/{lease_id}/revoke`, `POST /admin/leases/revoke` (its `?preview=true` dry run included), `POST /admin/approvals/{id}` |
+| `admin` | `POST /admin/budgets/refund`, `POST /admin/policies/reload`, `POST /admin/root-token` |
+
+`[admin] token` is the operator `admin` with role `admin`. The audit log records an admin action with `originating_subject` `urn:attenuo:admin` for `[admin] token`, as before operators existed, and `urn:attenuo:admin:<name>` for a named operator; an approval decided by an operator has that subject as `approver.subject` and as the approval token's `sub`.
 
 Where they are served: on the main listener by default; with `[admin] listen` set, on that listener only, and the main listener then answers every `/admin/...` path exactly as it answers an unknown path (404 with an empty body, whatever the method and bearer), so it does not reveal that an admin API exists. The admin listener serves these routes and nothing else (`/healthz` and `/readyz` stay on the main listener). Off a loopback `[server] listen` the server does not start with the admin routes on the main listener unless `[admin] serve_on_main_listener = true` ([config](config.md#admin)). The console listener (`[admin_ui]`) serves its own subset either way.
 
 | Method and path | Purpose |
 | --- | --- |
+| `GET /admin/whoami` | The credential that sent the request, `{"name": "<operator>", "role": "viewer" \| "operator" \| "admin"}`; `[admin] token` is `{"name": "admin", "role": "admin"}`. Reads nothing else and records nothing. Also on the console listener. |
 | `GET /admin/leases/{lease_id}` | Lease state. |
 | `POST /admin/leases/{lease_id}/revoke` | Revoke the lease and all descendants. Body `{"reason": "..."}` (optional). Answers `{lease_id, revoked, reason, audit_id}`: `revoked` counts the leases that changed, `audit_id` is the `admin.lease.revoke` record (null when it could not be written; the revocation stands). The SDKs return it: Python `revoke_lease(...).audit_id`, TypeScript `(await revokeLease(...)).auditId`. |
 | `POST /admin/leases/revoke?preview` | Revoke every lease of one originating user, one delegation chain or the chain that opened one MCP session, each with its descendants, in one transaction; `preview=true` is a dry run. See [Revoke by user or chain](#revoke-by-user-or-chain) and [Revoke by session](#revoke-by-session). |

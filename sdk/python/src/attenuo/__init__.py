@@ -28,6 +28,7 @@ from ._wire import (
 )
 from .admin import (
     AdminClient,
+    AdminIdentity,
     ApprovalPage,
     AsyncAdminClient,
     AuditEntry,
@@ -143,6 +144,7 @@ __all__ = [
     "TOKEN_TYPE",
     "USE_DPOP_NONCE",
     "AdminClient",
+    "AdminIdentity",
     "ApiError",
     "Approval",
     "ApprovalClaims",

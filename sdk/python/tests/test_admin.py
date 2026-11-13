@@ -608,6 +608,16 @@ async def test_policies_and_check(make: Any) -> None:
     assert pc.differs_from_loaded and not pc.ok and pc.issues[0]["line"] == 3
 
 
+async def test_whoami(make: Any) -> None:
+    def handler(r: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"name": "alice", "role": "operator"})
+
+    client, seen = make(handler)
+    who = await call(client, "whoami")
+    assert seen[-1].url.path == "/admin/whoami" and seen[-1].method == "GET"
+    assert (who.name, who.role) == ("alice", "operator")
+
+
 async def test_policy_evaluate(make: Any) -> None:
     answer = {
         "decision": "allow", "reason": "policy_allow", "policy_ids": ["a"], "diagnostics": [],

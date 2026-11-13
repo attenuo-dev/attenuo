@@ -143,6 +143,16 @@ class VerifyReport:
 
 
 @dataclass(frozen=True)
+class AdminIdentity:
+    """Who the admin token is (``GET /admin/whoami``, ADR-0016): the operator's ``name``
+    (``admin`` for the server's ``[admin] token``) and ``role``: ``viewer``, ``operator`` or
+    ``admin``."""
+
+    name: str
+    role: str
+
+
+@dataclass(frozen=True)
 class PolicyReload:
     policy_ids: list[str]
     warnings: list[str]
@@ -691,6 +701,10 @@ def _lease_tree(b: Any) -> LeaseTree:
     )
 
 
+def _admin_identity(b: Any) -> AdminIdentity:
+    return AdminIdentity(name=str(b["name"]), role=str(b["role"]))
+
+
 def _policy_set(b: Any) -> PolicySet:
     return PolicySet(
         path=b.get("path"),
@@ -1107,6 +1121,10 @@ class AdminClient:
             if cursor is None:
                 return
 
+    def whoami(self) -> AdminIdentity:
+        """The name and role of the admin token this client sends (``GET /admin/whoami``)."""
+        return _admin_identity(w.json_body(self._http.get("/admin/whoami")))
+
     def policies(self) -> PolicySet:
         """The policy set in force: file, digest, load time, ids, warnings and texts."""
         return _policy_set(w.json_body(self._http.get("/admin/policies")))
@@ -1429,6 +1447,9 @@ class AsyncAdminClient:
             cursor = _advance(page.next_cursor, cursor)
             if cursor is None:
                 return
+
+    async def whoami(self) -> AdminIdentity:
+        return _admin_identity(w.json_body(await self._http.get("/admin/whoami")))
 
     async def policies(self) -> PolicySet:
         return _policy_set(w.json_body(await self._http.get("/admin/policies")))

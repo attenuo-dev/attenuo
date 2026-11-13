@@ -403,6 +403,14 @@ describe("AdminClient", () => {
 });
 
 describe("AdminClient console endpoints", () => {
+  it("whoami names the token's operator and role", async () => {
+    const { fetch, calls } = mockFetch(() => jsonResponse({ name: "alice", role: "operator" }));
+    const admin = new AdminClient(URL_, "adm", { fetch });
+    expect(await admin.whoami()).toEqual({ name: "alice", role: "operator" });
+    expect(calls[0]!.url.pathname).toBe("/admin/whoami");
+    expect(calls[0]!.method).toBe("GET");
+  });
+
   const deny = (seq: number) => ({ seq, record: { ...entry(seq).record, decision: "deny" } });
 
   it("filters newest first and follows next_cursor across a short page", async () => {
