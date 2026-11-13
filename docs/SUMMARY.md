@@ -36,6 +36,7 @@
 - [Fuzzing](design/fuzzing.md)
   - [Fuzzing, round 2](research/fuzzing-2026-10-24-round2.md)
   - [Fuzzing, round 3](research/fuzz-round-3-2026-10-25.md)
+- [Lean proof of the covering rule](design/lean-proof.md)
 - [Admin console](design/admin-console.md)
 - [Output labelling](design/output-labelling.md)
 - [Run limits](design/run-limits.md)
