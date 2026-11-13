@@ -7,8 +7,10 @@ import {
   ApprovalRequiredError,
   AttenuoError,
   DeniedError,
+  RateLimitedError,
   RpcError,
   UnauthorizedError,
+  UnavailableError,
 } from "./errors.js";
 import type { DpopKeyLike } from "./dpop.js";
 import { bearer, decodeToken, parseTime, type Token } from "./token.js";
@@ -21,6 +23,9 @@ export const AUTHORIZATION_DETAILS_TYPE = "attenuo_capabilities";
 export const CODE_UNAUTHORIZED = -32001;
 export const CODE_DENIED = -32003;
 export const CODE_APPROVAL_REQUIRED = -32008;
+export const CODE_UNAVAILABLE = -32006;
+export const CODE_TOO_MANY = -32007;
+export const RETRY_AFTER_HEADER = "retry-after";
 export const DECISION_ID_HEADER = "x-attenuo-decision-id";
 export const SESSION_HEADER = "mcp-session-id";
 export const MCP_ACCEPT = "application/json, text/event-stream";
@@ -220,6 +225,9 @@ export interface AuthzenConfiguration {
  * The `ApiError` (`UnauthorizedError` for a 401) for a non-success answer. `decisionId` is the
  * body's `decision_id` when `headers` carry an `X-Attenuo-Decision-Id` that vouches for it (see
  * `provenDecisionId`). A JSON-RPC error body (the proxy's 401) gives its `data.reason` and `data`.
+ * The server's load refusals are `UnavailableError` (503 `temporarily_unavailable`, or the proxy's
+ * `-32006`) and `RateLimitedError` (429 `rate_limited`, or the proxy's `-32007`); see `rpcRefusal`
+ * for the proxy's.
  */
 export function errorFromResponse(status: number, text: string, headers?: Headers): ApiError {
   let error = "http_error";
@@ -252,10 +260,100 @@ export function errorFromResponse(status: number, text: string, headers?: Header
     }
   }
   const decisionId = provenDecisionId(headers?.get(DECISION_ID_HEADER) ?? undefined, claimed);
+  const b = typeof body === "object" && body !== null ? (body as Json) : undefined;
+  const refusal =
+    data !== undefined
+      ? rpcRefusal(status, headers, (b?.error as Json).code, detail, data)
+      : typeof b?.error === "string"
+        ? restRefusal(status, headers, error, detail, description)
+        : undefined;
+  if (refusal !== undefined) return refusal;
   if (status === 401) {
     return new UnauthorizedError(status, error, detail, description, decisionId, reason, data);
   }
   return new ApiError(status, error, detail, description, decisionId);
+}
+
+/**
+ * `Retry-After` in whole seconds; undefined when it is missing or not a plain non-negative number
+ * (an HTTP-date is not read: the server sends seconds only).
+ */
+export function retryAfterOf(headers?: Headers): number | undefined {
+  const value = headers?.get(RETRY_AFTER_HEADER)?.trim();
+  if (value === undefined || !/^[0-9]+$/.test(value)) return undefined;
+  return Number(value);
+}
+
+/**
+ * The server's own 503 `temporarily_unavailable` or 429 `rate_limited` answer of a REST route as
+ * `UnavailableError` or `RateLimitedError`, else undefined.
+ */
+function restRefusal(
+  status: number,
+  headers: Headers | undefined,
+  error: string,
+  detail: string,
+  description: string | undefined,
+): ApiError | undefined {
+  const reason = description || error;
+  if (status === 503 && error === "temporarily_unavailable") {
+    return new UnavailableError(reason, retryAfterOf(headers), detail);
+  }
+  if (status === 429 && error === "rate_limited") {
+    return new RateLimitedError(reason, retryAfterOf(headers), detail);
+  }
+  return undefined;
+}
+
+/**
+ * The proxy's own 503 `-32006` or 429 `-32007` as `UnavailableError` or `RateLimitedError`, else
+ * undefined. The proxy sets `Retry-After` on these and never relays one from an upstream, so an
+ * answer without it is an upstream's own error.
+ */
+function rpcRefusal(
+  status: number,
+  headers: Headers | undefined,
+  code: unknown,
+  message: string,
+  data: Json,
+): ApiError | undefined {
+  if (!headers?.has(RETRY_AFTER_HEADER)) return undefined;
+  const reason = typeof data.reason === "string" && data.reason !== "" ? data.reason : undefined;
+  if (status === 503 && code === CODE_UNAVAILABLE) {
+    return new UnavailableError(
+      reason ?? "temporarily_unavailable",
+      retryAfterOf(headers),
+      message,
+      data,
+    );
+  }
+  if (status === 429 && code === CODE_TOO_MANY) {
+    return new RateLimitedError(reason ?? "rate_limited", retryAfterOf(headers), message, data);
+  }
+  return undefined;
+}
+
+const RETRIED_REASONS: Record<number, string> = { 503: "overloaded", 429: "rate_limited" };
+
+/**
+ * The error of a refusal that the client's `maxRetries` may retry: 503 `overloaded` or 429
+ * `rate_limited` from the server's `[limits]`, refused before any work. Undefined for any other
+ * answer, `request_timeout` and every denial included. Reads a clone of the body, so `res` can
+ * still be read.
+ */
+export async function retryableRefusal(
+  res: Response,
+): Promise<UnavailableError | RateLimitedError | undefined> {
+  const wanted = RETRIED_REASONS[res.status];
+  if (wanted === undefined) return undefined;
+  const err = errorFromResponse(res.status, await res.clone().text(), res.headers);
+  if (
+    (err instanceof UnavailableError || err instanceof RateLimitedError) &&
+    err.reason === wanted
+  ) {
+    return err;
+  }
+  return undefined;
 }
 
 /** The JSON body of a success response; throws `ApiError` otherwise. */
@@ -590,8 +688,9 @@ function proxyDecisionId(headerValue: string | undefined, data: Json): string | 
  * vouches for with `X-Attenuo-Decision-Id`) throw `DeniedError`; a `-32003` without that proof
  * is an upstream's own error and throws `RpcError`. A `-32008` with the same proof throws
  * `ApprovalRequiredError`. `-32001` or HTTP 401 throws `UnauthorizedError` with the error's
- * `data.reason` as `reason` and, when the header vouches for it, its `data.decision_id`; any other
- * JSON-RPC error throws `RpcError`.
+ * `data.reason` as `reason` and, when the header vouches for it, its `data.decision_id`. HTTP 503
+ * with `-32006` throws `UnavailableError` and HTTP 429 with `-32007` `RateLimitedError`, when the
+ * answer carries `Retry-After`; any other JSON-RPC error throws `RpcError`.
  */
 export async function rpcResult(res: Response): Promise<{ result: Json; decisionId?: string }> {
   const sse = (res.headers.get("content-type") ?? "").includes("event-stream");
@@ -659,6 +758,8 @@ export function rpcMessageResult(
         data,
       );
     }
+    const refusal = rpcRefusal(res.status, res.headers, e.code, message, data);
+    if (refusal !== undefined) throw refusal;
     throw new RpcError(typeof e.code === "number" ? e.code : 0, message, e.data);
   }
   if (!res.ok) throw errorFromResponse(res.status, text, res.headers);

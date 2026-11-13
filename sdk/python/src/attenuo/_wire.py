@@ -18,8 +18,10 @@ from .errors import (
     ApprovalRequired,
     AttenuoError,
     Denied,
+    RateLimited,
     RpcError,
     Unauthorized,
+    Unavailable,
 )
 from .token import Token, decode_token, parse_time
 
@@ -31,6 +33,9 @@ AUTHORIZATION_DETAILS_TYPE = "attenuo_capabilities"
 CODE_UNAUTHORIZED = -32001
 CODE_DENIED = -32003
 CODE_APPROVAL_REQUIRED = -32008
+CODE_UNAVAILABLE = -32006
+CODE_TOO_MANY = -32007
+RETRY_AFTER_HEADER = "retry-after"
 DECISION_ID_HEADER = "x-attenuo-decision-id"
 SESSION_HEADER = "mcp-session-id"
 MCP_ACCEPT = "application/json, text/event-stream"
@@ -214,7 +219,9 @@ def error_from_response(resp: httpx.Response) -> ApiError:
 
     ``decision_id`` is the body's ``decision_id`` when ``X-Attenuo-Decision-Id`` vouches for
     it (see :func:`_proven_decision_id`). A JSON-RPC error body (the proxy's 401) gives its
-    ``data.reason`` and ``data``.
+    ``data.reason`` and ``data``. The server's load refusals are :class:`Unavailable` (503
+    ``temporarily_unavailable``, or the proxy's ``-32006``) and :class:`RateLimited` (429
+    ``rate_limited``, or the proxy's ``-32007``); see :func:`_rpc_refusal` for the proxy's.
     """
     text = resp.text
     error, detail, description = "http_error", text.strip(), None
@@ -239,11 +246,75 @@ def error_from_response(resp: httpx.Response) -> ApiError:
         claimed = data.get("decision_id")
         reason = _opt_str(data.get("reason")) or "unauthorized"
     decision_id = _proven_decision_id(resp, claimed)
+    refusal: ApiError | None = None
+    if data is not None:
+        refusal = _rpc_refusal(resp, body["error"].get("code"), detail, data)
+    elif isinstance(body, dict) and isinstance(body.get("error"), str):
+        refusal = _rest_refusal(resp, error, detail, description)
+    if refusal is not None:
+        return refusal
     if resp.status_code == 401:
         return Unauthorized(
             resp.status_code, error, detail, description, decision_id, reason=reason, data=data
         )
     return ApiError(resp.status_code, error, detail, description, decision_id)
+
+
+def retry_after(resp: httpx.Response) -> int | None:
+    """``Retry-After`` in whole seconds, ``None`` when it is missing or not a plain
+    non-negative number (an HTTP-date is not read: the server sends seconds only)."""
+    value = resp.headers.get(RETRY_AFTER_HEADER)
+    if value is None:
+        return None
+    value = value.strip()
+    if not (value.isascii() and value.isdigit()):
+        return None
+    return int(value)
+
+
+def _rest_refusal(
+    resp: httpx.Response, error: str, detail: str, description: Any
+) -> ApiError | None:
+    """The server's own 503 ``temporarily_unavailable`` or 429 ``rate_limited`` answer of a REST
+    route as :class:`Unavailable` or :class:`RateLimited`, else ``None``."""
+    reason = description if isinstance(description, str) and description else error
+    if resp.status_code == 503 and error == "temporarily_unavailable":
+        return Unavailable(reason, retry_after(resp), detail)
+    if resp.status_code == 429 and error == "rate_limited":
+        return RateLimited(reason, retry_after(resp), detail)
+    return None
+
+
+def _rpc_refusal(
+    resp: httpx.Response, code: Any, message: str, data: dict[str, Any]
+) -> ApiError | None:
+    """The proxy's own 503 ``-32006`` or 429 ``-32007`` as :class:`Unavailable` or
+    :class:`RateLimited`, else ``None``. The proxy sets ``Retry-After`` on these and never
+    relays one from an upstream, so an answer without it is an upstream's own error."""
+    if RETRY_AFTER_HEADER not in resp.headers:
+        return None
+    reason = _opt_str(data.get("reason"))
+    if resp.status_code == 503 and code == CODE_UNAVAILABLE:
+        return Unavailable(reason or "temporarily_unavailable", retry_after(resp), message, data)
+    if resp.status_code == 429 and code == CODE_TOO_MANY:
+        return RateLimited(reason or "rate_limited", retry_after(resp), message, data)
+    return None
+
+
+RETRIED_REASONS = {503: "overloaded", 429: "rate_limited"}
+
+
+def retryable_refusal(resp: httpx.Response) -> Unavailable | RateLimited | None:
+    """The error of a refusal that the client's ``max_retries`` may retry: 503 ``overloaded``
+    or 429 ``rate_limited`` from the server's ``[limits]``, refused before any work. ``None``
+    for any other answer, ``request_timeout`` and every denial included. Reads the body."""
+    wanted = RETRIED_REASONS.get(resp.status_code)
+    if wanted is None:
+        return None
+    err = error_from_response(resp)
+    if isinstance(err, (Unavailable, RateLimited)) and err.reason == wanted:
+        return err
+    return None
 
 
 def json_body(resp: httpx.Response) -> Any:
@@ -601,8 +672,10 @@ def rpc_result(
     :class:`Denied`; a ``-32003`` without that proof is an upstream's own error and raises
     :class:`RpcError`. A ``-32008`` with the same proof raises :class:`ApprovalRequired`.
     ``-32001`` or HTTP 401 raises :class:`Unauthorized` with the error's ``data.reason`` as
-    ``reason`` and, when the header vouches for it, its ``data.decision_id``; any other
-    JSON-RPC error raises :class:`RpcError`.
+    ``reason`` and, when the header vouches for it, its ``data.decision_id``. HTTP 503 with
+    ``-32006`` raises :class:`Unavailable` and HTTP 429 with ``-32007`` :class:`RateLimited`,
+    when the answer carries ``Retry-After`` (:func:`_rpc_refusal`); any other JSON-RPC error
+    raises :class:`RpcError`.
     """
     decision_id = resp.headers.get(DECISION_ID_HEADER)
     if msg is _UNPARSED:
@@ -647,6 +720,9 @@ def rpc_result(
                 or "unauthorized",
                 data=data,
             )
+        refusal = _rpc_refusal(resp, code, message, data)
+        if refusal is not None:
+            raise refusal
         raise RpcError(int(code) if isinstance(code, int) else 0, message, raw_data)
     if not resp.is_success:
         raise error_from_response(resp)

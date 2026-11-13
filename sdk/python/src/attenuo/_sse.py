@@ -66,6 +66,10 @@ class Deadline:
         self.seconds = seconds
         self.end = None if seconds is None else time.monotonic() + seconds
 
+    def left(self) -> float | None:
+        """Seconds until the deadline (``None`` without one)."""
+        return None if self.end is None else self.end - time.monotonic()
+
     def check(self) -> None:
         if self.end is not None and time.monotonic() >= self.end:
             raise TransportTimeout(f"stream deadline of {self.seconds:g}s elapsed")
