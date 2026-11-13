@@ -343,6 +343,26 @@ async def test_policy_reload(make: Any) -> None:
     assert e.value.error == "policy_invalid"
 
 
+async def test_operators_reload(make: Any) -> None:
+    client, seen = make(
+        lambda r: httpx.Response(
+            200,
+            json={"added": ["frank"], "removed": ["vera"], "changed": ["bob"], "audit_id": "x"},
+        )
+    )
+    rep = await call(client, "operators_reload")
+    assert (seen[-1].method, seen[-1].url.path) == ("POST", "/admin/operators/reload")
+    assert (rep.added, rep.removed, rep.changed) == (["frank"], ["vera"], ["bob"])
+    client, _ = make(
+        lambda r: httpx.Response(
+            422, json={"error": "operators_no_admin", "code": "operators_no_admin", "detail": "x"}
+        )
+    )
+    with pytest.raises(ApiError) as e:
+        await call(client, "operators_reload")
+    assert e.value.error == "operators_no_admin"
+
+
 async def test_mint_root_dev(make: Any) -> None:
     jwt = Signer().mint()
     client, seen = make(lambda r: httpx.Response(200, json=token_response(jwt, "root-lease")))
@@ -615,7 +635,15 @@ async def test_whoami(make: Any) -> None:
     client, seen = make(handler)
     who = await call(client, "whoami")
     assert seen[-1].url.path == "/admin/whoami" and seen[-1].method == "GET"
-    assert (who.name, who.role) == ("alice", "operator")
+    assert (who.name, who.role, who.expires_at) == ("alice", "operator", None)
+
+    client, _ = make(
+        lambda r: httpx.Response(
+            200, json={"name": "temp", "role": "viewer", "expires_at": "2026-12-31T23:59:59Z"}
+        )
+    )
+    who = await call(client, "whoami")
+    assert who.expires_at == "2026-12-31T23:59:59Z"
 
 
 async def test_policy_evaluate(make: Any) -> None:

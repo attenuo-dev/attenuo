@@ -346,6 +346,25 @@ describe("AdminClient", () => {
     ).rejects.toBeInstanceOf(ApiError);
   });
 
+  it("reloads operators and surfaces a 422 as ApiError", async () => {
+    const ok = mockFetch(() =>
+      jsonResponse({ added: ["frank"], removed: ["vera"], changed: ["bob"], audit_id: "x" }),
+    );
+    expect(await new AdminClient(URL_, "adm", { fetch: ok.fetch }).operatorsReload()).toEqual({
+      added: ["frank"],
+      removed: ["vera"],
+      changed: ["bob"],
+    });
+    expect(ok.calls[0]!.url.pathname).toBe("/admin/operators/reload");
+    expect(ok.calls[0]!.method).toBe("POST");
+    const bad = mockFetch(() =>
+      jsonResponse({ error: "operators_no_admin", code: "operators_no_admin", detail: "x" }, 422),
+    );
+    await expect(
+      new AdminClient(URL_, "adm", { fetch: bad.fetch }).operatorsReload(),
+    ).rejects.toBeInstanceOf(ApiError);
+  });
+
   it("mints a dev root token", async () => {
     const { fetch, calls } = mockFetch(() => jsonResponse(tokenResponse(rootJwt, "lease-0")));
     const admin = new AdminClient(URL_, "adm", { fetch });
@@ -406,9 +425,17 @@ describe("AdminClient console endpoints", () => {
   it("whoami names the token's operator and role", async () => {
     const { fetch, calls } = mockFetch(() => jsonResponse({ name: "alice", role: "operator" }));
     const admin = new AdminClient(URL_, "adm", { fetch });
-    expect(await admin.whoami()).toEqual({ name: "alice", role: "operator" });
+    expect(await admin.whoami()).toStrictEqual({ name: "alice", role: "operator" });
     expect(calls[0]!.url.pathname).toBe("/admin/whoami");
     expect(calls[0]!.method).toBe("GET");
+    const exp = mockFetch(() =>
+      jsonResponse({ name: "temp", role: "viewer", expires_at: "2026-12-31T23:59:59Z" }),
+    );
+    expect(await new AdminClient(URL_, "adm", { fetch: exp.fetch }).whoami()).toStrictEqual({
+      name: "temp",
+      role: "viewer",
+      expiresAt: "2026-12-31T23:59:59Z",
+    });
   });
 
   const deny = (seq: number) => ({ seq, record: { ...entry(seq).record, decision: "deny" } });

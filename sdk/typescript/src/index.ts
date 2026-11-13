@@ -79,6 +79,7 @@ export type {
   LeaseUsage,
   LimitKind,
   MintRootOptions,
+  OperatorsReload,
   PolicyCheck,
   PolicyEvaluateOptions,
   PolicyEvaluation,

@@ -145,17 +145,29 @@ class VerifyReport:
 @dataclass(frozen=True)
 class AdminIdentity:
     """Who the admin token is (``GET /admin/whoami``, ADR-0016): the operator's ``name``
-    (``admin`` for the server's ``[admin] token``) and ``role``: ``viewer``, ``operator`` or
-    ``admin``."""
+    (``admin`` for the server's ``[admin] token``), ``role``: ``viewer``, ``operator`` or
+    ``admin``, and ``expires_at``, the RFC 3339 time the token stops working (``None`` when it
+    does not expire)."""
 
     name: str
     role: str
+    expires_at: str | None = None
 
 
 @dataclass(frozen=True)
 class PolicyReload:
     policy_ids: list[str]
     warnings: list[str]
+
+
+@dataclass(frozen=True)
+class OperatorsReload:
+    """What ``POST /admin/operators/reload`` changed, by operator name (never a digest):
+    operators ``added``, ``removed`` and ``changed`` (role, token or expiry)."""
+
+    added: list[str]
+    removed: list[str]
+    changed: list[str]
 
 
 @dataclass(frozen=True)
@@ -702,7 +714,20 @@ def _lease_tree(b: Any) -> LeaseTree:
 
 
 def _admin_identity(b: Any) -> AdminIdentity:
-    return AdminIdentity(name=str(b["name"]), role=str(b["role"]))
+    expires_at = b.get("expires_at")
+    return AdminIdentity(
+        name=str(b["name"]),
+        role=str(b["role"]),
+        expires_at=None if expires_at is None else str(expires_at),
+    )
+
+
+def _operators_reload(b: Any) -> OperatorsReload:
+    return OperatorsReload(
+        added=list(b.get("added") or []),
+        removed=list(b.get("removed") or []),
+        changed=list(b.get("changed") or []),
+    )
 
 
 def _policy_set(b: Any) -> PolicySet:
@@ -1041,6 +1066,12 @@ class AdminClient:
         b = w.json_body(self._http.post("/admin/policies/reload", json={}))
         return PolicyReload(list(b.get("policy_ids") or []), list(b.get("warnings") or []))
 
+    def operators_reload(self) -> OperatorsReload:
+        """Re-read ``[[admin.operators]]`` from the server's config file and put them in force
+        (role ``admin``). A list that does not parse, breaks a rule or would leave no ``admin``
+        raises ``ApiError`` (422) and the operators in force stay as they were."""
+        return _operators_reload(w.json_body(self._http.post("/admin/operators/reload", json={})))
+
     def lease_tree(self, lease_id: str, max_nodes: int | None = None) -> LeaseTree:
         """The lease, its descendants and ancestors, and how many leases a revoke would change
         now. A dry run of :meth:`revoke_lease`: nothing changes, nothing is audited."""
@@ -1122,7 +1153,8 @@ class AdminClient:
                 return
 
     def whoami(self) -> AdminIdentity:
-        """The name and role of the admin token this client sends (``GET /admin/whoami``)."""
+        """The name, role and expiry of the admin token this client sends
+        (``GET /admin/whoami``)."""
         return _admin_identity(w.json_body(self._http.get("/admin/whoami")))
 
     def policies(self) -> PolicySet:
@@ -1382,6 +1414,10 @@ class AsyncAdminClient:
     async def policy_reload(self) -> PolicyReload:
         b = w.json_body(await self._http.post("/admin/policies/reload", json={}))
         return PolicyReload(list(b.get("policy_ids") or []), list(b.get("warnings") or []))
+
+    async def operators_reload(self) -> OperatorsReload:
+        b = w.json_body(await self._http.post("/admin/operators/reload", json={}))
+        return _operators_reload(b)
 
     async def lease_tree(self, lease_id: str, max_nodes: int | None = None) -> LeaseTree:
         params = {} if max_nodes is None else {"max_nodes": max_nodes}
