@@ -9,8 +9,11 @@
 # through the CLI (a chain, denials, a `budget_exhausted` decision, approvals), open every
 # console page in headless Chromium in both themes, and fail on any console error, page error
 # or CSP violation. A second attenuo-server on the same upstream, whose console listener does
-# not allow writes, is where the tests check that the console refuses a revocation there. All
-# servers are stopped on exit, pass or fail.
+# not allow writes, is where the tests check that the console refuses a revocation there. The
+# main server also has four `[[admin.operators]]` (viewer, operator, operator with a future
+# expiry, expired viewer); tests/console/roles.test.cjs then logs in as each, and as the admin
+# token, in a fresh page and checks the header, the buttons the role allows and the expired
+# login message. All servers are stopped on exit, pass or fail.
 #
 # Needs Node 20 or later and Playwright with its Chromium: `npm ci` in tests/console, then
 # `npx playwright install --with-deps chromium` (CI does both). A machine with Playwright
@@ -120,6 +123,27 @@ agent = "assistant"
 capabilities = ["github:*"]
 EOF
 
+# Named operators (tests/console/roles.test.cjs): a viewer, an operator, an operator whose
+# entry expires in the future and a viewer whose entry has expired. The config holds only the
+# SHA-256 of each token, which `attenuo admin operator hash` computes.
+VIEWER_TOKEN="smoke-viewer-token"
+OPERATOR_TOKEN="smoke-operator-token"
+EXPIRING_TOKEN="smoke-expiring-operator-token"
+EXPIRING_AT="2099-12-31T23:59:59Z"
+EXPIRED_TOKEN="smoke-expired-viewer-token"
+operator_entry() { # name role token [expires_at]
+  local digest
+  digest="$(printf '%s\n' "$3" | "$CLI_BIN" admin operator hash)"
+  printf '\n[[admin.operators]]\nname = "%s"\nrole = "%s"\ntoken_sha256 = "%s"\n' "$1" "$2" "$digest"
+  [ -z "${4:-}" ] || printf 'expires_at = "%s"\n' "$4"
+}
+{
+  operator_entry vera viewer "$VIEWER_TOKEN"
+  operator_entry otto operator "$OPERATOR_TOKEN"
+  operator_entry tara operator "$EXPIRING_TOKEN" "$EXPIRING_AT"
+  operator_entry gone viewer "$EXPIRED_TOKEN" "2020-01-01T00:00:00Z"
+} >> "$WORK/config.toml"
+
 # The read-only server: the same config on its own ports, with a console that cannot write.
 sed -e "s/18080/$RO_MAIN_PORT/g" -e "s/13001/$MCP_PORT/g" \
     -e "s#examples/github-leak-demo/policy.cedar#$DEMO/policy.cedar#" \
@@ -164,5 +188,10 @@ CONSOLE_SMOKE_RO_UI="http://127.0.0.1:$RO_UI_PORT" \
 CONSOLE_SMOKE_ADMIN_TOKEN="demo-admin-token" \
 CONSOLE_SMOKE_CLI="$CLI_BIN" \
 CONSOLE_SMOKE_SHOTS="$SHOTS" \
-  node --test --test-concurrency=1 "$ROOT/tests/console/console.test.cjs"
+CONSOLE_SMOKE_VIEWER_TOKEN="$VIEWER_TOKEN" \
+CONSOLE_SMOKE_OPERATOR_TOKEN="$OPERATOR_TOKEN" \
+CONSOLE_SMOKE_EXPIRING_TOKEN="$EXPIRING_TOKEN" \
+CONSOLE_SMOKE_EXPIRING_AT="$EXPIRING_AT" \
+CONSOLE_SMOKE_EXPIRED_TOKEN="$EXPIRED_TOKEN" \
+  node --test --test-concurrency=1 "$ROOT/tests/console/console.test.cjs" "$ROOT/tests/console/roles.test.cjs"
 echo "console browser smoke test passed in $(( $(date +%s) - start ))s; screenshots in $SHOTS" >&2

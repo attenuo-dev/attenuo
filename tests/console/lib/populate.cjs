@@ -39,6 +39,26 @@ function env() {
 }
 
 /**
+ * The tokens of the `[[admin.operators]]` that scripts/console-smoke.sh configures on the main
+ * server: a viewer, an operator, an operator whose entry has an `expires_at` in the future,
+ * and a viewer whose `expires_at` has passed.
+ */
+function operatorEnv() {
+  const need = (k) => {
+    const v = process.env[k];
+    if (!v) throw new Error(`${k} is not set; run the smoke test with scripts/console-smoke.sh`);
+    return v;
+  };
+  return {
+    viewer: need('CONSOLE_SMOKE_VIEWER_TOKEN'),
+    operator: need('CONSOLE_SMOKE_OPERATOR_TOKEN'),
+    expiring: need('CONSOLE_SMOKE_EXPIRING_TOKEN'),
+    expiringAt: need('CONSOLE_SMOKE_EXPIRING_AT'),
+    expired: need('CONSOLE_SMOKE_EXPIRED_TOKEN'),
+  };
+}
+
+/**
  * Run the CLI. Returns {status, stdout}. `token` goes in ATTENUO_TOKEN and `stdin` on standard
  * input, never in argv (as the CLI asks).
  */
@@ -154,4 +174,18 @@ function populateReadOnly(e) {
   return { lease: root.lease, session: FAKE_SESSION };
 }
 
-module.exports = { env, cli, cliJson, populate, populateReadOnly };
+/**
+ * For the role scenarios: a fresh root token for alice (a lease to open the lease page on) and
+ * one create_issue call with it, which the demo policy holds for approval. Returns
+ * {lease, pendingApproval}.
+ */
+function populateRoles(e) {
+  const root = cliJson(e, ['token', 'root', '--subject', 'alice', '--agent', 'assistant', '--cap', 'github:*']).json;
+  const gate = call(e, root.access_token, 'create_issue', { repo: 'alice/public-docs', title: 'role check' }, [2]).json;
+  if (gate.error.data.reason !== 'approval_required') {
+    throw new Error(`setup: expected approval_required, got ${gate.error.data.reason}`);
+  }
+  return { lease: root.lease, pendingApproval: gate.error.data.approval_id };
+}
+
+module.exports = { env, operatorEnv, cli, cliJson, populate, populateReadOnly, populateRoles };
