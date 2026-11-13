@@ -57,6 +57,9 @@ use crate::state::AppState;
 
 /// Error code when a body chain does not match what this server issued.
 pub const CHAIN_NOT_ISSUED: &str = "chain_not_issued";
+/// `code` of a PEP's unsigned body chain that does not validate (an expired hop, a widening,
+/// too deep): sent with `error` `invalid_request`.
+pub const INVALID_CHAIN: &str = "invalid_chain";
 
 // The `Err` is a full response, built once per refused request; boxing it buys nothing.
 /// `POST /access/v1/evaluation`: decide one AuthZEN request through the pipeline (see the
@@ -480,7 +483,10 @@ fn evaluate_value(
     if let Some(pep) = body_chain_pep {
         chain_value
             .validate_at(now, state.verifier.max_depth())
-            .map_err(|e| ApiError::bad_request("invalid_request", e.to_string()))?;
+            .map_err(|e| {
+                // The code `POST /admin/policies/check` answers a chain that does not validate.
+                ApiError::bad_request("invalid_request", e.to_string()).with_code(INVALID_CHAIN)
+            })?;
         check_issued(state, &chain_value).map_err(|detail| {
             tracing::warn!(pep = ?pep, detail = ?detail, "AuthZEN body chain was not issued here");
             ApiError::new(StatusCode::FORBIDDEN, CHAIN_NOT_ISSUED, detail)

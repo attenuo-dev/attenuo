@@ -7,9 +7,10 @@
 //! min(now + [issuer] lease_interval_seconds, token exp, parent lease expiry)
 //! ```
 //!
-//! and never earlier than the current expiry. Renewal fails (400 `invalid_grant`) when the
-//! lease, or any ancestor lease, is revoked or unknown, or when an ancestor lease has expired:
-//! a child cannot outlive a parent that stopped renewing. An expired or invalid *token* is a
+//! and never earlier than the current expiry. Renewal fails (400 `invalid_grant`, with `code`
+//! `lease_revoked`, `lease_expired` or `lease_unknown`) when the lease, or any ancestor lease,
+//! is revoked or unknown, or when an ancestor lease has expired: a child cannot outlive a
+//! parent that stopped renewing. An expired or invalid *token* is a
 //! 401. A token bound to a key (`cnf.jkt`) needs a DPoP proof for `POST /token/renew`
 //! ([`crate::dpop`]). Every renewal is appended to the audit log (`attenuo` / `lease.renew`,
 //! reason `lease_renewed`, with `dpop_bound`).
@@ -52,8 +53,8 @@ use crate::state::AppState;
 /// # Errors
 ///
 /// As the module docs say: 401 for a missing, invalid or expired token or a failed DPoP proof; 400
-/// `invalid_grant` (audited, with its `decision_id`) when the lease or an ancestor lease is revoked
-/// or unknown, or an ancestor lease has expired; 500 `server_error` when the lease store fails or
+/// `invalid_grant` (audited, with its `decision_id`, and the lease reason as `code`) when the
+/// lease or an ancestor lease is revoked or unknown, or an ancestor lease has expired; 500 `server_error` when the lease store fails or
 /// the renewal cannot be audited.
 pub async fn renew(
     State(state): State<Arc<AppState>>,
@@ -148,12 +149,13 @@ impl From<AuditError> for Failure {
     }
 }
 
-/// A refusal of the token's own lease.
+/// A refusal of the token's own lease. `code` is the lease reason (`detail` has carried it
+/// since before `code` existed, and still does).
 fn own_lease_refused(reason: &'static str) -> Failure {
     Failure::Refused {
         reason,
         ancestor: false,
-        error: ApiError::bad_request("invalid_grant", reason),
+        error: ApiError::bad_request("invalid_grant", reason).with_code(reason),
     }
 }
 
@@ -189,7 +191,8 @@ fn renew_verified(
             error: ApiError::bad_request(
                 "invalid_grant",
                 format!("an ancestor lease is not live: {reason}"),
-            ),
+            )
+            .with_code(reason),
         });
     }
 

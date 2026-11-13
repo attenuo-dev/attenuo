@@ -327,7 +327,7 @@ One cache per IdP (and per `[[actor_trust]]` entry, which uses the same code wit
 
 ### Error codes
 
-Each answer also carries `code`, the `error_description` below where there is one and `error` otherwise; every code is listed under [Errors](../reference/http-api.md#errors) in the HTTP reference.
+Each answer also carries `code`, the `error_description` below where there is one and `error` otherwise, except for the refusals whose specific reason has no `error_description`: they send that reason as `code` (a parent or renewed lease that is not live, `lease_revoked`, `lease_expired` or `lease_unknown`; a subject token that has expired, `token_expired`; an exchange with no capability, `no_capabilities_requested`, or an unknown `subject_token_type`, `unsupported_token_type`). Every code is listed under [Errors](../reference/http-api.md#errors) in the HTTP reference.
 
 | `error` | Status | `error_description` |
 |---|---|---|
