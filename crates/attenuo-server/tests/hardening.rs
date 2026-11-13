@@ -34,10 +34,10 @@ fn base_config() -> Config {
         "github",
         "http://127.0.0.1:9/internal-only-path",
     )];
-    cfg.peps = vec![AgentConfig {
-        id: "gateway".into(),
-        secret_sha256: hex::encode(Sha256::digest(PEP_SECRET.as_bytes())),
-    }];
+    cfg.peps = vec![AgentConfig::with_secret_sha256(
+        "gateway",
+        hex::encode(Sha256::digest(PEP_SECRET.as_bytes())),
+    )];
     cfg
 }
 
@@ -533,10 +533,7 @@ fn the_server_name_attenuo_is_reserved() {
 /// root grants may not use it as an agent id either.
 #[test]
 fn the_agent_id_attenuo_is_reserved() {
-    let agent = |id: &str| AgentConfig {
-        id: id.into(),
-        secret_sha256: hex::encode(Sha256::digest(b"s")),
-    };
+    let agent = |id: &str| AgentConfig::with_secret_sha256(id, hex::encode(Sha256::digest(b"s")));
     let mut cfg = Config::default();
     cfg.agents = vec![agent("attenuo")];
     assert!(cfg

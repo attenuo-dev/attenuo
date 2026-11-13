@@ -361,10 +361,7 @@ async fn cli_works_against_a_server_that_requires_nonces() {
     cfg.token.dpop_nonce = DpopNonceMode::Required;
     cfg.agents = ["planner", "coder"]
         .iter()
-        .map(|id| AgentConfig {
-            id: (*id).into(),
-            secret_sha256: sha256_hex(&format!("{id}-secret")),
-        })
+        .map(|id| AgentConfig::with_secret_sha256(*id, sha256_hex(&format!("{id}-secret"))))
         .collect();
     let (router, _state) = attenuo_server::build(&cfg).unwrap();
     let server = spawn_router(router).await.unwrap();

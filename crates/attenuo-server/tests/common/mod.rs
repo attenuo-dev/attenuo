@@ -18,10 +18,7 @@ pub fn sha256_hex(s: &str) -> String {
 /// One `[[agents]]` entry per id, each with the SHA-256 of `secret(id)` as its secret.
 pub fn agent_configs(ids: &[&str], secret: impl Fn(&str) -> String) -> Vec<AgentConfig> {
     ids.iter()
-        .map(|id| AgentConfig {
-            id: (*id).into(),
-            secret_sha256: sha256_hex(&secret(id)),
-        })
+        .map(|id| AgentConfig::with_secret_sha256(*id, sha256_hex(&secret(id))))
         .collect()
 }
 

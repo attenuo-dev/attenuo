@@ -13,7 +13,8 @@ use time::{Duration, OffsetDateTime};
 
 use crate::actor::ActorTrustRegistry;
 use crate::authz::Pipeline;
-use crate::config::{ActorAuth, AgentConfig, Config, RootGrant};
+use crate::clientauth::{AssertionPolicy, Clients};
+use crate::config::{ActorAuth, Config, RootGrant};
 use crate::idp::IdpRegistry;
 use crate::metrics::Metrics;
 
@@ -64,8 +65,9 @@ pub struct AppState {
     pub root_grants: Vec<RootGrant>,
     /// Trusted IdPs for hop-0 intake.
     pub idps: IdpRegistry,
-    /// Agents allowed to present IdP credentials (`[[agents]]`, validated).
-    pub agents: Vec<AgentConfig>,
+    /// Agents allowed to present IdP credentials (`[[agents]]`, validated, with their
+    /// `private_key_jwt` keys).
+    pub agents: Clients,
     /// `[dev] allow_root_mint`.
     pub dev_allow_root_mint: bool,
     /// `[token] require_actor_auth`.
@@ -80,8 +82,8 @@ pub struct AppState {
     pub authzen_max_batch: usize,
     /// `[authzen] diagnostics`.
     pub authzen_diagnostics: crate::config::AuthzenDiagnostics,
-    /// PEPs allowed to send unsigned chains (`[[peps]]`, validated).
-    pub peps: Vec<AgentConfig>,
+    /// PEPs allowed to send unsigned chains (`[[peps]]`, validated, with their keys).
+    pub peps: Clients,
     /// `[server] public_url`.
     pub public_url: Option<String>,
     /// `[issuer] lease_interval_seconds`: lifetime of a lease after issuance or renewal.
@@ -162,6 +164,7 @@ impl AppState {
         config.limits.check()?;
         config.audit.append_limits()?;
         config.token.check_dpop()?;
+        config.token.check_client_assertion()?;
         config.approvals.check()?;
         let lease_maintenance = config.leases.maintenance()?;
         let user_window_retention = config.leases.user_window_retention()?;
@@ -254,8 +257,9 @@ impl AppState {
         }
         let pipeline = Arc::new(pipeline);
         let idps = IdpRegistry::from_config(&config.idps, &config.issuer.issuer)?;
-        let agents = crate::idp::intake::validate_agents(&config.agents)?;
-        let peps = crate::clientauth::validate_clients("[[peps]]", &config.peps)?;
+        let assertion_policy = AssertionPolicy::from_config(config);
+        let agents = Clients::agents(&config.agents, assertion_policy.clone())?;
+        let peps = Clients::peps(&config.peps, assertion_policy)?;
         for idp in &config.idps {
             for agent in agents
                 .iter()
@@ -276,6 +280,12 @@ impl AppState {
         if actor_auth == ActorAuth::ActorToken && actor_trust.is_empty() {
             anyhow::bail!(
                 "[token] actor_auth = \"actor_token\" needs at least one [[actor_trust]] entry"
+            );
+        }
+        if actor_auth == ActorAuth::ActorToken && agents.iter().any(|a| a.has_keys()) {
+            tracing::warn!(
+                "[[agents]] entries have jwks but [token] actor_auth = \"actor_token\": client \
+                 assertions, like client secrets, are refused"
             );
         }
         if actor_auth == ActorAuth::Secret && !actor_trust.is_empty() {

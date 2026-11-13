@@ -729,14 +729,12 @@ pub async fn trace_route(
     let inbound = attenuo_proxy::TraceParent::from_headers(req.headers());
     let mode = if authzen
         && inbound.is_some()
-        && crate::clientauth::authenticate(
-            crate::clientauth::ClientKind::Pep,
-            &state.peps,
-            req.headers(),
-            None,
-            None,
-        )
-        .is_ok()
+        // HTTP Basic only: a client assertion is in the body, which is not read here (and
+        // would be used up by checking it).
+        && state
+            .peps
+            .authenticate(req.headers(), None, None, None, state.now())
+            .is_ok()
     {
         trace.inbound_authzen
     } else {

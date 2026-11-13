@@ -167,10 +167,10 @@ impl Harness {
         cfg.issuer.audience = "attenuo-test".into();
         cfg.admin.token = Some(ADMIN.into());
         cfg.dev.allow_root_mint = true;
-        cfg.agents = vec![AgentConfig {
-            id: "reviewer".into(),
-            secret_sha256: sha256_hex("reviewer-secret"),
-        }];
+        cfg.agents = vec![AgentConfig::with_secret_sha256(
+            "reviewer",
+            sha256_hex("reviewer-secret"),
+        )];
         cfg.actor_trust = vec![
             ActorTrustConfig {
                 issuer: None,

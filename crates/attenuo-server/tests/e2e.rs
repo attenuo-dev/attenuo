@@ -974,10 +974,10 @@ const PEP_SECRET: &str = "pep-secret-for-tests";
 async fn unsigned_authzen_chains_need_a_pep_and_an_issued_chain() {
     let h = Harness::start_tweaked(false, |cfg| {
         cfg.authzen.allow_unsigned_chain = true;
-        cfg.peps = vec![attenuo_server::config::PepConfig {
-            id: "gateway".into(),
-            secret_sha256: sha256_hex(PEP_SECRET),
-        }];
+        cfg.peps = vec![attenuo_server::config::PepConfig::with_secret_sha256(
+            "gateway",
+            sha256_hex(PEP_SECRET),
+        )];
     })
     .await;
     let root = h.mint_root("alice", "planner", &["github:*"]).await;

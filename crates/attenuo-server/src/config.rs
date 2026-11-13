@@ -201,9 +201,11 @@ pub struct TokenSection {
     #[serde(default = "default_true")]
     pub require_actor_auth: bool,
     /// How the actor of an exchange, and the agent of a hop-0 intake, may authenticate:
-    /// `"secret"` (`[[agents]]` client credentials only), `"actor_token"` (a JWT from an
-    /// `[[actor_trust]]` issuer only) or `"either"` (default). With `require_actor_auth = true`
-    /// one accepted method is mandatory for an exchange; hop 0 always needs one.
+    /// `"secret"` (`[[agents]]` client credentials only: the client secret or a
+    /// `private_key_jwt` assertion, whichever the agent's entry holds), `"actor_token"` (a JWT
+    /// from an `[[actor_trust]]` issuer only) or `"either"` (default). With
+    /// `require_actor_auth = true` one accepted method is mandatory for an exchange; hop 0
+    /// always needs one.
     #[serde(default)]
     pub actor_auth: ActorAuth,
     /// Sender-constrained tokens (DPoP, RFC 9449; SR-24): `"off"`, `"optional"` (default) or
@@ -225,6 +227,15 @@ pub struct TokenSection {
     /// [`crate::dpop`].
     #[serde(default)]
     pub dpop_nonce: DpopNonceMode,
+    /// How far in the future a `private_key_jwt` client assertion's `exp` may be, in seconds
+    /// from the server's clock (RFC 7523 §3: the server may limit how long an assertion it
+    /// accepts lives). Default 300; between 1 and 3600.
+    #[serde(default = "default_client_assertion_max_lifetime")]
+    pub client_assertion_max_lifetime_seconds: u64,
+    /// Clock skew allowed for a client assertion's `exp`, `nbf` and `iat`, in seconds. Default
+    /// 60, the default `clock_skew_seconds` of `[[idps]]` and `[[actor_trust]]`; at most 600.
+    #[serde(default = "default_clock_skew")]
+    pub client_assertion_clock_skew_seconds: u64,
 }
 
 /// Default for `[token] dpop_max_age_seconds`.
@@ -240,6 +251,13 @@ fn default_dpop_replay_capacity() -> usize {
     DEFAULT_DPOP_REPLAY_CAPACITY
 }
 
+/// Default for `[token] client_assertion_max_lifetime_seconds`.
+pub const DEFAULT_CLIENT_ASSERTION_MAX_LIFETIME_SECONDS: u64 = 300;
+
+fn default_client_assertion_max_lifetime() -> u64 {
+    DEFAULT_CLIENT_ASSERTION_MAX_LIFETIME_SECONDS
+}
+
 impl Default for TokenSection {
     fn default() -> Self {
         Self {
@@ -249,6 +267,8 @@ impl Default for TokenSection {
             dpop_max_age_seconds: DEFAULT_DPOP_MAX_AGE_SECONDS,
             dpop_replay_capacity: DEFAULT_DPOP_REPLAY_CAPACITY,
             dpop_nonce: DpopNonceMode::default(),
+            client_assertion_max_lifetime_seconds: DEFAULT_CLIENT_ASSERTION_MAX_LIFETIME_SECONDS,
+            client_assertion_clock_skew_seconds: default_clock_skew(),
         }
     }
 }
@@ -265,6 +285,24 @@ impl TokenSection {
         }
         if self.dpop_replay_capacity == 0 {
             anyhow::bail!("[token] dpop_replay_capacity must be at least 1");
+        }
+        Ok(())
+    }
+
+    /// Startup check of the client assertion settings.
+    ///
+    /// # Errors
+    ///
+    /// When `client_assertion_max_lifetime_seconds` is outside 1..=3600 or
+    /// `client_assertion_clock_skew_seconds` is above 600.
+    pub fn check_client_assertion(&self) -> anyhow::Result<()> {
+        if !(1..=3600).contains(&self.client_assertion_max_lifetime_seconds) {
+            anyhow::bail!(
+                "[token] client_assertion_max_lifetime_seconds must be between 1 and 3600"
+            );
+        }
+        if self.client_assertion_clock_skew_seconds > 600 {
+            anyhow::bail!("[token] client_assertion_clock_skew_seconds must be at most 600");
         }
         Ok(())
     }
@@ -302,10 +340,12 @@ pub enum DpopNonceMode {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActorAuth {
-    /// `[[agents]]` client credentials (HTTP Basic or `client_id` / `client_secret`) only. An
-    /// `actor_token` is refused.
+    /// `[[agents]]` client credentials only: the client secret (HTTP Basic or `client_id` /
+    /// `client_secret`) or a `private_key_jwt` client assertion, per agent as its entry
+    /// allows. An `actor_token` is refused.
     Secret,
-    /// An `actor_token` verified against `[[actor_trust]]` only. Client credentials are refused.
+    /// An `actor_token` verified against `[[actor_trust]]` only. Client credentials of
+    /// either kind (secret or assertion) are refused.
     ActorToken,
     /// Either; when both are sent, both are checked.
     #[default]
@@ -406,7 +446,7 @@ fn default_true() -> bool {
     true
 }
 
-/// One `[[peps]]` entry: `{ id, secret_sha256 }`, as for [`AgentConfig`].
+/// One `[[peps]]` entry: `id` with `secret_sha256`, `jwks` or both, as for [`AgentConfig`].
 pub type PepConfig = AgentConfig;
 
 /// `[server]`
@@ -2429,16 +2469,52 @@ fn default_clock_skew() -> u64 {
 
 /// One `[[agents]]` entry: an OAuth client that may exchange user credentials for root tokens.
 ///
-/// `id` is the `client_id` and becomes the root hop's agent id. `secret_sha256` is the
-/// lowercase hex SHA-256 of the client secret (`printf %s "$SECRET" | sha256sum`).
+/// `id` is the `client_id` and becomes the root hop's agent id. The client authenticates with
+/// a secret (`secret_sha256`, the lowercase hex SHA-256 of the client secret:
+/// `printf %s "$SECRET" | sha256sum`), with a JWT signed by one of its keys (`jwks`,
+/// `private_key_jwt`, RFC 7523 §2.2; see `crate::clientauth`), or with either when both are
+/// set. At least one of the two is required.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentConfig {
     /// The OAuth `client_id`; for an agent, also the root hop's agent id.
     pub id: String,
-    /// Lowercase hex SHA-256 of the client secret.
-    pub secret_sha256: String,
+    /// Lowercase hex SHA-256 of the client secret. Unset: the client cannot authenticate
+    /// with a secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_sha256: Option<String>,
+    /// The client's public keys, a JWK Set as JSON text (`{"keys": [...]}`), for
+    /// `private_key_jwt` client assertions. Only public, asymmetric signing keys of the
+    /// algorithms in [`CLIENT_ASSERTION_ALGS`]. Unset: the client cannot authenticate with an
+    /// assertion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwks: Option<String>,
 }
+
+impl AgentConfig {
+    /// An entry that authenticates with a client secret, given as its SHA-256 hex digest.
+    pub fn with_secret_sha256(id: impl Into<String>, secret_sha256: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            secret_sha256: Some(secret_sha256.into()),
+            jwks: None,
+        }
+    }
+
+    /// An entry that authenticates with `private_key_jwt` only, with the keys of this JWK Set.
+    pub fn with_jwks(id: impl Into<String>, jwks: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            secret_sha256: None,
+            jwks: Some(jwks.into()),
+        }
+    }
+}
+
+/// The JWS algorithms a `private_key_jwt` client assertion may be signed with, and so the
+/// algorithms of the keys `[[agents]] jwks` and `[[peps]] jwks` may hold: the asymmetric
+/// algorithms the server accepts from identity providers ([`DEFAULT_IDP_ALGS`]).
+pub const CLIENT_ASSERTION_ALGS: &[&str] = DEFAULT_IDP_ALGS;
 
 /// One `[[root_grants]]` entry: the ceiling of what a root token for users of `issuer`, held
 /// by `agent`, may carry.

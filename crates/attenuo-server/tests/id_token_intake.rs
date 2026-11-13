@@ -148,10 +148,10 @@ fn config_trusting(idp: &EcIdp) -> Config {
         tenant: None,
         client_ids: BTreeMap::from([("planner".to_string(), CLIENT_AUD.to_string())]),
     }];
-    cfg.agents = vec![AgentConfig {
-        id: "planner".into(),
-        secret_sha256: hex::encode(Sha256::digest(PLANNER_SECRET.as_bytes())),
-    }];
+    cfg.agents = vec![AgentConfig::with_secret_sha256(
+        "planner",
+        hex::encode(Sha256::digest(PLANNER_SECRET.as_bytes())),
+    )];
     cfg.root_grants = vec![RootGrant {
         subject: None,
         issuer: idp.issuer.clone(),
@@ -251,10 +251,7 @@ async fn server_with_two_clients(idp: &EcIdp) -> Spawned {
     let secret = |id: &str| hex::encode(Sha256::digest(format!("{id}-secret").as_bytes()));
     cfg.agents = ["planner", "coder", "reviewer"]
         .iter()
-        .map(|id| AgentConfig {
-            id: (*id).into(),
-            secret_sha256: secret(id),
-        })
+        .map(|id| AgentConfig::with_secret_sha256(*id, secret(id)))
         .collect();
     cfg.root_grants = ["planner", "coder", "reviewer"]
         .iter()

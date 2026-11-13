@@ -86,9 +86,21 @@ The table is generated from `attenuo_core::error_codes::ERROR_CODES`, the one pl
 | `chain_not_issued` | 403 |  |  | A PEP's unsigned body chain was not issued by this server. |
 | `charge_pruned` | 410 |  |  | The budget charge of the decision was pruned. |
 | `check_unavailable` | 409 |  |  | The policy check cannot run in this configuration. |
+| `client_assertion_audience_mismatch` | 401 `invalid_client` |  |  | The client assertion's `aud` is not exactly this server's issuer identifier (`[issuer] issuer`). |
+| `client_assertion_bad_signature` | 401 `invalid_client` |  |  | The client assertion's signature does not verify with the client's key. |
+| `client_assertion_expired` | 401 `invalid_client` |  |  | The client assertion has expired. |
+| `client_assertion_lifetime_too_long` | 401 `invalid_client` |  |  | The client assertion's `exp` is further ahead than `[token] client_assertion_max_lifetime_seconds`. |
+| `client_assertion_malformed` | 401 `invalid_client` |  |  | The client assertion is not a well-formed JWT, or its `typ` names another kind of token. |
+| `client_assertion_missing_claim` | 401 `invalid_client` |  |  | The client assertion lacks `exp` or `jti`. |
+| `client_assertion_not_yet_valid` | 401 `invalid_client` |  |  | The client assertion's `nbf` or `iat` is in the future. |
+| `client_assertion_replayed` | 401 `invalid_client` |  |  | The client assertion (its `jti`) was already used. |
+| `client_assertion_subject_mismatch` | 401 `invalid_client` |  |  | The client assertion's `iss` and `sub` are not both the client id, or differ from the request's client id. |
+| `client_assertion_type_unsupported` | 400 `invalid_request` |  |  | `client_assertion_type` is not `urn:ietf:params:oauth:client-assertion-type:jwt-bearer`. |
+| `client_assertion_unknown_kid` | 401 `invalid_client` |  |  | The client assertion's `kid` names none of the client's keys, or is missing and the client has several. |
+| `client_assertion_unsupported_alg` | 401 `invalid_client` |  |  | The client assertion's `alg` is not accepted, or is not the algorithm of the key it names. |
 | `client_auth_missing` | 401 `invalid_client` |  |  | No client credentials were sent. |
 | `client_auth_not_accepted` | 400 `invalid_request` |  |  | `[token] actor_auth` does not accept client credentials. |
-| `client_authentication_failed` | 401 `invalid_client` |  |  | The client id or secret is wrong. |
+| `client_authentication_failed` | 401 `invalid_client` |  |  | The client id or secret is wrong, or the client has no credential of the kind sent. |
 | `client_id_mismatch` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The credential was issued to another client. |
 | `credential_audience_mismatch` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The ID token was not issued to the presenting agent: its `aud` or `azp` names another client. |
 | `credential_expired` | 400 `invalid_grant` |  |  | The hop-0 credential expires before the token could be issued. |
@@ -124,7 +136,7 @@ The table is generated from `attenuo_core::error_codes::ERROR_CODES`, the one pl
 | `missing_claim` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The credential lacks a required claim. |
 | `missing_kid` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The credential names no `kid`. |
 | `missing_token` | 401 `unauthorized` | `-32001` (401) |  | No credential was sent. |
-| `multiple_client_auth` | 400 `invalid_request` |  |  | Client credentials were sent in more than one way. |
+| `multiple_client_auth` | 400 `invalid_request` |  |  | Client credentials were sent in more than one way (HTTP Basic and the body, or a secret and a client assertion). |
 | `no_agents_configured` | 401 `invalid_client` |  |  | No `[[agents]]` are configured, so no agent can authenticate. |
 | `no_capabilities_requested` | 400 `invalid_request` |  |  | The token request asks for no capability. |
 | `no_lifetime_left` | 400 `invalid_request` |  |  | The new token would expire immediately. |

@@ -234,14 +234,8 @@ impl Harness {
                 .into(),
         }];
         cfg.agents = vec![
-            AgentConfig {
-                id: "planner".into(),
-                secret_sha256: sha256_hex(PLANNER_SECRET),
-            },
-            AgentConfig {
-                id: "coder".into(),
-                secret_sha256: sha256_hex(CODER_SECRET),
-            },
+            AgentConfig::with_secret_sha256("planner", sha256_hex(PLANNER_SECRET)),
+            AgentConfig::with_secret_sha256("coder", sha256_hex(CODER_SECRET)),
         ];
         cfg.root_grants = vec![RootGrant {
             subject: None,

@@ -112,10 +112,7 @@ async fn fixture(upstream: &FakeMcpServer) -> Fixture {
     cfg.dev.allow_root_mint = true;
     cfg.agents = ["planner", "coder", "reviewer"]
         .iter()
-        .map(|id| AgentConfig {
-            id: (*id).into(),
-            secret_sha256: sha256_hex(&format!("{id}-secret")),
-        })
+        .map(|id| AgentConfig::with_secret_sha256(*id, sha256_hex(&format!("{id}-secret"))))
         .collect();
     let (router, _state) = attenuo_server::build(&cfg).unwrap();
     let server = spawn_router(router).await.unwrap();

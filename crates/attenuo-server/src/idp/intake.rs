@@ -9,6 +9,7 @@
 //! | `subject_token_type` | `urn:ietf:params:oauth:token-type:id_token` or `urn:ietf:params:oauth:token-type:id-jag` |
 //! | `assertion` | the ID-JAG (jwt-bearer) |
 //! | `client_id`, `client_secret` | the agent's credentials from `[[agents]]`; HTTP Basic also accepted (RFC 6749 §2.3.1). With an `actor_token`, `client_id` alone may name the agent |
+//! | `client_assertion_type`, `client_assertion` | instead of a secret: a `private_key_jwt` client assertion (RFC 7523 §2.2) signed by one of the agent's `[[agents]] jwks` keys ([`crate::clientauth`]); `client_id`, when sent, must equal its `sub` |
 //! | `actor_token`, `actor_token_type` | RFC 8693 §2.1: a workload-identity JWT for the agent from an `[[actor_trust]]` issuer, type `urn:ietf:params:oauth:token-type:jwt` ([`crate::actor`]) |
 //! | `actor` | optional; must equal the authenticated agent when given |
 //! | `authorization_details` / `scope` | requested capabilities, as for an exchange |
@@ -16,7 +17,8 @@
 //! | `may_act` | optional RFC 8693 §4.4 `may_act` for the root token (agent ids); within the grant's |
 //!
 //! **Agent authentication** follows `[token] actor_auth`, as for an exchange: client
-//! credentials (`"secret"`), an `actor_token` (`"actor_token"`), or either (`"either"`, the
+//! credentials (`"secret"`: the client secret or a `private_key_jwt` assertion, whichever the
+//! agent's entry holds), an `actor_token` (`"actor_token"`), or either (`"either"`, the
 //! default; when both are sent, both are checked and must name the same agent). A method the
 //! mode does not accept is refused (`actor_token_not_accepted`, `client_auth_not_accepted`),
 //! and with `"actor_token"` and no token the request fails with `actor_token_required`. Hop 0
@@ -54,8 +56,8 @@ use time::{Duration, OffsetDateTime};
 use super::JWT_BEARER_GRANT_TYPE;
 use super::{claims, CredentialKind, IntakeError, ID_JAG_TOKEN_TYPE, ID_TOKEN_TYPE};
 use crate::actor::{VerifiedActor, ACTOR_TOKEN_TYPE};
-use crate::clientauth::{self, invalid_request, ClientKind};
-use crate::config::{capability_set, ActorAuth, AgentConfig, RootGrant};
+use crate::clientauth::{self, invalid_request, Authenticated, Clients};
+use crate::config::{capability_set, ActorAuth, RootGrant};
 use crate::error::ApiError;
 use crate::routes::token::take_actor_token;
 use crate::routes::{audit_issuance, no_store, register_issued};
@@ -115,6 +117,10 @@ pub(crate) async fn handle(
 ) -> Result<Response, ApiError> {
     let mut body = body;
     let actor_token = take_actor_token(&mut body, state.actor_auth)?;
+    let assertion = match body.as_object_mut() {
+        Some(obj) => clientauth::take_client_assertion(obj)?,
+        None => None,
+    };
     let req: IntakeRequest = serde_json::from_value(body)
         .map_err(|e| invalid_request("malformed_request", e.to_string()))?;
     let (kind, credential) = credential_of(&req)?;
@@ -125,13 +131,23 @@ pub(crate) async fn handle(
         Some(token) => Some((state.actor_trust.verify(&token, now).await?, token)),
         None => None,
     };
-    let (agent, agent_auth) = authenticate_agent(
+    let (agent, agent_auth, client) = authenticate_agent(
         &state.agents,
         state.actor_auth,
         headers,
         &req,
+        assertion.as_deref(),
         actor.as_ref().map(|(v, _)| v),
+        now,
     )?;
+    // A client assertion authenticates this one request, whatever its outcome: its `jti` is
+    // recorded now (`crate::clientauth`), unlike the actor token and the IdP credential, which
+    // are recorded together once the root token is issued.
+    if let Some(client) = client {
+        state
+            .blocking(move |s| client.commit(&s.replay, now))
+            .await?;
+    }
     // `[limits] token_requests_per_minute`: before the DPoP proof, the IdP credential, the
     // lease registration, signing and the audit append.
     state.limits.admit_agent(mark, &agent)?;
@@ -357,40 +373,50 @@ fn credential_of(req: &IntakeRequest) -> Result<(CredentialKind, &str), ApiError
     }
 }
 
-/// Authenticate the agent against `[[agents]]`; returns its id.
+/// Authenticate the agent against `[[agents]]` with its client credentials (secret or
+/// assertion).
 fn authenticate_client(
-    agents: &[AgentConfig],
+    agents: &Clients,
     headers: &HeaderMap,
     req: &IntakeRequest,
-) -> Result<String, ApiError> {
-    clientauth::authenticate(
-        ClientKind::Agent,
-        agents,
+    assertion: Option<&str>,
+    now: OffsetDateTime,
+) -> Result<Authenticated, ApiError> {
+    agents.authenticate(
         headers,
         req.client_id.as_deref(),
         req.client_secret.as_deref(),
+        assertion,
+        now,
     )
 }
 
+/// The agent id, how it authenticated, and the client credential whose use the caller must
+/// still record ([`Authenticated::commit`]).
+type AgentAuth = (String, &'static str, Option<Authenticated>);
+
 /// Authenticate the agent of a hop-0 request under `[token] actor_auth` (see the module
-/// docs), and check that `actor` and `client_id` name it. Returns the agent id and how it
-/// authenticated (`client_secret`, `actor_token`, or `actor_token+client_secret`).
+/// docs), and check that `actor` and `client_id` name it. Returns the agent id, how it
+/// authenticated (`client_secret`, `private_key_jwt`, `actor_token`,
+/// `actor_token+client_secret` or `actor_token+private_key_jwt`) and, for client credentials,
+/// the [`Authenticated`] to commit.
 fn authenticate_agent(
-    agents: &[AgentConfig],
+    agents: &Clients,
     mode: ActorAuth,
     headers: &HeaderMap,
     req: &IntakeRequest,
+    assertion: Option<&str>,
     actor: Option<&VerifiedActor>,
-) -> Result<(String, &'static str), ApiError> {
-    let presented =
-        req.client_secret.is_some() || clientauth::basic_credentials(headers)?.is_some();
+    now: OffsetDateTime,
+) -> Result<AgentAuth, ApiError> {
+    let presented = clientauth::presented(headers, req.client_secret.as_deref(), assertion)?;
     if presented && mode == ActorAuth::ActorToken {
         return Err(invalid_request(
             "client_auth_not_accepted",
             "this server authenticates agents with an actor_token only ([token] actor_auth = \"actor_token\")",
         ));
     }
-    let (agent, how) = match actor {
+    let (agent, how, client) = match actor {
         Some(verified) => {
             if let Some(id) = &req.client_id {
                 if *id != verified.agent {
@@ -404,19 +430,20 @@ fn authenticate_agent(
                 }
             }
             if presented {
-                let client = authenticate_client(agents, headers, req)?;
-                if client != verified.agent {
+                let client = authenticate_client(agents, headers, req, assertion, now)?;
+                let id = client.id().to_owned();
+                if id != verified.agent {
                     return Err(invalid_request(
                         "actor_mismatch",
                         format!(
-                            "the authenticated client `{client}` is not the agent `{}` the actor_token identifies",
+                            "the authenticated client `{id}` is not the agent `{}` the actor_token identifies",
                             verified.agent
                         ),
                     ));
                 }
-                (client, "actor_token+client_secret")
+                (id, client.method().with_actor_token(), Some(client))
             } else {
-                (verified.agent.clone(), "actor_token")
+                (verified.agent.clone(), "actor_token", None)
             }
         }
         None if mode == ActorAuth::ActorToken => {
@@ -425,7 +452,14 @@ fn authenticate_agent(
                 format!("an actor_token (actor_token_type `{ACTOR_TOKEN_TYPE}`) is required"),
             ))
         }
-        None => (authenticate_client(agents, headers, req)?, "client_secret"),
+        None => {
+            let client = authenticate_client(agents, headers, req, assertion, now)?;
+            (
+                client.id().to_owned(),
+                client.method().as_str(),
+                Some(client),
+            )
+        }
     };
     if let Some(named) = &req.actor {
         if *named != agent {
@@ -435,28 +469,50 @@ fn authenticate_agent(
             ));
         }
     }
-    Ok((agent, how))
-}
-
-/// Validate `[[agents]]` at startup; returns them with the hash lowercased.
-pub(crate) fn validate_agents(agents: &[AgentConfig]) -> anyhow::Result<Vec<AgentConfig>> {
-    clientauth::validate_clients("[[agents]]", agents)
+    Ok((agent, how, client))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clientauth::AssertionPolicy;
+    use crate::config::AgentConfig;
     use axum::http::{header, HeaderValue};
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine;
     use sha2::{Digest, Sha256};
 
-    fn agents() -> Vec<AgentConfig> {
-        validate_agents(&[AgentConfig {
-            id: "planner".into(),
-            secret_sha256: hex::encode(Sha256::digest(b"s3cret")).to_uppercase(),
-        }])
+    fn policy() -> AssertionPolicy {
+        AssertionPolicy {
+            audience: "https://attenuo.example".into(),
+            max_lifetime_seconds: 300,
+            clock_skew_seconds: 60,
+        }
+    }
+
+    fn validate_agents(agents: &[AgentConfig]) -> anyhow::Result<Clients> {
+        Clients::agents(agents, policy())
+    }
+
+    fn agents() -> Clients {
+        validate_agents(&[AgentConfig::with_secret_sha256(
+            "planner",
+            hex::encode(Sha256::digest(b"s3cret")).to_uppercase(),
+        )])
         .unwrap()
+    }
+
+    fn now() -> OffsetDateTime {
+        OffsetDateTime::from_unix_timestamp(1_000_000).unwrap()
+    }
+
+    /// [`authenticate_client`] with a secret (no assertion), to the client id.
+    fn authenticate_secret(
+        agents: &Clients,
+        h: &HeaderMap,
+        r: &IntakeRequest,
+    ) -> Result<String, ApiError> {
+        authenticate_client(agents, h, r, None, now()).map(|c| c.id().to_owned())
     }
 
     fn req(id: Option<&str>, secret: Option<&str>) -> IntakeRequest {
@@ -482,11 +538,11 @@ mod tests {
     fn client_auth_form_and_basic() {
         let h = HeaderMap::new();
         assert_eq!(
-            authenticate_client(&agents(), &h, &req(Some("planner"), Some("s3cret"))).unwrap(),
+            authenticate_secret(&agents(), &h, &req(Some("planner"), Some("s3cret"))).unwrap(),
             "planner"
         );
         assert_eq!(
-            code(authenticate_client(
+            code(authenticate_secret(
                 &agents(),
                 &h,
                 &req(Some("planner"), Some("nope"))
@@ -494,7 +550,7 @@ mod tests {
             "client_authentication_failed"
         );
         assert_eq!(
-            code(authenticate_client(
+            code(authenticate_secret(
                 &agents(),
                 &h,
                 &req(Some("ghost"), Some("s3cret"))
@@ -502,12 +558,12 @@ mod tests {
             "client_authentication_failed"
         );
         assert_eq!(
-            code(authenticate_client(&agents(), &h, &req(None, None))),
+            code(authenticate_secret(&agents(), &h, &req(None, None))),
             "client_auth_missing"
         );
         assert_eq!(
-            code(authenticate_client(
-                &[],
+            code(authenticate_secret(
+                &validate_agents(&[]).unwrap(),
                 &h,
                 &req(Some("planner"), Some("s3cret"))
             )),
@@ -520,11 +576,11 @@ mod tests {
             HeaderValue::from_str(&format!("Basic {}", STANDARD.encode("planner:s3cret"))).unwrap(),
         );
         assert_eq!(
-            authenticate_client(&agents(), &basic, &req(None, None)).unwrap(),
+            authenticate_secret(&agents(), &basic, &req(None, None)).unwrap(),
             "planner"
         );
         assert_eq!(
-            code(authenticate_client(
+            code(authenticate_secret(
                 &agents(),
                 &basic,
                 &req(None, Some("s3cret"))
@@ -535,13 +591,17 @@ mod tests {
 
     #[test]
     fn agents_config_is_validated() {
-        let bad = AgentConfig {
-            id: "a".into(),
-            secret_sha256: "abc".into(),
-        };
+        let bad = AgentConfig::with_secret_sha256("a", "abc");
         assert!(validate_agents(&[bad]).is_err());
-        let a = agents().remove(0);
+        let a = AgentConfig::with_secret_sha256("a", hex::encode(Sha256::digest(b"x")));
         assert!(validate_agents(&[a.clone(), a]).is_err());
+        let neither = AgentConfig {
+            id: "a".into(),
+            secret_sha256: None,
+            jwks: None,
+        };
+        let e = validate_agents(&[neither]).err().unwrap().to_string();
+        assert!(e.contains("set secret_sha256, jwks"), "{e}");
     }
 
     fn verified(agent: &str) -> VerifiedActor {
@@ -559,7 +619,8 @@ mod tests {
     fn agent_auth_follows_actor_auth_modes() {
         let h = HeaderMap::new();
         let auth = |mode, r: &IntakeRequest, actor: Option<&VerifiedActor>| {
-            authenticate_agent(&agents(), mode, &h, r, actor)
+            authenticate_agent(&agents(), mode, &h, r, None, actor, now())
+                .map(|(a, how, _)| (a, how))
         };
         let desc = |r: Result<(String, &'static str), ApiError>| r.unwrap_err().description;
         let planner = verified("planner");
