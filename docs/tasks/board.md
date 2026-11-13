@@ -51,7 +51,6 @@ How to read it:
 
 ### SDKs and CLI
 
-- [ ] **SR-112 (Low, security review pass 13): redirects from the server URL.** The CLI and the TypeScript SDK follow a `307` or `308` to another origin and send the request body again there, so a token request's `client_secret`, `client_assertion`, `actor_token` and subject token reach whatever the redirect names; only `Authorization` is dropped. The Python SDK does not follow redirects. Options in the [report](../research/security-review-2026-11-13-pass13.md#sr-112-a-redirect-from-the-server-url-takes-the-token-request-body-to-another-origin-low-proposed); the recommendation is to follow none (CLI `redirect::Policy::none()`, TypeScript `redirect: "manual"`) and name the `Location` in the error. Tests that pin today's behaviour: `crates/attenuo-cli/tests/redirect.rs`, `sdk/typescript/test/redirect.test.ts`. **Needs:** the maintainer's choice.
 - [ ] **SDK hop 0 against a live IdP.** Test the Python and TypeScript hop-0 exchange against a real provider. While doing so, check that the `kid` check in the Python `inspect(verify=True)` still matches the server's header and JWKS `kid`. **Needs: a live IdP tenant.**
 
 ### Evaluation and research
@@ -154,7 +153,7 @@ How to read it:
 
 ### Security reviews and fuzzing
 
-- [x] Security review passes 1 to 13 (SR-01 to SR-114): every finding fixed or accepted with its reasoning but SR-112, Low, open under "SDKs and CLI" ([README status](https://github.com/attenuo-dev/attenuo#status)). Passes with pull requests: 5 (#71, #72), 6 (#104), 7 (#124, with SR-81 #128, SR-82 #125 and #126, SR-83 #273), 8 (#151, SR-87 #160), 9 (#192, SR-91 #193, SR-92 and SR-93 #195), 10 (#209, SR-97 #214, SR-100 and SR-101 #238), 11 (#255), 12 (#299, [report](../research/security-review-2026-11-13-pass12.md): SR-108 Low and SR-111 Info fixed there; SR-109 and SR-110 Info in #300), 13 ([report](../research/security-review-2026-11-13-pass13.md): SR-113 and SR-114 Info fixed there; SR-112 Low open). The per-principal session cap SR-36 suggested is `[proxy] max_sessions_per_principal` (SR-49).
+- [x] Security review passes 1 to 13 (SR-01 to SR-114): every finding fixed or accepted with its reasoning, none open ([README status](https://github.com/attenuo-dev/attenuo#status)). Passes with pull requests: 5 (#71, #72), 6 (#104), 7 (#124, with SR-81 #128, SR-82 #125 and #126, SR-83 #273), 8 (#151, SR-87 #160), 9 (#192, SR-91 #193, SR-92 and SR-93 #195), 10 (#209, SR-97 #214, SR-100 and SR-101 #238), 11 (#255), 12 (#299, [report](../research/security-review-2026-11-13-pass12.md): SR-108 Low and SR-111 Info fixed there; SR-109 and SR-110 Info in #300), 13 ([report](../research/security-review-2026-11-13-pass13.md): SR-112 Low, SR-113 and SR-114 Info, all fixed there). The per-principal session cap SR-36 suggested is `[proxy] max_sessions_per_principal` (SR-49).
 - [x] Fuzz targets ([fuzzing](../design/fuzzing.md)), round 2 (#74, FZ2-2 #75), round 3 over the SSE parsing (#130), `decimal` inputs in `policy_context` (#205); fuzz targets compile-checked on every PR (#262).
 
 ### Code quality and CI

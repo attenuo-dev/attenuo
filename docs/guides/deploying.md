@@ -26,7 +26,7 @@ Go through this before pointing anything real at the server.
 - [ ] Every agent that receives a token is an `[[agents]]` entry with its own secret or, to keep no shared secret on the server, its own public key (`jwks`, [`private_key_jwt`](identity-providers.md#a-key-instead-of-a-secret)): token exchanges authenticate as their `actor` (`[token] require_actor_auth`, on by default).
 - [ ] `[policy] unknown_tools` is `deny` (the default) or `sensitive`, not `allow`.
 - [ ] `/admin/*` is not reachable from the networks agents live on: `[admin] listen` gives it a port of its own. See [Network exposure](#network-exposure).
-- [ ] TLS terminates in front of attenuo, and agents reach it over HTTPS only. `[server] public_url` is the proxy's `https://` URL. A plain `http://` `public_url` on a host that is not loopback refuses to start unless `[server] allow_insecure_http = true`, which you should not need.
+- [ ] TLS terminates in front of attenuo, and agents reach it over HTTPS only. `[server] public_url` is the proxy's `https://` URL, and agents, the CLI and the SDKs are given that URL itself: they follow no redirect, so a URL that redirects is an error ([TLS and a reverse proxy](#tls-and-a-reverse-proxy)). A plain `http://` `public_url` on a host that is not loopback refuses to start unless `[server] allow_insecure_http = true`, which you should not need.
 - [ ] Every `[[idps]]` and `[[actor_trust]]` key URL (`jwks_url`, `spiffe_bundle_url`, or the IdP `issuer` used for discovery) is the final `https://` URL. Plain `http://` is accepted only on loopback, and redirects are not followed, so a key URL that redirects fails every ID or actor token it should verify.
 - [ ] `[issuer] private_key_pem_path` is set, the file is mode 0600, owned by the service user, and backed up somewhere safe. Without the setting the server makes a new key at every start and every token dies on restart.
 - [ ] `[audit] sqlite_path` is a real path on durable storage. The default is `:memory:`, which loses the audit log and every lease on exit. The server logs a warning when it is in memory.
@@ -78,6 +78,7 @@ Put anything that terminates TLS in front: Caddy, nginx, Envoy, a cloud load bal
 
 - **Do not buffer responses.** Streamable HTTP can answer with `text/event-stream`. A proxy that buffers will hold events back.
 - **Keep read timeouts long** enough for slow tools.
+- **Point clients at the final URL.** The CLI and both SDKs follow no redirect (SR-112): a `307` or `308` would send a token request's body, with the agent's client secret or assertion and the subject token, again to wherever `Location` names. A 3xx is an error that names the status and the `Location` (`ApiError` `redirect_not_followed` in the SDKs, exit 1 in the CLI). So a reverse proxy that redirects `http://` to `https://`, or one host name to another, now produces that error instead of a silent second request: give clients the `https://` URL that answers without a redirect, the `[server] public_url`.
 
 A minimal Caddy file. Untested, but small enough to check by eye:
 
