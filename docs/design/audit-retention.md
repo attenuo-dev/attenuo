@@ -198,7 +198,7 @@ Not measured. No committed bench file records the database size or the bytes per
 
 ## 8. Schema migration
 
-Migration 3, appended to `MIGRATIONS` with `SCHEMA_VERSION = 3`, plain DDL against version 2 (no `IF NOT EXISTS`), per the rules in `migrations.rs:27-31`:
+Migration 4, appended to `MIGRATIONS` with `SCHEMA_VERSION = 4`, plain DDL against version 3 (version 3 is the credential replay table) (no `IF NOT EXISTS`), per the rules in `migrations.rs:27-31`:
 
 ```sql
 CREATE TABLE audit_anchors (
@@ -250,7 +250,7 @@ Unit and store tests (`attenuo-audit`):
 - Two prunes in a row: the second anchor's `previous_through_seq` is the first's `through_seq`; the two archives and the retained export link.
 - Export: `from <= B` answers `audit_pruned`; `from = B + 1` carries the anchor and verifies with `from_anchor`; the archive `first ..= B` verifies strictly with no unsigned tail.
 - Cross-check: a shipped checkpoint below the export's range is counted; with an anchor, a shipped checkpoint at B that differs from the anchor's is a mismatch.
-- Migration 3 on a version 2 file with rows in every table.
+- Migration 4 on a version 3 file with rows in every table.
 
 Server and CLI tests:
 
