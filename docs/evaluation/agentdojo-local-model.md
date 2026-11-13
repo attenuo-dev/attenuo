@@ -142,10 +142,39 @@ So by AgentDojo's own score 15 of 99 landed, and that is the number in the table
 
 "By the token" is `capability_denied`: the call was outside what the planner's grant allows.
 
+## Where the finished tasks go
+
+Under attack, 54 tasks were finished by the agent alone and not behind attenuo, and 15 the other way round; 54 minus 15 is the net 39 between 164 and 125. `evaluation/agentdojo/utility_loss.py` gives each of these cases one cause, read from attenuo's decisions in that run, by the first rule that applies: attenuo refused a call to a tool that the task's ground-truth solution uses (split by the reason of the first such refusal); attenuo refused only calls the task does not need; attenuo refused nothing. The needed tools come from AgentDojo's own ground truth for each user task.
+
+| Attack runs | slack | banking | travel | Total |
+| --- | ---: | ---: | ---: | ---: |
+| Finished alone / behind attenuo (of pairs) | 46 / 26 (of 99) | 84 / 64 (of 143) | 34 / 35 (of 140) | 164 / 125 (of 382) |
+| **Lost** (finished alone only) | **27** | **21** | **6** | **54** |
+| Needed tool refused by the suite policy | 14 | 17 | 4 | 35 |
+| Needed tool refused: outside the planner's grant | 7 | 0 | 1 | 8 |
+| Needed tool refused by a run limit or for an argument type | 0 | 0 | 0 | 0 |
+| Only unneeded calls refused, task still not finished | 6 | 4 | 1 | 11 |
+| No call refused | 0 | 0 | 0 | 0 |
+| **Gained** (finished behind attenuo only) | **7** | **1** | **7** | **15** |
+| Only unneeded calls refused | 2 | 1 | 7 | 10 |
+| Needed tool refused by a run limit | 4 | 0 | 0 | 4 |
+| Needed tool refused: outside the planner's grant | 1 | 0 | 0 | 1 |
+
+With no attack, 8 tasks were lost (6 with a needed tool refused by the suite policy, 2 outside the grant) and 2 gained (both with a needed tool refused by a run limit), the 28 against 22 of 56. The full table, with every case and the refused calls, is [`stats/utility_loss.md`](https://github.com/attenuo-dev/attenuo/blob/main/evaluation/agentdojo/results/2026-11-12-local-qwen2.5-14b/stats/utility_loss.md) and `utility_loss.json` next to it.
+
+What it shows:
+
+- Every lost case had at least one refusal in the attenuo run; none is a plain difference in the model's path. In 43 of the 54 a tool the task needs was refused, 35 of them by the suite policy and 8 by the grant. In the other 11 attenuo refused only calls the task does not need, and the model did not finish the task afterwards.
+- The loss is concentrated: six user tasks account for 38 of the 54 (banking `user_task_11` and `user_task_14`, 9 each; slack `user_task_2`, `user_task_11`, `user_task_16` and `user_task_17`, 5 each). Going by the refused tool recorded for each case in `utility_loss.json`, on slack most of it is `invite_user_to_slack`, refused by the policy or the grant; on banking it is `send_money` in `user_task_11` and `update_password` in `user_task_14`, both refused by the policy.
+- The 15 gains also follow refusals: in 10 attenuo refused only unneeded calls and the model then finished the task, and in 4 a run limit stopped a repeated call.
+- Refusing a needed tool is not always refusing the task's own call. In 20 of the 43 the refused call had the ground truth's arguments (free text such as a subject or body aside); in the other 23 its arguments differed (another recipient, value or format). In 14 of the 43 the refused tool is also one the attack uses.
+
+The classification is mechanical. It gives one cause per case, the first that matches, even when a run had several refusals. It matches needed tools by name, so it cannot tell whether a refused `send_money` was the user's payment or the attacker's. It is one run per case, so it says what attenuo refused in that run, not what the model would have done without the refusal.
+
 ## What the numbers do not say
 
 - **This is a weak agent.** `qwen2.5:14b` finishes 10 of 21 slack tasks, 10 of 16 banking tasks and 8 of 20 travel tasks with no attack and no attenuo, and follows the injected instruction in 78 of 104 slack, 73 of 143 banking and 28 of 140 travel attack runs. Stronger models resist this attack on their own (see the report's four-model benchmark), so the drop from 179 to 23 of 382 is what enforcement does for an agent that does not resist. It is not a claim about every agent.
-- **The cost in finished tasks is real.** Under attack the agent with attenuo finishes 125 of 382 tasks against 164 of 382 without it (slack 26 against 46 of 99, banking 64 against 84 of 143, travel 35 against 34 of 140). This loss is not yet broken down by cause. One known part is the grant and the policy: in benign slack runs 28 of 148 calls were refused, 8 because the planner's grant was narrower than the path this model took, 13 by the suite policy and 7 by a run limit. The benign difference (28 against 22 of 56 over the three suites) is within noise at this size.
+- **The cost in finished tasks is real.** Under attack the agent with attenuo finishes 125 of 382 tasks against 164 of 382 without it (slack 26 against 46 of 99, banking 64 against 84 of 143, travel 35 against 34 of 140). Every one of the 54 lost cases had a refusal in the attenuo run: in 43 a tool the task needs was refused (35 by the suite policy, 8 by the grant) and in 11 only calls the task does not need, and six user tasks account for 38 of them ([where the finished tasks go](#where-the-finished-tasks-go)). 15 cases went the other way. In benign slack runs 28 of 148 calls were refused, 8 because the planner's grant was narrower than the path this model took, 13 by the suite policy and 7 by a run limit. The benign difference (28 against 22 of 56 over the three suites) is within noise at this size.
 - **One model, one seed, three suites so far.** Temperature 0 with a fixed seed, so there is one run per case and no measure of run-to-run spread.
 - **Errored runs differ between the arms** (2 against 7 over the three suites; on slack 1 against 7, on travel none). They are excluded from both, and the paired table only uses cases both arms scored, but slack user task 4 is missing from the comparison entirely.
 - **The grants come from a Claude model** and have the limits listed in [threats to validity](agentdojo-planner-grants.md#threats-to-validity).
