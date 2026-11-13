@@ -28,7 +28,7 @@ use crate::config::ProxyConfig;
 use crate::filter::{list_kinds_by_shape, ListFilter, ListKind};
 use crate::guard::{disown_stream, disown_stream_end, guard_stream, StreamEndCause, StreamGuard};
 use crate::jsonrpc::{
-    self, approval_required_response, denied_response, denied_response_with, error_response, id_of,
+    self, approval_required_response, attenuo_error, denied_response, denied_response_with, id_of,
     is_passthrough_method, is_request, method_of, CODE_INVALID_PARAMS, CODE_INVALID_REQUEST,
     CODE_PARSE_ERROR, CODE_TOO_MANY, CODE_UNAUTHORIZED, CODE_UNAVAILABLE, CODE_UNKNOWN_SERVER,
     CODE_UPSTREAM,
@@ -97,6 +97,11 @@ pub const REASON_UPSTREAM_NOT_EVENT_STREAM: &str = "upstream_not_event_stream";
 /// Reason code for a `tools/call` whose name the upstream never listed and the catalog does not
 /// know, with [`ProxyConfig::require_listed_tools`] on (SR-25).
 pub const REASON_TOOL_NOT_LISTED: &str = "tool_not_listed";
+
+/// Code (JSON-RPC `data.code`, HTTP 502) when the upstream's answer to a request the proxy must
+/// filter or label is not one it can read: a list answer with an unsupported content type or
+/// invalid JSON, or a body it cannot label.
+pub const REASON_UPSTREAM_INVALID_RESPONSE: &str = "upstream_invalid_response";
 
 /// Reason code recorded on the exported `attenuo.session_gate` span for a session id the
 /// proxy does not know (answered `404`, the MCP signal to start a new session).
@@ -333,9 +338,10 @@ fn unauthorized_recorded(err: AuthError, decision_id: Option<Uuid>) -> Response 
         // Over a per-run rate limit: the token is good, so not a 401. Logged by the
         // authorizer once per run and window, not here per request.
         tracing::debug!(reason, "request refused: rate limited");
-        let body = error_response(
+        let body = attenuo_error(
             Value::Null,
             CODE_TOO_MANY,
+            reason,
             "attenuo: too many requests for this run; retry later",
             Some(serde_json::json!({ "reason": reason })),
         );
@@ -348,9 +354,10 @@ fn unauthorized_recorded(err: AuthError, decision_id: Option<Uuid>) -> Response 
         // A server-side limit, not a bad credential: 503, so the client keeps its token and
         // key and retries (SR-47).
         tracing::warn!(reason = ?reason, "request refused: temporarily unavailable");
-        let body = error_response(
+        let body = attenuo_error(
             Value::Null,
             CODE_UNAVAILABLE,
+            reason,
             format!("attenuo: temporarily unavailable: {reason}"),
             Some(serde_json::json!({ "reason": reason })),
         );
@@ -382,9 +389,10 @@ fn unauthorized_body(id: Value, err: &AuthError, decision_id: Option<Uuid>) -> V
     if let Some(d) = decision_id {
         data["decision_id"] = Value::String(d.to_string());
     }
-    error_response(
+    attenuo_error(
         id,
         CODE_UNAUTHORIZED,
+        reason,
         format!("attenuo: unauthorized: {reason}"),
         Some(data),
     )
@@ -486,9 +494,10 @@ fn refused_tool_name(method: Option<&str>) -> &'static str {
 
 fn unknown_server(server: &str) -> Response {
     tracing::warn!(server = ?server, "request rejected: unknown upstream");
-    let body = error_response(
+    let body = attenuo_error(
         Value::Null,
         CODE_UNKNOWN_SERVER,
+        "unknown_server",
         format!("attenuo: unknown server `{server}`"),
         None,
     );
@@ -511,9 +520,10 @@ impl<S: Send + Sync> FromRequestParts<S> for ServerName {
             Ok(Path(server)) => Ok(ServerName(server)),
             Err(e) => {
                 tracing::debug!(error = ?e.body_text(), "request rejected: bad server name");
-                let body = error_response(
+                let body = attenuo_error(
                     Value::Null,
                     CODE_INVALID_REQUEST,
+                    "invalid_request",
                     "attenuo: the server name in the path is not valid UTF-8".to_string(),
                     None,
                 );
@@ -744,9 +754,10 @@ async fn session_gate(
         SessionCheck::Owned => Ok(owner),
         SessionCheck::Unknown => {
             tracing::warn!(session = %session_tag(sid), "request rejected: unknown session");
-            let body = error_response(
+            let body = attenuo_error(
                 Value::Null,
                 CODE_INVALID_REQUEST,
+                REASON_SESSION_UNKNOWN,
                 "attenuo: session not found; start a new session",
                 None,
             );
@@ -811,9 +822,10 @@ async fn adopt_session(
                 session = %session_tag(&sid),
                 "session registry full; refusing to bind a new session"
             );
-            let body = error_response(
+            let body = attenuo_error(
                 Value::Null,
                 CODE_UNAVAILABLE,
+                REASON_SESSION_REGISTRY_FULL,
                 "attenuo: too many open sessions; try again later",
                 Some(serde_json::json!({ "reason": REASON_SESSION_REGISTRY_FULL })),
             );
@@ -828,9 +840,10 @@ async fn adopt_session(
                 session = %session_tag(&sid),
                 "principal holds too many sessions; refusing to bind a new one"
             );
-            let body = error_response(
+            let body = attenuo_error(
                 Value::Null,
                 CODE_TOO_MANY,
+                REASON_TOO_MANY_SESSIONS,
                 "attenuo: too many open sessions for this principal; close one or try again later",
                 Some(serde_json::json!({ "reason": REASON_TOO_MANY_SESSIONS })),
             );
@@ -893,9 +906,10 @@ async fn read_request_body(
 ) -> Result<Bytes, Response> {
     let too_large = || {
         tracing::warn!(limit, "request rejected: body too large");
-        let body = error_response(
+        let body = attenuo_error(
             Value::Null,
             CODE_INVALID_REQUEST,
+            REASON_REQUEST_TOO_LARGE,
             format!("attenuo: request body larger than {limit} bytes"),
             Some(serde_json::json!({ "reason": REASON_REQUEST_TOO_LARGE })),
         );
@@ -911,9 +925,10 @@ async fn read_request_body(
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| {
             tracing::warn!(error = %e, "request body could not be read");
-            let body = error_response(
+            let body = attenuo_error(
                 Value::Null,
                 CODE_INVALID_REQUEST,
+                "invalid_request",
                 "attenuo: request body could not be read",
                 None,
             );
@@ -965,9 +980,10 @@ async fn read_upstream_body(
 
 fn upstream_body_too_large(limit: usize) -> Response {
     tracing::error!(limit, "upstream body larger than the proxy buffers");
-    let body = error_response(
+    let body = attenuo_error(
         Value::Null,
         CODE_UPSTREAM,
+        REASON_UPSTREAM_BODY_TOO_LARGE,
         format!("attenuo: upstream response larger than {limit} bytes"),
         Some(serde_json::json!({ "reason": REASON_UPSTREAM_BODY_TOO_LARGE })),
     );
@@ -1000,9 +1016,10 @@ fn session_id_of(headers: &HeaderMap) -> Result<Option<String>, Response> {
             several,
             "request rejected: Mcp-Session-Id header repeated or not visible ASCII"
         );
-        let body = error_response(
+        let body = attenuo_error(
             Value::Null,
             CODE_INVALID_REQUEST,
+            "invalid_request",
             "attenuo: invalid request: exactly one Mcp-Session-Id header, visible ASCII",
             None,
         );
@@ -1253,9 +1270,10 @@ fn upstream_not_event_stream(resp: &reqwest::Response) -> Response {
         content_type = ?content_type,
         "upstream answered GET with a success status that is not an SSE stream; refused"
     );
-    let body = error_response(
+    let body = attenuo_error(
         Value::Null,
         CODE_UPSTREAM,
+        REASON_UPSTREAM_NOT_EVENT_STREAM,
         "attenuo: upstream answered GET without an event stream",
         Some(serde_json::json!({ "reason": REASON_UPSTREAM_NOT_EVENT_STREAM })),
     );
@@ -1277,9 +1295,10 @@ fn upstream_error(failure: UpstreamFailure) -> Response {
             (StatusCode::GATEWAY_TIMEOUT, "attenuo: upstream timed out")
         }
     };
-    let body = error_response(
+    let body = attenuo_error(
         Value::Null,
         CODE_UPSTREAM,
+        failure.reason(),
         message,
         Some(serde_json::json!({ "reason": failure.reason() })),
     );
@@ -1437,9 +1456,10 @@ async fn handle_post_inner(
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(error = ?e.to_string(), "request body is not JSON");
-            let body = error_response(
+            let body = attenuo_error(
                 Value::Null,
                 CODE_PARSE_ERROR,
+                "parse_error",
                 format!("attenuo: parse error: {e}"),
                 None,
             );
@@ -1451,9 +1471,10 @@ async fn handle_post_inner(
         Value::Array(items) => (items, true),
         Value::Object(_) => (vec![parsed], false),
         _ => {
-            let body = error_response(
+            let body = attenuo_error(
                 Value::Null,
                 CODE_INVALID_REQUEST,
+                "invalid_request",
                 "attenuo: invalid request: expected a JSON-RPC object or batch",
                 None,
             );
@@ -1461,9 +1482,10 @@ async fn handle_post_inner(
         }
     };
     if is_batch && messages.is_empty() {
-        let body = error_response(
+        let body = attenuo_error(
             Value::Null,
             CODE_INVALID_REQUEST,
+            "invalid_request",
             "attenuo: invalid request: empty batch",
             None,
         );
@@ -1514,9 +1536,10 @@ async fn handle_post_inner(
         Ok(v) => Bytes::from(v),
         Err(e) => {
             tracing::error!(error = %e, "re-encoding the screened request failed");
-            let body = error_response(
+            let body = attenuo_error(
                 Value::Null,
                 CODE_INVALID_REQUEST,
+                "invalid_request",
                 "attenuo: invalid request",
                 None,
             );
@@ -1694,9 +1717,10 @@ async fn handle_post_inner(
                 status = %resp.status(),
                 "upstream answered a list request with a body the proxy cannot filter"
             );
-            let body = error_response(
+            let body = attenuo_error(
                 Value::Null,
                 CODE_UPSTREAM,
+                REASON_UPSTREAM_INVALID_RESPONSE,
                 "attenuo: upstream answered a list request with an unsupported content type",
                 None,
             );
@@ -1767,9 +1791,10 @@ async fn screen_message(
         Ok(t) => t,
         Err(detail) => {
             if is_request(&msg) {
-                out.replies.push(error_response(
+                out.replies.push(attenuo_error(
                     id_of(&msg),
                     CODE_INVALID_PARAMS,
+                    "invalid_params",
                     format!("attenuo: invalid params: {detail}"),
                     None,
                 ));
@@ -1811,9 +1836,10 @@ async fn screen_message(
     };
     let invalid = |detail: &str| {
         tracing::warn!(method = ?method, detail = ?detail, "invalid params");
-        error_response(
+        attenuo_error(
             id.clone(),
             CODE_INVALID_PARAMS,
+            "invalid_params",
             format!("attenuo: invalid params: {detail}"),
             None,
         )
@@ -2077,9 +2103,10 @@ async fn buffer_and_rewrite(
                     error = ?e.to_string(),
                     "upstream answered a list request with invalid JSON"
                 );
-                let body = error_response(
+                let body = attenuo_error(
                     Value::Null,
                     CODE_UPSTREAM,
+                    REASON_UPSTREAM_INVALID_RESPONSE,
                     "attenuo: upstream answered a list request with invalid JSON",
                     None,
                 );
@@ -2183,9 +2210,10 @@ fn label_failure(screened: &Screened, labeller: &Labeller, is_batch: bool) -> Re
     if items.is_empty() {
         // No call of this request was allowed, but the body may answer an earlier one
         // (SR-85): nothing in it can be relayed.
-        let body = error_response(
+        let body = attenuo_error(
             Value::Null,
             CODE_UPSTREAM,
+            REASON_UPSTREAM_INVALID_RESPONSE,
             "attenuo: upstream answered with a body the proxy cannot label",
             None,
         );

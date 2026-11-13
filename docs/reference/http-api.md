@@ -1,12 +1,174 @@
 # HTTP endpoints
 
-All routes the server mounts, from the route table in `crates/attenuo-server/src/lib.rs` and the proxy router. What may change before 1.0, and how a change is announced, is in [API compatibility](api-compatibility.md). Errors on non-MCP routes look like `{"error": "<code>", "detail": "<text>"}`. The codes for `/token` are listed in [design/server.md](../design/server.md#error-codes).
+All routes the server mounts, from the route table in `crates/attenuo-server/src/lib.rs` and the proxy router. What may change before 1.0, and how a change is announced, is in [API compatibility](api-compatibility.md). Errors on non-MCP routes look like `{"error": "<error>", "code": "<code>", "detail": "<text>"}`; every error carries a stable `code`, listed under [Errors](#errors). The codes for `/token` are explained in [design/server.md](../design/server.md#error-codes).
 
-A 401 for a bearer token (`/token/renew`, AuthZEN, `/admin/*`) is `{"error": "unauthorized", "detail": "<reason>", "error_description": "<reason>"}`, where the reason is one of `missing_token`, `invalid_token` or `token_expired`. Why a token did not verify (wrong key, audience, issuer, malformed) is logged at debug level and never returned. A token bound to a key (DPoP, below) adds `dpop_required` and `invalid_dpop_proof`. The same goes for a JWKS the server cannot fetch (503 `temporarily_unavailable`, sub-code `jwks_unavailable`): the URL and the transport error are logged, not returned. A hop-0 credential (ID token or ID-JAG) refused at `POST /token` is `400 invalid_grant` with the sub-code (`audience_mismatch`, `unknown_kid`, ...) as both `detail` and `error_description`; the verifier's message, which names the issuer, the audience or the `kid`, is logged at debug level. A refused `actor_token` is answered the same way, as `400 invalid_request` with its `actor_token_...` sub-code in both fields.
+A 401 for a bearer token (`/token/renew`, AuthZEN, `/admin/*`) is `{"error": "unauthorized", "code": "<reason>", "detail": "<reason>", "error_description": "<reason>"}`, where the reason is one of `missing_token`, `invalid_token` or `token_expired`. Why a token did not verify (wrong key, audience, issuer, malformed) is logged at debug level and never returned. A token bound to a key (DPoP, below) adds `dpop_required` and `invalid_dpop_proof`. The same goes for a JWKS the server cannot fetch (503 `temporarily_unavailable`, sub-code `jwks_unavailable`): the URL and the transport error are logged, not returned. A hop-0 credential (ID token or ID-JAG) refused at `POST /token` is `400 invalid_grant` with the sub-code (`audience_mismatch`, `unknown_kid`, ...) as both `detail` and `error_description`; the verifier's message, which names the issuer, the audience or the `kid`, is logged at debug level. A refused `actor_token` is answered the same way, as `400 invalid_request` with its `actor_token_...` sub-code in both fields.
 
 A request the server cannot read is refused in the same shape on every non-MCP route, the console listener included: a query parameter that does not parse (`?from=abc`, `?preview=maybe`) or a path parameter that does not parse or is not UTF-8 once percent-decoded (`/admin/audit/entries/abc`) is 400 `invalid_request`, and a body that is not JSON is 400 `invalid_request`. A body over 2 MiB is 413 `request_too_large`. `detail` names the parameter and the expected type (`the path parameter `seq` is not a valid u64`) and never repeats the value sent. The main listener reads a JSON body whatever its `Content-Type`; only `POST /token` uses it, to choose between a form and JSON. The console listener requires `Content-Type: application/json` on a `POST` (415 `unsupported_media_type` otherwise). At the MCP proxy a server name that is not UTF-8 (`/mcp/%FF`) is HTTP 400 with JSON-RPC `-32600` and `id: null`.
 
 An HTTP/1 answer sent before the request body was read to its end carries `Connection: close`, and the server closes the connection after it. Most refusals are decided on the headers alone: a missing or bad token on `/mcp/{server}` (401, `use_dpop_nonce` included), a declared body over `[proxy] max_request_body_bytes` (413), and a missing admin bearer (401). A client sends its retry on a new connection. Answers to requests whose body was read, and to requests with no body, keep the connection open. HTTP/2 answers never carry the header.
+
+## Errors
+
+Every error the server or its proxy sends carries a stable `code`: snake_case ASCII, documented below, and never reworded, so a client may match on it. The texts (`detail`, `message`) are for people and may change in any release. A code that a later release stops sending is announced as described in [API compatibility](api-compatibility.md). There are three shapes, one per kind of route:
+
+- **REST** (every route except `/mcp/{server}`, the AuthZEN routes and the console listener included). `error` is the OAuth-style error (RFC 6749 §5.2, RFC 6750 §3.1) and stays as it was; `code` is the precise code, which is `error_description` when the answer has one and `error` otherwise:
+
+  ```json
+  {"error": "invalid_grant", "code": "audience_mismatch", "detail": "audience_mismatch", "error_description": "audience_mismatch"}
+  ```
+
+  ```json
+  {"error": "invalid_request", "code": "invalid_request", "detail": "the query parameter `limit` is not a valid u32"}
+  ```
+
+- **JSON-RPC** (the MCP proxy at `/mcp/{server}`). The number in `error.code` is the JSON-RPC error code; the stable code is `data.code`. Where `data.reason` is present it is the same string, and it stays:
+
+  ```json
+  {"jsonrpc": "2.0", "id": 7, "error": {"code": -32003, "message": "attenuo: denied: policy_deny", "data": {"code": "policy_deny", "reason": "policy_deny", "decision_id": "10ce6d75-b2e0-4aa7-a563-7b2fc5a8b223"}}}
+  ```
+
+  An error the upstream sent is relayed unchanged and has no `data.code` from the proxy; an upstream error in the shape of the proxy's stream end is rewritten to `upstream_stream_end_shape` (see [MCP proxy](#mcp-proxy)).
+
+- **AuthZEN** (`/access/v1/evaluation`, `/access/v1/evaluations`). A request the PDP refuses as a whole (no token, a malformed body, a batch too large) is answered in the REST shape. A batch entry that fails is a deny whose `context.error` carries `status`, `code` and `message`:
+
+  ```json
+  {"decision": false, "context": {"error": {"status": 400, "code": "invalid_request", "message": "each evaluation must be an object"}}}
+  ```
+
+  A decision is not an error: a denied evaluation is `{"decision": false, "context": {"reason": "policy_deny", ...}}`, with no `code`.
+
+**`code` and `reason`.** A deny of the decision pipeline has a `reason` (in the audit record, in AuthZEN `context.reason`, in the proxy's `data.reason`). Every deny reason that reaches the wire is in the table below, marked in the "Deny `reason`" column, and the proxy's `data.code` for such a denial is the same string as `data.reason`. Reasons of allowed decisions (`policy_allow`, `capability_allow`) and of other audit records (`token_issued`, `lease_renewed`, `approval_granted`, ...) are not error codes. The audit reasons of refused exchanges (`exchange_widening`, `exchange_replayed`, ...) are audit-only; the 400 that answers the exchange carries the code in its own column of the table under [Token](#token).
+
+**Deprecated machine fields.** Before `code` existed, the precise code was read from `error_description` and, on a 401 and a refused hop-0 credential or `actor_token`, from `detail`. Both still carry it, and keep it at least until the next minor release (see [API compatibility](api-compatibility.md)), but RFC 6749 means `error_description` for people, so read `code` instead. The CLI, the SDKs and the console read `code`, falling back to the old fields for a server that does not send it.
+
+The table is generated from `attenuo_core::error_codes::ERROR_CODES`, the one place the server keeps every code with its HTTP status, its `error` member and its JSON-RPC number; a test fails when this page, or a code named in the sources, differs from it. "REST status" lists each status the code is sent with, and the `error` member when it is not the code itself. "JSON-RPC" lists the number and the HTTP status of the answer that carries it (200 for an error inside a JSON-RPC response or an SSE event).
+
+<!-- error-codes:start (generated from attenuo_core::error_codes; see crates/attenuo-server/tests/error_codes.rs) -->
+| `code` | REST status (`error`) | JSON-RPC (HTTP status) | Deny `reason` | Meaning |
+| --- | --- | --- | --- | --- |
+| `actor_mismatch` | 400 `invalid_request` |  |  | The authenticated agent or actor token is not the request's `actor`. |
+| `actor_not_permitted` | 400 `invalid_request` |  |  | The actor is not in the parent token's `may_act`. |
+| `actor_token_audience_mismatch` | 400 `invalid_request` |  |  | The actor token's audience is not this server. |
+| `actor_token_bad_signature` | 400 `invalid_request` |  |  | The actor token's signature does not verify. |
+| `actor_token_expired` | 400 `invalid_request` |  |  | The actor token has expired, or expires now. |
+| `actor_token_invalid_spiffe_id` | 400 `invalid_request` |  |  | The actor token's subject is not a valid SPIFFE id. |
+| `actor_token_malformed` | 400 `invalid_request` |  |  | The actor token is not a well-formed JWT. |
+| `actor_token_missing_claim` | 400 `invalid_request` |  |  | The actor token lacks a required claim. |
+| `actor_token_missing_kid` | 400 `invalid_request` |  |  | The actor token names no `kid`. |
+| `actor_token_not_accepted` | 400 `invalid_request` |  |  | `[token] actor_auth` does not accept actor tokens. |
+| `actor_token_not_yet_valid` | 400 `invalid_request` |  |  | The actor token is not valid yet. |
+| `actor_token_required` | 400 `invalid_request` |  |  | `[token] actor_auth` requires an actor token. |
+| `actor_token_typ_mismatch` | 400 `invalid_request` |  |  | The actor token's `typ` header is not accepted. |
+| `actor_token_type_unsupported` | 400 `invalid_request` |  |  | `actor_token_type` is not `urn:ietf:params:oauth:token-type:jwt`. |
+| `actor_token_unknown_kid` | 400 `invalid_request` |  |  | The actor token's `kid` is not in its issuer's keys. |
+| `actor_token_unmapped_subject` | 400 `invalid_request` |  |  | The actor token's subject maps to no agent. |
+| `actor_token_unsupported_alg` | 400 `invalid_request` |  |  | The actor token's algorithm is not accepted. |
+| `actor_token_untrusted_issuer` | 400 `invalid_request` |  |  | The actor token's issuer is not an `[[actor_trust]]` entry. |
+| `admin_disabled` | 403 |  |  | The admin API is turned off. |
+| `agent_token_refused` | 403 |  |  | A delegation token cannot decide an approval. |
+| `already_refunded` | 409 |  |  | The budget charge was already refunded. |
+| `approval_expired` | 409 |  |  | The approval, or the lease it is bound to, has expired. |
+| `approval_invalid` |  | `-32003` (200) | yes | A presented approval token does not verify, is for another call, or names an approval that is no longer granted. |
+| `approval_not_pending` | 409 |  |  | The approval is already decided. |
+| `approval_required` |  | `-32008` (200) | yes | The policy asks a person to approve this exact call first. |
+| `attribute_fixed_by_grant` | 403 |  |  | The root grant fixes this attribute; the request may not set it. |
+| `attribute_type_mismatch` |  | `-32003` (200) | yes | An originating-user attribute does not have its declared type. |
+| `audience_mismatch` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The credential's audience is not this server. |
+| `audit_error` |  | `-32003` (200) | yes | The decision could not be written to the audit log (fail closed). |
+| `bad_signature` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The credential's signature does not verify. |
+| `batch_too_large` | 400 |  |  | An AuthZEN batch has more entries than `[authzen] max_batch`. |
+| `budget_error` |  | `-32003` (200) | yes | The run-limit counters could not be read or written (fail closed). |
+| `budget_exhausted` |  | `-32003` (200) | yes | The call would exceed a run limit of the token. |
+| `capability_denied` |  | `-32003` (200) | yes | The token's capabilities do not permit the call. |
+| `chain_mismatch` | 400 |  |  | The chain in the body is not the bearer token's chain. |
+| `chain_not_issued` | 403 |  |  | A PEP's unsigned body chain was not issued by this server. |
+| `charge_pruned` | 410 |  |  | The budget charge of the decision was pruned. |
+| `check_unavailable` | 409 |  |  | The policy check cannot run in this configuration. |
+| `client_auth_missing` | 401 `invalid_client` |  |  | No client credentials were sent. |
+| `client_auth_not_accepted` | 400 `invalid_request` |  |  | `[token] actor_auth` does not accept client credentials. |
+| `client_authentication_failed` | 401 `invalid_client` |  |  | The client id or secret is wrong. |
+| `client_id_mismatch` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The credential was issued to another client. |
+| `credential_audience_mismatch` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The ID-JAG's audience does not match the authenticated agent. |
+| `credential_expired` | 400 `invalid_grant` |  |  | The hop-0 credential expires before the token could be issued. |
+| `dpop_replay_cache_full` | 503 `temporarily_unavailable` | `-32006` (503) |  | Too many DPoP proofs are in flight; retry later. |
+| `dpop_required` | 401 | `-32001` (401) |  | The token is bound to a key and no DPoP proof was sent. |
+| `duplicate_actor` | 400 `invalid_request` |  |  | The `actor` is already in the chain. |
+| `expired` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The credential has expired. |
+| `input_type_mismatch` |  | `-32003` (200) | yes | A call argument does not have the type the catalog declares. |
+| `invalid_chain` | 400 |  |  | The chain in the body does not validate. |
+| `invalid_client` | 401 |  |  | Client authentication failed. |
+| `invalid_cursor` | 400 |  |  | The paging cursor is malformed or belongs to another list or order. |
+| `invalid_dpop_proof` | 401 | `-32001` (401) |  | The DPoP proof does not verify, is replayed, or is for another key, method or URL. |
+| `invalid_grant` | 400 |  |  | The grant (subject token, lease, credential) is not valid. |
+| `invalid_host` | 400 |  |  | The `Host` header is not a loopback name and `[server] public_url` is unset. |
+| `invalid_name` |  | `-32003` (200) | yes | The call's server or tool name breaks the naming rules. |
+| `invalid_params` |  | `-32602` (200) |  | The JSON-RPC params of a decided method are not valid. |
+| `invalid_request` | 400 | `-32600` (400) |  | The request is malformed: a missing or invalid parameter or body. |
+| `invalid_scope` | 400 |  |  | The request asks for more than the parent token holds, or a chain deeper than allowed. |
+| `invalid_token` | 401 `unauthorized`, 400 | `-32001` (401) |  | The token is malformed, not issued here, or does not verify. |
+| `jwks_unavailable` | 503 `temporarily_unavailable`, 401 `invalid_token` |  |  | The issuer's keys cannot be fetched; retry later. |
+| `label_error` |  | `-32003` (200) | yes | The call's result could not be recorded, so it is withheld. |
+| `lease_error` |  | `-32001` (401), `-32003` (200) | yes | The lease store could not be read (fail closed). |
+| `lease_expired` |  | `-32001` (401), `-32001` (200), `-32003` (200) | yes | A lease of the chain has expired. |
+| `lease_revoked` | 409 | `-32001` (401), `-32001` (200), `-32003` (200) | yes | A lease of the chain, or the one an approval is bound to, has been revoked. |
+| `lease_unknown` |  | `-32001` (401), `-32001` (200), `-32003` (200) | yes | A lease of the chain is unknown to the lease store (fail closed). |
+| `limit_arg_invalid` |  | `-32003` (200) | yes | The call lacks an argument a run limit counts, or has a value it cannot count. |
+| `malformed_client_auth` | 401 `invalid_client` |  |  | The HTTP Basic credentials are malformed. |
+| `malformed_request` | 400 `invalid_request` |  |  | The token request is missing a field or has an invalid one. |
+| `malformed_token` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The credential is not a well-formed JWT. |
+| `may_act_exceeds_grant` | 400 `invalid_request` |  |  | `may_act` names agents the grant does not allow. |
+| `missing_claim` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The credential lacks a required claim. |
+| `missing_kid` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The credential names no `kid`. |
+| `missing_token` | 401 `unauthorized` | `-32001` (401) |  | No credential was sent. |
+| `multiple_client_auth` | 400 `invalid_request` |  |  | Client credentials were sent in more than one way. |
+| `no_agents_configured` | 401 `invalid_client` |  |  | No `[[agents]]` are configured, so no agent can authenticate. |
+| `no_capabilities_requested` | 400 `invalid_request` |  |  | The token request asks for no capability. |
+| `no_lifetime_left` | 400 `invalid_request` |  |  | The new token would expire immediately. |
+| `no_peps_configured` | 401 `invalid_client` |  |  | No `[[peps]]` are configured, so no PEP can authenticate. |
+| `no_root_grant` | 403, 400 `invalid_scope` |  |  | No `[[root_grants]]` entry covers the agent and user. |
+| `not_found` | 404 |  |  | The resource does not exist, or is not visible to the caller. |
+| `not_yet_valid` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The credential is not valid yet. |
+| `overloaded` | 503 `temporarily_unavailable` | `-32006` (503) |  | `[limits] max_in_flight` requests are already running; retry after `Retry-After`. |
+| `parse_error` |  | `-32700` (400) |  | The body is not JSON. |
+| `policy_deny` |  | `-32003` (200) | yes | The Cedar policy denies the call. |
+| `policy_error` |  | `-32003` (200) | yes | The call could not be evaluated safely (fail closed). |
+| `policy_invalid` | 422 |  |  | The policy set does not parse or validate. |
+| `rate_limited` | 429 | `-32007` (429) |  | A rate limit is used up; retry after `Retry-After`. |
+| `reload_unavailable` | 409 |  |  | The policy cannot be reloaded in this configuration. |
+| `replay_cache_full` | 503 `temporarily_unavailable` |  |  | Too many single-use credentials are in flight; retry later. |
+| `replayed` | 400 `invalid_grant` |  |  | The credential or delegation was already used. |
+| `request_timeout` | 408, 503 `temporarily_unavailable` |  |  | The body did not arrive in time (408), or the route did not answer in time (503). |
+| `request_too_large` | 413 | `-32600` (413) |  | The request body is over the size limit. |
+| `reserved_agent` | 400 `invalid_request` |  |  | The `actor` is the reserved agent `attenuo`. |
+| `reserved_subject` | 400 `invalid_request`, 400 `invalid_grant` |  |  | The subject is reserved. |
+| `scope_exceeds_grant` | 400 `invalid_scope` |  |  | The hop-0 request asks for more than the root grant allows. |
+| `server_error` | 500 |  |  | An internal error; the cause is in the server log only. |
+| `session_mismatch` |  | `-32003` (403) |  | The `Mcp-Session-Id` belongs to another principal. |
+| `session_registry_full` |  | `-32006` (503) |  | No free session slot (`[proxy] max_sessions`). |
+| `session_unknown` |  | `-32600` (404) |  | The `Mcp-Session-Id` is not bound; start a new session. |
+| `token_expired` | 401 `unauthorized` | `-32001` (401), `-32001` (200) |  | The token verified but has expired. |
+| `too_many_pending_approvals` | 429 |  |  | The run already has the maximum number of pending approvals. |
+| `too_many_sessions` |  | `-32007` (429) |  | The principal holds `[proxy] max_sessions_per_principal` live sessions. |
+| `tool_not_in_catalog` |  | `-32003` (200) | yes | The tool is not in the catalog and unknown tools are denied. |
+| `tool_not_listed` |  | `-32003` (200) | yes | The upstream never listed the tool and the catalog does not know it. |
+| `typ_mismatch` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The credential's `typ` header does not match its kind. |
+| `unknown_kid` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The credential's `kid` is not in its issuer's keys. |
+| `unknown_server` |  | `-32004` (404) |  | No `[[upstreams]]` entry has this name. |
+| `unsupported_alg` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The credential's signing algorithm is not accepted. |
+| `unsupported_grant_type` | 400 |  |  | The `grant_type` is not supported. |
+| `unsupported_media_type` | 415 |  |  | The console listener requires `Content-Type: application/json`. |
+| `unsupported_token_type` | 400 `invalid_request` |  |  | The `subject_token_type` is not supported. |
+| `untrusted_issuer` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The credential's issuer is not an `[[idps]]` entry. |
+| `upstream_body_too_large` |  | `-32005` (502) |  | An upstream body the proxy buffers is over `[proxy] max_upstream_body_bytes`. |
+| `upstream_invalid_response` |  | `-32005` (502) |  | The upstream's answer is not one the proxy can filter or label. |
+| `upstream_not_event_stream` |  | `-32005` (502) |  | The upstream answered a `GET` with something other than an event stream. |
+| `upstream_stream_end_shape` |  | `-32005` (200) |  | The upstream sent an error in the shape of the proxy's stream end; the original is in `data.upstream_error`. |
+| `upstream_timeout` |  | `-32005` (504) |  | The upstream did not answer in time; it may have acted on the request. |
+| `upstream_unreachable` |  | `-32005` (502) |  | The upstream could not be reached; nothing was sent. |
+| `use_dpop_nonce` | 401 | `-32001` (401) |  | The DPoP proof lacks the current server nonce; retry with `DPoP-Nonce`. |
+| `wrong_user` | 403 |  |  | The ID token is another user's. |
+<!-- error-codes:end -->
 
 ## Paging
 
@@ -118,7 +280,7 @@ Both endpoints echo a request's `X-Request-ID` header on the response, whatever 
 
 A denial is a JSON-RPC error with code `-32003`, carrying `reason` and `decision_id`. A call that a policy sends for approval (reason `approval_required`) gets `-32008` instead, with `reason`, `decision_id`, `call_hash` (SHA-256 of the RFC 8785 JSON of `{server, tool, arguments}`), `approval_id` and `expires_at`, and is not forwarded. Once the approval is granted, the identical call from the same hop is allowed once (see [Approvals](#approvals)); or the retry carries the grant's signed approval token in `params._meta["dev.attenuo/approval"]`, which the proxy removes before the upstream and which does not count as an argument (see [Approval tokens](#approval-tokens)). A token that does not verify, is for another call, hop, run or key, or names an approval that is no longer granted gets `-32003` with reason `approval_invalid`. `approval_id` is absent if the server could not open an approval: the store failed, or the run already has 32 approvals pending for hops whose lease is not revoked (AuthZEN diagnostics `too many pending approvals for this run`). When an argument of the call copies a value or span of an untrusted result of the run (output labelling phase 2), the `-32008` data, and a `-32003` policy denial's data, add `untrusted_args: [{arg, seq, kind}]`: the argument, the `seq` of the `tool_result` record it matched (absent for kind `unreadable`) and the kind (`leaf`, `entity`, `kgram`, or `unreadable` when the run's index could not be read or the call's arguments carry more than 8,000 fingerprints in all). A call over a run limit gets `-32003` with reason `budget_exhausted` and `data.limit: {hop, kind, arg, max, used}` (`arg` absent for `calls`, written `url#host` for a derived value; for `distinct`, `used` is how many values the limit has seen); `budget_error` means the counters could not be read or written, and `limit_arg_invalid` that the call lacks an argument a limit counts, or has a value it cannot count (a `sum` needs a non-negative integer, a `"derive": "host"` limit a URL of a special scheme or a bare host with a host and no backslash, whitespace or control character, and a `calls_per` or `distinct` list at most 256 values). No policy or approval passes these. For a call to a tool the catalog marks destructive or gives an `outbound` input, the `-32008` and `-32003` data also carry `usage: {calls, amount, destination_seen}`, the run's usage of the tool before this call as the policy saw it (`context.usage`): allowed calls of this server and tool by every hop of the run, the sum of the catalog's `amount` input over them, and whether the catalog's `destination` value, or a value of an `outbound` input, was seen in one of them. When some loaded policy reads a per-user window (run limits phase 3), `usage` also carries `user_window: {hour: {calls, amount}, day: {calls, amount}}`, the originating user's usage of the tool across all their runs in the current UTC hour and day; it is left out when all its figures are zero, which is also what a kind the server does not keep reads as. The decision record carries the same figures as `usage`, omitted for other tools; its `usage.user_window` names only the kinds the server keeps, each as `{start, calls, amount}` with `start` the window's start in Unix seconds UTC, and is absent when none is kept. If the answer to an allowed call cannot be recorded in the audit log, the agent gets `-32003` with reason `label_error` and the call's `decision_id` instead of the answer. A missing or bad token is HTTP 401 with `-32001` and `data.reason` set to `missing_token`, `invalid_token`, `token_expired`, `dpop_required`, `invalid_dpop_proof`, `use_dpop_nonce` or, for a lease that is no longer live, `lease_revoked`, `lease_expired` or `lease_unknown`. A request refused for its lease without a per-call decision (`initialize`, `tools/list`, `ping`, `resources/unsubscribe`, the other allowlisted methods, notifications, `GET` and `DELETE`) is also a `deny` record with that reason, the token's subject and chain, the proxied server, and `tool` set to the method (`http.POST` for a notification, `http.GET`, `http.DELETE`); its 401 carries the record's id in `X-Attenuo-Decision-Id` and `data.decision_id`. These records are bounded like listen-stream ends: the first refusal per delegation chain, tool and reason in `[proxy] record_window_seconds` (default 60 s) is recorded, and a retry within the window is still a 401 but writes no record, carries the first record's id (both are left out in the moment before a concurrent first record is written) and is counted in `audit_records_suppressed_total`. A refusal whose record could not be written (a failed audit append) names no decision id and opens no window, so the next one is recorded (SR-81). Refused exchanges and renewals, and `tools/call` denials, are recorded every time. A token that does not verify writes no record. An open stream (the `GET` listen stream, or a streamed answer) whose leases stop being live or whose token expires is ended within `[proxy] stream_recheck_seconds`: an SSE stream's last event is a JSON-RPC error with `id: null`, code `-32001`, `data.reason` (`lease_revoked`, `lease_expired`, `lease_unknown`, `token_expired`) and `data.decision_id`, the id of a `deny` record of tool `stream.end` with the session's hash tag. On the `GET` listen stream that record is written for the first such end per delegation chain and reason in `[proxy] record_window_seconds` (default 60 s); later ends in the window carry the same `decision_id` and are counted in `audit_records_suppressed_total` instead of recorded. A stream the client drops or the upstream ends writes no record; `GET` listen streams are counted by how they ended in `proxy_streams_ended_total`. An upstream the proxy cannot reach (connection refused, or not connected within `[proxy] upstream_connect_timeout_seconds`, default 5) is HTTP 502 with `-32005` and `data.reason` `upstream_unreachable`; the upstream URL and transport error are only logged. Nothing was sent, so a retry is safe. An upstream that accepts the request but does not send its response headers, or the rest of a JSON body the proxy must read (to filter a list or record a result), within `[proxy] upstream_response_timeout_seconds` (default 30) of sending is HTTP 504 with `-32005` and `data.reason` `upstream_timeout`. It is a separate reason because the request did reach the upstream, which may have acted on it: retry a call with side effects only if it is idempotent. A stream (SSE, the `GET` listen stream) whose headers arrived in time is never cut by that deadline. An upstream that answers a `GET` with a success status but not `text/event-stream` is HTTP 502 with `-32005` and `data.reason` `upstream_not_event_stream` (MCP allows only an SSE stream or `405` there); `405` and error answers to a `GET` are relayed. Allowed responses carry `X-Attenuo-Decision-Id`.
 
-Other refusals of the proxy:
+Other refusals of the proxy. Each also carries its stable code in `data.code` (listed under [Errors](#errors)); where the table says `data.reason` none, `data` holds only `code`: `unknown_server`, `session_unknown`, `invalid_request` and `parse_error`.
 
 | HTTP status | JSON-RPC code | `data.reason` | When |
 | --- | --- | --- | --- |

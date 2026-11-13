@@ -401,7 +401,7 @@ Before you point an agent at it:
 
 ### When it fails
 
-Errors carry a stable `error_description`. The usual causes:
+Errors carry a stable `code` (the same value as `error_description`, which older clients read). The usual causes:
 
 | Response | Cause |
 | --- | --- |

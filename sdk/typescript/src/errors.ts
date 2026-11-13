@@ -131,21 +131,30 @@ export function untrustedArgsOf(v: unknown): UntrustedArg[] {
 }
 
 /**
- * The server answered a non-success status, usually `{"error": ..., "detail": ...}`.
- * `decisionId` is the audit record of a refusal the server recorded (a refused token exchange or
+ * The server answered a non-success status, usually `{"error": ..., "code": ..., "detail": ...}`.
+ * `code` is the server's stable machine-readable code (`invalid_request`, `audience_mismatch`,
+ * `token_expired`, ...; the list is in the HTTP reference under "Errors"): branch on it, never on
+ * `detail`, which is text for people and may change. For a server that sends no `code` it is the
+ * `error_description` sub-code, or else `error`. `error` is the OAuth-style error
+ * (`invalid_grant`, `unauthorized`, ...) and `description` the `error_description`, which is
+ * deprecated as a machine field. `decisionId` is the audit record of a refusal the server recorded (a refused token exchange or
  * renewal, a proxy 401 for a lease that is no longer live). It is taken from the body only when
  * the `X-Attenuo-Decision-Id` header names the same id, the proof the proxy gives for its own
  * records (an upstream's answer it relays never carries that header).
  */
 export class ApiError extends AttenuoError {
+  readonly code: string;
+
   constructor(
     readonly status: number,
     readonly error: string,
     readonly detail: string = "",
     readonly description?: string,
     readonly decisionId?: string,
+    code?: string,
   ) {
     super(`server answered ${status}: ${error}${detail ? `: ${detail}` : ""}`);
+    this.code = code || description || error;
   }
 }
 
@@ -159,7 +168,8 @@ export class ApiError extends AttenuoError {
  * that is the generic `unauthorized`, its `error_description`; `"unauthorized"` when the answer
  * names no reason. `error` keeps what it always held: `"unauthorized"` for every proxy 401. `data`
  * is the proxy's JSON-RPC error `data` (`{}` for a REST route). A lease refusal the proxy
- * recorded carries the record's id in `decisionId`.
+ * recorded carries the record's id in `decisionId`. `code` is the stable code of the answer (see
+ * `ApiError`); for a proxy 401 it equals `reason`.
  */
 export class UnauthorizedError extends ApiError {
   readonly reason: string;
@@ -173,13 +183,15 @@ export class UnauthorizedError extends ApiError {
     decisionId?: string,
     reason?: string,
     data?: Json,
+    code?: string,
   ) {
-    super(status, error, detail, description, decisionId);
     let r = reason;
     if (!r) {
       r = error && error !== "unauthorized" && error !== "http_error" ? error : description;
     }
-    this.reason = r || "unauthorized";
+    r = r || "unauthorized";
+    super(status, error, detail, description, decisionId, code || r);
+    this.reason = r;
     this.data = data ?? {};
   }
 }

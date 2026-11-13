@@ -172,7 +172,15 @@ def untrusted_args_from_json(v: Any) -> list[UntrustedArg]:
 
 
 class ApiError(AttenuoError):
-    """The server answered a non-success status with ``{"error": ..., "detail": ...}``.
+    """The server answered a non-success status with ``{"error": ..., "code": ...,
+    "detail": ...}``.
+
+    ``code`` is the server's stable machine-readable code (``invalid_request``,
+    ``audience_mismatch``, ``token_expired``, ...; the list is in the HTTP reference under
+    "Errors"): branch on it, never on ``detail``, which is text for people and may change.
+    For a server that sends no ``code`` it is the ``error_description`` sub-code, or else
+    ``error``. ``error`` is the OAuth-style error (``invalid_grant``, ``unauthorized``, ...) and
+    ``description`` the ``error_description``, which is deprecated as a machine field.
 
     ``decision_id`` is the audit record of a refusal the server recorded (a refused token
     exchange or renewal, a proxy 401 for a lease that is no longer live), else ``None``. It is
@@ -188,12 +196,14 @@ class ApiError(AttenuoError):
         detail: str = "",
         description: str | None = None,
         decision_id: str | None = None,
+        code: str | None = None,
     ) -> None:
         self.status = status
         self.error = error
         self.detail = detail
         self.description = description
         self.decision_id = decision_id
+        self.code: str = code or description or error
         text = f"server answered {status}: {error}"
         if detail:
             text += f": {detail}"
@@ -211,7 +221,8 @@ class Unauthorized(ApiError):
     ``error_description``. ``"unauthorized"`` when the answer names no reason. ``error`` keeps
     what it always held: ``"unauthorized"`` for every proxy 401. ``data`` is the proxy's
     JSON-RPC error ``data`` (``{}`` for a REST route). A lease refusal the proxy recorded
-    carries the record's id in ``decision_id``.
+    carries the record's id in ``decision_id``. ``code`` is the stable code of the answer (see
+    :class:`ApiError`); for a proxy 401 it equals ``reason``.
     """
 
     def __init__(
@@ -223,14 +234,17 @@ class Unauthorized(ApiError):
         decision_id: str | None = None,
         reason: str | None = None,
         data: dict[str, Any] | None = None,
+        code: str | None = None,
     ) -> None:
-        super().__init__(status, error, detail, description, decision_id)
+        super().__init__(status, error, detail, description, decision_id, code)
         if not reason:
             if error and error not in ("unauthorized", "http_error"):
                 reason = error
             else:
                 reason = description or "unauthorized"
         self.reason = reason
+        if not code:
+            self.code = reason
         self.data: dict[str, Any] = data if data is not None else {}
 
 

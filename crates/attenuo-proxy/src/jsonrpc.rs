@@ -56,7 +56,37 @@ pub fn is_passthrough_method(method: &str) -> bool {
     PASSTHROUGH_METHODS.contains(&method) || method.starts_with("notifications/")
 }
 
-/// Build a JSON-RPC error response.
+/// Build one of the proxy's own JSON-RPC errors: `data.code` is `code`, the stable code of
+/// the answer (an entry of [`attenuo_core::error_codes::ERROR_CODES`] with this `number`,
+/// checked in debug builds), next to the members of `data`. Where `data` has a `reason`, it is
+/// the same string as `code`. An upstream's own errors are relayed unchanged and never get a
+/// `data.code`.
+pub fn attenuo_error(
+    id: Value,
+    number: i64,
+    code: &str,
+    message: impl Into<String>,
+    data: Option<Value>,
+) -> Value {
+    debug_assert!(
+        attenuo_core::error_codes::is_jsonrpc(code, number),
+        "code `{code}` with JSON-RPC number {number} is not in ERROR_CODES"
+    );
+    let mut data = match data {
+        Some(Value::Object(m)) => Value::Object(m),
+        _ => json!({}),
+    };
+    debug_assert!(
+        data.get("reason").is_none_or(|r| r == code),
+        "data.reason {:?} differs from code `{code}`",
+        data.get("reason")
+    );
+    data["code"] = Value::String(code.to_string());
+    error_response(id, number, message, Some(data))
+}
+
+/// Build a JSON-RPC error response as it is, without a `data.code` (for an upstream's or a
+/// test upstream's error). The proxy's own errors use [`attenuo_error`].
 pub fn error_response(
     id: Value,
     code: i64,
@@ -93,9 +123,10 @@ pub fn denied_response_with(
     if let Some(u) = untrusted_args {
         data["untrusted_args"] = u.clone();
     }
-    error_response(
+    attenuo_error(
         id,
         CODE_DENIED,
+        reason,
         format!("attenuo: denied: {reason}"),
         Some(data),
     )
@@ -134,7 +165,13 @@ pub fn approval_required_response(
         ),
         None => "attenuo: approval required".to_string(),
     };
-    error_response(id, CODE_APPROVAL_REQUIRED, message, Some(data))
+    attenuo_error(
+        id,
+        CODE_APPROVAL_REQUIRED,
+        crate::auth::REASON_APPROVAL_REQUIRED,
+        message,
+        Some(data),
+    )
 }
 
 /// Add the run's usage of a destructive tool (run-limits design section 3.5) to the `data` of
@@ -171,6 +208,52 @@ pub fn is_request(msg: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// K-8: the proxy's own errors carry `data.code`, equal to `data.reason` where that is
+    /// present; one without data gets `data: {"code": ...}`.
+    #[test]
+    fn attenuo_errors_carry_the_stable_code() {
+        let v = denied_response(json!(7), "policy_deny", Uuid::nil());
+        assert_eq!(v["error"]["data"]["code"], "policy_deny");
+        assert_eq!(v["error"]["data"]["reason"], "policy_deny");
+        let v = attenuo_error(
+            Value::Null,
+            CODE_UNKNOWN_SERVER,
+            "unknown_server",
+            "attenuo: unknown server `x`",
+            None,
+        );
+        assert_eq!(
+            v,
+            json!({"jsonrpc": "2.0", "id": null, "error": {"code": CODE_UNKNOWN_SERVER,
+                   "message": "attenuo: unknown server `x`", "data": {"code": "unknown_server"}}})
+        );
+        let v = approval_required_response(json!(1), Uuid::nil(), "h", None, None);
+        assert_eq!(v["error"]["data"]["code"], "approval_required");
+        // An upstream's error built as it is gets no code.
+        let v = error_response(json!(1), -32000, "upstream", None);
+        assert!(v["error"].get("data").is_none());
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "is not in ERROR_CODES")]
+    fn an_unlisted_code_panics_in_debug_builds() {
+        attenuo_error(Value::Null, CODE_DENIED, "no_such_code", "x", None);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "differs from code")]
+    fn a_reason_other_than_the_code_panics_in_debug_builds() {
+        attenuo_error(
+            Value::Null,
+            CODE_DENIED,
+            "policy_deny",
+            "x",
+            Some(json!({"reason": "capability_denied"})),
+        );
+    }
 
     #[test]
     fn denied_response_shape() {

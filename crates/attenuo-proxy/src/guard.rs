@@ -53,7 +53,7 @@ use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::auth::{AuthError, Authorizer};
-use crate::jsonrpc::{error_response, CODE_UNAUTHORIZED, CODE_UPSTREAM};
+use crate::jsonrpc::{attenuo_error, CODE_UNAUTHORIZED, CODE_UPSTREAM};
 use crate::records::{Admission, RecordWindow};
 use crate::session::session_tag;
 use crate::traceparent::{TraceParent, OTEL_TARGET};
@@ -408,9 +408,10 @@ pub fn end_event_recorded(reason: &str, decision_id: Option<Uuid>) -> Bytes {
     if let Some(id) = decision_id {
         data["decision_id"] = Value::String(id.to_string());
     }
-    let body: Value = error_response(
+    let body: Value = attenuo_error(
         Value::Null,
         CODE_UNAUTHORIZED,
+        reason,
         format!("attenuo: unauthorized: stream ended: {reason}"),
         Some(data),
     );
@@ -465,6 +466,7 @@ pub fn disown_stream_end(body: &mut Value) -> usize {
             "code": CODE_UPSTREAM,
             "message": "attenuo: upstream sent an error in the shape of the proxy's stream end",
             "data": {
+                "code": REASON_UPSTREAM_STREAM_END_SHAPE,
                 "reason": REASON_UPSTREAM_STREAM_END_SHAPE,
                 "upstream_error": original,
             },

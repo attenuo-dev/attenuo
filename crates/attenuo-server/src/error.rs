@@ -1,11 +1,20 @@
-//! JSON error responses: `{"error": "<code>", "detail": "<human-readable text>"}`, plus a
-//! stable machine-readable sub-code in `error_description` where one is defined (IdP intake at
-//! `POST /token`, see `crate::idp::IntakeError`).
+//! JSON error responses: `{"error": "<error>", "code": "<code>", "detail": "<human-readable
+//! text>"}`, plus `error_description` where one is set.
+//!
+//! `code` is the stable machine-readable code of the answer: `error_description` when the
+//! answer has one, `error` otherwise. Every code, with its HTTP status, its JSON-RPC number and
+//! whether it is also a deny `reason`, is in one table, [`ERROR_CODES`] (from
+//! `attenuo_core::error_codes`, so that the proxy and the CLI read the same table). `detail` is
+//! text for people and may change in any release; `error_description` keeps the sub-code it
+//! carried before `code` existed and is deprecated as a machine field (RFC 6749 §5.2 means it
+//! for people).
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::json;
+
+pub use attenuo_core::error_codes::{ErrorCode, ERROR_CODES};
 
 /// 401 reason: no credential was sent.
 pub const REASON_MISSING_TOKEN: &str = attenuo_proxy::auth::REASON_MISSING_TOKEN;
@@ -31,12 +40,14 @@ pub const INTERNAL_DETAIL: &str = "internal error; the details are in the server
 pub struct ApiError {
     /// HTTP status of the response.
     pub status: StatusCode,
-    /// Machine-readable code, sent as `error` in the body.
+    /// OAuth-style error, sent as `error` in the body. The stable code of the answer is
+    /// [`Self::stable_code`].
     pub code: String,
     /// Human-readable explanation, sent as `detail`. [`Self::internal`] sends
     /// [`INTERNAL_DETAIL`] here and keeps the cause in the log.
     pub detail: String,
-    /// Stable sub-code, sent as `error_description` (RFC 6749 §5.2) when set.
+    /// Stable sub-code, sent as `error_description` (RFC 6749 §5.2) when set, and then also the
+    /// answer's `code`.
     pub description: Option<&'static str>,
     /// The id of the `deny` audit record this refusal wrote, when it wrote one (a refused
     /// token exchange whose subject token verified, or a refused renewal whose token
@@ -49,6 +60,28 @@ pub struct ApiError {
 }
 
 impl ApiError {
+    /// The answer's stable code, sent as `code`: the `error_description` sub-code when there is
+    /// one, `error` otherwise. Always an entry of [`ERROR_CODES`] (checked in debug builds).
+    pub fn stable_code(&self) -> &str {
+        self.description.unwrap_or(&self.code)
+    }
+
+    /// In a debug build, panic unless [`ERROR_CODES`] lists [`Self::stable_code`] with this
+    /// status and `error`: a code that is not in the table is a bug the tests should catch.
+    pub(crate) fn debug_check(&self) {
+        debug_assert!(
+            attenuo_core::error_codes::is_rest(
+                self.stable_code(),
+                self.status.as_u16(),
+                &self.code
+            ),
+            "code `{}` with status {} and error `{}` is not in ERROR_CODES",
+            self.stable_code(),
+            self.status.as_u16(),
+            self.code
+        );
+    }
+
     /// An error with no `error_description` and no decision id.
     pub fn new(status: StatusCode, code: impl Into<String>, detail: impl Into<String>) -> Self {
         Self {
@@ -131,7 +164,9 @@ impl IntoResponse for ApiError {
         } else {
             tracing::debug!(status = %self.status, code = ?self.code, detail = ?self.detail, "request rejected");
         }
-        let mut body = json!({ "error": self.code, "detail": self.detail });
+        self.debug_check();
+        let code = self.stable_code();
+        let mut body = json!({ "error": self.code, "code": code, "detail": self.detail });
         if let Some(d) = self.description {
             body["error_description"] = d.into();
         }
@@ -317,6 +352,69 @@ mod tests {
             !text.contains("/var/lib") && !text.contains("disk I/O"),
             "{text}"
         );
+    }
+
+    async fn body_of(e: ApiError) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(e.into_response().into_body(), 4096)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// K-8: every body carries `code`, the sub-code when there is one and `error` otherwise,
+    /// and keeps `error`, `detail` and `error_description` as they were.
+    #[tokio::test]
+    async fn every_body_carries_the_stable_code() {
+        let b = body_of(ApiError::bad_request(
+            "invalid_request",
+            "missing field `action`",
+        ))
+        .await;
+        assert_eq!(
+            b,
+            json!({"error": "invalid_request", "code": "invalid_request",
+                   "detail": "missing field `action`"})
+        );
+        let b = body_of(ApiError::unauthorized(REASON_TOKEN_EXPIRED, "expired")).await;
+        assert_eq!(
+            b,
+            json!({"error": "unauthorized", "code": "token_expired", "detail": "token_expired",
+                   "error_description": "token_expired"})
+        );
+        let b = body_of(
+            ApiError::bad_request("invalid_grant", "x").with_description("audience_mismatch"),
+        )
+        .await;
+        assert_eq!(b["error"], "invalid_grant");
+        assert_eq!(b["code"], "audience_mismatch");
+        assert_eq!(b["error_description"], "audience_mismatch");
+        let b = body_of(ApiError::internal("disk on fire")).await;
+        assert_eq!(b["code"], "server_error");
+        assert_eq!(b["detail"], INTERNAL_DETAIL);
+    }
+
+    /// Debug builds refuse to send a code the table does not list, or lists with another
+    /// status or `error`, so a route test that reaches one fails.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "is not in ERROR_CODES")]
+    fn an_unlisted_code_panics_in_debug_builds() {
+        ApiError::bad_request("no_such_code", "x").debug_check();
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "is not in ERROR_CODES")]
+    fn a_listed_code_with_another_status_panics_in_debug_builds() {
+        ApiError::new(StatusCode::CONFLICT, "not_found", "x").debug_check();
+    }
+
+    /// Every `AuditError` and the token errors map to codes of the table.
+    #[test]
+    fn mapped_errors_are_in_the_table() {
+        for e in one_of_each_audit_error() {
+            ApiError::from(e).debug_check();
+        }
     }
 
     /// One value of every `AuditError` variant.

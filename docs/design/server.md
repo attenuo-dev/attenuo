@@ -317,6 +317,8 @@ One cache per IdP (and per `[[actor_trust]]` entry, which uses the same code wit
 
 ### Error codes
 
+Each answer also carries `code`, the `error_description` below where there is one and `error` otherwise; every code is listed under [Errors](../reference/http-api.md#errors) in the HTTP reference.
+
 | `error` | Status | `error_description` |
 |---|---|---|
 | `invalid_client` | 401 | `client_auth_missing`, `client_authentication_failed`, `malformed_client_auth`, `no_agents_configured` |

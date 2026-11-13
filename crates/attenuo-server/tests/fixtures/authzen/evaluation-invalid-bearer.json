@@ -32,6 +32,7 @@
         },
         "body": {
           "error": "unauthorized",
+          "code": "invalid_token",
           "detail": "<any>",
           "error_description": "invalid_token"
         }

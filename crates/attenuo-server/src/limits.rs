@@ -387,9 +387,10 @@ fn is_probe(path: &str) -> bool {
 /// the REST error shape elsewhere.
 fn unavailable(mcp: bool, description: &'static str, detail: &str) -> Response {
     if mcp {
-        let body = attenuo_proxy::jsonrpc::error_response(
+        let body = attenuo_proxy::jsonrpc::attenuo_error(
             serde_json::Value::Null,
             attenuo_proxy::jsonrpc::CODE_UNAVAILABLE,
+            description,
             format!("attenuo: temporarily unavailable: {description}"),
             Some(serde_json::json!({ "reason": description })),
         );

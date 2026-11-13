@@ -249,9 +249,10 @@ impl Semantic {
 }
 
 fn item_error(e: &ApiError) -> Value {
+    e.debug_check();
     json!({
         "decision": false,
-        "context": { "error": { "status": e.status.as_u16(), "code": e.code, "message": e.detail } },
+        "context": { "error": { "status": e.status.as_u16(), "code": e.stable_code(), "message": e.detail } },
     })
 }
 
