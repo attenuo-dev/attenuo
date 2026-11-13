@@ -360,7 +360,7 @@ The evidence that this stops injected calls is, from strongest to weakest:
 2. **The planner-grant replay.** With no model, 13 of 609 of AgentDojo's attacks landed under the same grants and policy, all on slack and all in the same two gaps, and 75 of 97 benign tasks were kept. The replay sends each attack's ground-truth calls verbatim, which a model need not do.
 3. **The injection suite.** On the held-out split of our own corpus, the base configuration allowed 7 of 38 attack calls and denied 3 of 29 benign calls. The corpus, policies and approver are ours, so these figures check the implementation against the corpus and do not measure effectiveness.
 
-None of these is an independent evaluation. The two gaps that still land are a read that carries data out and attacker text in a permitted message. URL pins and a host limit close the first in the replay, and argument taint closes both there at a cost in benign tasks, but none of these has been shown to close them with a model. Section 8 lists what an independent evaluation would need.
+None of these is an independent evaluation. The two gaps that still land are a read that carries data out and attacker text in a permitted message. In the replay, URL pins or a host limit refuse the fetches at no benign cost, and pins with argument taint close both gaps at a cost of 4 benign tasks. Pins and host limits have not run with a model, and argument taint, which has, never fired there. Section 8 lists what an independent evaluation would need.
 
 # Availability
 
