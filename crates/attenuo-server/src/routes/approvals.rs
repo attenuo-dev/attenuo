@@ -7,7 +7,7 @@
 //! |---|---|---|
 //! | `POST /approvals/{id}` | an ID token of the run's originating user, from a trusted `[[idps]]` | grant or decline (`by = "user"`) |
 //! | `GET /approvals/{id}` | that user's ID token, or a delegation token of the same run with live leases | the exact call, labels (and matched arguments, `untrusted_args`), state and expiry |
-//! | `POST /admin/approvals/{id}` | admin bearer | grant or decline as an operator (`by = "operator"`) |
+//! | `POST /admin/approvals/{id}` | admin credential, role `operator` or `admin` | grant or decline as an operator (`by = "operator"`, approver the operator's subject) |
 //! | `GET /admin/approvals/{id}`, `GET /admin/approvals?chain_id=&state=&cursor=` | admin bearer | one approval; approvals newest first, paged with a cursor (console, CLI) |
 //!
 //! The ID token is checked as hop-0 intake checks it (signature, `iss`, `aud`/`azp` bound to
@@ -45,7 +45,7 @@ use attenuo_core::{
 };
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
-use axum::Json;
+use axum::{Extension, Json};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use time::format_description::well_known::Rfc3339;
@@ -53,8 +53,9 @@ use time::OffsetDateTime;
 
 use super::extract::{Body, Path, Query};
 use super::page;
-use super::{bearer_of, parse_json, ADMIN_SUBJECT};
+use super::{bearer_of, parse_json};
 use crate::error::{ApiError, REASON_MISSING_TOKEN};
+use crate::operators::AdminIdentity;
 use crate::state::AppState;
 
 /// Most approvals one `GET /admin/approvals` page returns; a larger `limit` is a 400.
@@ -413,7 +414,9 @@ pub async fn user_get(
 }
 
 /// `POST /admin/approvals/{id}` with `{"decision": "grant" | "decline"}`: an operator decides
-/// (`by = "operator"`, approver `urn:attenuo:admin`).
+/// (`by = "operator"`, method `admin_token`, approver the operator's subject:
+/// `urn:attenuo:admin` for `[admin] token`, `urn:attenuo:admin:<name>` for a named operator,
+/// [`AdminIdentity::subject`]).
 ///
 /// # Errors
 ///
@@ -423,6 +426,7 @@ pub async fn user_get(
 /// store fails or the decision cannot be audited (the decision is then dropped).
 pub async fn admin_decide(
     State(state): State<Arc<AppState>>,
+    Extension(who): Extension<AdminIdentity>,
     Path(id): Path<String>,
     Body(body): Body,
 ) -> Result<Json<Value>, ApiError> {
@@ -432,7 +436,7 @@ pub async fn admin_decide(
     state
         .blocking(move |s| {
             let approver = Approver {
-                subject: ADMIN_SUBJECT.to_string(),
+                subject: who.subject(),
                 method: ApprovalMethod::AdminToken,
             };
             let a = decide(s, &id, grant, approver, now)?;

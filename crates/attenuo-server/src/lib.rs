@@ -33,6 +33,13 @@
 //! | `POST /approvals/{id}` | the originating user's IdP ID token (never a delegation token) | grant or decline a pending approval ([`routes::approvals`]) |
 //! | `GET /approvals/{id}` | the user's ID token, or a delegation token of the same run | the approval: exact call, labels, state, expiry |
 //! | `GET /admin/approvals?chain_id`, `GET /admin/approvals/{id}`, `POST /admin/approvals/{id}` | admin | list, show, and grant or decline as an operator |
+//! | `GET /admin/whoami` | admin | the name and role of the credential that sent the request ([`routes::admin::whoami`]) |
+//!
+//! "admin" in the Auth column means an admin credential (`[admin] token` or an
+//! `[[admin.operators]]` entry, [`operators`]) whose role is at least the one
+//! [`operators::ROUTE_ROLES`] lists for the route: `viewer` for reads, `operator` for revoking
+//! leases and deciding approvals, `admin` for the rest. A role too low is 403
+//! `admin_role_insufficient`.
 //!
 //! **Console listener.** With `[admin_ui] enabled = true` a second listener on
 //! `[admin_ui] listen` (default `127.0.0.1:9101`) serves the embedded console under
@@ -79,6 +86,8 @@ pub mod logging;
 pub mod metrics;
 // Used by the integration tests.
 pub mod notify;
+// Used by the integration tests.
+pub mod operators;
 pub(crate) mod replay;
 // Used by the integration tests.
 pub mod routes;
@@ -222,6 +231,7 @@ fn admin_routes(state: &Arc<AppState>) -> Router<Arc<AppState>> {
     use routes::{admin, approvals, dev_root, policies};
 
     let mut admin_routes = Router::new()
+        .route("/admin/whoami", get(admin::whoami))
         .route("/admin/leases/revoke", post(admin::revoke_by_selector))
         .route("/admin/leases/{lease_id}", get(admin::lease_status))
         .route("/admin/leases/{lease_id}/revoke", post(admin::revoke_lease))

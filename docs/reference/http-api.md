@@ -66,6 +66,7 @@ The table is generated from `attenuo_core::error_codes::ERROR_CODES`, the one pl
 | `actor_token_unsupported_alg` | 400 `invalid_request` |  |  | The actor token's algorithm is not accepted. |
 | `actor_token_untrusted_issuer` | 400 `invalid_request` |  |  | The actor token's issuer is not an `[[actor_trust]]` entry. |
 | `admin_disabled` | 403 |  |  | The admin API is turned off. |
+| `admin_role_insufficient` | 403 |  |  | The admin credential's role is below the one the route needs; the message names the role needed. |
 | `agent_token_refused` | 403 |  |  | A delegation token cannot decide an approval. |
 | `already_refunded` | 409 |  |  | The budget charge was already refunded. |
 | `approval_expired` | 409 |  |  | The approval, or the lease it is bound to, has expired. |

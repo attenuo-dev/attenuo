@@ -188,6 +188,7 @@ pub fn read_routes() -> Router<Arc<AppState>> {
         )
         .route_layer(middleware::from_fn(require_json));
     Router::new()
+        .route("/admin/whoami", get(admin::whoami))
         .route("/admin/audit", get(admin::audit_range))
         .route("/admin/audit/verify", get(admin::audit_verify))
         // Signs a checkpoint of the head when it has none yet; a read for the CLI and here.
@@ -210,6 +211,7 @@ pub fn read_routes() -> Router<Arc<AppState>> {
 /// would change. A revocation is answered 404, as the write routes are when not mounted.
 async fn selector_preview_only(
     state: State<Arc<AppState>>,
+    who: axum::Extension<crate::operators::AdminIdentity>,
     q: Query<admin::SelectorRevokeQuery>,
     Body(body): Body,
 ) -> Result<axum::Json<serde_json::Value>, ApiError> {
@@ -218,7 +220,7 @@ async fn selector_preview_only(
             "writes are disabled on the console listener; only `?preview=true` is served",
         ));
     }
-    admin::revoke_by_selector(state, q, Body(body)).await
+    admin::revoke_by_selector(state, who, q, Body(body)).await
 }
 
 /// The admin routes that change state, mounted on the console listener only with
