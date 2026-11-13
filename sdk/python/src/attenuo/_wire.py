@@ -225,6 +225,7 @@ def error_from_response(resp: httpx.Response) -> ApiError:
     """
     text = resp.text
     error, detail, description = "http_error", text.strip(), None
+    code: str | None = None
     claimed: Any = None
     reason: str | None = None
     data: dict[str, Any] | None = None
@@ -236,6 +237,7 @@ def error_from_response(resp: httpx.Response) -> ApiError:
         error = body["error"]
         detail = str(body.get("detail", ""))
         description = body.get("error_description")
+        code = _opt_str(body.get("code"))
         claimed = body.get("decision_id")
     elif isinstance(body, dict) and isinstance(body.get("error"), dict):
         # A JSON-RPC error body (the proxy's 401).
@@ -245,6 +247,7 @@ def error_from_response(resp: httpx.Response) -> ApiError:
         data = raw_data if isinstance(raw_data, dict) else {}
         claimed = data.get("decision_id")
         reason = _opt_str(data.get("reason")) or "unauthorized"
+        code = _opt_str(data.get("code")) or reason
     decision_id = _proven_decision_id(resp, claimed)
     refusal: ApiError | None = None
     if data is not None:
@@ -255,9 +258,16 @@ def error_from_response(resp: httpx.Response) -> ApiError:
         return refusal
     if resp.status_code == 401:
         return Unauthorized(
-            resp.status_code, error, detail, description, decision_id, reason=reason, data=data
+            resp.status_code,
+            error,
+            detail,
+            description,
+            decision_id,
+            reason=reason,
+            data=data,
+            code=code,
         )
-    return ApiError(resp.status_code, error, detail, description, decision_id)
+    return ApiError(resp.status_code, error, detail, description, decision_id, code)
 
 
 def retry_after(resp: httpx.Response) -> int | None:

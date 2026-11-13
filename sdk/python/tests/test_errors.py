@@ -161,6 +161,81 @@ async def test_api_error_carries_the_decision_id(make: Any) -> None:  # noqa: F8
         assert e2.value.decision_id is None
 
 
+# --- K-8: every error carries the stable `code` ---------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "code"),
+    [
+        # The server's `code` is taken as it is, also where `error` is broader.
+        (
+            400,
+            {
+                "error": "invalid_grant",
+                "code": "audience_mismatch",
+                "detail": "audience_mismatch",
+                "error_description": "audience_mismatch",
+            },
+            "audience_mismatch",
+        ),
+        (
+            400,
+            {"error": "invalid_request", "code": "invalid_request", "detail": "x"},
+            "invalid_request",
+        ),
+        # `code` wins over the deprecated `error_description`.
+        (400, {"error": "invalid_grant", "code": "replayed", "error_description": "y"}, "replayed"),
+        # A server that sends no `code`: the sub-code, else `error`.
+        (400, {"error": "invalid_grant", "error_description": "unknown_kid"}, "unknown_kid"),
+        (409, {"error": "already_refunded", "detail": "once"}, "already_refunded"),
+        (
+            401,
+            {
+                "error": "unauthorized",
+                "code": "token_expired",
+                "detail": "token_expired",
+                "error_description": "token_expired",
+            },
+            "token_expired",
+        ),
+        (
+            401,
+            {"error": "invalid_client", "code": "client_authentication_failed"},
+            "client_authentication_failed",
+        ),
+    ],
+)
+async def test_rest_error_carries_the_code(
+    make: Any,  # noqa: F811
+    status: int,
+    body: dict[str, Any],
+    code: str,
+) -> None:
+    client, _ = make(lambda r: httpx.Response(status, json=body))
+    with pytest.raises(ApiError) as e:
+        await call(client, "exchange", "a.b.c", "coder", ["github:read_file"])
+    assert e.value.code == code
+    assert e.value.error == body["error"]
+    assert e.value.description == body.get("error_description")
+
+
+async def test_proxy_401_code_is_its_reason(make: Any) -> None:  # noqa: F811
+    data = {"code": "lease_revoked", "reason": "lease_revoked"}
+    client, _ = make(
+        lambda r: rpc_err(-32001, "attenuo: unauthorized: lease_revoked", data, status=401)
+    )
+    with pytest.raises(Unauthorized) as e:
+        await call(client, "call_tool", "TOK", "github", "read_file")
+    assert (e.value.code, e.value.reason) == ("lease_revoked", "lease_revoked")
+
+
+def test_api_error_code_defaults() -> None:
+    assert ApiError(400, "invalid_request").code == "invalid_request"
+    assert ApiError(400, "invalid_grant", "", "replayed").code == "replayed"
+    assert ApiError(400, "invalid_grant", "", "replayed", None, "other").code == "other"
+    assert Unauthorized(401, "unauthorized", "", "token_expired").code == "token_expired"
+
+
 # --- K-3: a denial keeps what the server says about it -------------------------------------
 
 

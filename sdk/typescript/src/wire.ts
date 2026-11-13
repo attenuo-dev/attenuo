@@ -233,6 +233,7 @@ export function errorFromResponse(status: number, text: string, headers?: Header
   let error = "http_error";
   let detail = text.trim();
   let description: string | undefined;
+  let code: string | undefined;
   let claimed: unknown;
   let reason: string | undefined;
   let data: Json | undefined;
@@ -248,6 +249,7 @@ export function errorFromResponse(status: number, text: string, headers?: Header
       error = b.error;
       detail = String(b.detail ?? "");
       if (typeof b.error_description === "string") description = b.error_description;
+      if (typeof b.code === "string" && b.code !== "") code = b.code;
       claimed = b.decision_id;
     } else if (typeof b.error === "object" && b.error !== null) {
       // A JSON-RPC error body (the proxy's 401).
@@ -257,6 +259,7 @@ export function errorFromResponse(status: number, text: string, headers?: Header
       data = (typeof e.data === "object" && e.data !== null ? e.data : {}) as Json;
       claimed = data.decision_id;
       reason = typeof data.reason === "string" && data.reason !== "" ? data.reason : "unauthorized";
+      code = typeof data.code === "string" && data.code !== "" ? data.code : reason;
     }
   }
   const decisionId = provenDecisionId(headers?.get(DECISION_ID_HEADER) ?? undefined, claimed);
@@ -269,9 +272,18 @@ export function errorFromResponse(status: number, text: string, headers?: Header
         : undefined;
   if (refusal !== undefined) return refusal;
   if (status === 401) {
-    return new UnauthorizedError(status, error, detail, description, decisionId, reason, data);
+    return new UnauthorizedError(
+      status,
+      error,
+      detail,
+      description,
+      decisionId,
+      reason,
+      data,
+      code,
+    );
   }
-  return new ApiError(status, error, detail, description, decisionId);
+  return new ApiError(status, error, detail, description, decisionId, code);
 }
 
 /**

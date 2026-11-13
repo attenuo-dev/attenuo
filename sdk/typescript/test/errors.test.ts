@@ -125,6 +125,66 @@ describe("a REST 401", () => {
   });
 });
 
+describe("the stable code (K-8)", () => {
+  it.each([
+    [
+      400,
+      {
+        error: "invalid_grant",
+        code: "audience_mismatch",
+        detail: "audience_mismatch",
+        error_description: "audience_mismatch",
+      },
+      "audience_mismatch",
+    ],
+    [400, { error: "invalid_request", code: "invalid_request", detail: "x" }, "invalid_request"],
+    // `code` wins over the deprecated `error_description`.
+    [400, { error: "invalid_grant", code: "replayed", error_description: "y" }, "replayed"],
+    // A server that sends no `code`: the sub-code, else `error`.
+    [400, { error: "invalid_grant", error_description: "unknown_kid" }, "unknown_kid"],
+    [409, { error: "already_refunded", detail: "once" }, "already_refunded"],
+    [
+      401,
+      {
+        error: "unauthorized",
+        code: "token_expired",
+        detail: "token_expired",
+        error_description: "token_expired",
+      },
+      "token_expired",
+    ],
+    [
+      401,
+      { error: "invalid_client", code: "client_authentication_failed" },
+      "client_authentication_failed",
+    ],
+  ])("is carried by a REST error (%#)", async (status, body, code) => {
+    const { ob } = client(() => jsonResponse(body, status as number));
+    const e = (await caught(ob.exchange("a.b.c", "coder", "github:read_file"))) as ApiError;
+    expect(e).toBeInstanceOf(ApiError);
+    expect(e.code).toBe(code);
+    expect(e.error).toBe((body as { error: string }).error);
+  });
+
+  it("of a proxy 401 is its reason", async () => {
+    const data = { code: "lease_revoked", reason: "lease_revoked" };
+    const { ob } = client(() => rpcErr(-32001, "attenuo: unauthorized: lease_revoked", data, 401));
+    const e = (await caught(ob.callTool("TOK", "github", "read_file"))) as UnauthorizedError;
+    expect([e.code, e.reason]).toEqual(["lease_revoked", "lease_revoked"]);
+  });
+
+  it("defaults from the sub-code and error", () => {
+    expect(new ApiError(400, "invalid_request").code).toBe("invalid_request");
+    expect(new ApiError(400, "invalid_grant", "", "replayed").code).toBe("replayed");
+    expect(new ApiError(400, "invalid_grant", "", "replayed", undefined, "other").code).toBe(
+      "other",
+    );
+    expect(new UnauthorizedError(401, "unauthorized", "", "token_expired").code).toBe(
+      "token_expired",
+    );
+  });
+});
+
 describe("a REST error (K-4)", () => {
   it("carries the decision id the header vouches for", async () => {
     const body = {
