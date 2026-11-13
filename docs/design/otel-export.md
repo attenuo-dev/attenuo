@@ -55,7 +55,7 @@ The spans below follow the path of one `POST /mcp/{server}` with one `tools/call
 | `attenuo.lease_check` | internal | `Pipeline::check_leases` inside the decision | `attenuo.reason` on failure |
 | `attenuo.run_state` | internal | labels, span index and counters read (`run_labels`, `arg_taint`, `budget_view`) | `attenuo.limit.kind` when a limit was met |
 | `attenuo.policy` | internal | capability stage and Cedar | none beyond timing |
-| `attenuo.charge` | internal | `LeaseStore::charge` and the run lock wait | `attenuo.budget.exhausted_at` (`check`, `charge`) |
+| `attenuo.charge` | internal | `RunLimits::charge` and the run lock wait | `attenuo.budget.exhausted_at` (`check`, `charge`) |
 | `attenuo.audit_append` | internal | the append, lock wait and commit included | `attenuo.audit.seq` |
 | `attenuo.upstream` | client | sending the screened request until response headers | `attenuo.server`, `http.response.status_code`, `attenuo.reason` (`upstream_unreachable`, `upstream_timeout`) |
 | `attenuo.response` | internal | filtering, list screen, session binding | `attenuo.list.hidden` (count) |
