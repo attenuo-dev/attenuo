@@ -60,12 +60,16 @@ hygiene:
 fuzz-check:
     RUSTFLAGS="--cfg fuzzing -D warnings" cargo check --manifest-path fuzz/Cargo.toml --bins --examples --locked
 
+# the Lean proof of the covering rule: build, no sorry, standard axioms only (proofs/lean/README.md)
+lean:
+    bash scripts/check-lean.sh
+
 # cargo-deny (cargo install cargo-deny)
 deny:
     cargo deny check
 
 # everything CI runs that can run locally
-ci: fmt clippy test demo guide readme snippets policy docs links hygiene deny fuzz-check
+ci: fmt clippy test demo guide readme snippets policy docs links hygiene deny fuzz-check lean
 
 # print a random admin token
 admin-token:
