@@ -84,7 +84,7 @@ You do not need to write much of it. Before Cedar runs, a capability check in pl
 
 Point `private_key_pem_path` at a new key, list the old one in `previous_key_paths`, and restart. Tokens signed with the old key keep verifying (they carry a `kid`, and the JWKS lists both keys) until you remove it. The steps are in [Deploying](guides/deploying.md#key-rotation).
 
-Rotating the signing key does not touch the audit log, which is not signed with it. Rotating the admin token and agent secrets also means editing the config and restarting.
+Rotating the signing key does not touch the audit log, which is not signed with it. Rotating `[admin] token`, agent secrets or agent client keys also means editing the config and restarting. A named operator's token can be replaced without a restart: edit its `[[admin.operators]]` entry and call `POST /admin/operators/reload` (`attenuo admin operator reload`).
 
 ## How is the audit log tamper-evident?
 
@@ -123,4 +123,4 @@ Without those, it cannot stop an agent from misusing something it is legitimatel
 
 ## Is it ready for production?
 
-No. It is pre-alpha. Formats will change before 1.0 ([what may change](reference/api-compatibility.md)), there is one node and one SQLite file, admin authentication is static bearer tokens (one per operator, with a role, but no expiry and no login), and the eleven security review passes were done by the project itself with no outside audit (every finding is fixed or accepted, none is open; see [Status](https://github.com/attenuo-dev/attenuo#status)). Use it to evaluate the model, in staging, or in a closed pilot where you accept those limits. [Deploying](guides/deploying.md) lists what to harden.
+No. It is pre-alpha. Formats will change before 1.0 ([what may change](reference/api-compatibility.md)), there is one node and one SQLite file, admin authentication is static bearer tokens (one per operator, with a role and an optional expiry, but no login), and the eleven security review passes were done by the project itself with no outside audit (every finding is fixed or accepted, none is open; see [Status](https://github.com/attenuo-dev/attenuo#status)). Use it to evaluate the model, in staging, or in a closed pilot where you accept those limits. [Deploying](guides/deploying.md) lists what to harden.

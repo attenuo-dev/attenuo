@@ -36,7 +36,7 @@ There is a discovery document at `/.well-known/authzen-configuration`.
 The chain can arrive two ways:
 
 - **With a bearer token.** The chain comes from the verified token. This is the safe way.
-- **Without a bearer.** Off by default: a request with no bearer gets 401. With `[authzen] allow_unsigned_chain = true`, a PEP listed under `[[peps]]` that authenticates (HTTP Basic, or `pep_id` and `pep_secret` in the body) may send the chain in `subject.properties.chain`. The chain carries no signatures, so every hop must match what this server issued for its lease (leases are bound to a digest of the chain at issuance), or the request gets 403 `chain_not_issued`. It then has to pass the lease check like any other chain.
+- **Without a bearer.** Off by default: a request with no bearer gets 401. With `[authzen] allow_unsigned_chain = true`, a PEP listed under `[[peps]]` that authenticates (HTTP Basic, `pep_id` and `pep_secret` in the body, or a `private_key_jwt` client assertion) may send the chain in `subject.properties.chain`. The chain carries no signatures, so every hop must match what this server issued for its lease (leases are bound to a digest of the chain at issuance), or the request gets 403 `chain_not_issued`. It then has to pass the lease check like any other chain.
 
 The call arguments go in `context.input`. The response includes a decision id.
 
@@ -57,7 +57,7 @@ Both paths write to the same audit log.
 ## Limits today
 
 - There is no push channel, so a PEP that caches decisions will not learn of a revocation.
-- Admin routes use static bearer tokens (`[admin] token`, or one per operator with a role, [ADR-0016](../decisions/0016-admin-operators.md)) and should not be public.
+- Admin routes use static bearer tokens (`[admin] token`, or one per operator with a role and an optional expiry, [ADR-0016](../decisions/0016-admin-operators.md)) and should not be public. There is no operator login through an IdP.
 - AuthZEN conformance is checked by fixtures in `crates/attenuo-server/tests/fixtures/authzen/`; what is and is not implemented is in [AuthZEN conformance](../reference/authzen.md). The Search APIs are not served.
 
 More detail: [design/server.md](../design/server.md#the-decision-pipeline), [ADR-0001](../decisions/0001-separate-enforcement-layer.md) and [RFC-0001 section 5](../spec/rfc-0001-attenuo.md#5-per-call-authorization).
