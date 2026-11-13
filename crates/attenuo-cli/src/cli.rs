@@ -246,10 +246,26 @@ pub(crate) enum KeyCmd {
     /// Generate a key. `--dpop <PATH>` writes a new Ed25519 DPoP key (RFC 9449) as a private
     /// JWK, readable only by you, and prints its thumbprint (the `cnf.jkt` of tokens bound to
     /// it). Use it with `--dpop-key`; the Python and TypeScript SDKs take the same file.
+    /// `--client <PATH>` writes a new Ed25519 client key for `private_key_jwt` (RFC 7523) the
+    /// same way, and prints the `jwks` line with its public half to add to the agent's
+    /// `[[agents]]` (or the PEP's `[[peps]]`) entry. Use it with `token exchange --client-key`.
+    #[command(group(clap::ArgGroup::new("kind").required(true).args(["dpop", "client"])))]
     Gen {
         /// Where to write the DPoP key. An existing file is never overwritten.
-        #[arg(long, value_name = "PATH", required = true)]
-        dpop: std::path::PathBuf,
+        #[arg(long, value_name = "PATH")]
+        dpop: Option<std::path::PathBuf>,
+        /// Where to write the client key. An existing file is never overwritten.
+        #[arg(long, value_name = "PATH")]
+        client: Option<std::path::PathBuf>,
+        /// The client key's `kid` (default: its RFC 7638 thumbprint). Give each key of an
+        /// agent its own `kid`, so a new key can be added next to the old one.
+        #[arg(
+            long,
+            requires = "client",
+            conflicts_with = "dpop",
+            value_parser = NonEmptyStringValueParser::new()
+        )]
+        kid: Option<String>,
     },
 }
 
@@ -408,17 +424,29 @@ pub(crate) struct ExchangeArgs {
     #[arg(long)]
     pub client_id: Option<String>,
     /// The agent's client secret. Required by servers with `[token] require_actor_auth`
-    /// (the default). Without this flag, `--client-secret-stdin` or `--client-secret-file`,
+    /// (the default), unless the agent authenticates with `--client-key` or `--actor-token`.
+    /// Without this flag, `--client-secret-stdin`, `--client-secret-file` or `--client-key`,
     /// the `ATTENUO_CLIENT_SECRET` environment variable is used. Prefer those: an argument is
     /// visible to other local users in `ps`.
-    #[arg(long, conflicts_with_all = ["client_secret_stdin", "client_secret_file"])]
+    #[arg(long, conflicts_with_all = ["client_secret_stdin", "client_secret_file", "client_key"])]
     pub client_secret: Option<String>,
     /// Read the client secret from the first line of standard input.
-    #[arg(long, conflicts_with = "client_secret_file")]
+    #[arg(long, conflicts_with_all = ["client_secret_file", "client_key"])]
     pub client_secret_stdin: bool,
     /// Read the client secret from the first line of this file.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", conflicts_with = "client_key")]
     pub client_secret_file: Option<std::path::PathBuf>,
+    /// Authenticate with `private_key_jwt` (RFC 7523) instead of a secret: sign a client
+    /// assertion with this key, a private JWK (Ed25519 or P-256) such as `attenuo key gen
+    /// --client` writes; its `kid`, if the file has one, goes in the header. The assertion
+    /// names the client id, has a fresh `jti` and lives one minute. `ATTENUO_CLIENT_SECRET` is
+    /// then ignored.
+    #[arg(long, value_name = "PATH")]
+    pub client_key: Option<std::path::PathBuf>,
+    /// The `aud` of the client assertion: the server's `[issuer] issuer`. Default: the `iss`
+    /// of the subject token, which this server issued.
+    #[arg(long, value_name = "ISSUER", requires = "client_key")]
+    pub client_assertion_audience: Option<String>,
     /// RFC 8693 actor token authenticating `--actor`: a workload-identity JWT (for example a
     /// SPIFFE JWT-SVID) from an `[[actor_trust]]` issuer, or `-` to read it from stdin. Sent as
     /// `actor_token` with `actor_token_type` `urn:ietf:params:oauth:token-type:jwt`. Each
@@ -1430,10 +1458,51 @@ mod tests {
             ["--client-secret", "s", "--client-secret-stdin"].as_slice(),
             ["--client-secret", "s", "--client-secret-file", "/x"].as_slice(),
             ["--client-secret-stdin", "--client-secret-file", "/x"].as_slice(),
+            ["--client-key", "/k", "--client-secret", "s"].as_slice(),
+            ["--client-key", "/k", "--client-secret-stdin"].as_slice(),
+            ["--client-key", "/k", "--client-secret-file", "/x"].as_slice(),
+            ["--client-assertion-audience", "https://a"].as_slice(),
         ] {
             let mut a = both.to_vec();
             a.extend_from_slice(extra);
             assert!(parse(&a).is_err(), "{extra:?}");
+        }
+        let mut a = both.to_vec();
+        a.extend_from_slice(&[
+            "--client-key",
+            "/k",
+            "--client-assertion-audience",
+            "https://a",
+        ]);
+        let Command::Token(TokenCmd::Exchange(e)) = parse(&a).unwrap().command else {
+            panic!()
+        };
+        assert_eq!(e.client_key.as_deref(), Some(std::path::Path::new("/k")));
+        assert_eq!(e.client_assertion_audience.as_deref(), Some("https://a"));
+    }
+
+    /// `key gen` makes exactly one kind of key; `--kid` is for client keys.
+    #[test]
+    fn key_gen_takes_dpop_or_client() {
+        let Command::Key(KeyCmd::Gen { client, kid, dpop }) =
+            parse(&["key", "gen", "--client", "/c", "--kid", "k1"])
+                .unwrap()
+                .command
+        else {
+            panic!()
+        };
+        assert_eq!(
+            (client.is_some(), kid.as_deref(), dpop),
+            (true, Some("k1"), None)
+        );
+        assert!(parse(&["key", "gen", "--dpop", "/d"]).is_ok());
+        for bad in [
+            &["key", "gen"][..],
+            &["key", "gen", "--dpop", "/d", "--client", "/c"],
+            &["key", "gen", "--dpop", "/d", "--kid", "k1"],
+            &["key", "gen", "--client", "/c", "--kid", ""],
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?}");
         }
     }
 

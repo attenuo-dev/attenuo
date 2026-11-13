@@ -18,6 +18,13 @@ use time::OffsetDateTime;
 /// existing file is never overwritten.
 pub(crate) fn generate(path: &Path) -> Result<DpopKey> {
     let key = DpopKey::generate().context("generating a DPoP key")?;
+    write_new(path, &key.private_jwk())?;
+    Ok(key)
+}
+
+/// Write the private JWK `jwk` to a new file at `path`, mode 0600 on Unix. An existing file is
+/// never overwritten.
+pub(crate) fn write_new(path: &Path, jwk: &Value) -> Result<()> {
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -31,11 +38,11 @@ pub(crate) fn generate(path: &Path) -> Result<DpopKey> {
             path.display()
         )
     })?;
-    let mut text = serde_json::to_string_pretty(&key.private_jwk())?;
+    let mut text = serde_json::to_string_pretty(jwk)?;
     text.push('\n');
     file.write_all(text.as_bytes())
         .with_context(|| format!("writing {}", path.display()))?;
-    Ok(key)
+    Ok(())
 }
 
 /// Read a private JWK from `path`.
