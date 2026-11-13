@@ -3812,3 +3812,283 @@ async fn grant_and_body_chain_refusals_name_their_reason_in_code() {
     assert_eq!(b["error"], "invalid_request");
     assert!(b.get("error_description").is_none(), "{b}");
 }
+
+/// A refusal as the client sees it: status, every header but `date` and `content-length`, and
+/// the whole JSON body, with a decision id (body and `X-Attenuo-Decision-Id`) replaced by
+/// `<decision_id>` once checked to be the same in both.
+async fn refusal_as_sent(resp: reqwest::Response) -> Value {
+    let status = resp.status().as_u16();
+    let mut headers = serde_json::Map::new();
+    for (k, v) in resp.headers() {
+        if k == "date" || k == "content-length" {
+            continue;
+        }
+        headers.insert(k.as_str().into(), json!(v.to_str().unwrap()));
+    }
+    let mut body: Value = resp.json().await.unwrap();
+    if let Some(id) = body.get("decision_id").cloned() {
+        assert_eq!(
+            headers.get("x-attenuo-decision-id"),
+            Some(&id),
+            "the header names the body's decision"
+        );
+        body["decision_id"] = json!("<decision_id>");
+        headers.insert("x-attenuo-decision-id".into(), json!("<decision_id>"));
+    }
+    json!({"status": status, "headers": headers, "body": body})
+}
+
+/// Every refusal whose class or code was chosen from message text, or whose code was the
+/// generic class, as sent before the change that chose them from typed errors: status, headers
+/// and the whole body. Only `code` may change, and only where the expectation below says so.
+#[tokio::test]
+async fn refusal_bodies_are_pinned() {
+    let h = Harness::start_tweaked(false, |cfg| cfg.issuer.max_depth = 3).await;
+    let open = Harness::start_tweaked(false, |cfg| cfg.token.require_actor_auth = false).await;
+    let root = h.mint_root("alice", "planner", &["github:*"]).await;
+    let any = h.mint_root("bob", "planner", &["*:*"]).await;
+    const EXCHANGE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
+    const JWT: &str = "urn:ietf:params:oauth:token-type:jwt";
+    let json_body = |grant: &str, ty: &str| {
+        json!({"grant_type": grant, "subject_token": root.token, "subject_token_type": ty,
+               "actor": "coder", "client_id": "coder", "client_secret": agent_secret("coder"),
+               "authorization_details": [{"type": "attenuo_capabilities",
+                   "capabilities": [{"server": "github", "tool": "read_file"}]}]})
+    };
+    let post_json = |body: Value| h.client.post(h.url("/token")).json(&body).send();
+    let post_raw = |ct: &'static str, body: String| {
+        h.client
+            .post(h.url("/token"))
+            .header("content-type", ct)
+            .body(body)
+            .send()
+    };
+    const FORM: &str = "application/x-www-form-urlencoded";
+    let form = |extra: &str| {
+        format!(
+            "grant_type={EXCHANGE}&subject_token={}&subject_token_type={JWT}&actor=coder\
+             &client_id=coder&client_secret={}{extra}",
+            root.token,
+            agent_secret("coder")
+        )
+    };
+
+    let mut seen = Vec::new();
+    let mut pin = |name: &str, got: Value| seen.push((name.to_string(), got));
+
+    pin(
+        "token: unsupported grant_type",
+        refusal_as_sent(post_json(json_body("password", JWT)).await.unwrap()).await,
+    );
+    pin(
+        "token: unsupported subject_token_type",
+        refusal_as_sent(
+            post_json(json_body(EXCHANGE, "urn:example:saml"))
+                .await
+                .unwrap(),
+        )
+        .await,
+    );
+    let mut no_actor = json_body(EXCHANGE, JWT);
+    no_actor.as_object_mut().unwrap().remove("actor");
+    pin(
+        "token: body without actor",
+        refusal_as_sent(post_json(no_actor).await.unwrap()).await,
+    );
+    let mut bad_ttl = json_body(EXCHANGE, JWT);
+    bad_ttl["requested_ttl_seconds"] = json!("soon");
+    pin(
+        "token: ill-typed requested_ttl_seconds",
+        refusal_as_sent(post_json(bad_ttl).await.unwrap()).await,
+    );
+    // A field whose text names another refusal: decided by type, not by the words.
+    let mut lookalike = json_body(EXCHANGE, JWT);
+    lookalike["requested_ttl_seconds"] = json!("unsupported grant_type");
+    pin(
+        "token: field whose error text quotes a refusal",
+        refusal_as_sent(post_json(lookalike).await.unwrap()).await,
+    );
+    pin(
+        "token: body that is not JSON",
+        refusal_as_sent(post_raw("application/json", "{".into()).await.unwrap()).await,
+    );
+    pin(
+        "token: form parameter repeated",
+        refusal_as_sent(post_raw(FORM, form("&actor=coder")).await.unwrap()).await,
+    );
+    pin(
+        "token: form authorization_details not JSON",
+        refusal_as_sent(
+            post_raw(FORM, form("&authorization_details=nope"))
+                .await
+                .unwrap(),
+        )
+        .await,
+    );
+    pin(
+        "token: form requested_ttl_seconds not a number",
+        refusal_as_sent(
+            post_raw(FORM, form("&requested_ttl_seconds=soon"))
+                .await
+                .unwrap(),
+        )
+        .await,
+    );
+    pin(
+        "token: form may_act not JSON",
+        refusal_as_sent(post_raw(FORM, form("&may_act=%5Bnope")).await.unwrap()).await,
+    );
+    pin(
+        "token: form scope and authorization_details",
+        refusal_as_sent(
+            post_raw(
+                FORM,
+                form("&scope=github:read_file&authorization_details=%5B%5D"),
+            )
+            .await
+            .unwrap(),
+        )
+        .await,
+    );
+    pin(
+        "token: form scope entry that is not server:tool",
+        refusal_as_sent(post_raw(FORM, form("&scope=github")).await.unwrap()).await,
+    );
+
+    // Minting refusals once the subject token verified (audited).
+    let child = h
+        .exchange(&root.token, "coder", &["github:read_file"])
+        .await;
+    pin(
+        "token: delegation replayed",
+        refusal_as_sent(
+            h.exchange_raw(&root.token, "coder", &["github:read_file"])
+                .await,
+        )
+        .await,
+    );
+    pin(
+        "token: request wider than the parent",
+        refusal_as_sent(
+            h.exchange_raw(&child.token, "reviewer", &["github:delete_repo"])
+                .await,
+        )
+        .await,
+    );
+    let grandchild = h
+        .exchange(&child.token, "reviewer", &["github:read_file"])
+        .await;
+    pin(
+        "token: chain deeper than max_depth",
+        refusal_as_sent(
+            h.exchange_raw(&grandchild.token, "x", &["github:read_file"])
+                .await,
+        )
+        .await,
+    );
+    pin(
+        "token: capability with an invalid name",
+        refusal_as_sent(
+            h.exchange_raw(&any.token, "coder", &["evil/github:x"])
+                .await,
+        )
+        .await,
+    );
+    let open_root = open.mint_root("carol", "planner", &["github:*"]).await;
+    pin(
+        "token: empty actor",
+        refusal_as_sent(
+            open.exchange_as(&open_root.token, "", &["github:read_file"], None)
+                .await,
+        )
+        .await,
+    );
+
+    // The same minting refusals at `POST /admin/root-token`.
+    let root_token = |body: Value| h.admin_post("/admin/root-token", body);
+    pin(
+        "admin: root token with a lifetime out of range",
+        refusal_as_sent(
+            root_token(json!({"subject": "dan", "issuer": "https://idp.example",
+                              "agent": "planner", "capabilities": ["github:*"],
+                              "ttl_seconds": u64::MAX}))
+            .await,
+        )
+        .await,
+    );
+    pin(
+        "admin: root token for an empty agent",
+        refusal_as_sent(
+            root_token(json!({"subject": "dan", "issuer": "https://idp.example",
+                              "agent": "", "capabilities": ["github:*"]}))
+            .await,
+        )
+        .await,
+    );
+    pin(
+        "admin: root token for an empty subject",
+        refusal_as_sent(
+            root_token(json!({"subject": "", "issuer": "https://idp.example",
+                              "agent": "planner", "capabilities": ["github:*"]}))
+            .await,
+        )
+        .await,
+    );
+    pin(
+        "admin: root token with an invalid capability name",
+        refusal_as_sent(
+            root_token(json!({"subject": "dan", "issuer": "https://idp.example",
+                              "agent": "planner", "capabilities": ["evil/github:x"]}))
+            .await,
+        )
+        .await,
+    );
+    pin(
+        "admin: root token capability that is not server:tool",
+        refusal_as_sent(
+            root_token(json!({"subject": "dan", "issuer": "https://idp.example",
+                              "agent": "planner", "capabilities": ["github"]}))
+            .await,
+        )
+        .await,
+    );
+
+    let got = Value::Array(
+        seen.into_iter()
+            .map(|(n, v)| json!({"name": n, "sent": v}))
+            .collect(),
+    );
+    let want: Value = serde_json::from_str(PINNED_REFUSALS).unwrap();
+    if got != want {
+        panic!(
+            "refusals differ from the pinned ones; as sent now:\n{}",
+            serde_json::to_string_pretty(&got).unwrap()
+        );
+    }
+}
+
+/// What [`refusal_bodies_are_pinned`] expects, in its order.
+const PINNED_REFUSALS: &str = r#"[
+  {"name": "token: unsupported grant_type", "sent": {"status": 400, "headers": {"content-type": "application/json", "cache-control": "no-store"}, "body": {"error": "unsupported_grant_type", "code": "unsupported_grant_type", "detail": "unsupported grant_type `password`"}}},
+  {"name": "token: unsupported subject_token_type", "sent": {"status": 400, "headers": {"content-type": "application/json", "cache-control": "no-store"}, "body": {"error": "invalid_request", "code": "unsupported_token_type", "detail": "unsupported subject_token_type `urn:example:saml`"}}},
+  {"name": "token: body without actor", "sent": {"status": 400, "headers": {"content-type": "application/json", "cache-control": "no-store"}, "body": {"error": "invalid_request", "code": "invalid_request", "detail": "missing field `actor`"}}},
+  {"name": "token: ill-typed requested_ttl_seconds", "sent": {"status": 400, "headers": {"content-type": "application/json", "cache-control": "no-store"}, "body": {"error": "invalid_request", "code": "invalid_request", "detail": "invalid type: string \"soon\", expected u64"}}},
+  {"name": "token: field whose error text quotes a refusal", "sent": {"status": 400, "headers": {"content-type": "application/json", "cache-control": "no-store"}, "body": {"error": "unsupported_grant_type", "code": "unsupported_grant_type", "detail": "invalid type: string \"unsupported grant_type\", expected u64"}}},
+  {"name": "token: body that is not JSON", "sent": {"status": 400, "headers": {"content-type": "application/json", "cache-control": "no-store"}, "body": {"error": "invalid_request", "code": "invalid_request", "detail": "EOF while parsing an object at line 1 column 1"}}},
+  {"name": "token: form parameter repeated", "sent": {"status": 400, "headers": {"content-type": "application/json", "cache-control": "no-store"}, "body": {"error": "invalid_request", "code": "invalid_request", "detail": "parameter `actor` repeated"}}},
+  {"name": "token: form authorization_details not JSON", "sent": {"status": 400, "headers": {"content-type": "application/json", "cache-control": "no-store"}, "body": {"error": "invalid_request", "code": "invalid_request", "detail": "authorization_details is not JSON: expected ident at line 1 column 2"}}},
+  {"name": "token: form requested_ttl_seconds not a number", "sent": {"status": 400, "headers": {"content-type": "application/json", "cache-control": "no-store"}, "body": {"error": "invalid_request", "code": "invalid_request", "detail": "requested_ttl_seconds: invalid digit found in string"}}},
+  {"name": "token: form may_act not JSON", "sent": {"status": 400, "headers": {"content-type": "application/json", "cache-control": "no-store"}, "body": {"error": "invalid_request", "code": "invalid_request", "detail": "may_act is not JSON: expected ident at line 1 column 3"}}},
+  {"name": "token: form scope and authorization_details", "sent": {"status": 400, "headers": {"content-type": "application/json", "cache-control": "no-store"}, "body": {"error": "invalid_request", "code": "invalid_request", "detail": "use either scope or authorization_details, not both"}}},
+  {"name": "token: form scope entry that is not server:tool", "sent": {"status": 400, "headers": {"content-type": "application/json", "cache-control": "no-store"}, "body": {"error": "invalid_scope", "code": "invalid_scope", "detail": "capability `github` must look like `server:tool`"}}},
+  {"name": "token: delegation replayed", "sent": {"status": 400, "headers": {"content-type": "application/json", "x-attenuo-decision-id": "<decision_id>", "cache-control": "no-store"}, "body": {"error": "invalid_grant", "code": "replayed", "detail": "this credential was already used; present a fresh one", "error_description": "replayed", "decision_id": "<decision_id>"}}},
+  {"name": "token: request wider than the parent", "sent": {"status": 400, "headers": {"content-type": "application/json", "x-attenuo-decision-id": "<decision_id>", "cache-control": "no-store"}, "body": {"error": "invalid_scope", "code": "invalid_scope", "detail": "delegation chain is invalid: hop 2 widens capabilities relative to hop 1: requested capability `github:delete_repo` is not covered by the parent capability set", "decision_id": "<decision_id>"}}},
+  {"name": "token: chain deeper than max_depth", "sent": {"status": 400, "headers": {"content-type": "application/json", "x-attenuo-decision-id": "<decision_id>", "cache-control": "no-store"}, "body": {"error": "invalid_scope", "code": "invalid_scope", "detail": "delegation chain is invalid: chain depth 4 exceeds the maximum of 3", "decision_id": "<decision_id>"}}},
+  {"name": "token: capability with an invalid name", "sent": {"status": 400, "headers": {"content-type": "application/json", "x-attenuo-decision-id": "<decision_id>", "cache-control": "no-store"}, "body": {"error": "invalid_grant", "code": "invalid_grant", "detail": "delegation chain is invalid: hop 1 has an invalid capability: server name \"evil/github\" contains '/', which is not allowed", "decision_id": "<decision_id>"}}},
+  {"name": "token: empty actor", "sent": {"status": 400, "headers": {"content-type": "application/json", "x-attenuo-decision-id": "<decision_id>", "cache-control": "no-store"}, "body": {"error": "invalid_grant", "code": "invalid_grant", "detail": "delegation chain is invalid: hop 1 has an empty agent id", "decision_id": "<decision_id>"}}},
+  {"name": "admin: root token with a lifetime out of range", "sent": {"status": 400, "headers": {"content-type": "application/json", "cache-control": "no-store", "x-content-type-options": "nosniff"}, "body": {"error": "invalid_grant", "code": "invalid_grant", "detail": "delegation chain is invalid: requested lifetime is out of range"}}},
+  {"name": "admin: root token for an empty agent", "sent": {"status": 400, "headers": {"content-type": "application/json", "cache-control": "no-store", "x-content-type-options": "nosniff"}, "body": {"error": "invalid_grant", "code": "invalid_grant", "detail": "delegation chain is invalid: hop 0 has an empty agent id"}}},
+  {"name": "admin: root token for an empty subject", "sent": {"status": 400, "headers": {"content-type": "application/json", "cache-control": "no-store", "x-content-type-options": "nosniff"}, "body": {"error": "invalid_grant", "code": "invalid_grant", "detail": "delegation chain is invalid: originating user subject is empty"}}},
+  {"name": "admin: root token with an invalid capability name", "sent": {"status": 400, "headers": {"content-type": "application/json", "cache-control": "no-store", "x-content-type-options": "nosniff"}, "body": {"error": "invalid_grant", "code": "invalid_grant", "detail": "delegation chain is invalid: hop 0 has an invalid capability: server name \"evil/github\" contains '/', which is not allowed"}}},
+  {"name": "admin: root token capability that is not server:tool", "sent": {"status": 400, "headers": {"content-type": "application/json", "cache-control": "no-store", "x-content-type-options": "nosniff"}, "body": {"error": "invalid_scope", "code": "invalid_scope", "detail": "capability `github` must look like `server:tool`"}}}
+]"#;

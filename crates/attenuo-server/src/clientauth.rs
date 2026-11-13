@@ -1491,12 +1491,20 @@ mod tests {
         let replay = ReplayCache::new(Arc::new(MemoryLeaseStore::new()), 10);
         let auth = |a: &str| c.authenticate(&h, None, None, Some(a), now()).unwrap();
         assert_eq!(auth(&a).commit(&replay, now()).unwrap(), "coder");
+        // The whole refusal, as it was when the replay was recognised by its sub-code.
         let e = auth(&a).commit(&replay, now()).unwrap_err();
         assert_eq!(
-            (e.status, e.code.as_str()),
-            (StatusCode::UNAUTHORIZED, "invalid_client")
+            e,
+            ApiError {
+                status: StatusCode::UNAUTHORIZED,
+                code: "invalid_client".into(),
+                detail: "client_assertion was already used; sign a new one with a fresh jti".into(),
+                description: Some("client_assertion_replayed"),
+                code_only: false,
+                decision_id: None,
+                retry_after: None,
+            }
         );
-        assert_eq!(e.description, Some("client_assertion_replayed"));
         // Another jti is fine; the same jti for a PEP of the same name is another key.
         let fresh = new.sign(&patched("coder", &[("jti", "j-2".into())], &[]));
         assert_eq!(auth(&fresh).commit(&replay, now()).unwrap(), "coder");
@@ -1516,8 +1524,15 @@ mod tests {
         let full = ReplayCache::new(Arc::new(MemoryLeaseStore::new()), 1);
         auth(&fresh).commit(&full, now()).unwrap();
         let e = auth(&a).commit(&full, now()).unwrap_err();
-        assert_eq!(e.status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(e.description, Some("replay_cache_full"));
+        assert_eq!(
+            e,
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "temporarily_unavailable",
+                "too many credentials in flight; retry later",
+            )
+            .with_description("replay_cache_full")
+        );
         // A store that cannot record it: 503 replay_store_unavailable.
         let store = Arc::new(SqliteLeaseStore::open_in_memory().unwrap());
         store
@@ -1525,8 +1540,15 @@ mod tests {
             .unwrap();
         let broken = ReplayCache::new(store, 10);
         let e = auth(&a).commit(&broken, now()).unwrap_err();
-        assert_eq!(e.status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(e.description, Some("replay_store_unavailable"));
+        assert_eq!(
+            e,
+            ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "temporarily_unavailable",
+                "the server cannot record the use of this credential; retry later",
+            )
+            .with_description("replay_store_unavailable")
+        );
     }
 
     #[test]

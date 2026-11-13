@@ -199,6 +199,40 @@ mod tests {
         }
     }
 
+    /// Each outcome as the client receives it, whole: the callers (`crate::clientauth`, the
+    /// exchange, intake, approvals) send these unchanged or map a replay to their own refusal.
+    #[test]
+    fn refusals_are_pinned() {
+        for c in caches(1) {
+            let t = OffsetDateTime::from_unix_timestamp(1_000).unwrap();
+            c.use_once("a", 1_100, t).unwrap();
+            assert_eq!(
+                c.use_once("a", 1_100, t).unwrap_err(),
+                ApiError {
+                    status: StatusCode::BAD_REQUEST,
+                    code: "invalid_grant".into(),
+                    detail: "this credential was already used; present a fresh one".into(),
+                    description: Some("replayed"),
+                    code_only: false,
+                    decision_id: None,
+                    retry_after: None,
+                }
+            );
+            assert_eq!(
+                c.use_once("b", 1_100, t).unwrap_err(),
+                ApiError {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    code: "temporarily_unavailable".into(),
+                    detail: "too many credentials in flight; retry later".into(),
+                    description: Some("replay_cache_full"),
+                    code_only: false,
+                    decision_id: None,
+                    retry_after: None,
+                }
+            );
+        }
+    }
+
     /// A marker that cannot be written refuses the credential (fail closed) with a 503 the
     /// client may retry, and the code is in the table.
     #[test]
