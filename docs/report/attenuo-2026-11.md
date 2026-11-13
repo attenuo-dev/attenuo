@@ -278,7 +278,7 @@ Not measured: repeated runs with confidence intervals on a quiet machine, most o
 
 Round 2 added five targets over limits, budgets, approval tokens and server routes and found four low or informational bugs (`docs/research/fuzzing-2026-10-24-round2.md`). Round 3 ran two SSE targets for 300 s each and found none (`docs/research/fuzz-round-3-2026-10-25.md`). These campaigns are short. They ran on a busy machine without AddressSanitizer, and their corpora were not kept. CI now compiles every target on each pull request that can change Rust, but it does not fuzz (`.github/workflows/ci.yml`). Beyond those attenuation properties, run limits have their own property and integration tests, such as `exchange_clamps_child_budget_to_parent_remaining` and `concurrent_siblings_cannot_overspend_parent` (`docs/decisions/0010-run-limits.md`).
 
-**Security review.** Twelve passes were made between 2026-10-22 and 2026-11-13. Pass 2 was the fix round for pass 1, and the other eleven recorded SR-01 to SR-111 (Table 4).
+**Security review.** Thirteen passes were made between 2026-10-22 and 2026-11-13. Pass 2 was the fix round for pass 1, and the other twelve recorded SR-01 to SR-114 (Table 4).
 
 | Pass | Report under `docs/research/` | Found | High | Medium | Low | Info |
 |----|----------------------------------------|------:|-----:|-------:|----:|-----:|
@@ -293,13 +293,14 @@ Round 2 added five targets over limits, budgets, approval tokens and server rout
 | 10 | `security-review-2026-11-06-pass10.md` | 5 | 0 | 0 | 1 | 4 |
 | 11 | `security-review-2026-11-12-pass11.md` | 6 | 0 | 0 | 2 | 4 |
 | 12 | `security-review-2026-11-13-pass12.md` | 4 | 0 | 0 | 1 | 3 |
-| All | | 111 | 5 | 19 | 49 | 38 |
+| 13 | `security-review-2026-11-13-pass13.md` | 3 | 0 | 0 | 1 | 2 |
+| All | | 114 | 5 | 19 | 50 | 40 |
 
 Table: Table 4. Findings per pass, from each report's summary table (pass 8 from its finding list, which adds SR-90 after the summary). No pass found a Critical.
 
 The five High findings, all in pass 1, were a duplicate-member parser differential between screening and forwarding (SR-01), a policy idiom for every tool that never matched and so failed open (SR-04), an AuthZEN path that accepted a hand-written chain (SR-08), leases checked only for tool calls (SR-09), and an asserted exchange actor (SR-10).
 
-The Mediums of pass 7 are typical of later passes. The proxy and MCP clients read an upstream's SSE body differently (a byte order mark, a non-UTF-8 byte, a lone surrogate, deep nesting), so a client could act on a result that was never labelled (SR-77 to SR-79). Every finding is fixed or accepted with its reasoning in its report, and none is open. An unpinned release-workflow toolchain (SR-83, Info) was fixed after pass 11. SR-100 and SR-101 from pass 10 were fixed after that pass, the six findings of pass 11 (SR-102 to SR-107, two Low and four Info) were fixed on the branch that recorded them, and so were two of pass 12 (SR-108, Low, and SR-111, Info); SR-109 and SR-110 (both Info) were fixed after that pass. The system's own authors, the maintainer working with AI coding agents, did every pass, and there has been no outside audit. A gitleaks scan of all 572 commits on 2026-11-05 found no credential (`docs/research/secret-scan-2026-11-05.md`).
+The Mediums of pass 7 are typical of later passes. The proxy and MCP clients read an upstream's SSE body differently (a byte order mark, a non-UTF-8 byte, a lone surrogate, deep nesting), so a client could act on a result that was never labelled (SR-77 to SR-79). Every finding but one is fixed or accepted with its reasoning in its report. An unpinned release-workflow toolchain (SR-83, Info) was fixed after pass 11. SR-100 and SR-101 from pass 10 were fixed after that pass, the six findings of pass 11 (SR-102 to SR-107, two Low and four Info) were fixed on the branch that recorded them, and so were two of pass 12 (SR-108, Low, and SR-111, Info); SR-109 and SR-110 (both Info) were fixed after that pass. Pass 13 fixed two Info findings (SR-113 in the Python SDK, SR-114 in CI) and left one Low open for the maintainer: the CLI and the TypeScript SDK follow a `307` or `308` from the server URL to another origin with the token request body, client credentials included (SR-112). The system's own authors, the maintainer working with AI coding agents, did every pass, and there has been no outside audit. A gitleaks scan of all 572 commits on 2026-11-05 found no credential (`docs/research/secret-scan-2026-11-05.md`).
 
 ## Reproducibility
 
