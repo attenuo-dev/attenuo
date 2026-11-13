@@ -285,7 +285,7 @@ Show the most recent audit entries, oldest of them first. Filters keep only matc
 | `-f`, `--follow` | off | Keep polling for new matching entries. |
 | `--interval-ms` | 1000 | Polling interval with `--follow`. |
 | `--kind` | all | Record kind: `decision`, `tool_result`, `approval_request`, `approval_grant`, `exchange`, `root_token`, `lease_renew`, `lease_revoke` or `admin`. Repeatable, or comma-separated; any of them matches. |
-| `--decision` | all | `allow` or `deny`. |
+| `--decision` | all | `allow` or `deny`. It matches every kind whose record carries that decision: the `tool_result` record of an allowed call is `allow` too, so add `--kind decision` to get only decision records (for example to find the `id=` for `budget refund`). |
 | `--reason` | all | The record's `reason` (`policy_deny`, `lease_revoked`, ...). |
 | `--subject` | all | The originating user. |
 | `--agent` | all | An agent anywhere in the record's chain. |
