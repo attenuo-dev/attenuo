@@ -1358,6 +1358,88 @@ mod tests {
         );
     }
 
+    /// A fresh P-256 key in the token crate's `DpopKey`, which signs ES256. `ring` makes the
+    /// key; its private scalar is read out of the PKCS#8 document (the RFC 5915 ECPrivateKey:
+    /// version 1, then the 32-byte key as an OCTET STRING) and `from_jwk` checks that it
+    /// matches the public point.
+    fn ec_key() -> DpopKey {
+        use ring::rand::SystemRandom;
+        use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
+        let rng = SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
+        let der = pkcs8.as_ref();
+        let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, der, &rng).unwrap();
+        let point = pair.public_key().as_ref();
+        let at = der
+            .windows(5)
+            .position(|w| w == [0x02, 0x01, 0x01, 0x04, 0x20])
+            .unwrap()
+            + 5;
+        DpopKey::from_jwk(&json!({
+            "kty": "EC", "crv": "P-256",
+            "d": URL_SAFE_NO_PAD.encode(&der[at..at + 32]),
+            "x": URL_SAFE_NO_PAD.encode(&point[1..33]),
+            "y": URL_SAFE_NO_PAD.encode(&point[33..65]),
+        }))
+        .unwrap()
+    }
+
+    /// Both elliptic-curve algorithms authenticate end to end, from one entry whose JWKS
+    /// holds a P-256 and an Ed25519 key: an ES256 assertion and an EdDSA one. An assertion
+    /// really signed with ES256 (by the P-256 key) but naming the Ed25519 key's `kid` is
+    /// refused as an unsupported algorithm for that key, not tried against the other key.
+    #[test]
+    fn es256_and_eddsa_assertions_authenticate() {
+        let (ec, ed) = (ec_key(), ed_key());
+        assert_eq!((ec.alg(), ed.alg()), ("ES256", "EdDSA"));
+        let c = Clients::agents(
+            &[AgentConfig::with_jwks(
+                "coder",
+                jwks(&[public(&ec, Some("p256")), public(&ed, Some("ed25519"))]),
+            )],
+            policy(),
+        )
+        .unwrap();
+        let ec = Signer {
+            key: ec,
+            kid: Some("p256"),
+        };
+        let ed = Signer {
+            key: ed,
+            kid: Some("ed25519"),
+        };
+        let h = HeaderMap::new();
+        for s in [&ec, &ed] {
+            let a = s.sign(&claims("coder"));
+            let header: Value = serde_json::from_slice(
+                &URL_SAFE_NO_PAD
+                    .decode(a.split('.').next().unwrap())
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(header["alg"], s.key.alg());
+            let auth = c.authenticate(&h, None, None, Some(&a), now()).unwrap();
+            assert_eq!(
+                (auth.id(), auth.method()),
+                ("coder", ClientMethod::PrivateKeyJwt)
+            );
+            assert_eq!(verify(&c, &a, Some("coder")).unwrap().client, "coder");
+        }
+        let crossed = Signer {
+            key: ec.key,
+            kid: Some("ed25519"),
+        }
+        .sign(&claims("coder"));
+        assert_eq!(
+            verify(&c, &crossed, None).unwrap_err(),
+            "client_assertion_unsupported_alg"
+        );
+        assert_eq!(
+            code(c.authenticate(&h, None, None, Some(&crossed), now())),
+            "client_assertion_unsupported_alg"
+        );
+    }
+
     /// One method per request; and an entry is authenticated only by what it holds.
     #[test]
     fn methods_do_not_mix_or_substitute() {
