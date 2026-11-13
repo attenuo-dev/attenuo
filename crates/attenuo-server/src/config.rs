@@ -745,6 +745,14 @@ pub struct AuditSection {
     /// piling up blocked threads. Default 10, between 1 and 300.
     #[serde(default = "default_append_timeout_seconds")]
     pub append_timeout_seconds: u64,
+    /// Start even when `sqlite_path`'s directory is on a network filesystem (NFS, SMB/CIFS,
+    /// 9p, CephFS, Lustre, AFS, ...). Default `false`: the server refuses to start there,
+    /// because SQLite in WAL mode needs every process on one host and file locks there may
+    /// not keep a second writer out (multi-replica design, step 2). Set it only when one host
+    /// ever mounts the filesystem and its locking is known to work; the server then logs a
+    /// warning at every start. Ignored for `":memory:"`.
+    #[serde(default)]
+    pub allow_network_filesystem: bool,
     /// `[audit.sink]`: ship every signed checkpoint off the host as it is created (SR-21).
     /// Unset by default.
     #[serde(default)]
@@ -990,6 +998,7 @@ impl Default for AuditSection {
             wal_checkpoint_seconds: default_wal_checkpoint_seconds(),
             append_queue_max: default_append_queue_max(),
             append_timeout_seconds: default_append_timeout_seconds(),
+            allow_network_filesystem: false,
             sink: None,
         }
     }
@@ -3305,6 +3314,14 @@ mod tests {
             attenuo_audit::Durability::Full
         );
         assert!(Config::from_toml("[audit]\ndurability = \"off\"\n").is_err());
+        assert!(!cfg.audit.allow_network_filesystem);
+        assert!(
+            Config::from_toml("[audit]\nallow_network_filesystem = true\n")
+                .unwrap()
+                .audit
+                .allow_network_filesystem
+        );
+        assert!(Config::from_toml("[audit]\nallow_network_filesystem = \"yes\"\n").is_err());
         assert_eq!(cfg.issuer.default_ttl_seconds, 900);
         assert!(cfg.admin.token.is_none());
         assert!(

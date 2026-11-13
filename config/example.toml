@@ -115,6 +115,10 @@ wal_checkpoint_seconds = 5
 # piling up blocked threads.
 append_queue_max = 1024
 append_timeout_seconds = 10
+# The server refuses to start when sqlite_path's directory is on a network filesystem (NFS,
+# SMB/CIFS, 9p, CephFS, Lustre, AFS): SQLite's WAL mode and the single-writer lock are not
+# reliable there. true starts it anyway, with a warning; only if one host ever mounts it.
+allow_network_filesystem = false
 
 # Ship every signed checkpoint off the host as it is created (SR-21). The signing key lives
 # here, so only a copy that already left the host shows a log rewritten and re-signed later

@@ -436,7 +436,7 @@ Added for the 2026-11-07 audit (A-2 and O-1, A-3, and the deadline part of S-4).
 - **CLI.** No CLI path opens the database: `attenuo audit verify` and `audit export` read through the admin API (`GET /admin/audit/verify`, `/admin/audit/export`) or from an export file. They keep working while the server runs, and nothing needed a read-only exception. Opening the file with `sqlite3` is not fenced.
 - **Path spelling.** The database path is canonicalised (the file if it exists, otherwise its directory), so `data/../audit.sqlite` and a symbolic link meet the same lock.
 - **Rejected.** `PRAGMA locking_mode=EXCLUSIVE`: it holds SQLite's own lock for the connection's life, which would lock out the server's own second store and the WAL checkpointer's connection, and in WAL mode it changes how the `-shm` index is kept. A pid file without a lock: it goes stale after a crash and needs a liveness check that races. `fs2`/`fs4`: not needed since `File::try_lock` is in std.
-- **Not built.** The refusal to run on a network filesystem (multi-replica step 2's second half).
+- **Network filesystems.** Before the fence, `open_storage` runs `statfs` on the database's directory and refuses NFS, SMB/CIFS, 9p, CephFS, Lustre, AFS and the like with `AuditError::NetworkFilesystem`, unless `[audit] allow_network_filesystem` is set (a warning instead). FUSE and a failed probe are logged, not refused. Details in [multi-replica](multi-replica.md#step-2-as-built), step 2.
 
 ### Schema versions and migrations
 

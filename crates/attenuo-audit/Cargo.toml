@@ -30,6 +30,11 @@ time = { workspace = true }
 rusqlite = { workspace = true }
 ring = { workspace = true }
 
+# `statfs(2)` without `unsafe`, to refuse a database on a network filesystem
+# (`sqlite::filesystem`). Already in the lock file through `tempfile`.
+[target.'cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios"))'.dependencies]
+rustix = { workspace = true }
+
 [dev-dependencies]
 # Enables the `testing` hooks for this crate's own integration tests.
 attenuo-audit = { path = ".", features = ["testing"] }

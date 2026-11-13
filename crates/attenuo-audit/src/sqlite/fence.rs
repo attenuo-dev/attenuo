@@ -131,7 +131,7 @@ fn restrict_to_owner(file: &File) -> std::io::Result<()> {
 
 /// `database` with symbolic links and `..` resolved: the file itself when it exists, else its
 /// directory joined with its name. Unchanged when neither resolves (the open then reports it).
-fn resolve(database: &Path) -> PathBuf {
+pub(super) fn resolve(database: &Path) -> PathBuf {
     if let Ok(p) = std::fs::canonicalize(database) {
         return p;
     }

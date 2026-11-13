@@ -73,9 +73,9 @@ pub use shipped::{
 };
 pub use spans::{SpanHit, MAX_SEQS_PER_PROBE, MAX_SPANS_PER_RUN};
 pub use sqlite::{
-    AppendStats, Durability, NewNotice, OutboxNotice, SchemaState, SqliteAudit, SqliteLeaseStore,
-    WalCheckpoint, WalStats, WriterFence, CHECKPOINT_PRESYNC_LEAD, DEFAULT_APPEND_QUEUE,
-    DEFAULT_APPEND_TIMEOUT, DEFAULT_WAL_CHECKPOINT_INTERVAL, SCHEMA_VERSION,
+    AppendStats, Durability, Filesystem, NewNotice, OutboxNotice, SchemaState, SqliteAudit,
+    SqliteLeaseStore, WalCheckpoint, WalStats, WriterFence, CHECKPOINT_PRESYNC_LEAD,
+    DEFAULT_APPEND_QUEUE, DEFAULT_APPEND_TIMEOUT, DEFAULT_WAL_CHECKPOINT_INTERVAL, SCHEMA_VERSION,
     WAL_CHECKPOINT_COMMITS, WAL_WRITER_BACKSTOP_FRAMES,
 };
 #[cfg(feature = "testing")]

@@ -667,6 +667,9 @@ fn open_storage(
             .create(dir)
             .with_context(|| format!("creating {}", dir.display()))?;
     }
+    // Before the lock and the file: on a network filesystem neither can be trusted.
+    check_filesystem(p, cfg.allow_network_filesystem)
+        .with_context(|| format!("checking the filesystem of {path}"))?;
     // Before the file is opened: a second server on the same file stops here, before it has
     // touched the database, recovered the outbox or started a writer (audit A-2).
     let fence = attenuo_audit::WriterFence::acquire(p)
@@ -706,6 +709,65 @@ fn open_storage(
         "audit store opened (WAL)"
     );
     Ok((audit, Arc::new(leases), Some(fence)))
+}
+
+/// Refuse a database whose directory is on a network filesystem, unless `allow` (the
+/// `[audit] allow_network_filesystem` escape hatch, which logs a warning instead).
+fn check_filesystem(database: &Path, allow: bool) -> Result<(), attenuo_audit::AuditError> {
+    let probed = attenuo_audit::sqlite::filesystem::probe(database);
+    filesystem_verdict(database, probed, allow)
+}
+
+/// What [`check_filesystem`] does with what the probe found. FUSE is logged and allowed: it
+/// may be local or remote. Not knowing (a `statfs` error, a platform without the check) is
+/// logged and allowed too: the check exists to stop a known-bad placement, not to make
+/// start-up depend on it (multi-replica design, step 2).
+fn filesystem_verdict(
+    database: &Path,
+    probed: std::io::Result<attenuo_audit::Filesystem>,
+    allow: bool,
+) -> Result<(), attenuo_audit::AuditError> {
+    use attenuo_audit::Filesystem;
+    let path = database.display().to_string();
+    match probed {
+        Ok(Filesystem::Network(fs)) if allow => {
+            tracing::warn!(
+                path,
+                filesystem = fs,
+                "the database is on a network filesystem and [audit] allow_network_filesystem \
+                 is set: SQLite's WAL mode and the single-writer lock are not reliable there; \
+                 make sure only this host ever mounts it"
+            );
+            Ok(())
+        }
+        Ok(Filesystem::Network(fs)) => Err(attenuo_audit::AuditError::NetworkFilesystem {
+            dir: attenuo_audit::sqlite::filesystem::directory_of(database),
+            fs,
+        }),
+        Ok(Filesystem::Fuse) => {
+            tracing::warn!(
+                path,
+                "the database is on a FUSE filesystem; if it is a network filesystem (sshfs, \
+                 s3fs, GlusterFS, ceph-fuse), SQLite's WAL mode and the single-writer lock are \
+                 not reliable there: move it to a local disk"
+            );
+            Ok(())
+        }
+        Ok(Filesystem::Other) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+            tracing::info!(path, "{e}; the database's filesystem was not checked");
+            Ok(())
+        }
+        Err(e) => {
+            tracing::warn!(
+                path,
+                error = %e,
+                "could not tell the filesystem type of the database's directory; not checked \
+                 for a network filesystem"
+            );
+            Ok(())
+        }
+    }
 }
 
 /// Serve the audit store's shed appends as `audit_append_shed_total`. Weak, as for the WAL
@@ -1183,5 +1245,64 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+    }
+
+    /// Multi-replica step 2: a database on a network filesystem stops start-up with the
+    /// stable error, naming the filesystem and the escape hatch.
+    #[test]
+    fn a_network_filesystem_refuses_to_start() {
+        use attenuo_audit::{AuditError, Filesystem};
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("audit.sqlite");
+        for fs in ["nfs", "cifs", "smb2", "9p", "ceph", "lustre", "smbfs"] {
+            let err = filesystem_verdict(&db, Ok(Filesystem::Network(fs)), false).unwrap_err();
+            let text = err.to_string();
+            assert!(matches!(err, AuditError::NetworkFilesystem { fs: f, .. } if f == fs));
+            let shown = std::fs::canonicalize(dir.path()).unwrap();
+            assert!(
+                text.starts_with(&format!(
+                    "{} is on a network filesystem ({fs}): ",
+                    shown.display()
+                )),
+                "{text}"
+            );
+            assert!(
+                text.contains("`[audit] allow_network_filesystem = true`"),
+                "{text}"
+            );
+            assert!(text.contains("ReadWriteOnce"), "{text}");
+        }
+    }
+
+    /// The escape hatch, FUSE, a local filesystem and a failed or unsupported probe all
+    /// start: only a known network filesystem without the setting is refused.
+    #[test]
+    fn everything_but_a_known_network_filesystem_starts() {
+        use attenuo_audit::Filesystem;
+        let db = Path::new("/var/lib/attenuo/audit.sqlite");
+        assert!(filesystem_verdict(db, Ok(Filesystem::Network("nfs")), true).is_ok());
+        for allow in [false, true] {
+            assert!(filesystem_verdict(db, Ok(Filesystem::Fuse), allow).is_ok());
+            assert!(filesystem_verdict(db, Ok(Filesystem::Other), allow).is_ok());
+            let failed = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+            assert!(filesystem_verdict(db, Err(failed), allow).is_ok());
+            let unsupported = std::io::Error::from(std::io::ErrorKind::Unsupported);
+            assert!(filesystem_verdict(db, Err(unsupported), allow).is_ok());
+        }
+    }
+
+    /// The real probe on a temp directory (local on any test machine) lets the server start
+    /// on a file there, with the setting at its default.
+    #[test]
+    fn a_local_temp_dir_passes_the_filesystem_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("data/audit.sqlite");
+        std::fs::create_dir(dir.path().join("data")).unwrap();
+        check_filesystem(&db, false).unwrap();
+        let mut cfg = Config::default();
+        assert!(!cfg.audit.allow_network_filesystem);
+        cfg.audit.sqlite_path = db.to_string_lossy().into_owned();
+        let (_router, state) = crate::build(&cfg).unwrap();
+        assert!(state.store_fence().is_some());
     }
 }
