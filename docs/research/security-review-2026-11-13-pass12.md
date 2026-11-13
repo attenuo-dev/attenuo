@@ -30,14 +30,14 @@ Denial of service is out of scope as a security property in the threat model. SR
 | High | 0 | 0 | 0 | 0 |
 | Medium | 0 | 0 | 0 | 0 |
 | Low | 1 | 1 | 0 | 0 |
-| Info | 3 | 1 | 2 | 0 |
-| **Total** | **4** | **2** | **2** | **0** |
+| Info | 3 | 2 (SR-111; SR-110 after the pass) | 1 | 0 |
+| **Total** | **4** | **3** | **1** | **0** |
 
 | ID | Severity | Component | Title | Status |
 |---|---|---|---|---|
 | SR-108 | Low | server (`routes/token.rs`, `idp/intake.rs`, `limits.rs`) | An agent over `token_requests_per_minute` still had its client assertion recorded, one replay-store write per refused request | Fixed, test `a_rate_limited_agent_does_not_spend_its_assertion_sr108` |
 | SR-109 | Info | server (`limits.rs` `token_peer_limit`) | A full per-peer table refuses every new address, so agents with good credentials are refused before they can authenticate | Proposed, test `a_full_peer_table_refuses_an_authenticated_agent_sr109` pins today's behaviour |
-| SR-110 | Info | server (`clientauth.rs` `verify_assertion`) | A refused client assertion tells an unauthenticated caller which client ids have keys, and whether one key or several | Proposed, test `an_assertion_refusal_tells_which_client_ids_have_keys_sr110` pins today's behaviour |
+| SR-110 | Info | server (`clientauth.rs` `verify_assertion`) | A refused client assertion tells an unauthenticated caller which client ids have keys, and whether one key or several | Fixed after the pass (`fix/sr-109-sr-110`, option 1), test `an_assertion_refusal_does_not_tell_which_client_ids_have_keys_sr110` |
 | SR-111 | Info | server (`routes/token.rs`, `idp/intake.rs`, `dpop.rs`) | With `dpop_nonce = "required"`, the `use_dpop_nonce` retry of a request with a client assertion was refused as a replay | Fixed, test `a_nonce_retry_can_resend_its_assertion_sr111` |
 
 ## Findings
@@ -68,7 +68,7 @@ Denial of service is out of scope as a security property in the threat model. SR
   Option 2 is the closest to what the limit promises; option 4 is the smallest change.
 - **Test.** `limits::tests::a_full_peer_table_refuses_an_authenticated_agent_sr109` pins today's behaviour and will change with the option chosen.
 
-### SR-110: a refused client assertion tells which client ids have keys (Info, proposed)
+### SR-110: a refused client assertion tells which client ids have keys (Info, fixed)
 
 - **Confirmed by reading.** `clientauth.rs` (at `a0712f2`) `verify_assertion` looks the client up by the unverified `sub` at line 526 and refuses an unknown id, or one without keys, as `UnknownClient`, whose code is `client_authentication_failed` (line 707). For an id that has keys it goes on to the algorithm (line 533), the `kid` (lines 537 and 543) and the signature (line 556), each with its own code: `client_assertion_unsupported_alg`, `client_assertion_unknown_kid`, `client_assertion_bad_signature` (lines 708 to 710).
 - **Attacker.** Anyone who can send `POST /token`, or a body to the AuthZEN endpoints for `[[peps]]`, with no credential.
@@ -81,6 +81,7 @@ Denial of service is out of scope as a security property in the threat model. SR
 
   Option 1 matches the secret path; option 3 keeps the most help for an operator setting up keys.
 - **Test.** `private_key_jwt::an_assertion_refusal_tells_which_client_ids_have_keys_sr110` pins today's behaviour and will change with the option chosen.
+- **Fixed after the pass** on `fix/sr-109-sr-110`, with option 1 ([ADR-0017 update](../decisions/0017-private-key-jwt.md#update-2026-11-13-one-answer-until-the-signature-verifies-sr-110)). An unknown id, an entry without keys, an unknown `kid`, a key of another algorithm and a bad signature are one answer, `client_authentication_failed` with one `detail`; the reason is in the debug log. The `alg` allowlist and the `kid` type are checked before the lookup and keep their codes; `client_assertion_bad_signature` and `client_assertion_unknown_kid` are removed. A refusal with no key of the client to verify with verifies against a decoy key of the same algorithm, so an unknown id costs a signature verification too; an RSA key larger than the decoy's 2048 bits still verifies more slowly. Tests `an_assertion_refusal_does_not_tell_which_client_ids_have_keys_sr110` (six cases, byte for byte, at an exchange and at hop 0) and `refusals_after_the_signature_keep_their_codes_sr110`.
 
 ### SR-111: the nonce retry of a request with a client assertion was refused as a replay (Info, fixed)
 

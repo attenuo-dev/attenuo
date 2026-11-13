@@ -265,6 +265,8 @@ pub struct Clients {
     kind: ClientKind,
     list: Vec<Client>,
     policy: AssertionPolicy,
+    /// [`DECOY_JWKS`], parsed.
+    decoys: Vec<ClientKey>,
 }
 
 /// Most keys one entry's `jwks` may hold.
@@ -349,7 +351,14 @@ impl Clients {
                 keys,
             });
         }
-        Ok(Self { kind, list, policy })
+        let decoys = parse_client_jwks(DECOY_JWKS)
+            .map_err(|e| anyhow::anyhow!("the decoy client keys do not parse: {e}"))?;
+        Ok(Self {
+            kind,
+            list,
+            policy,
+            decoys,
+        })
     }
 
     /// No entries.
@@ -369,6 +378,19 @@ impl Clients {
 
     fn find(&self, id: &str) -> Option<&Client> {
         self.list.iter().find(|c| c.id == id)
+    }
+
+    /// Verify `assertion` against the decoy key of `alg` and throw the outcome away: the work
+    /// a refusal without a key of the client to verify with does instead (SR-110).
+    fn decoy_verify(&self, alg: Algorithm, assertion: &str) {
+        if let Some(decoy) = self.decoys.iter().find(|k| k.alg == alg) {
+            let outcome = jsonwebtoken::decode::<Map<String, Value>>(
+                assertion,
+                &decoy.key,
+                &signature_only(alg),
+            );
+            std::hint::black_box(outcome.is_ok());
+        }
     }
 
     /// Authenticate a client by whichever credential the request carries; see the module
@@ -478,19 +500,23 @@ impl Clients {
     ///    delegation token, an ID-JAG, an access token, a DPoP proof) is refused.
     /// 2. `iss` and `sub` are non-empty strings and equal, and equal the request's
     ///    `client_id` (`pep_id`) when it names one.
-    /// 3. `sub` names an entry with keys; otherwise `client_authentication_failed`, as for a
-    ///    wrong secret.
-    /// 4. `alg` is in [`CLIENT_ASSERTION_ALGS`] (never `none` or an HMAC); the key is the one
-    ///    with the header's `kid`, or the entry's only key when there is no `kid`; and the key
-    ///    is for that `alg`.
-    /// 5. The signature.
-    /// 6. `aud` is the server's issuer identifier (`[issuer] issuer`): a string equal to it,
+    /// 3. `alg` is in [`CLIENT_ASSERTION_ALGS`] (never `none` or an HMAC), and `kid`, when
+    ///    present, is a string. These are server-wide, checked before the client is looked up.
+    /// 4. `sub` names an entry with keys; the key is the one with the header's `kid`, or the
+    ///    entry's only key when there is no `kid`; the key is for that `alg`; and the
+    ///    signature verifies with it. Every failure of this step is the same answer,
+    ///    `client_authentication_failed` as for a wrong secret, with the same `detail`, so a
+    ///    caller that holds no key of the client cannot tell an unknown id, an id without
+    ///    keys, an unknown `kid` or a key of another algorithm from a bad signature (SR-110);
+    ///    the failures that have no key to verify with verify against a decoy key instead
+    ///    ([`DECOY_JWKS`]). The reason is logged at debug level.
+    /// 5. `aud` is the server's issuer identifier (`[issuer] issuer`): a string equal to it,
     ///    or a non-empty array whose every element equals it. The token endpoint URL and any
     ///    other value are refused.
-    /// 7. `exp` is required, not past (with the skew), and at most
+    /// 6. `exp` is required, not past (with the skew), and at most
     ///    `client_assertion_max_lifetime_seconds` (plus the skew) ahead; `nbf` and `iat`, when
     ///    present, are not in the future (with the skew).
-    /// 8. `jti` is a required non-empty string of at most 256 bytes.
+    /// 7. `jti` is a required non-empty string of at most 256 bytes.
     pub(crate) fn verify_assertion(
         &self,
         assertion: &str,
@@ -520,41 +546,57 @@ impl Clients {
                 "the request's client id is not the assertion's sub",
             ));
         }
-        let client = self
-            .find(sub)
-            .filter(|c| c.has_keys())
-            .ok_or(AssertionError::UnknownClient)?;
-
+        // Checks that do not depend on the client come before the lookup, so that their
+        // specific codes cannot tell which ids exist (SR-110). The algorithms are server-wide.
         let alg = header
             .get("alg")
             .and_then(Value::as_str)
             .and_then(|a| Algorithm::from_str(a).ok())
             .filter(|a| allowed_alg(*a))
             .ok_or(AssertionError::UnsupportedAlg)?;
-        let key = match header.get("kid") {
-            None | Some(Value::Null) => match client.keys.as_slice() {
-                [only] => only,
-                _ => return Err(AssertionError::UnknownKid),
-            },
-            Some(Value::String(kid)) => client
-                .keys
-                .iter()
-                .find(|k| k.kid.as_deref() == Some(kid.as_str()))
-                .ok_or(AssertionError::UnknownKid)?,
+        let kid = match header.get("kid") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(kid)) => Some(kid.as_str()),
             Some(_) => return Err(AssertionError::Malformed("kid is not a string")),
         };
+
+        // From here until the signature has verified, every refusal is the same answer
+        // (`client_authentication_failed`, as for a wrong secret), and one that has no key of
+        // the client to verify with verifies against a decoy key of the same algorithm, so that
+        // an unknown id, an id without keys, an unknown `kid` and a key of another algorithm
+        // cost a signature verification like a bad signature does (SR-110). The specific
+        // reason goes to the debug log only.
+        let refuse = |why: Unverified| {
+            self.decoy_verify(alg, assertion);
+            AssertionError::NotAuthenticated(why)
+        };
+        let Some(client) = self.find(sub) else {
+            return Err(refuse(Unverified::UnknownClient));
+        };
+        if !client.has_keys() {
+            return Err(refuse(Unverified::NoKeys));
+        }
+        let key = match kid {
+            None => match client.keys.as_slice() {
+                [only] => only,
+                _ => return Err(refuse(Unverified::UnknownKid)),
+            },
+            Some(kid) => match client.keys.iter().find(|k| k.kid.as_deref() == Some(kid)) {
+                Some(k) => k,
+                None => return Err(refuse(Unverified::UnknownKid)),
+            },
+        };
         if key.alg != alg {
-            return Err(AssertionError::UnsupportedAlg);
+            return Err(refuse(Unverified::KeyAlgMismatch));
         }
 
-        let mut validation = Validation::new(key.alg);
-        validation.validate_exp = false;
-        validation.validate_nbf = false;
-        validation.validate_aud = false;
-        validation.required_spec_claims.clear();
-        let claims = jsonwebtoken::decode::<Map<String, Value>>(assertion, &key.key, &validation)
-            .map_err(|_| AssertionError::BadSignature)?
-            .claims;
+        let claims = jsonwebtoken::decode::<Map<String, Value>>(
+            assertion,
+            &key.key,
+            &signature_only(key.alg),
+        )
+        .map_err(|_| AssertionError::NotAuthenticated(Unverified::BadSignature))?
+        .claims;
         // The verified payload is the one peeked at; `iss` and `sub` were checked on it.
 
         let p = &self.policy;
@@ -604,6 +646,28 @@ impl Clients {
         })
     }
 }
+
+/// A validation that checks the signature with `alg` and nothing else: the claims are checked
+/// by [`Clients::verify_assertion`] itself.
+fn signature_only(alg: Algorithm) -> Validation {
+    let mut validation = Validation::new(alg);
+    validation.validate_exp = false;
+    validation.validate_nbf = false;
+    validation.validate_aud = false;
+    validation.required_spec_claims.clear();
+    validation
+}
+
+/// Public keys, one per algorithm of [`CLIENT_ASSERTION_ALGS`], whose private halves were
+/// thrown away when they were made. A refused assertion that has no key of the client to be
+/// verified with is verified against the one of its algorithm (and refused whatever the
+/// outcome), so that an unknown client id costs about what a bad signature does (SR-110). The
+/// RSA key is 2048 bits, the smallest a client's may be.
+const DECOY_JWKS: &str = r#"{"keys":[
+{"kty":"RSA","kid":"decoy-rs256","e":"AQAB","n":"pX1GfhnQTCVuVfVtWZ1IAtNx378l1QCdWk5c0XGyBUGYiWrkfrdduEmOImieB-SnUzqgiM14prYqbp6Sd-JNykZjBNqU73pACESFAvaOVqObNjZBZtiNivSUkm5XoSjkKo7HStGhOdodar9CkSa-aVyUgSOsPtAeOyoY7HmxGzV7NO49VhS4W_Qz3BpH8x_6Ioto3m4sp2ft6UTXk190pWaxX--OxGbbWfgi9R8RqGPr3KxYIep5f3BNKjKQRODmuj-BaFXI92JjrDYfqkcAym9-a9x13y2UCUfjCQC_U_HVTU_LSUwreZlOUEZoxqoaV0AwhhK6Z8636ngBdrCyZQ"},
+{"kty":"EC","crv":"P-256","kid":"decoy-es256","x":"QJClA3Kr1c2kNzeXMdgXZoq_cEKBoS0sYKQOM5ZXq7I","y":"dHQ7FmzYT66EeSK6zSWjjE8uQqNhHF-f5xlm3NWXTg4"},
+{"kty":"OKP","crv":"Ed25519","kid":"decoy-eddsa","x":"DJ5bniDYAmrmCNJd5wUssJlPcouDf48lma3i-3DZ9K8"}
+]}"#;
 
 /// Is `alg` one of [`CLIENT_ASSERTION_ALGS`]?
 fn allowed_alg(alg: Algorithm) -> bool {
@@ -703,14 +767,13 @@ pub(crate) enum AssertionError {
     Malformed(&'static str),
     #[error("client_assertion iss and sub must both name the client, and match the request's client id: {0}")]
     SubjectMismatch(&'static str),
-    #[error("unknown client, or a client without keys")]
-    UnknownClient,
-    #[error("client_assertion algorithm is not accepted for the client's keys")]
+    /// `alg` is not one of [`CLIENT_ASSERTION_ALGS`]: a server-wide check, made before the
+    /// client is looked up.
+    #[error("client_assertion alg is not one this server accepts (RS256, ES256, EdDSA)")]
     UnsupportedAlg,
-    #[error("client_assertion kid names none of the client's keys (or is missing and the client has several)")]
-    UnknownKid,
-    #[error("client_assertion signature does not verify")]
-    BadSignature,
+    /// No key of the named client verified the assertion; the reason is for the log only.
+    #[error("unknown client, or the client_assertion is not signed by one of the client's keys")]
+    NotAuthenticated(Unverified),
     #[error("client_assertion aud must be this server's issuer identifier, and nothing else")]
     AudienceMismatch,
     #[error("client_assertion claim `{0}` is missing or has the wrong type")]
@@ -733,10 +796,8 @@ impl AssertionError {
         match self {
             AssertionError::Malformed(_) => "client_assertion_malformed",
             AssertionError::SubjectMismatch(_) => "client_assertion_subject_mismatch",
-            AssertionError::UnknownClient => "client_authentication_failed",
             AssertionError::UnsupportedAlg => "client_assertion_unsupported_alg",
-            AssertionError::UnknownKid => "client_assertion_unknown_kid",
-            AssertionError::BadSignature => "client_assertion_bad_signature",
+            AssertionError::NotAuthenticated(_) => "client_authentication_failed",
             AssertionError::AudienceMismatch => "client_assertion_audience_mismatch",
             AssertionError::MissingClaim(_) => "client_assertion_missing_claim",
             AssertionError::Expired => "client_assertion_expired",
@@ -747,10 +808,45 @@ impl AssertionError {
     }
 }
 
+/// Why an assertion did not authenticate before its signature verified. Never sent: every
+/// one is [`AssertionError::NotAuthenticated`], `client_authentication_failed` (SR-110).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Unverified {
+    /// No entry has the assertion's `sub` as its id.
+    UnknownClient,
+    /// The entry has no `jwks`.
+    NoKeys,
+    /// The `kid` names none of the entry's keys, or there is none and the entry has several.
+    UnknownKid,
+    /// The key the `kid` names is for another algorithm than the header's `alg`.
+    KeyAlgMismatch,
+    /// The signature does not verify with the key.
+    BadSignature,
+}
+
+impl Unverified {
+    /// The reason in the server's debug log.
+    fn reason(self) -> &'static str {
+        match self {
+            Unverified::UnknownClient => "unknown_client",
+            Unverified::NoKeys => "client_without_keys",
+            Unverified::UnknownKid => "unknown_kid",
+            Unverified::KeyAlgMismatch => "key_alg_mismatch",
+            Unverified::BadSignature => "bad_signature",
+        }
+    }
+}
+
 impl From<AssertionError> for ApiError {
     fn from(e: AssertionError) -> Self {
         let d = e.description();
-        tracing::debug!(reason = d, detail = %e, "client assertion refused");
+        match e {
+            // The specific reason stays in the log (SR-110).
+            AssertionError::NotAuthenticated(why) => {
+                tracing::debug!(reason = why.reason(), "client assertion refused");
+            }
+            _ => tracing::debug!(reason = d, detail = %e, "client assertion refused"),
+        }
         invalid_client(d, e.to_string())
     }
 }
@@ -1177,6 +1273,14 @@ mod tests {
             .map_err(|e| e.description())
     }
 
+    /// The logged reason of a refusal that is `client_authentication_failed` (SR-110).
+    fn unverified(c: &Clients, a: &str) -> Unverified {
+        match c.verify_assertion(a, None, now()) {
+            Err(AssertionError::NotAuthenticated(why)) => why,
+            other => panic!("expected NotAuthenticated, got {other:?}"),
+        }
+    }
+
     #[test]
     fn a_valid_assertion_authenticates_with_either_rotated_key() {
         let (c, old, new, solo, both) = setup();
@@ -1252,31 +1356,59 @@ mod tests {
             verify(&c, &sign(claims("coder")), Some("solo")).unwrap_err(),
             "client_assertion_subject_mismatch"
         );
-        // Unknown client, and a client without keys, look like a wrong secret.
-        assert_eq!(v(&sign(claims("ghost"))), "client_authentication_failed");
+        // A kid that is not a string, checked before the lookup: the same for any client id.
+        for id in ["coder", "ghost"] {
+            let bad_kid = new
+                .key
+                .sign_jws(&json!({"alg": "EdDSA", "kid": 7}), &claims(id));
+            assert_eq!(v(&bad_kid), "client_assertion_malformed", "{id}");
+        }
+        // Everything before the signature has verified is one answer, as for a wrong secret
+        // (SR-110), with the specific reason kept for the log. Unknown client, and a client
+        // without keys.
+        let fail = "client_authentication_failed";
+        let ghost = sign(claims("ghost"));
         assert_eq!(
-            v(&sign(claims("secretive"))),
-            "client_authentication_failed"
+            (v(&ghost), unverified(&c, &ghost)),
+            (fail, Unverified::UnknownClient)
+        );
+        let secretive = sign(claims("secretive"));
+        assert_eq!(
+            (v(&secretive), unverified(&c, &secretive)),
+            (fail, Unverified::NoKeys)
         );
         // kid.
         let other_kid = new
             .key
             .sign_jws(&json!({"alg": "EdDSA", "kid": "nope"}), &claims("coder"));
-        assert_eq!(v(&other_kid), "client_assertion_unknown_kid");
+        assert_eq!(
+            (v(&other_kid), unverified(&c, &other_kid)),
+            (fail, Unverified::UnknownKid)
+        );
         let no_kid = new.key.sign_jws(&json!({"alg": "EdDSA"}), &claims("coder"));
-        assert_eq!(v(&no_kid), "client_assertion_unknown_kid");
+        assert_eq!(
+            (v(&no_kid), unverified(&c, &no_kid)),
+            (fail, Unverified::UnknownKid)
+        );
         // Signature: the other rotated key's kid, signed by the new key; another client's key.
         let swapped = new
             .key
             .sign_jws(&json!({"alg": "EdDSA", "kid": "2026-10"}), &claims("coder"));
-        assert_eq!(v(&swapped), "client_assertion_bad_signature");
         let by_solo = solo
             .key
             .sign_jws(&json!({"alg": "EdDSA", "kid": "2026-11"}), &claims("coder"));
-        assert_eq!(v(&by_solo), "client_assertion_bad_signature");
         let mut tampered = old.sign(&claims("coder"));
         tampered.push('A');
-        assert_eq!(v(&tampered), "client_assertion_bad_signature");
+        for a in [&swapped, &by_solo, &tampered] {
+            assert_eq!((v(a), unverified(&c, a)), (fail, Unverified::BadSignature));
+        }
+        // And all of them are the same ApiError: status, error, code, detail.
+        let h = HeaderMap::new();
+        let answers: Vec<ApiError> = [&ghost, &secretive, &other_kid, &no_kid, &swapped]
+            .into_iter()
+            .map(|a| c.authenticate(&h, None, None, Some(a), now()).unwrap_err())
+            .collect();
+        assert!(answers.iter().all(|e| *e == answers[0]), "{answers:?}");
         // Audience: the token endpoint URL, another server, an extra value, an empty array.
         for aud in [
             json!(format!("{AUD}/token")),
@@ -1367,12 +1499,24 @@ mod tests {
                 "client_assertion_unsupported_alg"
             );
         }
-        // ES256 is allowed, but not for an Ed25519 key.
+        // ES256 is allowed, but not for an Ed25519 key: refused like a bad signature, since
+        // the answer would tell the key's algorithm (SR-110).
         let es = new
             .key
             .sign_jws(&json!({"alg": "ES256", "kid": "2026-11"}), &claims("coder"));
         assert_eq!(
             verify(&c, &es, None).unwrap_err(),
+            "client_authentication_failed"
+        );
+        assert_eq!(unverified(&c, &es), Unverified::KeyAlgMismatch);
+        // `none` and HMAC are refused before the lookup, so the same for an unknown id.
+        let ghost_none = format!(
+            "{}.{}.",
+            enc(&json!({"alg": "none"})),
+            enc(&claims("ghost"))
+        );
+        assert_eq!(
+            verify(&c, &ghost_none, None).unwrap_err(),
             "client_assertion_unsupported_alg"
         );
         let ps = new
@@ -1382,6 +1526,22 @@ mod tests {
             verify(&c, &ps, None).unwrap_err(),
             "client_assertion_unsupported_alg"
         );
+    }
+
+    /// There is a decoy key for every accepted algorithm, so that every refusal without a key
+    /// of the client verifies a signature (SR-110), and none has a private member.
+    #[test]
+    fn a_decoy_key_for_every_algorithm() {
+        let (c, ..) = setup();
+        for alg in CLIENT_ASSERTION_ALGS {
+            let alg = Algorithm::from_str(alg).unwrap();
+            assert_eq!(
+                c.decoys.iter().filter(|k| k.alg == alg).count(),
+                1,
+                "{alg:?}"
+            );
+        }
+        assert_eq!(c.decoys.len(), CLIENT_ASSERTION_ALGS.len());
     }
 
     /// A fresh P-256 key in the token crate's `DpopKey`, which signs ES256. `ring` makes the
@@ -1413,7 +1573,7 @@ mod tests {
     /// Both elliptic-curve algorithms authenticate end to end, from one entry whose JWKS
     /// holds a P-256 and an Ed25519 key: an ES256 assertion and an EdDSA one. An assertion
     /// really signed with ES256 (by the P-256 key) but naming the Ed25519 key's `kid` is
-    /// refused as an unsupported algorithm for that key, not tried against the other key.
+    /// refused, not tried against the other key, with the answer of a bad signature (SR-110).
     #[test]
     fn es256_and_eddsa_assertions_authenticate() {
         let (ec, ed) = (ec_key(), ed_key());
@@ -1456,13 +1616,10 @@ mod tests {
             kid: Some("ed25519"),
         }
         .sign(&claims("coder"));
-        assert_eq!(
-            verify(&c, &crossed, None).unwrap_err(),
-            "client_assertion_unsupported_alg"
-        );
+        assert_eq!(unverified(&c, &crossed), Unverified::KeyAlgMismatch);
         assert_eq!(
             code(c.authenticate(&h, None, None, Some(&crossed), now())),
-            "client_assertion_unsupported_alg"
+            "client_authentication_failed"
         );
     }
 
