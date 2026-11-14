@@ -65,6 +65,8 @@ The response:
 }
 ```
 
+The CLI sends the same request with `attenuo token exchange --subject-token-type id-token` ([CLI reference](../reference/cli.md#hop-0-from-an-id-token)).
+
 Keep `access_token` and `lease`. You need the token for every call and the lease id if your orchestration wants to show or revoke it.
 
 Each ID token or ID-JAG can be used once. Presenting the same one again, from any agent, fails with `invalid_grant` / `replayed`, so fetch a fresh credential for every root token. The root token never outlives the credential: its `expires_in` is at most the time left until the credential's `exp`.

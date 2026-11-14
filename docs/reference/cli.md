@@ -74,7 +74,7 @@ attenuo --server http://127.0.0.1:8080 health --ready    # readiness, for a load
 
 ### `token root`
 
-Mint a root (hop 0) token. This uses the development endpoint, so it needs the admin token and `[dev] allow_root_mint = true` on the server.
+Mint a root (hop 0) token. This uses the development endpoint, so it needs the admin token and `[dev] allow_root_mint = true` on the server. For a root token from a user's IdP credential, use `token exchange --subject-token-type id-token` instead ([Hop 0](#hop-0-from-an-id-token)).
 
 | Option | Meaning |
 | --- | --- |
