@@ -97,6 +97,7 @@ impl DelegationChain {
     /// [`ChainError::EmptySubject`], [`ChainError::EmptyAgentId`] or [`ChainError::EmptyLeaseId`]
     /// for an empty subject, agent or lease id; [`ChainError::AttenuationViolated`] (with
     /// [`AttenuationError::Empty`](crate::AttenuationError::Empty)) for an empty capability set;
+    /// [`ChainError::TooLarge`] for a set over [`CapabilitySet::validate_size`];
     /// [`ChainError::InvalidName`] or [`ChainError::InvalidLimit`] for a capability that fails
     /// [`CapabilitySet::validate`] or [`CapabilitySet::validate_limits`]; and
     /// [`ChainError::TtlOutOfRange`] when `now + ttl` is not a representable time.
@@ -124,6 +125,9 @@ impl DelegationChain {
         if lease.0.is_empty() {
             return Err(ChainError::EmptyLeaseId { index: 0 });
         }
+        capabilities
+            .validate_size()
+            .map_err(|source| ChainError::TooLarge { index: 0, source })?;
         capabilities
             .validate()
             .map_err(|source| ChainError::InvalidName { index: 0, source })?;
@@ -155,7 +159,8 @@ impl DelegationChain {
     /// Whatever [`validate_at`](Self::validate_at) reports for the chain as it is; then, for the
     /// new hop: [`ChainError::TooDeep`], [`ChainError::EmptyAgentId`],
     /// [`ChainError::EmptyLeaseId`], [`ChainError::DuplicateAgent`],
-    /// [`ChainError::DuplicateLease`], [`ChainError::InvalidName`], [`ChainError::InvalidLimit`],
+    /// [`ChainError::DuplicateLease`], [`ChainError::TooLarge`], [`ChainError::InvalidName`],
+    /// [`ChainError::InvalidLimit`],
     /// and [`ChainError::AttenuationViolated`] when the last hop does not cover `requested`. A
     /// `ttl` too large to add is not an error: the expiry is the parent's.
     pub fn extend(
@@ -197,6 +202,9 @@ impl DelegationChain {
                 lease: lease.0,
             });
         }
+        requested
+            .validate_size()
+            .map_err(|source| ChainError::TooLarge { index, source })?;
         requested
             .validate()
             .map_err(|source| ChainError::InvalidName { index, source })?;

@@ -270,7 +270,7 @@ Optional, per `[[idps]]` entry, off by default. With it, the root token minted f
 
 How each claim names capabilities:
 
-- `authorization_details`: the `capabilities` of every entry of type `attenuo_capabilities` (attenuo's own type, the one `POST /token` requests use), read as the token's capability objects but strictly: a capability with an unknown member (a misspelt `constraint`, say), an invalid name or limits no token may carry names nothing. An entry of any other type names nothing. A claim whose entries hold more than 256 capabilities names nothing at all (SR-123).
+- `authorization_details`: the `capabilities` of every entry of type `attenuo_capabilities` (attenuo's own type, the one `POST /token` requests use), read as the token's capability objects but strictly: a capability with an unknown member (a misspelt `constraint`, say), an invalid name or limits no token may carry names nothing. An entry of any other type names nothing. A claim whose entries hold more than 256 capabilities names nothing at all, and a capability with a `one_of` of more than 1,024 values names nothing (SR-123).
 - `resource` (a string or an array of strings): the servers `resources` maps each value to. An unmapped value names nothing.
 - `scope` (a space-separated string): the capabilities `scopes` maps each token to. An unmapped token names nothing.
 
@@ -278,9 +278,9 @@ A claim of the wrong JSON type names nothing; a claim that is absent or `null` i
 
 A capability is kept when a single capability of the other side covers it (`⊑`, RFC-0001), after its limits are clamped to the grant's as at a delegation hop. This is not the full intersection: two capabilities that only overlap (`github:read_*` against `github:*_file`) give nothing, never a new capability built from both. See the [standards note](../research/standards.md#the-id-jags-claims-as-a-ceiling).
 
-A limit in a claim, as in the root grant, bounds each root token capability it is copied into, not the run: a request for several capabilities under one limited capability (`send_money` once per recipient under `sum` 100) gets the limit on each, and each call is charged only against the capabilities it matches, so the run can spend the figure once per capability. Limits set at an exchange are not affected, since every call is also charged against the parent hop. Whether hop 0 should keep the limit for the run is open (SR-121, [task board](../tasks/board.md)).
+A limit in a claim, as in the root grant, is copied into the requested capability it covers. Hop 0 has no parent hop to charge, so a limit copied into several capabilities would bound each of them, not the run: a request in which two capabilities take their limits from the same limited capability of the ceiling (`send_money` once per recipient under `sum` 100) is refused with `invalid_scope` / `limit_split_at_root` (SR-121). Ask for one capability instead, with a `one_of` or wider constraint (`to` in `["alice", "bob", "carol"]`), which then carries the figure once. A capability of the ceiling without limits may be split as before. Limits set at an exchange are not affected, since every call is also charged against the parent hop.
 
-The server refuses to start on an empty resource identifier, a resource mapped to no server or to a name that is not a valid server name (or is `attenuo`), a scope token that is empty or holds whitespace, a scope mapped to no capability, or a capability that does not parse or whose limits no token may carry (for example an empty `arg`, a `derive` on a `sum`, a `max` above 2^63 - 1).
+The server refuses to start on an empty resource identifier, a resource mapped to no server or to a name that is not a valid server name (or is `attenuo`), a scope token that is empty or holds whitespace, a scope mapped to no capability, or a capability that does not parse or whose limits no token may carry (for example an empty `arg`, a `derive` on a `sum`, a `max` above 2^63 - 1), and on a scope mapped to more than 1,024 capabilities or a `one_of` of more than 1,024 values.
 
 ```toml
 [[idps]]
@@ -316,7 +316,7 @@ The most a root token may carry.
 | `issuer` | Issuer of the users this applies to. |
 | `agent` | The agent that holds the root token. |
 | `subject` | Optional. Pins the entry to one user. A pinned entry wins over an unpinned one. |
-| `capabilities` | List of `server:tool` strings (globs such as `github:*` allowed) or full capability tables `{ server, tool, constraints }`. Requests are attenuated against this. |
+| `capabilities` | List of `server:tool` strings (globs such as `github:*` allowed) or full capability tables `{ server, tool, constraints }`. Requests are attenuated against this. At most 1,024 capabilities, and at most 1,024 values in a `one_of`; more refuses to start (SR-123). |
 | `attributes` | Used only by the development root mint. IdP intake takes attributes from the verified token. |
 
 For the development root mint, an empty `[[root_grants]]` list lets the admin mint any capabilities.
@@ -326,7 +326,7 @@ A constraint's `op` is `equals`, `one_of`, `prefix`, `path_prefix` or `range` ([
 
 With no matching entry, no root token is issued.
 
-A capability table may also carry `limits`. A limit there is copied into every requested capability it covers, and bounds each of them, not the run: a request for `send_money` once per recipient under `{ server = "banking", tool = "send_money", limits = { sum = { arg = "amount", max = 100 } } }` gets `sum` 100 on each (SR-121, open on the [task board](../tasks/board.md)). For a run budget the agent cannot split, write a policy over run usage (`context.usage`), which counts the calls of a destructive tool per tool, not per capability ([run limits](../design/run-limits.md)).
+A capability table may also carry `limits`. A limit there is copied into the requested capability it covers, and is the run's budget because only one capability of the root token may take it: a request in which two capabilities take their limits from the same limited capability of the entry, such as `send_money` once per recipient under `{ server = "banking", tool = "send_money", limits = { sum = { arg = "amount", max = 100 } } }`, is refused with `invalid_scope` / `limit_split_at_root`, also when each asks for a lower figure of its own (SR-121). Ask for one capability that covers them all instead: a `one_of` constraint (`to = { op = "one_of", value = ["alice", "bob"] }`), a wider constraint, or, for several tools under a limited `github:*`, a tool pattern (`github:*` itself) rather than one capability per tool; the agent can then narrow to single tools at its first exchange, where the parent's budget bounds the total. A capability of the entry without limits may be split as before. `POST /admin/root-token` applies the same rule when `[[root_grants]]` is set. A policy over run usage (`context.usage`) counts the calls of a destructive tool per tool, not per capability ([run limits](../design/run-limits.md)).
 
 ## `[[peps]]`
 

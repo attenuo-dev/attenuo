@@ -239,8 +239,9 @@ async fn oversized_tokens_are_verified_but_not_cached() {
         authenticated_at: now,
         attributes: Default::default(),
     };
-    // A long constraint list, as a child narrowing `github:read_*` could carry.
-    let values: Vec<serde_json::Value> = (0..2000)
+    // A long constraint list, as a child narrowing `github:read_*` could carry, within the
+    // 1,024 values a `one_of` may hold (SR-123).
+    let values: Vec<serde_json::Value> = (0..attenuo_core::MAX_ONE_OF_VALUES)
         .map(|i| json!(format!("acme/repo-{i:05}")))
         .collect();
     let cap = Capability::new("github", "read_*")

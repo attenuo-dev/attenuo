@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::call::ToolCall;
-use crate::error::AttenuationError;
+use crate::error::{AttenuationError, SizeError};
 use crate::jcs::value_eq;
 use crate::limits::{LimitError, LimitKind, Limits};
 use crate::names::NameError;
@@ -786,6 +786,39 @@ impl Capability {
     }
 }
 
+/// The most capabilities one token request, and one hop of a token, may hold (SR-123).
+/// Attenuation compares every requested capability with the parent's, so its cost is the
+/// product of the two sizes; every path that mints a token bounds the request with
+/// [`CapabilitySet::validate_size`] before comparing anything.
+pub const MAX_CAPABILITIES: usize = 1024;
+
+/// The most values one `one_of` constraint may list (SR-123). Implication between two `one_of`
+/// lists costs the product of their lengths.
+pub const MAX_ONE_OF_VALUES: usize = 1024;
+
+impl Capability {
+    /// Is every `one_of` of this capability at most [`MAX_ONE_OF_VALUES`] long?
+    ///
+    /// # Errors
+    ///
+    /// [`SizeError::OneOfTooLong`] for the first constraint, by argument name, over the bound.
+    pub fn validate_size(&self) -> Result<(), SizeError> {
+        for (arg, c) in &self.constraints {
+            if let ArgConstraint::OneOf(values) = c {
+                if values.len() > MAX_ONE_OF_VALUES {
+                    return Err(SizeError::OneOfTooLong {
+                        capability: format!("{}:{}", self.server, self.tool),
+                        arg: arg.clone(),
+                        count: values.len(),
+                        max: MAX_ONE_OF_VALUES,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// A set of capabilities. A call is permitted if any member permits it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -843,6 +876,23 @@ impl CapabilitySet {
         self.0.iter().try_for_each(Capability::validate_limits)
     }
 
+    /// Is the set no larger than one request or token may be: at most [`MAX_CAPABILITIES`]
+    /// members, each passing [`Capability::validate_size`] (SR-123)? Linear in the set's size.
+    ///
+    /// # Errors
+    ///
+    /// [`SizeError::TooManyCapabilities`], or the [`SizeError::OneOfTooLong`] of the first
+    /// member, in canonical order, with a `one_of` over the bound.
+    pub fn validate_size(&self) -> Result<(), SizeError> {
+        if self.0.len() > MAX_CAPABILITIES {
+            return Err(SizeError::TooManyCapabilities {
+                count: self.0.len(),
+                max: MAX_CAPABILITIES,
+            });
+        }
+        self.0.iter().try_for_each(Capability::validate_size)
+    }
+
     /// [`Capability::path_prefix_warnings`] of every member, in canonical order.
     pub fn path_prefix_warnings(&self) -> Vec<String> {
         self.0
@@ -868,8 +918,9 @@ impl CapabilitySet {
     /// # Errors
     ///
     /// As [`attenuate_with`](Self::attenuate_with): [`AttenuationError::Empty`] for an empty
-    /// `requested`, [`AttenuationError::NotCovered`] for the first requested capability no member
-    /// of `self` covers.
+    /// `requested`, [`AttenuationError::TooLarge`] for one over [`CapabilitySet::validate_size`],
+    /// [`AttenuationError::NotCovered`] for the first requested capability no member of `self`
+    /// covers.
     pub fn attenuate(&self, requested: &CapabilitySet) -> Result<CapabilitySet, AttenuationError> {
         self.attenuate_with(requested, |_, _, _| None)
     }
@@ -895,7 +946,9 @@ impl CapabilitySet {
     ///
     /// # Errors
     ///
-    /// [`AttenuationError::Empty`] when `requested` is empty. [`AttenuationError::NotCovered`],
+    /// [`AttenuationError::Empty`] when `requested` is empty; [`AttenuationError::TooLarge`]
+    /// when it fails [`CapabilitySet::validate_size`], before anything is compared.
+    /// [`AttenuationError::NotCovered`],
     /// naming the capability, when no member of `self` covers a requested capability's calls, or
     /// when the clamped capability is still not covered by its parent (a constraint or limit
     /// clamping cannot fix).
@@ -904,10 +957,71 @@ impl CapabilitySet {
         requested: &CapabilitySet,
         remaining: impl Fn(usize, LimitKind, u64) -> Option<u64>,
     ) -> Result<CapabilitySet, AttenuationError> {
+        Ok(self
+            .attenuate_indexed(requested, remaining)?
+            .into_iter()
+            .map(|(_, _, child)| child)
+            .collect())
+    }
+
+    /// [`attenuate`](Self::attenuate) at hop 0, where `self` is not a hop but a root grant (or
+    /// a ceiling under one) that the root token's capabilities are taken from. A limit there
+    /// bounds the run only if a single capability of the root token carries it: each call is
+    /// charged against the capabilities that match it, and no parent hop is charged too, as
+    /// at an exchange. So in addition to [`attenuate`](Self::attenuate), two capabilities of
+    /// the result may not take their limits from the same limited capability of `self` (one
+    /// whose [`Limits`] are not empty), whatever limits they request themselves (SR-121). The
+    /// parent of each requested capability is the one [`attenuate`](Self::attenuate) clamps
+    /// it to. Requested capabilities that are the same after clamping are one capability of
+    /// the result and are not a split. A capability of `self` without limits may be split
+    /// freely.
+    ///
+    /// # Errors
+    ///
+    /// As [`attenuate`](Self::attenuate), which is checked first; then
+    /// [`AttenuationError::LimitSplit`] naming two requested capabilities, as requested, that
+    /// share a limited parent.
+    pub fn attenuate_root(
+        &self,
+        requested: &CapabilitySet,
+    ) -> Result<CapabilitySet, AttenuationError> {
+        let attenuated = self.attenuate_indexed(requested, |_, _, _| None)?;
+        let parents: Vec<&Capability> = self.0.iter().collect();
+        let mut first: BTreeMap<usize, (&Capability, &Capability)> = BTreeMap::new();
+        for (index, req, child) in &attenuated {
+            if parents[*index].limits.is_empty() {
+                continue;
+            }
+            match first.get(index) {
+                Some((req0, child0)) if *child0 != child => {
+                    return Err(AttenuationError::LimitSplit {
+                        first: req0.display(),
+                        second: req.display(),
+                    });
+                }
+                Some(_) => {}
+                None => {
+                    first.insert(*index, (req, child));
+                }
+            }
+        }
+        Ok(attenuated.into_iter().map(|(_, _, child)| child).collect())
+    }
+
+    /// The step of [`attenuate_with`](Self::attenuate_with) for each requested capability, in
+    /// canonical order: the index in `self` of the parent it was clamped to, the capability as
+    /// requested, and the clamped capability.
+    fn attenuate_indexed<'r>(
+        &self,
+        requested: &'r CapabilitySet,
+        remaining: impl Fn(usize, LimitKind, u64) -> Option<u64>,
+    ) -> Result<Vec<(usize, &'r Capability, Capability)>, AttenuationError> {
         if requested.is_empty() {
             return Err(AttenuationError::Empty);
         }
-        let mut out = BTreeSet::new();
+        // Before anything is compared: the loop below costs the product of both sizes (SR-123).
+        requested.validate_size()?;
+        let mut out = Vec::with_capacity(requested.len());
         for c in requested.0.iter() {
             let not_covered = || AttenuationError::NotCovered {
                 requested: c.display(),
@@ -936,9 +1050,9 @@ impl CapabilitySet {
             if !parent.covers(&child) {
                 return Err(not_covered());
             }
-            out.insert(child);
+            out.push((index, c, child));
         }
-        Ok(CapabilitySet(out))
+        Ok(out)
     }
 
     /// Does any capability in the set permit this call?
@@ -1780,5 +1894,244 @@ mod tests {
         let bare = Capability::new("fs", "ls")
             .with_constraint("dir", ArgConstraint::Prefix("/srv".into()));
         assert!(bare.path_prefix_warnings()[0].contains("\"/srv/../x\""));
+    }
+
+    fn to(who: &str) -> Capability {
+        Capability::new("banking", "send_money")
+            .with_constraint("to", ArgConstraint::Equals(json!(who)))
+    }
+
+    /// SR-121: a root grant's limit copied into several requested capabilities would bound
+    /// each of them, not the run. `attenuate` allows it (an exchange is charged against its
+    /// parent hop too); `attenuate_root` refuses it.
+    #[test]
+    fn a_limited_grant_capability_is_not_split_at_the_root_sr121() {
+        let grant =
+            CapabilitySet::from_iter([Capability::new("banking", "*")
+                .with_limits(Limits::default().with_sum("amount", 100))]);
+        let split = CapabilitySet::from_iter([to("alice"), to("bob"), to("carol")]);
+        let out = grant.attenuate(&split).unwrap();
+        assert_eq!(out.len(), 3, "each carries the whole figure");
+        assert!(out
+            .iter()
+            .all(|c| c.limits.sum.as_ref().unwrap().max == 100));
+        let err = grant.attenuate_root(&split).unwrap_err();
+        assert!(
+            matches!(err, AttenuationError::LimitSplit { .. }),
+            "{err:?}"
+        );
+        let text = err.to_string();
+        assert!(
+            text.contains("banking:send_money{to=") && text.contains("alice"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("100"),
+            "the grant's figure is not shown: {text}"
+        );
+
+        // One capability is fine, and so is one with a wider constraint.
+        let one = CapabilitySet::from_iter([to("alice")]);
+        assert_eq!(grant.attenuate_root(&one), grant.attenuate(&one));
+        let wide = CapabilitySet::from_iter([Capability::new("banking", "send_money")
+            .with_constraint(
+                "to",
+                ArgConstraint::OneOf(vec![json!("alice"), json!("bob"), json!("carol")]),
+            )]);
+        assert_eq!(grant.attenuate_root(&wide), grant.attenuate(&wide));
+
+        // Its own lower figures do not make it sound to allow: still a split.
+        let own = CapabilitySet::from_iter([
+            to("alice").with_limits(Limits::default().with_sum("amount", 50)),
+            to("bob").with_limits(Limits::default().with_sum("amount", 50)),
+        ]);
+        assert!(matches!(
+            grant.attenuate_root(&own),
+            Err(AttenuationError::LimitSplit { .. })
+        ));
+
+        // Requested capabilities that clamp to the same one are one capability.
+        let same = CapabilitySet::from_iter([
+            to("alice"),
+            to("alice").with_limits(Limits::default().with_sum("amount", 100)),
+        ]);
+        let out = grant.attenuate_root(&same).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out, grant.attenuate(&same).unwrap());
+
+        // A not-covered request still answers not covered first.
+        let wider = CapabilitySet::from_iter([to("alice"), Capability::new("github", "x")]);
+        assert!(matches!(
+            grant.attenuate_root(&wider),
+            Err(AttenuationError::NotCovered { .. })
+        ));
+        assert_eq!(
+            grant.attenuate_root(&CapabilitySet::new()),
+            Err(AttenuationError::Empty)
+        );
+    }
+
+    /// Every kind of limit counts, and the parent is the one `attenuate` clamps to.
+    #[test]
+    fn a_split_is_judged_by_the_parent_attenuate_picks_sr121() {
+        let fetch = |p: &str| {
+            Capability::new("web", "fetch").with_constraint("url", ArgConstraint::Prefix(p.into()))
+        };
+        let two =
+            CapabilitySet::from_iter([fetch("https://a.example/"), fetch("https://b.example/")]);
+        for limits in [
+            Limits::default().with_calls(3),
+            Limits::default().with_calls_per("url", 1),
+            Limits {
+                distinct: Some(crate::ArgLimit::new("url", 1).derived(crate::limits::Derive::Host)),
+                ..Limits::default()
+            },
+        ] {
+            let grant = CapabilitySet::from_iter([
+                Capability::new("web", "fetch").with_limits(limits.clone())
+            ]);
+            assert_eq!(grant.attenuate(&two).unwrap().len(), 2);
+            assert!(
+                matches!(
+                    grant.attenuate_root(&two),
+                    Err(AttenuationError::LimitSplit { .. })
+                ),
+                "{limits:?}"
+            );
+        }
+
+        // An unlimited grant capability may be split, as before.
+        let free = CapabilitySet::from_iter([Capability::new("web", "*")]);
+        assert_eq!(free.attenuate_root(&two), free.attenuate(&two));
+
+        // Two grant capabilities cover both; `attenuate` picks the first that covers as it
+        // is, `web:*` (unlimited, sorts first), so nothing is split.
+        let both = CapabilitySet::from_iter([
+            Capability::new("web", "*"),
+            Capability::new("web", "fetch").with_limits(Limits::default().with_calls(3)),
+        ]);
+        assert!(both
+            .attenuate(&two)
+            .unwrap()
+            .iter()
+            .all(|c| c.limits.is_empty()));
+        assert_eq!(both.attenuate_root(&two), both.attenuate(&two));
+
+        // `attenuate` prefers a capability that covers the request as it is: the unlimited
+        // `web:fetch{url=a}` is chosen for `fetch(a)` although the limited, unconstrained
+        // `web:fetch` sorts first, so only `fetch(b)` takes the limited one: no split.
+        let covering_first = CapabilitySet::from_iter([
+            Capability::new("web", "fetch").with_limits(Limits::default().with_calls(3)),
+            fetch("https://a.example/"),
+        ]);
+        let out = covering_first.attenuate(&two).unwrap();
+        assert_eq!(
+            out.iter().filter(|c| c.limits.is_empty()).count(),
+            1,
+            "{out:?}"
+        );
+        assert_eq!(covering_first.attenuate_root(&two), Ok(out));
+        // With a third request that also only the limited one covers, it is split.
+        let three =
+            CapabilitySet::from_iter(two.iter().cloned().chain([fetch("https://c.example/")]));
+        assert!(matches!(
+            covering_first.attenuate_root(&three),
+            Err(AttenuationError::LimitSplit { .. })
+        ));
+        // Split across two different limited capabilities is not a split of either.
+        let apart = CapabilitySet::from_iter([
+            fetch("https://a.example/").with_limits(Limits::default().with_calls(3)),
+            fetch("https://b.example/").with_limits(Limits::default().with_calls(3)),
+        ]);
+        assert_eq!(apart.attenuate_root(&two), apart.attenuate(&two));
+    }
+
+    /// SR-123: a request holds at most `MAX_CAPABILITIES` capabilities and a `one_of` at most
+    /// `MAX_ONE_OF_VALUES` values; attenuation refuses a larger one before comparing anything,
+    /// and so do `DelegationChain::root` and `extend`.
+    #[test]
+    fn requests_are_bounded_in_size_sr123() {
+        let many = |n: usize| -> CapabilitySet {
+            (0..n)
+                .map(|i| Capability::new("s", format!("t{i}")))
+                .collect()
+        };
+        let one_of = |n: usize| -> CapabilitySet {
+            CapabilitySet::from_iter([Capability::new("s", "t").with_constraint(
+                "a",
+                ArgConstraint::OneOf((0..n).map(|i| json!(i)).collect()),
+            )])
+        };
+        assert_eq!(many(MAX_CAPABILITIES).validate_size(), Ok(()));
+        assert_eq!(one_of(MAX_ONE_OF_VALUES).validate_size(), Ok(()));
+        assert_eq!(
+            many(MAX_CAPABILITIES + 1).validate_size(),
+            Err(SizeError::TooManyCapabilities {
+                count: MAX_CAPABILITIES + 1,
+                max: MAX_CAPABILITIES
+            })
+        );
+        assert!(matches!(
+            one_of(MAX_ONE_OF_VALUES + 1).validate_size(),
+            Err(SizeError::OneOfTooLong { count: 1025, .. })
+        ));
+        // Refused before the parent is read: even an empty parent answers "too large".
+        let none = CapabilitySet::new();
+        assert!(matches!(
+            none.attenuate(&many(MAX_CAPABILITIES + 1)),
+            Err(AttenuationError::TooLarge(_))
+        ));
+        assert!(matches!(
+            none.attenuate_root(&one_of(MAX_ONE_OF_VALUES + 1)),
+            Err(AttenuationError::TooLarge(_))
+        ));
+        let all = CapabilitySet::from_iter([Capability::new("*", "*")]);
+        assert!(all.attenuate(&many(MAX_CAPABILITIES)).is_ok());
+
+        let user = crate::OriginatingUser {
+            subject: "u".into(),
+            issuer: "i".into(),
+            authenticated_at: time::OffsetDateTime::UNIX_EPOCH,
+            attributes: Default::default(),
+        };
+        let now = time::OffsetDateTime::UNIX_EPOCH + time::Duration::days(1);
+        let hour = time::Duration::hours(1);
+        let lease = |s: &str| crate::LeaseId(s.into());
+        let err = crate::DelegationChain::root(
+            user.clone(),
+            crate::AgentId("a".into()),
+            many(MAX_CAPABILITIES + 1),
+            now,
+            hour,
+            lease("l0"),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, crate::ChainError::TooLarge { index: 0, .. }),
+            "{err}"
+        );
+        let root = crate::DelegationChain::root(
+            user,
+            crate::AgentId("a".into()),
+            all,
+            now,
+            hour,
+            lease("l0"),
+        )
+        .unwrap();
+        let err = root
+            .extend(
+                crate::AgentId("b".into()),
+                one_of(MAX_ONE_OF_VALUES + 1),
+                now,
+                hour,
+                lease("l1"),
+                8,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::ChainError::TooLarge { index: 1, .. }),
+            "{err}"
+        );
     }
 }

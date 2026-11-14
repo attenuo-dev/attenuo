@@ -14,6 +14,49 @@ pub enum AttenuationError {
     /// The requested set is empty; a hop with no capabilities is a configuration error.
     #[error("requested capability set is empty")]
     Empty,
+    /// At hop 0 ([`crate::CapabilitySet::attenuate_root`]): two requested capabilities take
+    /// their limits from the same limited capability of the root grant or ceiling, so each
+    /// would carry the whole figure (SR-121).
+    #[error(
+        "requested capabilities `{first}` and `{second}` take their limits from the same \
+         limited capability, which bounds one capability of a root token, not several"
+    )]
+    LimitSplit {
+        /// One of them, as [`crate::Capability::display`] writes the request.
+        first: String,
+        /// The other.
+        second: String,
+    },
+    /// The requested set is larger than [`crate::capability::MAX_CAPABILITIES`] or holds a
+    /// `one_of` longer than [`crate::capability::MAX_ONE_OF_VALUES`] (SR-123). Checked before
+    /// anything is compared, since attenuation costs the product of both sides' sizes.
+    #[error(transparent)]
+    TooLarge(#[from] SizeError),
+}
+
+/// Why a capability set is too large to be requested or carried by a token (SR-123).
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum SizeError {
+    /// More capabilities than [`crate::capability::MAX_CAPABILITIES`].
+    #[error("{count} capabilities requested; one request or token holds at most {max}")]
+    TooManyCapabilities {
+        /// How many the set holds.
+        count: usize,
+        /// The bound.
+        max: usize,
+    },
+    /// A `one_of` constraint with more values than [`crate::capability::MAX_ONE_OF_VALUES`].
+    #[error("`one_of` on argument {arg:?} of `{capability}` lists {count} values; at most {max} are allowed")]
+    OneOfTooLong {
+        /// The capability's `server:tool`.
+        capability: String,
+        /// The constrained argument.
+        arg: String,
+        /// How many values the list holds.
+        count: usize,
+        /// The bound.
+        max: usize,
+    },
 }
 
 /// Why a delegation chain is not valid.
@@ -48,6 +91,15 @@ pub enum ChainError {
         /// What was not covered.
         #[source]
         source: AttenuationError,
+    },
+    /// A hop's capabilities are more than one token may hold ([`SizeError`], SR-123).
+    #[error("hop {index}: {source}")]
+    TooLarge {
+        /// Position of the hop.
+        index: usize,
+        /// What is too large.
+        #[source]
+        source: SizeError,
     },
     /// The chain has more hops than allowed.
     #[error("chain depth {depth} exceeds the maximum of {max}")]
