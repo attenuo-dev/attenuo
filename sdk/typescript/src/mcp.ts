@@ -42,6 +42,7 @@ export function mcpHeaders(
  * (`mcpHeaders`) cannot carry proofs, which are single-use. The latest `DPoP-Nonce` the server
  * sent goes in each proof, and a request the server refuses with `use_dpop_nonce` is sent once
  * more with a proof carrying the new nonce (unless its body is a stream, which cannot be resent).
+ * Redirects are not followed (`redirect: "manual"`): a 3xx goes back to the MCP library as it is.
  */
 export function mcpFetch(
   token: () => Token | string | Promise<Token | string>,
@@ -60,12 +61,16 @@ export function mcpFetch(
       for (const [k, v] of Object.entries(auth)) headers.set(k, v);
       return headers;
     };
-    let res = await base(input, { ...init, headers: await headersNow() });
+    // Never followed, whatever `init` asks: a redirect would take the body (tool arguments)
+    // and the proof to another origin (SR-112). The MCP library gets the 3xx, or a browser's
+    // opaque redirect, as it is.
+    const redirect = "manual" as const;
+    let res = await base(input, { ...init, redirect, headers: await headersNow() });
     const replayable = !(init.body instanceof ReadableStream);
     if (dpopKey !== undefined && (await nonce.update(res)) && replayable) {
       await res.body?.cancel();
       const headers = await headersNow();
-      res = await resendOnce(() => base(input, { ...init, headers }));
+      res = await resendOnce(() => base(input, { ...init, redirect, headers }));
       await nonce.update(res);
     }
     return res;

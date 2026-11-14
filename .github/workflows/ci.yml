@@ -400,9 +400,10 @@ jobs:
 
   # Builds the Lean model of the covering rule (proofs/lean) and checks that it has no `sorry`
   # and only Lean's standard axioms, then runs the model against the Rust code on the cases of
-  # crates/attenuo-core/tests/lean_differential.rs. elan's installer is pinned to the v4.2.4
-  # commit; elan then installs the toolchain proofs/lean/lean-toolchain names. Core Lean only,
-  # no Mathlib.
+  # crates/attenuo-core/tests/lean_differential.rs. elan is the v4.2.4 release binary, checked
+  # against its sha256 (the installer script at a pinned commit still fetched whichever elan
+  # release was latest, unchecked: SR-114); elan then installs the toolchain
+  # proofs/lean/lean-toolchain names. Core Lean only, no Mathlib.
   lean:
     name: Lean proof of the covering rule
     needs: changes
@@ -412,9 +413,16 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install elan
+        env:
+          ELAN_VERSION: "4.2.4"
+          ELAN_SHA256: "42b94d4244e8353142c456ec0e4ca6528fd898a6c604d4059f494e706e431f63"
         run: |
-          curl -sSfL https://raw.githubusercontent.com/leanprover/elan/227caca133724d5516bee25c2aeb3e609478f2d8/elan-init.sh -o "$RUNNER_TEMP/elan-init.sh"
-          sh "$RUNNER_TEMP/elan-init.sh" -y --default-toolchain none --no-modify-path
+          set -euo pipefail
+          url="https://github.com/leanprover/elan/releases/download/v${ELAN_VERSION}/elan-x86_64-unknown-linux-gnu.tar.gz"
+          curl --proto '=https' --tlsv1.2 -sSfL -o "$RUNNER_TEMP/elan.tar.gz" "$url"
+          echo "${ELAN_SHA256}  $RUNNER_TEMP/elan.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/elan.tar.gz" -C "$RUNNER_TEMP"
+          "$RUNNER_TEMP/elan-init" -y --default-toolchain none --no-modify-path
           echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
       - run: bash scripts/check-lean.sh
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable

@@ -1077,13 +1077,19 @@ async fn approval_verify(
     };
     let (header, claims) = jwt::decode_approval_unverified(&token)?;
     let jwks: Value = match args.jwks.as_deref() {
-        Some(u) if u.starts_with("http://") || u.starts_with("https://") => reqwest::get(u)
-            .await
-            .and_then(reqwest::Response::error_for_status)
-            .with_context(|| format!("fetching the JWKS from {u}"))?
-            .json()
-            .await
-            .context("the JWKS is not JSON")?,
+        Some(u) if u.starts_with("http://") || u.starts_with("https://") => {
+            let resp = client::http_client()?
+                .get(u)
+                .send()
+                .await
+                .with_context(|| format!("fetching the JWKS from {u}"))?;
+            client::refuse_redirect(&resp, "--jwks")?;
+            resp.error_for_status()
+                .with_context(|| format!("fetching the JWKS from {u}"))?
+                .json()
+                .await
+                .context("the JWKS is not JSON")?
+        }
         Some(p) => serde_json::from_str(
             &std::fs::read_to_string(p).with_context(|| format!("reading {p}"))?,
         )
