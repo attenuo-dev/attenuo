@@ -1930,6 +1930,61 @@ async fn a_root_grant_budget_is_not_split_at_intake_sr121() {
     assert_eq!(got.0, StatusCode::OK, "{}", got.1);
 }
 
+/// `banking:send_money` with `to` pinned to `who`, and `sum` of `amount` up to `max` when
+/// given, as JSON for a claim or a request.
+fn payee(who: &str, max: Option<u64>) -> Value {
+    let mut cap = json!({"server": "banking", "tool": "send_money",
+                         "constraints": {"to": {"op": "equals", "value": who}}});
+    if let Some(max) = max {
+        cap["limits"] = json!({"sum": {"arg": "amount", "max": max}});
+    }
+    cap
+}
+
+/// An `authorization_details` value (claim or request) of these capabilities.
+fn details(caps: &[Value]) -> Value {
+    json!([{"type": "attenuo_capabilities", "capabilities": caps}])
+}
+
+/// A harness whose root grant is the unlimited `banking:*` and whose ceiling maps the scope
+/// token `payments` to `banking:send_money`, with `sum` 100 when `limited`.
+async fn payments_harness(limited: bool) -> Harness {
+    Harness::start_with(move |cfg| {
+        cfg.root_grants[0].capabilities = vec![CapSpec::Short("banking:*".into())];
+        let mut pay = attenuo_core::Capability::new("banking", "send_money");
+        if limited {
+            pay.limits = attenuo_core::Limits::default().with_sum("amount", 100);
+        }
+        cfg.idps[0].id_jag_ceiling = Some(IdJagCeilingConfig {
+            resources: BTreeMap::new(),
+            scopes: BTreeMap::from([("payments".to_string(), vec![CapSpec::Full(pay)])]),
+        });
+    })
+    .await
+}
+
+/// SR-127: the budget is in `scopes` (`payments` gives `banking:send_money` a `sum` of 100),
+/// and the ID-JAG's `authorization_details` names `alice` and `bob` under it. The ceiling's
+/// last step holds one capability per recipient, each with the 100 copied in, so a request for
+/// both passed the split check against the final ceiling and got the 100 twice. The split is
+/// judged against every step of the ceiling, so it is refused as without the claim.
+#[tokio::test]
+async fn a_scopes_budget_is_not_split_by_authorization_details_sr127() {
+    let h = payments_harness(true).await;
+    let both = details(&[payee("alice", None), payee("bob", None)]);
+    let jag = jag_with(
+        &h,
+        json!({"scope": "payments", "authorization_details": both.clone()}),
+    );
+    let got = present(&h, &jag, ("authorization_details", &both.to_string())).await;
+    assert_error(
+        &got,
+        StatusCode::BAD_REQUEST,
+        "invalid_scope",
+        "limit_split_at_root",
+    );
+}
+
 /// SR-123 at intake: a hop-0 request over 1,024 capabilities, or with a `one_of` over 1,024
 /// values, is refused before it is attenuated against the root grant.
 #[tokio::test]
