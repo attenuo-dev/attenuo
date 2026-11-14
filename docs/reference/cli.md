@@ -28,6 +28,8 @@ The MCP upstream a subcommand talks to (`call`, `tools`, `authzen eval`, `policy
 | 2 | The answer was no: a denial or `APPROVAL REQUIRED`, a JSON-RPC error from `tools`, a token that fails `--verify`, a failed test case, policy errors, a broken audit chain or invalid checkpoint, an invalid approval token; for `budget refund`, nothing to refund. |
 | 3, 4 | `budget refund` only: already refunded, charge pruned (see [`budget refund`](#budget-refund-id---reason-text)). |
 
+A refusal from a REST route reads `error: server answered <status>: <error> (<code>): <detail>`: the OAuth-style `error`, then the stable `code` in parentheses, then the server's `detail`, for example `error: server answered 400 Bad Request: invalid_grant (replayed): this credential was already used; present a fresh one`. Match on the code, which is never reworded ([Errors](http-api.md#errors)); the detail is for people. The ` (<code>)` is left out when the code is the `error` itself or the whole `detail` (`unauthorized: token_expired`), and so is `: <detail>` when there is none. A body that is not an error object is printed as it came. `--json` does not change this: an error is always this text on stderr, never JSON on stdout.
+
 ## Secrets
 
 Secrets are never taken from the argument list by default. That covers the admin token, the agent client secret and the delegation tokens (`--token`, `--subject-token`). For each, the CLI accepts, in this order of preference: the environment variable, `--…-file PATH`, stdin, and (with a one-line warning on stderr) the flag itself. Stdin is `--admin-token-stdin` / `--client-secret-stdin` for the first two, and the value `-` for the tokens (`--token -`, `--subject-token -`). A value from a file or stdin is the first line, without the line ending. At most one value can come from stdin per invocation. The flag, file and stdin forms are mutually exclusive on the command line; any of them overrides the environment variable.
@@ -132,8 +134,8 @@ printf '%s\n' "$PLANNER_SECRET" | ATTENUO_TOKEN="$ID_TOKEN" attenuo token exchan
 A refused exchange that the server audited (its subject token verified) prints the record id under the error, as `decision <id>`, for `audit show --id`:
 
 ```text
-error: server answered 400 Bad Request: invalid_request: agent `reviewer` is not permitted to act on this token (may_act)
-decision 6685bd7f-cbb3-48e5-ab05-f2b8ceae9a61
+error: server answered 400 Bad Request: invalid_request (actor_not_permitted): agent `reviewer` is not permitted to act on this token (may_act)
+decision 6c65098c-383f-4119-8c0f-95ce3a384bdc
 ```
 
 ### `token sign-off`
