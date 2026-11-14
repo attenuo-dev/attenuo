@@ -89,7 +89,7 @@ Ships every signed checkpoint off the host as it is created (SR-21); see [Shippi
 | `url` | required for webhook | URL to `POST` each checkpoint to (`http://` or `https://`). Any 2xx is success; redirects are not followed. |
 | `bearer_token` | `ATTENUO_AUDIT_SINK_TOKEN` | webhook: sent as `Authorization: Bearer <token>`. |
 | `path` | required for file | JSON Lines file to append to; created if missing, synced after each line. Put it on another mount than `sqlite_path` (a warning at startup otherwise). |
-| `endpoint` | required for s3 | Base URL without a path, e.g. `https://s3.eu-west-1.amazonaws.com` or `http://minio:9000`. Requests are path-style. |
+| `endpoint` | required for s3 | Base URL without a path, e.g. `https://s3.eu-west-1.amazonaws.com` or `http://minio:9000`. Requests are path-style (`<endpoint>/<bucket>/<key>`); an endpoint with the bucket in its host name (virtual-hosted style) is not supported. Run against MinIO, not AWS S3 ([tested against MinIO](../concepts/audit-log.md#tested-against-minio)). |
 | `bucket` | required for s3 | Bucket name. |
 | `region` | `us-east-1` | s3: SigV4 signing region. |
 | `prefix` | `attenuo/checkpoints/` | s3: object key prefix; keys are `<prefix><seq, 20 digits>-<16 hex of checkpoint_sha256>.json`. |
