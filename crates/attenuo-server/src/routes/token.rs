@@ -136,7 +136,7 @@ pub async fn exchange(
     if crate::idp::intake::is_intake(&value) {
         // Hop 0 from an IdP credential: the exported span (`crate::telemetry::trace_route`)
         // is `attenuo.token.root`, not `attenuo.token.exchange`.
-        tracing::Span::current().record("otel.name", "attenuo.token.root");
+        crate::telemetry::rename_current_span("attenuo.token.root");
         return crate::idp::intake::handle(&state, &headers, value, mark.as_ref(), now).await;
     }
     let mut value = value;
