@@ -52,7 +52,7 @@ How to read it:
 
 ### SDKs and CLI
 
-- [ ] **SDK hop 0 against a live IdP.** Done for Keycloak 26.8.2 in dev mode on 2026-11-14 (`scripts/live-keycloak-smoke.sh`, #317): the Python and TypeScript hop-0 exchange of a real ID token, and `inspect` with verification, whose header `kid` is the one in the server's JWKS. Open: the same against a hosted provider (Auth0, Okta, Entra ID or Google). **Needs: a live IdP tenant.**
+- [ ] **SDK hop 0 against a live IdP.** Done for Keycloak 26.8.2 in dev mode on 2026-11-14 (`scripts/live-keycloak-smoke.sh`, #317): the Python and TypeScript hop-0 exchange of a real ID token, and `inspect` with verification, whose header `kid` is the one in the server's JWKS; later the same day, the CLI's (`token exchange --subject-token-type id-token`) and its replay refusal. Open: the same against a hosted provider (Auth0, Okta, Entra ID or Google). **Needs: a live IdP tenant.**
 
 ### Evaluation and research
 

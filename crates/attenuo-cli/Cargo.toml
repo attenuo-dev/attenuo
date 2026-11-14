@@ -33,6 +33,7 @@ tokio = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+axum = { workspace = true }
 attenuo-core = { workspace = true }
 attenuo-server = { path = "../attenuo-server" }
 attenuo-proxy = { workspace = true, features = ["testing"] }

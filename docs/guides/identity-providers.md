@@ -185,7 +185,7 @@ attribute_claims = ["email", "roles", "amr"]
 
 Discovery is at `https://keycloak.example.com/realms/acme/.well-known/openid-configuration`; its `issuer` is the realm URL, byte for byte. Tested over plain HTTP on loopback; Keycloak behind HTTPS was not run.
 
-What the run did with that recipe, all passing: hop 0 with the `curl` command of [Checking your setup](#checking-your-setup) (with `authorization_details`, see there), the same ID token again (`replayed`), `attenuo token inspect --verify` of the root token (issuer, `email`, `roles`, `mfa=false`), hop 0 with the Python SDK (`Client.exchange(id_token, "planner", caps, client_id="planner", client_secret=...)`) and the TypeScript SDK (`AttenuoClient.exchange(idToken, "planner", caps, { clientId, clientSecret })`), each followed by `inspect` with verification, whose header `kid` is the one in the server's JWKS; then a narrowed child exchange with the CLI and calls through the proxy: one allowed, one `capability_denied`, and one `policy_deny` for want of `mfa`; and `attenuo audit verify`. The CLI has no command for hop 0 itself: `attenuo token exchange` sends its subject token as an attenuo token, so an ID token given to it is refused (`invalid_grant`, unknown key id). Use `curl` or an SDK for hop 0.
+What the run did with that recipe, all passing: hop 0 with the `curl` command of [Checking your setup](#checking-your-setup) (with `authorization_details`, see there), the same ID token again (`replayed`), `attenuo token inspect --verify` of the root token (issuer, `email`, `roles`, `mfa=false`), hop 0 with the Python SDK (`Client.exchange(id_token, "planner", caps, client_id="planner", client_secret=...)`) and the TypeScript SDK (`AttenuoClient.exchange(idToken, "planner", caps, { clientId, clientSecret })`), each followed by `inspect` with verification, whose header `kid` is the one in the server's JWKS; hop 0 with the CLI (`attenuo token exchange --subject-token-type id-token`, see [Checking your setup](#checking-your-setup)), followed by `inspect --verify` (issuer, `roles`), and the same ID token again through the CLI (`invalid_grant`, already used); then a narrowed child exchange with the CLI and calls through the proxy: one allowed, one `capability_denied`, and one `policy_deny` for want of `mfa`; and `attenuo audit verify`. The CLI hop-0 step was added to the script after the first run and checked in a second run of it, against the same pinned image, on the same day.
 
 ### Auth0 (untested)
 
@@ -438,6 +438,16 @@ Before you point an agent at it:
    ```
 
    A `scope` string asks for the tool with no constraints. When the `[[root_grants]]` entry has constraints (a repository prefix, say), that is more than the grant allows and is refused with `scope_exceeds_grant`; ask with `authorization_details` and the same constraints instead, as [examples/idp-exchange-demo](https://github.com/attenuo-dev/attenuo/blob/main/examples/idp-exchange-demo/run.sh) does. A request refused this way does not spend the ID token (seen with Keycloak: the same token was accepted after a `scope_exceeds_grant`).
+
+   Or with the CLI, which sends the same exchange with the capabilities as `authorization_details` (constraints included) and reads the ID token from `ATTENUO_TOKEN`, `--subject-token-file` or `--subject-token -`, as it reads a parent token ([CLI reference](../reference/cli.md#hop-0-from-an-id-token)):
+
+   ```sh
+   printf '%s\n' "$SECRET" | ATTENUO_TOKEN="$ID_TOKEN" attenuo --server http://127.0.0.1:8080 \
+     token exchange --subject-token-type id-token --actor planner --client-secret-stdin \
+     --cap '{"server":"github","tool":"read_file","constraints":{"repo":{"op":"prefix","value":"acme/"}}}'
+   ```
+
+   `--subject-token-type id-jag` sends an ID-JAG the same way. Without `--subject-token-type`, `token exchange` sends its subject token as an attenuo token, and an ID token is refused (`invalid_grant`, unknown key id). A refusal prints the server's error and its detail, not the stable code: a second use of one ID token reads `invalid_grant: this credential was already used`.
 
 4. Inspect the result. The user block should show the right subject, issuer and attributes:
 

@@ -467,17 +467,54 @@ fn split_agents(values: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// What `token exchange` sends as its subject token: the `subject_token_type` of the request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+pub(crate) enum SubjectTokenType {
+    /// An attenuo token: an exchange from hop n to hop n+1.
+    #[default]
+    Jwt,
+    /// An OIDC ID token from an `[[idps]]` issuer: hop 0, which mints a root token.
+    IdToken,
+    /// An ID-JAG from an `[[idps]]` issuer: hop 0, which mints a root token.
+    IdJag,
+}
+
+impl SubjectTokenType {
+    /// The RFC 8693 token type URN the request carries.
+    pub(crate) fn urn(self) -> &'static str {
+        match self {
+            Self::Jwt => "urn:ietf:params:oauth:token-type:jwt",
+            Self::IdToken => "urn:ietf:params:oauth:token-type:id_token",
+            Self::IdJag => "urn:ietf:params:oauth:token-type:id-jag",
+        }
+    }
+
+    /// Is the subject token an IdP credential (hop 0) rather than an attenuo token?
+    pub(crate) fn is_hop0(self) -> bool {
+        self != Self::Jwt
+    }
+}
+
 #[derive(Debug, Args)]
 pub(crate) struct ExchangeArgs {
-    /// The parent token, or `-` to read it from the first line of stdin. Without this flag or
+    /// The parent token (or, with `--subject-token-type id-token | id-jag`, the IdP
+    /// credential), or `-` to read it from the first line of stdin. Without this flag or
     /// `--subject-token-file`, the `ATTENUO_TOKEN` environment variable is used. Prefer those:
     /// an argument is visible to other local users in `ps`.
     #[arg(long, conflicts_with = "subject_token_file")]
     pub subject_token: Option<String>,
-    /// Read the parent token from the first line of this file.
+    /// Read the parent token (or the IdP credential) from the first line of this file.
     #[arg(long, value_name = "PATH")]
     pub subject_token_file: Option<std::path::PathBuf>,
-    /// The sub-agent that will hold the new token. The request authenticates as this agent.
+    /// What the subject token is. `jwt`: an attenuo token, exchanged from hop n to hop n+1.
+    /// `id-token` (an OIDC ID token) or `id-jag` (an ID-JAG): a user credential from an
+    /// `[[idps]]` issuer, exchanged at hop 0 for a root token held by `--actor`, within the
+    /// server's `[[root_grants]]`. Sent as `subject_token_type`
+    /// (`urn:ietf:params:oauth:token-type:jwt`, `...:id_token`, `...:id-jag`).
+    #[arg(long, value_enum, value_name = "TYPE", default_value_t = SubjectTokenType::Jwt)]
+    pub subject_token_type: SubjectTokenType,
+    /// The sub-agent that will hold the new token (at hop 0, the agent presenting the user's
+    /// credential). The request authenticates as this agent.
     #[arg(long)]
     pub actor: String,
     /// Client id to authenticate with (an `[[agents]]` entry). Defaults to `--actor`; the server
@@ -505,7 +542,8 @@ pub(crate) struct ExchangeArgs {
     #[arg(long, value_name = "PATH")]
     pub client_key: Option<std::path::PathBuf>,
     /// The `aud` of the client assertion: the server's `[issuer] issuer`. Default: the `iss`
-    /// of the subject token, which this server issued.
+    /// of the subject token, which this server issued. Required at hop 0, where the subject
+    /// token is the IdP's.
     #[arg(long, value_name = "ISSUER", requires = "client_key")]
     pub client_assertion_audience: Option<String>,
     /// RFC 8693 actor token authenticating `--actor`: a workload-identity JWT (for example a
@@ -533,26 +571,29 @@ pub(crate) struct ExchangeArgs {
     /// Capability `server:tool`, or a full capability as a JSON object (with `constraints` and
     /// run `limits`). Repeatable; plain `server:tool` values may also be comma-separated. Must
     /// be covered by the parent's capabilities; limits are inherited from the parent and
-    /// clamped to what it has left.
+    /// clamped to what it has left. At hop 0, must be covered by the `[[root_grants]]` entry.
     #[arg(long = "cap", required = true)]
     pub caps: Vec<String>,
-    /// Requested lifetime in seconds (clamped to the parent's expiry).
+    /// Requested lifetime in seconds (clamped to the parent's expiry; at hop 0, to the
+    /// credential's).
     #[arg(long)]
     pub ttl_seconds: Option<u64>,
     /// Bind the new token to this DPoP key (a private JWK from `attenuo key gen --dpop`): a
     /// proof by it goes in the `DPoP` header. When the parent token is bound to the same key,
-    /// the proof also covers the parent. Required for a bound parent.
+    /// the proof also covers the parent. Required for a bound parent, and at hop 0 for an
+    /// ID-JAG with a `cnf` key, which must be this key.
     #[arg(long, value_name = "PATH")]
     pub dpop_key: Option<std::path::PathBuf>,
     /// The parent token's DPoP key, when it differs from `--dpop-key`: its proof goes in the
     /// body as `subject_token_dpop`, the parent holder's consent to binding the new token to
     /// `--dpop-key` for `--actor`. Only when one party holds both keys; otherwise the parent
     /// makes the consent with `attenuo token sign-off` and you pass it with
-    /// `--subject-token-dpop-file`.
+    /// `--subject-token-dpop-file`. Not at hop 0.
     #[arg(long, value_name = "PATH", conflicts_with = "subject_token_dpop_file")]
     pub subject_dpop_key: Option<std::path::PathBuf>,
     /// The parent holder's consent (`subject_token_dpop`) made with `attenuo token sign-off`
     /// for this exchange's `--dpop-key` and `--actor`, read from the first line of this file.
+    /// Not at hop 0.
     #[arg(long, value_name = "PATH")]
     pub subject_token_dpop_file: Option<std::path::PathBuf>,
     /// Print only this value, for scripts.
@@ -561,6 +602,35 @@ pub(crate) struct ExchangeArgs {
 }
 
 impl ExchangeArgs {
+    /// Refuse the flags that mean nothing at hop 0 (`--subject-token-type id-token | id-jag`),
+    /// where there is no parent token: the server would ignore a parent's sign-off, and the
+    /// client assertion's audience cannot be read from an IdP credential.
+    pub(crate) fn check_hop0(&self) -> anyhow::Result<()> {
+        if !self.subject_token_type.is_hop0() {
+            return Ok(());
+        }
+        let ty = self
+            .subject_token_type
+            .to_possible_value()
+            .map(|v| v.get_name().to_owned())
+            .unwrap_or_default();
+        if self.subject_dpop_key.is_some() || self.subject_token_dpop_file.is_some() {
+            anyhow::bail!(
+                "--subject-dpop-key and --subject-token-dpop-file sign off on an exchange of a \
+                 bound parent token; at hop 0 (--subject-token-type {ty}) there is none. Use \
+                 --dpop-key to bind the root token"
+            );
+        }
+        if self.client_key.is_some() && self.client_assertion_audience.is_none() {
+            anyhow::bail!(
+                "--client-key at hop 0 (--subject-token-type {ty}) needs \
+                 --client-assertion-audience <the server's [issuer] issuer>: the subject token \
+                 is the IdP's, so its `iss` is not the server's"
+            );
+        }
+        Ok(())
+    }
+
     /// The actor token from `--actor-token` (`-` reads `stdin`) or `--actor-token-file`,
     /// trimmed; `None` when neither is given.
     pub(crate) fn actor_token(&self, stdin: impl std::io::Read) -> anyhow::Result<Option<String>> {
@@ -1501,6 +1571,96 @@ mod tests {
         };
         assert_eq!(e.client_secret.as_deref(), Some("s3cret"));
         assert!(parse(&["token", "exchange", "--subject-token", "J", "--actor", "c"]).is_err());
+    }
+
+    /// `--subject-token-type` picks the URN; `jwt` (an exchange from hop n) is the default.
+    #[test]
+    fn exchange_subject_token_type_sets_the_urn() {
+        let ex = |extra: &[&str]| {
+            let mut a = vec!["token", "exchange", "--actor", "planner", "--cap", "g:t"];
+            a.extend_from_slice(extra);
+            match parse(&a).map(|c| c.command) {
+                Ok(Command::Token(TokenCmd::Exchange(e))) => Ok(e),
+                Ok(_) => panic!("not exchange"),
+                Err(e) => Err(e),
+            }
+        };
+        let e = ex(&[]).unwrap();
+        assert_eq!(e.subject_token_type, SubjectTokenType::Jwt);
+        assert_eq!(
+            e.subject_token_type.urn(),
+            "urn:ietf:params:oauth:token-type:jwt"
+        );
+        assert!(!e.subject_token_type.is_hop0());
+        for (flag, urn) in [
+            ("jwt", "urn:ietf:params:oauth:token-type:jwt"),
+            ("id-token", "urn:ietf:params:oauth:token-type:id_token"),
+            ("id-jag", "urn:ietf:params:oauth:token-type:id-jag"),
+        ] {
+            let e = ex(&["--subject-token-type", flag]).unwrap();
+            assert_eq!(e.subject_token_type.urn(), urn);
+            assert_eq!(e.subject_token_type.is_hop0(), flag != "jwt");
+            e.check_hop0().unwrap();
+        }
+        for bad in ["id_token", "jag", ""] {
+            assert!(ex(&["--subject-token-type", bad]).is_err(), "{bad:?}");
+        }
+        // The subject token's sources, the agent's authentication and the rest of the request
+        // are the same flags as for an exchange from hop n.
+        let e = ex(&[
+            "--subject-token-type",
+            "id-token",
+            "--subject-token-file",
+            "/run/id",
+            "--client-secret-stdin",
+            "--no-delegation",
+            "--ttl-seconds",
+            "60",
+            "--dpop-key",
+            "/k",
+        ])
+        .unwrap();
+        e.check_hop0().unwrap();
+        assert!(e.subject_token_file.is_some() && e.client_secret_stdin && e.no_delegation);
+    }
+
+    /// At hop 0 there is no parent token: the parent's sign-off flags are refused (the server
+    /// would ignore them), and a client assertion needs its audience given, since the IdP
+    /// credential's `iss` is not the server's.
+    #[test]
+    fn hop0_refuses_what_only_an_exchange_from_hop_n_uses() {
+        let ex = |extra: &[&str]| {
+            let mut a = vec!["token", "exchange", "--actor", "planner", "--cap", "g:t"];
+            a.extend_from_slice(extra);
+            let Command::Token(TokenCmd::Exchange(e)) = parse(&a).unwrap().command else {
+                panic!("not exchange")
+            };
+            e
+        };
+        for ty in ["id-token", "id-jag"] {
+            for extra in [
+                ["--subject-token-dpop-file", "/s"].as_slice(),
+                ["--dpop-key", "/k", "--subject-dpop-key", "/p"].as_slice(),
+                ["--client-key", "/c"].as_slice(),
+            ] {
+                let mut a = vec!["--subject-token-type", ty];
+                a.extend_from_slice(extra);
+                let err = ex(&a).check_hop0().unwrap_err().to_string();
+                assert!(err.contains(ty), "{err}");
+                // The same flags at hop n are fine (the server checks them).
+                ex(extra).check_hop0().unwrap();
+            }
+            ex(&[
+                "--subject-token-type",
+                ty,
+                "--client-key",
+                "/c",
+                "--client-assertion-audience",
+                "https://attenuo.example",
+            ])
+            .check_hop0()
+            .unwrap();
+        }
     }
 
     #[test]
