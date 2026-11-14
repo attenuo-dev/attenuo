@@ -16,6 +16,13 @@ use serde_json::{json, Map, Value};
 mod proptest_seed;
 
 use super::super::{ArgConstraint, Capability, CapabilitySet, LimitKind};
+use super::{Prepared, PreparedCap};
+
+/// The prepared implication alone, whatever the sizes ([`ArgConstraint::implies`] compares
+/// small constraints directly).
+fn implies(a: &ArgConstraint, b: &ArgConstraint) -> bool {
+    Prepared::new(a).implies(&Prepared::new(b))
+}
 use crate::jcs::{to_vec, value_eq, value_key};
 use crate::limits::{ArgLimit, Limits};
 
@@ -228,19 +235,25 @@ proptest! {
 
     #[test]
     fn implies_is_the_pairwise_implication(a in constraint(), b in constraint()) {
+        prop_assert_eq!(implies(&a, &b), a.implies_direct(&b), "{:?} => {:?}", a, b);
         prop_assert_eq!(a.implies(&b), a.implies_direct(&b), "{:?} => {:?}", a, b);
     }
 
     #[test]
     fn implies_is_the_pairwise_implication_on_related_lists((a, b) in related()) {
+        prop_assert_eq!(implies(&a, &b), a.implies_direct(&b), "{:?} => {:?}", a, b);
         prop_assert_eq!(a.implies(&b), a.implies_direct(&b), "{:?} => {:?}", a, b);
-        prop_assert_eq!(b.implies(&a), b.implies_direct(&a), "{:?} => {:?}", b, a);
+        prop_assert_eq!(implies(&b, &a), b.implies_direct(&a), "{:?} => {:?}", b, a);
     }
 
     #[test]
     fn set_checks_are_the_pairwise_checks((parent, requested) in sets()) {
         for p in parent.iter() {
             for c in requested.iter() {
+                prop_assert_eq!(
+                    PreparedCap::new(p).covers_calls(&PreparedCap::new(c)),
+                    p.covers_calls_direct(c)
+                );
                 prop_assert_eq!(p.covers_calls(c), p.covers_calls_direct(c));
                 prop_assert_eq!(
                     p.covers(c),
@@ -248,6 +261,8 @@ proptest! {
                 );
             }
         }
+        prop_assert_eq!(parent.covers_prepared(&requested), parent.covers_direct(&requested));
+        prop_assert_eq!(requested.covers_prepared(&parent), requested.covers_direct(&parent));
         prop_assert_eq!(parent.covers(&requested), parent.covers_direct(&requested));
         let covered: Vec<&Capability> = requested
             .iter()
@@ -267,18 +282,22 @@ proptest! {
         prop_assert_eq!(requested.covers(&parent), requested.covers_direct(&parent));
         let none = |_: usize, _: LimitKind, _: u64| None;
         prop_assert_eq!(
-            parent.attenuate_indexed(&requested, none),
+            parent.attenuate_indexed_prepared(&requested, none),
             parent.attenuate_indexed_direct(&requested, none)
         );
         // With something spent on every limited parent, as at an exchange.
         let spent = |i: usize, _: LimitKind, max: u64| Some(max.saturating_sub(1 + i as u64 % 2));
         prop_assert_eq!(
-            parent.attenuate_indexed(&requested, spent),
+            parent.attenuate_indexed_prepared(&requested, spent),
             parent.attenuate_indexed_direct(&requested, spent)
         );
         prop_assert_eq!(
-            requested.attenuate_indexed(&parent, none),
+            requested.attenuate_indexed_prepared(&parent, none),
             requested.attenuate_indexed_direct(&parent, none)
+        );
+        prop_assert_eq!(
+            parent.attenuate_indexed(&requested, none),
+            parent.attenuate_indexed_direct(&requested, none)
         );
     }
 }
@@ -485,8 +504,8 @@ fn summaries_give_the_pairwise_answer() {
         ),
     ];
     for (a, b) in &cases {
-        assert_eq!(a.implies(b), a.implies_direct(b), "{a:?} => {b:?}");
-        assert_eq!(b.implies(a), b.implies_direct(a), "{b:?} => {a:?}");
+        assert_eq!(implies(a, b), a.implies_direct(b), "{a:?} => {b:?}");
+        assert_eq!(implies(b, a), b.implies_direct(a), "{b:?} => {a:?}");
     }
 }
 

@@ -26,7 +26,7 @@
 
 use std::cell::OnceCell;
 use std::collections::hash_map::RandomState;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::hash::{BuildHasher, BuildHasherDefault, Hash, Hasher};
 use std::sync::OnceLock;
 
@@ -326,30 +326,40 @@ impl<'c> Prepared<'c> {
 /// A capability with its constraints [`Prepared`].
 pub(super) struct PreparedCap<'c> {
     pub(super) cap: &'c Capability,
-    constraints: BTreeMap<&'c str, Prepared<'c>>,
+    /// In argument order, as the capability holds them; made on first use, so a pair whose
+    /// patterns do not match costs no allocation.
+    constraints: OnceCell<Vec<(&'c str, Prepared<'c>)>>,
 }
 
 impl<'c> PreparedCap<'c> {
     pub(super) fn new(cap: &'c Capability) -> Self {
         Self {
             cap,
-            constraints: cap
+            constraints: OnceCell::new(),
+        }
+    }
+
+    fn constraints(&self) -> &[(&'c str, Prepared<'c>)] {
+        self.constraints.get_or_init(|| {
+            self.cap
                 .constraints
                 .iter()
                 .map(|(k, c)| (k.as_str(), Prepared::new(c)))
-                .collect(),
-        }
+                .collect()
+        })
     }
 
     /// [`Capability::covers_calls`] of `self` (the parent) over `child`.
     pub(super) fn covers_calls(&self, child: &PreparedCap<'_>) -> bool {
         pattern_covers(&self.cap.server, &child.cap.server)
             && pattern_covers(&self.cap.tool, &child.cap.tool)
-            && self.constraints.iter().all(|(arg, parent_c)| {
-                child
-                    .constraints
-                    .get(arg)
-                    .is_some_and(|child_c| child_c.implies(parent_c))
+            && (self.cap.constraints.is_empty() || {
+                let theirs = child.constraints();
+                self.constraints().iter().all(|(arg, parent_c)| {
+                    theirs
+                        .binary_search_by(|(a, _)| a.cmp(arg))
+                        .is_ok_and(|i| theirs[i].1.implies(parent_c))
+                })
             })
     }
 

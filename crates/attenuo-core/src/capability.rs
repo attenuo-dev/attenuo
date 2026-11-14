@@ -533,14 +533,26 @@ impl ArgConstraint {
     /// Linear in the sizes of the two constraints: a `one_of` is compared through the set of
     /// its values' canonical keys, not value by value with the other's list (SR-123).
     pub fn implies(&self, other: &ArgConstraint) -> bool {
+        if self.is_small() && other.is_small() {
+            return self.implies_direct(other);
+        }
         prepared::Prepared::new(self).implies(&prepared::Prepared::new(other))
+    }
+
+    /// Is this constraint cheap to compare value by value: anything but a `one_of` of more than
+    /// [`SMALL_LIST`] values? Two such constraints are compared by
+    /// [`implies_direct`](Self::implies_direct), which hashes nothing.
+    fn is_small(&self) -> bool {
+        !matches!(self, ArgConstraint::OneOf(vs) if vs.len() > SMALL_LIST)
     }
 
     /// [`implies`](Self::implies) by its definition, arm by arm, comparing values pairwise.
     /// The arms between a `one_of` and a list or a summary of a list cost the product of the
     /// two lengths, and [`prepared::Prepared::implies`] answers those itself; it calls this
-    /// for the others, which compare at most one value with one constraint. The tests check
-    /// every answer of [`implies`](Self::implies) against this one.
+    /// for the others, which compare at most one value with one constraint.
+    /// [`implies`](Self::implies) calls it for two small constraints
+    /// ([`is_small`](Self::is_small)). The tests check every answer of the prepared
+    /// implication against this one.
     fn implies_direct(&self, other: &ArgConstraint) -> bool {
         // A constraint no value satisfies (an empty `OneOf`, an unchecked inverted range)
         // vacuously implies every constraint. That is sound: a capability carrying it permits
@@ -747,12 +759,22 @@ impl Capability {
 
     /// The call half of [`covers`](Self::covers): patterns and constraints, ignoring limits.
     pub fn covers_calls(&self, child: &Capability) -> bool {
+        if self.is_small() && child.is_small() {
+            return self.covers_calls_direct(child);
+        }
         PreparedCap::new(self).covers_calls(&PreparedCap::new(child))
     }
 
+    /// Is this capability cheap to compare constraint by constraint: at most [`SMALL_LIST`]
+    /// constraints, each [`ArgConstraint::is_small`]?
+    fn is_small(&self) -> bool {
+        self.constraints.len() <= SMALL_LIST
+            && self.constraints.values().all(ArgConstraint::is_small)
+    }
+
     /// [`covers_calls`](Self::covers_calls) with [`ArgConstraint::implies_direct`]: the
-    /// definition the tests compare the prepared check with.
-    #[cfg(test)]
+    /// definition, which the tests compare the prepared check with, and the check for small
+    /// capabilities, where preparing costs more than it saves.
     fn covers_calls_direct(&self, child: &Capability) -> bool {
         if !pattern_covers(&self.server, &child.server) || !pattern_covers(&self.tool, &child.tool)
         {
@@ -867,6 +889,15 @@ impl Capability {
 /// product of the two sizes; every path that mints a token bounds the request with
 /// [`CapabilitySet::validate_size`] before comparing anything.
 pub const MAX_CAPABILITIES: usize = 1024;
+
+/// A `one_of` of at most this many values, and a capability of at most this many constraints,
+/// are compared pairwise, without hashing ([`ArgConstraint::is_small`]).
+const SMALL_LIST: usize = 8;
+
+/// Two sets of at most this many pairs of small capabilities are compared pairwise
+/// ([`CapabilitySet::small_with`]): the common case of a few capabilities, where preparing the
+/// parent costs more than it saves.
+const SMALL_PAIRS: usize = 64;
 
 /// The most values one `one_of` constraint may list (SR-123).
 pub const MAX_ONE_OF_VALUES: usize = 1024;
@@ -1089,6 +1120,27 @@ impl CapabilitySet {
     /// A child that is only covered by the union of several parents is rejected. That is
     /// sound (never widens) and keeps the check linear and explainable.
     pub fn covers(&self, child: &CapabilitySet) -> bool {
+        if self.small_with(child) {
+            return self.covers_direct(child);
+        }
+        self.covers_prepared(child)
+    }
+
+    /// Are `self` and `other` small enough that comparing them pair by pair costs less than
+    /// preparing them: at most [`SMALL_PAIRS`] pairs of capabilities, each
+    /// [`Capability::is_small`]? Then each pair costs at most [`SMALL_LIST`] constraints of at
+    /// most [`SMALL_LIST`] squared value comparisons.
+    fn small_with(&self, other: &CapabilitySet) -> bool {
+        self.len().saturating_mul(other.len()) <= SMALL_PAIRS
+            && self
+                .0
+                .iter()
+                .chain(other.0.iter())
+                .all(Capability::is_small)
+    }
+
+    /// [`covers`](Self::covers) with `self` prepared once.
+    fn covers_prepared(&self, child: &CapabilitySet) -> bool {
         let parents = PreparedSet::new(&self.0);
         child.0.iter().all(|c| {
             let c = PreparedCap::new(c);
@@ -1112,8 +1164,8 @@ impl CapabilitySet {
             .collect()
     }
 
-    /// [`covers`](Self::covers) by its definition, pair by pair: the tests' reference.
-    #[cfg(test)]
+    /// [`covers`](Self::covers) by its definition, pair by pair: the tests' reference, and
+    /// the check for small sets ([`small_with`](Self::small_with)).
     fn covers_direct(&self, child: &CapabilitySet) -> bool {
         child.0.iter().all(|c| {
             self.0
@@ -1251,6 +1303,22 @@ impl CapabilitySet {
         }
         // Before anything is compared: the loop below costs the product of both sizes (SR-123).
         requested.validate_size()?;
+        if self.small_with(requested) {
+            return self.attenuate_indexed_direct(requested, remaining);
+        }
+        self.attenuate_indexed_prepared(requested, remaining)
+    }
+
+    /// [`attenuate_indexed`](Self::attenuate_indexed) with `self` prepared once, for a
+    /// `requested` that passed [`CapabilitySet::validate_size`].
+    fn attenuate_indexed_prepared<'r>(
+        &self,
+        requested: &'r CapabilitySet,
+        remaining: impl Fn(usize, LimitKind, u64) -> Option<u64>,
+    ) -> Result<Vec<(usize, &'r Capability, Capability)>, AttenuationError> {
+        if requested.is_empty() {
+            return Err(AttenuationError::Empty);
+        }
         let parents = PreparedSet::new(&self.0);
         let mut out = Vec::with_capacity(requested.len());
         for c in requested.0.iter() {
@@ -1311,8 +1379,8 @@ impl CapabilitySet {
     }
 
     /// The attenuation step as it was written before SR-123's fix, pair by pair with the
-    /// pairwise implication: the tests' reference for [`attenuate_indexed`](Self::attenuate_indexed).
-    #[cfg(test)]
+    /// pairwise implication: the tests' reference for the prepared step, and the step for small
+    /// sets ([`small_with`](Self::small_with)).
     fn attenuate_indexed_direct<'r>(
         &self,
         requested: &'r CapabilitySet,
