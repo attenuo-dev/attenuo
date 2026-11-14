@@ -734,6 +734,44 @@ async def test_action_search_is_retried_with_new_dpop_proofs(
     assert len({verify(r.headers["dpop"])[1]["jti"] for r in rec.requests}) == 2
 
 
+def search_rate_limited(retry_after: str = "2") -> httpx.Response:
+    """The server's answer to a run over ``[limits] authzen_search_requests_per_minute``."""
+    return httpx.Response(
+        429,
+        json={
+            "error": "rate_limited",
+            "code": "rate_limited",
+            "detail": "too many action searches for this run; retry later",
+            "error_description": "rate_limited",
+        },
+        headers={"retry-after": retry_after},
+    )
+
+
+async def test_an_action_search_over_its_rate_limit_is_rate_limited(
+    make: Any,  # noqa: F811
+    sleeps: list[float],
+) -> None:
+    """SR-117: a search refused by the per-run search limit raises ``RateLimited`` as the other
+    rate limits do, at once without ``max_retries`` and after that many waits with it."""
+    client, rec = make(lambda r: search_rate_limited("2"))
+    with pytest.raises(RateLimited) as e:
+        await call(client, "authzen_search_action", "TOK", "github")
+    assert (e.value.status, e.value.reason, e.value.code, e.value.retry_after) == (
+        429,
+        "rate_limited",
+        "rate_limited",
+        2,
+    )
+    assert not isinstance(e.value, (Denied, Unauthorized, Unavailable))
+    assert len(rec.requests) == 1 and sleeps == []
+    client, rec = make(lambda r: search_rate_limited("2"), max_retries=2)
+    with pytest.raises(RateLimited):
+        await call(client, "authzen_search_action", "TOK", "github")
+    assert [r.url.path for r in rec.requests] == ["/access/v1/search/action"] * 3
+    assert sleeps == [2.0, 2.0]
+
+
 async def test_a_streamed_call_is_retried_before_it_starts(
     make: Any,  # noqa: F811
     sleeps: list[float],

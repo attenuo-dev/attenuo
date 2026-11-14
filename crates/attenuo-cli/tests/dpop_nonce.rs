@@ -324,6 +324,32 @@ fn authzen_search_follows_pages_with_the_nonce() {
     assert!(body(&reqs[0]).get("page").is_none());
 }
 
+/// A search over `[limits] authzen_search_requests_per_minute` (SR-117) is reported with the
+/// server's status and code and not retried: the CLI has no load retry, for any rate limit.
+#[test]
+fn authzen_search_reports_a_rate_limit_and_does_not_retry() {
+    let (url, server) = scripted_server(vec![(
+        "429 Too Many Requests",
+        vec![("retry-after", "17".to_string())],
+        r#"{"error":"rate_limited","code":"rate_limited","detail":"too many action searches for this run; retry later","error_description":"rate_limited"}"#,
+    )]);
+    let out = attenuo()
+        .env("ATTENUO_TOKEN", "a.b.c")
+        .args(["--server", &url, "authzen", "search", "--all"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(server.join().unwrap().len(), 1);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("429") && stderr.contains("rate_limited"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("too many action searches"), "{stderr}");
+    assert!(out.stdout.is_empty());
+    assert_quiet(&out, &["a.b.c"]);
+}
+
 #[test]
 fn exchange_header_proof_carries_the_nonce_and_the_sign_off_does_not_need_one() {
     let dir = tempfile::tempdir().unwrap();

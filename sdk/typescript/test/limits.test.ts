@@ -624,6 +624,42 @@ describe("the opt-in retry", () => {
     expect(new Set(calls.map((c) => claimsOf(c.headers.get("dpop")).jti)).size).toBe(2);
   });
 
+  it("raises an action search over its rate limit as RateLimitedError, retried within bounds", async () => {
+    // SR-117: `[limits] authzen_search_requests_per_minute`, as the other rate limits.
+    const searchRateLimited = () =>
+      jsonResponse(
+        {
+          error: "rate_limited",
+          code: "rate_limited",
+          detail: "too many action searches for this run; retry later",
+          error_description: "rate_limited",
+        },
+        429,
+        { "retry-after": "2" },
+      );
+    const once = client(searchRateLimited);
+    const e = await caught(once.ob.authzenSearchAction("TOK", "github"));
+    expect(e).toBeInstanceOf(RateLimitedError);
+    const err = e as RateLimitedError;
+    expect([err.status, err.reason, err.code, err.retryAfter]).toEqual([
+      429,
+      "rate_limited",
+      "rate_limited",
+      2,
+    ]);
+    expect(err).not.toBeInstanceOf(DeniedError);
+    expect(once.calls).toHaveLength(1);
+    expect(sleeps).toEqual([]);
+    const retried = client(searchRateLimited, { maxRetries: 2 });
+    expect(await caught(retried.ob.authzenSearchAction("TOK", "github"))).toBeInstanceOf(
+      RateLimitedError,
+    );
+    expect(retried.calls.map((c) => c.url.pathname)).toEqual(
+      Array(3).fill("/access/v1/search/action"),
+    );
+    expect(sleeps).toEqual([2000, 2000]);
+  });
+
   it("retries a streamed call before it starts", async () => {
     const { ob, calls } = client(
       sequence(
