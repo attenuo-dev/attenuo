@@ -1000,11 +1000,7 @@ impl Deliver for S3Deliver {
             uri_encode(&self.key(s), false)
         );
         let url = format!("{}{}", self.endpoint, path);
-        let host = self
-            .endpoint
-            .split_once("://")
-            .map_or("", |(_, h)| h)
-            .to_string();
+        let host = signed_host(&self.endpoint);
         let payload_hash = hex::encode(Sha256::digest(&body));
         let amz_date = amz_date(SystemTime::now());
         let mut headers = vec![
@@ -1047,6 +1043,24 @@ impl Deliver for S3Deliver {
         } else {
             Err(format!("S3 answered {status}"))
         }
+    }
+}
+
+/// The `host` header value SigV4 signs for `endpoint`: what the HTTP client sends, so the
+/// host as the URL parser normalizes it (lowercased) and the port only when it is not the
+/// scheme's default (`http://s3:80` sends `Host: s3`). Signing the endpoint as written made
+/// S3 answer 403 for an endpoint with an explicit default port.
+fn signed_host(endpoint: &str) -> String {
+    match reqwest::Url::parse(endpoint) {
+        Ok(url) => match (url.host_str(), url.port()) {
+            (Some(h), Some(p)) => format!("{h}:{p}"),
+            (Some(h), None) => h.to_string(),
+            (None, _) => String::new(),
+        },
+        Err(_) => endpoint
+            .split_once("://")
+            .map_or("", |(_, h)| h)
+            .to_string(),
     }
 }
 
@@ -1556,6 +1570,35 @@ mod tests {
             ),
             "{auth}"
         );
+    }
+
+    /// The signed `host` is the one reqwest sends: a default port (`:80` for http, `:443` for
+    /// https) is not sent, so it must not be signed, or S3 answers 403 SignatureDoesNotMatch
+    /// (seen against MinIO at `http://127.0.0.1:80`); the host is sent lowercased.
+    #[test]
+    fn signed_host_is_the_host_header_sent() {
+        assert_eq!(signed_host("http://127.0.0.1:9000"), "127.0.0.1:9000");
+        assert_eq!(signed_host("http://127.0.0.1:80"), "127.0.0.1");
+        assert_eq!(
+            signed_host("https://s3.eu-west-1.amazonaws.com:443"),
+            "s3.eu-west-1.amazonaws.com"
+        );
+        assert_eq!(signed_host("http://minio:443"), "minio:443");
+        assert_eq!(signed_host("https://S3.Example.com"), "s3.example.com");
+        assert_eq!(signed_host("http://[::1]:9000"), "[::1]:9000");
+        for endpoint in [
+            "http://127.0.0.1:80",
+            "https://S3.Example.com:443",
+            "http://[::1]:9000",
+            "http://minio:9000",
+        ] {
+            let url = reqwest::Url::parse(&format!("{endpoint}/bucket/key")).unwrap();
+            let sent = match url.port() {
+                Some(p) => format!("{}:{p}", url.host_str().unwrap()),
+                None => url.host_str().unwrap().to_string(),
+            };
+            assert_eq!(signed_host(endpoint), sent, "{endpoint}");
+        }
     }
 
     #[test]
