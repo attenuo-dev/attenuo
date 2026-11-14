@@ -36,6 +36,7 @@ All three must match for hop 0 to work. With no `[[agents]]` and no `[[actor_tru
 issuer = "https://idp.example.com/realms/acme"   # exact `iss` of the tokens
 client_ids = { planner = "agent-platform" }       # client id of each agent at the IdP
 # jwks_url = "https://idp.example.com/keys"       # optional
+# ca_pem_path = "/etc/attenuo/idp-ca.pem"         # optional, a private CA for this IdP
 allowed_algs = ["RS256", "ES256", "EdDSA"]        # default
 attribute_claims = ["email", "groups", "amr"]     # default
 jwks_ttl_seconds = 300                            # default
@@ -49,6 +50,7 @@ clock_skew_seconds = 60                           # default
 | `client_ids` | Table of agent id to the client id registered for that agent at the IdP, the application that ran the login. An ID token is accepted only when its `aud` contains the presenting agent's client id, and its `azp` equals it when `aud` has several values or `azp` is present. An agent with no entry must have a client id equal to its agent id; the server logs a warning at startup for each such agent. Not used for an ID-JAG, whose `aud` must be attenuo's own `[issuer] issuer` and whose `client_id` must be the agent. |
 | `audience` | Deprecated. Ignored for ID tokens since SR-37, which needed the audience to be per agent. Existing configs still load; the server logs a warning when it is set. |
 | `jwks_url` | Where to fetch signing keys. When absent, attenuo reads `jwks_uri` from `<issuer>/.well-known/openid-configuration`. Every key fetch must be `https://` (plain `http://` is accepted only for a loopback host, for local testing), and redirects are not followed, so give the final URL. |
+| `ca_pem_path` | Optional. A PEM file of CA certificates that this entry's key fetches (discovery, JWKS, the refetch on an unknown `kid`) trust in addition to the built-in web PKI roots, for an IdP whose certificate a private CA issued. See [Private CAs for key URLs](#private-cas-for-key-urls). |
 | `allowed_algs` | Accepted JWS algorithms. Asymmetric only: `RS256`, `RS384`, `RS512`, `ES256`, `ES384`, `PS256` and so on. A symmetric algorithm such as `HS256` is refused when the config loads. |
 | `attribute_claims` | Claims copied verbatim into `originating_user.attributes`, when present and not null. |
 | `jwks_ttl_seconds` | How long fetched keys are used before refetching. A token with an unknown `kid` triggers one early refetch, at most once per 30 seconds. |
@@ -56,6 +58,20 @@ clock_skew_seconds = 60                           # default
 | `tenant` | Optional. For a multi-tenant issuer: the tenant whose users this entry trusts. An ID-JAG must then carry a `tenant` claim equal to it, else `missing_claim` or `tenant_mismatch` ([ID-JAG](#id-jag)). ID tokens are not affected. Unset by default: `tenant` is not checked. |
 
 You can list several IdPs. The unverified `iss` selects the entry. An issuer that is not listed is rejected without any network call.
+
+### Private CAs for key URLs
+
+attenuo checks the certificate of every key URL (an IdP's discovery document and JWKS, an `[[actor_trust]]` JWKS or SPIFFE bundle endpoint) against the Mozilla root set built into it (the `webpki-roots` crate), not against the system's trust store. An IdP or a bundle endpoint whose certificate a private CA issued is refused: the request that needed its keys fails with `503 temporarily_unavailable` / `jwks_unavailable`, and the server log names the TLS cause. To trust such a CA, put its certificate (PEM; several are fine) in a file and name it in that entry:
+
+```toml
+[[idps]]
+issuer = "https://idp.corp.example/realms/acme"
+ca_pem_path = "/etc/attenuo/corp-ca.pem"
+```
+
+The server refuses to start when the file is missing, unreadable or empty, or holds no usable certificate. It reads the file once, at start; no reload re-reads it, so restart after replacing it.
+
+Why additive: the file adds roots to the built-in ones and never replaces them, so naming a private CA cannot make a public IdP stop working, and no setting can turn verification or the hostname check off; the certificate must still be valid for the URL's host, the `https://` rule stays, and redirects are still refused. Why per entry: a CA trusted for one key URL is a CA that can sign keys for that issuer, so it is trusted for the entry that names it and nothing else. Another `[[idps]]` or `[[actor_trust]]` entry, and the server's other outbound connections (the audit sink, approval notifications, trace export), keep the built-in roots alone, and a private CA for the SPIRE server does not become able to vouch for your IdP.
 
 ### Which claims become `originating_user.attributes`
 

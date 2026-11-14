@@ -171,6 +171,7 @@ fn config(keys: &Keys, idp: &Idp) -> Config {
         clock_skew_seconds: 60,
         client_ids: BTreeMap::from([("planner".to_string(), CLIENT_AUD.to_string())]),
         tenant: None,
+        ca_pem_path: None,
     }];
     cfg.root_grants = vec![RootGrant {
         subject: None,
@@ -700,6 +701,7 @@ async fn actor_auth_modes_treat_an_assertion_as_client_credentials() {
             jwks_url: Some("http://127.0.0.1:9/jwks".into()),
             spiffe_trust_domain: None,
             spiffe_bundle_url: None,
+            ca_pem_path: None,
             audience: ISSUER.into(),
             subject_to_agent: SubjectToAgent::Sub,
             allowed_algs: vec!["EdDSA".into()],

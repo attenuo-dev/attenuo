@@ -111,6 +111,7 @@ url = "http://127.0.0.1:3001/mcp"
 [[idps]]
 issuer = "https://idp.example"
 jwks_url = "https://idp.example/jwks"
+ca_pem_path = "idp-ca.pem"
 client_ids = { planner = "planner-app" }
 tenant = "t"
 
@@ -137,6 +138,7 @@ issuer = "https://spiffe.example"
 jwks_url = "https://spiffe.example/jwks"
 spiffe_trust_domain = "example.org"
 spiffe_bundle_url = "https://spiffe.example/bundle"
+ca_pem_path = "spire-ca.pem"
 audience = "attenuo"
 "#;
 

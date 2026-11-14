@@ -260,7 +260,9 @@ pub struct IdpRegistry {
 impl IdpRegistry {
     /// Validate the `[[idps]]` entries and build their key caches.
     pub fn from_config(idps: &[IdpConfig], our_issuer: &str) -> anyhow::Result<Self> {
-        let client = jwks::fetch_client(FETCH_TIMEOUT)?;
+        // One client for every entry without `ca_pem_path`; an entry with one gets its own,
+        // so its extra roots are trusted for its fetches and no other.
+        let shared = jwks::fetch_client(FETCH_TIMEOUT, &[])?;
         let mut out = Vec::with_capacity(idps.len());
         for cfg in idps {
             if cfg.issuer.is_empty() {
@@ -313,8 +315,10 @@ impl IdpRegistry {
             };
             jwks::check_fetch_url(source)
                 .map_err(|e| anyhow::anyhow!("[[idps]] `{}`: {key} {source:?}: {e}", cfg.issuer))?;
+            let client = jwks::entry_client(&shared, cfg.ca_pem_path.as_deref(), FETCH_TIMEOUT)
+                .map_err(|e| anyhow::anyhow!("[[idps]] `{}`: {e}", cfg.issuer))?;
             let jwks = JwksCache::new(
-                client.clone(),
+                client,
                 cfg.issuer.clone(),
                 cfg.jwks_url.clone(),
                 Duration::from_secs(cfg.jwks_ttl_seconds),
@@ -800,6 +804,7 @@ mod tests {
             jwks_ttl_seconds: 300,
             clock_skew_seconds: 60,
             tenant: None,
+            ca_pem_path: None,
             client_ids: Default::default(),
         };
         assert!(IdpRegistry::from_config(std::slice::from_ref(&cfg), "me").is_err());
@@ -821,6 +826,7 @@ mod tests {
             jwks_ttl_seconds: 300,
             clock_skew_seconds: 60,
             tenant: tenant.map(str::to_owned),
+            ca_pem_path: None,
             client_ids: Default::default(),
         };
         for ok in [None, Some("acme")] {
@@ -848,6 +854,7 @@ mod tests {
             jwks_ttl_seconds: 300,
             clock_skew_seconds: 60,
             tenant: None,
+            ca_pem_path: None,
             client_ids: Default::default(),
         };
         for ok in [

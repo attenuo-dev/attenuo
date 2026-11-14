@@ -17,6 +17,13 @@
 //! development and tests ([`check_fetch_url`]). Redirects are never followed: a 3xx answer
 //! fails the fetch and names the `Location`, so a redirect cannot move a fetch from https to
 //! http or to another host. Configure the final URL instead.
+//!
+//! Trust: a key URL's certificate is checked against the web PKI roots built in (the
+//! `webpki-roots` set), plus, for an entry that sets `ca_pem_path`, the CA certificates in that
+//! file ([`read_ca_pem`]). The extra roots are added to the built-in ones, never replace them,
+//! and belong to that entry's client alone: another entry, and every other outbound client of
+//! the server, still trusts only the built-in roots. Nothing here can turn verification or
+//! the hostname check off.
 
 use std::str::FromStr;
 use std::time::{Duration, Instant};
@@ -43,11 +50,70 @@ pub(crate) const UNKNOWN_KID_REFETCH_COOLDOWN: Duration = Duration::from_secs(30
 /// then come over cleartext from another machine. Pinning the name keeps the local-development
 /// exception on the machine itself, whatever the resolver says (SR-107).
 ///
+/// `extra_roots` (an entry's `ca_pem_path`, from [`read_ca_pem`]) are trusted in addition to
+/// the built-in web PKI roots, for this client only.
+///
 /// # Errors
 ///
-/// When the TLS backend cannot be initialised.
-pub(crate) fn fetch_client(timeout: Duration) -> reqwest::Result<reqwest::Client> {
-    fetch_client_builder(timeout).build()
+/// When the TLS backend cannot be initialised, or a certificate of `extra_roots` cannot be
+/// used as a trust anchor.
+pub(crate) fn fetch_client(
+    timeout: Duration,
+    extra_roots: &[reqwest::Certificate],
+) -> reqwest::Result<reqwest::Client> {
+    extra_roots
+        .iter()
+        .fold(fetch_client_builder(timeout), |b, c| {
+            b.add_root_certificate(c.clone())
+        })
+        .build()
+}
+
+/// The CA certificates of an `[[idps]]` or `[[actor_trust]]` `ca_pem_path`: every
+/// `CERTIFICATE` block of a PEM file. Other blocks (a private key, say) are ignored.
+///
+/// # Errors
+///
+/// A message, without the path (callers name it), when the file cannot be read, is not PEM,
+/// or holds no certificate.
+pub(crate) fn read_ca_pem(path: &std::path::Path) -> Result<Vec<reqwest::Certificate>, String> {
+    let pem = std::fs::read(path).map_err(|e| format!("cannot read the file ({e})"))?;
+    if pem.iter().all(u8::is_ascii_whitespace) {
+        return Err("the file is empty; it must hold PEM CA certificates".into());
+    }
+    let certs = reqwest::Certificate::from_pem_bundle(&pem)
+        .map_err(|e| format!("not a PEM certificate file ({e})"))?;
+    if certs.is_empty() {
+        return Err("no PEM certificate (-----BEGIN CERTIFICATE-----) in the file".into());
+    }
+    Ok(certs)
+}
+
+/// The key-fetch client of one entry: `shared` (built-in roots only) when it names no
+/// `ca_pem_path`, else a client of its own that also trusts that file's CAs.
+///
+/// # Errors
+///
+/// A message, without the entry's name (callers give it), naming the path and the problem.
+pub(crate) fn entry_client(
+    shared: &reqwest::Client,
+    ca_pem_path: Option<&std::path::Path>,
+    timeout: Duration,
+) -> Result<reqwest::Client, String> {
+    let Some(path) = ca_pem_path else {
+        return Ok(shared.clone());
+    };
+    let fail = |e: String| format!("ca_pem_path {:?}: {e}", path.display().to_string());
+    let roots = read_ca_pem(path).map_err(fail)?;
+    fetch_client(timeout, &roots).map_err(|e| {
+        use std::error::Error as _;
+        let cause = e
+            .source()
+            .map_or_else(|| e.to_string(), ToString::to_string);
+        fail(format!(
+            "a certificate cannot be used as a trust anchor ({cause})"
+        ))
+    })
 }
 
 /// [`fetch_client`]'s builder, for a test that swaps the resolver underneath the pin.
@@ -436,7 +502,7 @@ mod tests {
 
     fn cache(issuer: &str, url: Option<String>) -> JwksCache {
         JwksCache::new(
-            fetch_client(Duration::from_secs(5)).unwrap(),
+            fetch_client(Duration::from_secs(5), &[]).unwrap(),
             issuer.into(),
             url,
             Duration::from_secs(300),
