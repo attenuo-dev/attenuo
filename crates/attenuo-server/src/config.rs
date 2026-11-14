@@ -2552,7 +2552,9 @@ pub struct IdpConfig {
     /// `resource`, `scope` and `authorization_details` claims name, under `[[root_grants]]`
     /// (draft-ietf-oauth-identity-assertion-authz-grant-06 §4.4.1). See
     /// [`IdJagCeilingConfig`]. Default: unset, those claims are ignored and the root token is
-    /// bounded by the root grant and the request only. ID tokens are never affected.
+    /// bounded by the root grant and the request only. ID tokens are never affected, so an
+    /// agent that can present this issuer's ID tokens (its `client_ids` entry, or its agent
+    /// id, is their `aud`) is not bound by the ceiling (SR-122).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id_jag_ceiling: Option<IdJagCeilingConfig>,
 }
