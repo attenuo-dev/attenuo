@@ -11,7 +11,7 @@
 //!
 //! | Claim | Names |
 //! |---|---|
-//! | `authorization_details` | the `capabilities` of every entry whose `type` is `attenuo_capabilities` ([`AUTHORIZATION_DETAILS_TYPE`]), each read strictly ([`CapabilityConfig`]: an unknown member, or a name that is not valid, makes that capability name nothing). An entry of any other `type` names nothing |
+//! | `authorization_details` | the `capabilities` of every entry whose `type` is `attenuo_capabilities` ([`AUTHORIZATION_DETAILS_TYPE`]), each read strictly ([`CapabilityConfig`]: an unknown member, or a name that is not valid, makes that capability name nothing). An entry of any other `type` names nothing, and so does the whole claim when its entries hold more than [`MAX_CLAIM_CAPABILITIES`] capabilities |
 //! | `resource` (string or array of strings) | `<server>:*` for every server that `resources` maps the value to. An unmapped value names nothing |
 //! | `scope` (space-separated string) | the capabilities that `scopes` maps each token to. An unmapped token names nothing |
 //!
@@ -40,6 +40,12 @@ use crate::config::{check_server_name, CapSpec, CapabilityConfig, IdJagCeilingCo
 /// The claims a ceiling reads, in the order they are applied.
 pub(crate) const CEILING_CLAIMS: [&str; 3] = ["resource", "scope", "authorization_details"];
 
+/// The most capabilities an `authorization_details` claim may name, over all its
+/// `attenuo_capabilities` entries. A claim naming more names nothing, so the request is refused
+/// (`id_jag_ceiling_empty`): the request is attenuated against the ceiling, which costs the
+/// product of the two sizes, before any of it reaches the blocking pool (SR-123).
+pub(crate) const MAX_CLAIM_CAPABILITIES: usize = 256;
+
 /// A checked `[idps.id_jag_ceiling]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct IdJagCeiling {
@@ -58,7 +64,7 @@ pub(crate) struct Applied {
 
 impl IdJagCeiling {
     /// Check the table: every resource maps to at least one valid server name, every scope
-    /// token is non-empty without whitespace and maps to at least one valid capability.
+    /// token is non-empty without whitespace and maps to at least one valid capability (names and limits).
     ///
     /// # Errors
     ///
@@ -99,6 +105,10 @@ impl IdJagCeiling {
                 let cap = CapSpec::to_capability(spec)
                     .map_err(|e| format!("id_jag_ceiling.scopes `{scope}`: {e}"))?;
                 cap.validate()
+                    .map_err(|e| format!("id_jag_ceiling.scopes `{scope}`: {e}"))?;
+                // As for an `authorization_details` capability: limits no token may carry
+                // would otherwise fail every intake that keeps this capability (SR-125).
+                cap.validate_limits()
                     .map_err(|e| format!("id_jag_ceiling.scopes `{scope}`: {e}"))?;
                 if cap.server != "*" {
                     check_server_name(&cap.server)
@@ -159,15 +169,28 @@ impl IdJagCeiling {
 }
 
 /// The capabilities of the `attenuo_capabilities` entries of an `authorization_details` claim.
+/// Nothing when they hold more than [`MAX_CLAIM_CAPABILITIES`] capability objects (SR-123).
 fn named_by_details(value: &Value) -> CapabilitySet {
     let Some(entries) = value.as_array() else {
         return CapabilitySet::new();
     };
-    entries
+    let objects: Vec<&Value> = entries
         .iter()
         .filter(|e| e.get("type").and_then(Value::as_str) == Some(AUTHORIZATION_DETAILS_TYPE))
         .filter_map(|e| e.get("capabilities").and_then(Value::as_array))
         .flatten()
+        .collect();
+    if objects.len() > MAX_CLAIM_CAPABILITIES {
+        tracing::warn!(
+            named = objects.len(),
+            max = MAX_CLAIM_CAPABILITIES,
+            "ID-JAG authorization_details names more capabilities than the ceiling reads; \
+             it names nothing"
+        );
+        return CapabilitySet::new();
+    }
+    objects
+        .into_iter()
         .filter_map(|c| serde_json::from_value::<CapabilityConfig>(c.clone()).ok())
         .map(Capability::from)
         .filter(|c| c.validate().is_ok() && c.validate_limits().is_ok())
@@ -406,9 +429,111 @@ mod tests {
         assert!(bad(r#"scopes = { "a b" = ["github:*"] }"#).contains("not a scope token"));
         assert!(bad(r#"scopes = { "s" = [] }"#).contains("maps to no capability"));
         assert!(bad(r#"scopes = { "s" = ["nocolon"] }"#).contains("server:tool"));
+        // SR-125: a scope capability whose limits no token may carry refuses to start, as an
+        // `authorization_details` one names nothing, instead of failing every intake later.
+        assert!(bad(
+            r#"scopes = { "s" = [{ server = "github", tool = "*", limits = { sum = { arg = "", max = 1 } } }] }"#
+        )
+        .contains("scopes `s`"));
+        assert!(bad(
+            r#"scopes = { "s" = [{ server = "github", tool = "*", limits = { sum = { arg = "n", max = 1, derive = "host" } } }] }"#
+        )
+        .contains("derive"));
         // An empty table is accepted: only authorization_details can then name anything.
         let cfg: IdJagCeilingConfig = toml::from_str("").unwrap();
         IdJagCeiling::from_config(&cfg).unwrap();
         assert!(toml::from_str::<IdJagCeilingConfig>("resource = {}").is_err());
+    }
+
+    /// SR-123: the request is attenuated against the ceiling, which costs the product of the
+    /// two sizes, on the request's own task. An `authorization_details` claim naming more
+    /// capabilities than [`MAX_CLAIM_CAPABILITIES`] names nothing (fails closed), so the
+    /// ceiling stays within the root grant's size plus that bound.
+    #[test]
+    fn a_claim_naming_too_many_capabilities_names_nothing_sr123() {
+        let c = ceiling();
+        let grant = set(&["github:*"]);
+        let details = |n: usize| {
+            let caps: Vec<Value> = (0..n)
+                .map(|i| json!({"server": "github", "tool": format!("t{i}")}))
+                .collect();
+            claims(json!({"authorization_details": [
+                {"type": AUTHORIZATION_DETAILS_TYPE, "capabilities": caps[..n / 2]},
+                {"type": "payment_initiation"},
+                {"type": AUTHORIZATION_DETAILS_TYPE, "capabilities": caps[n / 2..]},
+            ]}))
+        };
+        let at = c.apply(&grant, &details(MAX_CLAIM_CAPABILITIES));
+        assert_eq!(at.capabilities.len(), MAX_CLAIM_CAPABILITIES);
+        let over = c.apply(&grant, &details(MAX_CLAIM_CAPABILITIES + 1));
+        assert!(over.capabilities.is_empty());
+        assert_eq!(over.claims, ["authorization_details"]);
+    }
+
+    /// The claims hold for a spread of grants and claims with globs, constraints and limits:
+    /// the result is covered by the grant and by what each claim names, and the request
+    /// attenuated against it too.
+    #[test]
+    fn the_result_is_within_the_grant_and_every_claim() {
+        let limited = |cap: Capability, l: Limits| cap.with_limits(l);
+        let pin =
+            |cap: Capability, p: &str| cap.with_constraint("repo", ArgConstraint::Prefix(p.into()));
+        let caps = vec![
+            Capability::new("*", "*"),
+            Capability::new("github", "*"),
+            Capability::new("github", "read_*"),
+            Capability::new("github", "read_file"),
+            pin(Capability::new("github", "read_file"), "acme/"),
+            pin(Capability::new("github", "*"), "acme/api"),
+            limited(
+                Capability::new("github", "*"),
+                Limits::default().with_calls(5),
+            ),
+            limited(
+                Capability::new("github", "read_file"),
+                Limits::default().with_calls(2),
+            ),
+            limited(
+                Capability::new("github", "read_file"),
+                Limits {
+                    distinct: Some(attenuo_core::ArgLimit::new("repo", 1)),
+                    ..Limits::default()
+                },
+            ),
+            limited(
+                Capability::new("github", "read_file"),
+                Limits {
+                    sum: Some(attenuo_core::ArgLimit::new("bytes", 100)),
+                    ..Limits::default()
+                },
+            ),
+            Capability::new("slack", "post_message"),
+        ];
+        let sets: Vec<CapabilitySet> = (0..caps.len())
+            .flat_map(|i| {
+                (i..caps.len()).map({
+                    let caps = &caps;
+                    move |j| [caps[i].clone(), caps[j].clone()].into_iter().collect()
+                })
+            })
+            .collect();
+        let mut kept = 0;
+        for g in &sets {
+            for b in &sets {
+                let m = meet(g, b);
+                assert!(g.covers(&m), "{g:?} {b:?} -> {m:?}");
+                assert!(b.covers(&m), "{g:?} {b:?} -> {m:?}");
+                if m.is_empty() {
+                    continue;
+                }
+                kept += 1;
+                for r in &sets {
+                    if let Ok(t) = g.attenuate(r).and_then(|t| m.attenuate(&t)) {
+                        assert!(g.covers(&t) && b.covers(&t) && m.covers(&t));
+                    }
+                }
+            }
+        }
+        assert!(kept > 100, "{kept}");
     }
 }
