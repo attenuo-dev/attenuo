@@ -636,6 +636,34 @@ describe("AdminClient console endpoints", () => {
       remaining: 1,
       values: undefined,
     });
+    // An older server sends no `user_windows`.
+    expect(tree.userWindows).toBeUndefined();
+  });
+
+  it("types the user windows of a lease tree", async () => {
+    const windows = {
+      truncated: true,
+      windows: [
+        { tool: "bank/pay", kind: "hour", start: "2026-11-14T09:00:00Z", calls: 2, amount: 40 },
+        { tool: "bank/pay", kind: "day", start: "2026-11-14T00:00:00Z", calls: 5, amount: 130 },
+      ],
+    };
+    let userWindows: unknown = windows;
+    const { fetch } = mockFetch(() =>
+      jsonResponse({
+        root: "r",
+        ancestors: [],
+        nodes: [],
+        would_revoke: 0,
+        truncated: false,
+        user_windows: userWindows,
+      }),
+    );
+    const admin = new AdminClient(URL_, "adm", { fetch });
+    expect((await admin.leaseTree("r")).userWindows).toEqual(windows);
+    // A run from before the server kept issuers.
+    userWindows = null;
+    expect((await admin.leaseTree("r")).userWindows).toBeUndefined();
   });
 
   it("reads the policy set and the on-disk check", async () => {

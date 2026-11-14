@@ -22,6 +22,8 @@ from attenuo import (
     EvaluationBudget,
     EvaluationLabels,
     EvaluationUsage,
+    LeaseUserWindow,
+    LeaseUserWindows,
     Prefix,
     RevokeResult,
     StatedApproval,
@@ -602,6 +604,31 @@ async def test_lease_tree(make: Any) -> None:
     assert tree.nodes[0].budget == {"recorded": True, "limits": [], "usage": []}
     await call(client, "lease_tree", "l1")
     assert dict(seen[-1].url.params) == {}
+    # An older server sends no `user_windows`, and a run from before issuers were kept null.
+    assert tree.user_windows is None
+
+
+async def test_lease_tree_user_windows(make: Any) -> None:
+    windows = {"truncated": True, "windows": [
+        {"tool": "bank/pay", "kind": "hour", "start": "2026-11-14T09:00:00Z",
+         "calls": 2, "amount": 40},
+        {"tool": "bank/pay", "kind": "day", "start": "2026-11-14T00:00:00Z",
+         "calls": 5, "amount": 130},
+    ]}  # fmt: skip
+    body = {"root": "r", "ancestors": [], "nodes": [_node("r", None)], "would_revoke": 1,
+            "truncated": False, "user_windows": windows}  # fmt: skip
+    client, _ = make(lambda r: httpx.Response(200, json=body))
+    tree = await call(client, "lease_tree", "r")
+    assert tree.user_windows == LeaseUserWindows(
+        windows=[
+            LeaseUserWindow("bank/pay", "hour", "2026-11-14T09:00:00Z", 2, 40),
+            LeaseUserWindow("bank/pay", "day", "2026-11-14T00:00:00Z", 5, 130),
+        ],
+        truncated=True,
+    )
+    body["user_windows"] = None
+    client, _ = make(lambda r: httpx.Response(200, json=body))
+    assert (await call(client, "lease_tree", "r")).user_windows is None
 
 
 async def test_policies_and_check(make: Any) -> None:
