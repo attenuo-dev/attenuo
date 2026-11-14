@@ -307,7 +307,27 @@ What attenuo checks:
 
 The agent always authenticates (client secret, client assertion or actor token), even for a sender-constrained ID-JAG; the draft only requires one or the other.
 
-The draft's `resource`, `scope` and `authorization_details` claims are not used: what the root token may carry comes from `[[root_grants]]` and the request. An IdP that narrows an ID-JAG to one resource does not narrow the root token; `[[root_grants]]` is the only ceiling. Nor are `aud_tenant`, `aud_sub` or `sub_id`: the user is `sub`.
+By default the draft's `resource`, `scope` and `authorization_details` claims are not used: what the root token may carry comes from `[[root_grants]]` and the request, and an IdP that narrows an ID-JAG to one resource does not narrow the root token. `aud_tenant`, `aud_sub` and `sub_id` are never used: the user is `sub`.
+
+**The ID-JAG's claims as a ceiling.** Add `[idps.id_jag_ceiling]` to the IdP's entry and the root token carries no more than both the root grant and the ID-JAG allow. attenuo does not guess what a resource URL or a scope means, so you write down the mapping:
+
+```toml
+[[idps]]
+issuer = "https://idp.example.com"
+
+[idps.id_jag_ceiling]
+# resource (RFC 8707) -> upstream servers; each stands for <server>:*
+resources = { "https://mcp.example.com/github" = ["github"] }
+# scope token -> capabilities, as in [[root_grants]] capabilities
+scopes = { "repo.read" = ["github:read_file", "github:list_*"] }
+
+[[root_grants]]
+issuer = "https://idp.example.com"
+agent = "planner"
+capabilities = ["github:*", "slack:*"]
+```
+
+With this, an ID-JAG with `resource = "https://mcp.example.com/github"` gives at most `github:*` (slack is out), one with `scope = "repo.read"` at most the two read tools, and one with both their intersection. An `authorization_details` entry of attenuo's own type, `attenuo_capabilities`, names capabilities directly, constraints and limits included. Each claim present narrows; a claim the ID-JAG does not carry narrows nothing, so an ID-JAG with none of them gets the root grant. A claim never widens: a resource mapped to a server the grant does not give, or a scope mapped to `*:*`, adds nothing. An unmapped resource or scope token and an `authorization_details` entry of another type name nothing, so an ID-JAG whose claims name only such things is refused with `invalid_scope` / `id_jag_ceiling_empty`. A request within the grant but beyond the ID-JAG is `invalid_scope` / `scope_exceeds_id_jag`. Every later hop is bounded by the root token, so the ceiling holds for the whole chain. ID tokens are not affected. The keys and the exact rules are in the [configuration reference](../reference/config.md#idpsidjagceiling).
 
 **Multi-tenant issuers.** When one IdP issuer serves several tenants and tells them apart with the `tenant` claim, the draft says the authorization server must require `tenant` and trust `iss` and `tenant` together. Set `tenant` on the `[[idps]]` entry to the one tenant whose users it trusts:
 
@@ -505,6 +525,8 @@ Errors carry a stable `code` (the same value as `error_description`, which older
 | `400 invalid_grant` / `typ_mismatch` | Wrong credential type for the `subject_token_type` you sent |
 | `400 invalid_scope` / `no_root_grant` | No `[[root_grants]]` entry for this issuer and agent |
 | `400 invalid_scope` / `scope_exceeds_grant` | The request asks for more than the entry allows |
+| `400 invalid_scope` / `id_jag_ceiling_empty` | With `[idps.id_jag_ceiling]`: the ID-JAG's `resource`, `scope` or `authorization_details` name nothing the root grant gives (unmapped, of another type, or outside the grant) |
+| `400 invalid_scope` / `scope_exceeds_id_jag` | With `[idps.id_jag_ceiling]`: the request is within the root grant but asks for more than the ID-JAG's claims allow |
 | `503 temporarily_unavailable` / `jwks_unavailable` | attenuo cannot reach the IdP, or the JWKS or discovery document is bad. Failed refreshes drop old keys: there are no stale keys. The server's WARN line `IdP JWKS unavailable` (`actor token issuer JWKS unavailable` for `[[actor_trust]]`) names the URL and the cause, for a TLS failure the certificate error (`invalid peer certificate: UnknownIssuer` for a CA attenuo does not trust, see [Private CAs for key URLs](#private-cas-for-key-urls); `certificate not valid for name ...` for a hostname mismatch); the response does not |
 
 The server log shows each rejection with the issuer and the code.

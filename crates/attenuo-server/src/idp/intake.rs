@@ -36,7 +36,10 @@
 //! `cnf.jkt`, a DPoP proof by that key (`credential_pop_required`, `credential_pop_mismatch`);
 //! build the originating user
 //! ([`claims::originating_user`]); find the `[[root_grants]]` entry for (issuer, agent,
-//! subject) and attenuate the request against it (`invalid_scope`); cap the TTL at the
+//! subject) and attenuate the request against it (`invalid_scope`); for an ID-JAG from an
+//! issuer with `[idps.id_jag_ceiling]`, narrow that entry by the ID-JAG's `resource`, `scope`
+//! and `authorization_details` ([`super::ceiling`]; `id_jag_ceiling_empty` when nothing is
+//! left) and attenuate the request against the result too (`scope_exceeds_id_jag`); cap the TTL at the
 //! credential's remaining lifetime (`credential_expired` if none is left) and at the actor
 //! token's `exp` (`actor_token_expired`); use the credential and the actor token once
 //! ([`crate::replay`], `replayed`); then `Issuer::issue_root`, register the lease, and audit
@@ -231,10 +234,38 @@ pub(crate) async fn handle(
             ),
         )
     })?;
-    let ceiling = capability_set(&grant.capabilities).map_err(ApiError::internal)?;
-    let capabilities = ceiling
+    let granted = capability_set(&grant.capabilities).map_err(ApiError::internal)?;
+    let capabilities = granted
         .attenuate(&requested)
         .map_err(|e| invalid_scope("scope_exceeds_grant", e.to_string()))?;
+    // `[idps.id_jag_ceiling]` (opt-in): the ID-JAG's `resource`, `scope` and
+    // `authorization_details` narrow the root grant further (draft -06 §4.4.1). Without the
+    // table nothing here runs, and the answer and the audit record are as before.
+    let mut ceiling_claims = None;
+    let capabilities = match (kind, state.idps.id_jag_ceiling(&verified.issuer)) {
+        (CredentialKind::IdJag, Some(ceiling)) => {
+            let applied = ceiling.apply(&granted, &verified.claims);
+            if applied.capabilities.is_empty() {
+                return Err(invalid_scope(
+                    "id_jag_ceiling_empty",
+                    format!(
+                        "the ID-JAG's {} leave nothing of the [[root_grants]] entry for agent `{agent}` \
+                         ([idps.id_jag_ceiling] of `{}`)",
+                        applied.claims.join(", "),
+                        verified.issuer
+                    ),
+                ));
+            }
+            let narrowed = applied
+                .capabilities
+                .attenuate(&capabilities)
+                .map_err(|e| invalid_scope("scope_exceeds_id_jag", e.to_string()))?;
+            tracing::debug!(claims = ?applied.claims, "ID-JAG ceiling applied");
+            ceiling_claims = Some(applied.claims);
+            narrowed
+        }
+        _ => capabilities,
+    };
     let may_act = grant
         .may_act_for(req.may_act.clone())
         .map_err(|e| invalid_request("may_act_exceeds_grant", e))?;
@@ -320,6 +351,12 @@ pub(crate) async fn handle(
                 "agent_auth": agent_auth,
                 "dpop_bound": dpop_bound,
             });
+            // Present only under `[idps.id_jag_ceiling]`, so the digest of every other
+            // record is unchanged: the claims that narrowed the root grant (empty when the
+            // ID-JAG carried none of them).
+            if let Some(claims) = ceiling_claims {
+                args["id_jag_ceiling"] = claims.into();
+            }
             if let Some((subject, trust)) = actor_info {
                 args["actor_subject"] = subject.into();
                 args["actor_trust"] = trust.into();

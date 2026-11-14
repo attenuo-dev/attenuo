@@ -146,6 +146,7 @@ fn config_trusting(idp: &EcIdp) -> Config {
         jwks_ttl_seconds: 300,
         clock_skew_seconds: 60,
         tenant: None,
+        id_jag_ceiling: None,
         ca_pem_path: None,
         client_ids: BTreeMap::from([("planner".to_string(), CLIENT_AUD.to_string())]),
     }];
@@ -244,6 +245,7 @@ async fn server_with_two_clients(idp: &EcIdp) -> Spawned {
         jwks_ttl_seconds: 300,
         clock_skew_seconds: 60,
         tenant: None,
+        id_jag_ceiling: None,
         ca_pem_path: None,
         client_ids: BTreeMap::from([
             ("planner".to_string(), "planner-app".to_string()),

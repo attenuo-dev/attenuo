@@ -171,6 +171,7 @@ fn config(keys: &Keys, idp: &Idp) -> Config {
         clock_skew_seconds: 60,
         client_ids: BTreeMap::from([("planner".to_string(), CLIENT_AUD.to_string())]),
         tenant: None,
+        id_jag_ceiling: None,
         ca_pem_path: None,
     }];
     cfg.root_grants = vec![RootGrant {

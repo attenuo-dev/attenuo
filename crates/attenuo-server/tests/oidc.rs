@@ -11,7 +11,7 @@ use attenuo_policy::{ArgType, ToolAttrs};
 use attenuo_proxy::jsonrpc::CODE_DENIED;
 use attenuo_proxy::testing::{spawn_router, FakeMcpServer, Spawned};
 use attenuo_proxy::UpstreamConfig;
-use attenuo_server::config::{AgentConfig, CapSpec, IdpConfig, RootGrant};
+use attenuo_server::config::{AgentConfig, CapSpec, IdJagCeilingConfig, IdpConfig, RootGrant};
 use attenuo_server::{AppState, Config};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -229,6 +229,7 @@ impl Harness {
             jwks_ttl_seconds: 300,
             clock_skew_seconds: 60,
             tenant: None,
+            id_jag_ceiling: None,
             ca_pem_path: None,
             client_ids: ["planner", "coder"]
                 .map(|a| (a.to_string(), CLIENT_AUD.to_string()))
@@ -1316,5 +1317,393 @@ async fn id_tokens_are_used_once_and_cap_the_root_ttl() {
         StatusCode::BAD_REQUEST,
         "invalid_grant",
         "credential_expired",
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// `[idps.id_jag_ceiling]`: the ID-JAG's own claims as a ceiling under `[[root_grants]]`.
+// ---------------------------------------------------------------------------------------------
+
+const GITHUB_RESOURCE: &str = "https://mcp.test/github";
+const SLACK_RESOURCE: &str = "https://mcp.test/slack";
+const JIRA_RESOURCE: &str = "https://mcp.test/jira";
+
+/// A harness whose root grant gives `github:*` and `slack:*`, with a ceiling on the IdP when
+/// `ceiling` is set: three resources (jira is mapped but not granted) and two scopes.
+async fn ceiling_harness(ceiling: bool) -> Harness {
+    Harness::start_with(|cfg| {
+        cfg.root_grants[0].capabilities = vec![
+            CapSpec::Short("github:*".into()),
+            CapSpec::Short("slack:*".into()),
+        ];
+        if ceiling {
+            cfg.idps[0].id_jag_ceiling = Some(IdJagCeilingConfig {
+                resources: BTreeMap::from([
+                    (GITHUB_RESOURCE.to_string(), vec!["github".to_string()]),
+                    (SLACK_RESOURCE.to_string(), vec!["slack".to_string()]),
+                    (JIRA_RESOURCE.to_string(), vec!["jira".to_string()]),
+                ]),
+                scopes: BTreeMap::from([
+                    (
+                        "files.read".to_string(),
+                        vec![CapSpec::Short("github:read_file".into())],
+                    ),
+                    ("everything".to_string(), vec![CapSpec::Short("*:*".into())]),
+                ]),
+            });
+        }
+    })
+    .await
+}
+
+/// An ID-JAG for alice and planner, with `extra` claims set.
+fn jag_with(h: &Harness, extra: Value) -> String {
+    let mut c = h.idp.id_jag_claims("alice", "planner");
+    for (k, v) in extra.as_object().unwrap() {
+        c[k] = v.clone();
+    }
+    h.idp.sign(&h.idp.key, Some("oauth-id-jag+jwt"), &c)
+}
+
+/// Present `jag` as planner (jwt-bearer), asking with `ask` (`scope` or
+/// `authorization_details`).
+async fn present(h: &Harness, jag: &str, ask: (&str, &str)) -> (StatusCode, Value) {
+    h.post_form(
+        &[
+            ("grant_type", JWT_BEARER),
+            ("assertion", jag),
+            ("client_id", "planner"),
+            ("client_secret", PLANNER_SECRET),
+            ask,
+        ],
+        None,
+    )
+    .await
+}
+
+/// The audit record of the root token with this lease.
+async fn root_record(h: &Harness, lease: &str) -> Value {
+    let audit: Value = h
+        .client
+        .get(h.url("/admin/audit?from=1&limit=1000"))
+        .bearer_auth(ADMIN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    audit["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["record"].clone())
+        .find(|r| r["tool"] == "token.root" && r["leases"][0] == lease)
+        .unwrap_or_else(|| panic!("no token.root record for {lease}: {audit}"))
+}
+
+/// The arguments digest an intake record of `token` has, with `extra` members added to the
+/// arguments the server has always recorded.
+fn intake_digest(h: &Harness, token: &str, extra: Value) -> String {
+    let chain = h.verify(token);
+    let mut args = json!({
+        "agent": "planner",
+        "requested": chain.hops[0].capabilities,
+        "credential": "id-jag",
+        "idp": h.idp.issuer,
+        "agent_auth": "client_secret",
+        "dpop_bound": false,
+    });
+    for (k, v) in extra.as_object().unwrap() {
+        args[k] = v.clone();
+    }
+    attenuo_core::ToolCall::new("attenuo", "token.root", args).arguments_digest()
+}
+
+fn caps(token_caps: &attenuo_core::CapabilitySet) -> Vec<String> {
+    token_caps.iter().map(|c| c.display()).collect()
+}
+
+/// Without `[idps.id_jag_ceiling]` the claims are ignored: an ID-JAG whose claims name nothing
+/// mappable still gets what the root grant and the request allow, and the audit record's
+/// arguments are exactly the ones recorded before the option existed.
+#[tokio::test]
+async fn id_jag_claims_are_ignored_without_a_ceiling() {
+    let h = ceiling_harness(false).await;
+    let jag = jag_with(
+        &h,
+        json!({
+            "resource": "https://unmapped.example",
+            "scope": "nothing",
+            "authorization_details": [{"type": "payment_initiation"}],
+        }),
+    );
+    let got = present(&h, &jag, ("scope", "github:read_file slack:post_message")).await;
+    assert_eq!(got.0, StatusCode::OK, "{}", got.1);
+    let token = got.1["access_token"].as_str().unwrap();
+    assert_eq!(
+        caps(&h.verify(token).hops[0].capabilities),
+        ["github:read_file", "slack:post_message"]
+    );
+    let rec = root_record(&h, got.1["lease"].as_str().unwrap()).await;
+    assert_eq!(rec["arguments_digest"], intake_digest(&h, token, json!({})));
+    // A request wider than the grant keeps its old code.
+    let jag = jag_with(&h, json!({}));
+    assert_error(
+        &present(&h, &jag, ("scope", "jira:create_issue")).await,
+        StatusCode::BAD_REQUEST,
+        "invalid_scope",
+        "scope_exceeds_grant",
+    );
+}
+
+/// With the ceiling, each of `resource`, `scope` and `authorization_details` narrows the root
+/// grant; the audit record names the claims used.
+#[tokio::test]
+async fn id_jag_ceiling_narrows_by_each_claim() {
+    let h = ceiling_harness(true).await;
+    let exceeds = |got: &(StatusCode, Value)| {
+        assert_error(
+            got,
+            StatusCode::BAD_REQUEST,
+            "invalid_scope",
+            "scope_exceeds_id_jag",
+        )
+    };
+
+    // resource: github only, so slack is out.
+    let res = json!({"resource": GITHUB_RESOURCE});
+    exceeds(
+        &present(
+            &h,
+            &jag_with(&h, res.clone()),
+            ("scope", "slack:post_message"),
+        )
+        .await,
+    );
+    let got = present(
+        &h,
+        &jag_with(&h, res.clone()),
+        ("scope", "github:create_issue"),
+    )
+    .await;
+    assert_eq!(got.0, StatusCode::OK, "{}", got.1);
+    let token = got.1["access_token"].as_str().unwrap();
+    let rec = root_record(&h, got.1["lease"].as_str().unwrap()).await;
+    assert_eq!(
+        rec["arguments_digest"],
+        intake_digest(&h, token, json!({"id_jag_ceiling": ["resource"]}))
+    );
+
+    // scope: read_file only.
+    let scope = json!({"scope": "files.read"});
+    exceeds(
+        &present(
+            &h,
+            &jag_with(&h, scope.clone()),
+            ("scope", "github:create_issue"),
+        )
+        .await,
+    );
+    let got = present(
+        &h,
+        &jag_with(&h, scope.clone()),
+        ("scope", "github:read_file"),
+    )
+    .await;
+    assert_eq!(got.0, StatusCode::OK, "{}", got.1);
+
+    // authorization_details: read_file under a repository prefix; the constraint carries over,
+    // so asking without it is too much.
+    let details = json!({"authorization_details": [{
+        "type": "attenuo_capabilities",
+        "capabilities": [{"server": "github", "tool": "read_file",
+                          "constraints": {"repo": {"op": "prefix", "value": "acme/"}}}],
+    }]});
+    exceeds(
+        &present(
+            &h,
+            &jag_with(&h, details.clone()),
+            ("scope", "github:read_file"),
+        )
+        .await,
+    );
+    let ask = json!([{"type": "attenuo_capabilities", "capabilities": [
+        {"server": "github", "tool": "read_file",
+         "constraints": {"repo": {"op": "prefix", "value": "acme/api"}}}]}])
+    .to_string();
+    let got = present(
+        &h,
+        &jag_with(&h, details.clone()),
+        ("authorization_details", &ask),
+    )
+    .await;
+    assert_eq!(got.0, StatusCode::OK, "{}", got.1);
+
+    // All three together: their intersection.
+    let all = json!({"resource": [GITHUB_RESOURCE, SLACK_RESOURCE], "scope": "files.read",
+                     "authorization_details": details["authorization_details"]});
+    exceeds(
+        &present(
+            &h,
+            &jag_with(&h, all.clone()),
+            ("scope", "slack:post_message"),
+        )
+        .await,
+    );
+    let got = present(&h, &jag_with(&h, all), ("authorization_details", &ask)).await;
+    assert_eq!(got.0, StatusCode::OK, "{}", got.1);
+    let token = got.1["access_token"].as_str().unwrap();
+    let rec = root_record(&h, got.1["lease"].as_str().unwrap()).await;
+    assert_eq!(
+        rec["arguments_digest"],
+        intake_digest(
+            &h,
+            token,
+            json!({"id_jag_ceiling": ["resource", "scope", "authorization_details"]})
+        )
+    );
+
+    // None of the claims: the root grant as it is, and the record says the ceiling ran.
+    let got = present(
+        &h,
+        &jag_with(&h, json!({})),
+        ("scope", "slack:post_message"),
+    )
+    .await;
+    assert_eq!(got.0, StatusCode::OK, "{}", got.1);
+    let token = got.1["access_token"].as_str().unwrap();
+    let rec = root_record(&h, got.1["lease"].as_str().unwrap()).await;
+    assert_eq!(
+        rec["arguments_digest"],
+        intake_digest(&h, token, json!({"id_jag_ceiling": []}))
+    );
+
+    // ID tokens are not affected by the ceiling.
+    let got = h
+        .intake(&h.idp.id_token("alice"), "slack:post_message")
+        .await;
+    assert_eq!(got.0, StatusCode::OK, "{}", got.1);
+}
+
+/// A claim naming more than the root grant gives adds nothing; an unmapped resource or scope
+/// and an unknown `authorization_details` type name nothing; when nothing is left the request
+/// is refused with `id_jag_ceiling_empty`.
+#[tokio::test]
+async fn id_jag_ceiling_never_widens_and_fails_closed() {
+    let h = ceiling_harness(true).await;
+
+    // `everything` maps to `*:*` and jira is a mapped resource, but the grant has neither.
+    for wide in [
+        json!({"scope": "everything"}),
+        json!({"resource": [GITHUB_RESOURCE, JIRA_RESOURCE]}),
+    ] {
+        assert_error(
+            &present(
+                &h,
+                &jag_with(&h, wide.clone()),
+                ("scope", "jira:create_issue"),
+            )
+            .await,
+            StatusCode::BAD_REQUEST,
+            "invalid_scope",
+            "scope_exceeds_grant",
+        );
+        let got = present(&h, &jag_with(&h, wide), ("scope", "github:read_file")).await;
+        assert_eq!(got.0, StatusCode::OK, "{}", got.1);
+        let token = got.1["access_token"].as_str().unwrap();
+        assert_eq!(
+            caps(&h.verify(token).hops[0].capabilities),
+            ["github:read_file"]
+        );
+    }
+    // Only jira, which the grant does not give: nothing is left.
+    let empty = |got: &(StatusCode, Value)| {
+        assert_error(
+            got,
+            StatusCode::BAD_REQUEST,
+            "invalid_scope",
+            "id_jag_ceiling_empty",
+        )
+    };
+    empty(
+        &present(
+            &h,
+            &jag_with(&h, json!({"resource": JIRA_RESOURCE})),
+            ("scope", "github:read_file"),
+        )
+        .await,
+    );
+
+    // Unmapped, unknown or malformed: names nothing.
+    for claims in [
+        json!({"resource": "https://unmapped.example"}),
+        json!({"resource": format!("{GITHUB_RESOURCE}/")}),
+        json!({"scope": "admin"}),
+        json!({"scope": ["files.read"]}),
+        json!({"authorization_details": [{"type": "payment_initiation", "capabilities": [
+            {"server": "github", "tool": "*"}]}]}),
+        json!({"authorization_details": [{"type": "attenuo_capabilities", "capabilities": [
+            {"server": "github", "tool": "*", "constraint": {}}]}]}),
+        // A mapped resource with an unmapped scope: each claim present must allow it.
+        json!({"resource": GITHUB_RESOURCE, "scope": "admin"}),
+    ] {
+        empty(&present(&h, &jag_with(&h, claims), ("scope", "github:read_file")).await);
+    }
+    // An unmapped token next to a mapped one: the mapped one counts.
+    let got = present(
+        &h,
+        &jag_with(&h, json!({"scope": "admin files.read"})),
+        ("scope", "github:read_file"),
+    )
+    .await;
+    assert_eq!(got.0, StatusCode::OK, "{}", got.1);
+
+    // A refusal does not use the ID-JAG up (as with `scope_exceeds_grant`).
+    let jag = jag_with(&h, json!({"scope": "files.read"}));
+    assert_error(
+        &present(&h, &jag, ("scope", "github:create_issue")).await,
+        StatusCode::BAD_REQUEST,
+        "invalid_scope",
+        "scope_exceeds_id_jag",
+    );
+    assert_eq!(
+        present(&h, &jag, ("scope", "github:read_file")).await.0,
+        StatusCode::OK
+    );
+}
+
+/// The ceiling bounds the whole chain: an exchange from the root token cannot ask for what the
+/// root grant gives but the ID-JAG did not, and the proxy does not allow it either.
+#[tokio::test]
+async fn a_later_exchange_cannot_exceed_the_id_jag_ceiling() {
+    let h = ceiling_harness(true).await;
+    let jag = jag_with(&h, json!({"scope": "files.read"}));
+    let got = present(&h, &jag, ("scope", "github:read_file")).await;
+    assert_eq!(got.0, StatusCode::OK, "{}", got.1);
+    let root = got.1["access_token"].as_str().unwrap().to_owned();
+
+    for ask in ["github:create_issue", "github:*", "slack:post_message"] {
+        let (status, body) = h
+            .post_form(
+                &[
+                    ("grant_type", EXCHANGE),
+                    ("subject_token", &root),
+                    ("subject_token_type", JWT),
+                    ("actor", "coder"),
+                    ("scope", ask),
+                ],
+                Some(("coder", CODER_SECRET)),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{ask}: {body}");
+        assert_eq!(body["code"], "scope_exceeds_parent", "{ask}: {body}");
+    }
+    let ok = h.mcp_call(&root, "read_file").await;
+    assert!(ok.get("result").is_some(), "{ok}");
+    let denied = h.mcp_call(&root, "create_issue").await;
+    assert_eq!(
+        denied["error"]["data"]["reason"], "capability_denied",
+        "{denied}"
     );
 }

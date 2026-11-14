@@ -139,6 +139,7 @@ impl Harness {
             jwks_ttl_seconds: 300,
             clock_skew_seconds: 0,
             tenant: None,
+            id_jag_ceiling: None,
             ca_pem_path: None,
             client_ids: BTreeMap::new(),
         }];

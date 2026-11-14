@@ -116,6 +116,7 @@ The table is generated from `attenuo_core::error_codes::ERROR_CODES`, the one pl
 | `dpop_required` | 401 | `-32001` (401) |  | The token is bound to a key and no DPoP proof was sent. |
 | `duplicate_actor` | 400 `invalid_request` |  |  | The `actor` is already in the chain. |
 | `expired` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The credential has expired. |
+| `id_jag_ceiling_empty` | 400 `invalid_scope` |  |  | An ID-JAG from an issuer with `[idps.id_jag_ceiling]`: its `resource`, `scope` and `authorization_details` claims leave nothing of the root grant (each names only what is unmapped, of an unknown type, or not in the grant). |
 | `input_type_mismatch` |  | `-32003` (200) | yes | A call argument does not have the type the catalog declares. |
 | `invalid_agent` | 400 `invalid_grant` |  |  | The agent id of the token to mint is empty (an exchange's `actor`, or `agent` at `POST /admin/root-token`). |
 | `invalid_capability` | 400 `invalid_grant`, 400 `invalid_scope` |  |  | A requested capability is not one a call can have: a server or tool name that breaks the naming rules, or a malformed limit (sent with `error` `invalid_grant`); or a shorthand that is not `server:tool` (a form `scope` at `POST /token`, `capabilities` at `POST /admin/root-token`; sent with `error` `invalid_scope`). |
@@ -172,6 +173,7 @@ The table is generated from `attenuo_core::error_codes::ERROR_CODES`, the one pl
 | `reserved_agent` | 400 `invalid_request` |  |  | The `actor` is the reserved agent `attenuo`. |
 | `reserved_subject` | 400 `invalid_request`, 400 `invalid_grant` |  |  | The subject is reserved. |
 | `scope_exceeds_grant` | 400 `invalid_scope` |  |  | The hop-0 request (an IdP credential at `POST /token`, or `POST /admin/root-token`) asks for more than the root grant allows. |
+| `scope_exceeds_id_jag` | 400 `invalid_scope` |  |  | An ID-JAG from an issuer with `[idps.id_jag_ceiling]`: the request is within the root grant but asks for more than the ID-JAG's own claims allow. |
 | `scope_exceeds_parent` | 400 `invalid_scope` |  |  | An exchange asks for more than the subject token holds. |
 | `server_error` | 500 |  |  | An internal error; the cause is in the server log only. |
 | `session_mismatch` |  | `-32003` (403) |  | The `Mcp-Session-Id` belongs to another principal. |

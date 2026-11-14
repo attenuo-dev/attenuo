@@ -51,6 +51,7 @@
 //! verifier's message (issuer, audience, `kid`, client ids) is logged at debug level and never
 //! returned (SR-17).
 
+pub(crate) mod ceiling;
 pub(crate) mod claims;
 pub(crate) mod intake;
 pub(crate) mod jwks;
@@ -248,6 +249,8 @@ struct TrustedIdp {
     config: IdpConfig,
     algs: Vec<Algorithm>,
     jwks: JwksCache,
+    /// `[idps.id_jag_ceiling]`, checked.
+    ceiling: Option<ceiling::IdJagCeiling>,
 }
 
 /// The configured `[[idps]]`, each with its key cache.
@@ -298,6 +301,12 @@ impl IdpRegistry {
                     cfg.issuer
                 );
             }
+            let ceiling = cfg
+                .id_jag_ceiling
+                .as_ref()
+                .map(ceiling::IdJagCeiling::from_config)
+                .transpose()
+                .map_err(|e| anyhow::anyhow!("[[idps]] `{}`: {e}", cfg.issuer))?;
             if cfg.jwks_ttl_seconds == 0 {
                 anyhow::bail!(
                     "[[idps]] `{}`: jwks_ttl_seconds must be positive",
@@ -328,6 +337,7 @@ impl IdpRegistry {
                 config: cfg.clone(),
                 algs,
                 jwks,
+                ceiling,
             });
         }
         Ok(Self {
@@ -338,6 +348,15 @@ impl IdpRegistry {
 
     pub fn is_empty(&self) -> bool {
         self.idps.is_empty()
+    }
+
+    /// The `[idps.id_jag_ceiling]` of the IdP `issuer`, when it has one.
+    pub(crate) fn id_jag_ceiling(&self, issuer: &str) -> Option<&ceiling::IdJagCeiling> {
+        self.idps
+            .iter()
+            .find(|i| i.config.issuer == issuer)?
+            .ceiling
+            .as_ref()
     }
 
     /// The `aud` an ID token must name when presented by `agent` at the IdP `issuer`: the
@@ -806,6 +825,7 @@ mod tests {
             tenant: None,
             ca_pem_path: None,
             client_ids: Default::default(),
+            id_jag_ceiling: None,
         };
         assert!(IdpRegistry::from_config(std::slice::from_ref(&cfg), "me").is_err());
         let good = IdpConfig {
@@ -828,6 +848,7 @@ mod tests {
             tenant: tenant.map(str::to_owned),
             ca_pem_path: None,
             client_ids: Default::default(),
+            id_jag_ceiling: None,
         };
         for ok in [None, Some("acme")] {
             IdpRegistry::from_config(&[idp(ok)], "me").unwrap();
@@ -839,6 +860,36 @@ mod tests {
                 .to_string();
             assert!(err.contains("tenant is empty"), "{err}");
         }
+    }
+
+    /// A bad `[idps.id_jag_ceiling]` refuses to start, naming the entry.
+    #[test]
+    fn a_bad_id_jag_ceiling_is_refused_in_config() {
+        let idp = |ceiling: &str| IdpConfig {
+            issuer: "https://idp.example".into(),
+            audience: String::new(),
+            jwks_url: None,
+            allowed_algs: vec!["RS256".into()],
+            attribute_claims: vec![],
+            jwks_ttl_seconds: 300,
+            clock_skew_seconds: 60,
+            tenant: None,
+            ca_pem_path: None,
+            client_ids: Default::default(),
+            id_jag_ceiling: Some(toml::from_str(ceiling).unwrap()),
+        };
+        let reg =
+            IdpRegistry::from_config(&[idp(r#"scopes = { "s" = ["github:*"] }"#)], "me").unwrap();
+        assert!(reg.id_jag_ceiling("https://idp.example").is_some());
+        assert!(reg.id_jag_ceiling("https://other.example").is_none());
+        let err = IdpRegistry::from_config(&[idp(r#"resources = { "r" = [] }"#)], "me")
+            .err()
+            .expect("a resource mapped to no server must be refused")
+            .to_string();
+        assert!(
+            err.contains("https://idp.example") && err.contains("maps to no server"),
+            "{err}"
+        );
     }
 
     /// S-8: the JWKS (or, without `jwks_url`, the issuer used for discovery) is https, or plain
@@ -856,6 +907,7 @@ mod tests {
             tenant: None,
             ca_pem_path: None,
             client_ids: Default::default(),
+            id_jag_ceiling: None,
         };
         for ok in [
             idp("https://idp.example", None),

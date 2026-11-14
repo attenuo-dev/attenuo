@@ -84,8 +84,9 @@ pub(crate) struct IdJagClaims {
 /// `iss`, `sub`, `aud`, `exp` and `iat`, also required, are checked by
 /// [`IdpRegistry::verify`](super::IdpRegistry::verify) for both credential kinds, and
 /// `tenant` there too, against `[[idps]] tenant`. The draft's `resource`, `scope` and
-/// `authorization_details` claims are not used: the capabilities of the root token come from
-/// `[[root_grants]]` and the request, not from the IdP. If a later draft renames or adds
+/// `authorization_details` claims are read only under `[idps.id_jag_ceiling]`, and then only
+/// to narrow the root grant ([`super::ceiling`]); otherwise the capabilities of the root token
+/// come from `[[root_grants]]` and the request alone. If a later draft renames or adds
 /// required claims, this is the function to change.
 pub(crate) fn map_id_jag(claims: &Map<String, Value>) -> Result<IdJagClaims, IntakeError> {
     let client_id = match claims.get("client_id").and_then(Value::as_str) {
