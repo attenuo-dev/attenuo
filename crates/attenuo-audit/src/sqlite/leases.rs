@@ -622,8 +622,7 @@ impl SqliteLeaseStore {
             // is accepted and the row is left as it is (never filled in), so re-registering
             // such a lease after an upgrade is not a conflict.
             Some((s, i))
-                if s == subject
-                    && (issuer.is_none() || i.is_none() || i.as_deref() == issuer) => {}
+                if s == subject && (issuer.is_none() || i.is_none() || i.as_deref() == issuer) => {}
             Some(_) => return Err(AuditError::BindingConflict(lease.0.clone())),
             None => {
                 tx.prepare_cached(

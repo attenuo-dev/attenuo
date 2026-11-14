@@ -857,11 +857,16 @@ fn a_version_3_file_gains_the_subject_issuer() {
     // The old leases keep their subject and have no originating user, now or later.
     assert_eq!(store.subject(&id("l1")).unwrap().as_deref(), Some("alice"));
     assert_eq!(store.originating_user(&id("l1")).unwrap(), None);
+    // Registering one again after the upgrade is accepted and fills nothing in; another
+    // subject is still a conflict.
+    store
+        .record_originating_user(&id("l1"), "https://idp.example", "alice")
+        .unwrap();
+    assert_eq!(store.originating_user(&id("l1")).unwrap(), None);
     assert!(matches!(
-        store.record_originating_user(&id("l1"), "https://idp.example", "alice"),
+        store.record_originating_user(&id("l1"), "https://idp.example", "bob"),
         Err(AuditError::BindingConflict(_))
     ));
-    assert_eq!(store.originating_user(&id("l1")).unwrap(), None);
     // A lease issued after it has both.
     store
         .register(&id("l3"), Some(&id("l2")), t0() + Duration::hours(1))
