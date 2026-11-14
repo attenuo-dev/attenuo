@@ -1,0 +1,88 @@
+{
+  "_note": "AuthZEN 1.0 section 8 (Action Search API): the request's context is applied to every candidate, as an evaluation would apply it. With context.input.repo matching public_reads, read_file is a result too; with session_id quarantined, the forbid applies to every tool and the answer is empty. Without page the whole catalog of the server fits one page (at most [authzen] max_batch candidates), so next_token is \"\". resource.properties.server names the server as well as resource.id does, and an action in the request is ignored (section 8 has none).",
+  "token": {},
+  "steps": [
+    {
+      "path": "/access/v1/search/action",
+      "body": {
+        "subject": {
+          "type": "agent",
+          "id": ""
+        },
+        "resource": {
+          "type": "mcp_server",
+          "id": "ignored",
+          "properties": {
+            "server": "github"
+          }
+        },
+        "action": {
+          "name": "delete_repo"
+        },
+        "context": {
+          "input": {
+            "repo": "alice/public-site"
+          }
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "page": {
+            "next_token": "",
+            "count": 3
+          },
+          "results": [
+            {
+              "name": "create_issue",
+              "properties": {
+                "server": "github"
+              }
+            },
+            {
+              "name": "pay",
+              "properties": {
+                "server": "github"
+              }
+            },
+            {
+              "name": "read_file",
+              "properties": {
+                "server": "github"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "path": "/access/v1/search/action",
+      "body": {
+        "subject": {
+          "type": "agent",
+          "id": ""
+        },
+        "resource": {
+          "type": "mcp_server",
+          "id": "github"
+        },
+        "context": {
+          "input": {
+            "repo": "alice/public-site"
+          },
+          "session_id": "quarantined"
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "page": {
+            "next_token": "",
+            "count": 0
+          },
+          "results": []
+        }
+      }
+    }
+  ]
+}

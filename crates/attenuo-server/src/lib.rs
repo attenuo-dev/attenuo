@@ -12,6 +12,7 @@
 //! | `POST /token/renew` | delegation token (bearer; with a `DPoP` proof when bound, [`dpop`]) | extend the last hop's lease |
 //! | `POST /access/v1/evaluation` | delegation token (bearer); or `[[peps]]` credentials with `[authzen] allow_unsigned_chain` | AuthZEN evaluation |
 //! | `POST /access/v1/evaluations` | same as above | AuthZEN batch evaluation, at most `[authzen] max_batch` entries |
+//! | `POST /access/v1/search/action` | same as above | AuthZEN action search: the catalog tools of one server the pipeline would allow, at most `[authzen] max_batch` evaluated per page; no audit record, charge or approval |
 //! | `GET /.well-known/authzen-configuration` | none | AuthZEN metadata |
 //! | `GET /.well-known/jwks.json` | none | issuer public key |
 //! | `GET /healthz` | none | liveness |
@@ -143,6 +144,7 @@ pub fn router(state: Arc<AppState>, upstreams: Vec<UpstreamConfig>, config: &Con
     let authzen_routes = Router::new()
         .route("/access/v1/evaluation", post(authzen::evaluation))
         .route("/access/v1/evaluations", post(authzen::evaluations))
+        .route("/access/v1/search/action", post(authzen::search_action))
         .route_layer(axum::middleware::from_fn(authzen::echo_request_id));
     let mut token_routes = Router::new()
         .route(

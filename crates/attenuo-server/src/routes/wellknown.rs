@@ -27,9 +27,11 @@ pub async fn jwks(State(state): State<Arc<AppState>>) -> Json<Value> {
 ///
 /// Public, like the JWKS: no credential is asked for and `Authorization` is ignored, because a
 /// PEP reads it before it knows where to send credentials and the specification does not
-/// protect it (9.2.1, 11.8). It holds only the base URL and the two endpoint paths. The search
-/// endpoint parameters are left out because the Search APIs are not served (9.1.1: absent
-/// means unsupported); `capabilities` and `signed_metadata` are not published.
+/// protect it (9.2.1, 11.8). It holds only the base URL and the three endpoint paths
+/// (evaluation, batch evaluation, action search). `search_subject_endpoint` and
+/// `search_resource_endpoint` are left out because those APIs are not served (9.1.1: absent
+/// means unsupported). `capabilities` is left out because the AuthZEN capabilities registry has
+/// no entry this server could name, and `signed_metadata` because nothing signs the document.
 ///
 /// # Errors
 ///
@@ -45,6 +47,7 @@ pub async fn authzen_configuration(
         "policy_decision_point": base,
         "access_evaluation_endpoint": format!("{base}/access/v1/evaluation"),
         "access_evaluations_endpoint": format!("{base}/access/v1/evaluations"),
+        "search_action_endpoint": format!("{base}{}", super::authzen::SEARCH_ACTION_PATH),
     })))
 }
 

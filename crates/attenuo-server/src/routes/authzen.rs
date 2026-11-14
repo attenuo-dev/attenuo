@@ -215,6 +215,225 @@ fn evaluate_batch(state: &AppState, headers: &HeaderMap, body: &Bytes) -> Result
     Ok(json!({ "evaluations": results }))
 }
 
+/// The path of the Action Search API (AuthZEN 1.0 section 8, default path of section 10.1).
+pub const SEARCH_ACTION_PATH: &str = "/access/v1/search/action";
+
+/// `POST /access/v1/search/action`: the AuthZEN Action Search API. Which actions (tools) the
+/// subject may perform on the resource (an MCP server), in the request's context.
+///
+/// - **Who may call.** Exactly who may call `POST /access/v1/evaluation`, authenticated the same
+///   way, by the same code: the agent's delegation token, or a `[[peps]]` entry with an
+///   unsigned chain under `[authzen] allow_unsigned_chain`.
+/// - **Resource.** The MCP server: `resource.properties.server`, else `resource.id`, which must
+///   then hold no `/` (a `<server>/<tool>` id names one tool, not a server). `resource.type`
+///   is not checked, as for evaluation. An `action` in the request is ignored (section 8 leaves
+///   it out of this request).
+/// - **Candidates.** The `[policy] catalog` tools of that server, in name order. A tool the
+///   catalog does not list is never a result, also under `unknown_tools = "allow"`.
+/// - **Results.** The candidates for which the pipeline would allow the call
+///   ([`Pipeline::would_allow`](crate::authz::Pipeline::would_allow)): each result, sent back
+///   as the `action` of `POST /access/v1/evaluation` with the same subject, resource and
+///   context, is decided `true` while the run's state is unchanged. Each result is `{"name":
+///   <tool>, "properties": {"server": <server>}}`. No reason, policy id or diagnostic is
+///   returned, so a caller learns no more than evaluating each candidate one at a time would
+///   tell it.
+/// - **No side effects.** No audit record, no charge to run limits or usage, no approval taken
+///   or requested: a search acts on nothing, as the admin dry run and the list screen do not.
+///   An approval-gated tool is not a result. `context.approval_token` is refused (400
+///   `approval_token_not_accepted`): an approval token is spent by the one decision it names.
+/// - **Paging** (section 8.2). At most `[authzen] max_batch` candidates are evaluated per
+///   request, the bound of a batch. `page.limit` (1 or more; above `max_batch` it is clamped)
+///   is how many candidates one page evaluates, so a page holds at most that many results and
+///   may hold fewer, even none, while more remain. `page.next_token` is the token of the next
+///   page, or `""` after the last; `page.count` is the number of results in this answer.
+///   `page.token` sends it back. The token is an opaque position ([`super::page`]); a request
+///   whose other members changed between pages is not detected and simply continues at that
+///   position.
+///
+/// # Errors
+///
+/// 400 `invalid_request` for a body that is not a JSON object or whose `subject` or `resource`
+/// is malformed (as for evaluation); 400 `invalid_page` for a `page` that is not an object, a
+/// `page.token` that is not a string or a `page.limit` that is not a positive integer; 400
+/// `invalid_cursor` for a `page.token` this route did not issue; 400 `invalid_search_resource`
+/// when the resource names no server; 400 `approval_token_not_accepted`; and the 401 and 403
+/// of authentication, as for evaluation.
+// The `Err` is a full response, built once per refused request; boxing it buys nothing.
+#[allow(clippy::result_large_err)]
+pub async fn search_action(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Body(body): Body,
+) -> Result<Json<Value>, Response> {
+    state
+        .blocking(move |s| search_actions(s, &headers, &body))
+        .await
+        .map(Json)
+        .map_err(|e| with_challenge(e.into_response()))
+}
+
+/// The `page` of a search request: where to start in the candidate list and how many
+/// candidates to evaluate.
+struct SearchPage {
+    start: usize,
+    limit: usize,
+}
+
+impl SearchPage {
+    fn from_request(page: Option<&Value>, max: usize) -> Result<Self, ApiError> {
+        let refuse = |detail: &str| {
+            ApiError::bad_request("invalid_request", detail).with_code("invalid_page")
+        };
+        let page = match page {
+            None | Some(Value::Null) => {
+                return Ok(Self {
+                    start: 0,
+                    limit: max,
+                })
+            }
+            Some(Value::Object(p)) => p,
+            Some(_) => return Err(refuse("`page` must be an object")),
+        };
+        let limit = match page.get("limit") {
+            None | Some(Value::Null) => max,
+            Some(v) => match v.as_u64() {
+                Some(0) | None => {
+                    return Err(refuse("`page.limit` must be an integer of at least 1"))
+                }
+                Some(n) => usize::try_from(n).unwrap_or(usize::MAX).min(max),
+            },
+        };
+        let token = match page.get("token") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(t)) => Some(t.as_str()),
+            Some(_) => return Err(refuse("`page.token` must be a string")),
+        };
+        // AuthZEN's end-of-results token is the empty string; a client that sends it back is
+        // asking for the first page again, which is what leaving it out does.
+        let token = token.filter(|t| !t.is_empty());
+        let start = super::page::decode_named(
+            "page.token",
+            token,
+            super::page::List::ActionSearch,
+            super::page::Direction::Ascending,
+        )?
+        .map_or(0, |p| usize::try_from(p).unwrap_or(usize::MAX));
+        Ok(Self { start, limit })
+    }
+}
+
+/// The MCP server an action search's `resource` names.
+fn search_server(resource: Option<&Value>) -> Result<String, ApiError> {
+    let refuse = |detail: &str| {
+        ApiError::bad_request("invalid_request", detail).with_code("invalid_search_resource")
+    };
+    let Some(resource) = resource.and_then(Value::as_object) else {
+        // Missing or not an object: the request is malformed, as at evaluation.
+        return Err(ApiError::bad_request(
+            "invalid_request",
+            "`resource` is required and must be an object",
+        ));
+    };
+    let from_props = resource
+        .get("properties")
+        .and_then(|p| p.get("server"))
+        .and_then(Value::as_str);
+    let server = match from_props {
+        Some(s) => s,
+        None => match resource.get("id").and_then(Value::as_str) {
+            Some(id) if id.contains('/') => {
+                return Err(refuse(
+                    "`resource.id` names one tool (`<server>/<tool>`); name the server in \
+                     `resource.properties.server` or as the whole `resource.id`",
+                ))
+            }
+            Some(id) => id,
+            None => return Err(refuse("`resource` names no MCP server")),
+        },
+    };
+    if server.is_empty() {
+        return Err(refuse("`resource` names no MCP server"));
+    }
+    Ok(server.to_string())
+}
+
+fn search_actions(state: &AppState, headers: &HeaderMap, body: &Bytes) -> Result<Value, ApiError> {
+    let mut raw: Value = parse_json(body)?;
+    let Some(obj) = raw.as_object_mut() else {
+        return Err(ApiError::bad_request(
+            "invalid_request",
+            "expected a JSON object",
+        ));
+    };
+    let page = SearchPage::from_request(obj.get("page"), state.authzen_max_batch)?;
+    obj.remove("page");
+    let server = search_server(obj.get("resource"))?;
+    // The request has no `action`: each candidate becomes one. Until then the call names the
+    // server only.
+    obj.insert(
+        "action".into(),
+        json!({ "name": "", "properties": { "server": server } }),
+    );
+    let bearer = bearer_auth(state, headers, SEARCH_ACTION_PATH)?;
+    let pep = pep_assertion(state, headers, &mut raw)?;
+    let a = admit(state, headers, bearer.as_ref(), pep.as_deref(), raw)?;
+    if a.req
+        .context
+        .as_ref()
+        .and_then(|c| c.get("approval_token"))
+        .is_some_and(|t| !t.is_null())
+    {
+        return Err(ApiError::bad_request(
+            "invalid_request",
+            "context.approval_token is not accepted by action search: an approval token is \
+             spent by the one decision it names; send it to POST /access/v1/evaluation",
+        )
+        .with_code("approval_token_not_accepted"));
+    }
+
+    let engine = state.pipeline.policy_snapshot();
+    let candidates: Vec<&str> = engine
+        .catalog()
+        .iter()
+        .filter(|((s, _), _)| *s == server)
+        .map(|((_, tool), _)| tool.as_str())
+        .collect();
+    let start = page.start.min(candidates.len());
+    let end = start.saturating_add(page.limit).min(candidates.len());
+    let window = &candidates[start..end];
+    let allowed = state
+        .pipeline
+        .would_allow(&engine, &a.chain, &a.call, window, a.now);
+    let results: Vec<Value> = window
+        .iter()
+        .zip(allowed)
+        .filter(|(_, allow)| *allow)
+        .map(|(tool, _)| json!({ "name": tool, "properties": { "server": server } }))
+        .collect();
+    let next_token = if end < candidates.len() {
+        super::page::encode(
+            super::page::List::ActionSearch,
+            super::page::Direction::Ascending,
+            end as u64,
+        )
+    } else {
+        String::new()
+    };
+    // Not a decision, so not in the audit log (see `search_action`); the log line says that a
+    // search ran, for whom, and how much it looked at.
+    tracing::info!(
+        chain_id = attenuo_core::chain_id_of(&a.chain).unwrap_or_default(),
+        server = %server,
+        evaluated = window.len(),
+        permitted = results.len(),
+        "AuthZEN action search"
+    );
+    Ok(json!({
+        "page": { "next_token": next_token, "count": results.len() },
+        "results": results,
+    }))
+}
+
 /// `options.evaluations_semantic` of a batch (AuthZEN 1.0 section 7.1.2.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Semantic {

@@ -1,0 +1,57 @@
+{
+  "_note": "AuthZEN 1.0 sections 10.1.2 and 11.3: action search is authenticated exactly as evaluation is. Without the agent's delegation token, or with one that does not verify, the answer is 401 with WWW-Authenticate, and no search runs.",
+  "steps": [
+    {
+      "path": "/access/v1/search/action",
+      "body": {
+        "subject": {
+          "type": "agent",
+          "id": ""
+        },
+        "resource": {
+          "type": "mcp_server",
+          "id": "github"
+        }
+      },
+      "expect": {
+        "status": 401,
+        "headers": {
+          "www-authenticate": "Bearer realm=\"attenuo\""
+        },
+        "body": {
+          "error": "unauthorized",
+          "code": "missing_token",
+          "detail": "<any>",
+          "error_description": "missing_token"
+        }
+      },
+      "auth": "none"
+    },
+    {
+      "path": "/access/v1/search/action",
+      "body": {
+        "subject": {
+          "type": "agent",
+          "id": ""
+        },
+        "resource": {
+          "type": "mcp_server",
+          "id": "github"
+        }
+      },
+      "expect": {
+        "status": 401,
+        "headers": {
+          "www-authenticate": "Bearer realm=\"attenuo\""
+        },
+        "body": {
+          "error": "unauthorized",
+          "code": "invalid_token",
+          "detail": "<any>",
+          "error_description": "invalid_token"
+        }
+      },
+      "auth": "Bearer not-a-token"
+    }
+  ]
+}
