@@ -258,7 +258,7 @@ Every key fetch (`jwks_url`, or the discovery document at `issuer` and the `jwks
 | `attribute_claims` | `email`, `groups`, `amr` | Claims copied into `originating_user.attributes`. `mfa` is always derived from `amr`. |
 | `jwks_ttl_seconds` | `300` | How long a fetched key set is used. |
 | `clock_skew_seconds` | `60` | Leeway for `exp`, `iat` and `nbf`. |
-| `credentials` | `["id_token", "id-jag"]` | The credentials this issuer's users may be brought in with at hop 0: `"id_token"` (an OIDC ID token), `"id-jag"` (an ID-JAG), or both. The names are the audit record's `credential` values. A credential of a kind not listed is refused with `400 invalid_grant` / `credential_type_not_accepted`, at the step that refuses an unknown issuer: before any key fetch, before its signature or claims are checked, and without using it up. An empty list or another name refuses to start. With [`[idps.id_jag_ceiling]`](#idpsidjagceiling), `["id-jag"]` makes the ceiling hold for every agent (SR-122). Approval ID tokens (`[approvals]`) are not affected. |
+| `credentials` | `["id_token", "id-jag"]` | The credentials this issuer's users may be brought in with at hop 0: `"id_token"` (an OIDC ID token), `"id-jag"` (an ID-JAG), or both. The names are the audit record's `credential` values (`id_token` with an underscore, although the CLI's `--subject-token-type` spells it `id-token`). A credential of a kind not listed is refused with `400 invalid_grant` / `credential_type_not_accepted`, at the step that refuses an unknown issuer: before any key fetch, before its signature or claims are checked, and without using it up. An empty list or another name refuses to start. With [`[idps.id_jag_ceiling]`](#idpsidjagceiling), `["id-jag"]` makes the ceiling hold for every agent (SR-122). Approval ID tokens (`[approvals]`) are not affected. |
 
 ### `[idps.id_jag_ceiling]`
 
@@ -280,6 +280,8 @@ A claim of the wrong JSON type names nothing; a claim that is absent or `null` i
 A capability is kept when a single capability of the other side covers it (`⊑`, RFC-0001), after its limits are clamped to the grant's as at a delegation hop. This is not the full intersection: two capabilities that only overlap (`github:read_*` against `github:*_file`) give nothing, never a new capability built from both. See the [standards note](../research/standards.md#the-id-jags-claims-as-a-ceiling).
 
 A limit in a claim, as in the root grant, is copied into the requested capability it covers. Hop 0 has no parent hop to charge, so a limit copied into several capabilities would bound each of them, not the run: a request in which two capabilities take their limits from the same limited capability of the ceiling (`send_money` once per recipient under `sum` 100) is refused with `invalid_scope` / `limit_split_at_root` (SR-121). Ask for one capability instead, with a `one_of` or wider constraint (`to` in `["alice", "bob", "carol"]`), which then carries the figure once. A capability of the ceiling without limits may be split as before. Limits set at an exchange are not affected, since every call is also charged against the parent hop.
+
+The audit record of an intake under the ceiling keeps only the names of the claims used (`id_jag_ceiling`), inside its arguments digest. The info line `root token issued from IdP credential` names them too (`id_jag_ceiling`) and gives their values (`id_jag_claims`, compact JSON, each cut to 512 bytes, Debug-formatted), so the log says what the ceiling was (SR-126). Without the ceiling the line has neither field.
 
 The server refuses to start on an empty resource identifier, a resource mapped to no server or to a name that is not a valid server name (or is `attenuo`), a scope token that is empty or holds whitespace, a scope mapped to no capability, or a capability that does not parse or whose limits no token may carry (for example an empty `arg`, a `derive` on a `sum`, a `max` above 2^63 - 1), and on a scope mapped to more than 1,024 capabilities, more than 1,024 argument constraints or `one_of` values in all, or a `one_of` of more than 1,024 values.
 
@@ -320,11 +322,11 @@ The most a root token may carry.
 | `subject` | Optional. Pins the entry to one user. A pinned entry wins over an unpinned one. |
 | `capabilities` | List of `server:tool` strings (globs such as `github:*` allowed) or full capability tables `{ server, tool, constraints }`. Requests are attenuated against this. At most 1,024 capabilities, 1,024 argument constraints and 1,024 `one_of` values in all, and at most 1,024 values in a `one_of`; more refuses to start (SR-123). |
 | `attributes` | Used only by the development root mint. IdP intake takes attributes from the verified token. |
+| `may_act` | Optional list of agent ids: the RFC 8693 `may_act` of root tokens minted under this grant, so only these agents may exchange them. A request may narrow it with its own `may_act`, never widen it (`may_act_exceeds_grant`). |
 
 For the development root mint, an empty `[[root_grants]]` list lets the admin mint any capabilities.
 
 A constraint's `op` is `equals`, `one_of`, `prefix`, `path_prefix` or `range` ([capabilities](../concepts/capabilities-and-attenuation.md)); a malformed `range` or `path_prefix` (`{ op = "path_prefix", value = "/workspace/../x" }`) refuses the config. A `prefix` on an argument that looks like a file path (named `path`, `file`, `filename`, `dir`, `directory` or `folder`, or ending in `_path`, `_dir` or `_file`, or a prefix starting with `/`, `./` or `~`) is logged as a warning at startup recommending `path_prefix`, and `attenuo policy lint --config` prints the same warning; neither refuses it.
-| `may_act` | Optional list of agent ids: the RFC 8693 `may_act` of root tokens minted under this grant, so only these agents may exchange them. A request may narrow it with its own `may_act`, never widen it (`may_act_exceeds_grant`). |
 
 With no matching entry, no root token is issued.
 

@@ -303,6 +303,7 @@ A later-hop request authenticates its `actor` with `client_id` / `client_secret`
 | actor token expires now | `invalid_request` / `actor_token_expired`, `no_lifetime_left` | the same | `exchange_no_lifetime_left` |
 | parent already delegated to this actor, or actor token reused | `invalid_grant` / `replayed` | `replayed` | `exchange_replayed` |
 | a requested capability has an invalid name or limit | `invalid_grant` | `invalid_capability` | `exchange_invalid_capability` |
+| the request is over a size bound (1,024 capabilities, argument constraints or `one_of` values in all, 1,024 values in a `one_of`) | `invalid_scope` | `too_many_capabilities`, `too_many_constraints`, `too_many_one_of_values`, `one_of_too_long` | `exchange_invalid_capability` |
 | `actor` is empty (possible only without actor authentication) | `invalid_grant` | `invalid_agent` | `exchange_refused` |
 | parent lease revoked, expired or unknown | `invalid_grant` | `lease_revoked`, `lease_expired`, `lease_unknown` | the same |
 

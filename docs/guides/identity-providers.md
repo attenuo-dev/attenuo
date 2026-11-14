@@ -42,6 +42,7 @@ attribute_claims = ["email", "groups", "amr"]     # default
 jwks_ttl_seconds = 300                            # default
 clock_skew_seconds = 60                           # default
 # tenant = "acme"                                 # optional, ID-JAG only
+# credentials = ["id_token", "id-jag"]            # default: both kinds
 ```
 
 | Key | Meaning |
@@ -56,6 +57,8 @@ clock_skew_seconds = 60                           # default
 | `jwks_ttl_seconds` | How long fetched keys are used before refetching. A token with an unknown `kid` triggers one early refetch, at most once per 30 seconds. |
 | `clock_skew_seconds` | Leeway for `exp`, `iat` and `nbf`. |
 | `tenant` | Optional. For a multi-tenant issuer: the tenant whose users this entry trusts. An ID-JAG must then carry a `tenant` claim equal to it, else `missing_claim` or `tenant_mismatch` ([ID-JAG](#id-jag)). ID tokens are not affected. Unset by default: `tenant` is not checked. |
+| `credentials` | Which credentials this issuer's users may be brought in with at hop 0: `"id_token"`, `"id-jag"` or both (the default). A kind not listed is refused with `credential_type_not_accepted` before it is checked or used up. Set `["id-jag"]` with [the ceiling](#id-jag) so that an ID token cannot get past it. |
+| `id_jag_ceiling` | Optional table: the ID-JAG's own claims as a ceiling under the root grant ([ID-JAG](#id-jag)). |
 
 You can list several IdPs. The unverified `iss` selects the entry. An issuer that is not listed is rejected without any network call.
 
@@ -514,6 +517,7 @@ Errors carry a stable `code` (the same value as `error_description`, which older
 | `401 invalid_client` / `no_agents_configured` | `[[agents]]` is empty |
 | `401 invalid_client` / `client_auth_missing`, `actor_token_required` | The request sent no credential at all; `actor_token_required` when `[token] actor_auth = "actor_token"`, where only an `actor_token` authenticates the agent |
 | `400 invalid_grant` / `untrusted_issuer` | `iss` is not in `[[idps]]`. Look for a trailing slash, `http` against `https`, or a tenant id mismatch |
+| `400 invalid_grant` / `credential_type_not_accepted` | The issuer's `[[idps]] credentials` does not list this kind of credential (an ID token under `["id-jag"]`, or the other way round) |
 | `400 invalid_grant` / `credential_audience_mismatch` | An ID token's `aud` (or `azp`) does not name the presenting agent's client id: the token was issued to another client, or `client_ids` has no entry for this agent and the id differs from the agent id |
 | `400 invalid_grant` / `audience_mismatch` | An ID-JAG's `aud` is not `[issuer] issuer`, or is an array with more than one element |
 | `400 invalid_grant` / `tenant_mismatch` | An ID-JAG's `tenant` is not the `[[idps]] tenant` of its issuer |
@@ -529,6 +533,7 @@ Errors carry a stable `code` (the same value as `error_description`, which older
 | `400 invalid_scope` / `limit_split_at_root` | Two requested capabilities take their limits from the same limited capability of the entry or of the ID-JAG's claims; ask for one capability covering both (`one_of`, a wider constraint or tool pattern) |
 | `400 invalid_scope` / `id_jag_ceiling_empty` | With `[idps.id_jag_ceiling]`: the ID-JAG's `resource`, `scope` or `authorization_details` name nothing the root grant gives (unmapped, of another type, or outside the grant) |
 | `400 invalid_scope` / `scope_exceeds_id_jag` | With `[idps.id_jag_ceiling]`: the request is within the root grant but asks for more than the ID-JAG's claims allow |
+| `400 invalid_scope` / `too_many_capabilities`, `too_many_constraints`, `too_many_one_of_values`, `one_of_too_long` | The request is over a size bound: more than 1,024 capabilities, argument constraints or `one_of` values in all, or a `one_of` of more than 1,024 values |
 | `503 temporarily_unavailable` / `jwks_unavailable` | attenuo cannot reach the IdP, or the JWKS or discovery document is bad. Failed refreshes drop old keys: there are no stale keys. The server's WARN line `IdP JWKS unavailable` (`actor token issuer JWKS unavailable` for `[[actor_trust]]`) names the URL and the cause, for a TLS failure the certificate error (`invalid peer certificate: UnknownIssuer` for a CA attenuo does not trust, see [Private CAs for key URLs](#private-cas-for-key-urls); `certificate not valid for name ...` for a hostname mismatch); the response does not |
 
 The server log shows each rejection with the issuer and the code.
