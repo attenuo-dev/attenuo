@@ -504,7 +504,7 @@ Errors carry a stable `code` (the same value as `error_description`, which older
 | `400 invalid_grant` / `typ_mismatch` | Wrong credential type for the `subject_token_type` you sent |
 | `400 invalid_scope` / `no_root_grant` | No `[[root_grants]]` entry for this issuer and agent |
 | `400 invalid_scope` / `scope_exceeds_grant` | The request asks for more than the entry allows |
-| `503 temporarily_unavailable` / `jwks_unavailable` | attenuo cannot reach the IdP, or the JWKS or discovery document is bad. Failed refreshes drop old keys: there are no stale keys |
+| `503 temporarily_unavailable` / `jwks_unavailable` | attenuo cannot reach the IdP, or the JWKS or discovery document is bad. Failed refreshes drop old keys: there are no stale keys. The server's WARN line `IdP JWKS unavailable` (`actor token issuer JWKS unavailable` for `[[actor_trust]]`) names the URL and the cause, for a TLS failure the certificate error (`invalid peer certificate: UnknownIssuer` for a CA attenuo does not trust, see [Private CAs for key URLs](#private-cas-for-key-urls); `certificate not valid for name ...` for a hostname mismatch); the response does not |
 
 The server log shows each rejection with the issuer and the code.
 

@@ -2,7 +2,8 @@
 //! certificate from a private CA made in the test. Without the setting the fetch is refused
 //! (the CA is not a web PKI root); with the entry's CA it succeeds; with another CA it is
 //! refused; and an entry without the setting still refuses the same server. The hostname
-//! check, the refusal of redirects and the read-once-at-start rule are checked over TLS too.
+//! check, the refusal of redirects and the read-once-at-start rule are checked over TLS too,
+//! and the log line of a refused fetch names the TLS cause.
 
 // Configs are built field by field from `Config::default()`, as in the other server tests.
 #![allow(clippy::field_reassign_with_default)]
@@ -363,6 +364,47 @@ impl Attenuo {
     }
 }
 
+/// What the server logged at WARN and above, for every test of this binary.
+static LOGS: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+
+struct LogWriter;
+
+impl std::io::Write for LogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        LOGS.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Installs, once per process, a global subscriber that keeps WARN lines in [`LOGS`]. Global,
+/// not `with_default`: `tracing` caches each callsite's interest process-wide, and the server
+/// logs from tasks (see `install_capture` in `hardening.rs`). The tests of this binary run in
+/// parallel, so a test finds its own line by the key URL, whose port is its own.
+fn capture_logs() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(|| LogWriter)
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("no other test in this binary installs a subscriber");
+    });
+}
+
+/// The logged lines that report a failed key fetch of `url`.
+fn fetch_failures(url: &str) -> Vec<String> {
+    let logs = String::from_utf8_lossy(&LOGS.lock().unwrap()).into_owned();
+    logs.lines()
+        .filter(|l| l.contains("JWKS unavailable") && l.contains(url))
+        .map(str::to_owned)
+        .collect()
+}
+
 /// The refusal a key fetch failure gets: 503, the stable code, and no transport detail.
 fn assert_jwks_unavailable(status: StatusCode, v: &Value) {
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{v}");
@@ -379,6 +421,7 @@ fn assert_jwks_unavailable(status: StatusCode, v: &Value) {
 /// setting keeps refusing it: the extra root belongs to the entry that names it.
 #[tokio::test]
 async fn a_bundle_endpoint_behind_a_private_ca_needs_the_entrys_ca() {
+    capture_logs();
     let dir = tempfile::tempdir().unwrap();
     let ca = Ca::new("attenuo test CA");
     let other = Ca::new("another test CA");
@@ -413,6 +456,14 @@ async fn a_bundle_endpoint_behind_a_private_ca_needs_the_entrys_ca() {
         keys.handshakes_failed.load(Ordering::SeqCst) >= 2,
         "the refusals were TLS handshake failures"
     );
+    // The log names the TLS cause, not only "error sending request" (#320).
+    let lines = fetch_failures(&keys.url("/bundle"));
+    assert_eq!(lines.len(), 2, "{lines:#?}");
+    for line in &lines {
+        assert!(line.contains("WARN"), "{line}");
+        assert!(line.contains("invalid peer certificate"), "{line}");
+        assert!(line.contains("UnknownIssuer"), "{line}");
+    }
 
     // Two entries, one server: only the entry with the CA can fetch.
     let mut cfg = base_config();
@@ -516,6 +567,7 @@ async fn idp_discovery_and_jwks_use_the_entrys_ca() {
 /// `127.0.0.1`, not `localhost`), and a redirect is still refused, not followed.
 #[tokio::test]
 async fn the_hostname_check_and_the_redirect_refusal_stay() {
+    capture_logs();
     let dir = tempfile::tempdir().unwrap();
     let ca = Ca::new("attenuo test CA");
     let ca_pem = ca.write(dir.path(), "ca.pem");
@@ -534,6 +586,21 @@ async fn the_hostname_check_and_the_redirect_refusal_stay() {
     }
     assert_eq!(keys.hits("/moved"), 1, "the redirect was answered");
     assert_eq!(keys.hits("/bundle"), 0, "and not followed");
+    let lines = fetch_failures(&format!("https://localhost:{}/bundle", keys.port));
+    assert_eq!(lines.len(), 1, "{lines:#?}");
+    assert!(
+        lines[0].contains("invalid peer certificate"),
+        "{}",
+        lines[0]
+    );
+    assert!(
+        lines[0].contains("not valid for name") || lines[0].contains("NotValidForName"),
+        "the hostname mismatch is named: {}",
+        lines[0]
+    );
+    let lines = fetch_failures(&keys.url("/moved"));
+    assert_eq!(lines.len(), 1, "{lines:#?}");
+    assert!(lines[0].contains("redirect"), "{}", lines[0]);
 }
 
 /// The file is read once, when the server starts: removing it afterwards changes nothing
