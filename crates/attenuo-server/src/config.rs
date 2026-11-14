@@ -1020,6 +1020,11 @@ impl SinkSection {
                          (requests are path-style: <endpoint>/<bucket>/<key>)"
                     );
                 }
+                // As the HTTP client reads it (SR-119): `http://` has no host, and the
+                // request URL `http:///<bucket>/<key>` would take the bucket as its host; a
+                // backslash is a `/` to the URL parser, so a path the check above missed.
+                crate::sink::check_s3_endpoint(ep)
+                    .map_err(|e| anyhow::anyhow!("[audit.sink] endpoint = {ep:?} {e}"))?;
                 let bucket = self.bucket.as_deref().unwrap_or_default();
                 if bucket.is_empty() || bucket.contains('/') {
                     anyhow::bail!("[audit.sink] bucket = {bucket:?} is not a bucket name");
