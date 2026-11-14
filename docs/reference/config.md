@@ -90,7 +90,7 @@ Ships every signed checkpoint off the host as it is created (SR-21); see [Shippi
 | `bearer_token` | `ATTENUO_AUDIT_SINK_TOKEN` | webhook: sent as `Authorization: Bearer <token>`. |
 | `path` | required for file | JSON Lines file to append to; created if missing, synced after each line. Put it on another mount than `sqlite_path` (a warning at startup otherwise). |
 | `endpoint` | required for s3 | Base URL without a path, e.g. `https://s3.eu-west-1.amazonaws.com` or `http://minio:9000`. Requests are path-style (`<endpoint>/<bucket>/<key>`); an endpoint with the bucket in its host name (virtual-hosted style) is not supported. Run against MinIO, not AWS S3 ([tested against MinIO](../concepts/audit-log.md#tested-against-minio)). |
-| `bucket` | required for s3 | Bucket name. |
+| `bucket` | required for s3 | Bucket name. Each PutObject carries `x-amz-sdk-checksum-algorithm: SHA256` and `x-amz-checksum-sha256`, which AWS requires for a bucket with an Object Lock retention period (a `Content-MD5` would also do; the sink sends none). |
 | `region` | `us-east-1` | s3: SigV4 signing region. |
 | `prefix` | `attenuo/checkpoints/` | s3: object key prefix; keys are `<prefix><seq, 20 digits>-<16 hex of checkpoint_sha256>.json`. |
 | `access_key_id`, `secret_access_key`, `session_token` | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` | s3 credentials. Give them `PutObject` only. |
