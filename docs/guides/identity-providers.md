@@ -447,7 +447,7 @@ Before you point an agent at it:
      --cap '{"server":"github","tool":"read_file","constraints":{"repo":{"op":"prefix","value":"acme/"}}}'
    ```
 
-   `--subject-token-type id-jag` sends an ID-JAG the same way. Without `--subject-token-type`, `token exchange` sends its subject token as an attenuo token, and an ID token is refused (`invalid_grant`, unknown key id). A refusal prints the server's error and its detail, not the stable code: a second use of one ID token reads `invalid_grant: this credential was already used`.
+   `--subject-token-type id-jag` sends an ID-JAG the same way. Without `--subject-token-type`, `token exchange` sends its subject token as an attenuo token, and an ID token is refused (`invalid_grant`, unknown key id). A refusal prints the server's error, its stable code in parentheses and its detail: a second use of one ID token reads `invalid_grant (replayed): this credential was already used; present a fresh one`.
 
 4. Inspect the result. The user block should show the right subject, issuer and attributes:
 

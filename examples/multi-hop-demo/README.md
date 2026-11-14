@@ -60,7 +60,7 @@ Output of `examples/multi-hop-demo/run.sh` from one real run. Ports, lease ids, 
 
 ```text
 == Setup
-# attenuo at http://127.0.0.1:53831 proxies a fake GitHub MCP server at port 34313 as 'github'.
+# attenuo at http://127.0.0.1:38287 proxies a fake GitHub MCP server at port 54287 as 'github'.
 # Policy: reads anywhere in acme/, writes only to agent/* branches, never to main. See policy.cedar.
 # The policy's tests run offline first (policy_test.yaml).
 $ attenuo policy test examples/multi-hop-demo/policy_test.yaml
@@ -87,7 +87,7 @@ all 5 policies exercised
 # Read files and issues, open issues and write files, all only under acme/. may_act: only the
 # coder may exchange this token. (The dev mint stands in for an OIDC ID token at POST /token.)
 $ attenuo token root --subject alice --agent planner --may-act coder
-lease       fc687213-e1f6-4f52-be26-152387a86f2a
+lease       e9419f72-38e3-4adc-8029-0323dc8d2dfe
 expires_in  900s
 token       eyJ0eXAiOiJhdHRlbnVvK2p3...
 
@@ -100,41 +100,41 @@ ALLOWED
 # The coder authenticates as itself (its secret on stdin). The parent's last hop covers
 # get_file_contents only under acme/, so a capability with no repo constraint is wider: refused.
 $ printf "%s\n" demo-coder-secret | ATTENUO_TOKEN="$PLANNER" attenuo token exchange --actor coder --client-secret-stdin --cap github:get_file_contents
-error: server answered 400 Bad Request: invalid_scope: delegation chain is invalid: hop 1 widens capabilities relative to hop 0: requested capability `github:get_file_contents` is not covered by the parent capability set
-decision a4d3aeff-8095-45a1-86f0-0e28de32da05
+error: server answered 400 Bad Request: invalid_scope (scope_exceeds_parent): delegation chain is invalid: hop 1 widens capabilities relative to hop 0: requested capability `github:get_file_contents` is not covered by the parent capability set
+decision d0d00c3b-4a66-4eda-beca-25176879276b
 
 == 4. Exchange 2, planner -> coder (hop 2), narrowed at every point
 # repo narrowed from acme/ to acme/api, a distinct limit of 1 on repo (one repository per run),
 # no list_issues, no create_issue, and --no-delegation (may_act: []) so nobody may exchange it.
 $ printf "%s\n" demo-coder-secret | ATTENUO_TOKEN="$PLANNER" attenuo token exchange --actor coder --client-secret-stdin --no-delegation --ttl-seconds 600 --cap '{"server":"github","tool":"get_file_contents","constraints":{"repo":{"op":"prefix","value":"acme/api"}},"limits":{"distinct":{"arg":"repo","max":1}}}' --cap '{"server":"github","tool":"create_or_update_file","constraints":{"repo":{"op":"prefix","value":"acme/api"}},"limits":{"distinct":{"arg":"repo","max":1}}}'
-lease       254a57a7-504a-4e01-870f-06d66a034687
+lease       5c0d7817-6cfd-41c1-be67-d345ec34eb03
 expires_in  600s
 token       eyJ0eXAiOiJhdHRlbnVvK2p3...
 
 == 5. What the coder's token says: two hops, each narrower than the one above
 $ attenuo token inspect "$CODER" --verify
 user alice  (issuer https://idp.example)
-  authenticated 2026-10-24T20:36:39Z
+  authenticated 2026-11-14T07:26:14Z
 └─ agent planner
      can   github:create_issue {repo starts with "acme/"}, github:create_or_update_file {repo starts with "acme/"}, github:get_file_contents {repo starts with "acme/"}, github:list_issues {repo starts with "acme/"}
-     until 2026-10-24T20:51:39Z (in 14m 59s)
-     lease fc687213-e1f6-4f52-be26-152387a86f2a
+     until 2026-11-14T07:41:14Z (in 14m 59s)
+     lease e9419f72-38e3-4adc-8029-0323dc8d2dfe
    └─ agent coder  <- holds this token
         can   github:create_or_update_file {repo starts with "acme/api"} [distinct repo <= 1], github:get_file_contents {repo starts with "acme/api"} [distinct repo <= 1]
-        until 2026-10-24T20:46:39Z (in 9m 59s)
-        lease 254a57a7-504a-4e01-870f-06d66a034687
+        until 2026-11-14T07:36:14Z (in 9m 59s)
+        lease 5c0d7817-6cfd-41c1-be67-d345ec34eb03
 
-iss http://127.0.0.1:53831   aud attenuo   jti 7aeb93d4-aea1-49d5-ab4d-e5868777549b
-kid TVMUVqtMRfIgwfaiuNOssA   ou_kid TVMUVqtMRfIgwfaiuNOssA
-exp 2026-10-24T20:46:39Z (in 9m 59s)
+iss http://127.0.0.1:38287   aud attenuo   jti 43846121-d027-44ad-9359-73293ea9a21e
+kid m9NpvGuUbqzz5gSrTuxjEQ   ou_kid m9NpvGuUbqzz5gSrTuxjEQ
+exp 2026-11-14T07:36:14Z (in 9m 59s)
 may_act []: no agent may exchange this token
 verified: signature, type, issuer, audience, expiry, chain
 
 == 6. Exchange 3, refused: the coder tries to hand its token to a reviewer agent
 # The reviewer authenticates fine, but the coder's token carries may_act: [].
 $ printf "%s\n" demo-reviewer-secret | ATTENUO_TOKEN="$CODER" attenuo token exchange --actor reviewer --client-secret-stdin --cap '{"server":"github","tool":"get_file_contents","constraints":{"repo":{"op":"equals","value":"acme/api"}}}'
-error: server answered 400 Bad Request: invalid_request: agent `reviewer` is not permitted to act on this token (may_act)
-decision 6e0429d7-529e-4a36-b88d-6084e5ea80b6
+error: server answered 400 Bad Request: invalid_request (actor_not_permitted): agent `reviewer` is not permitted to act on this token (may_act)
+decision 6c65098c-383f-4119-8c0f-95ce3a384bdc
 
 == 7. The coder reads the file it was asked to fix: allowed
 $ ATTENUO_TOKEN="$CODER" attenuo call --upstream github --tool get_file_contents --arg repo=acme/api --arg path=src/lib.rs
@@ -145,68 +145,68 @@ ALLOWED
 # create_or_update_file on acme/api is in the coder's token; the policy wants an agent/* branch.
 $ ATTENUO_TOKEN="$CODER" attenuo call --upstream github --tool create_or_update_file --arg repo=acme/api --arg path=src/lib.rs --arg branch=main --arg content="fn fixed() {}"
 DENIED  policy_deny
-decision 2e156546-15e4-4168-91f5-3faeb6871786
+decision cf51f92d-7488-49f8-b78d-c29ff3cbc25c
 
 == 9. The coder tries to open an issue: denied, the planner never delegated create_issue
 $ ATTENUO_TOKEN="$CODER" attenuo call --upstream github --tool create_issue --arg repo=acme/api --arg title="fix pushed"
 DENIED  capability_denied
-decision 40d705aa-bc4b-4c1d-9b9a-93fd87a9031e
+decision 0f55f017-6fec-4c31-b85f-b8bec79ee349
 
 == 10. The coder reads from a second repository under acme/api: denied by the run limit
 # acme/api-client is inside the coder's repo prefix and the policy allows the read, but the
 # distinct limit allows one repository per run and acme/api was the first.
 $ ATTENUO_TOKEN="$CODER" attenuo call --upstream github --tool get_file_contents --arg repo=acme/api-client --arg path=README.md
 DENIED  budget_exhausted
-decision 98737a37-fc57-435a-8660-4665022c7b43
+decision 9ed78dc3-3927-4774-9ca7-868d3521d914
 
 == 11. The operator looks at the chain before acting
 # The chain id is the planner's lease, the first hop's (also the chain_id of every audit record).
 $ attenuo lease tree "$PLANNER_LEASE"
 root lease (no ancestors)
-fc687213-e1f6-4f52-be26-152387a86f2a  planner  active, expires 2026-10-24T20:41:39.794191298Z  issued #1
-└─ 254a57a7-504a-4e01-870f-06d66a034687  coder  active, expires 2026-10-24T20:41:39.874986778Z  issued #6
+e9419f72-38e3-4adc-8029-0323dc8d2dfe  planner  active, expires 2026-11-14T07:31:14.439143803Z  issued #1
+└─ 5c0d7817-6cfd-41c1-be67-d345ec34eb03  coder  active, expires 2026-11-14T07:31:14.502171808Z  issued #6
         limit github/create_or_update_file distinct repo 0/1 (1 left)
         limit github/get_file_contents distinct repo 1/1 (0 left)
 would revoke 2 lease(s) if revoked now
 $ attenuo lease revoke --chain-id "$PLANNER_LEASE" --preview
 preview: nothing was changed
-selector  chain_id fc687213-e1f6-4f52-be26-152387a86f2a
+selector  chain_id e9419f72-38e3-4adc-8029-0323dc8d2dfe
 matched   2 lease(s)
 would revoke 2 lease(s)
-  254a57a7-504a-4e01-870f-06d66a034687
-  fc687213-e1f6-4f52-be26-152387a86f2a
+  5c0d7817-6cfd-41c1-be67-d345ec34eb03
+  e9419f72-38e3-4adc-8029-0323dc8d2dfe
 
 == 12. The operator revokes the whole chain by chain_id
 $ attenuo lease revoke --chain-id "$PLANNER_LEASE" --reason "planner run went wrong"
-selector  chain_id fc687213-e1f6-4f52-be26-152387a86f2a
+selector  chain_id e9419f72-38e3-4adc-8029-0323dc8d2dfe
 matched   2 lease(s)
 revoked 2 lease(s)
-  254a57a7-504a-4e01-870f-06d66a034687
-  fc687213-e1f6-4f52-be26-152387a86f2a
+  5c0d7817-6cfd-41c1-be67-d345ec34eb03
+  e9419f72-38e3-4adc-8029-0323dc8d2dfe
 reason    planner run went wrong
-audit     092534bf-f3ad-44f4-b20b-de269067305a
+audit     6bdd7043-535b-4481-8e0d-f3a1812da2e0
 
 == 13. The coder's next call, even the one that worked before, is denied
 $ ATTENUO_TOKEN="$CODER" attenuo call --upstream github --tool get_file_contents --arg repo=acme/api --arg path=src/lib.rs
 DENIED  lease_revoked
-decision 88fc8d8d-a59e-4e76-b894-9440eeeb458d
+decision bc520924-21b2-4518-9732-b9478438a81a
 
 == 14. The audit log records every decision, and its hash chain checks out
 $ attenuo audit tail -n 50
-#1    2026-10-24T20:36:39.794191298Z  ALLOW attenuo/token.root  planner for alice  reason=token_issued  id=33917a5d-de75-4fb5-a824-086afed96724
-#2    2026-10-24T20:36:39.794191298Z  ALLOW attenuo/admin.root_token  by urn:attenuo:admin  reason=admin_action  id=75e33984-3400-4357-b251-f5e3958833a2
-#3    2026-10-24T20:36:39.820296318Z  ALLOW github/list_issues  planner for alice  reason=policy_allow  id=0ff58861-96a5-4227-bde4-b337eeec01db
-#4    2026-10-24T20:36:39.831660405Z  tool_result  github/list_issues  planner for alice  decision=0ff58861-96a5-4227-bde4-b337eeec01db  label=untrusted size=119  id=28e5db27-4cce-49ac-9676-635f989b51c3
-#5    2026-10-24T20:36:39.850626261Z  DENY  attenuo/token.exchange  planner for alice  reason=exchange_widening  id=a4d3aeff-8095-45a1-86f0-0e28de32da05
-#6    2026-10-24T20:36:39.874986778Z  ALLOW attenuo/token.exchange  planner > coder for alice  reason=token_issued  id=f557b789-7d09-48d7-8d9f-ef1e3c6ddac2
-#7    2026-10-24T20:36:39.92216652Z  DENY  attenuo/token.exchange  planner > coder for alice  reason=exchange_actor_not_permitted  id=6e0429d7-529e-4a36-b88d-6084e5ea80b6
-#8    2026-10-24T20:36:39.946105685Z  ALLOW github/get_file_contents  planner > coder for alice  reason=policy_allow  id=52dcf62d-ee47-49d5-9646-6e6e03d54a86
-#9    2026-10-24T20:36:39.955514584Z  tool_result  github/get_file_contents  planner > coder for alice  decision=52dcf62d-ee47-49d5-9646-6e6e03d54a86  label=untrusted size=149  id=e8dcf25d-d59d-41a2-9b99-2e292f069dc5
-#10   2026-10-24T20:36:39.970954354Z  DENY  github/create_or_update_file  planner > coder for alice  reason=policy_deny  id=2e156546-15e4-4168-91f5-3faeb6871786
-#11   2026-10-24T20:36:39.999109404Z  DENY  github/create_issue  planner > coder for alice  reason=capability_denied  id=40d705aa-bc4b-4c1d-9b9a-93fd87a9031e
-#12   2026-10-24T20:36:40.015708718Z  DENY  github/get_file_contents  planner > coder for alice  reason=budget_exhausted  id=98737a37-fc57-435a-8660-4665022c7b43
-#13   2026-10-24T20:36:40.060894592Z  ALLOW attenuo/admin.lease.revoke  by urn:attenuo:admin  reason=admin_action  id=092534bf-f3ad-44f4-b20b-de269067305a
-#14   2026-10-24T20:36:40.077264639Z  DENY  github/get_file_contents  planner > coder for alice  reason=lease_revoked  id=88fc8d8d-a59e-4e76-b894-9440eeeb458d
+#1    2026-11-14T07:26:14.439143803Z  ALLOW attenuo/token.root  planner for alice  reason=token_issued  id=e609b6e2-a349-49f1-a227-b1ed54b1b3c5
+#2    2026-11-14T07:26:14.439143803Z  ALLOW attenuo/admin.root_token  by urn:attenuo:admin  reason=admin_action  id=55c1dffb-cb10-468f-bfd0-d20976c4f41f
+#3    2026-11-14T07:26:14.459555831Z  ALLOW github/list_issues  planner for alice  reason=policy_allow  id=7837516b-0cc4-4eea-8626-3b5487ec9f38
+#4    2026-11-14T07:26:14.467412341Z  tool_result  github/list_issues  planner for alice  decision=7837516b-0cc4-4eea-8626-3b5487ec9f38  label=untrusted size=119  id=f31cf4a2-08a8-44b9-afe6-c8de47e27999
+#5    2026-11-14T07:26:14.48232096Z  DENY  attenuo/token.exchange  planner for alice  reason=exchange_widening  id=d0d00c3b-4a66-4eda-beca-25176879276b
+#6    2026-11-14T07:26:14.502171808Z  ALLOW attenuo/token.exchange  planner > coder for alice  reason=token_issued  id=9496aee9-4c86-4c3e-b612-7111b5021c41
+#7    2026-11-14T07:26:14.542583278Z  DENY  attenuo/token.exchange  planner > coder for alice  reason=exchange_actor_not_permitted  id=6c65098c-383f-4119-8c0f-95ce3a384bdc
+#8    2026-11-14T07:26:14.56271429Z  ALLOW github/get_file_contents  planner > coder for alice  reason=policy_allow  id=aae85c71-2d45-4309-b0cc-7daf9ca59ed1
+#9    2026-11-14T07:26:14.570001188Z  tool_result  github/get_file_contents  planner > coder for alice  decision=aae85c71-2d45-4309-b0cc-7daf9ca59ed1  label=untrusted size=149  id=e23cd3aa-6486-493c-8acb-5aef228bb7d8
+#10   2026-11-14T07:26:14.584943294Z  DENY  github/create_or_update_file  planner > coder for alice  reason=policy_deny  id=cf51f92d-7488-49f8-b78d-c29ff3cbc25c
+#11   2026-11-14T07:26:14.606809402Z  DENY  github/create_issue  planner > coder for alice  reason=capability_denied  id=0f55f017-6fec-4c31-b85f-b8bec79ee349
+#12   2026-11-14T07:26:14.623398134Z  DENY  github/get_file_contents  planner > coder for alice  reason=budget_exhausted  id=9ed78dc3-3927-4774-9ca7-868d3521d914
+#13   2026-11-14T07:26:14.662173618Z  ALLOW attenuo/admin.lease.revoke  by urn:attenuo:admin  reason=admin_action  id=6bdd7043-535b-4481-8e0d-f3a1812da2e0
+#14   2026-11-14T07:26:14.676901205Z  DENY  github/get_file_contents  planner > coder for alice  reason=lease_revoked  id=bc520924-21b2-4518-9732-b9478438a81a
 $ attenuo audit verify
 audit chain OK: 14 entries verified
 checkpoints: none signed yet
@@ -214,28 +214,28 @@ checkpoints: none signed yet
 == 15. The refused widening exchange is in the log too
 # A refused exchange whose subject token verified is a deny record against the parent's chain.
 $ attenuo audit show --id "$WIDEN_DECISION"
-#5    2026-10-24T20:36:39.850626261Z  DENY  attenuo/token.exchange  planner for alice  reason=exchange_widening  id=a4d3aeff-8095-45a1-86f0-0e28de32da05
+#5    2026-11-14T07:26:14.48232096Z  DENY  attenuo/token.exchange  planner for alice  reason=exchange_widening  id=d0d00c3b-4a66-4eda-beca-25176879276b
 kind        decision
-chain       fc687213-e1f6-4f52-be26-152387a86f2a
-hash        b842eb0ab2d7d3259437bc329b117559d242a50dc27a278230c87ce4904f455f
-prev hash   3bc7085bc8e3640c6be08364cb1b77d6343e153a0c7b8c17f34305c0e62db178
+chain       e9419f72-38e3-4adc-8029-0323dc8d2dfe
+hash        45c0fbc54e665af7fa5cf9fb591d5577ae09740d4e2ff2ac0b4519460acd875f
+prev hash   90e21060da6a30b0589e57bc17693be9bac3dec65c445d0b318082863a84eafc
 leases      (root first, as the registry sees them now)
-  fc687213-e1f6-4f52-be26-152387a86f2a  REVOKED 2026-10-24T20:36:40.060894592Z (planner run went wrong)
+  e9419f72-38e3-4adc-8029-0323dc8d2dfe  REVOKED 2026-11-14T07:26:14.662173618Z (planner run went wrong)
 checkpoint  none yet: the entry is newer than every checkpoint, only the hash chain covers it
 policy      not reloaded since this entry
 
 == 16. The decision chain of the refused write
 # The record names both hops, the policy that decided, the leases (revoked now) and its hashes.
 $ attenuo audit show --id "$WRITE_DECISION"
-#10   2026-10-24T20:36:39.970954354Z  DENY  github/create_or_update_file  planner > coder for alice  reason=policy_deny  id=2e156546-15e4-4168-91f5-3faeb6871786
+#10   2026-11-14T07:26:14.584943294Z  DENY  github/create_or_update_file  planner > coder for alice  reason=policy_deny  id=cf51f92d-7488-49f8-b78d-c29ff3cbc25c
 kind        decision
-chain       fc687213-e1f6-4f52-be26-152387a86f2a
+chain       e9419f72-38e3-4adc-8029-0323dc8d2dfe
 policies    no_writes_to_default_branch
-hash        6ca277beada03625091dfda2f5b55bb167f2e3a920df06b14f0059d402b3b82f
-prev hash   6623f66c3fca118d71c709e1829ff94a00f62fae824e89965c1b6b3ff5c7b20f
+hash        7af3240d207d68a2b42ccd71848709617e7d835e37339261c91ababdc7bdcbf0
+prev hash   39a3f716a3320fb5f5873968721ba71981697be85e9c87a0a19450e499b76541
 leases      (root first, as the registry sees them now)
-  fc687213-e1f6-4f52-be26-152387a86f2a  REVOKED 2026-10-24T20:36:40.060894592Z (planner run went wrong)
-  254a57a7-504a-4e01-870f-06d66a034687  REVOKED 2026-10-24T20:36:40.060894592Z (planner run went wrong)
+  e9419f72-38e3-4adc-8029-0323dc8d2dfe  REVOKED 2026-11-14T07:26:14.662173618Z (planner run went wrong)
+  5c0d7817-6cfd-41c1-be67-d345ec34eb03  REVOKED 2026-11-14T07:26:14.662173618Z (planner run went wrong)
 checkpoint  none yet: the entry is newer than every checkpoint, only the hash chain covers it
 policy      not reloaded since this entry
 

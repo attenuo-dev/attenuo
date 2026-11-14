@@ -220,8 +220,9 @@ async fn an_id_token_becomes_a_root_token() {
     c.env("ATTENUO_TOKEN", &first)
         .env("ATTENUO_CLIENT_SECRET", PLANNER_SECRET);
     let err = refused(&run(c, None).await);
+    // The stable code (`replayed`) is named after the OAuth error.
     assert!(
-        err.contains("400 Bad Request: invalid_grant: this credential was already used"),
+        err.contains("400 Bad Request: invalid_grant (replayed): this credential was already used"),
         "{err}"
     );
 

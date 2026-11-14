@@ -449,8 +449,9 @@ fn is_use_dpop_nonce(status: StatusCode, headers: &HeaderMap, body: &str) -> boo
             .is_ok_and(|v| stable_code(&v) == Some(USE_DPOP_NONCE))
 }
 
-/// A non-success answer from the server. Its text is `server answered <status>: <code>:
-/// <detail>` (or the raw body), and a second line `decision <id>` when the body names the
+/// A non-success answer from the server. Its text is `server answered <status>: <error>
+/// (<code>): <detail>` (or the raw body), the ` (<code>)` left out when the stable code is the
+/// error or the detail itself, and a second line `decision <id>` when the body names the
 /// audit record of the refusal; a command that gives some statuses a meaning of its own (as
 /// `budget refund` does for 404 and 409) finds it with `anyhow::Error::downcast_ref`.
 #[derive(Debug)]
@@ -482,8 +483,6 @@ pub(crate) fn stable_code(body: &Value) -> Option<&str> {
         .find_map(|v| v.as_str().filter(|s| !s.is_empty()))
 }
 
-/// A server error as `{"error": error, "code": code, "detail": text}`, or the raw body when it
-/// is not that.
 /// The HTTP client of every CLI request: a 30 s timeout and no redirects followed (SR-112).
 /// A followed `307` or `308` sends the body again to wherever `Location` names, client
 /// secret, client assertion and subject token included; [`refuse_redirect`] reports it
@@ -515,6 +514,8 @@ pub(crate) fn refuse_redirect(resp: &reqwest::Response, flag: &str) -> Result<()
     ))
 }
 
+/// A server error as `{"error": error, "code": code, "detail": text}`, or the raw body when it
+/// is not that.
 pub(crate) fn api_error(status: StatusCode, body: &str) -> anyhow::Error {
     let mut detail = None;
     let (code, message) = match serde_json::from_str::<Value>(body) {
@@ -522,9 +523,16 @@ pub(crate) fn api_error(status: StatusCode, body: &str) -> anyhow::Error {
             detail = v["detail"].as_str().map(str::to_string);
             let error = v["error"].as_str().unwrap_or_default();
             let code = stable_code(&v).unwrap_or(error).to_string();
+            // The stable code, after the error, when it says something the error and the
+            // detail do not (`invalid_grant (replayed)`, not `not_found (not_found)`).
+            let shown_code = if code == error || Some(code.as_str()) == v["detail"].as_str() {
+                String::new()
+            } else {
+                format!(" ({code})")
+            };
             // A refusal the server audited (a refused token exchange) names its record.
             let message = format!(
-                "server answered {status}: {error}{}{}",
+                "server answered {status}: {error}{shown_code}{}{}",
                 v["detail"]
                     .as_str()
                     .map(|d| format!(": {d}"))
@@ -606,6 +614,68 @@ mod tests {
         assert_eq!(
             api_error(StatusCode::BAD_GATEWAY, "oops").to_string(),
             "server answered 502 Bad Gateway: oops"
+        );
+    }
+
+    #[test]
+    fn api_error_names_the_stable_code_when_it_adds_something() {
+        let text = |status, body| api_error(status, body).to_string();
+        // A code other than the error and the detail goes in parentheses after the error.
+        assert_eq!(
+            text(
+                StatusCode::BAD_REQUEST,
+                r#"{"error":"invalid_grant","code":"replayed","detail":"this credential was already used"}"#,
+            ),
+            "server answered 400 Bad Request: invalid_grant (replayed): this credential was \
+             already used"
+        );
+        // With a decision line, and without a detail.
+        assert_eq!(
+            text(
+                StatusCode::BAD_REQUEST,
+                r#"{"error":"invalid_grant","code":"replayed","decision_id":"d-1"}"#,
+            ),
+            "server answered 400 Bad Request: invalid_grant (replayed)\ndecision d-1"
+        );
+        // A code equal to the error, or to the detail, is not said twice.
+        assert_eq!(
+            text(
+                StatusCode::NOT_FOUND,
+                r#"{"error":"not_found","code":"not_found","detail":"no such lease"}"#,
+            ),
+            "server answered 404 Not Found: not_found: no such lease"
+        );
+        assert_eq!(
+            text(
+                StatusCode::UNAUTHORIZED,
+                r#"{"error":"unauthorized","code":"token_expired","detail":"token_expired"}"#,
+            ),
+            "server answered 401 Unauthorized: unauthorized: token_expired"
+        );
+        // No code: the error alone (the stable code falls back to it).
+        assert_eq!(
+            text(
+                StatusCode::FORBIDDEN,
+                r#"{"error":"no_root_grant","detail":"no entry"}"#
+            ),
+            "server answered 403 Forbidden: no_root_grant: no entry"
+        );
+        // A server before `code`: its `error_description` sub-code is the stable code.
+        assert_eq!(
+            text(
+                StatusCode::SERVICE_UNAVAILABLE,
+                r#"{"error":"temporarily_unavailable","detail":"x","error_description":"overloaded"}"#,
+            ),
+            "server answered 503 Service Unavailable: temporarily_unavailable (overloaded): x"
+        );
+        // A body that is not an error object is printed as it came, with no code.
+        assert_eq!(
+            text(StatusCode::BAD_GATEWAY, r#"<html>bad gateway</html>"#),
+            "server answered 502 Bad Gateway: <html>bad gateway</html>"
+        );
+        assert_eq!(
+            text(StatusCode::BAD_REQUEST, r#"{"code":"replayed"}"#),
+            r#"server answered 400 Bad Request: {"code":"replayed"}"#
         );
     }
 

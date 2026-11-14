@@ -400,9 +400,9 @@ grep -q "issuer $REALM" "$WORK/inspect-cli.txt" || fail "CLI root token: issuer 
 grep -q '"github-reader"' "$WORK/inspect-cli.txt" || fail "CLI root token: roles attribute"
 ok "CLI: root token for planner, verified, issuer $REALM, roles github-reader"
 if OUT="$(cli_hop0 2>&1)"; then fail "the CLI's second use of one ID token was not refused"; fi
-printf %s "$OUT" | grep -q 'invalid_grant: this credential was already used' \
+printf %s "$OUT" | grep -q 'invalid_grant (replayed): this credential was already used' \
   || fail "expected the replay refusal: $OUT"
-ok "CLI: the same ID token again: invalid_grant, already used"
+ok "CLI: the same ID token again: invalid_grant (replayed), already used"
 
 say "6. key rotation at Keycloak"
 REALM_ID="$(kc get realms/acme --fields id --format csv --noquotes)"
