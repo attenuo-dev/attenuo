@@ -1,6 +1,6 @@
 # Run limits: design
 
-- Status: accepted with [ADR-0010](../decisions/0010-run-limits.md), 2026-10-24. Phases 1 and 2 are built and measured; phase 3 is not built. See [Status](#status). A proposed design for phase 3 (per-user windows, RAR mapping, reservation) is in [run limits phase 3](run-limits-phase3.md), not accepted.
+- Status: accepted with [ADR-0010](../decisions/0010-run-limits.md), 2026-10-24. Phases 1 and 2 are built and measured; of phase 3, steps 1 and 2 (per-user windows, and showing them to the operator) are built and the rest is not. See [Status](#status). A proposed design for phase 3 (per-user windows, RAR mapping, reservation) is in [run limits phase 3](run-limits-phase3.md), not accepted.
 - Date: 2026-10-24. Base: `main` at 52f8404; status updated at 1dccf79.
 - Related: [ADR-0010](../decisions/0010-run-limits.md) (accepted), [output labelling](output-labelling.md) and [ADR-0009](../decisions/0009-output-labelling.md), [RFC-0001](../spec/rfc-0001-attenuo.md) sections 2 (P2), 3, 3 (the `range` constraint), 3.1 ("Time-range constraints"), 8 and 9 open question 3, [threat model](../spec/threat-model.md), [injection suite results](../evaluation/injection-suite.md), [server pipeline](server.md), [ADR-0006](../decisions/0006-lease-based-in-flight-revocation.md) (leases).
 
