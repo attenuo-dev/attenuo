@@ -340,7 +340,7 @@ Each answer also carries `code`, the `error_description` below where there is on
 | `invalid_dpop_proof` | 401 | `invalid_dpop_proof`: a `DPoP` header or `subject_token_dpop` that fails a check (signature, `typ`, `alg`, `htm`, `htu`, `iat`, `ath`, key, replayed `jti`, several headers), or a `subject_token_dpop` whose `child_jkt` and `child_actor` do not name the new key and `actor` (SR-40) |
 | `use_dpop_nonce` | 401 | `use_dpop_nonce`: with `[token] dpop_nonce = "required"`, a `DPoP` header proof that is otherwise valid but has no current server nonce. The response carries `DPoP-Nonce` |
 | `temporarily_unavailable` | 503 | `jwks_unavailable` (IdP or `[[actor_trust]]` keys), `replay_cache_full`, `replay_store_unavailable`, `dpop_replay_cache_full` |
-| `invalid_cursor` | 400 | none. The `cursor` of a list route (`GET /admin/audit`, `/admin/audit/checkpoints`, `/admin/approvals`) is malformed, of another format version, from another list route or for the other `order`. `detail` says which and never repeats the cursor ([Paging](../reference/http-api.md#paging)) |
+| `invalid_cursor` | 400 | none. The `cursor` of a list route (`GET /admin/audit`, `/admin/audit/checkpoints`, `/admin/approvals`) is malformed, of another format version, from another list route or for the other `order`; or an action search `page.token` is malformed or was issued for another chain, server or `context`. `detail` says which and never repeats the cursor ([Paging](../reference/http-api.md#paging)) |
 | `server_error` | 500 | none. `detail` is always "internal error; the details are in the server log": a storage or I/O error, which can name a file, is logged and never returned (SR-43) |
 
 These codes are stable; `detail` is prose and may change.

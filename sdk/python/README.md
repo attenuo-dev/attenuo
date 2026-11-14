@@ -429,7 +429,7 @@ if page.next_token is not None:
 names = [a.name for a in ob.authzen_search_action_iter(token, "github", args)]
 ```
 
-`limit` is how many catalogued tools one page evaluates; the server clamps it to `[authzen] max_batch` (default 64). So a page can hold fewer results than `limit`, even none, while `next_token` is set; `next_token` is `None` after the last page. Send it back as `page_token` with the same arguments. `server` names the MCP server, not one tool: `"github/read_file"` is `ApiError` 400 `invalid_search_resource`, and a token the server did not issue is 400 `invalid_cursor`. Authentication, DPoP proofs (for the search URL), retries and errors are as for `authzen_evaluate`.
+`limit` is how many catalogued tools one page evaluates; the server clamps it to `[authzen] max_batch` (default 64). So a page can hold fewer results than `limit`, even none, while `next_token` is set; `next_token` is `None` after the last page. Send it back as `page_token` with the same `token`, `server` and arguments (`limit` may change): the server binds a page token to the chain, server and arguments it was issued for. `server` names the MCP server, not one tool: `"github/read_file"` is `ApiError` 400 `invalid_search_resource`, and a token the server did not issue, or one sent with another token, server or arguments, is 400 `invalid_cursor`. Authentication, DPoP proofs (for the search URL), retries and errors are as for `authzen_evaluate`.
 
 ### Streaming a call
 
