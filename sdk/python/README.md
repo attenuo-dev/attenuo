@@ -73,6 +73,7 @@ print(admin.audit_verify())  # VerifyReport(ok=True, entries=..., ...)
 | `close_session(token, server, session_id)` | `DELETE /mcp/{server}`: ends the MCP session. `True` when the upstream closed it, `False` when it does not let clients close sessions (405). |
 | `authzen_evaluate(token, server, tool, arguments)`                                                   | AuthZEN decision without calling the tool. A deny is a falsy `AuthzenDecision`, not an exception; on `approval_required` it also has `call_hash`, `approval_id` and `expires_at` (see [Approvals](#approvals)).                                                                                                                                                                                                   |
 | `authzen_evaluate_batch(token, evaluations, *, semantic=None)`, `authzen_configuration()` | `POST /access/v1/evaluations`: several decisions in one request, one `AuthzenDecision` per call; and the AuthZEN discovery document. See [AuthZEN batches and discovery](#authzen-batches-and-discovery). |
+| `authzen_search_action(token, server, arguments=None, *, page_token=None, limit=None)`, `authzen_search_action_iter(token, server, arguments=None, *, limit=None)` | `POST /access/v1/search/action`: the catalogued tools of `server` that an evaluation with these arguments would allow now, one `AuthzenActionPage` per page, or every `AuthzenAction` across pages. Nothing is audited or charged. See [AuthZEN action search](#authzen-action-search). |
 | `inspect(jwt, verify=False)`                                                                         | Decode a token. With `verify=True` fetch the JWKS and check the Ed25519 signature, `typ`, `exp` and that `sub`/`act` match the chain.                                                                                                                                                                                                                                                                             |
 | `AdminClient(server_url, admin_token)`                                                               | `revoke_lease`, `revoke_by_selector` (every lease of one user, chain or MCP session; see [below](#admin-revoking-by-user-chain-or-session)), `lease_status`, `refund_budget` (see [below](#admin-refunding-a-budget-charge)), `audit`, `audit_head` (reads `head` from `GET /admin/audit`, signs nothing), `audit_tail`, `audit_export` (iterator of JSON Lines objects; `kind=`, `chain_id=`, `tool=` and `decision=` filter), `audit_checkpoint` (explicit; signs and stores a checkpoint), `audit_verify`, `policy_reload`, `mint_root_dev`, the approval calls (`approvals`, `approval`, `grant_approval`, `decline_approval`); and the read-only console helpers below (`audit_query`, `audit_iter`, `audit_entry`, `audit_record`, `audit_checkpoints`, `lease_tree`, `policies`, `policy_check`, `policy_evaluate`, `whoami`).                                                                                                                       |
 
@@ -302,7 +303,7 @@ with Client(url, dpop_key=coder_key) as ob:
     ob.call_tool(coder, "github", "read_file", {"repo": "alice/docs"})  # proof attached
 ```
 
-With a key, every `call_tool`, `list_tools`, `close_session`, `renew`, `authzen_evaluate` and `authzen_evaluate_batch` sends `Authorization: DPoP <token>` and a fresh proof, and every `exchange` binds the new token. When the parent is bound to another key, its holder's sign-off names the new key and agent and works for that one exchange; a process that holds both keys can pass `subject_dpop_key=planner_key` instead. When the parent is bound to the client's own key, no sign-off is needed. `Token.dpop_jkt` is the thumbprint a token is bound to (`None` for a bearer token), and `AuditEntry.dpop_bound` says whether a decision was made with a proven bound token. A bound token without a proof is `Unauthorized` with `reason == "dpop_required"`, from `call_tool` as from `renew` or `exchange` (see [Errors](#errors)). See [Binding tokens to keys](https://github.com/attenuo-dev/attenuo/blob/main/docs/guides/binding-tokens-to-keys.md).
+With a key, every `call_tool`, `list_tools`, `close_session`, `renew`, `authzen_evaluate`, `authzen_evaluate_batch` and `authzen_search_action` sends `Authorization: DPoP <token>` and a fresh proof, and every `exchange` binds the new token. When the parent is bound to another key, its holder's sign-off names the new key and agent and works for that one exchange; a process that holds both keys can pass `subject_dpop_key=planner_key` instead. When the parent is bound to the client's own key, no sign-off is needed. `Token.dpop_jkt` is the thumbprint a token is bound to (`None` for a bearer token), and `AuditEntry.dpop_bound` says whether a decision was made with a proven bound token. A bound token without a proof is `Unauthorized` with `reason == "dpop_required"`, from `call_tool` as from `renew` or `exchange` (see [Errors](#errors)). See [Binding tokens to keys](https://github.com/attenuo-dev/attenuo/blob/main/docs/guides/binding-tokens-to-keys.md).
 
 Server nonces (RFC 9449 §8, `[token] dpop_nonce = "required"`) need no code. `Client`, `AsyncClient`, `AdminClient.mint_root_dev` and `TokenAuth` keep the latest `DPoP-Nonce` header the server sent and put it in each proof. When the server refuses a proof with `use_dpop_nonce`, they retry the request once with a new proof carrying the nonce from that response, on a new connection: the server can close the connection that carried the refusal without saying so (it does when it answers before reading the request body), so `NonceCache.update` shuts that socket down and the pool opens another (`attenuo.dpop.drop_connection`; a response without a socket, such as from a mock transport, is left alone). For your own HTTP code, `DpopKey.proof(method, url, access_token, nonce=...)` adds the claim, and `attenuo.dpop.NonceCache` does the bookkeeping: `update(response)` stores the nonce and returns true when the request should be retried.
 
@@ -410,7 +411,25 @@ for d in decisions:
 
 `semantic` is AuthZEN's `evaluations_semantic`: `execute_all` (the default), `deny_on_first_deny` or `permit_on_first_permit`. A batch that stops early answers only the calls it decided, so the list can be shorter than the request. A call the server could not decide is a deny with `error`, an `AuthzenEntryError(status, code, message)`. An empty batch raises `ValueError` before anything is sent (the server would answer it as a single evaluation), and more calls than `[authzen] max_batch` (default 64) is `ApiError` 400 `batch_too_large`.
 
-`authzen_configuration()` reads `GET /.well-known/authzen-configuration` without a credential and returns `AuthzenConfiguration(policy_decision_point, access_evaluation_endpoint, access_evaluations_endpoint, raw)`.
+`authzen_configuration()` reads `GET /.well-known/authzen-configuration` without a credential and returns `AuthzenConfiguration(policy_decision_point, access_evaluation_endpoint, access_evaluations_endpoint, raw, search_action_endpoint)`; `search_action_endpoint` is `""` when the server does not publish action search.
+
+### AuthZEN action search
+
+`authzen_search_action` asks which tools of one MCP server the token may call with these arguments (`POST /access/v1/search/action`, AuthZEN section 8.6). The candidates are the tools the server's `[policy] catalog` lists for `server`, and a result is one an evaluation with the same token and arguments would allow now. A search is not a decision: it writes no audit record, charges no run limit and takes no approval, so an approval-gated tool is never a result. Calling the tool, or `authzen_evaluate`, still decides it.
+
+```python
+args = {"repo": "alice/docs"}
+page = ob.authzen_search_action(token, "github", args, limit=16)
+for action in page.actions:
+    print(action.server, action.name)
+if page.next_token is not None:
+    page = ob.authzen_search_action(token, "github", args, page_token=page.next_token)
+
+# Or every result, following the pages:
+names = [a.name for a in ob.authzen_search_action_iter(token, "github", args)]
+```
+
+`limit` is how many catalogued tools one page evaluates; the server clamps it to `[authzen] max_batch` (default 64). So a page can hold fewer results than `limit`, even none, while `next_token` is set; `next_token` is `None` after the last page. Send it back as `page_token` with the same arguments. `server` names the MCP server, not one tool: `"github/read_file"` is `ApiError` 400 `invalid_search_resource`, and a token the server did not issue is 400 `invalid_cursor`. Authentication, DPoP proofs (for the search URL), retries and errors are as for `authzen_evaluate`.
 
 ### Streaming a call
 

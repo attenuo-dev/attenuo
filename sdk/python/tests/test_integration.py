@@ -40,6 +40,7 @@ from attenuo import (
     ApiError,
     ApprovalRequired,
     AsyncClient,
+    AuthzenAction,
     AuthzenEvaluation,
     BudgetLimit,
     Capability,
@@ -618,6 +619,9 @@ def test_dpop_server_nonce(nonce_stack: Stack) -> None:
         assert ob.authzen_evaluate(root, "github", "read_file", {"repo": "alice/public-x"})
         coder = ob.exchange(root, "coder", ["github:read_file"], client_secret=CODER_SECRET)
         assert coder.dpop_jkt == key.thumbprint
+        # Action search signs its own URL and picks up the nonce like evaluation.
+        found = ob.authzen_search_action(coder, "github", {"repo": "alice/public-x"})
+        assert [a.name for a in found.actions] == ["read_file"]
 
     # Through the `httpx` auth an MCP client library would use.
     auth = TokenAuth(lambda: coder, dpop_key=key)
@@ -1702,6 +1706,56 @@ async def test_authzen_batch_and_discovery(stack: Stack) -> None:
         (one,) = await aob.authzen_evaluate_batch(coder, [("github", "read_file", read)])
         assert one.decision
     admin.revoke_lease(root.lease)
+    ob.close()
+    admin.close()
+
+
+async def test_authzen_search_action(stack: Stack) -> None:
+    """Action search answers the catalogued tools that evaluation would allow, pages by
+    ``limit``, and agrees with evaluation; the async client agrees, and a bad token or a
+    ``server`` naming one tool is refused."""
+    admin = AdminClient(stack.url, ADMIN_TOKEN)
+    ob = Client(stack.url)
+    root = admin.mint_root_dev("alice", "https://idp.example", "assistant", ["github:*"])
+    coder = ob.exchange(root, "coder", ["github:read_file"], client_secret=CODER_SECRET)
+    public = {"repo": "alice/public-docs", "path": "README.md"}
+    private = {"repo": "alice/private-salaries", "path": "pay.csv"}
+
+    page = ob.authzen_search_action(coder, "github", public)
+    assert page.actions == [AuthzenAction("read_file", "github")] and page.next_token is None
+    assert ob.authzen_evaluate(coder, "github", "read_file", public)
+    # The policy forbids the private repo, so nothing is a result for these arguments.
+    assert ob.authzen_search_action(coder, "github", private).actions == []
+    assert not ob.authzen_evaluate(coder, "github", "read_file", private)
+
+    # One candidate per page: the catalog is create_issue, delete_repo, read_file. The first
+    # page is approval-gated create_issue, never a result, so it comes back empty with a token.
+    first = ob.authzen_search_action(root, "github", public, limit=1)
+    assert first.actions == [] and first.next_token
+    paged = list(ob.authzen_search_action_iter(root, "github", public, limit=1))
+    assert paged == list(ob.authzen_search_action_iter(root, "github", public))
+    assert AuthzenAction("read_file", "github") in paged
+    assert AuthzenAction("create_issue", "github") not in paged
+    for action in paged:
+        assert ob.authzen_evaluate(root, "github", action.name, public), action
+
+    with pytest.raises(Unauthorized):
+        ob.authzen_search_action("not-a-token", "github", public)
+    with pytest.raises(ApiError) as one_tool:
+        ob.authzen_search_action(coder, "github/read_file", public)
+    assert (one_tool.value.status, one_tool.value.code) == (400, "invalid_search_resource")
+    with pytest.raises(ApiError) as bad_page:
+        ob.authzen_search_action(coder, "github", public, page_token="not-a-token")
+    assert bad_page.value.code == "invalid_cursor"
+
+    assert ob.authzen_configuration().search_action_endpoint == (
+        f"{stack.url}/access/v1/search/action"
+    )
+    async with AsyncClient(stack.url) as aob:
+        assert [a async for a in aob.authzen_search_action_iter(root, "github", public)] == paged
+        assert (await aob.authzen_search_action(coder, "github", public)) == page
+    admin.revoke_lease(root.lease)
+    assert ob.authzen_search_action(coder, "github", public).actions == []
     ob.close()
     admin.close()
 
