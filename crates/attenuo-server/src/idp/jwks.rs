@@ -17,6 +17,13 @@
 //! development and tests ([`check_fetch_url`]). Redirects are never followed: a 3xx answer
 //! fails the fetch and names the `Location`, so a redirect cannot move a fetch from https to
 //! http or to another host. Configure the final URL instead.
+//!
+//! Trust: a key URL's certificate is checked against the web PKI roots built in (the
+//! `webpki-roots` set), plus, for an entry that sets `ca_pem_path`, the CA certificates in that
+//! file ([`read_ca_pem`]). The extra roots are added to the built-in ones, never replace them,
+//! and belong to that entry's client alone: another entry, and every other outbound client of
+//! the server, still trusts only the built-in roots. Nothing here can turn verification or
+//! the hostname check off.
 
 use std::str::FromStr;
 use std::time::{Duration, Instant};
@@ -43,11 +50,67 @@ pub(crate) const UNKNOWN_KID_REFETCH_COOLDOWN: Duration = Duration::from_secs(30
 /// then come over cleartext from another machine. Pinning the name keeps the local-development
 /// exception on the machine itself, whatever the resolver says (SR-107).
 ///
+/// `extra_roots` (an entry's `ca_pem_path`, from [`read_ca_pem`]) are trusted in addition to
+/// the built-in web PKI roots, for this client only.
+///
 /// # Errors
 ///
-/// When the TLS backend cannot be initialised.
-pub(crate) fn fetch_client(timeout: Duration) -> reqwest::Result<reqwest::Client> {
-    fetch_client_builder(timeout).build()
+/// When the TLS backend cannot be initialised, or a certificate of `extra_roots` cannot be
+/// used as a trust anchor.
+pub(crate) fn fetch_client(
+    timeout: Duration,
+    extra_roots: &[reqwest::Certificate],
+) -> reqwest::Result<reqwest::Client> {
+    extra_roots
+        .iter()
+        .fold(fetch_client_builder(timeout), |b, c| {
+            b.add_root_certificate(c.clone())
+        })
+        .build()
+}
+
+/// The CA certificates of an `[[idps]]` or `[[actor_trust]]` `ca_pem_path`: every
+/// `CERTIFICATE` block of a PEM file. Other blocks (a private key, say) are ignored.
+///
+/// # Errors
+///
+/// A message, without the path (callers name it), when the file cannot be read, is not PEM,
+/// or holds no certificate.
+pub(crate) fn read_ca_pem(path: &std::path::Path) -> Result<Vec<reqwest::Certificate>, String> {
+    let pem = std::fs::read(path).map_err(|e| format!("cannot read the file ({e})"))?;
+    if pem.iter().all(u8::is_ascii_whitespace) {
+        return Err("the file is empty; it must hold PEM CA certificates".into());
+    }
+    let certs = reqwest::Certificate::from_pem_bundle(&pem)
+        .map_err(|e| format!("not a PEM certificate file ({e})"))?;
+    if certs.is_empty() {
+        return Err("no PEM certificate (-----BEGIN CERTIFICATE-----) in the file".into());
+    }
+    Ok(certs)
+}
+
+/// The key-fetch client of one entry: `shared` (built-in roots only) when it names no
+/// `ca_pem_path`, else a client of its own that also trusts that file's CAs.
+///
+/// # Errors
+///
+/// A message, without the entry's name (callers give it), naming the path and the problem.
+pub(crate) fn entry_client(
+    shared: &reqwest::Client,
+    ca_pem_path: Option<&std::path::Path>,
+    timeout: Duration,
+) -> Result<reqwest::Client, String> {
+    let Some(path) = ca_pem_path else {
+        return Ok(shared.clone());
+    };
+    let fail = |e: String| format!("ca_pem_path {:?}: {e}", path.display().to_string());
+    let roots = read_ca_pem(path).map_err(fail)?;
+    fetch_client(timeout, &roots).map_err(|e| {
+        fail(format!(
+            "a certificate cannot be used as a trust anchor ({})",
+            error_chain(&e)
+        ))
+    })
 }
 
 /// [`fetch_client`]'s builder, for a test that swaps the resolver underneath the pin.
@@ -85,6 +148,41 @@ pub(crate) fn check_fetch_url(url: &str) -> Result<(), String> {
                 .into(),
         ),
         other => Err(format!("must be https://, not {other}://")),
+    }
+}
+
+/// `err` and its causes, outermost first, joined by `: ` (for a failed fetch: `error sending
+/// request: client error (Connect): invalid peer certificate: UnknownIssuer`). A cause whose
+/// text the previous one already contains is left out, as some errors repeat their source.
+///
+/// For the server log only: the HTTP answer to a failed fetch is the stable
+/// `jwks_unavailable` and never this text (SR-17). A key fetch sends no credential, so the
+/// causes of its failure carry none.
+pub(crate) fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut out = err.to_string();
+    let mut last = out.clone();
+    let mut next = err.source();
+    while let Some(cause) = next {
+        let text = cause.to_string();
+        if !text.is_empty() && !last.contains(&text) {
+            out.push_str(": ");
+            out.push_str(&text);
+        }
+        last = text;
+        next = cause.source();
+    }
+    out
+}
+
+/// `url` as the fetch error names it: a password in its user info is replaced by `***`, so
+/// a `https://user:secret@host/jwks` cannot put the secret in the log.
+fn url_for_log(url: &str) -> String {
+    match reqwest::Url::parse(url) {
+        Ok(mut u) if u.password().is_some() => {
+            let _ = u.set_password(Some("***"));
+            u.to_string()
+        }
+        _ => url.to_owned(),
     }
 }
 
@@ -214,7 +312,11 @@ impl JwksCache {
     }
 
     async fn get_json(&self, url: &str) -> Result<Value, JwksError> {
-        let fail = |e: String| JwksError::Unavailable(format!("{url}: {e}"));
+        let shown = url_for_log(url);
+        let fail = |e: String| JwksError::Unavailable(format!("{shown}: {e}"));
+        // The transport error with its causes (the TLS error under "error sending request"),
+        // without reqwest's copy of the URL, which `fail` already names.
+        let transport = |e: reqwest::Error| fail(error_chain(&e.without_url()));
         check_fetch_url(url).map_err(fail)?;
         let mut resp = self
             .client
@@ -222,7 +324,7 @@ impl JwksCache {
             .header(reqwest::header::ACCEPT, "application/json")
             .send()
             .await
-            .map_err(|e| fail(e.to_string()))?;
+            .map_err(transport)?;
         if resp.status().is_redirection() {
             let location = resp
                 .headers()
@@ -245,7 +347,7 @@ impl JwksCache {
             return Err(fail("document too large".into()));
         }
         let mut body = Vec::new();
-        while let Some(chunk) = resp.chunk().await.map_err(|e| fail(e.to_string()))? {
+        while let Some(chunk) = resp.chunk().await.map_err(transport)? {
             if body.len() + chunk.len() > MAX_JWKS_BYTES {
                 return Err(fail("document too large".into()));
             }
@@ -436,7 +538,7 @@ mod tests {
 
     fn cache(issuer: &str, url: Option<String>) -> JwksCache {
         JwksCache::new(
-            fetch_client(Duration::from_secs(5)).unwrap(),
+            fetch_client(Duration::from_secs(5), &[]).unwrap(),
             issuer.into(),
             url,
             Duration::from_secs(300),
@@ -483,6 +585,88 @@ mod tests {
         };
         assert!(msg.contains("http://keys.example/jwks"), "{msg}");
         assert!(msg.contains("must be https://"), "{msg}");
+    }
+
+    /// An error with an optional cause, for the chain formatter.
+    #[derive(Debug)]
+    struct Layer(&'static str, Option<Box<Layer>>);
+    impl std::fmt::Display for Layer {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+    impl std::error::Error for Layer {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.1.as_deref().map(|l| l as _)
+        }
+    }
+
+    #[test]
+    fn the_error_chain_names_every_cause_once() {
+        let chain = Layer(
+            "error sending request",
+            Some(Box::new(Layer(
+                "client error (Connect)",
+                Some(Box::new(Layer(
+                    "invalid peer certificate: UnknownIssuer",
+                    // Repeats its parent's text, as `io::Error` wrappers do.
+                    Some(Box::new(Layer("UnknownIssuer", None))),
+                ))),
+            ))),
+        );
+        assert_eq!(
+            error_chain(&chain),
+            "error sending request: client error (Connect): \
+             invalid peer certificate: UnknownIssuer"
+        );
+        assert_eq!(error_chain(&Layer("alone", None)), "alone");
+        // An empty cause adds no separator.
+        let empty = Layer("outer", Some(Box::new(Layer("", None))));
+        assert_eq!(error_chain(&empty), "outer");
+    }
+
+    #[test]
+    fn a_password_in_a_key_url_is_not_logged() {
+        assert_eq!(
+            url_for_log("https://keys:s3cret@idp.example/jwks"),
+            "https://keys:***@idp.example/jwks"
+        );
+        assert_eq!(
+            url_for_log("https://idp.example/jwks?x=1"),
+            "https://idp.example/jwks?x=1"
+        );
+        assert_eq!(url_for_log("not a url"), "not a url");
+    }
+
+    /// A transport failure is reported with its cause, not as a bare "error sending request".
+    #[tokio::test]
+    async fn a_failed_fetch_names_the_transport_cause() {
+        // A port that refuses connections: bind, note the port, close.
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let Err(JwksError::Unavailable(msg)) = cache(
+            "i",
+            Some(format!("http://keys:s3cret@127.0.0.1:{port}/jwks")),
+        )
+        .key_for(Some("a"), Algorithm::EdDSA)
+        .await
+        else {
+            panic!("the fetch must fail");
+        };
+        assert!(
+            msg.starts_with(&format!("http://keys:***@127.0.0.1:{port}/jwks: ")),
+            "{msg}"
+        );
+        assert!(msg.contains("error sending request"), "{msg}");
+        assert!(
+            msg.len() > msg.find("error sending request").unwrap() + 22,
+            "no cause: {msg}"
+        );
+        assert!(!msg.contains("s3cret"), "{msg}");
+        // reqwest's own copy of the URL is left out: the URL is named once.
+        assert_eq!(msg.matches("127.0.0.1").count(), 1, "{msg}");
     }
 
     #[test]

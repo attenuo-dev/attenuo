@@ -177,6 +177,7 @@ impl Harness {
                 jwks_url: None,
                 spiffe_trust_domain: Some(TRUST_DOMAIN.into()),
                 spiffe_bundle_url: Some(keys.server.url("/bundle")),
+                ca_pem_path: None,
                 audience: ACTOR_AUD.into(),
                 subject_to_agent: SubjectToAgent::Map(BTreeMap::from([
                     (CODER_ID.to_string(), "coder".to_string()),
@@ -194,6 +195,7 @@ impl Harness {
                 jwks_url: Some(keys.server.url("/jwks")),
                 spiffe_trust_domain: None,
                 spiffe_bundle_url: None,
+                ca_pem_path: None,
                 audience: ACTOR_AUD.into(),
                 subject_to_agent: SubjectToAgent::Sub,
                 allowed_algs: DEFAULT_IDP_ALGS.iter().map(|s| s.to_string()).collect(),

@@ -1000,18 +1000,15 @@ impl Deliver for S3Deliver {
             uri_encode(&self.key(s), false)
         );
         let url = format!("{}{}", self.endpoint, path);
-        let host = signed_host(&self.endpoint);
-        let payload_hash = hex::encode(Sha256::digest(&body));
         let amz_date = amz_date(SystemTime::now());
-        let mut headers = vec![
-            ("content-type".to_string(), "application/json".to_string()),
-            ("host".to_string(), host),
-            ("x-amz-content-sha256".to_string(), payload_hash.clone()),
-            ("x-amz-date".to_string(), amz_date.clone()),
-        ];
-        if let Some(t) = &self.creds.session_token {
-            headers.push(("x-amz-security-token".to_string(), t.clone()));
-        }
+        let digest = Sha256::digest(&body);
+        let payload_hash = hex::encode(digest);
+        let headers = s3_put_headers(
+            signed_host(&self.endpoint),
+            &digest,
+            &amz_date,
+            self.creds.session_token.as_deref(),
+        );
         let auth = sigv4_authorization(&SigV4Request {
             method: "PUT",
             canonical_uri: &path,
@@ -1044,6 +1041,44 @@ impl Deliver for S3Deliver {
             Err(format!("S3 answered {status}"))
         }
     }
+}
+
+/// The headers of the sink's PutObject, every one of them signed: `content-type`, `host`,
+/// `x-amz-checksum-sha256` (base64 of the body's SHA-256), `x-amz-content-sha256` (its hex),
+/// `x-amz-date`, `x-amz-sdk-checksum-algorithm` (`SHA256`) and, with STS credentials,
+/// `x-amz-security-token`.
+///
+/// The checksum pair is what an upload into an Object Lock bucket with a retention period
+/// needs: AWS's PutObject reference says "The `Content-MD5` or `x-amz-sdk-checksum-algorithm`
+/// header is required", and that `x-amz-sdk-checksum-algorithm` must come with the matching
+/// `x-amz-checksum-<algorithm>` header, here `x-amz-checksum-sha256`, "the Base64 encoded,
+/// 256-bit SHA256 digest of the object". S3 also checks the body against it (`BadDigest` on
+/// a mismatch). SHA-256 because the sink computes it already; no MD5 is needed.
+fn s3_put_headers(
+    host: String,
+    body_sha256: &[u8],
+    amz_date: &str,
+    session_token: Option<&str>,
+) -> Vec<(String, String)> {
+    use base64::Engine as _;
+    let mut headers = vec![
+        ("content-type".to_string(), "application/json".to_string()),
+        ("host".to_string(), host),
+        (
+            "x-amz-checksum-sha256".to_string(),
+            base64::engine::general_purpose::STANDARD.encode(body_sha256),
+        ),
+        ("x-amz-content-sha256".to_string(), hex::encode(body_sha256)),
+        ("x-amz-date".to_string(), amz_date.to_string()),
+        (
+            "x-amz-sdk-checksum-algorithm".to_string(),
+            "SHA256".to_string(),
+        ),
+    ];
+    if let Some(t) = session_token {
+        headers.push(("x-amz-security-token".to_string(), t.to_string()));
+    }
+    headers
 }
 
 /// The `host` header value SigV4 signs for `endpoint`: what the HTTP client sends, so the
@@ -1128,8 +1163,9 @@ fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
     ring::hmac::sign(&k, data).as_ref().to_vec()
 }
 
-/// The `Authorization` header value for `r` (AWS Signature Version 4, header form).
-pub fn sigv4_authorization(r: &SigV4Request<'_>) -> String {
+/// The SigV4 canonical request of `r` and its signed-header list: headers lowercased, values
+/// with runs of whitespace folded to one space, sorted by name.
+fn sigv4_canonical_request(r: &SigV4Request<'_>) -> (String, String) {
     let mut headers: Vec<(String, String)> = r
         .headers
         .iter()
@@ -1154,6 +1190,12 @@ pub fn sigv4_authorization(r: &SigV4Request<'_>) -> String {
         signed_headers,
         r.payload_sha256
     );
+    (canonical_request, signed_headers)
+}
+
+/// The `Authorization` header value for `r` (AWS Signature Version 4, header form).
+pub fn sigv4_authorization(r: &SigV4Request<'_>) -> String {
+    let (canonical_request, signed_headers) = sigv4_canonical_request(r);
     let date = &r.amz_date[..8];
     let scope = format!("{date}/{}/{}/aws4_request", r.region, r.service);
     let string_to_sign = format!(
@@ -1570,6 +1612,70 @@ mod tests {
             ),
             "{auth}"
         );
+    }
+
+    /// The sink's PutObject carries the checksum headers an Object Lock bucket asks for
+    /// (`x-amz-sdk-checksum-algorithm` with `x-amz-checksum-sha256`), and both are signed, in
+    /// the canonical (sorted) order.
+    #[test]
+    fn the_put_object_canonical_request_signs_the_checksum_headers() {
+        let body = b"Welcome to Amazon S3.";
+        let digest = Sha256::digest(body);
+        let headers = s3_put_headers(
+            "127.0.0.1:9000".into(),
+            &digest,
+            "20130524T000000Z",
+            Some("session-token"),
+        );
+        let payload_sha256 = hex::encode(digest);
+        let r = SigV4Request {
+            method: "PUT",
+            canonical_uri: "/bucket/checkpoints/key.json",
+            canonical_query: "",
+            headers: &headers,
+            payload_sha256: &payload_sha256,
+            region: "us-east-1",
+            service: "s3",
+            amz_date: "20130524T000000Z",
+            creds: &example_creds(),
+        };
+        let (canonical, signed) = sigv4_canonical_request(&r);
+        let hex_hash = "44ce7dd67c959e0d3524ffac1771dfbba87d2b6b4b4e99e42034a8b803f8b072";
+        assert_eq!(hex::encode(digest), hex_hash);
+        let b64 = "RM591nyVng01JP+sF3Hfu6h9K2tLTpnkIDSouAP4sHI=";
+        assert_eq!(
+            canonical,
+            format!(
+                "PUT\n/bucket/checkpoints/key.json\n\n\
+                 content-type:application/json\n\
+                 host:127.0.0.1:9000\n\
+                 x-amz-checksum-sha256:{b64}\n\
+                 x-amz-content-sha256:{hex_hash}\n\
+                 x-amz-date:20130524T000000Z\n\
+                 x-amz-sdk-checksum-algorithm:SHA256\n\
+                 x-amz-security-token:session-token\n\n\
+                 content-type;host;x-amz-checksum-sha256;x-amz-content-sha256;x-amz-date;\
+                 x-amz-sdk-checksum-algorithm;x-amz-security-token\n\
+                 {hex_hash}"
+            )
+        );
+        assert_eq!(
+            signed,
+            "content-type;host;x-amz-checksum-sha256;x-amz-content-sha256;x-amz-date;\
+             x-amz-sdk-checksum-algorithm;x-amz-security-token"
+        );
+        // The checksum is the standard (padded) base64 of the same SHA-256 as the hex.
+        use base64::Engine as _;
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .unwrap(),
+            digest.to_vec()
+        );
+        // Without STS credentials there is no token header, and the rest is unchanged.
+        let plain = s3_put_headers("h".into(), &digest, "20130524T000000Z", None);
+        assert_eq!(plain.len(), headers.len() - 1);
+        assert!(plain.iter().all(|(k, _)| k != "x-amz-security-token"));
     }
 
     /// The signed `host` is the one reqwest sends: a default port (`:80` for http, `:443` for

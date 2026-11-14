@@ -21,11 +21,11 @@
 # same through the OIDC Discovery Provider (`issuer` plus `jwks_url`); and a JWT key rotation
 # forced with `spire-server localauthority jwt prepare / activate / taint / revoke`.
 #
-# The bundle endpoint is HTTPS, and attenuo trusts only the web PKI roots built into it (no
-# option names another CA). Step 4 shows attenuo refusing the endpoint's certificate; the
-# other bundle checks reach the endpoint through a relay on 127.0.0.1 (plain http, which
-# attenuo accepts only for a loopback host) that verifies the certificate against this run's
-# CA. The discovery provider is served on 127.0.0.1 over plain http (`insecure_addr`).
+# The bundle endpoint is HTTPS with a certificate from this run's CA, which is not a web PKI
+# root. attenuo reaches it directly, over TLS, with the entry's `ca_pem_path` naming that CA;
+# step 4 shows that without the setting, or with another CA, the fetch is refused and the log
+# names the TLS cause. The discovery provider is served on 127.0.0.1 over plain http
+# (`insecure_addr`).
 #
 # Not part of CI. Needs docker (the daemon running), curl, openssl and python3; the Python
 # SDK step needs httpx. A step whose tool is missing is reported as skipped, and the script
@@ -128,7 +128,7 @@ else
   rm -rf "$WORK/dl"
 fi
 
-SPIRE_PORT="$(free_port)"; BE_PORT="$(free_port)"; ODP_PORT="$(free_port)"; RELAY_PORT="$(free_port)"
+SPIRE_PORT="$(free_port)"; BE_PORT="$(free_port)"; ODP_PORT="$(free_port)"; OB_OTHER_PORT="$(free_port)"
 OB_PORT="$(free_port)"; OB_ODP_PORT="$(free_port)"; OB_TLS_PORT="$(free_port)"
 TD=example.org
 ODP="http://127.0.0.1:$ODP_PORT"
@@ -146,6 +146,10 @@ printf 'subjectAltName=IP:127.0.0.1\nbasicConstraints=CA:FALSE\nkeyUsage=critica
 openssl x509 -req -in "$WORK/be.csr" -CA "$WORK/ca.pem" -CAkey "$WORK/ca.key" -CAcreateserial \
   -days 1 -extfile "$WORK/be.ext" -out "$WORK/be.pem" 2>/dev/null
 cat "$WORK/be.pem" "$WORK/ca.pem" > "$WORK/conf/be-chain.pem"
+# Another CA, which did not issue the endpoint's certificate (step 4).
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 1 \
+  -keyout "$WORK/other-ca.key" -out "$WORK/other-ca.pem" -subj "/CN=attenuo spire smoke other CA" \
+  -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign" 2>/dev/null
 chmod 644 "$WORK/conf/be.key"   # read by the container's root only; the dir is the run's
 
 cat > "$WORK/conf/server.conf" <<EOF
@@ -280,29 +284,6 @@ OTHER="$(svid coder "$AUD,smoke-$(rand)")"
 [ "$OTHER" != "$SVID" ] || fail "an extra audience did not give a fresh SVID"
 ok "an extra, unique audience gives a fresh one (aud = $(jwt_part "$OTHER" 1 | jq_py 'd["aud"]'))"
 
-# A relay on 127.0.0.1 that fetches the bundle over HTTPS, checking the certificate against
-# this run's CA, and serves it over plain http (see the header).
-cat > "$WORK/relay.py" <<'EOF'
-import ssl, sys, urllib.request
-from http.server import BaseHTTPRequestHandler, HTTPServer
-port, upstream, cafile = int(sys.argv[1]), sys.argv[2], sys.argv[3]
-ctx = ssl.create_default_context(cafile=cafile)
-op = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=ctx))
-class H(BaseHTTPRequestHandler):
-    def do_GET(self):
-        body = op.open(upstream).read()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-    def log_message(self, *a):
-        print("relay GET", flush=True)
-HTTPServer(("127.0.0.1", port), H).serve_forever()
-EOF
-python3 -I "$WORK/relay.py" "$RELAY_PORT" "https://127.0.0.1:$BE_PORT" "$WORK/ca.pem" > "$WORK/relay.log" 2>&1 &
-PIDS+=($!)
-
 # --- the mock IdP (hop 0) and attenuo-server ------------------------------------------------
 "$IDP_BIN" --port 0 --client-id agent-platform --subject alice > "$WORK/idp.out" 2> "$WORK/idp.log" &
 PIDS+=($!)
@@ -407,8 +388,9 @@ expect_refusal() {  # label code output
   ok "$1: refused, $2"
 }
 
-printf 'spiffe_trust_domain = "%s"\nspiffe_bundle_url = "http://127.0.0.1:%s"\n' "$TD" "$RELAY_PORT" \
-  | write_config "$OB_PORT" > "$WORK/config-bundle.toml"
+# The bundle endpoint directly, over TLS, trusting this run's CA for this entry only.
+printf 'spiffe_trust_domain = "%s"\nspiffe_bundle_url = "https://127.0.0.1:%s"\nca_pem_path = "%s"\n' \
+  "$TD" "$BE_PORT" "$WORK/ca.pem" | write_config "$OB_PORT" > "$WORK/config-bundle.toml"
 start_server "$WORK/config-bundle.toml" "$WORK/server-bundle.log" "$OB_PORT"
 OB="http://127.0.0.1:$OB_PORT"
 unset ATTENUO_TOKEN ATTENUO_CLIENT_SECRET ATTENUO_ADMIN_TOKEN
@@ -428,7 +410,8 @@ CHILD="$(printf %s "$OUT" | token_of)"
 [ "$(jwt_part "$CHILD" 1 | jq_py 'int(d["exp"]) <= '"$(jwt_part "$CODER_SVID" 1 | jq_py 'd["exp"]')")" = True ] \
   || fail "the child token outlives the SVID"
 ok "attenuo token exchange --actor coder --actor-token -: child token, exp <= the SVID's exp"
-grep -q 'relay GET' "$WORK/relay.log" || fail "the bundle was not fetched through the relay"
+grep -q 'JWKS unavailable' "$WORK/server-bundle.log" && fail "a bundle fetch failed: $(grep 'JWKS unavailable' "$WORK/server-bundle.log")"
+ok "the bundle came straight from https://127.0.0.1:$BE_PORT (ca_pem_path = this run's CA)"
 
 say "3. refusals"
 P="$(new_root "$OB")"
@@ -448,16 +431,26 @@ OUT="$(printf '%s\n' "$(fresh planner)" | ATTENUO_SERVER="$OB" ATTENUO_TOKEN="$P
   --actor coder --cap github:read_file --actor-token - 2>&1 || true)"
 expect_refusal "the planner's SVID for --actor coder" actor_mismatch "$OUT"
 
-say "4. the bundle endpoint itself, over HTTPS"
-printf 'spiffe_trust_domain = "%s"\nspiffe_bundle_url = "https://127.0.0.1:%s"\n' "$TD" "$BE_PORT" \
-  | write_config "$OB_TLS_PORT" > "$WORK/config-tls.toml"
-start_server "$WORK/config-tls.toml" "$WORK/server-tls.log" "$OB_TLS_PORT"
-OUT="$(hop0 "http://127.0.0.1:$OB_TLS_PORT" "$(fresh planner)")"
-printf %s "$OUT" | grep -q -i 'temporarily_unavailable\|jwks_unavailable' \
-  || fail "expected the bundle fetch to fail on a certificate from a private CA: $OUT"
-grep -m1 -i 'actor token issuer JWKS unavailable' "$WORK/server-tls.log" | grep -o 'detail=.*' | cut -c1-200 \
-  | sed 's/^/    /' || true
-ok "attenuo cannot fetch the bundle from an https_web endpoint whose CA is not a web PKI root: 503 jwks_unavailable"
+say "4. the same endpoint without ca_pem_path, and with another CA: refused"
+refused_tls() {  # label port config-lines
+  printf '%s' "$3" | write_config "$2" > "$WORK/config-$2.toml"
+  start_server "$WORK/config-$2.toml" "$WORK/server-$2.log" "$2"
+  OUT="$(hop0 "http://127.0.0.1:$2" "$(fresh planner)")"
+  printf %s "$OUT" | grep -q 'temporarily_unavailable' && printf %s "$OUT" | grep -q 'jwks_unavailable' \
+    || fail "$1: expected 503 jwks_unavailable: $OUT"
+  printf %s "$OUT" | grep -q -i 'certificate\|UnknownIssuer\|error sending' \
+    && fail "$1: the response names the TLS cause: $OUT"
+  LINE="$(grep -m1 'actor token issuer JWKS unavailable' "$WORK/server-$2.log" || true)"
+  printf %s "$LINE" | grep -o 'detail=.*' | cut -c1-220 | sed 's/^/    /'
+  printf %s "$LINE" | grep -q 'invalid peer certificate: UnknownIssuer' \
+    || fail "$1: the log line does not name the TLS cause: $LINE"
+  ok "$1: 503 jwks_unavailable; the log names the cause (UnknownIssuer), the response does not"
+}
+refused_tls "no ca_pem_path" "$OB_TLS_PORT" \
+  "$(printf 'spiffe_trust_domain = "%s"\nspiffe_bundle_url = "https://127.0.0.1:%s"\n' "$TD" "$BE_PORT")"
+refused_tls "ca_pem_path = another CA" "$OB_OTHER_PORT" \
+  "$(printf 'spiffe_trust_domain = "%s"\nspiffe_bundle_url = "https://127.0.0.1:%s"\nca_pem_path = "%s"\n' \
+    "$TD" "$BE_PORT" "$WORK/other-ca.pem")"
 
 say "5. trust through the OIDC Discovery Provider"
 DISC="$(curl -sf "$ODP/.well-known/openid-configuration")"

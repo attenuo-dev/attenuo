@@ -147,6 +147,7 @@ async fn server(
         jwks_ttl_seconds: 300,
         clock_skew_seconds: 60,
         tenant: None,
+        ca_pem_path: None,
         client_ids: BTreeMap::from([("planner".to_string(), CLIENT_AUD.to_string())]),
     }];
     cfg.agents = vec![agent];

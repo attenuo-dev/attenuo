@@ -78,6 +78,11 @@ attenuo-audit = { workspace = true, features = ["testing"] }
 attenuo-proxy = { workspace = true, features = ["testing"] }
 rusqlite = { workspace = true }
 tempfile = { workspace = true }
+# A test CA, its certificates and an HTTPS key server, for `[[idps]]` / `[[actor_trust]]`
+# `ca_pem_path` (tests/key_url_ca.rs and the unit tests of `idp::jwks`).
+rcgen = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
 # Paused time (`tokio::time::pause`) for the stream re-check test in `tests/e2e.rs`.
 tokio = { workspace = true, features = ["test-util"] }
 

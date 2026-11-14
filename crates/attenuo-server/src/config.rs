@@ -384,6 +384,12 @@ pub struct ActorTrustConfig {
     /// JWT-SVID signing keys as a JWKS. Required with `spiffe_trust_domain`.
     #[serde(default)]
     pub spiffe_bundle_url: Option<String>,
+    /// PEM file of CA certificates trusted, for this entry's key fetches only, in addition to
+    /// the built-in web PKI roots: for a key URL whose certificate a private CA issued. Read
+    /// once at start; a file that is missing, unreadable or holds no certificate refuses to
+    /// start. Verification and the hostname check are unchanged. See [`IdpConfig::ca_pem_path`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_pem_path: Option<PathBuf>,
     /// `aud` the token must carry (string, or an array containing it). Pick a value that no
     /// other relying party uses, such as attenuo's own URL.
     pub audience: String,
@@ -2503,6 +2509,16 @@ pub struct IdpConfig {
     /// JWKS location. When absent, `jwks_uri` from `<issuer>/.well-known/openid-configuration`.
     #[serde(default)]
     pub jwks_url: Option<String>,
+    /// PEM file of CA certificates trusted, for this entry's key fetches only (the discovery
+    /// document, the JWKS, and the refetch on an unknown `kid`), in addition to the built-in
+    /// web PKI roots: for an IdP whose certificate a private CA issued. Never instead of
+    /// them, and never for another entry. Certificate verification and the hostname check are
+    /// unchanged, as are the `https://` rule and the refusal of redirects. Read once at start
+    /// (no reload re-reads it; a new file needs a restart). A file that is missing,
+    /// unreadable, empty or holds no certificate refuses to start. A relative path is resolved
+    /// against the working directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_pem_path: Option<PathBuf>,
     /// JWS algorithms accepted from this IdP. Only asymmetric algorithms are allowed.
     #[serde(default = "default_idp_algs")]
     pub allowed_algs: Vec<String>,

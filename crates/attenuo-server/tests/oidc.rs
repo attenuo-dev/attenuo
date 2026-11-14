@@ -229,6 +229,7 @@ impl Harness {
             jwks_ttl_seconds: 300,
             clock_skew_seconds: 60,
             tenant: None,
+            ca_pem_path: None,
             client_ids: ["planner", "coder"]
                 .map(|a| (a.to_string(), CLIENT_AUD.to_string()))
                 .into(),

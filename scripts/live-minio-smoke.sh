@@ -15,6 +15,9 @@
 #   2. each object's bytes are the canonical `attenuo-shipped-checkpoint-v1` envelope of the
 #      checkpoint the server signed (compared field for field with the server's export, and
 #      `checkpoint_sha256` recomputed);
+#   2b. each upload carried `x-amz-checksum-sha256` (with `x-amz-sdk-checksum-algorithm`):
+#      MinIO stored the SHA-256 of the object's bytes, and refuses a PUT (sent by curl, not
+#      by attenuo) whose checksum is wrong;
 #   3. `attenuo audit verify --file --jwks --checkpoints` accepts the export against the
 #      objects, and exits 2 once one object is altered;
 #   4. what PutObject-only keys can and cannot do: they cannot read, list or delete; an
@@ -26,10 +29,10 @@
 #   6. endpoint spellings: `http://LOCALHOST:<port>/` and `http://127.0.0.1:80` (a second MinIO
 #      on port 80, root in its container; the step fails as skipped if the port is taken).
 #
-# Not part of CI. Needs docker (the daemon running), curl and python3. Skips with exit status 0
-# when docker is not available. The MinIO root password, the sink user's secret and the admin
-# token are random per run and stay in the temp dir. Nothing leaves the machine except the
-# image pull.
+# Not part of CI. Needs docker (the daemon running), curl (7.75 or later, for --aws-sigv4)
+# and python3. Skips with exit status 0 when docker is not available. The MinIO root
+# password, the sink user's secret and the admin token are random per run and stay in the
+# temp dir. Nothing leaves the machine except the image pull.
 #
 # Environment:
 #   MINIO_IMAGE          MinIO image with `minio` and `mc` (default: the pinned digest below)
@@ -284,6 +287,35 @@ for name in sorted(os.listdir(objdir)):
 assert not signed, f"signed but not shipped: {sorted(signed)}"
 EOF
 ok "object bytes = canonical shipped envelope of the signed checkpoint"
+
+say "2b. each upload carried a SHA-256 checksum, and MinIO checks it"
+# The sink sends x-amz-sdk-checksum-algorithm: SHA256 with x-amz-checksum-sha256 (what AWS
+# documents as required for an upload into an Object Lock bucket with a retention period).
+# MinIO stores the checksum it verified; a HEAD with x-amz-checksum-mode: ENABLED returns it.
+s3curl() {  # user secret-file curl-args... (SigV4 by curl itself, not by attenuo)
+  local user="$1" secret="$2"; shift 2
+  curl -s --aws-sigv4 "aws:amz:us-east-1:s3" --user "$user:$(cat "$secret")" "$@"
+}
+for f in "$WORK"/objects/*; do
+  key="$(basename "$f")"
+  want="$(python3 -c 'import base64,hashlib,sys; print(base64.b64encode(hashlib.sha256(open(sys.argv[1],"rb").read()).digest()).decode())' "$f")"
+  got="$(s3curl minio-root "$WORK/root.pw" -I -H 'x-amz-checksum-mode: ENABLED' \
+    "$S3/$BUCKET/$PREFIX$key" | tr -d '\r' | sed -n 's/^[Xx]-[Aa]mz-[Cc]hecksum-[Ss]ha256: //p')"
+  [ "$got" = "$want" ] || fail "$key: stored x-amz-checksum-sha256 '$got', want '$want'"
+done
+ok "every object has the x-amz-checksum-sha256 of its bytes stored (HEAD, checksum mode)"
+# A wrong checksum is refused. Sent by curl with the sink user's keys, not by attenuo: the
+# server has no switch to send a wrong one, and gets none.
+echo '{"probe":true}' > "$WORK/probe.json"
+BAD="$(python3 -c 'import base64,hashlib; print(base64.b64encode(hashlib.sha256(b"something else").digest()).decode())')"
+code="$(s3curl "$SINK_USER" "$WORK/sink.secret" -o "$WORK/probe.out" -w '%{http_code}' -X PUT \
+  -H "x-amz-sdk-checksum-algorithm: SHA256" -H "x-amz-checksum-sha256: $BAD" \
+  --data-binary @"$WORK/probe.json" "$S3/$BUCKET/probe/wrong-checksum.json")"
+[ "$code" = 400 ] || fail "a wrong x-amz-checksum-sha256 was answered $code: $(cat "$WORK/probe.out")"
+grep -q -i 'checksum\|digest' "$WORK/probe.out" || fail "400 for another reason: $(cat "$WORK/probe.out")"
+reason="$(sed -n 's:.*<Code>\(.*\)</Code>.*:\1:p' "$WORK/probe.out")"
+mc stat "root/$BUCKET/probe/wrong-checksum.json" >/dev/null 2>&1 && fail "the refused object exists"
+ok "a PUT with a wrong x-amz-checksum-sha256 is refused: 400 $reason, nothing stored"
 
 say "3. audit verify against the objects"
 curl -sf "$ATTENUO_SERVER/.well-known/jwks.json" > "$WORK/jwks.json"

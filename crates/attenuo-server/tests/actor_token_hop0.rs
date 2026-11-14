@@ -139,6 +139,7 @@ impl Harness {
             jwks_ttl_seconds: 300,
             clock_skew_seconds: 0,
             tenant: None,
+            ca_pem_path: None,
             client_ids: BTreeMap::new(),
         }];
         cfg.agents = vec![AgentConfig::with_secret_sha256(
@@ -150,6 +151,7 @@ impl Harness {
             jwks_url: None,
             spiffe_trust_domain: Some(TRUST_DOMAIN.into()),
             spiffe_bundle_url: Some(keys.url("/bundle")),
+            ca_pem_path: None,
             audience: ISSUER.into(),
             subject_to_agent: SubjectToAgent::Map(BTreeMap::from([
                 (PLANNER_ID.to_string(), "planner".to_string()),

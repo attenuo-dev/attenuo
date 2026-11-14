@@ -226,7 +226,9 @@ pub struct ActorTrustRegistry {
 impl ActorTrustRegistry {
     /// Validate the entries and build their key caches.
     pub fn from_config(entries: &[ActorTrustConfig]) -> anyhow::Result<Self> {
-        let client = crate::idp::jwks::fetch_client(FETCH_TIMEOUT)?;
+        // One client for every entry without `ca_pem_path`; an entry with one gets its own
+        // (`build_entry`), so its extra roots are trusted for its fetches and no other.
+        let client = crate::idp::jwks::fetch_client(FETCH_TIMEOUT, &[])?;
         let mut out: Vec<Entry> = Vec::with_capacity(entries.len());
         for cfg in entries {
             let entry = build_entry(cfg, &client)?;
@@ -383,8 +385,10 @@ fn build_entry(cfg: &ActorTrustConfig, client: &reqwest::Client) -> anyhow::Resu
     if cfg.jwks_ttl_seconds == 0 {
         return Err(fail("jwks_ttl_seconds must be positive"));
     }
+    let client = crate::idp::jwks::entry_client(client, cfg.ca_pem_path.as_deref(), FETCH_TIMEOUT)
+        .map_err(|e| fail(&e))?;
     let jwks = JwksCache::new(
-        client.clone(),
+        client,
         label.clone(),
         Some(url),
         Duration::from_secs(cfg.jwks_ttl_seconds),
@@ -536,6 +540,7 @@ mod tests {
             jwks_url: None,
             spiffe_trust_domain: Some("example.org".into()),
             spiffe_bundle_url: Some("https://spire.example.org/bundle".into()),
+            ca_pem_path: None,
             audience: "attenuo".into(),
             subject_to_agent: SubjectToAgent::SpiffePath,
             allowed_algs: vec!["ES256".into(), "RS256".into()],
