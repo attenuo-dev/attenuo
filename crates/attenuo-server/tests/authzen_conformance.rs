@@ -33,9 +33,13 @@
 //! - `grant_previous_approval`: before this step, grant (as an operator) the approval named by
 //!   the previous answer's `context.approval_id`; the string `"$approval_token"` anywhere in
 //!   this step's body is then replaced by the grant's approval token.
+//! - `"$next_token"` anywhere in a step's body is replaced by the latest non-empty
+//!   `page.next_token` an earlier step was answered with (an action search token is bound to
+//!   the fixture's chain, whose lease id is random).
 //! - The answer is normalised before it is compared, so only values that are random or depend
-//!   on the clock are tolerated: `decision_id`, `approval_id`, `call_hash`, `expires_at` and
-//!   `approval.id` become `"<decision_id>"`, `"<approval_id>"`, ... and the server's base URL
+//!   on the clock are tolerated: `decision_id`, `approval_id`, `call_hash`, `expires_at`,
+//!   `approval.id` and a non-empty `next_token` become `"<decision_id>"`, `"<approval_id>"`,
+//!   ... (an empty `next_token`, the last page, is compared as is) and the server's base URL
 //!   inside a string becomes `<base>`. Everything else, `decision` and `context.reason` above
 //!   all, is compared exactly, and a member the fixture does not list is a failure. The
 //!   expected value `"<any>"` accepts any value that is present (used for free-text error
@@ -200,6 +204,9 @@ fn normalise(v: &mut Value, base: &str) {
                     "decision_id" | "approval_id" | "call_hash" | "expires_at" => {
                         Some(format!("<{k}>"))
                     }
+                    "next_token" if val.as_str().is_some_and(|t| !t.is_empty()) => {
+                        Some(format!("<{k}>"))
+                    }
                     _ => None,
                 };
                 match placeholder {
@@ -357,6 +364,12 @@ async fn run_fixture(h: &Harness, name: &str, fx: &Value) -> Result<(), String> 
                     (w, g) => return Err(format!("{at}: header {k}: expected {w}, got {g:?}")),
                 }
             }
+        }
+        if let Some(t) = body["page"]["next_token"]
+            .as_str()
+            .filter(|t| !t.is_empty())
+        {
+            vars.insert("next_token".into(), json!(t));
         }
         previous = Some(body.clone());
         normalise(&mut body, &h.base());
@@ -710,4 +723,54 @@ async fn action_search_pages_only_over_the_tools_the_capabilities_name_sr116() {
         a,
         json!({"page": {"next_token": "", "count": 0}, "results": []})
     );
+}
+
+/// AuthZEN 1.0 section 8.2: an action search `page.token` belongs to the query it was issued
+/// for, the chain above all. Another run's token, even for the same server, context and
+/// position, is refused rather than continued under this run; an old-format token (an offset
+/// only, as tokens were before they were bound) is refused too.
+#[tokio::test]
+async fn action_search_token_of_another_run_is_refused() {
+    let h = Harness::start().await;
+    let alice = h.mint(&json!({})).await;
+    let other = h.mint(&json!({})).await;
+    let mut body = json!({
+        "subject": {"type": "agent", "id": ""},
+        "resource": {"type": "mcp_server", "id": "github"},
+        "context": {"input": {"repo": "alice/public-site"}},
+        "page": {"limit": 1},
+    });
+    let first = h.post_as(&alice, "/access/v1/search/action", &body).await;
+    let token = first["page"]["next_token"].as_str().unwrap().to_string();
+    assert!(!token.is_empty(), "{first}");
+    // The other run's own first page gives another token for the same position.
+    let theirs = h.post_as(&other, "/access/v1/search/action", &body).await;
+    assert_ne!(theirs["page"]["next_token"], first["page"]["next_token"]);
+    let search = |bearer: &str, body: &Value| {
+        h.client
+            .post(h.server.url("/access/v1/search/action"))
+            .bearer_auth(bearer.to_string())
+            .json(body)
+            .send()
+    };
+    body["page"]["token"] = json!(token);
+    for (bearer, t, what) in [
+        (&other, token.as_str(), "another subject (delegation chain)"),
+        (&alice, "AQQBAAAAAAAAAAE", "not a cursor this server issued"),
+    ] {
+        body["page"]["token"] = json!(t);
+        let resp = search(bearer, &body).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let e: Value = resp.json().await.unwrap();
+        assert_eq!(e["code"], "invalid_cursor", "{e}");
+        let detail = e["detail"].as_str().unwrap();
+        assert!(detail.contains(what), "{detail}");
+        assert!(!detail.contains(&token), "{detail}");
+    }
+    // Under its own run, the token continues: the second candidate, delete_repo, is
+    // approval-gated, so the page is empty and more remain.
+    body["page"]["token"] = json!(token);
+    let second = h.post_as(&alice, "/access/v1/search/action", &body).await;
+    assert_eq!(second["page"]["count"], 0, "{second}");
+    assert_ne!(second["page"]["next_token"], "", "{second}");
 }

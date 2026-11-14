@@ -543,7 +543,7 @@ List the tools of one MCP upstream that the token's chain may call with these ar
 | `--upstream` | `github` | MCP upstream name. |
 | `--arg` | | Argument every candidate is decided with, as `context.input`. Repeatable. |
 | `--limit N` | the server's `[authzen] max_batch` | How many catalogued tools one page evaluates (at least 1; a larger value is clamped by the server). A page can list fewer tools, even none, while more pages remain. |
-| `--page-token TOKEN` | | Ask for the page after the one that printed this token. |
+| `--page-token TOKEN` | | Ask for the page after the one that printed this token, with the same delegation token, server and arguments (`--limit` may change); otherwise 400 `invalid_cursor`. |
 | `--all` | | Follow the pages to the last one and print every result. Not with `--page-token`. |
 
 It prints one `<upstream>/<tool>` per line, then `next page: --page-token <token>` while more pages remain; `--json` prints `{"page": {"next_token", "count"}, "results"}` in the server's shape, with every page's results under `--all`. The exit status is 0 whether or not a tool is listed; a refused request (a bad token, `--upstream` naming one tool, a token the server did not issue) is 1.
