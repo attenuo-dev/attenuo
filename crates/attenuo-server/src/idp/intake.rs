@@ -248,6 +248,7 @@ pub(crate) async fn handle(
     // `authorization_details` narrow the root grant further (draft -06 §4.4.1). Without the
     // table nothing here runs, and the answer and the audit record are as before.
     let mut ceiling_claims = None;
+    let mut ceiling_log: Option<(String, String)> = None;
     let capabilities = match (kind, state.idps.id_jag_ceiling(&verified.issuer)) {
         (CredentialKind::IdJag, Some(ceiling)) => {
             let applied = ceiling.apply(&granted, &verified.claims);
@@ -307,6 +308,10 @@ pub(crate) async fn handle(
                     invalid_scope("scope_exceeds_id_jag", detail)
                 })?;
             tracing::debug!(claims = ?applied.claims, "ID-JAG ceiling applied");
+            ceiling_log = Some((
+                applied.claims.join(","),
+                ceiling_claim_values(&applied.claims, &verified.claims),
+            ));
             ceiling_claims = Some(applied.claims);
             narrowed
         }
@@ -424,11 +429,41 @@ pub(crate) async fn handle(
         agent = ?agent,
         agent_auth,
         lease = %issued.lease.0,
+        // Only when `[idps.id_jag_ceiling]` was applied: which claims narrowed the root grant
+        // and what they said, as the IdP signed them, capped and Debug-formatted (SR-126).
+        id_jag_ceiling = ceiling_log.as_ref().map(|(names, _)| tracing::field::display(names)),
+        id_jag_claims = ceiling_log.as_ref().map(|(_, values)| tracing::field::debug(values)),
         "root token issued from IdP credential"
     );
     let mut out = Json(ExchangeResponse::from_issued(&issued, now)).into_response();
     no_store(out.headers_mut());
     Ok(out)
+}
+
+/// The most bytes of one claim's value the intake's info line shows (SR-126).
+const MAX_LOGGED_CLAIM_BYTES: usize = 512;
+
+/// The values of the ID-JAG claims named in `names`, for the info line of an intake under
+/// `[idps.id_jag_ceiling]`: `name=<compact JSON>` for each, space-separated, each value cut to
+/// [`MAX_LOGGED_CLAIM_BYTES`] (at a character boundary) with its full length noted. The claims
+/// are the IdP's signed values, not secrets, but the agent may have asked for them, so the line
+/// Debug-formats the result (SR-18): a newline or a control character cannot forge a line.
+fn ceiling_claim_values(names: &[&str], claims: &serde_json::Map<String, Value>) -> String {
+    names
+        .iter()
+        .map(|name| {
+            let text = claims.get(*name).map(Value::to_string).unwrap_or_default();
+            if text.len() <= MAX_LOGGED_CLAIM_BYTES {
+                return format!("{name}={text}");
+            }
+            let mut end = MAX_LOGGED_CLAIM_BYTES;
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("{name}={}...({} bytes)", &text[..end], text.len())
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Which credential the request carries, by grant type and token type.
@@ -849,5 +884,38 @@ mod tests {
         assert!(!is_intake(&json!({
             "subject_token_type": "urn:ietf:params:oauth:token-type:jwt"
         })));
+    }
+
+    /// SR-126: the info line of an intake under the ceiling carries each claim's value, cut to
+    /// a bound, and Debug-formatting it keeps a newline the IdP signed on one line.
+    #[test]
+    fn ceiling_claim_values_are_capped_sr126() {
+        let claims = json!({
+            "resource": "https://mcp.example/github",
+            "scope": "repo.read\nfake log line",
+            "authorization_details": [{"type": "attenuo_capabilities",
+                "capabilities": [{"server": "github", "tool": "x".repeat(2000)}]}],
+            "sub": "not named",
+        });
+        let claims = claims.as_object().unwrap();
+        let out = ceiling_claim_values(&["resource", "scope", "authorization_details"], claims);
+        assert!(
+            out.starts_with("resource=\"https://mcp.example/github\" scope="),
+            "{out}"
+        );
+        assert!(!out.contains("not named"));
+        let details = out.split(" authorization_details=").nth(1).unwrap();
+        assert!(
+            details.len() < MAX_LOGGED_CLAIM_BYTES + 32,
+            "{}",
+            details.len()
+        );
+        assert!(details.ends_with(" bytes)"), "{details}");
+        assert!(!format!("{out:?}").contains('\n'));
+        // A cut inside a multi-byte character backs up to its start.
+        let wide = json!({"scope": "é".repeat(600)});
+        let out = ceiling_claim_values(&["scope"], wide.as_object().unwrap());
+        assert!(out.ends_with(" bytes)"), "{out}");
+        assert_eq!(ceiling_claim_values(&[], claims), "");
     }
 }
