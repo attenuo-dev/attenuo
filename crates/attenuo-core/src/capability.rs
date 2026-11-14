@@ -16,6 +16,9 @@ use crate::jcs::value_eq;
 use crate::limits::{LimitError, LimitKind, Limits};
 use crate::names::NameError;
 
+mod prepared;
+use prepared::{PreparedCap, PreparedSet};
+
 /// A constraint on a single tool argument.
 ///
 /// Constraints are compared by *implication*: `a.implies(&b)` is true when every value that
@@ -352,17 +355,22 @@ pub fn as_long(value: &Value) -> Option<i64> {
 /// large, so `equals 10^16` would let through a value the range refuses (SR-71). Such an
 /// integer has an equal float exactly when the float nearest to it is written with its digits.
 fn range_admits_all_equal(range: &ArgConstraint, v: &Value) -> bool {
+    range.satisfied_by(v) && exact_long(v).is_some()
+}
+
+/// [`as_long`] of `v` when every value canonically equal to `v` reads as the same integer, so
+/// a range judges them all as it judges `v` ([`range_admits_all_equal`]); `None` otherwise.
+fn exact_long(v: &Value) -> Option<i64> {
     #[allow(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
         reason = "WHOLE_FLOAT_MAX is a positive whole number far below 2^64"
     )]
     const WHOLE_FLOAT_MAX_U64: u64 = WHOLE_FLOAT_MAX as u64;
-    range.satisfied_by(v)
-        && as_long(v).is_some_and(|n| {
-            n.unsigned_abs() <= WHOLE_FLOAT_MAX_U64
-                || crate::jcs::format_f64(n as f64).as_deref() != Some(n.to_string().as_str())
-        })
+    as_long(v).filter(|&n| {
+        n.unsigned_abs() <= WHOLE_FLOAT_MAX_U64
+            || crate::jcs::format_f64(n as f64).as_deref() != Some(n.to_string().as_str())
+    })
 }
 
 impl ArgConstraint {
@@ -396,8 +404,57 @@ impl ArgConstraint {
 
     /// Canonical (RFC 8785) JSON form; equality and ordering are defined on it, so
     /// constraints can live in `BTreeSet`/`BTreeMap`.
+    ///
+    /// Written straight from the constraint, which is the bytes [`crate::jcs::to_vec`] gives
+    /// for it (a test checks that on generated constraints) without building a tree of the
+    /// value first: a set of capabilities is ordered by this, once per comparison (SR-123).
     fn canonical(&self) -> Vec<u8> {
-        crate::jcs::to_vec(self).expect("a constraint has a canonical JSON form")
+        use crate::jcs::{write_str, write_value};
+        let mut out = Vec::with_capacity(32);
+        let op = match self {
+            ArgConstraint::Equals(_) => "equals",
+            ArgConstraint::OneOf(_) => "one_of",
+            ArgConstraint::Prefix(_) => "prefix",
+            ArgConstraint::PathPrefix(_) => "path_prefix",
+            ArgConstraint::Range { .. } => "range",
+        };
+        out.extend_from_slice(b"{\"op\":");
+        write_str(&mut out, op);
+        out.extend_from_slice(b",\"value\":");
+        match self {
+            ArgConstraint::Equals(v) => write_value(&mut out, v),
+            ArgConstraint::OneOf(vs) => {
+                out.push(b'[');
+                for (i, v) in vs.iter().enumerate() {
+                    if i > 0 {
+                        out.push(b',');
+                    }
+                    write_value(&mut out, v);
+                }
+                out.push(b']');
+            }
+            ArgConstraint::Prefix(p) | ArgConstraint::PathPrefix(p) => write_str(&mut out, p),
+            // Members sorted by name: `max` before `min`.
+            ArgConstraint::Range { min, max } => {
+                let members = [("max", max), ("min", min)];
+                out.push(b'{');
+                let mut first = true;
+                for (name, bound) in members {
+                    if let Some(n) = bound {
+                        if !first {
+                            out.push(b',');
+                        }
+                        first = false;
+                        write_str(&mut out, name);
+                        out.push(b':');
+                        out.extend_from_slice(n.to_string().as_bytes());
+                    }
+                }
+                out.push(b'}');
+            }
+        }
+        out.push(b'}');
+        out
     }
 
     /// A range's inclusive bounds over `i64`, a missing bound as the end of the type. `None`
@@ -472,7 +529,19 @@ impl ArgConstraint {
     }
 
     /// Does every value satisfying `self` also satisfy `other`?
+    ///
+    /// Linear in the sizes of the two constraints: a `one_of` is compared through the set of
+    /// its values' canonical keys, not value by value with the other's list (SR-123).
     pub fn implies(&self, other: &ArgConstraint) -> bool {
+        prepared::Prepared::new(self).implies(&prepared::Prepared::new(other))
+    }
+
+    /// [`implies`](Self::implies) by its definition, arm by arm, comparing values pairwise.
+    /// The arms between a `one_of` and a list or a summary of a list cost the product of the
+    /// two lengths, and [`prepared::Prepared::implies`] answers those itself; it calls this
+    /// for the others, which compare at most one value with one constraint. The tests check
+    /// every answer of [`implies`](Self::implies) against this one.
+    fn implies_direct(&self, other: &ArgConstraint) -> bool {
         // A constraint no value satisfies (an empty `OneOf`, an unchecked inverted range)
         // vacuously implies every constraint. That is sound: a capability carrying it permits
         // nothing, and it can still be re-delegated unchanged.
@@ -678,6 +747,13 @@ impl Capability {
 
     /// The call half of [`covers`](Self::covers): patterns and constraints, ignoring limits.
     pub fn covers_calls(&self, child: &Capability) -> bool {
+        PreparedCap::new(self).covers_calls(&PreparedCap::new(child))
+    }
+
+    /// [`covers_calls`](Self::covers_calls) with [`ArgConstraint::implies_direct`]: the
+    /// definition the tests compare the prepared check with.
+    #[cfg(test)]
+    fn covers_calls_direct(&self, child: &Capability) -> bool {
         if !pattern_covers(&self.server, &child.server) || !pattern_covers(&self.tool, &child.tool)
         {
             return false;
@@ -687,7 +763,7 @@ impl Capability {
             child
                 .constraints
                 .get(arg)
-                .map(|child_c| child_c.implies(parent_c))
+                .map(|child_c| child_c.implies_direct(parent_c))
                 .unwrap_or(false)
         })
     }
@@ -820,14 +896,82 @@ impl Capability {
 }
 
 /// A set of capabilities. A call is permitted if any member permits it.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct CapabilitySet(pub BTreeSet<Capability>);
 
+/// Collected as a `BTreeSet` collects: of capabilities that are equal, the last is kept.
 impl FromIterator<Capability> for CapabilitySet {
     fn from_iter<I: IntoIterator<Item = Capability>>(iter: I) -> Self {
-        Self(iter.into_iter().collect())
+        Self(sorted_set(iter.into_iter().collect(), Keep::Last))
     }
+}
+
+/// Read as a `BTreeSet` is read, one member after the other: of capabilities that are equal,
+/// the first is kept.
+impl<'de> Deserialize<'de> for CapabilitySet {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(Self(sorted_set(Vec::deserialize(d)?, Keep::First)))
+    }
+}
+
+/// Which of several equal capabilities [`sorted_set`] keeps. Equal capabilities can differ in
+/// how a value is written (`1` and `1.0`), which the set's serialization shows.
+#[derive(Clone, Copy)]
+enum Keep {
+    First,
+    Last,
+}
+
+/// The set of `caps`, built in time linear in their size plus a sort of precomputed keys.
+///
+/// `BTreeSet` orders capabilities by [`Capability`]'s `Ord`, which compares constraints by
+/// their canonical bytes, written afresh on every comparison, so inserting `n` large
+/// capabilities one at a time wrote each of them about `2 log n` times, before any bound of
+/// [`CapabilitySet::validate_size`] could be checked: a 2 MiB request took 0.8 s to read
+/// (SR-123). Here each capability's sort key is written once and the keys are sorted. The key
+/// orders exactly as `Ord` does (the server, the tool, then each constraint's argument name and
+/// canonical bytes in argument order, as a `BTreeMap` compares, then the limits), so the set
+/// built from the sorted capabilities, whose own sort then only confirms the order, is the
+/// one `BTreeSet` would build.
+fn sorted_set(caps: Vec<Capability>, keep: Keep) -> BTreeSet<Capability> {
+    type SortKey<'a> = (&'a str, &'a str, Vec<(&'a str, Vec<u8>)>, &'a Limits);
+    if caps.len() < 2 {
+        return caps.into_iter().collect();
+    }
+    let order: Vec<usize> = {
+        let keys: Vec<SortKey<'_>> = caps
+            .iter()
+            .map(|c| {
+                let constraints = c
+                    .constraints
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.canonical()))
+                    .collect();
+                (c.server.as_str(), c.tool.as_str(), constraints, &c.limits)
+            })
+            .collect();
+        let mut order: Vec<usize> = (0..caps.len()).collect();
+        // Stable, so equal capabilities stay in the order given.
+        order.sort_by(|&a, &b| keys[a].cmp(&keys[b]));
+        let mut kept: Vec<usize> = Vec::with_capacity(order.len());
+        for i in order {
+            match kept.last_mut() {
+                Some(last) if keys[*last] == keys[i] => {
+                    if matches!(keep, Keep::Last) {
+                        *last = i;
+                    }
+                }
+                _ => kept.push(i),
+            }
+        }
+        kept
+    };
+    let mut slots: Vec<Option<Capability>> = caps.into_iter().map(Some).collect();
+    order
+        .into_iter()
+        .map(|i| slots[i].take().expect("each index is kept once"))
+        .collect()
 }
 
 impl CapabilitySet {
@@ -907,7 +1051,37 @@ impl CapabilitySet {
     /// A child that is only covered by the union of several parents is rejected. That is
     /// sound (never widens) and keeps the check linear and explainable.
     pub fn covers(&self, child: &CapabilitySet) -> bool {
-        child.0.iter().all(|c| self.0.iter().any(|p| p.covers(c)))
+        let parents = PreparedSet::new(&self.0);
+        child.0.iter().all(|c| {
+            let c = PreparedCap::new(c);
+            parents.0.iter().any(|p| p.covers(&c))
+        })
+    }
+
+    /// The members of `child` that a single member of `self` covers, in canonical order: what
+    /// [`covers`](Self::covers) checks, member by member, with `self` prepared once instead of
+    /// once per member ([`Capability::covers`] in a loop would hash `self`'s lists again for
+    /// each, SR-123).
+    pub fn covered<'c>(&self, child: &'c CapabilitySet) -> Vec<&'c Capability> {
+        let parents = PreparedSet::new(&self.0);
+        child
+            .0
+            .iter()
+            .filter(|c| {
+                let c = PreparedCap::new(c);
+                parents.0.iter().any(|p| p.covers(&c))
+            })
+            .collect()
+    }
+
+    /// [`covers`](Self::covers) by its definition, pair by pair: the tests' reference.
+    #[cfg(test)]
+    fn covers_direct(&self, child: &CapabilitySet) -> bool {
+        child.0.iter().all(|c| {
+            self.0
+                .iter()
+                .any(|p| p.covers_calls_direct(c) && c.limits.narrows(&p.limits))
+        })
     }
 
     /// Derive `requested` from `self`, failing if that would widen anything.
@@ -962,6 +1136,24 @@ impl CapabilitySet {
             .into_iter()
             .map(|(_, _, child)| child)
             .collect())
+    }
+
+    /// [`attenuate`](Self::attenuate) of each of `requested` alone, in the order given:
+    /// `self.attenuate(&{c})` for each `c`, with `self` prepared once (SR-123). For saying which
+    /// requested capability a refusal is about.
+    pub fn attenuate_each<'r>(
+        &self,
+        requested: impl IntoIterator<Item = &'r Capability>,
+    ) -> Vec<Result<Capability, AttenuationError>> {
+        let parents = PreparedSet::new(&self.0);
+        requested
+            .into_iter()
+            .map(|c| {
+                CapabilitySet::from_iter([c.clone()]).validate_size()?;
+                self.attenuate_one(&parents, c, &|_, _, _| None)
+                    .map(|(_, child)| child)
+            })
+            .collect()
     }
 
     /// [`attenuate`](Self::attenuate) at hop 0, where `self` is not a hop but a root grant (or
@@ -1021,6 +1213,80 @@ impl CapabilitySet {
         }
         // Before anything is compared: the loop below costs the product of both sizes (SR-123).
         requested.validate_size()?;
+        let parents = PreparedSet::new(&self.0);
+        let mut out = Vec::with_capacity(requested.len());
+        for c in requested.0.iter() {
+            let (index, child) = self.attenuate_one(&parents, c, &remaining)?;
+            out.push((index, c, child));
+        }
+        Ok(out)
+    }
+
+    /// The step of [`attenuate_indexed`](Self::attenuate_indexed) for one requested capability
+    /// `c`, `parents` being `self` prepared: the index of the parent it is clamped to, and the
+    /// clamped capability.
+    fn attenuate_one(
+        &self,
+        parents: &PreparedSet<'_>,
+        c: &Capability,
+        remaining: &impl Fn(usize, LimitKind, u64) -> Option<u64>,
+    ) -> Result<(usize, Capability), AttenuationError> {
+        let not_covered = || AttenuationError::NotCovered {
+            requested: c.display(),
+        };
+        // The first parent that covers `c`, else the first that covers its calls: one
+        // pass, each pair compared once (SR-123).
+        let prepared = PreparedCap::new(c);
+        let mut calls_only = None;
+        let mut covering = None;
+        for (i, p) in parents.0.iter().enumerate() {
+            if p.covers_calls(&prepared) {
+                if c.limits.narrows(&p.cap.limits) {
+                    covering = Some(i);
+                    break;
+                }
+                calls_only = calls_only.or(Some(i));
+            }
+        }
+        let index = covering.or(calls_only).ok_or_else(not_covered)?;
+        let parent = parents.0[index].cap;
+        let mut child = c.clone();
+        child.limits = c.limits.clamp_to(&parent.limits);
+        if let (Some(calls), Some(max)) = (child.limits.calls, parent.limits.calls) {
+            if let Some(left) = remaining(index, LimitKind::Calls, max) {
+                child.limits.calls = Some(calls.min(left));
+            }
+        }
+        if let (Some(sum), Some(p)) = (child.limits.sum.as_mut(), parent.limits.sum.as_ref()) {
+            if sum.arg == p.arg {
+                if let Some(left) = remaining(index, LimitKind::Sum, p.max) {
+                    sum.max = sum.max.min(left);
+                }
+            }
+        }
+        // `parent.covers(&child)`: `child` has `c`'s patterns and constraints, whose
+        // calls `parent` covers, so only the clamped limits are left to check.
+        if !child.limits.narrows(&parent.limits) {
+            return Err(not_covered());
+        }
+        Ok((index, child))
+    }
+
+    /// The attenuation step as it was written before SR-123's fix, pair by pair with the
+    /// pairwise implication: the tests' reference for [`attenuate_indexed`](Self::attenuate_indexed).
+    #[cfg(test)]
+    fn attenuate_indexed_direct<'r>(
+        &self,
+        requested: &'r CapabilitySet,
+        remaining: impl Fn(usize, LimitKind, u64) -> Option<u64>,
+    ) -> Result<Vec<(usize, &'r Capability, Capability)>, AttenuationError> {
+        if requested.is_empty() {
+            return Err(AttenuationError::Empty);
+        }
+        requested.validate_size()?;
+        let covers = |p: &Capability, c: &Capability| {
+            p.covers_calls_direct(c) && c.limits.narrows(&p.limits)
+        };
         let mut out = Vec::with_capacity(requested.len());
         for c in requested.0.iter() {
             let not_covered = || AttenuationError::NotCovered {
@@ -1030,8 +1296,13 @@ impl CapabilitySet {
                 .0
                 .iter()
                 .enumerate()
-                .find(|(_, p)| p.covers(c))
-                .or_else(|| self.0.iter().enumerate().find(|(_, p)| p.covers_calls(c)))
+                .find(|(_, p)| covers(p, c))
+                .or_else(|| {
+                    self.0
+                        .iter()
+                        .enumerate()
+                        .find(|(_, p)| p.covers_calls_direct(c))
+                })
                 .ok_or_else(not_covered)?;
             let mut child = c.clone();
             child.limits = c.limits.clamp_to(&parent.limits);
@@ -1047,7 +1318,7 @@ impl CapabilitySet {
                     }
                 }
             }
-            if !parent.covers(&child) {
+            if !covers(parent, &child) {
                 return Err(not_covered());
             }
             out.push((index, c, child));
