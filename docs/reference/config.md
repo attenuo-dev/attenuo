@@ -261,7 +261,7 @@ Every key fetch (`jwks_url`, or the discovery document at `issuer` and the `jwks
 
 ### `[idps.id_jag_ceiling]`
 
-Optional, per `[[idps]]` entry, off by default. With it, the root token minted from one of this issuer's ID-JAGs carries no more than both the [`[[root_grants]]`](#rootgrants) entry and the ID-JAG's own `resource`, `scope` and `authorization_details` claims allow (draft-ietf-oauth-identity-assertion-authz-grant-06 §4.4.1). Without it those claims are ignored and nothing changes. ID tokens are never affected. An empty table (`[idps.id_jag_ceiling]` with no keys) turns the ceiling on with only `authorization_details` able to name anything.
+Optional, per `[[idps]]` entry, off by default. With it, the root token minted from one of this issuer's ID-JAGs carries no more than both the [`[[root_grants]]`](#rootgrants) entry and the ID-JAG's own `resource`, `scope` and `authorization_details` claims allow (draft-ietf-oauth-identity-assertion-authz-grant-06 §4.4.1). Without it those claims are ignored and nothing changes. ID tokens are never affected: an ID token from the same issuer, presented by an agent its `aud` names ([`client_ids`](#idps)), still gets the root grant as it is, so with the ceiling on, the ceiling holds only for agents that cannot present this issuer's ID tokens (SR-122). An empty table (`[idps.id_jag_ceiling]` with no keys) turns the ceiling on with only `authorization_details` able to name anything.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
@@ -270,7 +270,7 @@ Optional, per `[[idps]]` entry, off by default. With it, the root token minted f
 
 How each claim names capabilities:
 
-- `authorization_details`: the `capabilities` of every entry of type `attenuo_capabilities` (attenuo's own type, the one `POST /token` requests use), read as the token's capability objects but strictly: a capability with an unknown member (a misspelt `constraint`, say) or an invalid name names nothing. An entry of any other type names nothing.
+- `authorization_details`: the `capabilities` of every entry of type `attenuo_capabilities` (attenuo's own type, the one `POST /token` requests use), read as the token's capability objects but strictly: a capability with an unknown member (a misspelt `constraint`, say), an invalid name or limits no token may carry names nothing. An entry of any other type names nothing. A claim whose entries hold more than 256 capabilities names nothing at all (SR-123).
 - `resource` (a string or an array of strings): the servers `resources` maps each value to. An unmapped value names nothing.
 - `scope` (a space-separated string): the capabilities `scopes` maps each token to. An unmapped token names nothing.
 
@@ -278,7 +278,9 @@ A claim of the wrong JSON type names nothing; a claim that is absent or `null` i
 
 A capability is kept when a single capability of the other side covers it (`⊑`, RFC-0001), after its limits are clamped to the grant's as at a delegation hop. This is not the full intersection: two capabilities that only overlap (`github:read_*` against `github:*_file`) give nothing, never a new capability built from both. See the [standards note](../research/standards.md#the-id-jags-claims-as-a-ceiling).
 
-The server refuses to start on an empty resource identifier, a resource mapped to no server or to a name that is not a valid server name (or is `attenuo`), a scope token that is empty or holds whitespace, a scope mapped to no capability, or a capability that does not parse.
+A limit in a claim, as in the root grant, bounds each root token capability it is copied into, not the run: a request for several capabilities under one limited capability (`send_money` once per recipient under `sum` 100) gets the limit on each, and each call is charged only against the capabilities it matches, so the run can spend the figure once per capability. Limits set at an exchange are not affected, since every call is also charged against the parent hop. Whether hop 0 should keep the limit for the run is open (SR-121, [task board](../tasks/board.md)).
+
+The server refuses to start on an empty resource identifier, a resource mapped to no server or to a name that is not a valid server name (or is `attenuo`), a scope token that is empty or holds whitespace, a scope mapped to no capability, or a capability that does not parse or whose limits no token may carry (for example an empty `arg`, a `derive` on a `sum`, a `max` above 2^63 - 1).
 
 ```toml
 [[idps]]
@@ -323,6 +325,8 @@ A constraint's `op` is `equals`, `one_of`, `prefix`, `path_prefix` or `range` ([
 | `may_act` | Optional list of agent ids: the RFC 8693 `may_act` of root tokens minted under this grant, so only these agents may exchange them. A request may narrow it with its own `may_act`, never widen it (`may_act_exceeds_grant`). |
 
 With no matching entry, no root token is issued.
+
+A capability table may also carry `limits`. A limit there is copied into every requested capability it covers, and bounds each of them, not the run: a request for `send_money` once per recipient under `{ server = "banking", tool = "send_money", limits = { sum = { arg = "amount", max = 100 } } }` gets `sum` 100 on each (SR-121, open on the [task board](../tasks/board.md)). For a run budget the agent cannot split, write a policy over run usage (`context.usage`), which counts the calls of a destructive tool per tool, not per capability ([run limits](../design/run-limits.md)).
 
 ## `[[peps]]`
 
