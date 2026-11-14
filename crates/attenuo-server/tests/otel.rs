@@ -60,6 +60,14 @@ const ALLOWED: &[&str] = &[
     "attenuo.result.label",
 ];
 
+/// The attributes that are numbers. They are exported as OTLP integers (`http.response.status_code`
+/// is an int in the semantic conventions), not as the strings `tracing` makes of a `u64` field.
+const INTEGERS: &[&str] = &[
+    "http.response.status_code",
+    "attenuo.chain_depth",
+    "attenuo.audit.seq",
+];
+
 /// An exporter that keeps what it is given.
 #[derive(Debug, Clone, Default)]
 struct Collect(Arc<Mutex<Vec<SpanData>>>);
@@ -391,6 +399,15 @@ fn assert_nothing_forbidden(spans: &[SpanData], secrets: &[&str]) {
                 s.name,
                 kv.key
             );
+            if INTEGERS.contains(&kv.key.as_str()) {
+                assert!(
+                    matches!(kv.value, opentelemetry::Value::I64(_)),
+                    "{}: {} is exported as {:?}, not an integer",
+                    s.name,
+                    kv.key,
+                    kv.value
+                );
+            }
             let v = kv.value.as_str();
             for secret in secrets {
                 assert!(!v.contains(secret), "{}: {} holds a secret", s.name, kv.key);

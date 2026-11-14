@@ -20,7 +20,7 @@ use attenuo_policy::{
     ApprovalContext, ArgLabels, BudgetContext, BudgetRefusal, CallLabels, PolicyEngine,
     SessionLabels, UsageContext,
 };
-use attenuo_proxy::{ApprovalTicket, CallContext, Stage};
+use attenuo_proxy::{otel_int, ApprovalTicket, CallContext, Stage};
 use attenuo_token::Verifier;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -724,7 +724,7 @@ impl Pipeline {
                 self.audit.append(record)
             };
             if let Ok(entry) = &appended {
-                tracing::Span::current().record("attenuo.audit.seq", entry.seq);
+                tracing::Span::current().record("attenuo.audit.seq", otel_int(entry.seq));
             }
             appended
         });
@@ -1401,7 +1401,7 @@ impl Pipeline {
         // The proxy's `attenuo.record_result` span, carried onto this thread.
         let span = tracing::Span::current();
         span.record("attenuo.result.label", label.as_str());
-        span.record("attenuo.audit.seq", entry.seq);
+        span.record("attenuo.audit.seq", otel_int(entry.seq));
         tracing::debug!(
             server = ?call.server,
             tool = ?call.tool,
@@ -1476,7 +1476,7 @@ impl Pipeline {
                 );
                 // The proxy's `attenuo.stream_end` span, carried onto this thread; a no-op
                 // in any span that does not declare the field.
-                tracing::Span::current().record("attenuo.audit.seq", entry.seq);
+                tracing::Span::current().record("attenuo.audit.seq", otel_int(entry.seq));
                 true
             }
             Err(e) => {
