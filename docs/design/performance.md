@@ -102,6 +102,8 @@ Measured 2026-11-14, release build, before and after the change ([`criterion-att
 
 The small checks above moved by 20 to 120 ns (`covered/1` 44 to 64 ns, `rejected_widening/8` 92 to 211 ns, `covered/32` 6.97 to 6.51 us), and the decide stages did not move beyond noise. The answers are the same: the pairwise code is kept as the oracle of property tests over adversarial JSON (Unicode forms, escapes, `1` against `1.0`, member order, nested arrays and objects), and a test counts the key lookups of an attenuation, which are linear in the lists.
 
+Where the work runs: an exchange attenuates inside `exchange_sync`, on tokio's blocking pool. Hop-0 intake from an IdP credential did its attenuations against the root grant and the ceiling, the ceiling's `meet` and the `limit_split_at_root` checks on the request's async task until the change after the pass; they now run in one `AppState::blocking` call, as the exchange's do, so a worst-case intake (tens of milliseconds over about three passes) no longer holds a runtime worker. That is one more hand-off to the pool per intake (about 70 to 85 us p50 on this VM, the blocking-pool stage measured below). `POST /admin/root-token` already ran its attenuation inside its blocking call. Reading the request (the JSON body into a `CapabilitySet`, 73 ms for the largest a 2 MiB body holds) stays on the async task at intake, as the body parse does at the exchange.
+
 ## End to end: proxy versus direct
 
 Harness: `crates/attenuo-bench` (binary `attenuo-bench`), driven by `scripts/bench-e2e.sh`. Raw results are committed in [`bench/`](bench/) as `<date>-<host>.json` (every number below, plus the metadata) and `.md` (the tables with the hardware).

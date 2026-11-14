@@ -31,7 +31,9 @@
 //! Steps, in order: check and verify the actor token, if any (`invalid_request` with
 //! `actor_token_*` sub-codes); authenticate the agent (`invalid_client`, 401, for client
 //! credentials, or for no credential at all); check `actor` and that capabilities were requested (`invalid_request`); verify
-//! the credential ([`IdpRegistry::verify`](super::IdpRegistry::verify), `invalid_grant`); for
+//! the credential ([`IdpRegistry::verify`](super::IdpRegistry::verify), `invalid_grant`, which
+//! first refuses a kind the issuer's `[[idps]] credentials` does not list with
+//! `credential_type_not_accepted`, SR-122); for
 //! an ID-JAG, require its `client_id` to be the authenticated agent and, when it has a
 //! `cnf.jkt`, a DPoP proof by that key (`credential_pop_required`, `credential_pop_mismatch`);
 //! build the originating user
@@ -39,7 +41,8 @@
 //! subject) and attenuate the request against it (`invalid_scope`); for an ID-JAG from an
 //! issuer with `[idps.id_jag_ceiling]`, narrow that entry by the ID-JAG's `resource`, `scope`
 //! and `authorization_details` ([`super::ceiling`]; `id_jag_ceiling_empty` when nothing is
-//! left) and attenuate the request against the result too (`scope_exceeds_id_jag`); cap the TTL at the
+//! left) and attenuate the request against the result too (`scope_exceeds_id_jag`), these
+//! attenuations on the blocking pool ([`narrow`]); cap the TTL at the
 //! credential's remaining lifetime (`credential_expired` if none is left) and at the actor
 //! token's `exp` (`actor_token_expired`); use the credential and the actor token once
 //! ([`crate::replay`], `replayed`); then `Issuer::issue_root`, register the lease, and audit
@@ -235,93 +238,23 @@ pub(crate) async fn handle(
         )
     })?;
     let granted = capability_set(&grant.capabilities).map_err(ApiError::internal)?;
-    // `attenuate_root`: a limit of the grant bounds one capability of the root token (SR-121).
-    let capabilities = granted.attenuate_root(&requested).map_err(|e| match e {
-        attenuo_core::AttenuationError::LimitSplit { first, second } => invalid_scope(
-            LIMIT_SPLIT_AT_ROOT,
-            limit_split_detail(&first, &second, "the [[root_grants]] entry"),
-        ),
-        attenuo_core::AttenuationError::TooLarge(e) => invalid_scope(size_code(&e), e.to_string()),
-        e => invalid_scope("scope_exceeds_grant", e.to_string()),
-    })?;
-    // `[idps.id_jag_ceiling]` (opt-in): the ID-JAG's `resource`, `scope` and
-    // `authorization_details` narrow the root grant further (draft -06 §4.4.1). Without the
-    // table nothing here runs, and the answer and the audit record are as before.
-    let mut ceiling_claims = None;
-    let mut ceiling_log: Option<(String, String)> = None;
-    let capabilities = match (kind, state.idps.id_jag_ceiling(&verified.issuer)) {
-        (CredentialKind::IdJag, Some(ceiling)) => {
-            let applied = ceiling.apply(&granted, &verified.claims);
-            if applied.capabilities.is_empty() {
-                return Err(invalid_scope(
-                    "id_jag_ceiling_empty",
-                    format!(
-                        "the ID-JAG's {} leave nothing of the [[root_grants]] entry for agent `{agent}` \
-                         ([idps.id_jag_ceiling] of `{}`)",
-                        applied.claims.join(", "),
-                        verified.issuer
-                    ),
-                ));
-            }
-            let narrowed = applied
-                .capabilities
-                .attenuate_root(&capabilities)
-                .map_err(|e| {
-                    // Name a refused capability as the request has it: `capabilities` carry
-                    // the root grant's limits, which the caller was not given (SR-124).
-                    // Each requested capability against the grant alone, the grant prepared
-                    // once (SR-123).
-                    let each = granted.attenuate_each(requested.iter());
-                    let as_requested = |shown: &str| {
-                        requested
-                            .iter()
-                            .zip(&each)
-                            .find(|(_, c)| c.as_ref().is_ok_and(|c| c.display() == shown))
-                            .map(|(r, _)| r)
-                    };
-                    if let attenuo_core::AttenuationError::LimitSplit { first, second } = &e {
-                        let detail = match (as_requested(first), as_requested(second)) {
-                            (Some(a), Some(b)) => limit_split_detail(
-                                &a.display(),
-                                &b.display(),
-                                "the ID-JAG's claims",
-                            ),
-                            _ => "two requested capabilities take their limits from the same \
-                              capability of the ID-JAG's claims: ask for one capability \
-                              covering both instead"
-                                .into(),
-                        };
-                        return invalid_scope(LIMIT_SPLIT_AT_ROOT, detail);
-                    }
-                    // Then each that passes the grant against the ceiling, prepared once.
-                    let under_ceiling = applied
-                        .capabilities
-                        .attenuate_each(each.iter().filter_map(|c| c.as_ref().ok()));
-                    let mut under_ceiling = under_ceiling.into_iter();
-                    let refused = requested.iter().zip(&each).find_map(|(r, c)| {
-                        let passes =
-                            c.is_ok() && under_ceiling.next().is_some_and(|under| under.is_ok());
-                        (!passes).then_some(r)
-                    });
-                    let detail = match refused {
-                        Some(r) => attenuo_core::AttenuationError::NotCovered {
-                            requested: r.display(),
-                        }
-                        .to_string(),
-                        None => "the request asks for more than the ID-JAG's claims allow".into(),
-                    };
-                    invalid_scope("scope_exceeds_id_jag", detail)
-                })?;
-            tracing::debug!(claims = ?applied.claims, "ID-JAG ceiling applied");
-            ceiling_log = Some((
-                applied.claims.join(","),
-                ceiling_claim_values(&applied.claims, &verified.claims),
-            ));
-            ceiling_claims = Some(applied.claims);
-            narrowed
-        }
-        _ => capabilities,
+    // The attenuations against the grant and the ceiling, the ceiling's meet and the split
+    // checks are CPU work on the request (tens of milliseconds at the bounds, SR-123): on the
+    // blocking pool, as the exchange runs its own. The credential goes there and comes back.
+    let (verified, narrowed) = {
+        let agent = agent.clone();
+        state
+            .blocking(move |s| {
+                let narrowed = narrow(s, kind, &agent, &verified, &granted, &requested);
+                (verified, narrowed)
+            })
+            .await
     };
+    let Narrowed {
+        capabilities,
+        ceiling_claims,
+        ceiling_log,
+    } = narrowed?;
     let may_act = grant
         .may_act_for(req.may_act.clone())
         .map_err(|e| invalid_request("may_act_exceeds_grant", e))?;
@@ -443,6 +376,119 @@ pub(crate) async fn handle(
     let mut out = Json(ExchangeResponse::from_issued(&issued, now)).into_response();
     no_store(out.headers_mut());
     Ok(out)
+}
+
+/// What [`narrow`] gives: the root token's capabilities and, under `[idps.id_jag_ceiling]`,
+/// the claims that narrowed (for the record) and their names and values (for the log line).
+struct Narrowed {
+    capabilities: CapabilitySet,
+    ceiling_claims: Option<Vec<&'static str>>,
+    ceiling_log: Option<(String, String)>,
+}
+
+/// Attenuate `requested` against the root grant `granted`, then, for an ID-JAG from an issuer
+/// with `[idps.id_jag_ceiling]`, against the ceiling its claims leave of the grant. CPU work on
+/// the request: run it on the blocking pool ([`AppState::blocking`]).
+fn narrow(
+    state: &AppState,
+    kind: CredentialKind,
+    agent: &str,
+    verified: &super::VerifiedAssertion,
+    granted: &CapabilitySet,
+    requested: &CapabilitySet,
+) -> Result<Narrowed, ApiError> {
+    // `attenuate_root`: a limit of the grant bounds one capability of the root token (SR-121).
+    let capabilities = granted.attenuate_root(requested).map_err(|e| match e {
+        attenuo_core::AttenuationError::LimitSplit { first, second } => invalid_scope(
+            LIMIT_SPLIT_AT_ROOT,
+            limit_split_detail(&first, &second, "the [[root_grants]] entry"),
+        ),
+        attenuo_core::AttenuationError::TooLarge(e) => invalid_scope(size_code(&e), e.to_string()),
+        e => invalid_scope("scope_exceeds_grant", e.to_string()),
+    })?;
+    // `[idps.id_jag_ceiling]` (opt-in): the ID-JAG's `resource`, `scope` and
+    // `authorization_details` narrow the root grant further (draft -06 §4.4.1). Without the
+    // table nothing here runs, and the answer and the audit record are as before.
+    match (kind, state.idps.id_jag_ceiling(&verified.issuer)) {
+        (CredentialKind::IdJag, Some(ceiling)) => {
+            let applied = ceiling.apply(granted, &verified.claims);
+            if applied.capabilities.is_empty() {
+                return Err(invalid_scope(
+                    "id_jag_ceiling_empty",
+                    format!(
+                        "the ID-JAG's {} leave nothing of the [[root_grants]] entry for agent `{agent}` \
+                         ([idps.id_jag_ceiling] of `{}`)",
+                        applied.claims.join(", "),
+                        verified.issuer
+                    ),
+                ));
+            }
+            let narrowed = applied
+                .capabilities
+                .attenuate_root(&capabilities)
+                .map_err(|e| {
+                    // Name a refused capability as the request has it: `capabilities` carry
+                    // the root grant's limits, which the caller was not given (SR-124).
+                    // Each requested capability against the grant alone, the grant prepared
+                    // once (SR-123).
+                    let each = granted.attenuate_each(requested.iter());
+                    let as_requested = |shown: &str| {
+                        requested
+                            .iter()
+                            .zip(&each)
+                            .find(|(_, c)| c.as_ref().is_ok_and(|c| c.display() == shown))
+                            .map(|(r, _)| r)
+                    };
+                    if let attenuo_core::AttenuationError::LimitSplit { first, second } = &e {
+                        let detail = match (as_requested(first), as_requested(second)) {
+                            (Some(a), Some(b)) => limit_split_detail(
+                                &a.display(),
+                                &b.display(),
+                                "the ID-JAG's claims",
+                            ),
+                            _ => "two requested capabilities take their limits from the same \
+                              capability of the ID-JAG's claims: ask for one capability \
+                              covering both instead"
+                                .into(),
+                        };
+                        return invalid_scope(LIMIT_SPLIT_AT_ROOT, detail);
+                    }
+                    // Then each that passes the grant against the ceiling, prepared once.
+                    let under_ceiling = applied
+                        .capabilities
+                        .attenuate_each(each.iter().filter_map(|c| c.as_ref().ok()));
+                    let mut under_ceiling = under_ceiling.into_iter();
+                    let refused = requested.iter().zip(&each).find_map(|(r, c)| {
+                        let passes =
+                            c.is_ok() && under_ceiling.next().is_some_and(|under| under.is_ok());
+                        (!passes).then_some(r)
+                    });
+                    let detail = match refused {
+                        Some(r) => attenuo_core::AttenuationError::NotCovered {
+                            requested: r.display(),
+                        }
+                        .to_string(),
+                        None => "the request asks for more than the ID-JAG's claims allow".into(),
+                    };
+                    invalid_scope("scope_exceeds_id_jag", detail)
+                })?;
+            tracing::debug!(claims = ?applied.claims, "ID-JAG ceiling applied");
+            let ceiling_log = Some((
+                applied.claims.join(","),
+                ceiling_claim_values(&applied.claims, &verified.claims),
+            ));
+            Ok(Narrowed {
+                capabilities: narrowed,
+                ceiling_claims: Some(applied.claims),
+                ceiling_log,
+            })
+        }
+        _ => Ok(Narrowed {
+            capabilities,
+            ceiling_claims: None,
+            ceiling_log: None,
+        }),
+    }
 }
 
 /// The most bytes of one claim's value the intake's info line shows (SR-126).

@@ -140,6 +140,7 @@ impl Harness {
             clock_skew_seconds: 0,
             tenant: None,
             id_jag_ceiling: None,
+            credentials: attenuo_server::config::DEFAULT_IDP_CREDENTIALS.to_vec(),
             ca_pem_path: None,
             client_ids: BTreeMap::new(),
         }];

@@ -42,8 +42,8 @@ pub(crate) const CEILING_CLAIMS: [&str; 3] = ["resource", "scope", "authorizatio
 
 /// The most capabilities an `authorization_details` claim may name, over all its
 /// `attenuo_capabilities` entries. A claim naming more names nothing, so the request is refused
-/// (`id_jag_ceiling_empty`): the request is attenuated against the ceiling, which costs the
-/// product of the two sizes, before any of it reaches the blocking pool (SR-123).
+/// (`id_jag_ceiling_empty`): the request is attenuated against the ceiling, which cost the
+/// product of the two sizes (SR-123).
 pub(crate) const MAX_CLAIM_CAPABILITIES: usize = 256;
 
 /// A checked `[idps.id_jag_ceiling]`.

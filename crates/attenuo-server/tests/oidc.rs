@@ -11,7 +11,9 @@ use attenuo_policy::{ArgType, ToolAttrs};
 use attenuo_proxy::jsonrpc::CODE_DENIED;
 use attenuo_proxy::testing::{spawn_router, FakeMcpServer, Spawned};
 use attenuo_proxy::UpstreamConfig;
-use attenuo_server::config::{AgentConfig, CapSpec, IdJagCeilingConfig, IdpConfig, RootGrant};
+use attenuo_server::config::{
+    AgentConfig, CapSpec, IdJagCeilingConfig, IdpConfig, IdpCredential, RootGrant,
+};
 use attenuo_server::{AppState, Config};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -230,6 +232,7 @@ impl Harness {
             clock_skew_seconds: 60,
             tenant: None,
             id_jag_ceiling: None,
+            credentials: attenuo_server::config::DEFAULT_IDP_CREDENTIALS.to_vec(),
             ca_pem_path: None,
             client_ids: ["planner", "coder"]
                 .map(|a| (a.to_string(), CLIENT_AUD.to_string()))
@@ -1983,4 +1986,151 @@ async fn an_intake_request_is_bounded_in_size_sr123() {
     )
     .await;
     assert_eq!(got.0, StatusCode::OK, "{}", got.1);
+}
+
+// ---------------------------------------------------------------------------------------------
+// `[[idps]] credentials` (SR-122): which credentials an entry accepts at hop 0.
+// ---------------------------------------------------------------------------------------------
+
+/// The ceiling harness with `credentials` set on the IdP.
+async fn credentials_harness(credentials: &[IdpCredential]) -> Harness {
+    let credentials = credentials.to_vec();
+    Harness::start_with(move |cfg| {
+        cfg.root_grants[0].capabilities = vec![
+            CapSpec::Short("github:*".into()),
+            CapSpec::Short("slack:*".into()),
+        ];
+        cfg.idps[0].id_jag_ceiling = Some(IdJagCeilingConfig {
+            resources: BTreeMap::from([
+                (GITHUB_RESOURCE.to_string(), vec!["github".to_string()]),
+                (SLACK_RESOURCE.to_string(), vec!["slack".to_string()]),
+            ]),
+            scopes: BTreeMap::new(),
+        });
+        cfg.idps[0].credentials = credentials;
+    })
+    .await
+}
+
+/// Present `jag` as planner through a token exchange (`subject_token_type` id-jag).
+async fn present_by_exchange(h: &Harness, jag: &str, scope: &str) -> (StatusCode, Value) {
+    h.post_form(
+        &[
+            ("grant_type", EXCHANGE),
+            ("subject_token", jag),
+            ("subject_token_type", ID_JAG),
+            ("client_id", "planner"),
+            ("client_secret", PLANNER_SECRET),
+            ("scope", scope),
+        ],
+        None,
+    )
+    .await
+}
+
+/// A refusal for a kind the entry does not list: `invalid_grant` /
+/// `credential_type_not_accepted`, with the sub-code as the whole `detail` (SR-17), so the
+/// body names neither the issuer nor the entry's list.
+fn assert_not_accepted(got: &(StatusCode, Value)) {
+    assert_error(
+        got,
+        StatusCode::BAD_REQUEST,
+        "invalid_grant",
+        "credential_type_not_accepted",
+    );
+    assert_eq!(got.1["detail"], "credential_type_not_accepted", "{}", got.1);
+    assert_eq!(got.1["code"], "credential_type_not_accepted", "{}", got.1);
+}
+
+/// Without the key both kinds are accepted, the ceiling binds the ID-JAG only, and the same
+/// user's ID token still gets past it: the answers SR-122 describes, unchanged by default.
+#[tokio::test]
+async fn by_default_an_entry_accepts_both_credentials_sr122() {
+    let h = credentials_harness(attenuo_server::config::DEFAULT_IDP_CREDENTIALS).await;
+    let jag = jag_with(&h, json!({"resource": GITHUB_RESOURCE}));
+    assert_error(
+        &present(&h, &jag, ("scope", "slack:post_message")).await,
+        StatusCode::BAD_REQUEST,
+        "invalid_scope",
+        "scope_exceeds_id_jag",
+    );
+    let got = h
+        .intake(&h.idp.id_token("alice"), "slack:post_message")
+        .await;
+    assert_eq!(got.0, StatusCode::OK, "{}", got.1);
+    let got = present(&h, &jag, ("scope", "github:read_file")).await;
+    assert_eq!(got.0, StatusCode::OK, "{}", got.1);
+}
+
+/// `credentials = ["id-jag"]` closes SR-122: the ID token that got past the ceiling is refused,
+/// before any key fetch and without being used up; ID-JAGs are accepted under the ceiling, by
+/// both grant types.
+#[tokio::test]
+async fn an_id_jag_only_entry_refuses_id_tokens_sr122() {
+    let h = credentials_harness(&[IdpCredential::IdJag]).await;
+    let id_token = h.idp.id_token("alice");
+    let (markers, hits) = (h.state.replay.len(), h.idp.hits());
+    for scope in ["slack:post_message", "github:read_file"] {
+        assert_not_accepted(&h.intake(&id_token, scope).await);
+    }
+    // Refused where an unknown issuer is, before the JWKS is fetched, and nothing was recorded
+    // as used.
+    assert_eq!(h.idp.hits(), hits);
+    assert_eq!(h.state.replay.len(), markers);
+    // An unknown issuer is still `untrusted_issuer`, at the same step.
+    let mut claims = h.idp.id_token_claims("alice");
+    claims["iss"] = json!("https://evil.example");
+    let stranger = h.idp.sign(&h.idp.key, Some("JWT"), &claims);
+    assert_error(
+        &h.intake(&stranger, "github:read_file").await,
+        StatusCode::BAD_REQUEST,
+        "invalid_grant",
+        "untrusted_issuer",
+    );
+    assert_eq!(h.idp.hits(), hits);
+
+    // ID-JAGs: accepted, still under the ceiling.
+    let jag = jag_with(&h, json!({"resource": GITHUB_RESOURCE}));
+    assert_error(
+        &present(&h, &jag, ("scope", "slack:post_message")).await,
+        StatusCode::BAD_REQUEST,
+        "invalid_scope",
+        "scope_exceeds_id_jag",
+    );
+    let got = present(&h, &jag, ("scope", "github:read_file")).await;
+    assert_eq!(got.0, StatusCode::OK, "{}", got.1);
+    let jag = jag_with(&h, json!({"resource": GITHUB_RESOURCE}));
+    let got = present_by_exchange(&h, &jag, "github:read_file").await;
+    assert_eq!(got.0, StatusCode::OK, "{}", got.1);
+}
+
+/// `credentials = ["id_token"]`: an ID-JAG is refused by either grant type, before any key
+/// fetch and without its `jti` being used up; ID tokens are accepted.
+#[tokio::test]
+async fn an_id_token_only_entry_refuses_id_jags_sr122() {
+    let h = credentials_harness(&[IdpCredential::IdToken]).await;
+    let claims = h.idp.id_jag_claims("alice", "planner");
+    let jti = claims["jti"].as_str().unwrap().to_owned();
+    let jag = h.idp.sign(&h.idp.key, Some("oauth-id-jag+jwt"), &claims);
+    let (markers, hits) = (h.state.replay.len(), h.idp.hits());
+    assert_not_accepted(&present(&h, &jag, ("scope", "github:read_file")).await);
+    assert_not_accepted(&present_by_exchange(&h, &jag, "github:read_file").await);
+    assert_eq!(h.idp.hits(), hits);
+    assert_eq!(h.state.replay.len(), markers);
+    // The ID-JAG's (iss, jti) was never recorded: recording it now succeeds.
+    let exp = claims["exp"].as_i64().unwrap();
+    h.state
+        .replay
+        .use_once(
+            &format!("idp\n{}\n{jti}", h.idp.issuer),
+            exp,
+            OffsetDateTime::now_utc(),
+        )
+        .expect("a refused ID-JAG is not used up");
+
+    let got = h
+        .intake(&h.idp.id_token("alice"), "slack:post_message")
+        .await;
+    assert_eq!(got.0, StatusCode::OK, "{}", got.1);
+    assert!(h.state.replay.len() > markers);
 }

@@ -2554,9 +2554,38 @@ pub struct IdpConfig {
     /// [`IdJagCeilingConfig`]. Default: unset, those claims are ignored and the root token is
     /// bounded by the root grant and the request only. ID tokens are never affected, so an
     /// agent that can present this issuer's ID tokens (its `client_ids` entry, or its agent
-    /// id, is their `aud`) is not bound by the ceiling (SR-122).
+    /// id, is their `aud`) is not bound by the ceiling unless [`credentials`](Self::credentials)
+    /// leaves ID tokens out (SR-122); the server warns at start when it does not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id_jag_ceiling: Option<IdJagCeilingConfig>,
+    /// The credentials this issuer's users may be brought in with at hop 0: `"id_token"`
+    /// (an OIDC ID token), `"id-jag"` (an ID-JAG), or both. A credential of a kind not listed
+    /// is refused with `credential_type_not_accepted`, before its signature is checked and
+    /// before it is used up. Default: both. An empty list, or a name not in this list, refuses
+    /// to start. Approval ID tokens (`[approvals]`) are not affected (SR-122).
+    #[serde(default = "default_idp_credentials")]
+    pub credentials: Vec<IdpCredential>,
+}
+
+/// A credential kind an `[[idps]] credentials` list names. The names are the ones the audit
+/// record's `credential` member uses, which are also the ends of the RFC 8693 token type URNs
+/// (`urn:ietf:params:oauth:token-type:id_token`, `...:id-jag`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IdpCredential {
+    /// An OIDC ID token.
+    #[serde(rename = "id_token")]
+    IdToken,
+    /// An ID-JAG (draft-ietf-oauth-identity-assertion-authz-grant).
+    #[serde(rename = "id-jag")]
+    IdJag,
+}
+
+/// Default `[[idps]] credentials`: both kinds.
+pub const DEFAULT_IDP_CREDENTIALS: &[IdpCredential] =
+    &[IdpCredential::IdToken, IdpCredential::IdJag];
+
+fn default_idp_credentials() -> Vec<IdpCredential> {
+    DEFAULT_IDP_CREDENTIALS.to_vec()
 }
 
 /// `[idps.id_jag_ceiling]`: how an ID-JAG's `resource`, `scope` and `authorization_details`

@@ -541,6 +541,7 @@ async fn idp_discovery_and_jwks_use_the_entrys_ca() {
             clock_skew_seconds: 60,
             tenant: None,
             id_jag_ceiling: None,
+            credentials: attenuo_server::config::DEFAULT_IDP_CREDENTIALS.to_vec(),
             ca_pem_path: ca_path,
             client_ids: BTreeMap::from([("planner".to_string(), CLIENT_AUD.to_string())]),
         }];
@@ -677,6 +678,7 @@ fn a_bad_ca_file_refuses_to_start() {
             clock_skew_seconds: 60,
             tenant: None,
             id_jag_ceiling: None,
+            credentials: attenuo_server::config::DEFAULT_IDP_CREDENTIALS.to_vec(),
             ca_pem_path: Some(path.clone()),
             client_ids: BTreeMap::new(),
         }];

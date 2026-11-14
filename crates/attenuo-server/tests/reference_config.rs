@@ -116,6 +116,7 @@ jwks_url = "https://idp.example/jwks"
 ca_pem_path = "idp-ca.pem"
 client_ids = { planner = "planner-app" }
 tenant = "t"
+credentials = ["id-jag"]
 
 [idps.id_jag_ceiling]
 resources = { "https://mcp.example/github" = ["github"] }
