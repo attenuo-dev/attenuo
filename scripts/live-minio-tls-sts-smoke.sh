@@ -560,6 +560,9 @@ if [ "${STS_EXPIRY:-0}" = 1 ]; then
   WAIT="$(python3 -c 'import datetime,sys; e=datetime.datetime.fromisoformat(sys.argv[1].replace("Z","+00:00")); print(max(0, int((e-datetime.datetime.now(datetime.timezone.utc)).total_seconds()) + 15))' "$EXP")"
   echo "    waiting ${WAIT}s for the credentials to expire..."
   sleep "$WAIT"
+  # Counted again now: the tail checkpoint ([audit] checkpoint_interval_seconds) may have been
+  # signed and delivered during the wait, before the expiry.
+  BEFORE="$(count_objects "$C_TLS" "root/$BUCKET/expiry/")"
   decisions
   wait_log "$WORK/server-expiry.log" 'S3 answered 4' || fail "expiry: no refusal logged after the expiry"
   show "$WORK/server-expiry.log" 'S3 answered 4'
