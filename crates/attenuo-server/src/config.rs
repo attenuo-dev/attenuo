@@ -2548,6 +2548,41 @@ pub struct IdpConfig {
     /// `tenant_mismatch`. ID tokens are not affected. Default: unset, `tenant` is not checked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant: Option<String>,
+    /// Opt-in: narrow the root token minted from this issuer's ID-JAGs to what the ID-JAG's own
+    /// `resource`, `scope` and `authorization_details` claims name, under `[[root_grants]]`
+    /// (draft-ietf-oauth-identity-assertion-authz-grant-06 §4.4.1). See
+    /// [`IdJagCeilingConfig`]. Default: unset, those claims are ignored and the root token is
+    /// bounded by the root grant and the request only. ID tokens are never affected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id_jag_ceiling: Option<IdJagCeilingConfig>,
+}
+
+/// `[idps.id_jag_ceiling]`: how an ID-JAG's `resource`, `scope` and `authorization_details`
+/// claims name attenuo capabilities, so that the root token carries no more than both the
+/// `[[root_grants]]` entry and the ID-JAG allow.
+///
+/// - `authorization_details` entries of attenuo's own type, `attenuo_capabilities`, name
+///   capabilities directly (the token's capability objects, read strictly: an unknown member
+///   makes that capability name nothing); entries of any other type name nothing.
+/// - `resource` values name upstream servers through [`resources`](Self::resources): each
+///   mapped server stands for `<server>:*`. An unmapped value names nothing.
+/// - `scope` tokens (space-separated) name capabilities through [`scopes`](Self::scopes). An
+///   unmapped token names nothing.
+///
+/// Each claim the ID-JAG carries narrows the ceiling further; a claim it does not carry
+/// narrows nothing. When what is left is empty, the request is refused
+/// (`id_jag_ceiling_empty`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdJagCeilingConfig {
+    /// Resource identifier (an exact `resource` value, RFC 8707) to the `[[upstreams]]` server
+    /// names it stands for. Compared as strings, with no URL normalisation.
+    #[serde(default)]
+    pub resources: BTreeMap<String, Vec<String>>,
+    /// Scope token to the capabilities it stands for, written as in `[[root_grants]]
+    /// capabilities` (`"server:tool"` with globs, or a full table).
+    #[serde(default)]
+    pub scopes: BTreeMap<String, Vec<CapSpec>>,
 }
 
 fn default_idp_algs() -> Vec<String> {

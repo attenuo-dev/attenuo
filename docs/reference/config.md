@@ -259,6 +259,36 @@ Every key fetch (`jwks_url`, or the discovery document at `issuer` and the `jwks
 | `jwks_ttl_seconds` | `300` | How long a fetched key set is used. |
 | `clock_skew_seconds` | `60` | Leeway for `exp`, `iat` and `nbf`. |
 
+### `[idps.id_jag_ceiling]`
+
+Optional, per `[[idps]]` entry, off by default. With it, the root token minted from one of this issuer's ID-JAGs carries no more than both the [`[[root_grants]]`](#rootgrants) entry and the ID-JAG's own `resource`, `scope` and `authorization_details` claims allow (draft-ietf-oauth-identity-assertion-authz-grant-06 §4.4.1). Without it those claims are ignored and nothing changes. ID tokens are never affected. An empty table (`[idps.id_jag_ceiling]` with no keys) turns the ceiling on with only `authorization_details` able to name anything.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `resources` | `{}` | Table of resource identifier (an exact `resource` value, RFC 8707) to a list of `[[upstreams]]` server names. Each server stands for `<server>:*`. Compared as strings: no URL normalisation, so `https://mcp.example/github` and `https://mcp.example/github/` are two identifiers. |
+| `scopes` | `{}` | Table of scope token to a list of capabilities, written as in `[[root_grants]] capabilities` (`"server:tool"` with globs, or a full table with `constraints` and `limits`). |
+
+How each claim names capabilities:
+
+- `authorization_details`: the `capabilities` of every entry of type `attenuo_capabilities` (attenuo's own type, the one `POST /token` requests use), read as the token's capability objects but strictly: a capability with an unknown member (a misspelt `constraint`, say) or an invalid name names nothing. An entry of any other type names nothing.
+- `resource` (a string or an array of strings): the servers `resources` maps each value to. An unmapped value names nothing.
+- `scope` (a space-separated string): the capabilities `scopes` maps each token to. An unmapped token names nothing.
+
+A claim of the wrong JSON type names nothing; a claim that is absent or `null` is not used. Each claim that is present narrows the root grant further, in the order `resource`, `scope`, `authorization_details`, so the result is within the grant and within every claim used. A claim can only narrow: naming something the grant does not give adds nothing. An ID-JAG with none of the three claims gets the root grant as it is. The request is then attenuated against the result. When nothing is left, the request is refused with `400 invalid_scope` / `id_jag_ceiling_empty`; a request within the root grant but beyond the ceiling is refused with `400 invalid_scope` / `scope_exceeds_id_jag` (beyond the root grant itself it is `scope_exceeds_grant`, as without the ceiling). Neither refusal uses the ID-JAG up.
+
+A capability is kept when a single capability of the other side covers it (`⊑`, RFC-0001), after its limits are clamped to the grant's as at a delegation hop. This is not the full intersection: two capabilities that only overlap (`github:read_*` against `github:*_file`) give nothing, never a new capability built from both. See the [standards note](../research/standards.md#the-id-jags-claims-as-a-ceiling).
+
+The server refuses to start on an empty resource identifier, a resource mapped to no server or to a name that is not a valid server name (or is `attenuo`), a scope token that is empty or holds whitespace, a scope mapped to no capability, or a capability that does not parse.
+
+```toml
+[[idps]]
+issuer = "https://idp.example.com"
+
+[idps.id_jag_ceiling]
+resources = { "https://mcp.example.com/github" = ["github"] }
+scopes = { "repo.read" = ["github:read_file", "github:list_*"] }
+```
+
 ## `[[agents]]`
 
 Agents (OAuth clients) that may present user credentials at `POST /token`, and that authenticate as the `actor` of an exchange with client credentials. With none configured, every request that authenticates with client credentials is rejected (`no_agents_configured`); an agent that authenticates with an `actor_token` from `[[actor_trust]]` needs no entry here.

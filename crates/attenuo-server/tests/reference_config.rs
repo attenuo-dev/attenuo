@@ -44,6 +44,8 @@ const NAME_TABLES: &[(&str, Option<&str>)] = &[
     ("telemetry.resource_attributes", None),
     ("approvals.notify.headers", None),
     ("idps.client_ids", None),
+    ("idps.id_jag_ceiling.resources", None),
+    ("idps.id_jag_ceiling.scopes", None),
     ("root_grants.attributes", None),
 ];
 
@@ -114,6 +116,10 @@ jwks_url = "https://idp.example/jwks"
 ca_pem_path = "idp-ca.pem"
 client_ids = { planner = "planner-app" }
 tenant = "t"
+
+[idps.id_jag_ceiling]
+resources = { "https://mcp.example/github" = ["github"] }
+scopes = { "repo.read" = ["github:read_file"] }
 
 [[agents]]
 id = "planner"
