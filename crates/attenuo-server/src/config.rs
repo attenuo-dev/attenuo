@@ -2942,10 +2942,11 @@ impl Config {
     ///
     /// When a server name in `[[upstreams]]`, the catalog or a `[[root_grants]]` capability is
     /// refused by [`check_server_name`], when the catalog cannot be loaded or does not validate,
-    /// when a `[[root_grants]]` capability does not parse or has limits no token may carry
-    /// ([`Capability::validate_limits`]; the message names the entry by index, issuer, agent
-    /// and subject), or when an agent id in `[[agents]]`, `[[peps]]` or `[[root_grants]]` is
-    /// `attenuo`; the message names the section.
+    /// when a `[[root_grants]]` capability does not parse, is over the size bounds (SR-123) or
+    /// has limits no token may carry ([`Capability::validate_limits`]), or when an agent id in
+    /// `[[agents]]`, `[[peps]]` or `[[root_grants]]` is `attenuo`. The message names the
+    /// section; for `[[root_grants]]` it also names the entry by index (from 0, in file
+    /// order), issuer, agent and subject.
     pub fn check_server_names(&self) -> anyhow::Result<()> {
         for u in &self.upstreams {
             check_server_name(&u.name).map_err(|e| anyhow::anyhow!("[[upstreams]]: {e}"))?;
@@ -2974,26 +2975,28 @@ impl Config {
             reserved_agent("[[peps]]", &p.id)?;
         }
         for (index, g) in self.root_grants.iter().enumerate() {
-            reserved_agent("[[root_grants]]", &g.agent)?;
-            let caps = capability_set(&g.capabilities).map_err(|e| anyhow::anyhow!(e))?;
+            // Every refusal names the entry: its index from 0 in file order, issuer, agent
+            // and subject, since several entries may share an agent or an issuer.
+            let entry = format!("[[root_grants]] entry {index} ({})", g.describe());
+            reserved_agent(&entry, &g.agent)?;
+            let caps =
+                capability_set(&g.capabilities).map_err(|e| anyhow::anyhow!("{entry}: {e}"))?;
             // A request is attenuated against the grant at a cost of the product (SR-123).
             caps.validate_size()
-                .map_err(|e| anyhow::anyhow!("[[root_grants]] for agent `{}`: {e}", g.agent))?;
+                .map_err(|e| anyhow::anyhow!("{entry}: {e}"))?;
             for cap in caps.iter() {
                 cap.validate()
-                    .map_err(|e| anyhow::anyhow!("[[root_grants]]: {e}"))?;
+                    .map_err(|e| anyhow::anyhow!("{entry}: {e}"))?;
                 if cap.server != "*" {
-                    check_server_name(&cap.server)
-                        .map_err(|e| anyhow::anyhow!("[[root_grants]]: {e}"))?;
+                    check_server_name(&cap.server).map_err(|e| anyhow::anyhow!("{entry}: {e}"))?;
                 }
                 // The check every hop-0 mint makes (`Chain::root`): limits no token
                 // may carry would start and then fail every mint under this grant with
                 // `invalid_capability`, as `[idps.id_jag_ceiling] scopes` did (SR-125).
                 cap.validate_limits().map_err(|e| {
                     anyhow::anyhow!(
-                        "[[root_grants]] entry {index} ({}): {e}; no token may carry it, so \
-                         every mint under this grant would fail",
-                        g.describe()
+                        "{entry}: {e}; no token may carry it, so every mint under this grant \
+                         would fail"
                     )
                 })?;
             }

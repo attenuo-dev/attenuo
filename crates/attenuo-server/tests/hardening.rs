@@ -602,7 +602,9 @@ fn the_agent_id_attenuo_is_reserved() {
         attributes: Default::default(),
         may_act: None,
     }];
-    assert!(cfg.check_server_names().is_err());
+    let err = cfg.check_server_names().unwrap_err().to_string();
+    assert!(err.contains("reserved"), "{err}");
+    assert!(err.starts_with("[[root_grants]] entry 0 "), "{err}");
     // A root-grant capability or catalog entry on the server `attenuo` is refused too.
     let mut cfg = Config::default();
     cfg.root_grants = vec![RootGrant {
@@ -613,7 +615,9 @@ fn the_agent_id_attenuo_is_reserved() {
         attributes: Default::default(),
         may_act: None,
     }];
-    assert!(cfg.check_server_names().is_err());
+    let err = cfg.check_server_names().unwrap_err().to_string();
+    assert!(err.contains("reserved"), "{err}");
+    assert!(err.starts_with("[[root_grants]] entry 0 "), "{err}");
     let cfg = Config::from_toml("[policy.catalog.attenuo.\"token.exchange\"]\n").unwrap();
     let err = cfg.check_server_names().unwrap_err().to_string();
     assert!(err.contains("reserved"), "{err}");
@@ -752,6 +756,53 @@ fn release_workflow_actions_are_pinned_to_commits() {
         !text.contains("Swatinem/rust-cache"),
         "the release build must not restore a shared cargo cache"
     );
+}
+
+/// Every `[[root_grants]]` refusal at start names the entry the way the limits one does (its
+/// index from 0, issuer, agent and subject), then gives the reason it gave before: a reserved
+/// agent id, a capability that does not parse, an invalid tool name and a reserved server
+/// name. The SR-123 size bound is checked in `tests/run_limits.rs`.
+#[test]
+fn root_grant_refusals_name_the_entry() {
+    let grant = |agent: &str, subject: Option<&str>, cap: &str| RootGrant {
+        subject: subject.map(Into::into),
+        issuer: "https://idp.example".into(),
+        agent: agent.into(),
+        capabilities: vec![CapSpec::Short(cap.into())],
+        attributes: Default::default(),
+        may_act: None,
+    };
+    for (agent, cap, reason) in [
+        (
+            "attenuo",
+            "github:*",
+            "agent id `attenuo` is reserved for the server's own records",
+        ),
+        (
+            "planner",
+            "github",
+            "capability `github` must look like `server:tool`",
+        ),
+        ("planner", "github:a//b", "which is not allowed"),
+        (
+            "planner",
+            "attenuo:admin.lease.revoke",
+            "server name `attenuo` is reserved for the server's own audit records",
+        ),
+    ] {
+        let mut cfg = Config::default();
+        cfg.root_grants = vec![
+            grant("planner", None, "github:*"),
+            grant(agent, Some("alice"), cap),
+        ];
+        let err = cfg.check_server_names().unwrap_err().to_string();
+        let entry = format!(
+            "[[root_grants]] entry 1 (issuer \"https://idp.example\", agent \"{agent}\", \
+             subject \"alice\"): "
+        );
+        assert!(err.starts_with(&entry), "{err}");
+        assert!(err.contains(reason), "{err}");
+    }
 }
 
 /// A `[[root_grants]]` capability whose limits no token may carry refuses to start, naming the

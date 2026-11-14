@@ -1462,7 +1462,11 @@ fn a_root_grant_over_the_bounds_does_not_start_sr123() {
         let err = cfg.check_server_names().unwrap_err().to_string();
         assert!(attenuo_server::build(&cfg).is_err());
         assert!(
-            err.contains(says) && err.contains("[[root_grants]]"),
+            err.contains(says)
+                && err.starts_with(
+                    "[[root_grants]] entry 0 (issuer \"https://idp.example\", agent \"helper\", \
+                     any subject): "
+                ),
             "{err}"
         );
     }
