@@ -556,7 +556,7 @@ pub(crate) fn record_decision(
         tracing::field::display(out.decision_id),
     );
     if let Some(seq) = out.audit_seq {
-        span.record("attenuo.audit.seq", seq);
+        span.record("attenuo.audit.seq", attenuo_proxy::otel_int(seq));
     }
     if !out.policy_ids.is_empty() {
         span.record("attenuo.policy_ids", out.policy_ids.join(",").as_str());
@@ -742,7 +742,10 @@ pub async fn trace_route(
     };
     trace.adopt(mode, &span, inbound);
     let response = next.run(req).instrument(span.clone()).await;
-    span.record("http.response.status_code", response.status().as_u16());
+    span.record(
+        "http.response.status_code",
+        i64::from(response.status().as_u16()),
+    );
     response
 }
 

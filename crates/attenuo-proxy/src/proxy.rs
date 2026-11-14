@@ -44,7 +44,7 @@ use crate::session::{
     session_digest, session_tag, BindOutcome, SessionCheck, SessionOwner, SessionRegistry,
 };
 use crate::stage::Stage;
-use crate::traceparent::{TraceParent, OTEL_TARGET, TRACEPARENT_HEADER};
+use crate::traceparent::{otel_int, TraceParent, OTEL_TARGET, TRACEPARENT_HEADER};
 
 /// Response header carrying the decision record id(s) of every `tools/call` in the request,
 /// comma separated in request order.
@@ -626,7 +626,7 @@ async fn authenticate_traced(
             if let Some(chain_id) = chain_id_of(&who.chain) {
                 otel.record("attenuo.chain_id", chain_id.as_str());
             }
-            otel.record("attenuo.chain_depth", who.chain.depth());
+            otel.record("attenuo.chain_depth", otel_int(who.chain.depth() as u64));
             otel.record("attenuo.dpop_bound", who.dpop_bound);
         }
         Err(e) => {
@@ -720,7 +720,10 @@ async fn send_upstream(
         Err(_) => Err(UpstreamFailure::Timeout),
     };
     match &out {
-        Ok(resp) => span.record("http.response.status_code", resp.status().as_u16()),
+        Ok(resp) => span.record(
+            "http.response.status_code",
+            i64::from(resp.status().as_u16()),
+        ),
         Err(f) => span.record("attenuo.reason", f.reason()),
     };
     out
@@ -1085,7 +1088,10 @@ async fn handle_passthrough(
     let response = passthrough_request(&state, &otel, upstream, server, uri, method, headers, body)
         .instrument(otel.clone())
         .await;
-    otel.record("http.response.status_code", response.status().as_u16());
+    otel.record(
+        "http.response.status_code",
+        i64::from(response.status().as_u16()),
+    );
     response
 }
 
@@ -1361,7 +1367,10 @@ async fn handle_post(
     )
     .instrument(otel.clone())
     .await;
-    otel.record("http.response.status_code", response.status().as_u16());
+    otel.record(
+        "http.response.status_code",
+        i64::from(response.status().as_u16()),
+    );
     response
 }
 

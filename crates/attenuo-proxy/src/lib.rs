@@ -228,4 +228,4 @@ pub use screen::ListFilterMode;
 pub use session::{SessionOwner, SessionRegistry};
 pub use stage::Stage;
 pub use subject_log::{LoggedSubject, SubjectLog};
-pub use traceparent::{TraceHook, TraceParent, OTEL_TARGET};
+pub use traceparent::{otel_int, TraceHook, TraceParent, OTEL_TARGET};
