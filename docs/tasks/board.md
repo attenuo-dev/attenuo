@@ -141,6 +141,7 @@ How to read it:
 - [x] Python SDK (`sdk/python`) and TypeScript SDK (`sdk/typescript`) with agent examples and workflows; token-refresh helpers; offline `audit verify`; streamed `tools/call` answers (#115); an optional total stream deadline (SR-82, #126) and a linear SSE line reader (#125).
 - [x] SDK export filters and selector revocation (#94); SDK packaging for PyPI and npm prepared (#118); typed errors and opt-in retry for load refusals (#259); stable error code on SDK errors (#278); batch evaluate, discovery, user approval, session close, budget refund and timeout errors (#244).
 - [x] `--admin-server` for a separate admin listener (#266), with a hint on a bare admin 404 (#270).
+- [x] CLI hop 0 from an ID token or ID-JAG, `token exchange --subject-token-type id-token|id-jag` (#318); a refusal names the stable error code, `<error> (<code>): <detail>` (#319); text from the server printed with control characters escaped (SR-118, #322).
 - [x] `attenuo policy lint` without `--config`, and the injection-suite runner ignoring inherited `ATTENUO_*` variables.
 - [x] Flaky Python test `test_dpop_server_nonce`: a retry landing on a closing keep-alive connection; both SDKs retry on a fresh connection (#208).
 

@@ -533,7 +533,7 @@ A server with [`[limits]`](https://github.com/attenuo-dev/attenuo/blob/main/docs
 | `reason` | Error | Ran on the server? | Retried by `max_retries` |
 | --- | --- | --- | --- |
 | `overloaded` | `Unavailable` (503) | No: refused before any decision, audit record or upstream call. Safe to retry after `retry_after`. | Yes |
-| `rate_limited` | `RateLimited` (429) | No: `POST /token` per agent or address, `/mcp/{server}` per run, refused before the work. Safe to retry after `retry_after` (the end of the caller's minute). | Yes |
+| `rate_limited` | `RateLimited` (429) | No: `POST /token` per agent or address, `/mcp/{server}` and AuthZEN action search per run, refused before the work. Safe to retry after `retry_after` (the end of the caller's minute). | Yes |
 | `request_timeout` | `Unavailable` (503) | Maybe: the handler may have issued a token or written a decision. | No |
 | `too_many_sessions`, `session_registry_full` | `RateLimited` (429), `Unavailable` (503) | The upstream answered `initialize`; the proxy then closed that session. | No |
 | `jwks_unavailable`, `dpop_replay_cache_full` | `Unavailable` (503) | No decision was made. | No |
@@ -630,4 +630,4 @@ The integration test builds `attenuo-server` and the `fake_mcp` example, starts 
 
 - The server's JSON-RPC and header behaviour is what is implemented in this repository today. Nothing here is tested against a server of another version.
 - `call_tool` reads the whole response and returns the first JSON-RPC result or error in it; `call_tool_stream` yields a streamed answer as it arrives. Neither answers server-initiated requests (sampling, elicitation) or resumes a broken stream with `Last-Event-ID`: `call_tool_stream` yields such requests and keeps the id, but replying and resuming need a full MCP client with `attenuo.mcp`.
-- Hop-0 exchange (`client_id`/`client_secret`) is covered by unit tests against a mock transport only, not against a live IdP.
+- Hop-0 exchange (`client_id`/`client_secret`) is covered by unit tests against a mock transport, and was run once against Keycloak 26.8.2 in dev mode on loopback (`scripts/live-keycloak-smoke.sh`, not part of CI); not against a hosted IdP.

@@ -27,7 +27,7 @@ Go through this before pointing anything real at the server.
 - [ ] `[policy] unknown_tools` is `deny` (the default) or `sensitive`, not `allow`.
 - [ ] `/admin/*` is not reachable from the networks agents live on: `[admin] listen` gives it a port of its own. See [Network exposure](#network-exposure).
 - [ ] TLS terminates in front of attenuo, and agents reach it over HTTPS only. `[server] public_url` is the proxy's `https://` URL, and agents, the CLI and the SDKs are given that URL itself: they follow no redirect, so a URL that redirects is an error ([TLS and a reverse proxy](#tls-and-a-reverse-proxy)). A plain `http://` `public_url` on a host that is not loopback refuses to start unless `[server] allow_insecure_http = true`, which you should not need.
-- [ ] Every `[[idps]]` and `[[actor_trust]]` key URL (`jwks_url`, `spiffe_bundle_url`, or the IdP `issuer` used for discovery) is the final `https://` URL. Plain `http://` is accepted only on loopback, and redirects are not followed, so a key URL that redirects fails every ID or actor token it should verify.
+- [ ] Every `[[idps]]` and `[[actor_trust]]` key URL (`jwks_url`, `spiffe_bundle_url`, or the IdP `issuer` used for discovery) is the final `https://` URL. Plain `http://` is accepted only on loopback, and redirects are not followed, so a key URL that redirects fails every ID or actor token it should verify. Its certificate chains to a root built into attenuo (the web PKI) or, for a private CA, to a CA in that entry's `ca_pem_path` ([private CAs for key URLs](identity-providers.md#private-cas-for-key-urls)).
 - [ ] `[issuer] private_key_pem_path` is set, the file is mode 0600, owned by the service user, and backed up somewhere safe. Without the setting the server makes a new key at every start and every token dies on restart.
 - [ ] `[audit] sqlite_path` is a real path on durable storage. The default is `:memory:`, which loses the audit log and every lease on exit. The server logs a warning when it is in memory.
 - [ ] `[issuer] issuer` is the URL clients will use, for example `https://attenuo.example.com`. It becomes the `iss` of every token, and changing it later invalidates tokens. `[server] public_url` is set to the same base URL so the AuthZEN discovery document points at the right host. Off a loopback `listen` address the server refuses to start without it.
@@ -455,7 +455,7 @@ From the process and the host:
 From the logs:
 
 - `warn` lines. A rise in rejections can mean a misconfigured client or an attack.
-- `503` answers from `POST /token` with `jwks_unavailable`. That is your identity provider or the network path to it.
+- `503` answers from `POST /token` with `jwks_unavailable`. That is your identity provider, the network path to it, or a certificate attenuo does not trust; the `warn` line (`IdP JWKS unavailable`, or `actor token issuer JWKS unavailable`) names the cause, the answer does not.
 
 From the audit log (`GET /admin/audit`, `attenuo audit tail`):
 
