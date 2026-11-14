@@ -243,6 +243,10 @@ pub const SEARCH_ACTION_PATH: &str = "/access/v1/search/action";
 ///   or requested: a search acts on nothing, as the admin dry run and the list screen do not.
 ///   An approval-gated tool is not a result. `context.approval_token` is refused (400
 ///   `approval_token_not_accepted`): an approval token is spent by the one decision it names.
+/// - **Rate limit.** `[limits] authzen_search_requests_per_minute` (off by default) counts
+///   searches per run, the chain's root lease, once the caller has authenticated and before
+///   any candidate is evaluated, in a table apart from `mcp_requests_per_minute`. Over it the
+///   answer is 429 `rate_limited` with `Retry-After`, and nothing is evaluated (SR-117).
 /// - **Paging** (section 8.2). At most `[authzen] max_batch` candidates are evaluated per
 ///   request, the bound of a batch. `page.limit` (1 or more; above `max_batch` it is clamped)
 ///   is how many candidates one page evaluates, so a page holds at most that many results and
@@ -258,8 +262,9 @@ pub const SEARCH_ACTION_PATH: &str = "/access/v1/search/action";
 /// is malformed (as for evaluation); 400 `invalid_page` for a `page` that is not an object, a
 /// `page.token` that is not a string or a `page.limit` that is not a positive integer; 400
 /// `invalid_cursor` for a `page.token` this route did not issue; 400 `invalid_search_resource`
-/// when the resource names no server; 400 `approval_token_not_accepted`; and the 401 and 403
-/// of authentication, as for evaluation.
+/// when the resource names no server; 400 `approval_token_not_accepted`; 429 `rate_limited`
+/// over `[limits] authzen_search_requests_per_minute`; and the 401 and 403 of
+/// authentication, as for evaluation.
 // The `Err` is a full response, built once per refused request; boxing it buys nothing.
 #[allow(clippy::result_large_err)]
 pub async fn search_action(
@@ -379,6 +384,14 @@ fn search_actions(state: &AppState, headers: &HeaderMap, body: &Bytes) -> Result
     let bearer = bearer_auth(state, headers, SEARCH_ACTION_PATH)?;
     let pep = pep_assertion(state, headers, &mut raw)?;
     let a = admit(state, headers, bearer.as_ref(), pep.as_deref(), raw)?;
+    // `[limits] authzen_search_requests_per_minute`, per run (the root lease of the bearer's
+    // chain, or of a PEP's issued unsigned chain): only once the caller has authenticated, so
+    // a caller without the credentials cannot use up a run's searches, and before any
+    // candidate is evaluated. A search writes no audit record, so this is what bounds how fast
+    // a run can try arguments (SR-117).
+    if let Some(run) = attenuo_core::chain_id_of(&a.chain) {
+        state.limits.admit_search(&run)?;
+    }
     if a.req
         .context
         .as_ref()

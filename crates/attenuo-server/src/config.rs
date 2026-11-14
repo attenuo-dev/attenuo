@@ -2306,11 +2306,12 @@ impl ProxySection {
 ///   listener except `/mcp/{server}` (bounded by the `[proxy]` upstream deadlines, and whose
 ///   streams must stay open) and `/admin/*` (an audit verify or export of a large log may take
 ///   longer); past it the answer is `503` with `Retry-After`.
-/// - `token_requests_per_minute`, `token_unauthenticated_requests_per_minute` and
-///   `mcp_requests_per_minute` are per-caller fixed-window rate limits, off (0) by default:
-///   `POST /token` per authenticated agent, `POST /token` requests that authenticated no
-///   agent per peer address, and `/mcp/{server}` per run (the chain's root lease). Over the
-///   limit the answer is `429` with `Retry-After`.
+/// - `token_requests_per_minute`, `token_unauthenticated_requests_per_minute`,
+///   `mcp_requests_per_minute` and `authzen_search_requests_per_minute` are per-caller
+///   fixed-window rate limits, off (0) by default: `POST /token` per authenticated agent,
+///   `POST /token` requests that authenticated no agent per peer address, `/mcp/{server}` per
+///   run (the chain's root lease), and `POST /access/v1/search/action` per run, in a table of
+///   its own. Over the limit the answer is `429` with `Retry-After`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LimitsSection {
@@ -2345,6 +2346,13 @@ pub struct LimitsSection {
     /// at most 1000000.
     #[serde(default)]
     pub mcp_requests_per_minute: u64,
+    /// AuthZEN action searches (`POST /access/v1/search/action`) per minute per run (the
+    /// chain's root lease, from the bearer token or a PEP's issued unsigned chain), counted
+    /// once the caller has authenticated and before any candidate is evaluated. Its own table:
+    /// searches do not use up `mcp_requests_per_minute`, nor the reverse. Evaluations are not
+    /// counted (they are audited). 0 (the default) turns it off; at most 1000000.
+    #[serde(default)]
+    pub authzen_search_requests_per_minute: u64,
     /// Most callers each rate limit tracks at once. Callers whose minute has ended are dropped
     /// first; when every tracked caller is inside its minute, a new caller is refused (`429`)
     /// until one ends. Default 10000, between 100 and 1000000.
@@ -2395,6 +2403,7 @@ impl Default for LimitsSection {
             token_requests_per_minute: 0,
             token_unauthenticated_requests_per_minute: 0,
             mcp_requests_per_minute: 0,
+            authzen_search_requests_per_minute: 0,
             rate_limit_max_keys: DEFAULT_RATE_LIMIT_MAX_KEYS,
         }
     }
@@ -2444,6 +2453,12 @@ impl LimitsSection {
             (
                 "mcp_requests_per_minute",
                 self.mcp_requests_per_minute,
+                0,
+                MAX_LIMITS_COUNT,
+            ),
+            (
+                "authzen_search_requests_per_minute",
+                self.authzen_search_requests_per_minute,
                 0,
                 MAX_LIMITS_COUNT,
             ),
@@ -3426,16 +3441,18 @@ mod tests {
                 l.token_requests_per_minute,
                 l.token_unauthenticated_requests_per_minute,
                 l.mcp_requests_per_minute,
+                l.authzen_search_requests_per_minute,
                 l.rate_limit_max_keys,
             ),
-            (0, 0, 0, 10_000)
+            (0, 0, 0, 0, 10_000)
         );
         l.check().unwrap();
         // The edges of each range are accepted.
         let edges = Config::from_toml(
             "[limits]\nmax_in_flight = 0\nheader_read_timeout_seconds = 300\n\
              request_body_timeout_seconds = 1\nrequest_timeout_seconds = 3600\n\
-             mcp_requests_per_minute = 1000000\nrate_limit_max_keys = 100\n",
+             mcp_requests_per_minute = 1000000\nauthzen_search_requests_per_minute = 1000000\n\
+             rate_limit_max_keys = 100\n",
         )
         .unwrap();
         edges.limits.check().unwrap();

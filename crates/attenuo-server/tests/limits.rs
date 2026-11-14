@@ -1,6 +1,6 @@
-//! `[limits]` over real connections (audit finding S-4): the per-run MCP rate limit, the
-//! per-agent and per-peer `POST /token` limits, the in-flight cap with the body deadline, and
-//! streams that neither the handler deadline nor the cap may cut. The servers run through
+//! `[limits]` over real connections (audit finding S-4): the per-run MCP and action search
+//! (SR-117) rate limits, the per-agent and per-peer `POST /token` limits, the in-flight cap
+//! with the body deadline, and streams that neither the handler deadline nor the cap may cut. The servers run through
 //! `attenuo_server::run`, so requests go through the server's own accept loop.
 
 mod common;
@@ -568,6 +568,7 @@ fn nonsense_limits_refuse_to_start() {
         ("request_timeout_seconds", 3_601),
         ("max_in_flight", 1_000_001),
         ("mcp_requests_per_minute", 1_000_001),
+        ("authzen_search_requests_per_minute", 1_000_001),
         ("rate_limit_max_keys", 99),
     ] {
         let mut cfg = Config::from_toml(&format!("[limits]\n{key} = {value}\n")).unwrap();
@@ -580,5 +581,236 @@ fn nonsense_limits_refuse_to_start() {
         assert!(err.ends_with(&format!("not {value}")), "{err}");
     }
     assert!(Config::from_toml("[limits]\nmax_in_flight = -1\n").is_err());
+    assert!(Config::from_toml("[limits]\nauthzen_search_requests_per_minute = -1\n").is_err());
     assert!(Config::from_toml("[limits]\nunknown_key = 1\n").is_err());
+}
+
+// ---------------------------------------------------------------------------------------------
+// `authzen_search_requests_per_minute` (SR-117)
+// ---------------------------------------------------------------------------------------------
+
+/// The `[[peps]]` secret of the unsigned-chain search test.
+const PEP_SECRET: &str = "gateway-secret";
+
+/// An action search body for the `github` server.
+fn search_body() -> Value {
+    json!({
+        "subject": {"type": "agent", "id": ""},
+        "resource": {"type": "mcp_server", "id": "github"},
+        "context": {"input": {"repo": "alice/public-site"}},
+    })
+}
+
+impl Harness {
+    async fn search(&self, token: &str) -> reqwest::Response {
+        self.client
+            .post(self.url("/access/v1/search/action"))
+            .bearer_auth(token)
+            .json(&search_body())
+            .send()
+            .await
+            .unwrap()
+    }
+
+    async fn evaluate(&self, token: &str) -> reqwest::Response {
+        self.client
+            .post(self.url("/access/v1/evaluation"))
+            .bearer_auth(token)
+            .json(&json!({
+                "subject": {"type": "agent", "id": ""},
+                "action": {"name": "read_file", "properties": {"server": "github"}},
+                "resource": {"type": "mcp_server", "id": "github"},
+                "context": {"input": {"repo": "alice/public-site"}},
+            }))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    async fn evaluate_batch(&self, token: &str) -> reqwest::Response {
+        let entry = json!({"action": {"name": "read_file", "properties": {"server": "github"}}});
+        self.client
+            .post(self.url("/access/v1/evaluations"))
+            .bearer_auth(token)
+            .json(&json!({
+                "subject": {"type": "agent", "id": ""},
+                "resource": {"type": "mcp_server", "id": "github"},
+                "context": {"input": {"repo": "alice/public-site"}},
+                "evaluations": [entry.clone(), entry],
+            }))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    async fn audit_len(&self) -> usize {
+        let resp = self
+            .client
+            .get(self.url("/admin/audit?from=1&limit=1000"))
+            .bearer_auth(ADMIN)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        resp.json::<Value>().await.unwrap()["entries"]
+            .as_array()
+            .unwrap()
+            .len()
+    }
+}
+
+/// Off by default: a run may search as often as it likes, and nothing is counted.
+#[tokio::test]
+async fn the_search_rate_limit_is_off_by_default() {
+    let h = Harness::start(|_| {}).await;
+    let alice = h.mint_root("alice", "planner").await;
+    for _ in 0..30 {
+        assert_eq!(h.search(&alice).await.status(), StatusCode::OK);
+    }
+    assert!(h.metrics().contains(
+        "attenuo_requests_rate_limited_total{limit=\"authzen_search\",cause=\"limit\"} 0\n"
+    ));
+    h.stop().await;
+}
+
+/// `authzen_search_requests_per_minute`: a run gets N searches a minute, a delegated token of
+/// the run shares them, the N+1st is `429` `rate_limited` with `Retry-After` and evaluates
+/// nothing; another run is not touched; evaluation, batch evaluation and `/mcp` of the limited
+/// run still answer, and MCP requests spend no searches (a table of its own); a bad token
+/// counts against no one; and no search, admitted or refused, writes an audit record.
+#[tokio::test]
+async fn the_search_rate_limit_is_per_run() {
+    let h = Harness::start(|c| {
+        c.limits.authzen_search_requests_per_minute = 3;
+        c.limits.mcp_requests_per_minute = 2;
+    })
+    .await;
+    let alice = h.mint_root("alice", "planner").await;
+    let bob = h.mint_root("bob", "planner").await;
+    // Two MCP requests use up alice's MCP minute and none of her searches.
+    for _ in 0..2 {
+        assert_eq!(h.list(&alice).await.status(), StatusCode::OK);
+    }
+    assert_eq!(h.list(&alice).await.status(), StatusCode::TOO_MANY_REQUESTS);
+    // A bad token is refused before anything is counted.
+    for _ in 0..5 {
+        assert_eq!(
+            h.search("not-a-token").await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    // A child of alice's run (its delegation is audited, before the count starts).
+    let child = h
+        .exchange(&alice, "coder", ("coder", &secret("coder")))
+        .await;
+    assert_eq!(child.status(), StatusCode::OK);
+    let child = child.json::<Value>().await.unwrap()["access_token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let before = h.audit_len().await;
+    for _ in 0..2 {
+        let resp = h.search(&alice).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: Value = resp.json().await.unwrap();
+        assert_eq!(v["results"][0]["name"], "read_file", "{v}");
+    }
+    // A child of alice's run: its third search.
+    assert_eq!(h.search(&child).await.status(), StatusCode::OK);
+    for token in [&alice, &child] {
+        let resp = h.search(token).await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!((1..=60).contains(&retry_after(&resp)));
+        let v: Value = resp.json().await.unwrap();
+        assert_eq!(v["error"], "rate_limited", "{v}");
+        assert_eq!(v["code"], "rate_limited", "{v}");
+        assert_eq!(v["error_description"], "rate_limited", "{v}");
+        assert!(v.get("results").is_none(), "{v}");
+    }
+    assert_eq!(
+        h.audit_len().await,
+        before,
+        "a search wrote an audit record"
+    );
+    // Another run searches as before.
+    assert_eq!(h.search(&bob).await.status(), StatusCode::OK);
+    // The limited run still evaluates (audited, not counted here).
+    let e = h.evaluate(&alice).await;
+    assert_eq!(e.status(), StatusCode::OK);
+    assert_eq!(e.json::<Value>().await.unwrap()["decision"], true);
+    let b = h.evaluate_batch(&alice).await;
+    assert_eq!(b.status(), StatusCode::OK);
+    assert_eq!(
+        b.json::<Value>().await.unwrap()["evaluations"]
+            .as_array()
+            .map(Vec::len),
+        Some(2)
+    );
+    assert_eq!(h.audit_len().await, before + 3);
+    let m = h.metrics();
+    assert!(
+        m.contains(
+            "attenuo_requests_rate_limited_total{limit=\"authzen_search\",cause=\"limit\"} 2\n"
+        ),
+        "{m}"
+    );
+    assert!(m.contains("attenuo_requests_rate_limited_total{limit=\"mcp\",cause=\"limit\"} 1\n"));
+    h.stop().await;
+}
+
+/// A `[[peps]]` entry searching with an unsigned chain is counted against the chain's root
+/// lease, the same run as the bearer's: requests that fail the PEP's authentication spend
+/// nothing, and the run's own token shares the minute with the PEP.
+#[tokio::test]
+async fn a_pep_search_with_an_unsigned_chain_counts_against_its_run() {
+    let h = Harness::start(|c| {
+        c.limits.authzen_search_requests_per_minute = 2;
+        c.authzen.allow_unsigned_chain = true;
+        c.peps = vec![attenuo_server::config::PepConfig::with_secret_sha256(
+            "gateway",
+            common::sha256_hex(PEP_SECRET),
+        )];
+    })
+    .await;
+    let alice = h.mint_root("alice", "planner").await;
+    let chain = h
+        .state
+        .verifier
+        .verify(&alice, time::OffsetDateTime::now_utc())
+        .unwrap()
+        .chain;
+    let call = attenuo_core::ToolCall::new("github", "read_file", json!({}));
+    let pep_search = |secret: &str| {
+        let mut body =
+            serde_json::to_value(attenuo_policy::authzen::to_request(&chain, &call)).unwrap();
+        let obj = body.as_object_mut().unwrap();
+        obj.remove("action");
+        obj.insert(
+            "resource".into(),
+            json!({"type": "mcp_server", "id": "github"}),
+        );
+        obj.insert("pep_id".into(), json!("gateway"));
+        obj.insert("pep_secret".into(), json!(secret));
+        h.client
+            .post(h.url("/access/v1/search/action"))
+            .json(&body)
+            .send()
+    };
+    for _ in 0..5 {
+        let resp = pep_search("wrong").await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+    assert_eq!(
+        pep_search(PEP_SECRET).await.unwrap().status(),
+        StatusCode::OK
+    );
+    assert_eq!(h.search(&alice).await.status(), StatusCode::OK);
+    let resp = pep_search(PEP_SECRET).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(resp.json::<Value>().await.unwrap()["code"], "rate_limited");
+    assert_eq!(
+        h.search(&alice).await.status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    h.stop().await;
 }

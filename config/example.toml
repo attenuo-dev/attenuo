@@ -404,11 +404,13 @@ request_body_timeout_seconds = 30
 request_timeout_seconds = 60
 # Per-caller rate limits, per minute, off (0) by default: POST /token per authenticated
 # agent, POST /token that authenticated no agent per peer address (behind a reverse proxy
-# every caller shares its address), and /mcp/{server} per run (root lease). Over: 429 with
-# Retry-After. Pick a few times the busiest legitimate rate.
+# every caller shares its address), /mcp/{server} per run (root lease), and AuthZEN action
+# search (POST /access/v1/search/action, not audited) per run in a table of its own. Over:
+# 429 with Retry-After. Pick a few times the busiest legitimate rate.
 token_requests_per_minute = 0
 token_unauthenticated_requests_per_minute = 0
 mcp_requests_per_minute = 0
+authzen_search_requests_per_minute = 0
 # Callers each rate limit tracks; when all are inside their minute a new one is refused.
 rate_limit_max_keys = 10000
 

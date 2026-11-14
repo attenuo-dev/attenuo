@@ -82,14 +82,17 @@ pub enum RateLimitedBy {
     TokenUnauthenticated = 1,
     /// `mcp_requests_per_minute`, per run.
     Mcp = 2,
+    /// `authzen_search_requests_per_minute`, per run.
+    AuthzenSearch = 3,
 }
 
 impl RateLimitedBy {
     /// Every limit, in index order.
-    pub const ALL: [RateLimitedBy; 3] = [
+    pub const ALL: [RateLimitedBy; 4] = [
         RateLimitedBy::Token,
         RateLimitedBy::TokenUnauthenticated,
         RateLimitedBy::Mcp,
+        RateLimitedBy::AuthzenSearch,
     ];
 
     /// The label value.
@@ -98,6 +101,7 @@ impl RateLimitedBy {
             RateLimitedBy::Token => "token",
             RateLimitedBy::TokenUnauthenticated => "token_unauthenticated",
             RateLimitedBy::Mcp => "mcp",
+            RateLimitedBy::AuthzenSearch => "authzen_search",
         }
     }
 }
@@ -236,7 +240,7 @@ pub struct Metrics {
     /// `[limits]`: requests refused by the in-flight cap, by a rate limit (by
     /// [`RateLimitedBy`] and [`RateLimitCause`]), and past a deadline (by [`TimeoutKind`]).
     requests_shed: AtomicU64,
-    rate_limited: [[AtomicU64; 2]; 3],
+    rate_limited: [[AtomicU64; 2]; 4],
     request_timeouts: [AtomicU64; 2],
 }
 
@@ -891,8 +895,8 @@ impl Metrics {
             &mut out,
             "requests_rate_limited_total",
             "Requests answered 429 by a [limits] rate limit, by limit (token: per agent, \
-             token_unauthenticated: per peer address, mcp: per run) and cause (limit: the \
-             caller used up its minute; table_full: a new caller while rate_limit_max_keys \
+             token_unauthenticated: per peer address, mcp: per run, authzen_search: action \
+             searches per run) and cause (limit: the caller used up its minute; table_full: a new caller while rate_limit_max_keys \
              callers were inside their minute).",
             "counter",
         );

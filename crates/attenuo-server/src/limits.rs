@@ -1,5 +1,6 @@
 //! `[limits]`: the in-flight cap, the request body and handler deadlines, and the per-caller
-//! rate limits of `POST /token` and `/mcp/{server}` (audit finding S-4).
+//! rate limits of `POST /token`, `/mcp/{server}` (audit finding S-4) and AuthZEN action search
+//! (SR-117).
 //!
 //! All of it is in-process and per server: with more than one replica each counts on its own
 //! (one replica is the supported deployment, see the deploy guide). None of it is a security
@@ -28,7 +29,8 @@
 //! distinct callers cannot push out the count of the one being limited. The per-peer table of
 //! `POST /token` is the exception: requests that authenticate an agent never enter it, so a
 //! new address with client credentials is let through to authenticate, and refused only if it
-//! does not ([`token_peer_limit`], SR-109). Keys are run ids (root lease ids), agent ids and
+//! does not ([`token_peer_limit`], SR-109). Action search has its own per-run table, apart from
+//! the MCP one ([`Limits::admit_search`]). Keys are run ids (root lease ids), agent ids and
 //! peer addresses, never a user subject.
 
 use std::collections::HashMap;
@@ -75,6 +77,9 @@ pub(crate) struct Limits {
     pub(crate) token_peer: Option<RateLimiter>,
     /// `/mcp/{server}`, per run.
     pub(crate) mcp: Option<RateLimiter>,
+    /// `POST /access/v1/search/action`, per run; a table of its own, so searches and MCP
+    /// requests do not use up each other's minute.
+    pub(crate) authzen_search: Option<RateLimiter>,
     metrics: Arc<Metrics>,
     /// When a full table was last logged, so a flood of new callers logs once in a while.
     full_logged: Mutex<Option<Instant>>,
@@ -109,6 +114,7 @@ impl Limits {
             token: limiter(section.token_requests_per_minute),
             token_peer: limiter(section.token_unauthenticated_requests_per_minute),
             mcp: limiter(section.mcp_requests_per_minute),
+            authzen_search: limiter(section.authzen_search_requests_per_minute),
             metrics,
             full_logged: Mutex::new(None),
         }
@@ -134,6 +140,38 @@ impl Limits {
                     );
                 }
                 Err(retry)
+            }
+        }
+    }
+
+    /// Count one AuthZEN action search of the run `chain_id` (the chain's root lease), once the
+    /// caller has authenticated and before any candidate is evaluated (SR-117).
+    ///
+    /// # Errors
+    ///
+    /// `429` `rate_limited` with `Retry-After` when the run is over
+    /// `authzen_search_requests_per_minute`.
+    pub(crate) fn admit_search(&self, chain_id: &str) -> Result<(), ApiError> {
+        let Some(limiter) = &self.authzen_search else {
+            return Ok(());
+        };
+        match limiter.admit(chain_id, Instant::now()) {
+            Verdict::Admit => Ok(()),
+            refused => {
+                let retry = self.refused(RateLimitedBy::AuthzenSearch, &refused);
+                if refused.first() {
+                    tracing::warn!(
+                        limit = "authzen_search_requests_per_minute",
+                        chain_id,
+                        retry_after_seconds = retry,
+                        "rate limit reached; further action searches of this run are refused \
+                         until the minute ends"
+                    );
+                }
+                Err(rate_limited(
+                    "too many action searches for this run; retry later",
+                    retry,
+                ))
             }
         }
     }
@@ -881,6 +919,44 @@ mod tests {
             let _ = l.admit(&format!("churn{step}"), now);
         }
         assert_eq!(admitted, 5);
+    }
+
+    /// `authzen_search_requests_per_minute` (SR-117): off by default; on, a run gets N
+    /// searches, the next is `429` `rate_limited` with `Retry-After`, another run is not
+    /// touched, and its table is not the MCP one in either direction.
+    #[test]
+    fn the_search_limit_is_per_run_and_apart_from_the_mcp_limit() {
+        let (off, _) = limits(|_| {});
+        for _ in 0..1_000 {
+            off.admit_search("run-a").unwrap();
+        }
+        let (l, metrics) = limits(|s| {
+            s.authzen_search_requests_per_minute = 2;
+            s.mcp_requests_per_minute = 2;
+        });
+        // Two MCP requests of run-a spend none of its searches.
+        l.admit_mcp("run-a").unwrap();
+        l.admit_mcp("run-a").unwrap();
+        l.admit_search("run-a").unwrap();
+        l.admit_search("run-a").unwrap();
+        let e = l.admit_search("run-a").unwrap_err();
+        assert_eq!(e.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(e.stable_code(), RATE_LIMITED);
+        l.admit_search("run-b").unwrap();
+        // And the searches spent none of run-b's MCP requests.
+        l.admit_mcp("run-b").unwrap();
+        l.admit_mcp("run-b").unwrap();
+        assert!(l.admit_mcp("run-b").is_err());
+        let m = metrics.render();
+        assert!(
+            m.contains(
+                "attenuo_requests_rate_limited_total{limit=\"authzen_search\",cause=\"limit\"} 1\n"
+            ),
+            "{m}"
+        );
+        assert!(
+            m.contains("attenuo_requests_rate_limited_total{limit=\"mcp\",cause=\"limit\"} 1\n")
+        );
     }
 
     fn limits(f: impl FnOnce(&mut LimitsSection)) -> (Arc<Limits>, Arc<Metrics>) {
