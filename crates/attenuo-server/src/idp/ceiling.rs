@@ -226,12 +226,8 @@ fn named_by_details(value: &Value) -> CapabilitySet {
 /// Sound, not complete: see the module docs. Empty when nothing on either side is covered by a
 /// single capability of the other.
 pub(crate) fn meet(a: &CapabilitySet, b: &CapabilitySet) -> CapabilitySet {
-    let mut out = CapabilitySet::new();
-    for x in a.iter() {
-        if b.iter().any(|y| y.covers(x)) {
-            out.insert(x.clone());
-        }
-    }
+    // `covered`: `b` is prepared once, not once per member of `a` (SR-123).
+    let mut out: CapabilitySet = b.covered(a).into_iter().cloned().collect();
     for y in b.iter() {
         let one: CapabilitySet = std::iter::once(y.clone()).collect();
         if let Ok(narrowed) = a.attenuate(&one) {

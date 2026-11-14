@@ -269,13 +269,15 @@ pub(crate) async fn handle(
                 .map_err(|e| {
                     // Name a refused capability as the request has it: `capabilities` carry
                     // the root grant's limits, which the caller was not given (SR-124).
+                    // Each requested capability against the grant alone, the grant prepared
+                    // once (SR-123).
+                    let each = granted.attenuate_each(requested.iter());
                     let as_requested = |shown: &str| {
-                        requested.iter().find(|r| {
-                            let one: CapabilitySet = std::iter::once((*r).clone()).collect();
-                            granted
-                                .attenuate(&one)
-                                .is_ok_and(|c| c.iter().any(|c| c.display() == shown))
-                        })
+                        requested
+                            .iter()
+                            .zip(&each)
+                            .find(|(_, c)| c.as_ref().is_ok_and(|c| c.display() == shown))
+                            .map(|(r, _)| r)
                     };
                     if let attenuo_core::AttenuationError::LimitSplit { first, second } = &e {
                         let detail = match (as_requested(first), as_requested(second)) {
@@ -291,12 +293,15 @@ pub(crate) async fn handle(
                         };
                         return invalid_scope(LIMIT_SPLIT_AT_ROOT, detail);
                     }
-                    let refused = requested.iter().find(|r| {
-                        let one: CapabilitySet = std::iter::once((*r).clone()).collect();
-                        granted
-                            .attenuate(&one)
-                            .and_then(|c| applied.capabilities.attenuate(&c))
-                            .is_err()
+                    // Then each that passes the grant against the ceiling, prepared once.
+                    let under_ceiling = applied
+                        .capabilities
+                        .attenuate_each(each.iter().filter_map(|c| c.as_ref().ok()));
+                    let mut under_ceiling = under_ceiling.into_iter();
+                    let refused = requested.iter().zip(&each).find_map(|(r, c)| {
+                        let passes =
+                            c.is_ok() && under_ceiling.next().is_some_and(|under| under.is_ok());
+                        (!passes).then_some(r)
                     });
                     let detail = match refused {
                         Some(r) => attenuo_core::AttenuationError::NotCovered {
