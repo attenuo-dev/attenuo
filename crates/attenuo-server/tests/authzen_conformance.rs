@@ -650,3 +650,64 @@ async fn action_search_agrees_with_evaluation() {
         }
     }
 }
+
+/// SR-116: action search paged over every catalogued tool of the server, the ones the token's
+/// capabilities do not name included, so the pages of a `page.limit` of 1 counted the catalog
+/// (and placed the caller's own tools in it), which evaluating one tool at a time does not
+/// tell: a tool outside the capabilities is `capability_denied` whether it is catalogued or
+/// not. The candidates are now the catalogued tools the capabilities could permit, the
+/// proxy's `tools/list` filter, so paging shows nothing the caller's own token does not name.
+#[tokio::test]
+async fn action_search_pages_only_over_the_tools_the_capabilities_name_sr116() {
+    let h = Harness::start().await;
+    let token = h.mint(&json!({"capabilities": ["github:read_file"]})).await;
+    let mut body = json!({
+        "subject": {"type": "agent", "id": ""},
+        "resource": {"type": "mcp_server", "id": "github"},
+        "context": {"input": {"repo": "alice/public-site"}},
+        "page": {"limit": 1},
+    });
+    let mut pages = Vec::new();
+    loop {
+        let a = h.post_as(&token, "/access/v1/search/action", &body).await;
+        let next = a["page"]["next_token"].as_str().unwrap().to_string();
+        pages.push(a["results"].clone());
+        if next.is_empty() {
+            break;
+        }
+        assert!(pages.len() < 10, "paging did not end");
+        body["page"]["token"] = json!(next);
+    }
+    assert_eq!(
+        pages,
+        [json!([{"name": "read_file", "properties": {"server": "github"}}])],
+        "one page, holding the one tool the token names"
+    );
+    // What evaluation tells about a tool outside the capabilities: the same answer for a
+    // catalogued tool and one the catalog does not have.
+    let reason = |tool: &str| {
+        let eval = json!({
+            "subject": {"type": "agent", "id": ""},
+            "action": {"name": tool, "properties": {"server": "github"}},
+            "resource": {"type": "mcp_server", "id": "github"},
+            "context": {"input": {"repo": "alice/public-site"}},
+        });
+        let h = &h;
+        let token = &token;
+        async move {
+            let e = h.post_as(token, "/access/v1/evaluation", &eval).await;
+            assert_eq!(e["decision"], false, "{e}");
+            e["context"]["reason"].clone()
+        }
+    };
+    assert_eq!(reason("pay").await, json!("capability_denied"));
+    assert_eq!(reason("not_catalogued").await, json!("capability_denied"));
+    // A server the token does not name at all: no candidate, no next page.
+    body["resource"]["id"] = json!("vault");
+    body["page"] = json!({"limit": 1});
+    let a = h.post_as(&token, "/access/v1/search/action", &body).await;
+    assert_eq!(
+        a,
+        json!({"page": {"next_token": "", "count": 0}, "results": []})
+    );
+}

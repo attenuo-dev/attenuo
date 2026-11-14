@@ -257,16 +257,33 @@ thread_local! {
     static CAPTURE: std::cell::RefCell<Option<Vec<u8>>> = const { std::cell::RefCell::new(None) };
 }
 
-/// Writes to the calling thread's capture buffer, and discards output when none is active.
+/// Lines written on threads without a capture buffer of their own (the blocking pool a route
+/// handler runs on), while a test that needs them has turned this on. Tests running at the same
+/// time may write here too, so a test filters what it reads by a marker of its own.
+static SHARED_CAPTURE: std::sync::Mutex<Option<Vec<u8>>> = std::sync::Mutex::new(None);
+
+/// Writes to the calling thread's capture buffer, else to [`SHARED_CAPTURE`] when that is on,
+/// and discards output otherwise.
 struct ThreadCapture;
 
 impl std::io::Write for ThreadCapture {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        CAPTURE.with(|c| {
-            if let Some(v) = c.borrow_mut().as_mut() {
+        let mine = CAPTURE.with(|c| match c.borrow_mut().as_mut() {
+            Some(v) => {
+                v.extend_from_slice(buf);
+                true
+            }
+            None => false,
+        });
+        if !mine {
+            if let Some(v) = SHARED_CAPTURE
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .as_mut()
+            {
                 v.extend_from_slice(buf);
             }
-        });
+        }
         Ok(buf.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
@@ -318,6 +335,38 @@ fn a_newline_in_a_tool_name_stays_on_one_log_line() {
     assert_eq!(text.lines().count(), 1, "{text}");
     assert!(text.contains(r#"tool="read_file\nFORGED"#), "{text}");
     assert!(text.contains(r#"subject="alice\nFORGED"#), "{text}");
+}
+
+/// SR-115: the `AuthZEN action search` log line wrote the request's `server` with `Display`,
+/// so a newline in `resource.properties.server` forged a second log line, as SR-18 did for the
+/// decision line. It is Debug-formatted now.
+#[tokio::test]
+async fn a_newline_in_an_action_search_server_stays_on_one_log_line_sr115() {
+    install_capture();
+    let server = start(&base_config()).await;
+    let (token, _) = root_token(&server).await;
+    *SHARED_CAPTURE.lock().unwrap() = Some(Vec::new());
+    let resp = reqwest::Client::new()
+        .post(server.url("/access/v1/search/action"))
+        .bearer_auth(&token)
+        .json(&json!({
+            "subject": {"type": "agent", "id": ""},
+            "resource": {"type": "mcp_server", "id": "x",
+                         "properties": {"server": "gh\nFORGED-SR115 level=INFO decision"}},
+        }))
+        .send()
+        .await
+        .unwrap();
+    let captured = SHARED_CAPTURE.lock().unwrap().take().unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let text = String::from_utf8(captured).unwrap();
+    let marked: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("FORGED-SR115"))
+        .collect();
+    assert_eq!(marked.len(), 1, "{text}");
+    assert!(marked[0].contains("AuthZEN action search"), "{text}");
+    assert!(marked[0].contains(r#"server="gh\nFORGED-SR115"#), "{text}");
 }
 
 /// SR-90: tower-http's default request span recorded the full URI, query string included, so

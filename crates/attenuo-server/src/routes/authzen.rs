@@ -228,8 +228,10 @@ pub const SEARCH_ACTION_PATH: &str = "/access/v1/search/action";
 ///   then hold no `/` (a `<server>/<tool>` id names one tool, not a server). `resource.type`
 ///   is not checked, as for evaluation. An `action` in the request is ignored (section 8 leaves
 ///   it out of this request).
-/// - **Candidates.** The `[policy] catalog` tools of that server, in name order. A tool the
-///   catalog does not list is never a result, also under `unknown_tools = "allow"`.
+/// - **Candidates.** The `[policy] catalog` tools of that server that the chain's capabilities
+///   could permit (the proxy's `tools/list` filter), in name order. A tool the catalog does not
+///   list is never a result, also under `unknown_tools = "allow"`; a catalogued tool outside the
+///   capabilities is not a candidate, so paging does not count the catalog (SR-116).
 /// - **Results.** The candidates for which the pipeline would allow the call
 ///   ([`Pipeline::would_allow`](crate::authz::Pipeline::would_allow)): each result, sent back
 ///   as the `action` of `POST /access/v1/evaluation` with the same subject, resource and
@@ -392,11 +394,18 @@ fn search_actions(state: &AppState, headers: &HeaderMap, body: &Bytes) -> Result
     }
 
     let engine = state.pipeline.policy_snapshot();
+    // Only the catalogued tools the chain's capabilities could permit, the proxy's `tools/list`
+    // filter: no other tool can be a result (the capability stage denies it), and paging over
+    // them would count the catalog for the caller (SR-116).
+    let caps = a.chain.effective_capabilities();
     let candidates: Vec<&str> = engine
         .catalog()
         .iter()
         .filter(|((s, _), _)| *s == server)
         .map(|((_, tool), _)| tool.as_str())
+        .filter(|tool| {
+            caps.is_some_and(|c| attenuo_proxy::filter::could_permit_tool(c, &server, tool))
+        })
         .collect();
     let start = page.start.min(candidates.len());
     let end = start.saturating_add(page.limit).min(candidates.len());
@@ -420,10 +429,11 @@ fn search_actions(state: &AppState, headers: &HeaderMap, body: &Bytes) -> Result
         String::new()
     };
     // Not a decision, so not in the audit log (see `search_action`); the log line says that a
-    // search ran, for whom, and how much it looked at.
+    // search ran, for whom, and how much it looked at. `server` is the caller's: Debug-format
+    // it so a newline cannot forge a log line (SR-18, SR-115).
     tracing::info!(
         chain_id = attenuo_core::chain_id_of(&a.chain).unwrap_or_default(),
-        server = %server,
+        server = ?server,
         evaluated = window.len(),
         permitted = results.len(),
         "AuthZEN action search"
