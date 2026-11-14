@@ -270,7 +270,7 @@ Optional, per `[[idps]]` entry, off by default. With it, the root token minted f
 
 How each claim names capabilities:
 
-- `authorization_details`: the `capabilities` of every entry of type `attenuo_capabilities` (attenuo's own type, the one `POST /token` requests use), read as the token's capability objects but strictly: a capability with an unknown member (a misspelt `constraint`, say), an invalid name or limits no token may carry names nothing. An entry of any other type names nothing. A claim whose entries hold more than 256 capabilities names nothing at all, and a capability with a `one_of` of more than 1,024 values names nothing (SR-123).
+- `authorization_details`: the `capabilities` of every entry of type `attenuo_capabilities` (attenuo's own type, the one `POST /token` requests use), read as the token's capability objects but strictly: a capability with an unknown member (a misspelt `constraint`, say), an invalid name or limits no token may carry names nothing. An entry of any other type names nothing. A claim whose entries hold more than 256 capabilities, or more than 1,024 argument constraints or `one_of` values in all, names nothing at all, and a capability with a `one_of` of more than 1,024 values names nothing (SR-123).
 - `resource` (a string or an array of strings): the servers `resources` maps each value to. An unmapped value names nothing.
 - `scope` (a space-separated string): the capabilities `scopes` maps each token to. An unmapped token names nothing.
 
@@ -280,7 +280,7 @@ A capability is kept when a single capability of the other side covers it (`⊑`
 
 A limit in a claim, as in the root grant, is copied into the requested capability it covers. Hop 0 has no parent hop to charge, so a limit copied into several capabilities would bound each of them, not the run: a request in which two capabilities take their limits from the same limited capability of the ceiling (`send_money` once per recipient under `sum` 100) is refused with `invalid_scope` / `limit_split_at_root` (SR-121). Ask for one capability instead, with a `one_of` or wider constraint (`to` in `["alice", "bob", "carol"]`), which then carries the figure once. A capability of the ceiling without limits may be split as before. Limits set at an exchange are not affected, since every call is also charged against the parent hop.
 
-The server refuses to start on an empty resource identifier, a resource mapped to no server or to a name that is not a valid server name (or is `attenuo`), a scope token that is empty or holds whitespace, a scope mapped to no capability, or a capability that does not parse or whose limits no token may carry (for example an empty `arg`, a `derive` on a `sum`, a `max` above 2^63 - 1), and on a scope mapped to more than 1,024 capabilities or a `one_of` of more than 1,024 values.
+The server refuses to start on an empty resource identifier, a resource mapped to no server or to a name that is not a valid server name (or is `attenuo`), a scope token that is empty or holds whitespace, a scope mapped to no capability, or a capability that does not parse or whose limits no token may carry (for example an empty `arg`, a `derive` on a `sum`, a `max` above 2^63 - 1), and on a scope mapped to more than 1,024 capabilities, more than 1,024 argument constraints or `one_of` values in all, or a `one_of` of more than 1,024 values.
 
 ```toml
 [[idps]]
@@ -316,7 +316,7 @@ The most a root token may carry.
 | `issuer` | Issuer of the users this applies to. |
 | `agent` | The agent that holds the root token. |
 | `subject` | Optional. Pins the entry to one user. A pinned entry wins over an unpinned one. |
-| `capabilities` | List of `server:tool` strings (globs such as `github:*` allowed) or full capability tables `{ server, tool, constraints }`. Requests are attenuated against this. At most 1,024 capabilities, and at most 1,024 values in a `one_of`; more refuses to start (SR-123). |
+| `capabilities` | List of `server:tool` strings (globs such as `github:*` allowed) or full capability tables `{ server, tool, constraints }`. Requests are attenuated against this. At most 1,024 capabilities, 1,024 argument constraints and 1,024 `one_of` values in all, and at most 1,024 values in a `one_of`; more refuses to start (SR-123). |
 | `attributes` | Used only by the development root mint. IdP intake takes attributes from the verified token. |
 
 For the development root mint, an empty `[[root_grants]]` list lets the admin mint any capabilities.
