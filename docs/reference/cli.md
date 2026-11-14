@@ -511,7 +511,7 @@ attenuo --admin-server http://127.0.0.1:9102 --admin-token-file /run/secrets/att
 
 Parse a Cedar policy file and validate it against the generated schema. Prints errors with line and column. Exit 0 if clean, 2 if there are errors.
 
-With `--config`, it also reads the config's `[[root_grants]]` capabilities and prints `<config>: warning: [[root_grants]] ...` for each `prefix` constraint on an argument that looks like a file path, recommending `path_prefix` ([why](../concepts/capabilities-and-attenuation.md#prefixes-of-strings-and-of-paths)). These warnings do not change the exit code; `--json` lists them under `capability_warnings`. It does not run the server's start-up checks on `[[root_grants]]` (a reserved agent id or server name, a capability that does not parse, the size bounds, limits no token may carry): a configuration that passes `policy lint` can still refuse to start, and the server's message names the entry.
+With `--config`, it also reads the config's `[[root_grants]]` capabilities and prints `<config>: warning: [[root_grants]] ...` for each `prefix` constraint on an argument that looks like a file path, recommending `path_prefix` ([why](../concepts/capabilities-and-attenuation.md#prefixes-of-strings-and-of-paths)). These warnings do not change the exit code; `--json` lists them under `capability_warnings`. It does not run the server's start-up checks on `[[root_grants]]` (the reserved agent id, a capability that does not parse, a server or tool name that is not allowed, the size bounds, limits no token may carry): a configuration that passes `policy lint` can still refuse to start, and the server's message names the entry.
 
 | Option | Meaning |
 | --- | --- |
