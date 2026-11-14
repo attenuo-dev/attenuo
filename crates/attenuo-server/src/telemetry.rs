@@ -749,6 +749,18 @@ pub async fn trace_route(
     response
 }
 
+/// Rename the exported span that is current, once it has started: the route span of
+/// [`trace_route`] for a `POST /token` that turns out to be an IdP intake
+/// (`attenuo.token.root`). Recording `otel.name` does not do this: `tracing-opentelemetry`
+/// applies that field only before the span starts, and `trace_route` has entered it by then.
+/// Nothing happens when no exported span is current (tracing off).
+pub fn rename_current_span(name: &'static str) {
+    #[cfg(feature = "otel")]
+    otel::rename_current(name);
+    #[cfg(not(feature = "otel"))]
+    let _ = name;
+}
+
 /// The subscriber's log layer in the text format, on standard output, with colour when that
 /// is a terminal ([`crate::logging::layer`]). [`init`] picks the format from `[logging]`.
 pub fn log_layer<S>() -> impl tracing_subscriber::Layer<S> + Send + Sync
@@ -903,6 +915,10 @@ mod otel {
 
     pub(super) fn current() -> Option<TraceParent> {
         trace_parent(opentelemetry::Context::current().span().span_context())
+    }
+
+    pub(super) fn rename_current(name: &'static str) {
+        opentelemetry::Context::current().span().update_name(name);
     }
 
     pub(super) fn context_of(span: &tracing::Span) -> Option<TraceParent> {

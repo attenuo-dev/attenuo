@@ -1109,3 +1109,157 @@ async fn authzen_and_token_routes_get_one_span_each() {
     assert_eq!(attr(renew, "http.response.status_code"), Some(status));
     assert_nothing_forbidden(&spans, &[&token, SUBJECT]);
 }
+
+/// A fake OIDC IdP publishing one ES256 key through discovery, and the ID tokens it signs.
+struct EcIdp {
+    issuer: String,
+    encoding: jsonwebtoken::EncodingKey,
+    _server: Spawned,
+}
+
+impl EcIdp {
+    const AUDIENCE: &'static str = "attenuo-client";
+
+    async fn start() -> Self {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
+        let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref(), &rng)
+            .unwrap();
+        let point = pair.public_key().as_ref().to_vec();
+        let jwk = json!({
+            "kty": "EC", "crv": "P-256", "alg": "ES256", "use": "sig", "kid": "ec1",
+            "x": URL_SAFE_NO_PAD.encode(&point[1..33]),
+            "y": URL_SAFE_NO_PAD.encode(&point[33..]),
+        });
+        let cell = Arc::new(std::sync::OnceLock::<String>::new());
+        let discovery = cell.clone();
+        let app = axum::Router::new()
+            .route(
+                "/.well-known/openid-configuration",
+                axum::routing::get(move || {
+                    let iss = discovery.get().cloned().unwrap_or_default();
+                    async move {
+                        axum::Json(json!({ "issuer": iss, "jwks_uri": format!("{iss}/jwks") }))
+                    }
+                }),
+            )
+            .route(
+                "/jwks",
+                axum::routing::get(move || {
+                    let jwk = jwk.clone();
+                    async move { axum::Json(json!({ "keys": [jwk] })) }
+                }),
+            );
+        let server = spawn_router(app).await.unwrap();
+        let issuer = server.url("").trim_end_matches('/').to_string();
+        cell.set(issuer.clone()).unwrap();
+        Self {
+            issuer,
+            encoding: jsonwebtoken::EncodingKey::from_ec_der(pkcs8.as_ref()),
+            _server: server,
+        }
+    }
+
+    fn id_token(&self, sub: &str) -> String {
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
+        header.kid = Some("ec1".into());
+        let claims = json!({
+            "iss": self.issuer, "aud": Self::AUDIENCE, "sub": sub,
+            "iat": now, "exp": now + 300, "jti": uuid::Uuid::new_v4().to_string(),
+        });
+        jsonwebtoken::encode(&header, &claims, &self.encoding).unwrap()
+    }
+
+    /// `planner` (secret `planner-secret`) may present this IdP's ID tokens for `github:*`.
+    fn trust(&self, cfg: &mut Config) {
+        use attenuo_server::config::{AgentConfig, CapSpec, IdpConfig, RootGrant};
+        use sha2::Digest;
+        cfg.idps = vec![IdpConfig {
+            issuer: self.issuer.clone(),
+            audience: Self::AUDIENCE.into(),
+            jwks_url: None,
+            allowed_algs: vec!["ES256".into()],
+            attribute_claims: vec![],
+            jwks_ttl_seconds: 300,
+            clock_skew_seconds: 60,
+            tenant: None,
+            ca_pem_path: None,
+            client_ids: BTreeMap::from([("planner".to_string(), Self::AUDIENCE.to_string())]),
+        }];
+        cfg.agents = vec![AgentConfig::with_secret_sha256(
+            "planner",
+            hex::encode(sha2::Sha256::digest(b"planner-secret")),
+        )];
+        cfg.root_grants = vec![RootGrant {
+            subject: None,
+            issuer: self.issuer.clone(),
+            agent: "planner".into(),
+            capabilities: vec![CapSpec::Short("github:*".into())],
+            attributes: BTreeMap::new(),
+            may_act: None,
+        }];
+    }
+}
+
+/// Live run of 2026-11-14 (`scripts/live-otel-backend-smoke.sh`): a root token minted from an
+/// IdP's ID token at `POST /token` reached Jaeger as `attenuo.token.exchange`. The handler
+/// renamed the span by recording `otel.name`, which `tracing-opentelemetry` applies only
+/// before the span has started, and `trace_route` had already entered it.
+#[tokio::test]
+async fn an_idp_credential_at_post_token_is_an_attenuo_token_root_span() {
+    let sink = Collect::default();
+    let (provider, _guard) = install(&settings(2048, 512), sink.clone(), Arc::default());
+    let idp = EcIdp::start().await;
+    let h = Harness::start(|c| idp.trust(c)).await;
+    let id_token = idp.id_token(SUBJECT);
+    let body = serde_urlencoded::to_string([
+        (
+            "grant_type",
+            "urn:ietf:params:oauth:grant-type:token-exchange",
+        ),
+        ("subject_token", id_token.as_str()),
+        (
+            "subject_token_type",
+            "urn:ietf:params:oauth:token-type:id_token",
+        ),
+        ("client_id", "planner"),
+        ("client_secret", "planner-secret"),
+        ("scope", "github:read_file"),
+    ])
+    .unwrap();
+    let resp = h
+        .client
+        .post(h.server.url("/token"))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header("traceparent", INBOUND)
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let root = resp.json::<Value>().await.unwrap()["access_token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let spans = spans_until(&provider, &sink, "attenuo.token.root").await;
+    let span = one(&spans, "attenuo.token.root");
+    assert!(
+        !names(&spans).contains("attenuo.token.exchange"),
+        "{:?}",
+        names(&spans)
+    );
+    assert_eq!(span.span_kind, SpanKind::Server);
+    assert_eq!(attr(span, "http.route").as_deref(), Some("/token"));
+    assert_eq!(
+        attr(span, "http.response.status_code").as_deref(),
+        Some("200")
+    );
+    // The token route is linked, as the MCP port is.
+    assert_ne!(span.span_context.trace_id().to_string(), INBOUND_TRACE);
+    assert_eq!(span.links.len(), 1);
+    assert_nothing_forbidden(&spans, &[&id_token, &root, SUBJECT, "planner-secret"]);
+}
