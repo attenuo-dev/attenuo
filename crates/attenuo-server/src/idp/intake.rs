@@ -62,7 +62,7 @@ use super::{claims, CredentialKind, IntakeError, ID_JAG_TOKEN_TYPE, ID_TOKEN_TYP
 use crate::actor::{VerifiedActor, ACTOR_TOKEN_TYPE};
 use crate::clientauth::{self, invalid_request, Authenticated, Clients};
 use crate::config::{capability_set, ActorAuth, RootGrant};
-use crate::error::ApiError;
+use crate::error::{limit_split_detail, ApiError, LIMIT_SPLIT_AT_ROOT};
 use crate::routes::token::take_actor_token;
 use crate::routes::{audit_issuance, no_store, register_issued};
 use crate::state::AppState;
@@ -235,9 +235,14 @@ pub(crate) async fn handle(
         )
     })?;
     let granted = capability_set(&grant.capabilities).map_err(ApiError::internal)?;
-    let capabilities = granted
-        .attenuate(&requested)
-        .map_err(|e| invalid_scope("scope_exceeds_grant", e.to_string()))?;
+    // `attenuate_root`: a limit of the grant bounds one capability of the root token (SR-121).
+    let capabilities = granted.attenuate_root(&requested).map_err(|e| match e {
+        attenuo_core::AttenuationError::LimitSplit { first, second } => invalid_scope(
+            LIMIT_SPLIT_AT_ROOT,
+            limit_split_detail(&first, &second, "the [[root_grants]] entry"),
+        ),
+        e => invalid_scope("scope_exceeds_grant", e.to_string()),
+    })?;
     // `[idps.id_jag_ceiling]` (opt-in): the ID-JAG's `resource`, `scope` and
     // `authorization_details` narrow the root grant further (draft -06 §4.4.1). Without the
     // table nothing here runs, and the answer and the audit record are as before.
@@ -256,25 +261,50 @@ pub(crate) async fn handle(
                     ),
                 ));
             }
-            let narrowed = applied.capabilities.attenuate(&capabilities).map_err(|_| {
-                // Name a refused capability as the request has it: `capabilities` carry
-                // the root grant's limits, which the caller was not given (SR-124).
-                let refused = requested.iter().find(|r| {
-                    let one: CapabilitySet = std::iter::once((*r).clone()).collect();
-                    granted
-                        .attenuate(&one)
-                        .and_then(|c| applied.capabilities.attenuate(&c))
-                        .is_err()
-                });
-                let detail = match refused {
-                    Some(r) => attenuo_core::AttenuationError::NotCovered {
-                        requested: r.display(),
+            let narrowed = applied
+                .capabilities
+                .attenuate_root(&capabilities)
+                .map_err(|e| {
+                    // Name a refused capability as the request has it: `capabilities` carry
+                    // the root grant's limits, which the caller was not given (SR-124).
+                    let as_requested = |shown: &str| {
+                        requested.iter().find(|r| {
+                            let one: CapabilitySet = std::iter::once((*r).clone()).collect();
+                            granted
+                                .attenuate(&one)
+                                .is_ok_and(|c| c.iter().any(|c| c.display() == shown))
+                        })
+                    };
+                    if let attenuo_core::AttenuationError::LimitSplit { first, second } = &e {
+                        let detail = match (as_requested(first), as_requested(second)) {
+                            (Some(a), Some(b)) => limit_split_detail(
+                                &a.display(),
+                                &b.display(),
+                                "the ID-JAG's claims",
+                            ),
+                            _ => "two requested capabilities take their limits from the same \
+                              capability of the ID-JAG's claims: ask for one capability \
+                              covering both instead"
+                                .into(),
+                        };
+                        return invalid_scope(LIMIT_SPLIT_AT_ROOT, detail);
                     }
-                    .to_string(),
-                    None => "the request asks for more than the ID-JAG's claims allow".into(),
-                };
-                invalid_scope("scope_exceeds_id_jag", detail)
-            })?;
+                    let refused = requested.iter().find(|r| {
+                        let one: CapabilitySet = std::iter::once((*r).clone()).collect();
+                        granted
+                            .attenuate(&one)
+                            .and_then(|c| applied.capabilities.attenuate(&c))
+                            .is_err()
+                    });
+                    let detail = match refused {
+                        Some(r) => attenuo_core::AttenuationError::NotCovered {
+                            requested: r.display(),
+                        }
+                        .to_string(),
+                        None => "the request asks for more than the ID-JAG's claims allow".into(),
+                    };
+                    invalid_scope("scope_exceeds_id_jag", detail)
+                })?;
             tracing::debug!(claims = ?applied.claims, "ID-JAG ceiling applied");
             ceiling_claims = Some(applied.claims);
             narrowed

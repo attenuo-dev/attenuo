@@ -14,6 +14,19 @@ pub enum AttenuationError {
     /// The requested set is empty; a hop with no capabilities is a configuration error.
     #[error("requested capability set is empty")]
     Empty,
+    /// At hop 0 ([`crate::CapabilitySet::attenuate_root`]): two requested capabilities take
+    /// their limits from the same limited capability of the root grant or ceiling, so each
+    /// would carry the whole figure (SR-121).
+    #[error(
+        "requested capabilities `{first}` and `{second}` take their limits from the same \
+         limited capability, which bounds one capability of a root token, not several"
+    )]
+    LimitSplit {
+        /// One of them, as [`crate::Capability::display`] writes the request.
+        first: String,
+        /// The other.
+        second: String,
+    },
 }
 
 /// Why a delegation chain is not valid.

@@ -373,6 +373,20 @@ pub const TTL_OUT_OF_RANGE: &str = "ttl_out_of_range";
 pub const SCOPE_EXCEEDS_PARENT: &str = "scope_exceeds_parent";
 /// `code` of an exchange whose chain would be deeper than `[issuer] max_depth`.
 pub const CHAIN_TOO_DEEP: &str = "chain_too_deep";
+/// `code` of a hop-0 request in which two capabilities take their limits from the same
+/// limited capability of the root grant or of the ID-JAG ceiling (SR-121).
+pub const LIMIT_SPLIT_AT_ROOT: &str = "limit_split_at_root";
+
+/// The `detail` of a [`LIMIT_SPLIT_AT_ROOT`] refusal: names the two capabilities as requested
+/// and `of`, where their limits come from, never the limits themselves (SR-124).
+pub(crate) fn limit_split_detail(first: &str, second: &str, of: &str) -> String {
+    format!(
+        "requested capabilities `{first}` and `{second}` take their limits from the same \
+         capability of {of}, and a limit there bounds one capability of the root token, not \
+         each of several: ask for one capability covering both (a `one_of` or wider \
+         constraint) instead"
+    )
+}
 
 /// The answer to a token the server was asked to mint (an exchange's child, a root token) and
 /// could not. As [`From<TokenError>`](attenuo_token::TokenError), with the request's own fault

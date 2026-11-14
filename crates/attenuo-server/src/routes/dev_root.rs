@@ -31,7 +31,7 @@ use super::{
     audit_admin, audit_issuance, no_store, parse_json, register_issued, REASON_ADMIN_ACTION,
 };
 use crate::config::{capability_set, CapSpec, RootGrant};
-use crate::error::{ApiError, INVALID_CAPABILITY};
+use crate::error::{limit_split_detail, ApiError, INVALID_CAPABILITY, LIMIT_SPLIT_AT_ROOT};
 use crate::state::AppState;
 use attenuo_core::Decision;
 
@@ -220,8 +220,17 @@ fn resolve_grant(grants: &[RootGrant], req: &RootTokenRequest) -> Result<Granted
     let ceiling = capability_set(&grant.capabilities).map_err(ApiError::internal)?;
     let caps = match requested {
         None => ceiling,
-        Some(r) => ceiling.attenuate(&r).map_err(|e| {
-            ApiError::bad_request("invalid_scope", e.to_string()).with_code(SCOPE_EXCEEDS_GRANT)
+        // `attenuate_root`: a limit of the grant bounds one capability of the root token
+        // (SR-121).
+        Some(r) => ceiling.attenuate_root(&r).map_err(|e| match e {
+            attenuo_core::AttenuationError::LimitSplit { first, second } => ApiError::bad_request(
+                "invalid_scope",
+                limit_split_detail(&first, &second, "the [[root_grants]] entry"),
+            )
+            .with_code(LIMIT_SPLIT_AT_ROOT),
+            e => {
+                ApiError::bad_request("invalid_scope", e.to_string()).with_code(SCOPE_EXCEEDS_GRANT)
+            }
         })?,
     };
     let may_act = grant.may_act_for(req.may_act.clone()).map_err(|e| {

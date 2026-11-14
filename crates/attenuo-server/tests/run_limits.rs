@@ -46,6 +46,10 @@ struct Minted {
 
 impl Harness {
     async fn start() -> Self {
+        Self::start_with(|_| {}).await
+    }
+
+    async fn start_with(tweak: impl FnOnce(&mut Config)) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let policy_path = dir.path().join("policies.cedar");
         std::fs::write(&policy_path, POLICY).unwrap();
@@ -81,6 +85,7 @@ impl Harness {
         cfg.admin.token = Some(ADMIN.into());
         cfg.dev.allow_root_mint = true;
         cfg.agents = agent_configs(AGENTS, secret);
+        tweak(&mut cfg);
         let (router, state) = attenuo_server::build(&cfg).unwrap();
         let server = spawn_router(router).await.unwrap();
         Self {
@@ -103,6 +108,15 @@ impl Harness {
     }
 
     async fn mint_root(&self, caps: Value) -> Minted {
+        let (status, v) = self.try_mint_root(caps).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        Minted {
+            token: v["access_token"].as_str().unwrap().into(),
+            lease: v["lease"].as_str().unwrap().into(),
+        }
+    }
+
+    async fn try_mint_root(&self, caps: Value) -> (StatusCode, Value) {
         let resp = self
             .admin_post(
                 "/admin/root-token",
@@ -110,12 +124,7 @@ impl Harness {
                        "agent": "planner", "capabilities": caps}),
             )
             .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let v: Value = resp.json().await.unwrap();
-        Minted {
-            token: v["access_token"].as_str().unwrap().into(),
-            lease: v["lease"].as_str().unwrap().into(),
-        }
+        (resp.status(), resp.json().await.unwrap())
     }
 
     async fn exchange(&self, parent: &str, actor: &str, caps: Value) -> Minted {
@@ -1108,4 +1117,168 @@ async fn dry_run_refuses_a_malformed_budget() {
         assert!(text.contains(want), "{budget}: want {want:?} in {v}");
     }
     assert_eq!(h.state.audit.len().unwrap(), audit_before);
+}
+
+/// A harness whose `POST /admin/root-token` is limited to one `[[root_grants]]` entry for
+/// planner, with these capabilities.
+async fn with_root_grant(caps: Value) -> Harness {
+    Harness::start_with(|cfg| {
+        cfg.root_grants = vec![attenuo_server::config::RootGrant {
+            subject: None,
+            issuer: "https://idp.example".into(),
+            agent: "planner".into(),
+            capabilities: serde_json::from_value(caps).unwrap(),
+            attributes: BTreeMap::new(),
+            may_act: None,
+        }];
+    })
+    .await
+}
+
+fn pay_to(who: &str) -> Value {
+    json!({"server": "bank", "tool": "send_money",
+           "constraints": {"recipient": {"op": "equals", "value": who}}})
+}
+
+/// SR-121: a limit of the root grant is copied into each requested capability it covers, and
+/// a call is charged only against the capabilities that match it, so three capabilities, one
+/// per recipient, would each carry the grant's `sum` of 100 and the run could send 300. Hop 0
+/// refuses that request; one capability with `one_of` gets the budget once.
+#[tokio::test]
+async fn a_root_grant_limit_is_not_split_across_capabilities_sr121() {
+    let h = with_root_grant(json!([{"server": "bank", "tool": "send_money",
+        "limits": {"sum": {"arg": "amount", "max": 100}}}]))
+    .await;
+    let (status, v) = h
+        .try_mint_root(json!([pay_to("alice"), pay_to("bob"), pay_to("carol")]))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["error"], "invalid_scope");
+    assert_eq!(v["code"], "limit_split_at_root");
+    let detail = v["detail"].as_str().unwrap();
+    assert!(detail.contains("one_of"), "says how to ask: {detail}");
+    assert!(
+        !detail.contains("100") && !detail.contains("limits=") && !detail.contains("max"),
+        "{detail}"
+    );
+    // Its own lower figures do not make it a different request.
+    let mut halves = [pay_to("alice"), pay_to("bob")];
+    for c in &mut halves {
+        c["limits"] = json!({"sum": {"arg": "amount", "max": 50}});
+    }
+    let (status, v) = h.try_mint_root(json!(halves)).await;
+    assert_eq!(
+        (status, v["code"].clone()),
+        (StatusCode::BAD_REQUEST, json!("limit_split_at_root"))
+    );
+
+    // One capability, one budget for the three recipients.
+    let root = h
+        .mint_root(
+            json!([{"server": "bank", "tool": "send_money", "constraints":
+            {"recipient": {"op": "one_of", "value": ["alice", "bob", "carol"]}}}]),
+        )
+        .await;
+    let pay = |who: &'static str, amount: i64| {
+        let token = root.token.clone();
+        let h = &h;
+        async move {
+            h.call(
+                &token,
+                "send_money",
+                json!({"recipient": who, "amount": amount}),
+            )
+            .await
+        }
+    };
+    assert!(allowed(&pay("alice", 100).await));
+    assert_eq!(denial(&pay("bob", 1).await).0, "budget_exhausted");
+    // A single recipient is one capability and still fine.
+    h.mint_root(json!([pay_to("alice")])).await;
+}
+
+/// SR-121 with `distinct` by host: two capabilities, one per URL prefix, would each carry
+/// "one host", so the run could reach two. Refused at hop 0; under an unlimited grant the same
+/// split is allowed, as before.
+#[tokio::test]
+async fn a_root_grant_host_limit_is_not_split_sr121() {
+    let fetch = |prefix: &str| {
+        json!({"server": "bank", "tool": "get_webpage",
+               "constraints": {"url": {"op": "prefix", "value": prefix}}})
+    };
+    let two = json!([fetch("https://a.example/"), fetch("https://b.example/")]);
+    let h = with_root_grant(json!([{"server": "bank", "tool": "get_webpage",
+        "limits": {"distinct": {"arg": "url", "derive": "host", "max": 1}}}]))
+    .await;
+    let (status, v) = h.try_mint_root(two.clone()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["code"], "limit_split_at_root");
+    let root = h.mint_root(json!([fetch("https://")])).await;
+    let get = |url: &'static str| {
+        let token = root.token.clone();
+        let h = &h;
+        async move { h.call(&token, "get_webpage", json!({ "url": url })).await }
+    };
+    assert!(allowed(&get("https://a.example/x").await));
+    assert_eq!(
+        denial(&get("https://b.example/x").await).0,
+        "budget_exhausted"
+    );
+
+    let free = with_root_grant(json!(["bank:*"])).await;
+    let root = free.mint_root(two).await;
+    assert_eq!(
+        decode_chain(&root.token)["chain"]["hops"][0]["capabilities"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+/// SR-121 does not reach an exchange: a hop's capabilities may split a limited parent
+/// capability, because each call is charged against the parent hop too, so the parent's
+/// figure still bounds the total.
+#[tokio::test]
+async fn an_exchange_may_split_a_limited_parent_capability_sr121() {
+    let h = with_root_grant(json!([{"server": "bank", "tool": "send_money",
+        "limits": {"sum": {"arg": "amount", "max": 100}}}]))
+    .await;
+    let root = h
+        .mint_root(json!([{"server": "bank", "tool": "send_money"}]))
+        .await;
+    let child = h
+        .exchange(
+            &root.token,
+            "helper",
+            json!([pay_to("alice"), pay_to("bob"), pay_to("carol")]),
+        )
+        .await;
+    let hops = &decode_chain(&child.token)["chain"]["hops"];
+    let caps = hops[1]["capabilities"].as_array().unwrap();
+    assert_eq!(caps.len(), 3);
+    assert!(
+        caps.iter().all(|c| c["limits"]["sum"]["max"] == 100),
+        "{caps:?}"
+    );
+    let pay = |who: &'static str, amount: i64| {
+        let token = child.token.clone();
+        let h = &h;
+        async move {
+            h.call(
+                &token,
+                "send_money",
+                json!({"recipient": who, "amount": amount}),
+            )
+            .await
+        }
+    };
+    assert!(allowed(&pay("alice", 60).await));
+    assert!(allowed(&pay("bob", 40).await));
+    let (reason, limit) = denial(&pay("carol", 1).await);
+    assert_eq!(reason, "budget_exhausted");
+    assert_eq!(
+        limit["hop"], 0,
+        "the root hop's capability bounds the total: {limit}"
+    );
 }

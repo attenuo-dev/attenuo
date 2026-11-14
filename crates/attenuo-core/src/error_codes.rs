@@ -210,6 +210,7 @@ pub const ERROR_CODES: &[ErrorCode] = &[
     d("lease_revoked", &[r(409, "lease_revoked"), r(400, "invalid_grant")], LEASE, "A lease of the chain (at `POST /token` and `POST /token/renew`, the token's own lease or an ancestor's), or the one an approval is bound to, has been revoked."),
     d("lease_unknown", BAD_GRANT, LEASE, "A lease of the chain is unknown to the lease store (fail closed); at `POST /token` and `POST /token/renew`, the token's own lease or an ancestor's."),
     d("limit_arg_invalid", NONE, DENY, "The call lacks an argument a run limit counts, or has a value it cannot count."),
+    e("limit_split_at_root", &[r(400, "invalid_scope")], NO_RPC, "The hop-0 request (an IdP credential at `POST /token`, or `POST /admin/root-token`) has two capabilities that take their limits from the same limited capability of the root grant or of the ID-JAG's claims; ask for one capability with a `one_of` or wider constraint instead."),
     e("malformed_client_auth", BAD_CLIENT, NO_RPC, "The HTTP Basic credentials are malformed."),
     e("malformed_request", BAD_REQUEST, NO_RPC, "The token request is missing a field or has an invalid one (at `POST /token`, also a body that is not JSON or a well-formed form)."),
     e("malformed_token", CREDENTIAL, NO_RPC, "The credential is not a well-formed JWT."),

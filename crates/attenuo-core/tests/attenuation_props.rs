@@ -675,6 +675,32 @@ proptest! {
         prop_assert!(parent.attenuate(&requested).is_ok());
     }
 
+    /// Hop 0 (SR-121): `attenuate_root` answers as `attenuate` or refuses a split, and a
+    /// split refused is one `attenuate` would have made, two limited capabilities or more. Under
+    /// a grant of one limited capability the root token holds at most one capability.
+    #[test]
+    fn attenuate_root_is_attenuate_without_splits(
+        parent in capability_set(),
+        requested in capability_set(),
+        one in capability(),
+    ) {
+        match parent.attenuate_root(&requested) {
+            Err(AttenuationError::LimitSplit { .. }) => {
+                let out = parent.attenuate(&requested);
+                prop_assert!(out.is_ok());
+                let out = out.unwrap();
+                prop_assert!(out.iter().filter(|c| !c.limits.is_empty()).count() >= 2);
+            }
+            other => prop_assert_eq!(other, parent.attenuate(&requested)),
+        }
+        if !one.limits.is_empty() {
+            let single = CapabilitySet::from_iter([one]);
+            if let Ok(out) = single.attenuate_root(&requested) {
+                prop_assert!(out.len() <= 1, "{:?}", out);
+            }
+        }
+    }
+
     /// 7. Serde round trip preserves the digest (and the chain).
     #[test]
     fn digest_survives_serde_round_trip(chain in chain()) {

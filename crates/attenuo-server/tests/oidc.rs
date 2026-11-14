@@ -1729,7 +1729,7 @@ async fn scope_exceeds_id_jag_does_not_show_the_grant_limits_sr124() {
     let got = present(
         &h,
         &jag_with(&h, json!({"scope": "files.read"})),
-        ("scope", "github:read_file github:create_issue"),
+        ("scope", "github:create_issue"),
     )
     .await;
     assert_error(
@@ -1741,6 +1741,25 @@ async fn scope_exceeds_id_jag_does_not_show_the_grant_limits_sr124() {
     let detail = got.1["detail"].as_str().unwrap();
     assert!(detail.contains("github:create_issue"), "{detail}");
     assert!(!detail.contains("limits"), "{detail}");
+    // Asking for both tools splits the grant's one `calls: 7` into two capabilities, which
+    // hop 0 refuses before the ceiling is read (SR-121), without the figure either.
+    let got = present(
+        &h,
+        &jag_with(&h, json!({"scope": "files.read"})),
+        ("scope", "github:read_file github:create_issue"),
+    )
+    .await;
+    assert_error(
+        &got,
+        StatusCode::BAD_REQUEST,
+        "invalid_scope",
+        "limit_split_at_root",
+    );
+    let detail = got.1["detail"].as_str().unwrap();
+    assert!(
+        !detail.contains("limits=") && !detail.contains('7'),
+        "{detail}"
+    );
     // Within both, the root token carries the grant's limit, as before.
     let got = present(
         &h,
@@ -1754,4 +1773,156 @@ async fn scope_exceeds_id_jag_does_not_show_the_grant_limits_sr124() {
         caps(&h.verify(token).hops[0].capabilities),
         [r#"github:read_file limits={"calls":7}"#]
     );
+}
+
+/// Three `banking:send_money` capabilities, one per recipient, as an `authorization_details`
+/// request value.
+fn three_payees() -> String {
+    let pay = |who: &str| {
+        json!({"server": "banking", "tool": "send_money",
+               "constraints": {"to": {"op": "equals", "value": who}}})
+    };
+    json!([{"type": "attenuo_capabilities",
+            "capabilities": [pay("alice"), pay("bob"), pay("carol")]}])
+    .to_string()
+}
+
+/// SR-121, the budget in an ID-JAG claim: under an unlimited root grant `banking:*`, the
+/// ID-JAG's `authorization_details` names `banking:send_money` with `sum` 100. A request split
+/// into three capabilities, one per recipient, would get the 100 three times; it is refused
+/// with `limit_split_at_root`, naming the capabilities as requested. One capability with
+/// `one_of` gets the claim's figure once. Without the ceiling the claim is ignored and the
+/// split is allowed under the unlimited grant, as before.
+#[tokio::test]
+async fn an_id_jag_budget_is_not_split_across_capabilities_sr121() {
+    let tweak = |ceiling: bool| {
+        move |cfg: &mut Config| {
+            cfg.root_grants[0].capabilities = vec![CapSpec::Short("banking:*".into())];
+            if ceiling {
+                cfg.idps[0].id_jag_ceiling = Some(IdJagCeilingConfig {
+                    resources: BTreeMap::new(),
+                    scopes: BTreeMap::new(),
+                });
+            }
+        }
+    };
+    let budget = json!({"authorization_details": [{"type": "attenuo_capabilities",
+        "capabilities": [{"server": "banking", "tool": "send_money",
+                          "limits": {"sum": {"arg": "amount", "max": 100}}}]}]});
+    let h = Harness::start_with(tweak(true)).await;
+    let got = present(
+        &h,
+        &jag_with(&h, budget.clone()),
+        ("authorization_details", &three_payees()),
+    )
+    .await;
+    assert_error(
+        &got,
+        StatusCode::BAD_REQUEST,
+        "invalid_scope",
+        "limit_split_at_root",
+    );
+    let detail = got.1["detail"].as_str().unwrap();
+    assert!(detail.contains("ID-JAG"), "{detail}");
+    assert!(
+        detail.contains("alice") && detail.contains("bob"),
+        "{detail}"
+    );
+    assert!(
+        !detail.contains("100") && !detail.contains("limits="),
+        "{detail}"
+    );
+
+    let one = json!([{"type": "attenuo_capabilities", "capabilities": [
+        {"server": "banking", "tool": "send_money", "constraints":
+            {"to": {"op": "one_of", "value": ["alice", "bob", "carol"]}}}]}])
+    .to_string();
+    let got = present(
+        &h,
+        &jag_with(&h, budget.clone()),
+        ("authorization_details", &one),
+    )
+    .await;
+    assert_eq!(got.0, StatusCode::OK, "{}", got.1);
+    let token = got.1["access_token"].as_str().unwrap();
+    let caps = caps(&h.verify(token).hops[0].capabilities);
+    assert_eq!(caps.len(), 1);
+    assert!(
+        caps[0].contains(r#""sum":{"arg":"amount","max":100}"#),
+        "{caps:?}"
+    );
+
+    // The ceiling off: the claim is not read, the grant is unlimited, the split is allowed.
+    let h = Harness::start_with(tweak(false)).await;
+    let got = present(
+        &h,
+        &jag_with(&h, budget),
+        ("authorization_details", &three_payees()),
+    )
+    .await;
+    assert_eq!(got.0, StatusCode::OK, "{}", got.1);
+    assert_eq!(
+        h.verify(got.1["access_token"].as_str().unwrap()).hops[0]
+            .capabilities
+            .len(),
+        3
+    );
+}
+
+/// SR-121, the budget in `[[root_grants]]`: the same split is refused at intake, for an
+/// ID-JAG and for an ID token, before any ceiling is read.
+#[tokio::test]
+async fn a_root_grant_budget_is_not_split_at_intake_sr121() {
+    let h = Harness::start_with(|cfg| {
+        let mut banking = attenuo_core::Capability::new("banking", "*");
+        banking.limits = attenuo_core::Limits::default().with_sum("amount", 100);
+        cfg.root_grants[0].capabilities = vec![CapSpec::Full(banking)];
+    })
+    .await;
+    let got = present(
+        &h,
+        &jag_with(&h, json!({})),
+        ("authorization_details", &three_payees()),
+    )
+    .await;
+    assert_error(
+        &got,
+        StatusCode::BAD_REQUEST,
+        "invalid_scope",
+        "limit_split_at_root",
+    );
+    let detail = got.1["detail"].as_str().unwrap();
+    assert!(detail.contains("[[root_grants]]"), "{detail}");
+    assert!(!detail.contains("100"), "{detail}");
+
+    let id_token = h
+        .idp
+        .sign(&h.idp.key, Some("JWT"), &h.idp.id_token_claims("alice"));
+    let got = h
+        .post_form(
+            &[
+                ("grant_type", EXCHANGE),
+                ("subject_token", &id_token),
+                ("subject_token_type", ID_TOKEN),
+                ("client_id", "planner"),
+                ("client_secret", PLANNER_SECRET),
+                ("authorization_details", &three_payees()),
+            ],
+            None,
+        )
+        .await;
+    assert_error(
+        &got,
+        StatusCode::BAD_REQUEST,
+        "invalid_scope",
+        "limit_split_at_root",
+    );
+    // One payee is one capability, and fine.
+    let got = present(
+        &h,
+        &jag_with(&h, json!({})),
+        ("scope", "banking:send_money"),
+    )
+    .await;
+    assert_eq!(got.0, StatusCode::OK, "{}", got.1);
 }
