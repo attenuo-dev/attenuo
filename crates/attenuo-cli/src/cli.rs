@@ -571,7 +571,9 @@ pub(crate) struct ExchangeArgs {
     /// Capability `server:tool`, or a full capability as a JSON object (with `constraints` and
     /// run `limits`). Repeatable; plain `server:tool` values may also be comma-separated. Must
     /// be covered by the parent's capabilities; limits are inherited from the parent and
-    /// clamped to what it has left. At hop 0, must be covered by the `[[root_grants]]` entry.
+    /// clamped to what it has left. At hop 0, must be covered by the `[[root_grants]]` entry,
+    /// and a limited capability of the entry cannot be split across two requested
+    /// capabilities (`limit_split_at_root`): ask for one with a `one_of` constraint instead.
     #[arg(long = "cap", required = true)]
     pub caps: Vec<String>,
     /// Requested lifetime in seconds (clamped to the parent's expiry; at hop 0, to the
