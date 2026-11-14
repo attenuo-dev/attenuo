@@ -59,7 +59,7 @@ Every value `path_prefix: P` admits also starts with `P` as a string, so swappin
 - `calls_per`: at most n calls per value of one argument (per recipient, say).
 - `distinct`: at most n different values of one argument. `calls_per` and `distinct` can count the host of a URL instead of the whole URL (`"derive": "host"`).
 
-The maxima are in the signed token; what has been used is kept by the server, per hop lease. Every allowed call is charged to every matching limited capability in every hop of the chain, so a sub-agent cannot reset its parent's budget by delegating again. A call that would take any of them past its maximum is denied with `budget_exhausted` before Cedar runs, and no approval passes it. Servers older than 0.1.0 accept a `limits` block and ignore it. See [the run-limits design](../design/run-limits.md) and [Writing policies](../guides/writing-policies.md#run-limits).
+The maxima are in the signed token; what has been used is kept by the server, per hop lease. Every allowed call is charged to every matching limited capability in every hop of the chain, so a sub-agent cannot reset its parent's budget by delegating again. A call that would take any of them past its maximum is denied with `budget_exhausted` before Cedar runs, and no approval passes it. A limit in a root grant is different: the grant is not a hop and nothing charges it, so a root token request may not split one limited grant capability into several (`limit_split_at_root`); ask for one capability with a `one_of` instead. Servers older than 0.1.0 accept a `limits` block and ignore it. See [the run-limits design](../design/run-limits.md) and [Writing policies](../guides/writing-policies.md#run-limits).
 
 ## Attenuation
 
@@ -77,7 +77,7 @@ For `range`, the child's interval must sit inside the parent's: `0..2000` can be
 
 Each child capability must be covered by a single parent capability. A child that would be covered only by the union of two parent capabilities is rejected. This is deliberately conservative. It keeps the check simple and the reason for a refusal easy to explain.
 
-An empty request is rejected too.
+An empty request is rejected too, and so is one over the size bounds: more than 1,024 capabilities, argument constraints or `one_of` values in all, or a `one_of` of more than 1,024 values.
 
 ## Three things shrink together
 
