@@ -198,6 +198,7 @@ impl Harness {
             clock_skew_seconds: 0,
             tenant: None,
             id_jag_ceiling: None,
+            credentials: attenuo_server::config::DEFAULT_IDP_CREDENTIALS.to_vec(),
             ca_pem_path: None,
             client_ids: [("planner".to_string(), CLIENT_AUD.to_string())].into(),
         }];
@@ -375,6 +376,22 @@ impl Harness {
             .filter(|c| c.name == "delete_repo")
             .count()
     }
+}
+
+/// `[[idps]] credentials` is about hop 0 (SR-122): an entry that accepts ID-JAGs only still
+/// takes its users' ID tokens as approvals.
+#[tokio::test]
+async fn an_id_jag_only_entry_still_takes_approval_id_tokens_sr122() {
+    let h = Harness::start_with(|cfg| {
+        cfg.idps[0].credentials = vec![attenuo_server::config::IdpCredential::IdJag];
+    })
+    .await;
+    let token = h.root().await;
+    h.taint(&token).await;
+    let g = h.gated(&token, "alice/site").await;
+    let granted = h.grant_as_alice(&g.approval_id).await;
+    assert_eq!(granted["state"], "granted");
+    assert_eq!(granted["approver"]["method"], "id_token");
 }
 
 #[tokio::test]

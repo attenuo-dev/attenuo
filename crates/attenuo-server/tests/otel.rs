@@ -1188,6 +1188,7 @@ impl EcIdp {
             clock_skew_seconds: 60,
             tenant: None,
             id_jag_ceiling: None,
+            credentials: attenuo_server::config::DEFAULT_IDP_CREDENTIALS.to_vec(),
             ca_pem_path: None,
             client_ids: BTreeMap::from([("planner".to_string(), Self::AUDIENCE.to_string())]),
         }];

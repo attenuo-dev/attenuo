@@ -31,7 +31,9 @@
 //! Steps, in order: check and verify the actor token, if any (`invalid_request` with
 //! `actor_token_*` sub-codes); authenticate the agent (`invalid_client`, 401, for client
 //! credentials, or for no credential at all); check `actor` and that capabilities were requested (`invalid_request`); verify
-//! the credential ([`IdpRegistry::verify`](super::IdpRegistry::verify), `invalid_grant`); for
+//! the credential ([`IdpRegistry::verify`](super::IdpRegistry::verify), `invalid_grant`, which
+//! first refuses a kind the issuer's `[[idps]] credentials` does not list with
+//! `credential_type_not_accepted`, SR-122); for
 //! an ID-JAG, require its `client_id` to be the authenticated agent and, when it has a
 //! `cnf.jkt`, a DPoP proof by that key (`credential_pop_required`, `credential_pop_mismatch`);
 //! build the originating user

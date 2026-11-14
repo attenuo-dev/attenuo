@@ -258,10 +258,11 @@ Every key fetch (`jwks_url`, or the discovery document at `issuer` and the `jwks
 | `attribute_claims` | `email`, `groups`, `amr` | Claims copied into `originating_user.attributes`. `mfa` is always derived from `amr`. |
 | `jwks_ttl_seconds` | `300` | How long a fetched key set is used. |
 | `clock_skew_seconds` | `60` | Leeway for `exp`, `iat` and `nbf`. |
+| `credentials` | `["id_token", "id-jag"]` | The credentials this issuer's users may be brought in with at hop 0: `"id_token"` (an OIDC ID token), `"id-jag"` (an ID-JAG), or both. The names are the audit record's `credential` values. A credential of a kind not listed is refused with `400 invalid_grant` / `credential_type_not_accepted`, at the step that refuses an unknown issuer: before any key fetch, before its signature or claims are checked, and without using it up. An empty list or another name refuses to start. With [`[idps.id_jag_ceiling]`](#idpsidjagceiling), `["id-jag"]` makes the ceiling hold for every agent (SR-122). Approval ID tokens (`[approvals]`) are not affected. |
 
 ### `[idps.id_jag_ceiling]`
 
-Optional, per `[[idps]]` entry, off by default. With it, the root token minted from one of this issuer's ID-JAGs carries no more than both the [`[[root_grants]]`](#rootgrants) entry and the ID-JAG's own `resource`, `scope` and `authorization_details` claims allow (draft-ietf-oauth-identity-assertion-authz-grant-06 §4.4.1). Without it those claims are ignored and nothing changes. ID tokens are never affected: an ID token from the same issuer, presented by an agent its `aud` names ([`client_ids`](#idps)), still gets the root grant as it is, so with the ceiling on, the ceiling holds only for agents that cannot present this issuer's ID tokens (SR-122). An empty table (`[idps.id_jag_ceiling]` with no keys) turns the ceiling on with only `authorization_details` able to name anything.
+Optional, per `[[idps]]` entry, off by default. With it, the root token minted from one of this issuer's ID-JAGs carries no more than both the [`[[root_grants]]`](#rootgrants) entry and the ID-JAG's own `resource`, `scope` and `authorization_details` claims allow (draft-ietf-oauth-identity-assertion-authz-grant-06 §4.4.1). Without it those claims are ignored and nothing changes. ID tokens are never affected: an ID token from the same issuer, presented by an agent its `aud` names ([`client_ids`](#idps)), still gets the root grant as it is. So with the ceiling on and the default [`credentials`](#idps), which accepts both kinds, the ceiling holds only for agents that cannot present this issuer's ID tokens, and the server logs a warning at start for each such entry. Set `credentials = ["id-jag"]` on the entry to refuse its ID tokens at hop 0 and make the ceiling hold for every agent (SR-122). An empty table (`[idps.id_jag_ceiling]` with no keys) turns the ceiling on with only `authorization_details` able to name anything.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
@@ -285,6 +286,7 @@ The server refuses to start on an empty resource identifier, a resource mapped t
 ```toml
 [[idps]]
 issuer = "https://idp.example.com"
+credentials = ["id-jag"]
 
 [idps.id_jag_ceiling]
 resources = { "https://mcp.example.com/github" = ["github"] }

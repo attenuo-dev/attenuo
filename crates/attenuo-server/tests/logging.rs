@@ -277,3 +277,43 @@ async fn subjects_are_logged_in_clear_by_default() {
         .iter()
         .any(|v| v["message"] == "decision" && v["subject"] == format!("\"{subject}\"")));
 }
+
+/// SR-122: an `[[idps]]` entry with `[idps.id_jag_ceiling]` that still accepts ID tokens starts,
+/// with a warning that names it; an entry that accepts ID-JAGs only starts without one.
+#[tokio::test]
+async fn a_ceiling_that_id_tokens_get_past_is_warned_about_at_start_sr122() {
+    install_capture();
+    let build = |issuer: &str, credentials: &str| {
+        let cfg = Config {
+            idps: vec![toml::from_str(&format!(
+                "issuer = \"{issuer}\"\n{credentials}\n\
+                 [id_jag_ceiling]\nscopes = {{ \"s\" = [\"github:*\"] }}\n"
+            ))
+            .unwrap()],
+            ..Config::default()
+        };
+        attenuo_server::build(&cfg).expect("a warning, not a refusal")
+    };
+    let warned = "https://ceiling-warned-7f3a.example";
+    let quiet = "https://ceiling-quiet-7f3a.example";
+    let _both = build(warned, "");
+    let _jag_only = build(quiet, r#"credentials = ["id-jag"]"#);
+    let lines = json_lines();
+    let warning = lines
+        .iter()
+        .find(|v| v["message"].as_str().is_some_and(|m| m.contains(warned)))
+        .expect("the start-up warning names the entry");
+    assert_eq!(warning["level"], "WARN", "{warning}");
+    let text = warning["message"].as_str().unwrap();
+    assert!(
+        text.contains("does not apply to ID tokens")
+            && text.contains(r#"credentials = ["id-jag"]"#),
+        "{text}"
+    );
+    assert!(
+        !lines.iter().any(|v| v["message"]
+            .as_str()
+            .is_some_and(|m| m.contains(quiet) && m.contains("does not apply to ID tokens"))),
+        "no warning for an entry that accepts ID-JAGs only"
+    );
+}

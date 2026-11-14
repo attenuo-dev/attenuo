@@ -112,6 +112,7 @@ The table is generated from `attenuo_core::error_codes::ERROR_CODES`, the one pl
 | `credential_expired` | 400 `invalid_grant` |  |  | The hop-0 credential expires before the token could be issued. |
 | `credential_pop_mismatch` | 400 `invalid_grant` |  |  | The DPoP proof is by another key than the one the ID-JAG is bound to (`cnf.jkt`). |
 | `credential_pop_required` | 400 `invalid_grant` |  |  | The ID-JAG is bound to a key (`cnf`) and the request has no DPoP proof that this server checks. |
+| `credential_type_not_accepted` | 400 `invalid_grant` |  |  | The credential's issuer is an `[[idps]]` entry whose `credentials` does not list this kind (an ID token or an ID-JAG). |
 | `dpop_replay_cache_full` | 503 `temporarily_unavailable` | `-32006` (503) |  | Too many DPoP proofs are in flight; retry later. |
 | `dpop_required` | 401 | `-32001` (401) |  | The token is bound to a key and no DPoP proof was sent. |
 | `duplicate_actor` | 400 `invalid_request` |  |  | The `actor` is already in the chain. |
