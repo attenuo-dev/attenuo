@@ -2733,8 +2733,14 @@ pub struct RootGrant {
 
 impl RootGrant {
     /// The entry as start-up errors name it: issuer, agent and subject (or "any subject").
-    pub(crate) fn describe(&self) -> String {
+    /// With `redact_subjects` (`[logging] redact_subjects`) a subject is not written out: it
+    /// names a user, which that setting keeps out of the server's output, and the entry's
+    /// index in the message already tells which entry it is (SR-130).
+    pub(crate) fn describe(&self, redact_subjects: bool) -> String {
         let subject = match &self.subject {
+            Some(_) if redact_subjects => {
+                "a subject (not shown: [logging] redact_subjects)".to_string()
+            }
             Some(s) => format!("subject {s:?}"),
             None => "any subject".to_string(),
         };
@@ -2977,7 +2983,10 @@ impl Config {
         for (index, g) in self.root_grants.iter().enumerate() {
             // Every refusal names the entry: its index from 0 in file order, issuer, agent
             // and subject, since several entries may share an agent or an issuer.
-            let entry = format!("[[root_grants]] entry {index} ({})", g.describe());
+            let entry = format!(
+                "[[root_grants]] entry {index} ({})",
+                g.describe(self.logging.redact_subjects)
+            );
             reserved_agent(&entry, &g.agent)?;
             let caps =
                 capability_set(&g.capabilities).map_err(|e| anyhow::anyhow!("{entry}: {e}"))?;

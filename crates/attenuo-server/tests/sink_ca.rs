@@ -414,6 +414,30 @@ async fn a_webhook_behind_a_private_ca_needs_the_sinks_ca() {
     assert_eq!(rx.got()[0].path, "/hook");
 }
 
+/// The TLS cause the error now carries comes from the error's source chain, which the URL is
+/// not taken out of; neither cause names the URL, so a credential in its user info or query
+/// stays out of `last_error` and the log (SR-94; security review pass 17).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tls_failure_does_not_carry_the_url() {
+    let dir = tempfile::tempdir().unwrap();
+    let ca = Ca::new("attenuo test CA");
+    let ca_pem = ca.write(dir.path(), "ca.pem");
+    let url = |port: u16| {
+        format!("https://user:pw-marker@127.0.0.1:{port}/path-marker?token=query-marker")
+    };
+    let rx = TlsReceiver::start(&ca, &["127.0.0.1"], OK).await;
+    let sink = push_one(&webhook_section(url(rx.port), None)).await;
+    let e = last_error(&sink);
+    assert!(e.contains("UnknownIssuer"), "{e}");
+    assert!(!e.contains("marker"), "{e}");
+    drop(sink);
+    let rx = TlsReceiver::start(&ca, &["other.example"], OK).await;
+    let sink = push_one(&webhook_section(url(rx.port), Some(ca_pem))).await;
+    let e = last_error(&sink);
+    assert!(e.contains("not valid for name"), "{e}");
+    assert!(!e.contains("marker"), "{e}");
+}
+
 /// A file that is missing, empty, holds no certificate, or a certificate that does not parse
 /// refuses to start, naming the key and the path. A file sink does not take the key.
 #[test]

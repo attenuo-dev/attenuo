@@ -29,7 +29,7 @@
 //! as [`CapabilitySet::covers`]. Two capabilities that only overlap (`github:read_*` and
 //! `github:*_file`) give nothing, rather than a new capability built from both.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use attenuo_core::{Capability, CapabilitySet};
 use attenuo_token::AUTHORIZATION_DETAILS_TYPE;
@@ -149,27 +149,40 @@ impl IdJagCeiling {
     }
 
     fn named_by_resource(&self, value: &Value) -> CapabilitySet {
-        let values: Vec<&str> = match value {
-            Value::String(s) => vec![s.as_str()],
+        let values: BTreeSet<&str> = match value {
+            Value::String(s) => BTreeSet::from([s.as_str()]),
             Value::Array(items) => items.iter().filter_map(Value::as_str).collect(),
-            _ => Vec::new(),
+            _ => BTreeSet::new(),
         };
-        values
-            .into_iter()
-            .filter_map(|v| self.resources.get(v))
-            .flat_map(|set| set.iter().cloned())
-            .collect()
+        expand(values.into_iter().filter_map(|v| self.resources.get(v)))
     }
 
     fn named_by_scope(&self, value: &Value) -> CapabilitySet {
-        value
+        let tokens: BTreeSet<&str> = value
             .as_str()
             .unwrap_or("")
             .split_ascii_whitespace()
-            .filter_map(|token| self.scopes.get(token))
-            .flat_map(|set| set.iter().cloned())
-            .collect()
+            .collect();
+        expand(
+            tokens
+                .into_iter()
+                .filter_map(|token| self.scopes.get(token)),
+        )
     }
+}
+
+/// The union of `sets`, one per distinct claim value. The callers drop repeated values first:
+/// a claim that repeats one mapped value `n` times would otherwise copy its capabilities `n`
+/// times before the set removed the copies, so a `scope` of 20,000 repeats of a token mapped
+/// to 64 capabilities (80 KB) made 1.28 million copies, 2.6 s and 440 MB in a debug build,
+/// and the body limit allows 25 times that (SR-129).
+fn expand<'a>(sets: impl Iterator<Item = &'a CapabilitySet>) -> CapabilitySet {
+    sets.flat_map(|set| {
+        #[cfg(test)]
+        tests::EXPANDED.with(|n| n.set(n.get() + set.len()));
+        set.iter().cloned()
+    })
+    .collect()
 }
 
 /// The capabilities of the `attenuo_capabilities` entries of an `authorization_details` claim.
@@ -246,6 +259,11 @@ mod tests {
     use super::*;
     use attenuo_core::{ArgConstraint, Limits};
     use serde_json::json;
+
+    thread_local! {
+        /// Capabilities copied out of `resources` and `scopes` by [`expand`].
+        pub(super) static EXPANDED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
 
     fn set(caps: &[&str]) -> CapabilitySet {
         caps.iter()
@@ -626,5 +644,38 @@ mod tests {
             }
         }
         assert!(kept > 100, "{kept}");
+    }
+
+    /// SR-129: a claim value repeated many times is expanded once. A `scope` repeating a
+    /// token mapped to 64 capabilities 20,000 times copied 1,280,000 capabilities before the
+    /// set dropped the copies; the ceiling is the same as for the token once.
+    #[test]
+    fn a_repeated_claim_value_is_expanded_once_sr129() {
+        let tools: Vec<String> = (0..64).map(|i| format!("\"github:tool_{i}\"")).collect();
+        let cfg: IdJagCeilingConfig = toml::from_str(&format!(
+            "scopes = {{ big = [{}] }}\nresources = {{ \"https://mcp.example/github\" = [\"github\"] }}",
+            tools.join(",")
+        ))
+        .unwrap();
+        let c = IdJagCeiling::from_config(&cfg).unwrap();
+        let grant = set(&["github:*"]);
+        let expanded = |claims_: Value| {
+            EXPANDED.with(|n| n.set(0));
+            let a = c.apply(&grant, &claims(claims_));
+            (a.capabilities, EXPANDED.with(std::cell::Cell::get))
+        };
+        let (once, n) = expanded(json!({"scope": "big"}));
+        assert_eq!((once.len(), n), (64, 64));
+        let (many, n) = expanded(json!({"scope": "big ".repeat(20_000)}));
+        assert_eq!(many, once);
+        assert_eq!(n, 64);
+        let (many, n) = expanded(json!({"scope": "big\tother big\nbig"}));
+        assert_eq!((many, n), (once, 64));
+
+        let (one, n) = expanded(json!({"resource": "https://mcp.example/github"}));
+        assert_eq!((one.len(), n), (1, 1));
+        let repeated = vec!["https://mcp.example/github"; 20_000];
+        let (many, n) = expanded(json!({ "resource": repeated }));
+        assert_eq!((many, n), (one, 1));
     }
 }

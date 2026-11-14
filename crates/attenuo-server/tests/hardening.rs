@@ -851,6 +851,30 @@ async fn root_grant_limits_no_token_may_carry_refuse_to_start() {
             "{err}"
         );
     }
+    // SR-130: under `[logging] redact_subjects` the refusal does not write the subject out;
+    // the index still names the entry.
+    let mut cfg = base_config();
+    cfg.logging.redact_subjects = true;
+    cfg.root_grants = vec![
+        grant(None, json!({"calls": 5})),
+        grant(
+            Some("alice@example.com"),
+            json!({"sum": {"arg": "", "max": 1}}),
+        ),
+    ];
+    let err = attenuo_server::build(&cfg)
+        .err()
+        .expect("must refuse")
+        .to_string();
+    assert!(
+        err.starts_with(
+            "[[root_grants]] entry 1 (issuer \"https://idp.example\", agent \"planner\", \
+             a subject (not shown: [logging] redact_subjects)): limit `sum`"
+        ),
+        "{err}"
+    );
+    assert!(!err.contains("alice"), "{err}");
+
     // Well-formed limits start, and a mint under the grant succeeds.
     let mut cfg = base_config();
     cfg.root_grants = vec![grant(
