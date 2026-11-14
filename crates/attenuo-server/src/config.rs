@@ -882,8 +882,17 @@ pub struct SinkSection {
     #[serde(default)]
     pub secret_access_key: Option<String>,
     /// s3: session token for temporary credentials. Falls back to `AWS_SESSION_TOKEN`.
+    /// Like the keys, read once at start: when the temporary credentials expire, every PUT is
+    /// refused until the server is restarted with new ones.
     #[serde(default)]
     pub session_token: Option<String>,
+    /// webhook and s3: PEM file of CA certificates trusted, for the sink's requests only, in
+    /// addition to the built-in web PKI roots: for a receiver or an S3-compatible store whose
+    /// certificate a private CA issued. Read once at start; a file that is missing, unreadable
+    /// or holds no certificate refuses to start. Verification and the hostname check are
+    /// unchanged. As `[[idps]] ca_pem_path`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_pem_path: Option<PathBuf>,
     /// Checkpoints waiting to be delivered, at most. When full, the oldest queued one is
     /// dropped (a later checkpoint covers every entry an earlier one does) and
     /// `attenuo_audit_sink_dropped_total` counts it. Default 1024.
@@ -939,6 +948,7 @@ impl SinkSection {
             access_key_id: None,
             secret_access_key: None,
             session_token: None,
+            ca_pem_path: None,
             queue_capacity: default_sink_queue_capacity(),
             max_lag_seconds: default_sink_max_lag_seconds(),
             fail_readiness: false,
@@ -963,6 +973,7 @@ impl SinkSection {
             set("bearer_token", self.bearer_token.is_some()),
         ];
         let file = [set("path", self.path.is_some())];
+        let https = [set("ca_pem_path", self.ca_pem_path.is_some())];
         let s3 = [
             set("endpoint", self.endpoint.is_some()),
             set("bucket", self.bucket.is_some()),
@@ -975,7 +986,13 @@ impl SinkSection {
         let kind = self.kind;
         let foreign: Vec<&str> = match kind {
             SinkKind::Webhook => file.iter().chain(&s3).flatten().copied().collect(),
-            SinkKind::File => webhook.iter().chain(&s3).flatten().copied().collect(),
+            SinkKind::File => webhook
+                .iter()
+                .chain(&s3)
+                .chain(&https)
+                .flatten()
+                .copied()
+                .collect(),
             SinkKind::S3 => webhook.iter().chain(&file).flatten().copied().collect(),
         };
         if !foreign.is_empty() {

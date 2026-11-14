@@ -88,6 +88,7 @@ prefix = "p/"
 access_key_id = "a"
 secret_access_key = "s"
 session_token = "s"
+ca_pem_path = "sink-ca.pem"
 
 [admin]
 token = "t"
