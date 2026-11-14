@@ -1983,6 +1983,153 @@ async fn a_scopes_budget_is_not_split_by_authorization_details_sr127() {
         "invalid_scope",
         "limit_split_at_root",
     );
+    // Named as requested, never with the ceiling's limits (SR-121, SR-124).
+    let detail = got.1["detail"].as_str().unwrap();
+    assert!(detail.contains("ID-JAG"), "{detail}");
+    assert!(
+        detail.contains("alice") && detail.contains("bob"),
+        "{detail}"
+    );
+    assert!(
+        !detail.contains("100") && !detail.contains("limits=") && !detail.contains("sum"),
+        "{detail}"
+    );
+
+    // The scope alone: refused as before, against the final ceiling.
+    let scope_only = jag_with(&h, json!({"scope": "payments"}));
+    let got = present(
+        &h,
+        &scope_only,
+        ("authorization_details", &both.to_string()),
+    )
+    .await;
+    assert_error(
+        &got,
+        StatusCode::BAD_REQUEST,
+        "invalid_scope",
+        "limit_split_at_root",
+    );
+
+    // One recipient of the two the claim names: one capability, the scope's 100 once.
+    let got = present(
+        &h,
+        &jag,
+        (
+            "authorization_details",
+            &details(&[payee("alice", None)]).to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(got.0, StatusCode::OK, "{}", got.1);
+    let token = got.1["access_token"].as_str().unwrap();
+    assert_eq!(
+        caps(&h.verify(token).hops[0].capabilities),
+        [
+            r#"banking:send_money{to={"op":"equals","value":"alice"}} limits={"sum":{"arg":"amount","max":100}}"#
+        ]
+    );
+
+    // Both recipients in one capability (`one_of`), which the claim names: one `sum` of 100.
+    let either = details(&[json!({"server": "banking", "tool": "send_money",
+        "constraints": {"to": {"op": "one_of", "value": ["alice", "bob"]}}})]);
+    let jag_either = jag_with(
+        &h,
+        json!({"scope": "payments", "authorization_details": either.clone()}),
+    );
+    let got = present(
+        &h,
+        &jag_either,
+        ("authorization_details", &either.to_string()),
+    )
+    .await;
+    assert_eq!(got.0, StatusCode::OK, "{}", got.1);
+    let token = got.1["access_token"].as_str().unwrap();
+    let issued = caps(&h.verify(token).hops[0].capabilities);
+    assert_eq!(issued.len(), 1, "{issued:?}");
+    assert!(
+        issued[0].contains(r#""sum":{"arg":"amount","max":100}"#),
+        "{issued:?}"
+    );
+
+    // Lower figures of the claim's own under the scope's 100 (50 to alice, 50 to bob): sound,
+    // answered 200 before, and refused now, as SR-121 refuses a split into halves.
+    let halves = details(&[payee("alice", Some(50)), payee("bob", Some(50))]);
+    let jag_halves = jag_with(
+        &h,
+        json!({"scope": "payments", "authorization_details": halves.clone()}),
+    );
+    let got = present(
+        &h,
+        &jag_halves,
+        ("authorization_details", &both.to_string()),
+    )
+    .await;
+    assert_error(
+        &got,
+        StatusCode::BAD_REQUEST,
+        "invalid_scope",
+        "limit_split_at_root",
+    );
+    let detail = got.1["detail"].as_str().unwrap();
+    assert!(
+        !detail.contains("100") && !detail.contains("50"),
+        "{detail}"
+    );
+}
+
+/// SR-127, what does not change. The limits in `authorization_details` itself, under a scope
+/// without limits: each named capability has its own budget, as the last step of the ceiling,
+/// and the request for both is answered as before. A ceiling with no limits at all: the split
+/// is allowed as before.
+#[tokio::test]
+async fn a_budget_in_authorization_details_is_kept_sr127() {
+    let h = payments_harness(false).await;
+    let both = details(&[payee("alice", None), payee("bob", None)]);
+    let halves = details(&[payee("alice", Some(50)), payee("bob", Some(50))]);
+    let jag = jag_with(
+        &h,
+        json!({"scope": "payments", "authorization_details": halves}),
+    );
+    let got = present(&h, &jag, ("authorization_details", &both.to_string())).await;
+    assert_eq!(got.0, StatusCode::OK, "{}", got.1);
+    let token = got.1["access_token"].as_str().unwrap();
+    assert_eq!(
+        caps(&h.verify(token).hops[0].capabilities),
+        [
+            r#"banking:send_money{to={"op":"equals","value":"alice"}} limits={"sum":{"arg":"amount","max":50}}"#,
+            r#"banking:send_money{to={"op":"equals","value":"bob"}} limits={"sum":{"arg":"amount","max":50}}"#,
+        ]
+    );
+    // One limit in the claim, two capabilities under it: refused, as since SR-121.
+    let one = details(&[json!({"server": "banking", "tool": "send_money",
+        "limits": {"sum": {"arg": "amount", "max": 100}}})]);
+    let jag_one = jag_with(
+        &h,
+        json!({"scope": "payments", "authorization_details": one}),
+    );
+    let got = present(&h, &jag_one, ("authorization_details", &both.to_string())).await;
+    assert_error(
+        &got,
+        StatusCode::BAD_REQUEST,
+        "invalid_scope",
+        "limit_split_at_root",
+    );
+
+    // No limits anywhere: the two recipients are two unlimited capabilities, as before.
+    let jag = jag_with(
+        &h,
+        json!({"scope": "payments", "authorization_details": both.clone()}),
+    );
+    let got = present(&h, &jag, ("authorization_details", &both.to_string())).await;
+    assert_eq!(got.0, StatusCode::OK, "{}", got.1);
+    let token = got.1["access_token"].as_str().unwrap();
+    assert_eq!(
+        caps(&h.verify(token).hops[0].capabilities),
+        [
+            r#"banking:send_money{to={"op":"equals","value":"alice"}}"#,
+            r#"banking:send_money{to={"op":"equals","value":"bob"}}"#,
+        ]
+    );
 }
 
 /// SR-123 at intake: a hop-0 request over 1,024 capabilities, or with a `one_of` over 1,024

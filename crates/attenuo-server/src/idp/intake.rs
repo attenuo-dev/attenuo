@@ -387,8 +387,10 @@ struct Narrowed {
 }
 
 /// Attenuate `requested` against the root grant `granted`, then, for an ID-JAG from an issuer
-/// with `[idps.id_jag_ceiling]`, against the ceiling its claims leave of the grant. CPU work on
-/// the request: run it on the blocking pool ([`AppState::blocking`]).
+/// with `[idps.id_jag_ceiling]`, against the ceiling its claims leave of the grant. No limit of
+/// the grant, of the ceiling or of a step of the ceiling that holds limits may be split across
+/// two root token capabilities (`limit_split_at_root`, SR-121, SR-127). CPU work on the
+/// request: run it on the blocking pool ([`AppState::blocking`]).
 fn narrow(
     state: &AppState,
     kind: CredentialKind,
@@ -472,6 +474,51 @@ fn narrow(
                     };
                     invalid_scope("scope_exceeds_id_jag", detail)
                 })?;
+            // Every earlier step of the ceiling that holds limits: `meet` copied them into
+            // each capability a later claim named under them, so two capabilities of the
+            // result may take one limit of `scopes` (SR-127). Checked over the result, so a
+            // request refused above keeps its answer.
+            for step in &applied.limited_steps {
+                step.attenuate_root(&narrowed).map_err(|e| {
+                    let attenuo_core::AttenuationError::LimitSplit { first, second } = e else {
+                        // Not reached: the result is within every step. Fail closed.
+                        return invalid_scope(
+                            "scope_exceeds_id_jag",
+                            "the request asks for more than the ID-JAG's claims allow",
+                        );
+                    };
+                    // Named as requested: `narrowed` carries the ceiling's limits (SR-124).
+                    let each = granted.attenuate_each(requested.iter());
+                    let under_ceiling = applied
+                        .capabilities
+                        .attenuate_each(each.iter().filter_map(|c| c.as_ref().ok()));
+                    let mut under_ceiling = under_ceiling.into_iter();
+                    let shown: Vec<(&attenuo_core::Capability, Option<String>)> = requested
+                        .iter()
+                        .zip(&each)
+                        .map(|(r, c)| {
+                            let under = c.is_ok().then(|| under_ceiling.next()).flatten();
+                            (r, under.and_then(|u| u.ok()).map(|u| u.display()))
+                        })
+                        .collect();
+                    let as_requested = |d: &str| {
+                        shown
+                            .iter()
+                            .find(|(_, s)| s.as_deref() == Some(d))
+                            .map(|(r, _)| *r)
+                    };
+                    let detail = match (as_requested(&first), as_requested(&second)) {
+                        (Some(a), Some(b)) => {
+                            limit_split_detail(&a.display(), &b.display(), "the ID-JAG's claims")
+                        }
+                        _ => "two requested capabilities take their limits from the same \
+                              capability of the ID-JAG's claims: ask for one capability \
+                              covering both instead"
+                            .into(),
+                    };
+                    invalid_scope(LIMIT_SPLIT_AT_ROOT, detail)
+                })?;
+            }
             tracing::debug!(claims = ?applied.claims, "ID-JAG ceiling applied");
             let ceiling_log = Some((
                 applied.claims.join(","),
