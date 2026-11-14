@@ -456,6 +456,54 @@ impl Pipeline {
             .collect()
     }
 
+    /// Action search (AuthZEN `POST /access/v1/search/action`): for each of `tools` on
+    /// `template.server`, whether [`decide`](Self::decide) would allow `template` with that tool
+    /// now, as far as it can be known without acting. The same stages run, on one policy
+    /// snapshot: the lease check (a dead lease allows nothing), the run's labels, budget
+    /// counters, usage and per-user windows as they are in the store, argument taint, then the
+    /// capability stage and Cedar ([`evaluate_policy`](Self::evaluate_policy)).
+    ///
+    /// Nothing is written: no audit record, no charge, no pending approval, no metrics, and no
+    /// approval is looked up or taken, so Cedar sees `context.approval.present = false`. An
+    /// approval-gated tool is therefore never in the answer, even when a granted approval for
+    /// the exact call is waiting; a decision would take it. Every `true` is what `decide` would
+    /// answer for the same call against the same state (it may still deny if the state changes
+    /// in between, as when another call spends the last of a run limit).
+    pub fn would_allow(
+        &self,
+        engine: &PolicyEngine,
+        chain: &DelegationChain,
+        template: &ToolCall,
+        tools: &[&str],
+        now: OffsetDateTime,
+    ) -> Vec<bool> {
+        if let Err((reason, _)) = self.check_leases(chain, now) {
+            tracing::debug!(reason, "action search: the chain's leases are not live");
+            return vec![false; tools.len()];
+        }
+        let run = self.run_labels(chain);
+        tools
+            .iter()
+            .map(|tool| {
+                let mut call = template.clone();
+                call.tool = (*tool).to_string();
+                let mut budget = self.budget_view(engine, chain, &call);
+                self.add_user_windows(engine, &mut budget, chain, &call, now);
+                let args = self.arg_taint(engine, chain, &call, &run.session);
+                let labels = CallLabels {
+                    session: run.session.clone(),
+                    args: args.context,
+                    approval: ApprovalContext::default(),
+                    budget: budget.context,
+                    usage: budget.usage.unwrap_or_default(),
+                };
+                self.evaluate_policy(engine, chain, &call, &labels, now)
+                    .decision
+                    .is_allow()
+            })
+            .collect()
+    }
+
     fn decide_inner(
         &self,
         chain: &DelegationChain,

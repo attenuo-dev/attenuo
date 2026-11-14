@@ -108,7 +108,7 @@ Ships every signed checkpoint off the host as it is created (SR-21); see [Shippi
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `allow_unsigned_chain` | `false` | Accept `subject.properties.chain` without a bearer token from an authenticated `[[peps]]` entry. Every hop must match what the server issued. |
-| `max_batch` | 64 | Most evaluations one `POST /access/v1/evaluations` may carry. More is refused with 400 `batch_too_large` before anything is decided or audited. Must be at least 1. |
+| `max_batch` | 64 | Most evaluations one `POST /access/v1/evaluations` may carry. More is refused with 400 `batch_too_large` before anything is decided or audited. Also the most candidate tools one page of `POST /access/v1/search/action` evaluates, and that page's default size. Must be at least 1. |
 | `diagnostics` | `"peps"` | Who gets `context.diagnostics` (the effective capabilities a call fell outside, lease ids, Cedar errors): `"peps"` only callers that authenticated as a `[[peps]]` entry (with a bearer token, by `pep_id` and `pep_secret` in the body), `"always"` every caller, `"never"` nobody. Others get an empty list; `reason`, `policy_ids` and `decision_id` are always returned. |
 
 ## `[token]`

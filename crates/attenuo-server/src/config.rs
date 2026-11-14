@@ -143,7 +143,8 @@ pub struct AuthzenSection {
     pub allow_unsigned_chain: bool,
     /// Most evaluations one `POST /access/v1/evaluations` request may carry. Default 64.
     /// Larger requests are refused with 400 `batch_too_large` before anything is decided or
-    /// audited. Must be at least 1.
+    /// audited. Also the most candidate tools one page of `POST /access/v1/search/action`
+    /// evaluates, and that page's default size. Must be at least 1.
     #[serde(default = "default_max_batch")]
     pub max_batch: usize,
     /// Who gets `context.diagnostics` (the effective capabilities a call fell outside, lease

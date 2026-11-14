@@ -45,7 +45,7 @@ These constructions carry a version, and a verifier refuses any other value:
 | Audit export | header `format: attenuo-audit-export-v2`; a `v1` export is refused with a message saying why | `crates/attenuo-audit/src/export.rs` |
 | Shipped checkpoint | `format: attenuo-shipped-checkpoint-v1` | `crates/attenuo-audit/src/shipped.rs` |
 | Token type | `typ: attenuo+jwt`, `typ: attenuo-approval+jwt` | `crates/attenuo-token` |
-| AuthZEN routes | `/access/v1/evaluation(s)` | prefix from AuthZEN 1.0 |
+| AuthZEN routes | `/access/v1/evaluation(s)`, `/access/v1/search/action` | prefix from AuthZEN 1.0 |
 
 ## Not versioned yet
 

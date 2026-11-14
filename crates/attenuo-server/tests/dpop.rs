@@ -730,3 +730,49 @@ async fn server_nonce_required_through_the_proxy() {
     assert!(nonce_of(&resp).is_none());
     assert!(allowed(&resp.json().await.unwrap()));
 }
+
+/// AuthZEN action search authenticates a bound token exactly as evaluation does: the bare
+/// token is `dpop_required`, a proof made for the evaluation URL is `invalid_dpop_proof`, and a
+/// proof for the search URL itself is accepted.
+#[tokio::test]
+async fn action_search_needs_a_proof_for_its_own_url() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = start(dir.path(), DpopMode::Optional).await;
+    let key = DpopKey::generate().unwrap();
+    let token = s.root_token(Some(&key)).await;
+    let search_url = s.url("/access/v1/search/action");
+    let search = |p: Option<String>| {
+        let req = s.client.post(&search_url).bearer_auth(&token).json(&json!({
+            "subject": {"type": "agent", "id": ""},
+            "resource": {"type": "mcp_server", "id": "github"},
+            "context": {"input": {"repo": "acme/api"}},
+        }));
+        match p {
+            Some(p) => req.header("DPoP", p),
+            None => req,
+        }
+    };
+    let (status, code, challenge) = refusal(search(None).send().await.unwrap()).await;
+    assert_eq!(
+        (status, code.as_str()),
+        (StatusCode::UNAUTHORIZED, "dpop_required")
+    );
+    assert!(challenge.starts_with("DPoP "), "{challenge}");
+    let elsewhere = proof(&key, &s.url("/access/v1/evaluation"), Some(&token));
+    let (status, code, _) = refusal(search(Some(elsewhere)).send().await.unwrap()).await;
+    assert_eq!(
+        (status, code.as_str()),
+        (StatusCode::UNAUTHORIZED, "invalid_dpop_proof")
+    );
+    let resp = search(Some(proof(&key, &search_url, Some(&token))))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(
+        v["results"],
+        json!([{"name": "read_file", "properties": {"server": "github"}}]),
+        "{v}"
+    );
+}

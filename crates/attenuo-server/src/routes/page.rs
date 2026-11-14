@@ -26,11 +26,17 @@
 //! `detail` says which check failed and never quotes the cursor.
 //!
 //! **No integrity tag.** A cursor holds only a position in a list the caller is already
-//! allowed to read in full (every list route is an admin route), not a subject, a filter
-//! value, a query or anything else from the data. Forging one can only start a page at
-//! another position, which the caller could reach anyway by paging, so a MAC would protect
-//! nothing; what is checked is that it is well-formed and meant for this list. Clients must
-//! still treat it as opaque: the encoding may change in another format version.
+//! allowed to read in full (every admin list route; for AuthZEN action search, the candidate
+//! tools of the caller's own query), not a subject, a filter value, a query or anything else
+//! from the data. Forging one can only start a page at another position, which the caller
+//! could reach anyway by paging, so a MAC would protect nothing; what is checked is that it
+//! is well-formed and meant for this list. Clients must still treat it as opaque: the
+//! encoding may change in another format version.
+//!
+//! **Action search** (`POST /access/v1/search/action`) carries the same cursor as AuthZEN's
+//! `page.token` / `page.next_token`, but its position is an offset into the sorted candidate
+//! tools, not a keyset key, and its `limit` is clamped to `[authzen] max_batch` rather than
+//! refused, because a generic AuthZEN client cannot know the maximum.
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -56,6 +62,10 @@ pub enum List {
     Checkpoints = 2,
     /// `GET /admin/approvals`.
     Approvals = 3,
+    /// `POST /access/v1/search/action`, whose `page.token` is a cursor of this format: the
+    /// position is the index of the next candidate tool, an offset (see
+    /// `routes::authzen::search_action`).
+    ActionSearch = 4,
 }
 
 /// The direction a cursor pages in; one written for `order=asc` is refused with `order=desc`.
@@ -93,10 +103,25 @@ pub fn encode(list: List, dir: Direction, position: u64) -> String {
 ///
 /// 400 [`INVALID_CURSOR`] for an empty, malformed, foreign or zero-position cursor.
 pub fn decode(cursor: Option<&str>, list: List, dir: Direction) -> Result<Option<u64>, ApiError> {
+    decode_named("cursor", cursor, list, dir)
+}
+
+/// [`decode`] for a cursor sent in a member named `field` (`page.token` for AuthZEN search),
+/// which the refusal's `detail` names.
+///
+/// # Errors
+///
+/// As [`decode`].
+pub fn decode_named(
+    field: &str,
+    cursor: Option<&str>,
+    list: List,
+    dir: Direction,
+) -> Result<Option<u64>, ApiError> {
     let Some(cursor) = cursor else {
         return Ok(None);
     };
-    let refuse = |why: &str| ApiError::bad_request(INVALID_CURSOR, format!("`cursor` {why}"));
+    let refuse = |why: &str| ApiError::bad_request(INVALID_CURSOR, format!("`{field}` {why}"));
     if cursor.is_empty() {
         return Err(refuse("must not be empty; leave it out for the first page"));
     }
@@ -166,7 +191,12 @@ mod tests {
 
     #[test]
     fn round_trip_and_opaque_shape() {
-        for list in [List::Audit, List::Checkpoints, List::Approvals] {
+        for list in [
+            List::Audit,
+            List::Checkpoints,
+            List::Approvals,
+            List::ActionSearch,
+        ] {
             for dir in [Direction::Ascending, Direction::Descending] {
                 for pos in [1, 2, 4096, u64::MAX] {
                     let c = encode(list, dir, pos);

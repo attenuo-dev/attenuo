@@ -512,3 +512,141 @@ async fn stopped_batch_audits_only_what_it_ran() {
         }
     }
 }
+
+impl Harness {
+    async fn admin_get(&self, path: &str) -> Value {
+        let resp = self
+            .client
+            .get(self.server.url(path))
+            .bearer_auth(ADMIN)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "GET {path}");
+        resp.json().await.unwrap()
+    }
+
+    async fn post_as(&self, token: &str, path: &str, body: &Value) -> Value {
+        let resp = self
+            .client
+            .post(self.server.url(path))
+            .bearer_auth(token)
+            .json(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "POST {path}");
+        resp.json().await.unwrap()
+    }
+}
+
+/// The catalog's github tools, in the order action search evaluates them.
+const GITHUB_TOOLS: [&str; 4] = ["create_issue", "delete_repo", "pay", "read_file"];
+
+/// Action search (AuthZEN 1.0 section 8) acts on nothing: however often it runs, over an
+/// approval-gated tool and a tool with a run limit alike, it appends no
+/// audit record, creates no pending approval and charges no limit.
+#[tokio::test]
+async fn action_search_writes_nothing() {
+    let h = Harness::start().await;
+    let token = h
+        .mint(&json!({"capabilities": [
+            "github:create_issue", "github:delete_repo", "github:read_file",
+            {"server": "github", "tool": "pay", "limits": {"calls": 1}},
+        ]}))
+        .await;
+    let before = h.admin_get("/admin/audit?from=1&limit=1000").await["entries"]
+        .as_array()
+        .unwrap()
+        .len();
+    let body = json!({
+        "subject": {"type": "agent", "id": ""},
+        "resource": {"type": "mcp_server", "id": "github"},
+        "context": {"input": {"repo": "alice/public-site"}},
+    });
+    for _ in 0..3 {
+        let a = h.post_as(&token, "/access/v1/search/action", &body).await;
+        let names: Vec<&str> = a["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["create_issue", "pay", "read_file"], "{a}");
+    }
+    let after = h.admin_get("/admin/audit?from=1&limit=1000").await;
+    assert_eq!(
+        after["entries"].as_array().unwrap().len(),
+        before,
+        "a search appended to the audit log: {after}"
+    );
+    let approvals = h.admin_get("/admin/approvals").await;
+    assert_eq!(
+        approvals["approvals"].as_array().map(Vec::len),
+        Some(0),
+        "a search created an approval: {approvals}"
+    );
+    // The one call the run limit allows is still there: the searches charged nothing.
+    let e = h
+        .post_as(
+            &token,
+            "/access/v1/evaluation",
+            &json!({
+                "subject": {"type": "agent", "id": ""},
+                "action": {"name": "pay", "properties": {"server": "github"}},
+                "resource": {"type": "mcp_server", "id": "github"},
+            }),
+        )
+        .await;
+    assert_eq!(e["decision"], true, "{e}");
+    assert_eq!(e["context"]["budget"]["calls_remaining"], 1, "{e}");
+}
+
+/// What action search returns is exactly the set of candidates that `POST
+/// /access/v1/evaluation` decides `true` for the same subject, resource and context: it tells
+/// a caller nothing that evaluating each tool one at a time would not, and it leaves out no
+/// tool evaluation would allow without an approval.
+#[tokio::test]
+async fn action_search_agrees_with_evaluation() {
+    let h = Harness::start().await;
+    let contexts = [
+        json!(null),
+        json!({"input": {"repo": "alice/public-site"}}),
+        json!({"input": {"repo": "alice/private"}}),
+        json!({"input": {"repo": "alice/public-site"}, "session_id": "quarantined"}),
+    ];
+    for caps in [
+        json!(["github:*"]),
+        json!(["github:read_file", "github:pay"]),
+    ] {
+        // A fresh run per capability set; nothing here is limited, so evaluations change no
+        // later answer.
+        let token = h.mint(&json!({ "capabilities": caps })).await;
+        for context in &contexts {
+            let mut search = json!({
+                "subject": {"type": "agent", "id": ""},
+                "resource": {"type": "mcp_server", "id": "github"},
+            });
+            if !context.is_null() {
+                search["context"] = context.clone();
+            }
+            let found = h.post_as(&token, "/access/v1/search/action", &search).await;
+            let found: Vec<String> = found["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["name"].as_str().unwrap().to_string())
+                .collect();
+            let mut allowed = Vec::new();
+            for tool in GITHUB_TOOLS {
+                let mut eval = search.clone();
+                eval["action"] = json!({"name": tool, "properties": {"server": "github"}});
+                let e = h.post_as(&token, "/access/v1/evaluation", &eval).await;
+                if e["decision"] == true {
+                    allowed.push(tool.to_string());
+                }
+            }
+            assert_eq!(found, allowed, "capabilities {caps}, context {context}");
+        }
+    }
+}

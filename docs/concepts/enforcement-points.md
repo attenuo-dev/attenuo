@@ -58,6 +58,6 @@ Both paths write to the same audit log.
 
 - There is no push channel, so a PEP that caches decisions will not learn of a revocation.
 - Admin routes use static bearer tokens (`[admin] token`, or one per operator with a role and an optional expiry, [ADR-0016](../decisions/0016-admin-operators.md)) and should not be public. There is no operator login through an IdP.
-- AuthZEN conformance is checked by fixtures in `crates/attenuo-server/tests/fixtures/authzen/`; what is and is not implemented is in [AuthZEN conformance](../reference/authzen.md). The Search APIs are not served.
+- AuthZEN conformance is checked by fixtures in `crates/attenuo-server/tests/fixtures/authzen/`; what is and is not implemented is in [AuthZEN conformance](../reference/authzen.md). Of the Search APIs only action search is served (`POST /access/v1/search/action`).
 
 More detail: [design/server.md](../design/server.md#the-decision-pipeline), [ADR-0001](../decisions/0001-separate-enforcement-layer.md) and [RFC-0001 section 5](../spec/rfc-0001-attenuo.md#5-per-call-authorization).
