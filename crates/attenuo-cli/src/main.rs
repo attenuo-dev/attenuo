@@ -230,7 +230,16 @@ async fn run(cli: Cli) -> Result<Outcome> {
         }
         Command::Token(TokenCmd::Exchange(a)) => {
             let client = client?;
-            let subject_token = secrets::resolve_token(
+            a.check_hop0()?;
+            let hop0 = a.subject_token_type.is_hop0();
+            let (what, a_what) = if hop0 {
+                ("IdP credential", "an IdP credential")
+            } else {
+                ("delegation token", "a delegation token")
+            };
+            let subject_token = secrets::resolve_named_token(
+                what,
+                a_what,
                 "--subject-token",
                 a.subject_token.clone(),
                 a.subject_token_file.as_deref(),
@@ -243,7 +252,7 @@ async fn run(cli: Cli) -> Result<Outcome> {
             let mut body = json!({
                 "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
                 "subject_token": subject_token,
-                "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+                "subject_token_type": a.subject_token_type.urn(),
                 "actor": a.actor,
                 "authorization_details": [{
                     "type": "attenuo_capabilities",
@@ -303,6 +312,14 @@ async fn run(cli: Cli) -> Result<Outcome> {
                 .transpose()?;
             let url = client.token_url();
             let proofs = |nonce: Option<&str>| {
+                if hop0 {
+                    // No parent token: the proof binds the root token and covers nothing else
+                    // (`check_hop0` refused the sign-off flags).
+                    return Ok((
+                        dpop_key::new_token_proof(&url, a.dpop_key.as_deref(), nonce)?,
+                        None,
+                    ));
+                }
                 dpop_key::exchange_proofs(
                     &url,
                     &subject_token,

@@ -120,6 +120,18 @@ pub(crate) fn exchange_proofs(
     Ok((header, sign_off))
 }
 
+/// The `DPoP` header of a request that mints a token bound to `key` and presents no attenuo
+/// token (`token exchange` at hop 0): a proof for `POST url` with the server's `nonce`, if any,
+/// and no `ath`. `None` without a key.
+pub(crate) fn new_token_proof(
+    url: &str,
+    key: Option<&Path>,
+    nonce: Option<&str>,
+) -> Result<Option<String>> {
+    let now = OffsetDateTime::now_utc();
+    Ok(load_opt(key)?.map(|k| k.proof_with_nonce("POST", url, None, nonce, now)))
+}
+
 /// `attenuo token sign-off`: the parent holder's consent (`subject_token_dpop`) to an
 /// exchange of `subject` at `url` that binds the new token to the key `child_jkt` and gives it
 /// to `actor`, made with the parent's key at `key` (SR-40).

@@ -37,7 +37,7 @@ Secrets are never taken from the argument list by default. That covers the admin
 | Admin token | `ATTENUO_ADMIN_TOKEN` | `--admin-token-file` | `--admin-token-stdin` |
 | Client secret | `ATTENUO_CLIENT_SECRET` | `--client-secret-file` | `--client-secret-stdin` |
 | Delegation token (`call`, `tools`, `authzen eval`, `authzen search`) | `ATTENUO_TOKEN` | `--token-file` | `--token -` |
-| Parent token (`token exchange`) | `ATTENUO_TOKEN` | `--subject-token-file` | `--subject-token -` |
+| Parent token, or the IdP credential at hop 0 (`token exchange`) | `ATTENUO_TOKEN` | `--subject-token-file` | `--subject-token -` |
 
 ```sh
 export ATTENUO_ADMIN_TOKEN=$(cat /run/secrets/attenuo-admin)
@@ -89,33 +89,44 @@ Mint a root (hop 0) token. This uses the development endpoint, so it needs the a
 
 ### `token exchange`
 
-RFC 8693 exchange: delegate a subset of a token's capabilities to a sub-agent.
+RFC 8693 exchange: delegate a subset of a token's capabilities to a sub-agent. With `--subject-token-type id-token` or `id-jag` it is hop 0 instead: an agent trades a user's credential from an `[[idps]]` issuer for a root token (see [Hop 0](#hop-0-from-an-id-token)).
 
 | Option | Meaning |
 | --- | --- |
-| `--subject-token-file PATH` | Read the parent token from the first line of a file. |
-| `--subject-token <JWT\|->` (`ATTENUO_TOKEN`) | The parent token; `-` reads it from stdin. One of the flag, the file or `ATTENUO_TOKEN` is required. The flag with a literal token prints a warning. |
-| `--actor` | The sub-agent that will hold the new token. Required. |
+| `--subject-token-file PATH` | Read the parent token (at hop 0, the IdP credential) from the first line of a file. |
+| `--subject-token <JWT\|->` (`ATTENUO_TOKEN`) | The parent token (at hop 0, the IdP credential); `-` reads it from stdin. One of the flag, the file or `ATTENUO_TOKEN` is required. The flag with a literal token prints a warning. |
+| `--subject-token-type jwt\|id-token\|id-jag` | What the subject token is, sent as `subject_token_type`. `jwt` (the default, `urn:ietf:params:oauth:token-type:jwt`): an attenuo token, exchanged from hop n to hop n+1. `id-token` (`...:id_token`, an OIDC ID token) or `id-jag` (`...:id-jag`, an ID-JAG): hop 0. |
+| `--actor` | The sub-agent that will hold the new token; at hop 0, the agent presenting the credential. Required. |
 | `--client-secret-stdin` | Read the agent's client secret from the first line of standard input. |
 | `--client-secret-file PATH` | Read it from the first line of a file. |
 | `--client-secret` (`ATTENUO_CLIENT_SECRET`) | The agent's client secret, required when the server has `require_actor_auth` (the default). Prefer the environment variable, stdin or a file; the flag prints a warning. |
 | `--client-id` | Client id to authenticate with. Defaults to `--actor`. |
 | `--client-key PATH` | Authenticate with `private_key_jwt` (RFC 7523) instead of a secret, for an agent whose `[[agents]]` entry has `jwks`: sign a client assertion with this private JWK (Ed25519 or P-256, as `key gen --client` writes). The assertion's `iss` and `sub` are the client id, its `kid` the file's, its `jti` fresh, and it lives one minute. Cannot be combined with the `--client-secret` forms; `ATTENUO_CLIENT_SECRET` is then ignored. |
-| `--client-assertion-audience ISSUER` | The assertion's `aud`, which must be the server's `[issuer] issuer`. Defaults to the subject token's `iss`. Needs `--client-key`. |
-| `--cap` | Capability to hand over. Required, repeatable. Must be covered by the parent. |
-| `--ttl-seconds` | Requested lifetime, clamped to the parent's expiry. |
+| `--client-assertion-audience ISSUER` | The assertion's `aud`, which must be the server's `[issuer] issuer`. Defaults to the subject token's `iss`; required at hop 0, where the subject token's `iss` is the IdP's. Needs `--client-key`. |
+| `--cap` | Capability to hand over. Required, repeatable. Must be covered by the parent; at hop 0, by the `[[root_grants]]` entry. |
+| `--ttl-seconds` | Requested lifetime, clamped to the parent's expiry; at hop 0, to the credential's. |
 | `--actor-token <JWT\|->` | Authenticate `--actor` with an RFC 8693 actor token, such as a SPIFFE JWT-SVID from an `[[actor_trust]]` issuer, instead of a client secret. `-` reads it from stdin. Each token works for one exchange. |
 | `--actor-token-file <PATH>` | Read the actor token from a file, for example the JWT-SVID a SPIFFE helper writes. Cannot be combined with `--actor-token`. |
 | `--may-act <AGENT>` | Only this agent may exchange the new token (RFC 8693 `may_act`). Repeatable, or comma-separated. Without it and without `--no-delegation` the new token has no `may_act`, so any authenticated agent may exchange it; it does not inherit the parent's list. Values that are all empty are refused. |
 | `--no-delegation` | Send `may_act: []`: no agent may exchange the new token. Cannot be combined with `--may-act`. |
-| `--dpop-key PATH` | Bind the new token to this DPoP key. Required when the parent is bound. When the parent is bound to the same key, the proof also covers the parent. |
-| `--subject-token-dpop-file PATH` | The parent holder's sign-off (`subject_token_dpop`), made with `token sign-off` for this exchange's `--dpop-key` and `--actor`. Required when the parent is bound to a key other than `--dpop-key`. |
-| `--subject-dpop-key PATH` | Instead of `--subject-token-dpop-file`, when this process may hold the parent's key too: the sign-off is made here. Cannot be combined with `--subject-token-dpop-file`. |
+| `--dpop-key PATH` | Bind the new token to this DPoP key. Required when the parent is bound. When the parent is bound to the same key, the proof also covers the parent. At hop 0, required for an ID-JAG with a `cnf` key, which must be this key. |
+| `--subject-token-dpop-file PATH` | The parent holder's sign-off (`subject_token_dpop`), made with `token sign-off` for this exchange's `--dpop-key` and `--actor`. Required when the parent is bound to a key other than `--dpop-key`. Refused at hop 0. |
+| `--subject-dpop-key PATH` | Instead of `--subject-token-dpop-file`, when this process may hold the parent's key too: the sign-off is made here. Cannot be combined with `--subject-token-dpop-file`. Refused at hop 0. |
 | `--print token\|lease` | Print only that value. |
 
 ```sh
 ATTENUO_TOKEN="$PARENT" attenuo token exchange --actor coder \
   --cap github:read_file --actor-token-file /run/spiffe/coder.jwt --may-act reviewer
+```
+
+#### Hop 0 from an ID token
+
+With `--subject-token-type id-token` the subject token is a user's OIDC ID token, and the request is the hop-0 exchange of [Identity providers](../guides/identity-providers.md): `subject_token_type` `urn:ietf:params:oauth:token-type:id_token`, the capabilities as `authorization_details`, and the agent's credentials. The answer is a root token for the user and `--actor`. `--subject-token-type id-jag` sends an ID-JAG the same way (`...:id-jag`, as a token exchange; the CLI does not send the `jwt-bearer` grant). The server's rules for hop 0 apply: the agent always authenticates (client secret, `--client-key` or `--actor-token`), `--cap` must be within its `[[root_grants]]` entry, `--may-act` and `--no-delegation` within the entry's `may_act`, and each credential mints one root token (a second use is `invalid_grant` / `replayed`). The sign-off flags are refused before anything is sent, since there is no parent token, and so is `--client-key` without `--client-assertion-audience`.
+
+```sh
+printf '%s\n' "$PLANNER_SECRET" | ATTENUO_TOKEN="$ID_TOKEN" attenuo token exchange \
+  --subject-token-type id-token --actor planner --client-secret-stdin \
+  --cap '{"server":"github","tool":"get_file_contents","constraints":{"repo":{"op":"prefix","value":"acme/"}}}'
 ```
 
 A refused exchange that the server audited (its subject token verified) prints the record id under the error, as `decision <id>`, for `audit show --id`:

@@ -177,6 +177,7 @@ dependencies = [
  "attenuo-proxy",
  "attenuo-server",
  "attenuo-token",
+ "axum",
  "base64 0.23.1",
  "clap",
  "hex",
