@@ -32,7 +32,10 @@
 # Not part of CI. Needs docker (the daemon running), curl (7.75 or later, for --aws-sigv4)
 # and python3. Skips with exit status 0 when docker is not available. The MinIO root
 # password, the sink user's secret and the admin token are random per run and stay in the
-# temp dir. Nothing leaves the machine except the image pull.
+# temp dir (mode 0700). `mc` inside the container takes the root password and the sink secret
+# as arguments, which other local users can read in `ps` while it runs; run it on a machine
+# you do not share, or accept that for these throwaway, loopback-only credentials. Nothing
+# leaves the machine except the image pull.
 #
 # Environment:
 #   MINIO_IMAGE          MinIO image with `minio` and `mc` (default: the pinned digest below)
@@ -110,8 +113,11 @@ SINK_USER=attenuo-sink
 
 # --- MinIO -----------------------------------------------------------------------------------
 say "MinIO: $MINIO_IMAGE"
+# The password reaches the container through docker's environment (`-e NAME` copies it from
+# ours), not its argument list, which other local users can read with `ps` (SR-120).
+MINIO_ROOT_PASSWORD="$(cat "$WORK/root.pw")" \
 docker run -d --name "$CONTAINER" --network host --entrypoint minio \
-  -e MINIO_ROOT_USER=minio-root -e MINIO_ROOT_PASSWORD="$(cat "$WORK/root.pw")" \
+  -e MINIO_ROOT_USER=minio-root -e MINIO_ROOT_PASSWORD \
   "$MINIO_IMAGE" server /tmp/data --address "127.0.0.1:$S3_PORT" \
   --console-address "127.0.0.1:$CONSOLE_PORT" >/dev/null
 for _ in $(seq 1 60); do
@@ -430,8 +436,9 @@ ok "endpoint http://LOCALHOST:$S3_PORT/ (upper case, trailing /): objects arrive
 # port. Before the fix the signed host kept `:80` and MinIO answered 403.
 if python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",80))' 2>/dev/null \
    || [ "$(id -u)" != 0 ]; then
+  MINIO_ROOT_PASSWORD="$(cat "$WORK/root.pw")" \
   docker run -d --name "$CONTAINER80" --network host --user 0 --entrypoint minio \
-    -e MINIO_ROOT_USER=minio-root -e MINIO_ROOT_PASSWORD="$(cat "$WORK/root.pw")" \
+    -e MINIO_ROOT_USER=minio-root -e MINIO_ROOT_PASSWORD \
     "$MINIO_IMAGE" server /tmp/data --address 127.0.0.1:80 \
     --console-address "127.0.0.1:$(free_port)" >/dev/null || true
   for _ in $(seq 1 60); do

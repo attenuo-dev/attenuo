@@ -28,8 +28,10 @@
 # build` there). A step whose tool is missing is reported as skipped, and the script then
 # exits non-zero, so a partial run is never mistaken for a pass. Skips with exit status 0 when
 # docker is not available. The admin password, client secrets, agent secrets and user password
-# are random per run and stay in the temp dir. Nothing leaves the machine except the image
-# pull.
+# are random per run and stay in the temp dir (mode 0700). `kcadm.sh` inside the container and
+# curl take some of them as arguments, which other local users can read in `ps` while they
+# run; run it on a machine you do not share, or accept that for these throwaway, loopback-only
+# credentials. Nothing leaves the machine except the image pull.
 #
 # Environment:
 #   KEYCLOAK_IMAGE       Keycloak image (default: the pinned 26.8.2 digest below)
@@ -105,8 +107,11 @@ rand > "$WORK/kc-admin.pw"; rand > "$WORK/user.pw"
 
 # --- Keycloak --------------------------------------------------------------------------------
 say "Keycloak: $KEYCLOAK_IMAGE"
+# The password reaches the container through docker's environment (`-e NAME` copies it from
+# ours), not its argument list, which other local users can read with `ps` (SR-120).
+KC_BOOTSTRAP_ADMIN_PASSWORD="$(cat "$WORK/kc-admin.pw")" \
 docker run -d --name "$CONTAINER" --network host \
-  -e KC_BOOTSTRAP_ADMIN_USERNAME=admin -e KC_BOOTSTRAP_ADMIN_PASSWORD="$(cat "$WORK/kc-admin.pw")" \
+  -e KC_BOOTSTRAP_ADMIN_USERNAME=admin -e KC_BOOTSTRAP_ADMIN_PASSWORD \
   "$KEYCLOAK_IMAGE" start-dev --http-port="$KC_PORT" --http-host=127.0.0.1 >/dev/null
 for _ in $(seq 1 120); do
   curl -sf "$KC/realms/master" >/dev/null 2>&1 && break
