@@ -18,6 +18,8 @@ from importlib.metadata import PackageNotFoundError, version
 from ._sse import DEFAULT_MAX_EVENT_BYTES, StreamEvent
 from ._wire import (
     Approval,
+    AuthzenAction,
+    AuthzenActionPage,
     AuthzenConfiguration,
     AuthzenDecision,
     AuthzenEntryError,
@@ -161,6 +163,8 @@ __all__ = [
     "AuditEntryDetail",
     "AuditFilter",
     "AuditPage",
+    "AuthzenAction",
+    "AuthzenActionPage",
     "AuthzenConfiguration",
     "AuthzenDecision",
     "AuthzenEntryError",

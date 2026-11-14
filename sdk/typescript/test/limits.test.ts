@@ -603,6 +603,27 @@ describe("the opt-in retry", () => {
     expect(jtis.size).toBe(3);
   });
 
+  it("retries an action search with the same body and new DPoP proofs", async () => {
+    const empty = { page: { next_token: "", count: 0 }, results: [] };
+    const { ob, calls } = client(
+      sequence(
+        () => restOverloaded("1"),
+        () => jsonResponse(empty),
+      ),
+      { maxRetries: 1, dpopKey: await DpopKey.generate() },
+    );
+    const page = await ob.authzenSearchAction("TOK", "github", undefined, { limit: 3 });
+    expect(page.actions).toEqual([]);
+    expect(sleeps).toEqual([1000]);
+    expect(calls.map((c) => c.url.pathname)).toEqual([
+      "/access/v1/search/action",
+      "/access/v1/search/action",
+    ]);
+    expect(calls[1]!.body).toEqual(calls[0]!.body);
+    expect((calls[0]!.body as { page: unknown }).page).toEqual({ limit: 3 });
+    expect(new Set(calls.map((c) => claimsOf(c.headers.get("dpop")).jti)).size).toBe(2);
+  });
+
   it("retries a streamed call before it starts", async () => {
     const { ob, calls } = client(
       sequence(

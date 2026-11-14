@@ -527,6 +527,51 @@ class Client:
         resp = self._post(path, self._auth(w.bearer(token, self.token), path), json=body)
         return w.authzen_batch_from_response(w.json_body(resp))
 
+    def authzen_search_action(
+        self,
+        token: Token | str | None,
+        server: str,
+        arguments: dict[str, Any] | None = None,
+        *,
+        page_token: str | None = None,
+        limit: int | None = None,
+    ) -> w.AuthzenActionPage:
+        """One page of AuthZEN action search (``POST /access/v1/search/action``): the tools the
+        ``[policy] catalog`` lists for ``server`` that an evaluation with this token and
+        ``arguments`` would allow now. Nothing is audited or charged, and no approval is taken,
+        so an approval-gated tool is never a result.
+
+        ``limit`` is how many catalogued tools the page evaluates (the server clamps it to
+        ``[authzen] max_batch``); ``page_token`` is the ``next_token`` of the previous page, sent
+        with the same arguments. :meth:`authzen_search_action_iter` follows it. Authentication,
+        DPoP and retries are as for :meth:`authzen_evaluate`; a refusal raises
+        :class:`~attenuo.ApiError` (400 ``invalid_search_resource`` for a ``server`` holding
+        ``/``, 400 ``invalid_page`` or ``invalid_cursor`` for a bad page)."""
+        path = "/access/v1/search/action"
+        body = w.authzen_search_action_body(server, arguments, page_token, limit)
+        resp = self._post(path, self._auth(w.bearer(token, self.token), path), json=body)
+        return w.authzen_search_action_from_response(w.json_body(resp))
+
+    def authzen_search_action_iter(
+        self,
+        token: Token | str | None,
+        server: str,
+        arguments: dict[str, Any] | None = None,
+        *,
+        limit: int | None = None,
+    ) -> Iterator[w.AuthzenAction]:
+        """Every result of :meth:`authzen_search_action`, following ``next_token`` until the
+        last page. Pages lazily: stop iterating to stop asking."""
+        page_token: str | None = None
+        while True:
+            page = self.authzen_search_action(
+                token, server, arguments, page_token=page_token, limit=limit
+            )
+            yield from page.actions
+            page_token = w.advance_cursor(page.next_token, page_token)
+            if page_token is None:
+                return
+
     def authzen_configuration(self) -> w.AuthzenConfiguration:
         """``GET /.well-known/authzen-configuration``: the AuthZEN discovery document. No
         credential is sent."""
@@ -926,6 +971,39 @@ class AsyncClient:
         path = "/access/v1/evaluations"
         resp = await self._post(path, self._auth(w.bearer(token, self.token), path), json=body)
         return w.authzen_batch_from_response(w.json_body(resp))
+
+    async def authzen_search_action(
+        self,
+        token: Token | str | None,
+        server: str,
+        arguments: dict[str, Any] | None = None,
+        *,
+        page_token: str | None = None,
+        limit: int | None = None,
+    ) -> w.AuthzenActionPage:
+        path = "/access/v1/search/action"
+        body = w.authzen_search_action_body(server, arguments, page_token, limit)
+        resp = await self._post(path, self._auth(w.bearer(token, self.token), path), json=body)
+        return w.authzen_search_action_from_response(w.json_body(resp))
+
+    async def authzen_search_action_iter(
+        self,
+        token: Token | str | None,
+        server: str,
+        arguments: dict[str, Any] | None = None,
+        *,
+        limit: int | None = None,
+    ) -> AsyncIterator[w.AuthzenAction]:
+        page_token: str | None = None
+        while True:
+            page = await self.authzen_search_action(
+                token, server, arguments, page_token=page_token, limit=limit
+            )
+            for action in page.actions:
+                yield action
+            page_token = w.advance_cursor(page.next_token, page_token)
+            if page_token is None:
+                return
 
     async def authzen_configuration(self) -> w.AuthzenConfiguration:
         resp = await self._retrying(lambda: self._http.get("/.well-known/authzen-configuration"))

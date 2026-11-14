@@ -69,6 +69,17 @@ describe("a redirect from the server URL (SR-112)", () => {
     expect(seen).toEqual([]);
   });
 
+  it("is not followed by action search, and the bearer stays on this origin", async () => {
+    const { front, seen } = await redirecting();
+    const err = await new AttenuoClient(front)
+      .authzenSearchAction("sr112-bearer", "gh", { repo: "a/b" })
+      .catch((e: unknown) => e);
+    expect((err as ApiError).code).toBe("redirect_not_followed");
+    expect((err as ApiError).message).not.toContain("sr112-bearer");
+    await settle();
+    expect(seen).toEqual([]);
+  });
+
   it("is not followed by the admin client either", async () => {
     const { front, seen } = await redirecting();
     const admin = new AdminClient(front, "sr112-admin-token");

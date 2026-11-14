@@ -646,12 +646,7 @@ def _next_cursor(page: Any) -> str | None:
     return cur if isinstance(cur, str) else None
 
 
-def _advance(cur: str | None, last: str | None) -> str | None:
-    """``cur`` to follow next, refusing a cursor that repeats the one just sent (which would
-    page forever)."""
-    if cur is not None and cur == last:
-        raise AttenuoError("paging did not advance (the server sent the same cursor again)")
-    return cur
+_advance = w.advance_cursor
 
 
 def _entry_detail(b: Any) -> AuditEntryDetail:

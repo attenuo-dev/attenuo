@@ -716,6 +716,9 @@ describe.skipIf(!enabled)("DPoP server nonces against the real server", () => {
       clientSecret: CODER_SECRET,
     });
     expect(coder.dpopJkt).toBe(key.thumbprint);
+    // Action search signs its own URL and picks up the nonce like evaluation.
+    const found = await ob.authzenSearchAction(coder, "github", { repo: "alice/public-x" });
+    expect(found.actions.map((a) => a.name)).toEqual(["read_file"]);
 
     // Through the fetch an MCP client library would use.
     const f = mcpFetch(() => coder, { dpopKey: key });
@@ -1257,6 +1260,63 @@ describe.skipIf(!enabled)(
         accessEvaluationsEndpoint: `${url}/access/v1/evaluations`,
       });
       await admin.revokeLease(root.lease);
+    });
+
+    it("searches actions as evaluation would decide them, page by page", async () => {
+      const admin = new AdminClient(url, ADMIN_TOKEN);
+      const ob = new AttenuoClient(url);
+      const root = await admin.mintRootDev("alice", ISSUER, "assistant", {
+        capabilities: ["github:*"],
+      });
+      const coder = await ob.exchange(root, "coder", ["github:read_file"], {
+        clientSecret: CODER_SECRET,
+      });
+      const pub = { repo: "alice/public-docs", path: "README.md" };
+      const priv = { repo: "alice/private-salaries", path: "pay.csv" };
+      const collect = async (token: typeof root, args: Record<string, unknown>, limit?: number) => {
+        const out = [];
+        for await (const a of ob.authzenSearchActionIter(token, "github", args, { limit })) {
+          out.push(a);
+        }
+        return out;
+      };
+
+      const page = await ob.authzenSearchAction(coder, "github", pub);
+      expect(page.actions).toEqual([{ name: "read_file", server: "github" }]);
+      expect(page.nextToken).toBeUndefined();
+      expect((await ob.authzenEvaluate(coder, "github", "read_file", pub)).decision).toBe(true);
+      // The policy forbids the private repo, so nothing is a result for these arguments.
+      expect((await ob.authzenSearchAction(coder, "github", priv)).actions).toEqual([]);
+
+      // One candidate per page: the catalog is create_issue, delete_repo, read_file. The first
+      // page is approval-gated create_issue, never a result, so it is empty with a token.
+      const first = await ob.authzenSearchAction(root, "github", pub, { limit: 1 });
+      expect(first.actions).toEqual([]);
+      expect(first.nextToken).toBeTruthy();
+      const paged = await collect(root, pub, 1);
+      expect(paged).toEqual(await collect(root, pub));
+      expect(paged).toContainEqual({ name: "read_file", server: "github" });
+      expect(paged).not.toContainEqual({ name: "create_issue", server: "github" });
+      for (const a of paged) {
+        expect((await ob.authzenEvaluate(root, "github", a.name, pub)).decision).toBe(true);
+      }
+
+      await expect(ob.authzenSearchAction("not-a-token", "github", pub)).rejects.toBeInstanceOf(
+        UnauthorizedError,
+      );
+      await expect(ob.authzenSearchAction(coder, "github/read_file", pub)).rejects.toMatchObject({
+        status: 400,
+        code: "invalid_search_resource",
+      });
+      await expect(
+        ob.authzenSearchAction(coder, "github", pub, { pageToken: "not-a-token" }),
+      ).rejects.toMatchObject({ code: "invalid_cursor" });
+      expect((await ob.authzenConfiguration()).searchActionEndpoint).toBe(
+        `${url}/access/v1/search/action`,
+      );
+
+      await admin.revokeLease(root.lease);
+      expect((await ob.authzenSearchAction(coder, "github", pub)).actions).toEqual([]);
     });
 
     it("lets the user decide with their ID token, and nobody else", async () => {

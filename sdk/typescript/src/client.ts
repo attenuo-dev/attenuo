@@ -634,6 +634,52 @@ export class AttenuoClient {
     return w.authzenBatchFromResponse(await w.jsonBody(res));
   }
 
+  /**
+   * One page of AuthZEN action search (`POST /access/v1/search/action`): the tools the
+   * `[policy] catalog` lists for `server` that an evaluation with this token and `args` would
+   * allow now. Nothing is audited or charged, and no approval is taken, so an approval-gated
+   * tool is never a result.
+   *
+   * `opts.limit` is how many catalogued tools the page evaluates (the server clamps it to
+   * `[authzen] max_batch`); `opts.pageToken` is the `nextToken` of the previous page, sent with
+   * the same arguments. `authzenSearchActionIter` follows it. Authentication, DPoP and retries
+   * are as for `authzenEvaluate`; a refusal throws `ApiError` (400 `invalid_search_resource`
+   * for a `server` holding `/`, 400 `invalid_page` or `invalid_cursor` for a bad page).
+   */
+  async authzenSearchAction(
+    token: Token | string | undefined,
+    server: string,
+    args?: Record<string, unknown>,
+    opts: w.AuthzenSearchOptions = {},
+  ): Promise<w.AuthzenActionPage> {
+    const path = "/access/v1/search/action";
+    const body = w.authzenSearchActionBody(server, args, opts);
+    const res = await this.post(path, this.auth(bearer(token, this.token), path), body);
+    return w.authzenSearchActionFromResponse(await w.jsonBody(res));
+  }
+
+  /**
+   * Every result of `authzenSearchAction`, following `nextToken` until the last page. Pages
+   * lazily: stop iterating to stop asking.
+   */
+  async *authzenSearchActionIter(
+    token: Token | string | undefined,
+    server: string,
+    args?: Record<string, unknown>,
+    opts: { limit?: number } = {},
+  ): AsyncGenerator<w.AuthzenAction> {
+    let pageToken: string | undefined;
+    for (;;) {
+      const page = await this.authzenSearchAction(token, server, args, { ...opts, pageToken });
+      yield* page.actions;
+      if (page.nextToken !== undefined && page.nextToken === pageToken) {
+        throw new AttenuoError("paging did not advance (the server sent the same cursor again)");
+      }
+      pageToken = page.nextToken;
+      if (pageToken === undefined) return;
+    }
+  }
+
   /** `GET /.well-known/authzen-configuration`: the AuthZEN discovery document. No credential is sent. */
   async authzenConfiguration(): Promise<w.AuthzenConfiguration> {
     const res = await this.retrying(() => this.http.get("/.well-known/authzen-configuration"));

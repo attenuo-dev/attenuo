@@ -1208,6 +1208,29 @@ pub(crate) enum AuthzenCmd {
         #[arg(long = "arg", value_parser = parse_kv)]
         args: Vec<(String, Value)>,
     },
+    /// List the catalogued tools of an upstream that the token's chain may call with these
+    /// arguments (AuthZEN action search), without calling or auditing anything.
+    Search {
+        /// The delegation token, sent as the bearer.
+        #[command(flatten)]
+        token: TokenSource,
+        /// MCP upstream name.
+        #[arg(long, value_name = "NAME", default_value = "github")]
+        upstream: String,
+        /// Argument `key=value` (`key:=json`) every candidate is decided with. Repeatable.
+        #[arg(long = "arg", value_parser = parse_kv)]
+        args: Vec<(String, Value)>,
+        /// How many catalogued tools one page evaluates (the server clamps it to its
+        /// `[authzen] max_batch`).
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
+        limit: Option<u64>,
+        /// Ask for the page after this one: the `next_token` a previous search printed.
+        #[arg(long, value_name = "TOKEN", conflicts_with = "all")]
+        page_token: Option<String>,
+        /// Follow `next_token` and print every page's results.
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 /// Turn `--cap` values into capability objects. A value starting with `{` is a full
@@ -1406,6 +1429,37 @@ mod tests {
             assert!(help.contains("--upstream"), "{path:?}: {help}");
             assert!(!help.contains("--server <"), "{path:?}: {help}");
         }
+    }
+
+    #[test]
+    fn authzen_search_flags() {
+        let cli = parse(&["authzen", "search", "--arg", "repo=a/b", "--limit", "5"]).unwrap();
+        match cli.command {
+            Command::Authzen(AuthzenCmd::Search {
+                upstream,
+                args,
+                limit,
+                page_token,
+                all,
+                ..
+            }) => {
+                assert_eq!(upstream, "github");
+                assert_eq!(args, vec![("repo".to_string(), json!("a/b"))]);
+                assert_eq!((limit, page_token, all), (Some(5), None, false));
+            }
+            _ => panic!("not authzen search"),
+        }
+        assert!(parse(&["authzen", "search", "--limit", "0"]).is_err());
+        assert!(parse(&["authzen", "search", "--all", "--page-token", "t"]).is_err());
+        assert!(parse(&[
+            "authzen",
+            "search",
+            "--page-token",
+            "t",
+            "--token-file",
+            "/t"
+        ])
+        .is_ok());
     }
 
     #[test]

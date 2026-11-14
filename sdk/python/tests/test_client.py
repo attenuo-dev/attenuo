@@ -18,6 +18,8 @@ from attenuo import (
     AsyncAdminClient,
     AsyncClient,
     AttenuoError,
+    AuthzenAction,
+    AuthzenActionPage,
     AuthzenConfiguration,
     AuthzenEntryError,
     AuthzenEvaluation,
@@ -682,13 +684,114 @@ async def test_authzen_configuration(make: Any) -> None:
     assert cfg.policy_decision_point == "https://pdp.example"
     assert cfg.access_evaluation_endpoint.endswith("/access/v1/evaluation")
     assert cfg.access_evaluations_endpoint.endswith("/access/v1/evaluations")
+    assert cfg.search_action_endpoint == ""
     assert cfg.raw == doc
+    with_search = {**doc, "search_action_endpoint": "https://pdp.example/access/v1/search/action"}
+    client, _ = make(lambda r: httpx.Response(200, json=with_search))
+    cfg = await call(client, "authzen_configuration")
+    assert cfg.search_action_endpoint == with_search["search_action_endpoint"]
 
     bad_host = {"error": "invalid_host", "detail": "Host must be localhost"}
     client, _ = make(lambda r: httpx.Response(400, json=bad_host))
     with pytest.raises(ApiError) as e:
         await call(client, "authzen_configuration")
     assert e.value.error == "invalid_host"
+
+
+async def test_authzen_search_action_wire_format_and_paging(make: Any) -> None:
+    pages = [
+        {
+            "page": {"next_token": "T1", "count": 1},
+            "results": [{"name": "read_file", "properties": {"server": "github"}}],
+        },
+        {"page": {"next_token": "T2", "count": 0}, "results": []},
+        {
+            "page": {"next_token": "", "count": 1},
+            "results": [{"name": "search", "properties": {"server": "github"}}],
+        },
+    ]
+
+    def handler(r: httpx.Request) -> httpx.Response:
+        token = json.loads(r.content).get("page", {}).get("token")
+        return httpx.Response(200, json=pages[{None: 0, "T1": 1, "T2": 2}[token]])
+
+    client, rec = make(handler)
+    page = await call(client, "authzen_search_action", "TOK", "github", {"repo": "a/b"}, limit=2)
+    assert (rec.last.method, rec.last.url.path) == ("POST", "/access/v1/search/action")
+    assert rec.last.headers["authorization"] == "Bearer TOK"
+    assert rec.body() == {
+        "subject": {"type": "agent", "id": ""},
+        "resource": {"type": "mcp_server", "id": "github"},
+        "context": {"input": {"repo": "a/b"}},
+        "page": {"limit": 2},
+    }
+    assert isinstance(page, AuthzenActionPage)
+    assert page.actions == [AuthzenAction("read_file", "github")]
+    assert page.next_token == "T1" and page.raw == pages[0]
+
+    page = await call(client, "authzen_search_action", "TOK", "github", page_token="T2")
+    assert rec.body() == {
+        "subject": {"type": "agent", "id": ""},
+        "resource": {"type": "mcp_server", "id": "github"},
+        "context": {"input": {}},
+        "page": {"token": "T2"},
+    }
+    assert page.actions == [AuthzenAction("search", "github")]
+    assert page.next_token is None, "the server's empty token is the last page"
+
+    # The iterator follows next_token through an empty page to the last one.
+    it = client.authzen_search_action_iter("TOK", "github", limit=2)
+    names = [a.name async for a in it] if inspect.isasyncgen(it) else [a.name for a in it]
+    assert names == ["read_file", "search"]
+    assert [json.loads(r.content).get("page") for r in rec.requests[-3:]] == [
+        {"limit": 2},
+        {"token": "T1", "limit": 2},
+        {"token": "T2", "limit": 2},
+    ]
+
+
+async def test_authzen_search_action_refusals(make: Any) -> None:
+    stuck = {"page": {"next_token": "T", "count": 0}, "results": []}
+    client, _ = make(lambda r: httpx.Response(200, json=stuck))
+    it = client.authzen_search_action_iter("TOK", "github")
+    with pytest.raises(AttenuoError, match="did not advance"):
+        if inspect.isasyncgen(it):
+            async for _ in it:
+                pass
+        else:
+            for _ in it:
+                pass
+
+    bad = {"error": "invalid_request", "code": "invalid_search_resource", "detail": "one tool"}
+    client, _ = make(lambda r: httpx.Response(400, json=bad))
+    with pytest.raises(ApiError) as e:
+        await call(client, "authzen_search_action", "TOK", "github/read_file")
+    assert (e.value.status, e.value.code) == (400, "invalid_search_resource")
+
+    expired = {"error": "invalid_token", "detail": "expired", "error_description": "expired"}
+    client, _ = make(lambda r: httpx.Response(401, json=expired))
+    with pytest.raises(Unauthorized):
+        await call(client, "authzen_search_action", "TOK", "github")
+
+    for odd in ({"decision": True}, {"results": [{"properties": {}}]}):
+        client, _ = make(lambda r, odd=odd: httpx.Response(200, json=odd))
+        with pytest.raises(AttenuoError, match="action search"):
+            await call(client, "authzen_search_action", "TOK", "github")
+
+    client, _ = make(lambda r: httpx.Response(200, json=stuck))
+    with pytest.raises(ValueError, match="no token"):
+        await call(client, "authzen_search_action", None, "github")
+
+
+async def test_authzen_search_action_signs_with_dpop(make: Any) -> None:
+    key = DpopKey.generate()
+    empty = {"page": {"next_token": "", "count": 0}, "results": []}
+    client, rec = make(lambda r: httpx.Response(200, json=empty), dpop_key=key)
+    page = await call(client, "authzen_search_action", "TOK", "github")
+    assert page.actions == [] and page.next_token is None
+    assert rec.last.headers["authorization"] == "DPoP TOK"
+    claims = json.loads(base64.urlsafe_b64decode(rec.last.headers["dpop"].split(".")[1] + "=="))
+    assert (claims["htm"], claims["htu"]) == ("POST", f"{BASE}/access/v1/search/action")
 
 
 async def test_close_session(make: Any) -> None:

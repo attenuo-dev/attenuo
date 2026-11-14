@@ -1106,6 +1106,129 @@ async fn unsigned_authzen_chains_need_a_pep_and_an_issued_chain() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
+/// Action search takes the same unsigned-chain path as evaluation: with `allow_unsigned_chain`,
+/// a `[[peps]]` entry may search for a chain this server issued, and answers come from that
+/// chain's capabilities. A PEP without its credentials, or a chain the server did not issue, is
+/// refused as at evaluation, and no search (accepted or refused) writes an audit record.
+#[tokio::test]
+async fn unsigned_authzen_chains_can_search_actions_from_a_pep() {
+    let h = Harness::start_tweaked(false, |cfg| {
+        cfg.authzen.allow_unsigned_chain = true;
+        cfg.peps = vec![attenuo_server::config::PepConfig::with_secret_sha256(
+            "gateway",
+            sha256_hex(PEP_SECRET),
+        )];
+    })
+    .await;
+    let root = h.mint_root("alice", "planner", &["github:*"]).await;
+    let child = h
+        .exchange(&root.token, "coder", &["github:read_file"])
+        .await;
+    let chain = h
+        .state
+        .verifier
+        .verify(&child.token, time::OffsetDateTime::now_utc())
+        .unwrap()
+        .chain;
+    let call =
+        attenuo_core::ToolCall::new("github", "read_file", json!({"repo": "alice/public-site"}));
+    let search_body = |chain: &attenuo_core::DelegationChain, secret: Option<&str>| {
+        let mut body = serde_json::to_value(authzen::to_request(chain, &call)).unwrap();
+        let obj = body.as_object_mut().unwrap();
+        obj.remove("action");
+        obj.insert(
+            "resource".into(),
+            json!({"type": "mcp_server", "id": "github"}),
+        );
+        if let Some(s) = secret {
+            obj.insert("pep_id".into(), json!("gateway"));
+            obj.insert("pep_secret".into(), json!(s));
+        }
+        body
+    };
+    let search = |body: Value| {
+        h.client
+            .post(h.url("/access/v1/search/action"))
+            .json(&body)
+            .send()
+    };
+    let before = h.audit_entries().await.len();
+
+    // Accepted: the issued child chain, from an authenticated PEP (body credentials).
+    let resp = search(search_body(&chain, Some(PEP_SECRET))).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let b: Value = resp.json().await.unwrap();
+    assert_eq!(
+        b["results"],
+        json!([{"name": "read_file", "properties": {"server": "github"}}]),
+        "{b}"
+    );
+    assert_eq!(b["page"], json!({"next_token": "", "count": 1}), "{b}");
+    // And with HTTP Basic: the root chain holds `github:*`, so more of the catalog is a result.
+    let root_chain = attenuo_core::DelegationChain {
+        originating_user: chain.originating_user.clone(),
+        hops: chain.hops[..1].to_vec(),
+    };
+    let resp = h
+        .client
+        .post(h.url("/access/v1/search/action"))
+        .basic_auth("gateway", Some(PEP_SECRET))
+        .json(&search_body(&root_chain, None))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let b: Value = resp.json().await.unwrap();
+    let names: Vec<&str> = b["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"read_file"), "{b}");
+
+    // Refused: no PEP credentials, a wrong secret, and wrong Basic credentials.
+    for (name, body) in [
+        ("no credentials", search_body(&chain, None)),
+        ("wrong secret", search_body(&chain, Some("wrong"))),
+    ] {
+        let resp = search(body).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{name}");
+        assert_eq!(
+            resp.json::<Value>().await.unwrap()["error"],
+            "invalid_client",
+            "{name}"
+        );
+    }
+    let resp = h
+        .client
+        .post(h.url("/access/v1/search/action"))
+        .basic_auth("gateway", Some("wrong"))
+        .json(&search_body(&chain, None))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Refused: chains this server did not issue, built from real lease ids.
+    let mut other_user = chain.clone();
+    other_user.originating_user.subject = "bob".into();
+    let mut wider = chain.clone();
+    wider.hops[1].capabilities = root_chain.hops[0].capabilities.clone();
+    for (name, forged) in [("other user", &other_user), ("wider child", &wider)] {
+        let resp = search(search_body(forged, Some(PEP_SECRET))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{name}");
+        let err: Value = resp.json().await.unwrap();
+        assert_eq!(err["error"], "chain_not_issued", "{name}: {err}");
+    }
+
+    assert_eq!(
+        h.audit_entries().await.len(),
+        before,
+        "a search, accepted or refused, writes no audit record"
+    );
+}
+
 // ---------------------------------------------------------------------------------------------
 // Scenario 5: audit verification, and tamper detection on a file-backed log.
 // ---------------------------------------------------------------------------------------------

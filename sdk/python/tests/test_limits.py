@@ -716,6 +716,24 @@ async def test_each_retry_has_new_dpop_proofs(make: Any, sleeps: list[float]) ->
     assert len(jtis) == 3
 
 
+async def test_action_search_is_retried_with_new_dpop_proofs(
+    make: Any,  # noqa: F811
+    sleeps: list[float],
+) -> None:
+    empty = {"page": {"next_token": "", "count": 0}, "results": []}
+    client, rec = make(
+        sequence(rest_overloaded("1"), httpx.Response(200, json=empty)),
+        max_retries=1,
+        dpop_key=DpopKey.generate(),
+    )
+    page = await call(client, "authzen_search_action", "TOK", "github", limit=3)
+    assert page.actions == [] and sleeps == [1.0]
+    assert [r.url.path for r in rec.requests] == ["/access/v1/search/action"] * 2
+    first, second = (json.loads(r.content) for r in rec.requests)
+    assert first == second and first["page"] == {"limit": 3}
+    assert len({verify(r.headers["dpop"])[1]["jti"] for r in rec.requests}) == 2
+
+
 async def test_a_streamed_call_is_retried_before_it_starts(
     make: Any,  # noqa: F811
     sleeps: list[float],

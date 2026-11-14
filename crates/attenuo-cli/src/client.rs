@@ -320,7 +320,30 @@ impl Client {
         body: &Value,
         key: Option<&DpopKey>,
     ) -> Result<Value> {
-        let url = self.url("/access/v1/evaluation");
+        self.post_as_agent("/access/v1/evaluation", token, body, key)
+            .await
+    }
+
+    /// `POST /access/v1/search/action` with the delegation token as bearer.
+    pub(crate) async fn authzen_search_action(
+        &self,
+        token: &str,
+        body: &Value,
+        key: Option<&DpopKey>,
+    ) -> Result<Value> {
+        self.post_as_agent("/access/v1/search/action", token, body, key)
+            .await
+    }
+
+    /// `POST path` with the delegation token as bearer (and a DPoP proof for that URL).
+    async fn post_as_agent(
+        &self,
+        path: &str,
+        token: &str,
+        body: &Value,
+        key: Option<&DpopKey>,
+    ) -> Result<Value> {
+        let url = self.url(path);
         let reply = self
             .send_dpop(key.is_some(), |nonce| {
                 Ok(present(self.http.post(&url), token, key, "POST", &url, nonce).json(body))

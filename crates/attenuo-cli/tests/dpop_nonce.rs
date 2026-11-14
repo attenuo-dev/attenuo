@@ -240,6 +240,90 @@ fn root_and_authzen_retry_with_the_nonce() {
     assert_quiet(&out, &[NONCE, "a.b.c"]);
 }
 
+/// `authzen search --all` sends the search body, retries once with the nonce, then follows
+/// `next_token` page by page with the same arguments and prints every page's results.
+#[test]
+fn authzen_search_follows_pages_with_the_nonce() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = key_file(dir.path());
+    let first = r#"{"page":{"next_token":"T1","count":1},"results":[{"name":"read_file","properties":{"server":"github"}}]}"#;
+    let last = r#"{"page":{"next_token":"","count":1},"results":[{"name":"search","properties":{"server":"github"}}]}"#;
+    let (url, server) = scripted_server(vec![refusal(NONCE), ok(first), ok(last)]);
+    let out = attenuo()
+        .env("ATTENUO_TOKEN", "a.b.c")
+        .args([
+            "--server",
+            &url,
+            "authzen",
+            "search",
+            "--upstream",
+            "github",
+        ])
+        .args([
+            "--arg",
+            "repo=alice/docs",
+            "--limit",
+            "1",
+            "--all",
+            "--dpop-key",
+        ])
+        .arg(&key)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(stdout, "github/read_file\ngithub/search\n");
+    let reqs = server.join().unwrap();
+    let search = format!("{url}/access/v1/search/action");
+    assert!(reqs
+        .iter()
+        .all(|r| r.starts_with("POST /access/v1/search/action ")));
+    assert_eq!(proof_of(&reqs[0], &search, Some("a.b.c")).nonce, None);
+    for r in &reqs[1..] {
+        assert_eq!(
+            proof_of(r, &search, Some("a.b.c")).nonce.as_deref(),
+            Some(NONCE)
+        );
+    }
+    let body = |r: &str| -> serde_json::Value {
+        serde_json::from_str(&r[r.find("\r\n\r\n").unwrap() + 4..]).unwrap()
+    };
+    assert_eq!(
+        body(&reqs[1]),
+        serde_json::json!({
+            "subject": {"type": "agent", "id": ""},
+            "resource": {"type": "mcp_server", "id": "github"},
+            "context": {"input": {"repo": "alice/docs"}},
+            "page": {"limit": 1},
+        })
+    );
+    assert_eq!(
+        body(&reqs[2])["page"],
+        serde_json::json!({"token": "T1", "limit": 1})
+    );
+    assert_quiet(&out, &[NONCE, "a.b.c"]);
+
+    // Without `--all`: one page, and the token to ask for the next one.
+    let (url, server) = scripted_server(vec![ok(first)]);
+    let out = attenuo()
+        .env("ATTENUO_TOKEN", "a.b.c")
+        .args(["--server", &url, "authzen", "search"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "github/read_file\nnext page: --page-token T1\n"
+    );
+    let reqs = server.join().unwrap();
+    assert_eq!(header(&reqs[0], "authorization"), Some("Bearer a.b.c"));
+    assert!(body(&reqs[0]).get("page").is_none());
+}
+
 #[test]
 fn exchange_header_proof_carries_the_nonce_and_the_sign_off_does_not_need_one() {
     let dir = tempfile::tempdir().unwrap();
@@ -454,6 +538,27 @@ async fn cli_works_against_a_server_that_requires_nonces() {
         ])
         .arg(&key);
     assert!(run(c).await.unwrap().contains("ALLOW"));
+
+    let mut c = attenuo();
+    c.env("ATTENUO_TOKEN", &child)
+        .args([
+            "--server",
+            &url,
+            "authzen",
+            "search",
+            "--upstream",
+            "github",
+        ])
+        .args(["--arg", "repo=alice/docs", "--json", "--dpop-key"])
+        .arg(&key);
+    let found: serde_json::Value = serde_json::from_str(&run(c).await.unwrap()).unwrap();
+    assert_eq!(
+        found,
+        serde_json::json!({
+            "page": {"next_token": "", "count": 1},
+            "results": [{"name": "read_file", "properties": {"server": "github"}}],
+        })
+    );
 
     // Without the key the bound token is refused, with or without nonce handling.
     let mut c = attenuo();

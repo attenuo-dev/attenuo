@@ -179,6 +179,29 @@ class AuthzenConfiguration:
     access_evaluation_endpoint: str
     access_evaluations_endpoint: str
     raw: dict[str, Any] = field(repr=False)
+    #: ``""`` when the server does not publish action search.
+    search_action_endpoint: str = ""
+
+
+@dataclass(frozen=True)
+class AuthzenAction:
+    """One result of an AuthZEN action search: the tool ``server/name`` that an evaluation
+    with the same token and arguments would allow now."""
+
+    name: str
+    server: str
+
+
+@dataclass(frozen=True)
+class AuthzenActionPage:
+    """One page of ``POST /access/v1/search/action``. ``next_token`` is the token of the next
+    page, ``None`` after the last (the server's ``""``). A page can hold fewer results than its
+    ``limit``, even none, while ``next_token`` is set: ``limit`` bounds how many catalogued
+    tools one page evaluates, not how many it returns."""
+
+    actions: list[AuthzenAction]
+    next_token: str | None
+    raw: dict[str, Any] = field(repr=False)
 
 
 @dataclass(frozen=True)
@@ -529,6 +552,59 @@ def authzen_configuration_from_json(body: Any) -> AuthzenConfiguration:
         policy_decision_point=str(body.get("policy_decision_point", "")),
         access_evaluation_endpoint=str(body.get("access_evaluation_endpoint", "")),
         access_evaluations_endpoint=str(body.get("access_evaluations_endpoint", "")),
+        raw=body,
+        search_action_endpoint=str(body.get("search_action_endpoint", "")),
+    )
+
+
+def advance_cursor(cur: str | None, last: str | None) -> str | None:
+    """``cur`` to follow next, refusing a cursor that repeats the one just sent (which would
+    page forever)."""
+    if cur is not None and cur == last:
+        raise AttenuoError("paging did not advance (the server sent the same cursor again)")
+    return cur
+
+
+def authzen_search_action_body(
+    server: str,
+    arguments: dict[str, Any] | None,
+    page_token: str | None = None,
+    limit: int | None = None,
+) -> dict[str, Any]:
+    """The ``POST /access/v1/search/action`` body: the subject (filled in by the server from
+    the verified chain), the MCP ``server`` as the resource, the arguments every candidate is
+    decided with, and ``page`` when a token or limit is given."""
+    body: dict[str, Any] = {
+        "subject": {"type": "agent", "id": ""},
+        "resource": {"type": "mcp_server", "id": server},
+        "context": {"input": arguments or {}},
+    }
+    page: dict[str, Any] = {}
+    if page_token:
+        page["token"] = page_token
+    if limit is not None:
+        page["limit"] = limit
+    if page:
+        body["page"] = page
+    return body
+
+
+def authzen_search_action_from_response(body: Any) -> AuthzenActionPage:
+    items = body.get("results") if isinstance(body, dict) else None
+    if not isinstance(items, list):
+        raise AttenuoError(f"unexpected AuthZEN action search response: {str(body)[:200]}")
+    actions = []
+    for item in items:
+        if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+            raise AttenuoError(f"unexpected AuthZEN action search result: {str(item)[:200]}")
+        props = item.get("properties")
+        server = props.get("server") if isinstance(props, dict) else None
+        actions.append(AuthzenAction(name=item["name"], server=str(server or "")))
+    page = body.get("page")
+    token = page.get("next_token") if isinstance(page, dict) else None
+    return AuthzenActionPage(
+        actions=actions,
+        next_token=token if isinstance(token, str) and token else None,
         raw=body,
     )
 
