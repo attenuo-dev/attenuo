@@ -118,7 +118,7 @@ print(ev.decision, ev.reason, ev.policy_ids)  # no lease check, no audit record
 | `audit_iter(filter=None, *, order="asc", from_seq=None, to_seq=None, limit=1000)` | `GET /admin/audit`, repeated | iterator of `AuditEntry`, following `next_cursor` until null |
 | `audit_entry(seq)`, `audit_record(record_id)` | `GET /admin/audit/entries/{seq}`, `/admin/audit/records/{id}` | `AuditEntryDetail(entry, lease_states, covered_by_checkpoint, policy_reloaded_after)` |
 | `audit_checkpoints(cursor=None, limit=None)`, `audit_checkpoints_iter(limit=None)` | `GET /admin/audit/checkpoints` | `CheckpointPage(checkpoints, next_cursor)`; the iterator yields every checkpoint, newest first |
-| `lease_tree(lease_id, max_nodes=None)` | `GET /admin/leases/{id}/tree` | `LeaseTree(root, ancestors, nodes, would_revoke, truncated)` |
+| `lease_tree(lease_id, max_nodes=None)` | `GET /admin/leases/{id}/tree` | `LeaseTree(root, ancestors, nodes, would_revoke, truncated, user_windows)`; `user_windows` is the run user's `LeaseUserWindows` (`None` for a run issued before the server kept issuers) |
 | `whoami()` | `GET /admin/whoami` | `AdminIdentity(name, role)`: the operator the admin token belongs to (`admin` for the server's `[admin] token`) and its role |
 | `policies()` | `GET /admin/policies` | `PolicySet(path, sha256, loaded_at, policy_ids, warnings, policies)` |
 | `policy_check()` | `GET /admin/policies/check` | `PolicyCheck(ok, issues, differs_from_loaded, ...)` |

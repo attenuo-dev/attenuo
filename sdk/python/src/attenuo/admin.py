@@ -275,18 +275,45 @@ class LeaseNode:
 
 
 @dataclass(frozen=True)
+class LeaseUserWindow:
+    """One per-user window of a run's originating user (run limits phase 3): the window of
+    ``kind`` (``hour`` or ``day``) holding now, starting at ``start`` (RFC 3339, UTC), and what
+    every run of the user was allowed in it for ``tool`` (``"<server>/<tool>"``)."""
+
+    tool: str
+    kind: str
+    start: str
+    calls: int
+    amount: int
+
+
+@dataclass(frozen=True)
+class LeaseUserWindows:
+    """The ``user_windows`` of a :class:`LeaseTree`: a window per tool the run used and kind a
+    loaded policy reads, ordered by tool then kind; ``truncated`` when the server's cap cut
+    the list short."""
+
+    windows: list[LeaseUserWindow]
+    truncated: bool
+
+
+@dataclass(frozen=True)
 class LeaseTree:
     """What a revoke of the lease would reach, changing nothing.
 
     ``nodes`` is the lease then its descendants, breadth-first, cut short when ``truncated``.
     ``ancestors`` runs nearest first to ``root``, the chain's first hop. ``would_revoke`` is the
-    count a revoke sent now would return (whole subtree, ignoring ``max_nodes``)."""
+    count a revoke sent now would return (whole subtree, ignoring ``max_nodes``).
+    ``user_windows`` is the run's originating user's per-user windows, read at ``root``;
+    ``None`` when the root lease was issued before the server kept the user's issuer, or the
+    server is older than the member."""
 
     root: str
     ancestors: list[LeaseNode]
     nodes: list[LeaseNode]
     would_revoke: int
     truncated: bool
+    user_windows: LeaseUserWindows | None = None
 
 
 @dataclass(frozen=True)
@@ -698,6 +725,20 @@ def _lease_node(n: Any) -> LeaseNode:
     )
 
 
+def _user_windows(v: Any) -> LeaseUserWindows | None:
+    if not isinstance(v, dict):
+        return None
+    return LeaseUserWindows(
+        windows=[
+            LeaseUserWindow(
+                str(e["tool"]), str(e["kind"]), str(e["start"]), int(e["calls"]), int(e["amount"])
+            )
+            for e in v.get("windows") or []
+        ],
+        truncated=v.get("truncated") is True,
+    )
+
+
 def _lease_tree(b: Any) -> LeaseTree:
     return LeaseTree(
         root=str(b["root"]),
@@ -705,6 +746,7 @@ def _lease_tree(b: Any) -> LeaseTree:
         nodes=[_lease_node(n) for n in b.get("nodes") or []],
         would_revoke=int(b.get("would_revoke", 0)),
         truncated=b.get("truncated") is True,
+        user_windows=_user_windows(b.get("user_windows")),
     )
 
 

@@ -309,6 +309,28 @@ export interface LeaseBudget {
   usage: LeaseUsage[];
 }
 
+/**
+ * One per-user window of a run's originating user (run limits phase 3): the window of `kind`
+ * (`hour` or `day`) holding now, starting at `start` (RFC 3339, UTC), and what every run of
+ * the user was allowed in it for `tool` (`"<server>/<tool>"`).
+ */
+export interface LeaseUserWindow {
+  tool: string;
+  kind: string;
+  start: string;
+  calls: number;
+  amount: number;
+}
+
+/**
+ * The `userWindows` of a `LeaseTree`: a window per tool the run used and kind a loaded policy
+ * reads, ordered by tool then kind; `truncated` when the server's cap cut the list short.
+ */
+export interface LeaseUserWindows {
+  windows: LeaseUserWindow[];
+  truncated: boolean;
+}
+
 /** What a revoke of the lease would reach, changing nothing. */
 export interface LeaseTree {
   /** The chain's first hop (also the `chain_id` of its audit records). */
@@ -320,6 +342,11 @@ export interface LeaseTree {
   /** The `revoked` count a revoke sent now would return (whole subtree). */
   wouldRevoke: number;
   truncated: boolean;
+  /**
+   * The run's originating user's per-user windows, read at `root`; undefined when the root
+   * lease was issued before the server kept the user's issuer, or the server is older.
+   */
+  userWindows: LeaseUserWindows | undefined;
 }
 
 /** The policy set in force. `sha256` and `loadedAt` describe the text the engine loaded. */
@@ -669,6 +696,22 @@ function budgetOf(v: unknown): LeaseBudget | undefined {
       amount: Number(u.amount),
       destinations: Number(u.destinations),
     })),
+  };
+}
+
+function userWindowsOf(v: unknown): LeaseUserWindows | undefined {
+  if (typeof v !== "object" || v === null) return undefined;
+  const b = v as Json;
+  const list = Array.isArray(b.windows) ? (b.windows as Json[]) : [];
+  return {
+    windows: list.map((e) => ({
+      tool: String(e.tool),
+      kind: String(e.kind),
+      start: String(e.start),
+      calls: Number(e.calls),
+      amount: Number(e.amount),
+    })),
+    truncated: b.truncated === true,
   };
 }
 
@@ -1041,6 +1084,7 @@ export class AdminClient {
       nodes: leaseNodes(b.nodes),
       wouldRevoke: Number(b.would_revoke ?? 0),
       truncated: b.truncated === true,
+      userWindows: userWindowsOf(b.user_windows),
     };
   }
 

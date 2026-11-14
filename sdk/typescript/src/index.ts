@@ -77,6 +77,8 @@ export type {
   LeaseStatus,
   LeaseTree,
   LeaseUsage,
+  LeaseUserWindow,
+  LeaseUserWindows,
   LimitKind,
   MintRootOptions,
   OperatorsReload,

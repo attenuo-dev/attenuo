@@ -162,6 +162,42 @@ pub trait LeaseRegistry: Send + Sync {
     /// fault (see [`LeaseStore`]).
     fn record_subject(&self, lease: &LeaseId, subject: &str) -> Result<(), AuditError>;
 
+    /// [`record_subject`](Self::record_subject), together with the originating user's IdP
+    /// `issuer`, in one write. Per-user windows are keyed by issuer and subject
+    /// ([`crate::window`]), so a lease recorded this way lets the admin lease tree find its
+    /// run's windows ([`originating_user`](Self::originating_user)). Write-once: the same
+    /// pair again is a no-op; a different subject, or an issuer other than the one recorded,
+    /// is an error. A lease whose subject was recorded without an issuer (before issuers were
+    /// kept) accepts the same subject and stays without one. The default records the subject
+    /// only, for a store that keeps no issuers.
+    ///
+    /// # Errors
+    ///
+    /// As [`record_subject`](Self::record_subject).
+    fn record_originating_user(
+        &self,
+        lease: &LeaseId,
+        issuer: &str,
+        subject: &str,
+    ) -> Result<(), AuditError> {
+        let _ = issuer;
+        self.record_subject(lease, subject)
+    }
+
+    /// The originating user recorded by
+    /// [`record_originating_user`](Self::record_originating_user), as `(issuer, subject)`.
+    /// `None` for an unknown lease, one without a subject, and one whose subject was recorded
+    /// without an issuer (by [`record_subject`](Self::record_subject), or before the store kept
+    /// issuers, schema version 4). The default keeps no issuers and answers `None`.
+    ///
+    /// # Errors
+    ///
+    /// Only a store fault (see [`LeaseStore`]).
+    fn originating_user(&self, lease: &LeaseId) -> Result<Option<(String, String)>, AuditError> {
+        let _ = lease;
+        Ok(None)
+    }
+
     /// The subject recorded by [`record_subject`](Self::record_subject), or `None`.
     ///
     /// # Errors

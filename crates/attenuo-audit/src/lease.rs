@@ -730,6 +730,9 @@ pub struct MemoryLeaseStore {
     bindings: Mutex<BTreeMap<LeaseId, String>>,
     /// The originating user's subject of each lease (`record_subject`).
     subjects: Mutex<BTreeMap<LeaseId, String>>,
+    /// The originating user's issuer of each lease recorded by `record_originating_user`.
+    /// Taken after `subjects`.
+    issuers: Mutex<BTreeMap<LeaseId, String>>,
     /// Session bindings by `(session digest, server)` (`record_session`).
     sessions: Mutex<BTreeMap<(String, String), (LeaseId, OffsetDateTime)>>,
     /// The last session binding a `prune_sessions` pass looked at; `None` to start from the
@@ -854,6 +857,41 @@ impl MemoryLeaseStore {
     /// An empty store.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// `record_subject` (`issuer` `None`: a recorded issuer is kept and not compared) or
+    /// `record_originating_user` (`issuer` set: it must be the one recorded, and none
+    /// recorded counts as a different one).
+    fn record_user(
+        &self,
+        lease: &LeaseId,
+        issuer: Option<&str>,
+        subject: &str,
+    ) -> Result<(), AuditError> {
+        let rows = self.rows.lock()?;
+        if !rows.contains_key(lease) {
+            return Err(AuditError::UnknownLease(lease.0.clone()));
+        }
+        let mut subjects = self.subjects.lock()?;
+        let mut issuers = self.issuers.lock()?;
+        match subjects.get(lease) {
+            Some(s)
+                if s == subject
+                    && (issuer.is_none()
+                        || !issuers.contains_key(lease)
+                        || issuers.get(lease).map(String::as_str) == issuer) =>
+            {
+                Ok(())
+            }
+            Some(_) => Err(AuditError::BindingConflict(lease.0.clone())),
+            None => {
+                subjects.insert(lease.clone(), subject.to_string());
+                if let Some(i) = issuer {
+                    issuers.insert(lease.clone(), i.to_string());
+                }
+                Ok(())
+            }
+        }
     }
 
     /// After a revocation: a revoked run's span index ends with it (`crate::spans`), and so
@@ -1043,6 +1081,7 @@ impl PruneOps for MemoryPrune<'_> {
         let found = self.rows.remove(lease).is_some();
         s.bindings.lock()?.remove(lease);
         s.subjects.lock()?.remove(lease);
+        s.issuers.lock()?.remove(lease);
         s.sessions.lock()?.retain(|_, (chain, _)| chain != lease);
         s.labels.lock()?.remove(lease);
         s.spans.lock()?.runs.remove(lease);
@@ -1140,19 +1179,25 @@ impl LeaseRegistry for MemoryLeaseStore {
     }
 
     fn record_subject(&self, lease: &LeaseId, subject: &str) -> Result<(), AuditError> {
-        let rows = self.rows.lock()?;
-        if !rows.contains_key(lease) {
-            return Err(AuditError::UnknownLease(lease.0.clone()));
-        }
-        let mut subjects = self.subjects.lock()?;
-        match subjects.get(lease) {
-            Some(s) if s == subject => Ok(()),
-            Some(_) => Err(AuditError::BindingConflict(lease.0.clone())),
-            None => {
-                subjects.insert(lease.clone(), subject.to_string());
-                Ok(())
-            }
-        }
+        self.record_user(lease, None, subject)
+    }
+
+    fn record_originating_user(
+        &self,
+        lease: &LeaseId,
+        issuer: &str,
+        subject: &str,
+    ) -> Result<(), AuditError> {
+        self.record_user(lease, Some(issuer), subject)
+    }
+
+    fn originating_user(&self, lease: &LeaseId) -> Result<Option<(String, String)>, AuditError> {
+        let subjects = self.subjects.lock()?;
+        let issuers = self.issuers.lock()?;
+        Ok(subjects
+            .get(lease)
+            .zip(issuers.get(lease))
+            .map(|(s, i)| (i.clone(), s.clone())))
     }
 
     fn subject(&self, lease: &LeaseId) -> Result<Option<String>, AuditError> {

@@ -239,6 +239,23 @@ test('lease tree of the run and its revoke preview match `attenuo lease tree`', 
   await bothThemes('lease-tree');
 });
 
+test('lease page of the run: user windows match `attenuo lease tree`', async () => {
+  await c.go(`#/lease/${data.rootLease}`);
+  const panel = c.page.locator('section.panel', { has: c.page.locator('h2', { hasText: 'User windows' }) });
+  await panel.waitFor();
+  const { stdout } = cli(E, ['lease', 'tree', data.rootLease]);
+  const want = [...stdout.matchAll(/window (\S+) (\S+) (\S+): (\d+) calls, amount (\d+)/g)]
+    .map((m) => [m[3], m[1], m[2], m[4], m[5]]);
+  // The approved create_issue of alice's run was charged to her day window.
+  assert.ok(want.some((w) => w[0] === 'github/create_issue' && w[1] === 'day' && Number(w[3]) >= 1),
+    `the CLI shows alice's day window of create_issue:\n${stdout}`);
+  const got = [];
+  for (const row of await panel.locator('tbody tr').all()) got.push(await row.locator('td').allInnerTexts());
+  // Tool, Window, Start (UTC), Calls, Amount: the same lines as the CLI's.
+  assert.deepEqual(got, want);
+  await bothThemes('lease-user-windows');
+});
+
 test('leaving the page closes an open revoke dialog', async () => {
   await c.go(`#/lease/${data.rootLease}`);
   await c.page.locator('ul.leases').waitFor();

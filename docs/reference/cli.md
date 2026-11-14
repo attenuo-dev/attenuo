@@ -314,6 +314,18 @@ root lease (no ancestors)
 would revoke 1 lease(s) if revoked now
 ```
 
+The run's root lease (the first line when `ID` is the root, otherwise the last ancestor) also gets the per-user windows of the run's originating user ([run limits phase 3](../design/run-limits-phase3.md)), from the tree's `user_windows` member, after its budget lines: one `window <kind> <start> <server>/<tool>: <calls> calls, amount <amount>` line per tool the run used and window kind a loaded policy reads, with the window's start in UTC. The figures count every run of that user, not only this one. A run issued before the server kept the user's issuer (schema version 4) prints `user windows not recorded (lease issued before schema version 4)` instead; a run with no usage, or a deployment whose policies read no window, adds nothing, and so does a server older than the member. When the server's cap cut the list, a `user windows truncated: only N listed` line follows.
+
+```console
+$ attenuo lease tree 7a1c90e2-...
+root lease (no ancestors)
+7a1c90e2-...  planner  active, expires 2026-10-24T14:20:00Z  issued #1
+│    usage bank/send_money: 1 calls, amount 40, 1 destinations
+│    window day 2026-10-24T00:00:00Z bank/send_money: 3 calls, amount 120
+└─ 5e21d4b0-...  coder  active, expires 2026-10-24T14:20:00Z  issued #2
+would revoke 1 lease(s) if revoked now
+```
+
 ### `budget refund <ID> --reason TEXT`
 
 Give back to every run-limit counter what one allowed decision charged, once, for a call whose effect did not happen (`POST /admin/budgets/refund`). `ID` is the decision record's id: the `id=` that `audit tail` prints for the allowed call, or the AuthZEN `context.decision_id`. `--reason` is required and must not be blank; it is recorded in the `admin.budget.refund` audit record the server appends. The run usage the decision charged is given back too, but `refunded` counts only the token-limit counters, so a call that charged usage alone answers 0. A `distinct` value counts as refunded only when no other unrefunded decision used it (SR-62): until then it stays counted, and a refund that frees nothing answers 0. `--json` prints the server's `{decision_id, refunded, reason, audit_id}`. Needs the admin token.

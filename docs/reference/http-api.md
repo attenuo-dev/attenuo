@@ -567,6 +567,7 @@ When the proxy binds a new MCP session (the upstream assigns an `Mcp-Session-Id`
 - Per lease: the registry row (`parent`, `expires_at`, `revoked_at`, `revoke_reason`), `active` now, and from the audit record that issued it (`root_token` or `exchange`) the `agent` it was issued to, `issued_at` and `issued_seq`. These three are `null` when no issuance record is found.
 - Per lease, `chain_id` and `subject`: the chain id, which is the same as `root` for every lease of the tree and is what `POST /admin/leases/revoke` takes as `chain_id`; and the originating user's subject the server recorded when it issued the lease, which that route takes as `user`. `subject` is `null` for a lease registered before the server recorded subjects. The subjects of the whole tree are read with one store call. `subject` is the IdP's `sub`, so treat it as untrusted text.
 - Per lease, `budget`: the hop's run limits and what is left of them, `null` when the hop has no limits and nothing was charged under its lease. `{recorded, limits, usage}`: `recorded` says the server kept the hop's limits when it issued the token (a lease issued by an older server has counters but no `max`); `limits` has one entry per limit, `{cap, server, tool, kind, arg, max, used, remaining}` (`arg` is `null` for `calls` and `url#host` for a derived value; `used` is calls, the sum, for `distinct` the values seen, and for `calls_per` the most calls any one value has had, with `values` the number of values seen; `remaining` is `max - used`); `usage`, on a run's root lease, is the run's usage per destructive or outbound tool, `{tool, calls, amount, destinations}`. Value hashes are never shown. Calls are charged to every hop, so the smallest `remaining` along the chain is what a lease can still spend.
+- `user_windows`: the per-user windows ([run limits phase 3](../design/run-limits-phase3.md)) of the run's originating user, read at `root`, for the tools the run used. `{windows, truncated}`: `windows` has one entry per tool in the root lease's `budget.usage` and per window kind a loaded policy reads (`context.usage.user_window.<kind>`), ordered by tool and then `hour` before `day`, each `{tool, kind, start, calls, amount}`. `start` is the start of the window that holds the current time, RFC 3339 in UTC; `calls` and `amount` are what every run of that user (the same issuer and subject) was allowed in that window, this run and the others. The list is empty when the run has no run usage (none yet, or the run was revoked, which deletes run usage but never a window) or no policy reads a window. It holds at most 10000 entries, the tree's node cap; `truncated` is `true` when it was cut there. `user_windows` is `null` for a run whose root lease was issued before the server recorded the originating user's issuer (schema version 4): a window is keyed by issuer and subject, and the server never guesses an issuer. The answer shows neither the issuer nor the keyed digest the store files windows under; the user is the `subject` already on the nodes. Reading the tree charges nothing.
 
 ```json
 {
@@ -592,7 +593,10 @@ When the proxy binds a new MCP session (the upstream assigns an `Mcp-Session-Id`
      "budget": null}
   ],
   "would_revoke": 1,
-  "truncated": false
+  "truncated": false,
+  "user_windows": {"truncated": false, "windows": [
+    {"tool": "bank/send_money", "kind": "day", "start": "2026-10-23T00:00:00Z",
+     "calls": 3, "amount": 120}]}
 }
 ```
 
