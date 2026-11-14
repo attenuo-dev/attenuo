@@ -1707,3 +1707,51 @@ async fn a_later_exchange_cannot_exceed_the_id_jag_ceiling() {
         "{denied}"
     );
 }
+
+/// SR-124: `scope_exceeds_id_jag` names the capability as the caller asked for it, not with
+/// the root grant's limits copied in, so a refusal does not tell the caller the grant's figures
+/// for a capability its ID-JAG does not allow.
+#[tokio::test]
+async fn scope_exceeds_id_jag_does_not_show_the_grant_limits_sr124() {
+    let h = Harness::start_with(|cfg| {
+        let mut github: attenuo_core::Capability = attenuo_core::Capability::new("github", "*");
+        github.limits = attenuo_core::Limits::default().with_calls(7);
+        cfg.root_grants[0].capabilities = vec![CapSpec::Full(github)];
+        cfg.idps[0].id_jag_ceiling = Some(IdJagCeilingConfig {
+            resources: BTreeMap::new(),
+            scopes: BTreeMap::from([(
+                "files.read".to_string(),
+                vec![CapSpec::Short("github:read_file".into())],
+            )]),
+        });
+    })
+    .await;
+    let got = present(
+        &h,
+        &jag_with(&h, json!({"scope": "files.read"})),
+        ("scope", "github:read_file github:create_issue"),
+    )
+    .await;
+    assert_error(
+        &got,
+        StatusCode::BAD_REQUEST,
+        "invalid_scope",
+        "scope_exceeds_id_jag",
+    );
+    let detail = got.1["detail"].as_str().unwrap();
+    assert!(detail.contains("github:create_issue"), "{detail}");
+    assert!(!detail.contains("limits"), "{detail}");
+    // Within both, the root token carries the grant's limit, as before.
+    let got = present(
+        &h,
+        &jag_with(&h, json!({"scope": "files.read"})),
+        ("scope", "github:read_file"),
+    )
+    .await;
+    assert_eq!(got.0, StatusCode::OK, "{}", got.1);
+    let token = got.1["access_token"].as_str().unwrap();
+    assert_eq!(
+        caps(&h.verify(token).hops[0].capabilities),
+        [r#"github:read_file limits={"calls":7}"#]
+    );
+}

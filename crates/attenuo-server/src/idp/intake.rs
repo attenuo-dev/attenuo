@@ -256,10 +256,25 @@ pub(crate) async fn handle(
                     ),
                 ));
             }
-            let narrowed = applied
-                .capabilities
-                .attenuate(&capabilities)
-                .map_err(|e| invalid_scope("scope_exceeds_id_jag", e.to_string()))?;
+            let narrowed = applied.capabilities.attenuate(&capabilities).map_err(|_| {
+                // Name a refused capability as the request has it: `capabilities` carry
+                // the root grant's limits, which the caller was not given (SR-124).
+                let refused = requested.iter().find(|r| {
+                    let one: CapabilitySet = std::iter::once((*r).clone()).collect();
+                    granted
+                        .attenuate(&one)
+                        .and_then(|c| applied.capabilities.attenuate(&c))
+                        .is_err()
+                });
+                let detail = match refused {
+                    Some(r) => attenuo_core::AttenuationError::NotCovered {
+                        requested: r.display(),
+                    }
+                    .to_string(),
+                    None => "the request asks for more than the ID-JAG's claims allow".into(),
+                };
+                invalid_scope("scope_exceeds_id_jag", detail)
+            })?;
             tracing::debug!(claims = ?applied.claims, "ID-JAG ceiling applied");
             ceiling_claims = Some(applied.claims);
             narrowed
