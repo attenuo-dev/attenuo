@@ -28,7 +28,7 @@ The MCP upstream a subcommand talks to (`call`, `tools`, `authzen eval`, `policy
 | 2 | The answer was no: a denial or `APPROVAL REQUIRED`, a JSON-RPC error from `tools`, a token that fails `--verify`, a failed test case, policy errors, a broken audit chain or invalid checkpoint, an invalid approval token; for `budget refund`, nothing to refund. |
 | 3, 4 | `budget refund` only: already refunded, charge pruned (see [`budget refund`](#budget-refund-id---reason-text)). |
 
-A refusal from a REST route reads `error: server answered <status>: <error> (<code>): <detail>`: the OAuth-style `error`, then the stable `code` in parentheses, then the server's `detail`, for example `error: server answered 400 Bad Request: invalid_grant (replayed): this credential was already used; present a fresh one`. Match on the code, which is never reworded ([Errors](http-api.md#errors)); the detail is for people. The ` (<code>)` is left out when the code is the `error` itself or the whole `detail` (`unauthorized: token_expired`), and so is `: <detail>` when there is none. A body that is not an error object is printed as it came. `--json` does not change this: an error is always this text on stderr, never JSON on stdout.
+A refusal from a REST route reads `error: server answered <status>: <error> (<code>): <detail>`: the OAuth-style `error`, then the stable `code` in parentheses, then the server's `detail`, for example `error: server answered 400 Bad Request: invalid_grant (replayed): this credential was already used; present a fresh one`. Match on the code, which is never reworded ([Errors](http-api.md#errors)); the detail is for people. The ` (<code>)` is left out when the code is the `error` itself or the whole `detail` (`unauthorized: token_expired`), and so is `: <detail>` when there is none. A body that is not an error object is printed as it came. Control characters in any of these strings are printed escaped (`\u{1b}`), so an answer cannot drive the terminal (SR-118). `--json` does not change this: an error is always this text on stderr, never JSON on stdout.
 
 ## Secrets
 
@@ -250,11 +250,13 @@ Call a tool through the proxy (`tools/call`).
 | `--tool` | Tool name. Required. |
 | `--arg` | Tool argument. Repeatable. |
 
+The text output prints the tool's text content with its line breaks and tabs, and every other control character escaped (`\u{1b}`, `\r`): the result, an error message and the fields of a denial come from the server or the upstream MCP server, and must not drive the terminal (SR-118). `--json` prints the answer as JSON, whose strings escape control characters anyway.
+
 A call that needs an approval prints `APPROVAL REQUIRED` followed by the approval id, its expiry, the call hash and the decision id, and exits 2, like a denial. Once the approval is granted, run the identical command again: it is allowed once.
 
 ### `tools`
 
-List the tools the token may see (`tools/list`). Takes `--token` (or `--token-file`, or `ATTENUO_TOKEN`) and `--upstream` (`--server` after `tools` is a deprecated spelling), and `--dpop-key PATH` (`ATTENUO_DPOP_KEY`) for a token bound to a key, as `call` does.
+List the tools the token may see (`tools/list`). Takes `--token` (or `--token-file`, or `ATTENUO_TOKEN`) and `--upstream` (`--server` after `tools` is a deprecated spelling), and `--dpop-key PATH` (`ATTENUO_DPOP_KEY`) for a token bound to a key, as `call` does. Tool names and descriptions are the upstream's: the text output escapes their control characters, keeping a description's line breaks and tabs (SR-118).
 
 ### `lease revoke <ID> [--reason TEXT]`
 
