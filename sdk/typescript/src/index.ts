@@ -166,11 +166,14 @@ export { decodeToken, Token, TOKEN_TYPE, verifyToken } from "./token.js";
 export type { Chain, Hop, Jwks, User, VerifyOptions } from "./token.js";
 export type {
   Approval,
+  AuthzenAction,
+  AuthzenActionPage,
   AuthzenConfiguration,
   AuthzenDecision,
   AuthzenEntryError,
   AuthzenEvaluation,
   AuthzenEvaluationLike,
+  AuthzenSearchOptions,
   EvaluationsSemantic,
   ExchangeOptions,
   Lease,

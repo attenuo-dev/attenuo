@@ -218,7 +218,36 @@ export interface AuthzenConfiguration {
   policyDecisionPoint: string;
   accessEvaluationEndpoint: string;
   accessEvaluationsEndpoint: string;
+  /** `""` when the server does not publish action search. */
+  searchActionEndpoint: string;
   raw: Json;
+}
+
+/**
+ * One result of an AuthZEN action search: the tool `server/name` that an evaluation with the
+ * same token and arguments would allow now.
+ */
+export interface AuthzenAction {
+  name: string;
+  server: string;
+}
+
+/**
+ * One page of `POST /access/v1/search/action`. `nextToken` is the token of the next page,
+ * undefined after the last (the server's `""`). A page can hold fewer results than its `limit`,
+ * even none, while `nextToken` is set: `limit` bounds how many catalogued tools one page
+ * evaluates, not how many it returns.
+ */
+export interface AuthzenActionPage {
+  actions: AuthzenAction[];
+  nextToken: string | undefined;
+  raw: Json;
+}
+
+/** Paging of `authzenSearchAction`: `pageToken` is the `nextToken` of the previous page. */
+export interface AuthzenSearchOptions {
+  pageToken?: string;
+  limit?: number;
 }
 
 // --- plain HTTP -------------------------------------------------------------------------------
@@ -651,6 +680,56 @@ export function authzenConfigurationFromJson(body: unknown): AuthzenConfiguratio
     policyDecisionPoint: String(b.policy_decision_point ?? ""),
     accessEvaluationEndpoint: String(b.access_evaluation_endpoint ?? ""),
     accessEvaluationsEndpoint: String(b.access_evaluations_endpoint ?? ""),
+    searchActionEndpoint: String(b.search_action_endpoint ?? ""),
+    raw: b,
+  };
+}
+
+/**
+ * The `POST /access/v1/search/action` body: the subject (filled in by the server from the
+ * verified chain), the MCP `server` as the resource, the arguments every candidate is decided
+ * with, and `page` when a token or limit is given.
+ */
+export function authzenSearchActionBody(
+  server: string,
+  args?: Json,
+  opts: AuthzenSearchOptions = {},
+): Json {
+  const body: Json = {
+    subject: { type: "agent", id: "" },
+    resource: { type: "mcp_server", id: server },
+    context: { input: args ?? {} },
+  };
+  const page: Json = {};
+  if (opts.pageToken !== undefined && opts.pageToken !== "") page.token = opts.pageToken;
+  if (opts.limit !== undefined) page.limit = opts.limit;
+  if (Object.keys(page).length > 0) body.page = page;
+  return body;
+}
+
+export function authzenSearchActionFromResponse(body: unknown): AuthzenActionPage {
+  const b = asObject(body, "AuthZEN action search");
+  if (!Array.isArray(b.results)) {
+    throw new AttenuoError(
+      `unexpected AuthZEN action search response: ${JSON.stringify(body)?.slice(0, 200)}`,
+    );
+  }
+  const actions = b.results.map((item: unknown): AuthzenAction => {
+    const r = item as Json | null;
+    if (typeof r !== "object" || r === null || typeof r.name !== "string") {
+      throw new AttenuoError(
+        `unexpected AuthZEN action search result: ${JSON.stringify(item)?.slice(0, 200)}`,
+      );
+    }
+    const props = r.properties as Json | null | undefined;
+    const server = typeof props === "object" && props !== null ? props.server : undefined;
+    return { name: r.name, server: typeof server === "string" ? server : "" };
+  });
+  const page = b.page as Json | null | undefined;
+  const token = typeof page === "object" && page !== null ? page.next_token : undefined;
+  return {
+    actions,
+    nextToken: typeof token === "string" && token !== "" ? token : undefined,
     raw: b,
   };
 }

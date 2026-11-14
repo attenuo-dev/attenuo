@@ -711,8 +711,16 @@ describe("authzenConfiguration (K-5)", () => {
       policyDecisionPoint: "https://pdp.example",
       accessEvaluationEndpoint: "https://pdp.example/access/v1/evaluation",
       accessEvaluationsEndpoint: "https://pdp.example/access/v1/evaluations",
+      searchActionEndpoint: "",
       raw: doc,
     });
+    const withSearch = {
+      ...doc,
+      search_action_endpoint: "https://pdp.example/access/v1/search/action",
+    };
+    const { fetch: f2 } = mockFetch(() => jsonResponse(withSearch));
+    const cfg2 = await new AttenuoClient(URL_, { fetch: f2 }).authzenConfiguration();
+    expect(cfg2.searchActionEndpoint).toBe(withSearch.search_action_endpoint);
   });
 
   it("throws the server's refusal as an ApiError", async () => {
@@ -723,6 +731,116 @@ describe("authzenConfiguration (K-5)", () => {
       status: 400,
       error: "invalid_host",
     });
+  });
+});
+
+describe("authzenSearchAction", () => {
+  const pages: Record<string, unknown> = {
+    first: {
+      page: { next_token: "T1", count: 1 },
+      results: [{ name: "read_file", properties: { server: "github" } }],
+    },
+    T1: { page: { next_token: "T2", count: 0 }, results: [] },
+    T2: {
+      page: { next_token: "", count: 1 },
+      results: [{ name: "search", properties: { server: "github" } }],
+    },
+  };
+  const paged = () =>
+    mockFetch((req) => {
+      const token = (req.body as { page?: { token?: string } }).page?.token;
+      return jsonResponse(pages[token ?? "first"]);
+    });
+
+  it("posts the search body with page and reads one page", async () => {
+    const { fetch, calls } = paged();
+    const ob = new AttenuoClient(URL_, { fetch });
+    const page = await ob.authzenSearchAction("TOK", "github", { repo: "a/b" }, { limit: 2 });
+    expect(calls[0]!.method).toBe("POST");
+    expect(calls[0]!.url.pathname).toBe("/access/v1/search/action");
+    expect(calls[0]!.headers.get("authorization")).toBe("Bearer TOK");
+    expect(calls[0]!.body).toEqual({
+      subject: { type: "agent", id: "" },
+      resource: { type: "mcp_server", id: "github" },
+      context: { input: { repo: "a/b" } },
+      page: { limit: 2 },
+    });
+    expect(page).toEqual({
+      actions: [{ name: "read_file", server: "github" }],
+      nextToken: "T1",
+      raw: pages.first,
+    });
+
+    const last = await ob.authzenSearchAction("TOK", "github", undefined, { pageToken: "T2" });
+    expect(calls[1]!.body).toEqual({
+      subject: { type: "agent", id: "" },
+      resource: { type: "mcp_server", id: "github" },
+      context: { input: {} },
+      page: { token: "T2" },
+    });
+    expect(last.actions).toEqual([{ name: "search", server: "github" }]);
+    expect(last.nextToken).toBeUndefined();
+  });
+
+  it("iterates every page, through an empty one, to the last", async () => {
+    const { fetch, calls } = paged();
+    const ob = new AttenuoClient(URL_, { fetch });
+    const names: string[] = [];
+    for await (const a of ob.authzenSearchActionIter("TOK", "github", undefined, { limit: 2 })) {
+      names.push(a.name);
+    }
+    expect(names).toEqual(["read_file", "search"]);
+    expect(calls.map((c) => (c.body as { page?: unknown }).page)).toEqual([
+      { limit: 2 },
+      { limit: 2, token: "T1" },
+      { limit: 2, token: "T2" },
+    ]);
+  });
+
+  it("refuses a token that does not advance, and maps refusals", async () => {
+    const stuck = { page: { next_token: "T", count: 0 }, results: [] };
+    const { fetch } = mockFetch(() => jsonResponse(stuck));
+    const it_ = new AttenuoClient(URL_, { fetch }).authzenSearchActionIter("TOK", "github");
+    await expect(
+      (async () => {
+        for await (const _ of it_) void _;
+      })(),
+    ).rejects.toThrow(/did not advance/);
+
+    const bad = { error: "invalid_request", code: "invalid_search_resource", detail: "one tool" };
+    const { fetch: f400 } = mockFetch(() => jsonResponse(bad, 400));
+    const e400 = await new AttenuoClient(URL_, { fetch: f400 })
+      .authzenSearchAction("TOK", "github/read_file")
+      .catch((e: unknown) => e);
+    expect(e400).toBeInstanceOf(ApiError);
+    expect(e400).toMatchObject({ status: 400, code: "invalid_search_resource" });
+
+    const expired = { error: "invalid_token", detail: "expired", error_description: "expired" };
+    const { fetch: f401 } = mockFetch(() => jsonResponse(expired, 401));
+    await expect(
+      new AttenuoClient(URL_, { fetch: f401 }).authzenSearchAction("TOK", "github"),
+    ).rejects.toBeInstanceOf(UnauthorizedError);
+
+    for (const odd of [{ decision: true }, { results: [{ properties: {} }] }]) {
+      const { fetch: fOdd } = mockFetch(() => jsonResponse(odd));
+      await expect(
+        new AttenuoClient(URL_, { fetch: fOdd }).authzenSearchAction("TOK", "github"),
+      ).rejects.toThrow(/action search/);
+    }
+  });
+
+  it("signs the search URL with DPoP when the client has a key", async () => {
+    const empty = { page: { next_token: "", count: 0 }, results: [] };
+    const { fetch, calls } = mockFetch(() => jsonResponse(empty));
+    const ob = new AttenuoClient(URL_, { fetch, dpopKey: await DpopKey.generate() });
+    const page = await ob.authzenSearchAction("TOK", "github");
+    expect(page.actions).toEqual([]);
+    expect(page.nextToken).toBeUndefined();
+    expect(calls[0]!.headers.get("authorization")).toBe("DPoP TOK");
+    const claims = JSON.parse(
+      Buffer.from(calls[0]!.headers.get("dpop")!.split(".")[1]!, "base64url").toString(),
+    );
+    expect([claims.htm, claims.htu]).toEqual(["POST", `${URL_}/access/v1/search/action`]);
   });
 });
 
