@@ -412,15 +412,32 @@ fn bearer_auth(
     }))
 }
 
-/// Decide one evaluation. `pep_by_assertion` is the PEP a client assertion of the request
-/// authenticated ([`pep_assertion`]); without one, a PEP authenticates with its secret.
-fn evaluate_value(
+/// An evaluation request whose caller is authenticated and whose chain is the bearer's, or a
+/// PEP's unsigned chain this server issued ([`admit`]).
+struct Admitted {
+    req: EvaluationRequest,
+    chain: DelegationChain,
+    /// The call, with `dpop_bound` set from the bearer.
+    call: attenuo_core::ToolCall,
+    /// The caller proved it is a `[[peps]]` entry, which decides whether it sees diagnostics.
+    pep_authenticated: bool,
+    /// The time the request was admitted at; the decision is made as of it too.
+    now: time::OffsetDateTime,
+}
+
+/// Authenticate the caller of one evaluation and settle its chain and call, deciding nothing:
+/// the bearer's chain (checked against a body chain), or with `[authzen] allow_unsigned_chain`
+/// a PEP's unsigned body chain checked against what this server issued. `pep_by_assertion` is
+/// the PEP a client assertion of the request authenticated ([`pep_assertion`]); without one, a
+/// PEP authenticates with its secret. Shared by the evaluation endpoints and action search, so
+/// the three admit exactly the same callers.
+fn admit(
     state: &AppState,
     headers: &HeaderMap,
     bearer: Option<&Bearer>,
     pep_by_assertion: Option<&str>,
     raw: Value,
-) -> Result<EvaluationResponse, ApiError> {
+) -> Result<Admitted, ApiError> {
     if raw.get("client_assertion").is_some() || raw.get("client_assertion_type").is_some() {
         // Only the request's top level may carry an assertion (see `pep_assertion`).
         return Err(clientauth::invalid_request(
@@ -494,6 +511,30 @@ fn evaluate_value(
         tracing::debug!(pep = ?pep, "AuthZEN body chain accepted from an authenticated PEP");
     }
     let call = call.with_dpop_bound(bearer.is_some_and(|b| b.dpop_bound));
+    Ok(Admitted {
+        req,
+        chain: chain_value,
+        call,
+        pep_authenticated,
+        now,
+    })
+}
+
+/// Decide one evaluation: [`admit`], then the pipeline's decision.
+fn evaluate_value(
+    state: &AppState,
+    headers: &HeaderMap,
+    bearer: Option<&Bearer>,
+    pep_by_assertion: Option<&str>,
+    raw: Value,
+) -> Result<EvaluationResponse, ApiError> {
+    let Admitted {
+        req,
+        chain: chain_value,
+        call,
+        pep_authenticated,
+        now,
+    } = admit(state, headers, bearer, pep_by_assertion, raw)?;
     let approval_token = match req.context.as_ref().and_then(|c| c.get("approval_token")) {
         None | Some(Value::Null) => None,
         Some(Value::String(t)) => Some(t.clone()),
