@@ -22,7 +22,9 @@
 //!
 //! Three deliverers: [`WebhookDeliver`] (`POST`, any 2xx), [`FileDeliver`] (append one JSON
 //! line, `fsync`), and [`S3Deliver`] (`PUT` with AWS Signature Version 4, implemented here on
-//! `ring` HMAC and `sha2`).
+//! `ring` HMAC and `sha2`). The webhook and S3 clients check the receiver's certificate against
+//! the built-in web PKI roots plus the CA certificates of `ca_pem_path`, read once at start;
+//! the S3 credentials are read once at start too, and nothing refreshes them.
 //!
 //! The queue itself ([`Queue`]) is generic over what it carries, so the approval notifier
 //! (`[approvals.notify]`, [`crate::notify`]) runs on the same code with its own metrics and
@@ -556,7 +558,8 @@ impl CheckpointSink {
     ///
     /// # Errors
     ///
-    /// When `cfg` does not validate, when the webhook or S3 client cannot be built, when an S3 sink
+    /// When `cfg` does not validate, when `ca_pem_path` cannot be read or holds no usable CA
+    /// certificate, when the webhook or S3 client cannot be built, when an S3 sink
     /// has no access key id or secret access key (in the config or `AWS_ACCESS_KEY_ID` and
     /// `AWS_SECRET_ACCESS_KEY`), when a file sink's path cannot be opened for appending, or as
     /// [`with_deliver`](Self::with_deliver).
@@ -567,6 +570,7 @@ impl CheckpointSink {
     ) -> anyhow::Result<Self> {
         cfg.validate()?;
         let timeout = Duration::from_secs(cfg.timeout_seconds);
+        let roots = sink_roots(cfg)?;
         let deliver: Box<dyn Deliver> = match cfg.kind {
             SinkKind::Webhook => Box::new(WebhookDeliver::new(
                 cfg.url.clone().unwrap_or_default(),
@@ -574,9 +578,10 @@ impl CheckpointSink {
                     .clone()
                     .or_else(|| std::env::var(SINK_TOKEN_ENV).ok().filter(|t| !t.is_empty())),
                 timeout,
+                &roots,
             )?),
             SinkKind::File => Box::new(FileDeliver::new(cfg.path.clone().unwrap_or_default())?),
-            SinkKind::S3 => Box::new(S3Deliver::from_config(cfg, timeout)?),
+            SinkKind::S3 => Box::new(S3Deliver::from_config(cfg, timeout, &roots)?),
         };
         let mut sink =
             Self::with_deliver(deliver, SinkLimits::from_config(cfg), public_url, metrics)?;
@@ -785,6 +790,67 @@ fn run<T: QueueItem>(shared: Arc<Shared<T>>, deliver: Box<dyn Deliver<T>>) {
     }
 }
 
+/// The extra CA certificates of `[audit.sink] ca_pem_path` (none when unset), read once.
+///
+/// # Errors
+///
+/// The file cannot be read or holds no PEM certificate; the message names the key and path.
+fn sink_roots(cfg: &SinkSection) -> anyhow::Result<Vec<reqwest::Certificate>> {
+    let Some(path) = cfg.ca_pem_path.as_deref() else {
+        return Ok(Vec::new());
+    };
+    let fail = |e: String| {
+        anyhow::anyhow!(
+            "[audit.sink] ca_pem_path {:?}: {e}",
+            path.display().to_string()
+        )
+    };
+    let roots = crate::idp::jwks::read_ca_pem(path).map_err(fail)?;
+    // Build once here so a certificate that is not a usable trust anchor fails at start,
+    // naming the file, and not as a client-build error without it.
+    sink_client(Duration::from_secs(1), &roots).map_err(|e| {
+        fail(format!(
+            "a certificate cannot be used as a trust anchor ({})",
+            crate::idp::jwks::error_chain(&e)
+        ))
+    })?;
+    let endpoint = cfg.url.as_deref().or(cfg.endpoint.as_deref());
+    if endpoint.is_some_and(|u| u.starts_with("http://")) {
+        tracing::warn!(
+            "[audit.sink] ca_pem_path is set but the sink's URL is http://: the CA is not used \
+             and requests are not encrypted"
+        );
+    }
+    Ok(roots)
+}
+
+/// The HTTP client of a webhook or S3 sink: `timeout` per request, no redirects followed, and
+/// the built-in web PKI roots plus `extra_roots` (`ca_pem_path`) trusted.
+fn sink_client(
+    timeout: Duration,
+    extra_roots: &[reqwest::Certificate],
+) -> reqwest::Result<reqwest::Client> {
+    extra_roots
+        .iter()
+        .fold(
+            reqwest::Client::builder()
+                .timeout(timeout)
+                .redirect(reqwest::redirect::Policy::none()),
+            |b, c| b.add_root_certificate(c.clone()),
+        )
+        .build()
+}
+
+/// A failed request as the sink logs it: reqwest's error without the URL (its query may hold
+/// a credential, SR-94), followed by its causes, so a TLS failure names itself (`invalid peer
+/// certificate: UnknownIssuer`) and is not only `error sending request`.
+fn request_failed(e: reqwest::Error) -> String {
+    format!(
+        "request failed: {}",
+        crate::idp::jwks::error_chain(&e.without_url())
+    )
+}
+
 /// `POST` the shipped checkpoint as JSON.
 #[derive(Debug)]
 pub struct WebhookDeliver {
@@ -795,16 +861,19 @@ pub struct WebhookDeliver {
 
 impl WebhookDeliver {
     /// A webhook deliverer for `url`, with `bearer` as `Authorization: Bearer` when set. Each
-    /// request times out after `timeout`; redirects are not followed.
+    /// request times out after `timeout`; redirects are not followed. `extra_roots` are
+    /// trusted in addition to the built-in web PKI roots.
     ///
     /// # Errors
     ///
     /// The HTTP client cannot be built.
-    pub fn new(url: String, bearer: Option<String>, timeout: Duration) -> anyhow::Result<Self> {
-        let client = reqwest::Client::builder()
-            .timeout(timeout)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?;
+    pub fn new(
+        url: String,
+        bearer: Option<String>,
+        timeout: Duration,
+        extra_roots: &[reqwest::Certificate],
+    ) -> anyhow::Result<Self> {
+        let client = sink_client(timeout, extra_roots)?;
         Ok(Self {
             client,
             url,
@@ -827,10 +896,7 @@ impl Deliver for WebhookDeliver {
             req = req.bearer_auth(t);
         }
         // The URL is left out of the error: its query may hold a credential (SR-94).
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| format!("request failed: {}", e.without_url()))?;
+        let resp = req.send().await.map_err(request_failed)?;
         let status = resp.status();
         if status.is_success() {
             Ok(())
@@ -912,7 +978,11 @@ pub struct S3Deliver {
 }
 
 impl S3Deliver {
-    fn from_config(cfg: &SinkSection, timeout: Duration) -> anyhow::Result<Self> {
+    fn from_config(
+        cfg: &SinkSection,
+        timeout: Duration,
+        extra_roots: &[reqwest::Certificate],
+    ) -> anyhow::Result<Self> {
         let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
         let access_key_id = cfg
             .access_key_id
@@ -948,11 +1018,14 @@ impl S3Deliver {
                     .or_else(|| env("AWS_SESSION_TOKEN")),
             },
             timeout,
+            extra_roots,
         )
     }
 
     /// An S3 deliverer for `bucket` at `endpoint` (a trailing `/` is dropped), naming objects
     /// under `prefix`. Each request times out after `timeout`; redirects are not followed.
+    /// `extra_roots` are trusted in addition to the built-in web PKI roots. The credentials
+    /// are kept as given: nothing refreshes them (temporary ones need a restart).
     ///
     /// # Errors
     ///
@@ -965,12 +1038,10 @@ impl S3Deliver {
         prefix: String,
         creds: S3Credentials,
         timeout: Duration,
+        extra_roots: &[reqwest::Certificate],
     ) -> anyhow::Result<Self> {
         check_s3_endpoint(&endpoint).map_err(|e| anyhow::anyhow!("S3 endpoint {e}"))?;
-        let client = reqwest::Client::builder()
-            .timeout(timeout)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?;
+        let client = sink_client(timeout, extra_roots)?;
         Ok(Self {
             client,
             endpoint: endpoint.trim_end_matches('/').to_string(),
@@ -1032,17 +1103,46 @@ impl Deliver for S3Deliver {
                 req = req.header(k.as_str(), v.as_str());
             }
         }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| format!("request failed: {}", e.without_url()))?;
+        let resp = req.send().await.map_err(request_failed)?;
         let status = resp.status();
         if status.is_success() {
             Ok(())
         } else {
-            Err(format!("S3 answered {status}"))
+            match s3_error_code(resp).await {
+                Some(code) => Err(format!("S3 answered {status} ({code})")),
+                None => Err(format!("S3 answered {status}")),
+            }
         }
     }
+}
+
+/// Most bytes of an S3 error answer read to find its `<Code>`.
+const S3_ERROR_BODY_MAX: usize = 4096;
+
+/// The `<Code>` of an S3 error answer (`SignatureDoesNotMatch`, `ExpiredToken`,
+/// `InvalidTokenId`, `AccessDenied`, ...), which tells a wrong secret from an expired session
+/// token where the status alone (403) does not. At most [`S3_ERROR_BODY_MAX`] bytes are read;
+/// a code that is not a short run of ASCII letters and digits is not reported, so the store
+/// cannot put arbitrary text in the log.
+async fn s3_error_code(mut resp: reqwest::Response) -> Option<String> {
+    let mut body = Vec::new();
+    while body.len() < S3_ERROR_BODY_MAX {
+        match resp.chunk().await {
+            Ok(Some(c)) => body.extend_from_slice(&c),
+            _ => break,
+        }
+    }
+    body.truncate(S3_ERROR_BODY_MAX);
+    s3_error_code_of(&body)
+}
+
+fn s3_error_code_of(body: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(body).ok()?;
+    let start = text.find("<Code>")? + "<Code>".len();
+    let len = text[start..].find("</Code>")?;
+    let code = &text[start..start + len];
+    (!code.is_empty() && code.len() <= 64 && code.bytes().all(|b| b.is_ascii_alphanumeric()))
+        .then(|| code.to_string())
 }
 
 /// The headers of the sink's PutObject, every one of them signed: `content-type`, `host`,
@@ -1533,6 +1633,7 @@ mod tests {
             "http://127.0.0.1:1/ingest/path-marker?token=secret-marker".into(),
             None,
             Duration::from_secs(2),
+            &[],
         )
         .unwrap();
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -1824,6 +1925,7 @@ mod tests {
                 "p/".into(),
                 example_creds(),
                 Duration::from_secs(1),
+                &[],
             )
             .unwrap_err()
             .to_string();
@@ -1836,7 +1938,31 @@ mod tests {
             "p/".into(),
             example_creds(),
             Duration::from_secs(1),
+            &[],
         )
         .unwrap();
+    }
+
+    /// The `<Code>` of an S3 error answer is reported; anything that is not a short ASCII
+    /// word is not, so a store cannot put its own text in the log.
+    #[test]
+    fn the_s3_error_code_is_read_from_the_answer() {
+        let xml = |code: &str| {
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>{code}</Code>\
+                 <Message>m</Message></Error>"
+            )
+        };
+        for code in ["ExpiredToken", "InvalidTokenId", "SignatureDoesNotMatch"] {
+            assert_eq!(
+                s3_error_code_of(xml(code).as_bytes()).as_deref(),
+                Some(code)
+            );
+        }
+        for bad in ["", "two words", "x\nforged log line", &"A".repeat(65)] {
+            assert_eq!(s3_error_code_of(xml(bad).as_bytes()), None, "{bad:?}");
+        }
+        assert_eq!(s3_error_code_of(b"<html>Forbidden</html>"), None);
+        assert_eq!(s3_error_code_of(&[0xff, 0xfe]), None);
     }
 }

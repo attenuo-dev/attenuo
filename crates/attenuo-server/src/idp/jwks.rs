@@ -22,8 +22,8 @@
 //! `webpki-roots` set), plus, for an entry that sets `ca_pem_path`, the CA certificates in that
 //! file ([`read_ca_pem`]). The extra roots are added to the built-in ones, never replace them,
 //! and belong to that entry's client alone: another entry, and every other outbound client of
-//! the server, still trusts only the built-in roots. Nothing here can turn verification or
-//! the hostname check off.
+//! the server, does not trust them (the checkpoint sink has its own `[audit.sink]
+//! ca_pem_path`). Nothing here can turn verification or the hostname check off.
 
 use std::str::FromStr;
 use std::time::{Duration, Instant};
