@@ -52,7 +52,7 @@ How to read it:
 
 ### SDKs and CLI
 
-- [ ] **SDK hop 0 against a live IdP.** Done for Keycloak 26.8.2 in dev mode on 2026-11-14 (`scripts/live-keycloak-smoke.sh`, this PR): the Python and TypeScript hop-0 exchange of a real ID token, and `inspect` with verification, whose header `kid` is the one in the server's JWKS. Open: the same against a hosted provider (Auth0, Okta, Entra ID or Google). **Needs: a live IdP tenant.**
+- [ ] **SDK hop 0 against a live IdP.** Done for Keycloak 26.8.2 in dev mode on 2026-11-14 (`scripts/live-keycloak-smoke.sh`, #317): the Python and TypeScript hop-0 exchange of a real ID token, and `inspect` with verification, whose header `kid` is the one in the server's JWKS. Open: the same against a hosted provider (Auth0, Okta, Entra ID or Google). **Needs: a live IdP tenant.**
 
 ### Evaluation and research
 
@@ -65,7 +65,7 @@ How to read it:
 ### Docs and release
 
 - [ ] **Release 0.1.0.** Prepared (#68): every artifact at 0.1.0, crate metadata and `LICENSE` files, `CHANGELOG.md` with a `[0.1.0]` section and Highlights, `scripts/release-check.sh` passing locally. Still to do: confirm the seven crate names on crates.io, `attenuo` on PyPI and the `@attenuo` npm scope; tag `v0.1.0` and date the CHANGELOG section; the first run of `release.yml` and the `release-packages.yml` dry run; make the repository public; `cargo publish` by hand and the SDK publish through `release-packages.yml`; set the GHCR package public, the social preview image and the README's crates.io and docs.rs badges. Pointer: [release 0.1.0](../release/0.1.0.md). **Needs: the maintainer and GitHub Actions minutes.**
-- [ ] **Identity-provider recipes against live tenants.** Keycloak done for 26.8.2 in dev mode on 2026-11-14 (`scripts/live-keycloak-smoke.sh`, this PR); its section says which statements were checked, and the OTP-to-`mfa` path, the client role mapper and a production Keycloak were not. Open: Auth0, Okta, Entra ID and Google, and ID-JAG with Okta; drop their "untested" marks. Pointer: [identity providers](../guides/identity-providers.md). **Needs: live IdP tenants.**
+- [ ] **Identity-provider recipes against live tenants.** Keycloak done for 26.8.2 in dev mode on 2026-11-14 (`scripts/live-keycloak-smoke.sh`, #317); its section says which statements were checked, and the OTP-to-`mfa` path, the client role mapper and a production Keycloak were not. Open: Auth0, Okta, Entra ID and Google, and ID-JAG with Okta; drop their "untested" marks. Pointer: [identity providers](../guides/identity-providers.md). **Needs: live IdP tenants.**
 - [ ] **Documentation site on GitHub Pages.** `docs.yml` builds the book but has not deployed it: Pages is off while the repository is private. Once it is public, set the repository variable `DEPLOY_PAGES=true` (#1) and "GitHub Actions" as the Pages source in the repository settings. **Needs: the maintainer.**
 
 ### CI
