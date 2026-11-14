@@ -193,7 +193,7 @@ fn named_by_details(value: &Value) -> CapabilitySet {
         );
         return CapabilitySet::new();
     }
-    objects
+    let named: CapabilitySet = objects
         .into_iter()
         .filter_map(|c| serde_json::from_value::<CapabilityConfig>(c.clone()).ok())
         .map(Capability::from)
@@ -201,7 +201,18 @@ fn named_by_details(value: &Value) -> CapabilitySet {
         .filter(|c| {
             c.validate().is_ok() && c.validate_limits().is_ok() && c.validate_size().is_ok()
         })
-        .collect()
+        .collect();
+    // So does a claim whose capabilities hold together more constraints or `one_of` values
+    // than one token may (SR-123): the ceiling is then at most the root grant and one token's
+    // worth of claim.
+    if let Err(e) = named.validate_size() {
+        tracing::warn!(
+            error = %e,
+            "ID-JAG authorization_details is larger than one token may be; it names nothing"
+        );
+        return CapabilitySet::new();
+    }
+    named
 }
 
 /// A set `⊑ a` and `⊑ b`, from the existing `⊑` ([`Capability::covers`]) and attenuation
@@ -518,6 +529,40 @@ mod tests {
             .apply(&grant, &details(attenuo_core::MAX_ONE_OF_VALUES + 1))
             .capabilities
             .is_empty());
+    }
+
+    /// SR-123: an `authorization_details` claim whose capabilities hold together more
+    /// `one_of` values or constraints than one token may names nothing, though each capability
+    /// is within the per-list bound; one at the bounds is kept.
+    #[test]
+    fn a_claim_larger_than_a_token_names_nothing_sr123() {
+        let c = ceiling();
+        let grant = set(&["github:*"]);
+        let lists = |n: usize| {
+            let caps: Vec<Value> = (0..2)
+                .map(|i| {
+                    json!({"server": "github", "tool": format!("t{i}"), "constraints":
+                        {"repo": {"op": "one_of", "value": (0..n).collect::<Vec<_>>()}}})
+                })
+                .collect();
+            claims(json!({"authorization_details": [
+                {"type": AUTHORIZATION_DETAILS_TYPE, "capabilities": caps}]}))
+        };
+        let half = attenuo_core::MAX_ONE_OF_VALUES_TOTAL / 2;
+        assert_eq!(c.apply(&grant, &lists(half)).capabilities.len(), 2);
+        assert!(c.apply(&grant, &lists(half + 1)).capabilities.is_empty());
+        // 256 capabilities (the claim's own bound) with five constraints each: 1,280.
+        let wide: Vec<Value> = (0..MAX_CLAIM_CAPABILITIES)
+            .map(|i| {
+                let constraints: Map<String, Value> = (0..5)
+                    .map(|j| (format!("a{j}"), json!({"op": "equals", "value": i})))
+                    .collect();
+                json!({"server": "github", "tool": format!("t{i}"), "constraints": constraints})
+            })
+            .collect();
+        let wide = claims(json!({"authorization_details": [
+            {"type": AUTHORIZATION_DETAILS_TYPE, "capabilities": wide}]}));
+        assert!(c.apply(&grant, &wide).capabilities.is_empty());
     }
 
     /// The claims hold for a spread of grants and claims with globs, constraints and limits:

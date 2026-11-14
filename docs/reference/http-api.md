@@ -184,6 +184,8 @@ The table is generated from `attenuo_core::error_codes::ERROR_CODES`, the one pl
 | `tenant_mismatch` | 400 `invalid_grant` |  |  | The ID-JAG's `tenant` is not the `[[idps]] tenant` of its issuer. |
 | `token_expired` | 401 `unauthorized`, 400 `invalid_grant` | `-32001` (401), `-32001` (200) |  | The token verified but has expired (a bearer, or at `POST /token` the subject token or a hop of its chain). |
 | `too_many_capabilities` | 400 `invalid_scope` |  |  | A request (an exchange, a hop-0 request, `POST /admin/root-token`) asks for more than 1,024 capabilities, more than one token may hold. |
+| `too_many_constraints` | 400 `invalid_scope` |  |  | A request (an exchange, a hop-0 request, `POST /admin/root-token`) has more than 1,024 argument constraints over all its capabilities. |
+| `too_many_one_of_values` | 400 `invalid_scope` |  |  | A request (an exchange, a hop-0 request, `POST /admin/root-token`) has more than 1,024 `one_of` values over all its capabilities. |
 | `too_many_pending_approvals` | 429 |  |  | The run already has the maximum number of pending approvals. |
 | `too_many_sessions` |  | `-32007` (429) |  | The principal holds `[proxy] max_sessions_per_principal` live sessions. |
 | `tool_not_in_catalog` |  | `-32003` (200) | yes | The tool is not in the catalog and unknown tools are denied. |

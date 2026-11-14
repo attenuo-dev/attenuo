@@ -868,9 +868,21 @@ impl Capability {
 /// [`CapabilitySet::validate_size`] before comparing anything.
 pub const MAX_CAPABILITIES: usize = 1024;
 
-/// The most values one `one_of` constraint may list (SR-123). Implication between two `one_of`
-/// lists costs the product of their lengths.
+/// The most values one `one_of` constraint may list (SR-123).
 pub const MAX_ONE_OF_VALUES: usize = 1024;
+
+/// The most argument constraints one token request, and one hop of a token, may hold over all
+/// its capabilities (SR-123). Attenuation and [`CapabilitySet::covers`] compare a requested
+/// capability with every parent capability whose patterns cover it, constraint by constraint,
+/// so their cost grows with the constraints of one side times the capabilities of the other;
+/// this bounds that product as [`MAX_CAPABILITIES`] bounds the number of pairs.
+pub const MAX_CONSTRAINTS: usize = 1024;
+
+/// The most `one_of` values one token request, and one hop of a token, may hold over all its
+/// capabilities (SR-123). Each value of a requested `one_of` is looked up in the list of every
+/// parent capability compared with it, so the cost grows with the values of one side times
+/// the capabilities of the other; this bounds that product.
+pub const MAX_ONE_OF_VALUES_TOTAL: usize = 1024;
 
 impl Capability {
     /// Is every `one_of` of this capability at most [`MAX_ONE_OF_VALUES`] long?
@@ -1021,12 +1033,15 @@ impl CapabilitySet {
     }
 
     /// Is the set no larger than one request or token may be: at most [`MAX_CAPABILITIES`]
-    /// members, each passing [`Capability::validate_size`] (SR-123)? Linear in the set's size.
+    /// members, each passing [`Capability::validate_size`], with at most [`MAX_CONSTRAINTS`]
+    /// constraints and [`MAX_ONE_OF_VALUES_TOTAL`] `one_of` values among them (SR-123)?
+    /// Linear in the set's size.
     ///
     /// # Errors
     ///
-    /// [`SizeError::TooManyCapabilities`], or the [`SizeError::OneOfTooLong`] of the first
-    /// member, in canonical order, with a `one_of` over the bound.
+    /// Checked in this order: [`SizeError::TooManyCapabilities`]; the
+    /// [`SizeError::OneOfTooLong`] of the first member, in canonical order, with a `one_of`
+    /// over the bound; [`SizeError::TooManyConstraints`]; [`SizeError::TooManyOneOfValues`].
     pub fn validate_size(&self) -> Result<(), SizeError> {
         if self.0.len() > MAX_CAPABILITIES {
             return Err(SizeError::TooManyCapabilities {
@@ -1034,7 +1049,30 @@ impl CapabilitySet {
                 max: MAX_CAPABILITIES,
             });
         }
-        self.0.iter().try_for_each(Capability::validate_size)
+        self.0.iter().try_for_each(Capability::validate_size)?;
+        let constraints: usize = self.0.iter().map(|c| c.constraints.len()).sum();
+        if constraints > MAX_CONSTRAINTS {
+            return Err(SizeError::TooManyConstraints {
+                count: constraints,
+                max: MAX_CONSTRAINTS,
+            });
+        }
+        let values: usize = self
+            .0
+            .iter()
+            .flat_map(|c| c.constraints.values())
+            .map(|c| match c {
+                ArgConstraint::OneOf(vs) => vs.len(),
+                _ => 0,
+            })
+            .sum();
+        if values > MAX_ONE_OF_VALUES_TOTAL {
+            return Err(SizeError::TooManyOneOfValues {
+                count: values,
+                max: MAX_ONE_OF_VALUES_TOTAL,
+            });
+        }
+        Ok(())
     }
 
     /// [`Capability::path_prefix_warnings`] of every member, in canonical order.
@@ -2404,5 +2442,76 @@ mod tests {
             matches!(err, crate::ChainError::TooLarge { index: 1, .. }),
             "{err}"
         );
+    }
+
+    /// SR-123, the rest: a request also holds at most `MAX_CONSTRAINTS` argument constraints
+    /// and `MAX_ONE_OF_VALUES_TOTAL` `one_of` values over all its capabilities, since
+    /// attenuation costs each of those times the parent's capabilities. Refused before
+    /// anything is compared, at the same places as the other bounds.
+    #[test]
+    fn requests_are_bounded_in_total_constraints_and_values_sr123() {
+        // `n` capabilities with `k` constraints each, `one_of` lists of `v` values when `v > 0`.
+        let set = |n: usize, k: usize, v: usize| -> CapabilitySet {
+            (0..n)
+                .map(|i| {
+                    (0..k).fold(Capability::new("s", format!("t{i}")), |c, j| {
+                        let constraint = if v > 0 {
+                            ArgConstraint::OneOf((0..v).map(|x| json!(x)).collect())
+                        } else {
+                            ArgConstraint::Equals(json!(j))
+                        };
+                        c.with_constraint(format!("a{j}"), constraint)
+                    })
+                })
+                .collect()
+        };
+        assert_eq!(set(MAX_CONSTRAINTS, 1, 0).validate_size(), Ok(()));
+        assert_eq!(set(MAX_CONSTRAINTS / 2, 2, 0).validate_size(), Ok(()));
+        assert_eq!(
+            set(MAX_CONSTRAINTS / 2 + 1, 2, 0).validate_size(),
+            Err(SizeError::TooManyConstraints {
+                count: MAX_CONSTRAINTS + 2,
+                max: MAX_CONSTRAINTS
+            })
+        );
+        // One list at the bound, or two halves, fit; one value more over the set does not.
+        assert_eq!(set(1, 1, MAX_ONE_OF_VALUES_TOTAL).validate_size(), Ok(()));
+        assert_eq!(
+            set(2, 1, MAX_ONE_OF_VALUES_TOTAL / 2).validate_size(),
+            Ok(())
+        );
+        let over = {
+            let mut s = set(2, 1, MAX_ONE_OF_VALUES_TOTAL / 2);
+            s.insert(
+                Capability::new("s", "u")
+                    .with_constraint("a", ArgConstraint::OneOf(vec![json!(0)])),
+            );
+            s
+        };
+        assert_eq!(
+            over.validate_size(),
+            Err(SizeError::TooManyOneOfValues {
+                count: MAX_ONE_OF_VALUES_TOTAL + 1,
+                max: MAX_ONE_OF_VALUES_TOTAL
+            })
+        );
+        // A single list over the per-list bound is still named as such.
+        assert!(matches!(
+            set(1, 1, MAX_ONE_OF_VALUES + 1).validate_size(),
+            Err(SizeError::OneOfTooLong { .. })
+        ));
+        let none = CapabilitySet::new();
+        assert!(matches!(
+            none.attenuate(&over),
+            Err(AttenuationError::TooLarge(
+                SizeError::TooManyOneOfValues { .. }
+            ))
+        ));
+        assert!(matches!(
+            none.attenuate_root(&set(MAX_CONSTRAINTS / 2 + 1, 2, 0)),
+            Err(AttenuationError::TooLarge(
+                SizeError::TooManyConstraints { .. }
+            ))
+        ));
     }
 }
