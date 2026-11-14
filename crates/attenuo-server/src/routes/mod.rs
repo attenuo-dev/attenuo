@@ -88,10 +88,13 @@ pub(crate) fn register_issued(
         .leases
         .register(lease, parent, state.initial_lease_expiry(now, token_exp))?;
     state.leases.bind(lease, &chain.digest())?;
-    // So that `POST /admin/leases/revoke` with `{"user": ...}` finds this lease.
-    state
-        .leases
-        .record_subject(lease, &chain.originating_user.subject)?;
+    // So that `POST /admin/leases/revoke` with `{"user": ...}` finds this lease, and the admin
+    // lease tree finds the run's per-user windows (keyed by issuer and subject).
+    state.leases.record_originating_user(
+        lease,
+        &chain.originating_user.issuer,
+        &chain.originating_user.subject,
+    )?;
     // Run limits (ADR-0010): keep the hop's limits as issued (after clamping), for the admin
     // console. Display only, so a failure is logged and the issuance stands.
     if let Some(hop) = chain.hops.last() {

@@ -43,7 +43,7 @@ use crate::log::ENTRY_HASH_VERSION;
 
 /// The schema version this build writes and reads: the number of the last migration in the
 /// crate's list. A file above it is refused ([`AuditError::SchemaTooNew`]).
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// One step of the schema: from version `version - 1` to `version`.
 pub(super) struct Migration {
@@ -77,6 +77,12 @@ pub(super) const MIGRATIONS: &[Migration] = &[
                       key, expiry) and its expiry index, so a credential redeemed before a \
                       restart stays redeemed",
         apply: v3_used_credentials,
+    },
+    Migration {
+        version: 4,
+        description: "lease subjects get the originating user's `issuer` (nullable text), so \
+                      the admin lease tree can show the run's user's per-user windows",
+        apply: v4_lease_subject_issuer,
     },
 ];
 
@@ -278,6 +284,17 @@ fn v2_approval_position(conn: &Connection) -> Result<(), AuditError> {
 /// memory, so the upgrade itself is the last restart that forgets one.
 fn v3_used_credentials(conn: &Connection) -> Result<(), AuditError> {
     conn.execute_batch(REPLAY_SCHEMA)?;
+    Ok(())
+}
+
+/// Migration 4: `lease_subjects.issuer`, the originating user's IdP issuer, next to the
+/// subject the issuer already recorded for each lease. A per-user window is keyed by issuer and
+/// subject together ([`crate::window`]), so the admin lease tree needs both to show the run's
+/// user's windows. Nullable text added at the end: a lease registered before this migration
+/// keeps its subject and has no issuer, and nothing fills one in later (its windows are not
+/// shown rather than guessed from a configured issuer).
+fn v4_lease_subject_issuer(conn: &Connection) -> Result<(), AuditError> {
+    conn.execute_batch("ALTER TABLE lease_subjects ADD COLUMN issuer TEXT NULL;")?;
     Ok(())
 }
 
@@ -513,6 +530,33 @@ mod tests {
             other => panic!("expected SchemaTooNew, got {other:?}"),
         }
         assert!(!object_exists(&conn, "a"));
+    }
+
+    /// A build from before migration 4 (its list ends at 3) refuses a file this build
+    /// migrated, before reading or writing anything; this build finds it current.
+    #[test]
+    fn a_build_before_migration_4_refuses_a_migrated_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v4.sqlite");
+        let mut conn = Connection::open(&path).unwrap();
+        assert_eq!(migrate(&mut conn).unwrap().version, 4);
+        let older: Vec<Migration> = MIGRATIONS[..3]
+            .iter()
+            .map(|m| Migration {
+                version: m.version,
+                description: m.description,
+                apply: m.apply,
+            })
+            .collect();
+        match run(&mut conn, &older).unwrap_err() {
+            AuditError::SchemaTooNew { found, supported } => {
+                assert_eq!((found, supported), (4, 3));
+            }
+            other => panic!("expected SchemaTooNew, got {other:?}"),
+        }
+        assert_eq!(version(&conn), 4);
+        let mut second = Connection::open(&path).unwrap();
+        assert_eq!(migrate(&mut second).unwrap().migrated_from, None);
     }
 
     /// A negative `user_version` was not written by attenuo.

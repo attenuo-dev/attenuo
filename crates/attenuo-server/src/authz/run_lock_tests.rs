@@ -73,6 +73,14 @@ impl LeaseRegistry for Rendezvous {
         self.inner.subject(l)
     }
 
+    fn record_originating_user(&self, l: &LeaseId, i: &str, s: &str) -> Result<(), AuditError> {
+        self.inner.record_originating_user(l, i, s)
+    }
+
+    fn originating_user(&self, l: &LeaseId) -> Result<Option<(String, String)>, AuditError> {
+        self.inner.originating_user(l)
+    }
+
     fn preview_selected(
         &self,
         s: &attenuo_audit::LeaseSelector,

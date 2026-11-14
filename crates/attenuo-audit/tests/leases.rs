@@ -597,6 +597,56 @@ fn subjects_are_write_once_and_only_for_known_leases() {
     }
 }
 
+/// `record_originating_user` keeps the issuer with the subject, write-once: the same pair
+/// again is a no-op, another subject or issuer a conflict, and a lease whose subject was
+/// recorded without an issuer has no originating user and is never given one.
+#[test]
+fn originating_users_are_write_once_and_need_an_issuer() {
+    for (name, store) in stores() {
+        tree(store.as_ref());
+        assert_eq!(store.originating_user(&id("a")).unwrap(), None, "{name}");
+        store
+            .record_originating_user(&id("a"), "https://idp.example", "alice")
+            .unwrap();
+        store
+            .record_originating_user(&id("a"), "https://idp.example", "alice")
+            .unwrap();
+        // `record_subject` of the same subject is still a no-op.
+        store.record_subject(&id("a"), "alice").unwrap();
+        let alice = Some(("https://idp.example".to_string(), "alice".to_string()));
+        assert_eq!(store.originating_user(&id("a")).unwrap(), alice, "{name}");
+        assert_eq!(store.subject(&id("a")).unwrap().as_deref(), Some("alice"));
+        for (issuer, subject) in [
+            ("https://other.example", "alice"),
+            ("https://idp.example", "bob"),
+        ] {
+            assert!(
+                matches!(
+                    store.record_originating_user(&id("a"), issuer, subject),
+                    Err(AuditError::BindingConflict(_))
+                ),
+                "{name} {issuer} {subject}"
+            );
+        }
+        assert_eq!(store.originating_user(&id("a")).unwrap(), alice, "{name}");
+        // A subject without an issuer (a lease from before issuers were kept).
+        store.record_subject(&id("b"), "alice").unwrap();
+        assert_eq!(store.originating_user(&id("b")).unwrap(), None, "{name}");
+        assert!(
+            matches!(
+                store.record_originating_user(&id("b"), "https://idp.example", "alice"),
+                Err(AuditError::BindingConflict(_))
+            ),
+            "{name}"
+        );
+        assert_eq!(store.originating_user(&id("b")).unwrap(), None, "{name}");
+        assert!(matches!(
+            store.record_originating_user(&id("ghost"), "https://idp.example", "alice"),
+            Err(AuditError::UnknownLease(_))
+        ));
+    }
+}
+
 /// `subjects` answers in one call what `subject` answers per lease: leases with no recorded
 /// subject (here `b`, standing for a lease from before subjects were kept, `legacy`, and an
 /// unknown id) are absent.
@@ -975,10 +1025,11 @@ fn sqlite_store_from_before_sessions_gains_the_table_at_open() {
         let s = SqliteLeaseStore::open(&path).unwrap();
         two_users(&s);
         s.with_connection(|c| {
-            // An older server's file: no table, no replay table (schema version 3), and no
-            // schema version.
+            // An older server's file: no table, no replay table (schema version 3), no
+            // subject issuer (version 4), and no schema version.
             c.execute_batch(
-                "DROP TABLE lease_sessions; DROP TABLE used_credentials; PRAGMA user_version = 0;",
+                "DROP TABLE lease_sessions; DROP TABLE used_credentials; \
+                 ALTER TABLE lease_subjects DROP COLUMN issuer; PRAGMA user_version = 0;",
             )?;
             Ok(())
         })

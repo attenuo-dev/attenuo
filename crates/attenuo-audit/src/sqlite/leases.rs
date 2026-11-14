@@ -597,6 +597,41 @@ fn sessions_in(conn: &Connection, session: &str) -> Result<Vec<SessionBinding>, 
         .collect()
 }
 
+impl SqliteLeaseStore {
+    /// [`LeaseRegistry::record_subject`] (`issuer` `None`: a recorded issuer is kept and not
+    /// compared) or [`LeaseRegistry::record_originating_user`] (`issuer` set: it must be the one
+    /// recorded, and none recorded counts as a different one), in one write transaction.
+    fn record_user(
+        &self,
+        lease: &LeaseId,
+        issuer: Option<&str>,
+        subject: &str,
+    ) -> Result<(), AuditError> {
+        let _gate = self.gate.hold();
+        let mut conn = self.conn.lock()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if get_in(&tx, lease)?.is_none() {
+            return Err(AuditError::UnknownLease(lease.0.clone()));
+        }
+        let recorded: Option<(String, Option<String>)> = tx
+            .prepare_cached("SELECT subject, issuer FROM lease_subjects WHERE id = ?1")?
+            .query_row([&lease.0], |row| Ok((row.get(0)?, row.get(1)?)))
+            .optional()?;
+        match recorded {
+            Some((s, i)) if s == subject && (issuer.is_none() || i.as_deref() == issuer) => {}
+            Some(_) => return Err(AuditError::BindingConflict(lease.0.clone())),
+            None => {
+                tx.prepare_cached(
+                    "INSERT INTO lease_subjects (id, subject, issuer) VALUES (?1, ?2, ?3)",
+                )?
+                .execute(params![lease.0, subject, issuer])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+}
+
 fn subject_in(conn: &Connection, lease: &LeaseId) -> Result<Option<String>, AuditError> {
     Ok(conn
         .prepare_cached("SELECT subject FROM lease_subjects WHERE id = ?1")?
@@ -819,22 +854,25 @@ impl LeaseRegistry for SqliteLeaseStore {
     }
 
     fn record_subject(&self, lease: &LeaseId, subject: &str) -> Result<(), AuditError> {
-        let _gate = self.gate.hold();
-        let mut conn = self.conn.lock()?;
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        if get_in(&tx, lease)?.is_none() {
-            return Err(AuditError::UnknownLease(lease.0.clone()));
-        }
-        match subject_in(&tx, lease)? {
-            Some(s) if s == subject => {}
-            Some(_) => return Err(AuditError::BindingConflict(lease.0.clone())),
-            None => {
-                tx.prepare_cached("INSERT INTO lease_subjects (id, subject) VALUES (?1, ?2)")?
-                    .execute(params![lease.0, subject])?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
+        self.record_user(lease, None, subject)
+    }
+
+    fn record_originating_user(
+        &self,
+        lease: &LeaseId,
+        issuer: &str,
+        subject: &str,
+    ) -> Result<(), AuditError> {
+        self.record_user(lease, Some(issuer), subject)
+    }
+
+    fn originating_user(&self, lease: &LeaseId) -> Result<Option<(String, String)>, AuditError> {
+        let conn = self.conn.lock()?;
+        let row: Option<(Option<String>, String)> = conn
+            .prepare_cached("SELECT issuer, subject FROM lease_subjects WHERE id = ?1")?
+            .query_row([&lease.0], |row| Ok((row.get(0)?, row.get(1)?)))
+            .optional()?;
+        Ok(row.and_then(|(issuer, subject)| Some((issuer?, subject))))
     }
 
     fn subject(&self, lease: &LeaseId) -> Result<Option<String>, AuditError> {

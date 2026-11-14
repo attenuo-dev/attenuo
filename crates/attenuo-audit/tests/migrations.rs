@@ -191,6 +191,23 @@ fn assert_rows_kept(
     }
 }
 
+/// `after` (a table's dump once migrated) limited to the columns `before` had, for "no row
+/// added, changed or removed" checks on a table a later migration gave a column to.
+/// [`assert_rows_kept`] checks that the added columns are NULL in the old rows.
+fn kept_columns(
+    after: &(Vec<String>, Vec<String>),
+    before: &(Vec<String>, Vec<String>),
+) -> (Vec<String>, Vec<String>) {
+    let n = before.0.len();
+    let mut rows: Vec<String> = after
+        .1
+        .iter()
+        .map(|r| r.split('|').take(n).collect::<Vec<_>>().join("|"))
+        .collect();
+    rows.sort();
+    (after.0[..n].to_vec(), rows)
+}
+
 /// The audit log's head as stored: `(seq, entry_hash)`.
 fn head(path: &Path) -> (i64, String) {
     Connection::open(path)
@@ -454,7 +471,8 @@ fn a_file_from_the_pre_versioning_code_is_adopted_unchanged() {
     for (table, content) in &rows {
         if table != "approvals" {
             assert_eq!(
-                &after[table], content,
+                &kept_columns(&after[table], content),
+                content,
                 "adoption must not change a row of {table}"
             );
         }
@@ -503,9 +521,9 @@ const APPROVAL_COLUMNS: &str = "id, chain_id, lease, call_hash, server, tool, ar
 /// Write `path` as a file at schema version 1 with the content of the current-version file
 /// `source`: every table and index as `source` has it (from its own `CREATE` statements),
 /// except `approvals`, which has version 1's shape and gets each approval's position as its
-/// rowid, and `used_credentials` (version 3), which is left out; every row of every other
-/// table; and `user_version` 1. No `sqlite_sequence`, as in a real
-/// version 1 file.
+/// rowid, `used_credentials` (version 3), which is left out, and `lease_subjects`, without
+/// the `issuer` of version 4; every row of every other table; and `user_version` 1. No
+/// `sqlite_sequence`, as in a real version 1 file.
 fn version_1_copy(source: &Path, path: &Path) {
     let conn = Connection::open(path).unwrap();
     let statements: Vec<String> = {
@@ -523,6 +541,7 @@ fn version_1_copy(source: &Path, path: &Path) {
     for sql in statements {
         conn.execute_batch(&sql).unwrap();
     }
+    without_subject_issuer(&conn);
     conn.execute_batch(V1_APPROVALS).unwrap();
     let tables: Vec<String> = {
         let mut stmt = conn
@@ -554,6 +573,12 @@ fn version_1_copy(source: &Path, path: &Path) {
             .any(|(_, name, _)| name == "sqlite_sequence"),
         "a version 1 file has no AUTOINCREMENT table"
     );
+}
+
+/// Take `lease_subjects` back to its shape before migration 4: no `issuer` column.
+fn without_subject_issuer(conn: &Connection) {
+    conn.execute_batch("ALTER TABLE lease_subjects DROP COLUMN issuer;")
+        .unwrap();
 }
 
 /// `(position, id)` of every approval in the file, in table order, with the position read
@@ -631,7 +656,11 @@ fn a_version_1_file_keeps_its_approvals_in_order() {
     assert_rows_kept(&rows, &after);
     for (table, content) in &rows {
         if table != "approvals" {
-            assert_eq!(&after[table], content, "{table} is untouched");
+            assert_eq!(
+                &kept_columns(&after[table], content),
+                content,
+                "{table} is untouched"
+            );
         }
     }
     assert_eq!(approval_rowids(&path, "position"), before);
@@ -698,10 +727,12 @@ fn a_version_2_file_gains_the_replay_table() {
         write_leases(&store);
     }
     {
-        // Version 2 is the current schema without migration 3's table and index.
+        // Version 2 is the current schema without migration 3's table and index, and
+        // without migration 4's column.
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch("DROP TABLE used_credentials; PRAGMA user_version = 2;")
             .unwrap();
+        without_subject_issuer(&conn);
     }
     assert!(!objects(&path)
         .iter()
@@ -714,15 +745,31 @@ fn a_version_2_file_gains_the_replay_table() {
     assert_eq!(log.schema().migrated_from, Some(2));
     let store = SqliteLeaseStore::open(&path).unwrap();
     assert_eq!(store.schema().migrated_from, None);
-    assert_eq!(user_version(&path), 3);
+    assert_eq!(user_version(&path), i64::from(SCHEMA_VERSION));
     assert_eq!(objects(&path), current_objects());
 
     let after = dump(&path);
     assert_rows_kept(&rows, &after);
     for (table, content) in &rows {
-        assert_eq!(&after[table], content, "{table} is untouched");
+        assert_eq!(
+            &kept_columns(&after[table], content),
+            content,
+            "{table} is untouched"
+        );
     }
     assert_eq!(after["used_credentials"].1, Vec::<String>::new());
+    // Migration 4: every subject kept, with no issuer (none is guessed).
+    assert_eq!(
+        after["lease_subjects"],
+        (
+            vec!["id".into(), "subject".into(), "issuer".into()],
+            vec![format!(
+                "t:{}|t:{}|NULL",
+                hex::encode("l1"),
+                hex::encode("alice")
+            )]
+        )
+    );
     assert_eq!(head(&path), head_before);
     let report = log.verify_chain_signed(&keys(&issuer)).unwrap();
     assert!(report.ok, "{report:?}");
@@ -741,6 +788,93 @@ fn a_version_2_file_gains_the_replay_table() {
             .unwrap(),
         ReplayOutcome::Replayed,
         "the marker survives the reopen"
+    );
+}
+
+/// Migration 4 on a version 3 file with a log, checkpoints, leases with subjects, an approval
+/// and an outbox notice: `lease_subjects` gains a NULL `issuer` in every row and nothing else
+/// changes (no issuer is filled in), the schema is that of a new file, a lease from before
+/// keeps its subject and has no originating user (and cannot be given one later), and a lease
+/// recorded after it has both, across a reopen.
+#[test]
+fn a_version_3_file_gains_the_subject_issuer() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v3.sqlite");
+    let issuer = issuer();
+    write_log(&path, &issuer, 20);
+    {
+        let store = SqliteLeaseStore::open(&path).unwrap();
+        write_leases(&store);
+        store.record_subject(&id("l2"), "alice").unwrap();
+    }
+    {
+        // Version 3 is the current schema without migration 4's column.
+        let conn = Connection::open(&path).unwrap();
+        without_subject_issuer(&conn);
+        conn.pragma_update(None, "user_version", 3).unwrap();
+    }
+    let rows = dump(&path);
+    assert_eq!(rows["lease_subjects"].0, ["id", "subject"]);
+    let head_before = head(&path);
+
+    let store = SqliteLeaseStore::open(&path).unwrap();
+    assert_eq!(store.schema().version, SCHEMA_VERSION);
+    assert_eq!(store.schema().migrated_from, Some(3));
+    let log = SqliteAudit::open(&path).unwrap();
+    assert_eq!(log.schema().migrated_from, None);
+    assert_eq!(user_version(&path), 4);
+    assert_eq!(objects(&path), current_objects());
+    {
+        let fresh = dir.path().join("fresh.sqlite");
+        drop(SqliteLeaseStore::open(&fresh).unwrap());
+        let table = |p: &Path| {
+            master(p)
+                .into_iter()
+                .find(|(_, name, _)| name == "lease_subjects")
+                .unwrap()
+        };
+        assert_eq!(table(&path), table(&fresh), "the column of a new file");
+    }
+
+    let after = dump(&path);
+    assert_rows_kept(&rows, &after);
+    for (table, content) in &rows {
+        assert_eq!(
+            &kept_columns(&after[table], content),
+            content,
+            "{table} is untouched"
+        );
+    }
+    assert_eq!(after["lease_subjects"].0, ["id", "subject", "issuer"]);
+    assert!(after["lease_subjects"]
+        .1
+        .iter()
+        .all(|r| r.ends_with("|NULL")));
+    assert_eq!(head(&path), head_before);
+    let report = log.verify_chain_signed(&keys(&issuer)).unwrap();
+    assert!(report.ok, "{report:?}");
+
+    // The old leases keep their subject and have no originating user, now or later.
+    assert_eq!(store.subject(&id("l1")).unwrap().as_deref(), Some("alice"));
+    assert_eq!(store.originating_user(&id("l1")).unwrap(), None);
+    assert!(matches!(
+        store.record_originating_user(&id("l1"), "https://idp.example", "alice"),
+        Err(AuditError::BindingConflict(_))
+    ));
+    assert_eq!(store.originating_user(&id("l1")).unwrap(), None);
+    // A lease issued after it has both.
+    store
+        .register(&id("l3"), Some(&id("l2")), t0() + Duration::hours(1))
+        .unwrap();
+    store
+        .record_originating_user(&id("l3"), "https://idp.example", "alice")
+        .unwrap();
+    drop((log, store));
+    let store = SqliteLeaseStore::open(&path).unwrap();
+    assert_eq!(store.schema().migrated_from, None);
+    assert_eq!(
+        store.originating_user(&id("l3")).unwrap(),
+        Some(("https://idp.example".into(), "alice".into()))
     );
 }
 
