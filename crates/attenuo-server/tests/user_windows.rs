@@ -2,7 +2,8 @@
 //! is kept per originating user across all their runs, so a new run does not reset it and a
 //! second user is never charged by the first user's window; it is reported on the decision
 //! record and in the `-32003` error data, returned by the operator refund, and not reset by
-//! revoking the run.
+//! revoking the run. The admin lease tree shows the run's user's windows (phase 3 step 2),
+//! read only, to the same roles as the rest of the tree.
 
 mod common;
 
@@ -18,6 +19,9 @@ use reqwest::StatusCode;
 use serde_json::{json, Value};
 
 const ADMIN: &str = "user-windows-test-admin";
+/// A `viewer` operator, the lowest role, and an expired one.
+const VIEWER: &str = "user-windows-test-viewer";
+const EXPIRED: &str = "user-windows-test-expired";
 
 /// A user's agents send at most 100 a UTC day, whatever run they are in.
 const POLICY: &str = r#"
@@ -34,7 +38,7 @@ when {
 
 struct Harness {
     server: Spawned,
-    _state: Arc<AppState>,
+    state: Arc<AppState>,
     _upstream_task: Spawned,
     client: reqwest::Client,
     _dir: tempfile::TempDir,
@@ -74,12 +78,26 @@ impl Harness {
         cfg.audit.sqlite_path = dir.path().join("audit.db").to_string_lossy().into_owned();
         cfg.upstreams = vec![UpstreamConfig::new("bank", upstream_task.url("/mcp"))];
         cfg.admin.token = Some(ADMIN.into());
+        cfg.admin.operators = [
+            ("vera", VIEWER, None),
+            ("old", EXPIRED, Some(time::OffsetDateTime::UNIX_EPOCH)),
+        ]
+        .into_iter()
+        .map(
+            |(name, token, expires_at)| attenuo_server::config::AdminOperator {
+                name: name.into(),
+                token_sha256: attenuo_server::operators::token_sha256_hex(token),
+                role: attenuo_server::operators::AdminRole::Viewer,
+                expires_at,
+            },
+        )
+        .collect();
         cfg.dev.allow_root_mint = true;
         let (router, state) = attenuo_server::build(&cfg).unwrap();
         let server = spawn_router(router).await.unwrap();
         Self {
             server,
-            _state: state,
+            state,
             _upstream_task: upstream_task,
             client: reqwest::Client::new(),
             _dir: dir,
@@ -98,10 +116,15 @@ impl Harness {
 
     /// A new run (root token) of `subject`.
     async fn new_run(&self, subject: &str) -> Minted {
+        self.new_run_of("https://idp.example", subject).await
+    }
+
+    /// A new run (root token) of `subject` as `issuer` asserts it.
+    async fn new_run_of(&self, issuer: &str, subject: &str) -> Minted {
         let resp = self
             .admin_post(
                 "/admin/root-token",
-                json!({"subject": subject, "issuer": "https://idp.example",
+                json!({"subject": subject, "issuer": issuer,
                        "agent": "planner", "capabilities": ["bank:*"]}),
             )
             .await;
@@ -127,6 +150,19 @@ impl Harness {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         resp.json().await.unwrap()
+    }
+
+    /// `GET /admin/leases/{lease}/tree` with `bearer` (none when `None`).
+    async fn tree(&self, lease: &str, bearer: Option<&str>) -> (StatusCode, Value) {
+        let mut req = self
+            .client
+            .get(self.server.url(&format!("/admin/leases/{lease}/tree")));
+        if let Some(b) = bearer {
+            req = req.bearer_auth(b);
+        }
+        let resp = req.send().await.unwrap();
+        let status = resp.status();
+        (status, resp.json().await.unwrap_or(Value::Null))
     }
 
     async fn payments(&self) -> Vec<Value> {
@@ -221,4 +257,104 @@ async fn a_users_window_spans_runs_and_never_charges_another_user() {
         resp.text().await.unwrap()
     );
     assert!(allowed(&h.pay(&alice2.token, 20).await));
+}
+
+/// The start of today's UTC day, RFC 3339.
+fn today() -> String {
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    time::OffsetDateTime::from_unix_timestamp(now - now.rem_euclid(86_400))
+        .unwrap()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap()
+}
+
+/// The lease tree of a run shows its user's windows for the tools the run used, as every run
+/// of that user charged them, for the kinds the policies read (only `day` here). The same
+/// subject under another issuer is another user. Nothing is shown that the tree did not
+/// already show: no issuer, no digest. A run with no usage lists no window, and reading the
+/// tree charges nothing.
+#[tokio::test]
+async fn the_lease_tree_shows_the_run_users_windows() {
+    let h = Harness::start().await;
+    let alice1 = h.new_run("alice").await;
+    assert!(allowed(&h.pay(&alice1.token, 30).await));
+    let alice2 = h.new_run("alice").await;
+    assert!(allowed(&h.pay(&alice2.token, 40).await));
+    // Another IdP's "alice" is someone else.
+    let other = h.new_run_of("https://other-idp.example", "alice").await;
+    assert!(allowed(&h.pay(&other.token, 5).await));
+    let idle = h.new_run("alice").await;
+
+    let day = today();
+    let (status, tree) = h.tree(&alice2.lease, Some(ADMIN)).await;
+    assert_eq!(status, StatusCode::OK, "{tree}");
+    let expected = json!({"truncated": false, "windows": [
+        {"tool": "bank/send_money", "kind": "day", "start": day, "calls": 2, "amount": 70}]});
+    assert_eq!(tree["user_windows"], expected, "{tree}");
+    let text = tree.to_string();
+    assert!(!text.contains("idp.example"), "no issuer is shown: {text}");
+
+    let (_, tree) = h.tree(&other.lease, Some(ADMIN)).await;
+    assert_eq!(
+        tree["user_windows"]["windows"][0],
+        json!({"tool": "bank/send_money", "kind": "day", "start": day, "calls": 1, "amount": 5})
+    );
+    // No usage in the run, so no tool to show a window for.
+    let (_, tree) = h.tree(&idle.lease, Some(ADMIN)).await;
+    assert_eq!(
+        tree["user_windows"],
+        json!({"windows": [], "truncated": false})
+    );
+    // A read twice is the same read: nothing was charged.
+    let (_, again) = h.tree(&alice2.lease, Some(ADMIN)).await;
+    assert_eq!(again["user_windows"], expected);
+}
+
+/// A lease registered before the store kept issuers (schema version 4) has a subject and no
+/// issuer: its tree answers `user_windows: null`, and no configured issuer is tried instead.
+#[tokio::test]
+async fn a_run_without_a_recorded_issuer_shows_no_windows() {
+    use attenuo_audit::LeaseRegistry;
+    let h = Harness::start().await;
+    let run = h.new_run("alice").await;
+    assert!(allowed(&h.pay(&run.token, 30).await));
+    let old = attenuo_core::LeaseId::new("lease-from-before-v4");
+    h.state
+        .leases
+        .register(
+            &old,
+            None,
+            time::OffsetDateTime::now_utc() + time::Duration::hours(1),
+        )
+        .unwrap();
+    h.state.leases.record_subject(&old, "alice").unwrap();
+    let (status, tree) = h.tree(&old.0, Some(ADMIN)).await;
+    assert_eq!(status, StatusCode::OK, "{tree}");
+    assert_eq!(tree["nodes"][0]["subject"], "alice");
+    assert!(tree["user_windows"].is_null(), "{tree}");
+}
+
+/// The windows are part of the lease tree, so they need what the tree needs: the `viewer`
+/// role, the lowest there is. Without a credential, with a wrong one or with an expired one
+/// the tree, windows included, is 401.
+#[tokio::test]
+async fn the_windows_need_the_trees_role() {
+    let h = Harness::start().await;
+    let run = h.new_run("alice").await;
+    assert!(allowed(&h.pay(&run.token, 30).await));
+    assert_eq!(
+        attenuo_server::operators::required_role(
+            &reqwest::Method::GET,
+            Some("/admin/leases/{lease_id}/tree")
+        ),
+        attenuo_server::operators::AdminRole::Viewer
+    );
+    let (status, tree) = h.tree(&run.lease, Some(VIEWER)).await;
+    assert_eq!(status, StatusCode::OK, "{tree}");
+    assert_eq!(tree["user_windows"]["windows"][0]["amount"], 30);
+    for bearer in [None, Some("not-a-token"), Some(EXPIRED)] {
+        let (status, body) = h.tree(&run.lease, bearer).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{bearer:?}: {body}");
+        assert!(body.get("user_windows").is_none(), "{body}");
+    }
 }

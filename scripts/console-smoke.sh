@@ -79,7 +79,8 @@ RO_UI_PORT="${PORTS[4]}"
 
 # The demo policy plus a destructive tool the policy allows outright and asks about once the
 # run is tainted unless the call carries an approval, which the policy page's dry runs with
-# stated run labels and a stated approval use.
+# stated run labels and a stated approval use, and a rule that reads the per-user day window
+# of create_issue, for the lease page's user windows.
 cp "$DEMO/policy.cedar" "$WORK/policy.cedar"
 cat >> "$WORK/policy.cedar" <<'EOF'
 
@@ -91,6 +92,12 @@ permit(principal, action == Action::"github/add_label", resource);
 @obligation("approval")
 forbid(principal, action == Action::"github/add_label", resource)
 when { context.session.tainted && !context.approval.present };
+
+// Reads the user's day window (never refuses), so the server keeps it and the lease page
+// shows it under "User windows".
+@id("smoke_user_day_window")
+forbid(principal, action == Action::"github/create_issue", resource)
+when { context.usage.user_window.day.calls > 1000000 };
 EOF
 
 # The demo config with its ports rewritten (as run.sh does) and that policy, plus the console,

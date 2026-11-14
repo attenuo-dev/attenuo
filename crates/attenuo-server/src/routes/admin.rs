@@ -631,7 +631,7 @@ pub struct TreeQuery {
 }
 
 /// `GET /admin/leases/{lease_id}/tree?max_nodes=`: a dry-run revocation. Answers
-/// `{root, ancestors, nodes, would_revoke, truncated}`:
+/// `{root, ancestors, nodes, would_revoke, truncated, user_windows}`:
 ///
 /// - `nodes`: the lease, then everything delegated from it, breadth-first, at most
 ///   `max_nodes`; `truncated` says the cap cut the list short.
@@ -639,6 +639,9 @@ pub struct TreeQuery {
 ///   chain's first hop (also the audit `chain_id`).
 /// - `would_revoke`: how many leases `POST /admin/leases/{lease_id}/revoke` would revoke if
 ///   sent now, counted over the whole subtree with the same query the revocation runs.
+/// - `user_windows`: the run's originating user's per-user windows (run limits phase 3) for
+///   the tools the run used, read at `root` (see `run_user_windows`); null for a run whose
+///   root lease has no recorded issuer (issued before schema version 4).
 ///
 /// Each node carries its registry row, whether it is active now, `chain_id` (the chain's
 /// first-hop lease, the same as `root`; the selector `POST /admin/leases/revoke` takes),
@@ -712,15 +715,117 @@ pub async fn lease_tree(
                     "issued_seq": issuance.map(|e| e.seq),
                 })
             };
+            let engine = state.pipeline.policy_snapshot();
+            let user_windows = run_user_windows(
+                state.leases.as_ref(),
+                engine.user_window_kinds(),
+                &root,
+                now,
+                MAX_TREE_WINDOWS,
+            )?;
             Ok(Json(json!({
                 "root": root,
                 "ancestors": tree.ancestors.iter().map(node).collect::<Vec<_>>(),
                 "nodes": tree.nodes.iter().map(node).collect::<Vec<_>>(),
                 "would_revoke": tree.would_revoke,
                 "truncated": tree.truncated,
+                "user_windows": user_windows,
             })))
         })
         .await
+}
+
+/// Most entries `user_windows.windows` of `GET /admin/leases/{id}/tree` lists: the tree's own
+/// cap, [`MAX_TREE_NODES`]. A run that used more tools than that (times the kinds kept) gets
+/// the first ones by tool and `truncated` set.
+pub const MAX_TREE_WINDOWS: usize = MAX_TREE_NODES;
+
+/// The `user_windows` member of a lease tree (run limits phase 3, step 2): the per-user
+/// windows of the run whose first-hop lease is `root`, as policies read them now. `null` when
+/// the store has no issuer for `root` (a lease issued before schema version 4, or by a store
+/// that keeps none): the windows are keyed by issuer and subject, and the issuer is never
+/// guessed. Else `{windows: [..], truncated}`:
+///
+/// - `windows`: for each tool the run has run usage of (the `usage` of its root lease's
+///   budget, so the tools of destructive calls it was allowed), and each window kind a loaded
+///   policy reads (`kinds`, hour before day), the window holding `now`: `{tool, kind, start,
+///   calls, amount}`. `start` is the window's start in UTC (RFC 3339); `calls` and `amount`
+///   are what the window holds for every run of the user, this one and others. Ordered by
+///   tool, then kind. Empty when the run has no usage (none yet, or it was revoked, which
+///   deletes run usage but never a window) or no policy reads a window.
+/// - `truncated`: the list stopped at `max` ([`MAX_TREE_WINDOWS`]).
+///
+/// Read only. The user's digest is never shown, and neither is the issuer: the user is the
+/// `subject` the tree's nodes already carry.
+fn run_user_windows(
+    leases: &dyn attenuo_audit::LeaseStore,
+    kinds: &[attenuo_core::WindowKind],
+    root: &LeaseId,
+    now: OffsetDateTime,
+    max: usize,
+) -> Result<Value, ApiError> {
+    let Some((issuer, subject)) = leases.originating_user(root)? else {
+        return Ok(Value::Null);
+    };
+    let tools: std::collections::BTreeSet<String> = leases
+        .budget_summary(root)?
+        .into_iter()
+        .filter(|c| c.kind.starts_with("usage_"))
+        .map(|c| c.arg)
+        .collect();
+    let mut kinds = kinds.to_vec();
+    kinds.sort();
+    let mut shown: Vec<(&str, attenuo_core::WindowKind)> = Vec::new();
+    let mut truncated = false;
+    'tools: for tool in &tools {
+        for &kind in &kinds {
+            if shown.len() == max {
+                truncated = true;
+                break 'tools;
+            }
+            shown.push((tool, kind));
+        }
+    }
+    let charges: Vec<attenuo_core::WindowCharge> = shown
+        .iter()
+        .flat_map(|&(tool, kind)| {
+            [
+                attenuo_core::WindowMeasure::Calls,
+                attenuo_core::WindowMeasure::Amount,
+            ]
+            .map(|measure| attenuo_core::WindowCharge {
+                issuer: issuer.clone(),
+                subject: subject.clone(),
+                kind,
+                start: kind.start_of(now),
+                tool: tool.to_owned(),
+                measure,
+                amount: 0,
+            })
+        })
+        .collect();
+    let used = if charges.is_empty() {
+        Vec::new()
+    } else {
+        leases.window_used(&charges)?
+    };
+    let windows: Vec<Value> = shown
+        .iter()
+        .zip(used.chunks(2))
+        .map(|(&(tool, kind), u)| {
+            let start = OffsetDateTime::from_unix_timestamp(kind.start_of(now))
+                .ok()
+                .and_then(|t| t.format(&Rfc3339).ok());
+            json!({
+                "tool": tool,
+                "kind": kind.as_str(),
+                "start": start,
+                "calls": u.first().copied().unwrap_or(0),
+                "amount": u.get(1).copied().unwrap_or(0),
+            })
+        })
+        .collect();
+    Ok(json!({"windows": windows, "truncated": truncated}))
 }
 
 /// The `budget` member of a lease tree node (run limits, ADR-0010): `null` when the hop has no
@@ -1667,7 +1772,94 @@ pub async fn reload_operators(
 
 #[cfg(test)]
 mod tests {
-    use super::constant_time_eq;
+    use super::{constant_time_eq, run_user_windows};
+    use attenuo_audit::{LeaseRegistry, MemoryLeaseStore, RunLimits};
+    use attenuo_core::{LeaseId, WindowCharge, WindowKind, WindowMeasure};
+    use serde_json::json;
+    use time::macros::datetime;
+
+    /// Tools by name, then hour before day; the cap cuts the list and says so; the window
+    /// figures are the user's, read at the window holding `now`.
+    #[test]
+    fn run_user_windows_are_ordered_and_capped() {
+        let store = MemoryLeaseStore::new();
+        let root = LeaseId::new("r");
+        let now = datetime!(2026-11-14 09:30 UTC);
+        store
+            .register(&root, None, now + time::Duration::hours(1))
+            .unwrap();
+        // No issuer recorded: null, whatever else is there.
+        assert!(run_user_windows(&store, &WindowKind::ALL, &root, now, 10)
+            .unwrap()
+            .is_null());
+        store
+            .record_originating_user(&root, "https://idp.example", "alice")
+            .unwrap();
+        let mut charges = Vec::new();
+        let mut windows = Vec::new();
+        for (i, tool) in ["bank/pay", "bank/refund"].into_iter().enumerate() {
+            let (server, name) = tool.split_once('/').unwrap();
+            let call = attenuo_core::ToolCall::new(server, name, json!({"amount": 7}));
+            charges.extend(attenuo_core::limits::usage_charges(
+                &root,
+                &call,
+                Some("amount"),
+                None,
+            ));
+            for kind in WindowKind::ALL {
+                for (measure, amount) in [(WindowMeasure::Calls, 1), (WindowMeasure::Amount, 7)] {
+                    windows.push(WindowCharge {
+                        issuer: "https://idp.example".into(),
+                        subject: "alice".into(),
+                        kind,
+                        start: kind.start_of(now),
+                        tool: tool.into(),
+                        measure,
+                        amount: amount * (i as u64 + 1),
+                    });
+                }
+            }
+        }
+        store
+            .charge_windowed("d1", &charges, &windows, now, false)
+            .unwrap();
+        let all =
+            run_user_windows(&store, &[WindowKind::Day, WindowKind::Hour], &root, now, 10).unwrap();
+        assert_eq!(
+            all,
+            json!({"truncated": false, "windows": [
+                {"tool": "bank/pay", "kind": "hour", "start": "2026-11-14T09:00:00Z",
+                 "calls": 1, "amount": 7},
+                {"tool": "bank/pay", "kind": "day", "start": "2026-11-14T00:00:00Z",
+                 "calls": 1, "amount": 7},
+                {"tool": "bank/refund", "kind": "hour", "start": "2026-11-14T09:00:00Z",
+                 "calls": 2, "amount": 14},
+                {"tool": "bank/refund", "kind": "day", "start": "2026-11-14T00:00:00Z",
+                 "calls": 2, "amount": 14},
+            ]})
+        );
+        let cut = run_user_windows(&store, &WindowKind::ALL, &root, now, 3).unwrap();
+        assert_eq!(cut["truncated"], true);
+        assert_eq!(cut["windows"].as_array().unwrap().len(), 3);
+        let exact = run_user_windows(&store, &WindowKind::ALL, &root, now, 4).unwrap();
+        assert_eq!(exact["truncated"], false);
+        // An hour later the hour window is a new one, empty; the day still holds the calls.
+        let later = run_user_windows(
+            &store,
+            &[WindowKind::Hour],
+            &root,
+            now + time::Duration::hours(1),
+            10,
+        )
+        .unwrap();
+        assert_eq!(later["windows"][0]["start"], "2026-11-14T10:00:00Z");
+        assert_eq!(later["windows"][0]["calls"], 0);
+        // No kind kept: nothing listed.
+        assert_eq!(
+            run_user_windows(&store, &[], &root, now, 10).unwrap(),
+            json!({"windows": [], "truncated": false})
+        );
+    }
 
     #[test]
     fn ct_eq() {

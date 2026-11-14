@@ -78,6 +78,7 @@ function render(root, leaseId, tree) {
         ['History', h('a', { href: `#/audit${qs({ lease: leaseId })}` }, 'Every record naming this lease')],
       ])),
     limitsPanel(tree),
+    userWindowsPanel(tree),
     h('section', { class: 'panel' },
       h('header', null, h('h2', null, 'Subtree'),
         h('span', { class: 'small muted' }, `${tree.nodes.length} lease${tree.nodes.length === 1 ? '' : 's'} listed`)),
@@ -133,6 +134,34 @@ function limitsPanel(tree) {
     hops.some((n) => n.budget && !n.budget.recorded)
       ? h('p', { class: 'small muted' }, 'Some hops were issued before the server kept their limits: their counters are shown without a maximum.')
       : null);
+}
+
+/**
+ * The run's originating user's per-user windows (run limits phase 3) for the tools this run
+ * used, from the tree's `user_windows`: every run of the user counts in them, this one and
+ * others. Read only. `null` from the server means the run's root lease was issued before the
+ * server kept the user's issuer, and the windows cannot be found; an older server sends no
+ * member, and a run with no window to show gets no panel.
+ */
+function userWindowsPanel(tree) {
+  const w = tree.user_windows;
+  if (w === undefined) return null;
+  const head = h('header', null, h('h2', null, 'User windows'));
+  if (w === null) {
+    return h('section', { class: 'panel' }, head,
+      h('p', { class: 'muted small' }, 'Not recorded: this run was issued before the server kept the originating user’s issuer, which a window is keyed by.'));
+  }
+  if (!w.windows.length) return null;
+  const rows = w.windows.map((e) => h('tr', null,
+    h('td', { class: 'wrap' }, mono(e.tool)),
+    h('td', null, h('span', { class: 'tag' }, e.kind)),
+    h('td', null, mono(e.start)),
+    h('td', { class: 'num' }, mono(e.calls)),
+    h('td', { class: 'num' }, mono(e.amount))));
+  return h('section', { class: 'panel' }, head,
+    h('p', { class: 'small muted' }, 'Allowed calls of each destructive tool this run used, by every run of its originating user in the current UTC window, as policies see them in ', mono('context.usage.user_window'), '.'),
+    table(['Tool', 'Window', 'Start (UTC)', 'Calls', 'Amount'], rows, { short: true }),
+    w.truncated ? h('p', { class: 'callout warn' }, 'The list is cut short at the server’s cap.') : null);
 }
 
 /** `used`, with how many values a `calls_per` limit has seen. */
