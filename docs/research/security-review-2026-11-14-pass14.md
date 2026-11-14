@@ -25,14 +25,14 @@ The review was done by reading the code. Every suspected issue then got a test o
 | High | 0 | 0 | 0 | 0 |
 | Medium | 0 | 0 | 0 | 0 |
 | Low | 1 | 1 (SR-115) | 0 | 0 |
-| Info | 2 | 1 (SR-116) | 1 (SR-117) | 0 |
+| Info | 2 | 1 (SR-116) | 1 (SR-117; its rate limit added after the pass) | 0 |
 | **Total** | **3** | **2** | **1** | **0** |
 
 | ID | Severity | Component | Title | Status |
 |---|---|---|---|---|
 | SR-115 | Low | server (`routes/authzen.rs` `search_actions`) | The `AuthZEN action search` log line wrote the caller's `server` with `Display`, so a newline in it forged log lines | Fixed: Debug-formatted; test `a_newline_in_an_action_search_server_stays_on_one_log_line_sr115` |
 | SR-116 | Info | server (`routes/authzen.rs` `search_actions`) | Action search paged over catalogued tools outside the token's capabilities, so `page.next_token` counted the catalog for the caller | Fixed: the candidates are the catalogued tools the capabilities could permit; test `action_search_pages_only_over_the_tools_the_capabilities_name_sr116` |
-| SR-117 | Info | server (action search), ADR-0014 | Action search is an unaudited, unlimited oracle over argument values the agent chooses | Proposed: options below |
+| SR-117 | Info | server (action search), ADR-0014 | Action search is an unaudited, unlimited oracle over argument values the agent chooses | Proposed: options below. Option 2 done after the pass on `fix/sr-117-search-audit` (`[limits] authzen_search_requests_per_minute`, off by default), tests `the_search_rate_limit_is_per_run`, `a_pep_search_with_an_unsigned_chain_counts_against_its_run`; option 3 (an audit record per search) still open |
 
 ## Findings
 
@@ -62,6 +62,7 @@ The review was done by reading the code. Every suspected issue then got a test o
 - **Severity.** Info: no enforcement changes, and the reference page names the missing record as a cost; recorded because the stated comparison understates it and nothing bounds it.
 - **Options.** (1) Keep it, and say in the reference page and the threat model that a search lets the caller try arguments without a record, unlike the list screen. (2) Count searches in a per-run rate limit: share the `mcp_requests_per_minute` table (the root lease is the key there too) or add `[limits] authzen_search_requests_per_minute`, off by default like the other rate limits. (3) Write one audit record per search request (not per candidate), with a new tool such as `authzen.search`, the server, an input digest and the permitted count; this changes what the audit log holds and every reader of it. (4) Add a digest of `context.input` to the log line, which gives a trace without the log's integrity.
 - **Recommendation.** (2), with a new key off by default and the documentation change of (1) now. A run limit bounds the rate without changing the audit format, the threat model already treats rates as `[limits]` business (ADR-0014), and a deployment that wants searches visible can lower it; (3) is the stronger answer if the maintainer wants every probe in the log, at the cost of a record format change. Left open; this branch changes neither behaviour nor wording of the trade-off beyond pointing to this finding.
+- **Option 2 done after the pass** in #315 ([ADR-0014 update](../decisions/0014-request-limits.md#update-2026-11-14-a-per-run-rate-limit-on-authzen-action-search-sr-117)), with the documentation of option 1. `[limits] authzen_search_requests_per_minute`, off by default, counts searches per run (the root lease, of the bearer's chain or of a PEP's issued unsigned chain) in a table of its own, apart from `mcp_requests_per_minute`. It is checked after authentication and before any candidate is evaluated; over it the answer is `429` `rate_limited` with `Retry-After`, nothing is evaluated, no audit record is written, and `requests_rate_limited_total{limit="authzen_search"}` counts it. Evaluations are not counted. Unset, nothing bounds the rate as before, so the finding stays open: whether a search should also write an audit record (option 3) is the maintainer's decision. Tests `limits::tests::the_search_limit_is_per_run_and_apart_from_the_mcp_limit` and, in `tests/limits.rs`, `the_search_rate_limit_is_off_by_default`, `the_search_rate_limit_is_per_run` and `a_pep_search_with_an_unsigned_chain_counts_against_its_run`.
 
 ## Not confirmed
 

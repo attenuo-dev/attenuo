@@ -332,10 +332,12 @@ class RateLimited(ApiError):
     the proxy's JSON-RPC error ``data`` (``{}`` for a REST route).
 
     - ``rate_limited``: ``POST /token`` over ``[limits] token_requests_per_minute`` (per agent)
-      or ``token_unauthenticated_requests_per_minute`` (per address), or ``/mcp/{server}`` over
-      ``mcp_requests_per_minute`` (per run). The request was refused before the server did the
-      work (no token issued, no decision, no audit record, nothing sent upstream), so it is safe
-      to retry after ``retry_after``. The client's ``max_retries`` retries it.
+      or ``token_unauthenticated_requests_per_minute`` (per address), ``/mcp/{server}`` over
+      ``mcp_requests_per_minute`` (per run), or an AuthZEN action search over
+      ``authzen_search_requests_per_minute`` (per run). The request was refused before the
+      server did the work (no token issued, no decision, no audit record, nothing sent
+      upstream), so it is safe to retry after ``retry_after``. The client's ``max_retries``
+      retries it.
     - ``too_many_sessions`` (proxy): the principal holds ``[proxy] max_sessions_per_principal``
       live sessions; the upstream answered ``initialize`` and the proxy then closed that
       session. Close a session first; not retried for you.

@@ -65,3 +65,17 @@ What this costs, honestly:
 Rejected: letting every request from a new address through uncounted (option 1), which leaves unauthenticated work from new addresses unbounded on every path, including IdP and actor-token key fetches; a second table of addresses that recently authenticated an agent (option 3), which still refuses an agent from a new address during a flood; documenting the behaviour and asking for a larger `rate_limit_max_keys` (option 4), which leaves the limit refusing the callers it was not meant for.
 
 Confirmation: `limits::tests::a_full_peer_table_still_serves_an_authenticated_agent_sr109` (the middleware with a stand-in handler: agent served from a known and a new address, a failed authentication, no credential and an actor token all `429` with one body, the handler not run for a peer over its limit, the metrics) and `tests/limits.rs` `a_full_peer_table_lets_agents_authenticate_sr109` (the server's own handler, at an exchange and at hop 0).
+
+### Update 2026-11-14: a per-run rate limit on AuthZEN action search (SR-117)
+
+The decision above stands. It keyed `/mcp` by run and `POST /token` by agent and peer, and left the AuthZEN routes to the in-flight cap and the handler deadline. Action search (#310) writes no audit record and takes `context.input` from the caller, so a run could try argument values against the policy as fast as the server answered, leaving only a log line ([SR-117](../research/security-review-2026-11-14-pass14.md#sr-117-action-search-is-an-unaudited-unlimited-oracle-over-chosen-arguments-info-proposed)).
+
+Now (option 2 of the report): `[limits] authzen_search_requests_per_minute`, off by default like the other rate limits, counts searches per run in the same limiter, keyed by the root lease as `/mcp` is. A PEP sending an unsigned chain is keyed on that chain's root lease, once the server has checked that it issued every hop. A search is counted after the caller has authenticated and before any candidate is evaluated, so a caller without the token (and its DPoP key) or the PEP's credentials cannot use up a run's searches. Over the limit: `429` `rate_limited` with `Retry-After`, the code and shape of the other REST rate limits; a refused search writes no audit record and is counted as `requests_rate_limited_total{limit="authzen_search"}`.
+
+- **A table of its own**, not the `/mcp` one: an agent that searches would otherwise spend its run's tool calls, and a busy run could no longer search. The operator who wants one figure for both sets both keys.
+- **Evaluations are not counted.** `POST /access/v1/evaluation` and `/access/v1/evaluations` audit every decision, so probing through them is already visible.
+- **Off by default**, for the reason the decision gives: the right figure depends on the client. The deploy guide recommends setting it where agents can reach the route.
+
+Not decided here: whether a search should also write one audit record (option 3 of the report), which changes what the audit log holds and every reader of it. That stays open in SR-117.
+
+Confirmation: `limits::tests::the_search_limit_is_per_run_and_apart_from_the_mcp_limit`, and in `tests/limits.rs` `the_search_rate_limit_is_off_by_default`, `the_search_rate_limit_is_per_run` (a delegated token shares the count, another run does not, evaluation, batch evaluation and `/mcp` are unaffected, a bad token counts against no one, no audit record) and `a_pep_search_with_an_unsigned_chain_counts_against_its_run`.
