@@ -848,7 +848,100 @@ async fn run(cli: Cli) -> Result<Outcome> {
             }
             Ok(if allow { Outcome::Ok } else { Outcome::No })
         }
+        Command::Authzen(AuthzenCmd::Search {
+            token,
+            upstream: server,
+            args,
+            limit,
+            page_token,
+            all,
+        }) => {
+            let input: Map<String, Value> = args.into_iter().collect();
+            let client = client?;
+            let token_src_key = token.dpop_key.clone();
+            let token = secrets::resolve_token(
+                "--token",
+                token.token,
+                token.token_file.as_deref(),
+                &mut stdin,
+            )?;
+            let key = dpop_key::load_opt(token_src_key.as_deref())?;
+            let mut results: Vec<Value> = Vec::new();
+            let mut page_token = page_token.filter(|t| !t.is_empty());
+            let next = loop {
+                let resp = client
+                    .authzen_search_action(
+                        &token,
+                        &search_action_body(&server, &input, page_token.as_deref(), limit),
+                        key.as_ref(),
+                    )
+                    .await?;
+                let Some(page) = resp["results"].as_array() else {
+                    anyhow::bail!("unexpected action search answer: {resp}");
+                };
+                results.extend(page.iter().cloned());
+                let next = resp["page"]["next_token"]
+                    .as_str()
+                    .filter(|t| !t.is_empty())
+                    .map(str::to_owned);
+                if !all || next.is_none() {
+                    break next;
+                }
+                if next == page_token {
+                    anyhow::bail!("paging did not advance (the server sent the same token again)");
+                }
+                page_token = next;
+            };
+            if json {
+                print_json(&json!({
+                    "page": {"next_token": next.clone().unwrap_or_default(), "count": results.len()},
+                    "results": results,
+                }));
+            } else {
+                for r in &results {
+                    println!(
+                        "{}/{}",
+                        r["properties"]["server"].as_str().unwrap_or(&server),
+                        r["name"].as_str().unwrap_or("-")
+                    );
+                }
+                if results.is_empty() {
+                    println!("no permitted tools on this page");
+                }
+                if let Some(t) = next {
+                    println!("next page: --page-token {t}");
+                }
+            }
+            Ok(Outcome::Ok)
+        }
     }
+}
+
+/// The body of `POST /access/v1/search/action`: the subject (the server fills it from the
+/// token's chain), the upstream as the resource, the arguments every candidate is decided
+/// with, and `page` when a token or limit is given.
+fn search_action_body(
+    server: &str,
+    input: &Map<String, Value>,
+    page_token: Option<&str>,
+    limit: Option<u64>,
+) -> Value {
+    let mut body = json!({
+        "subject": {"type": "agent", "id": ""},
+        "resource": {"type": "mcp_server", "id": server},
+        "context": {"input": input},
+    });
+    let mut page = Map::new();
+    if let Some(t) = page_token {
+        page.insert("token".into(), json!(t));
+    }
+    if let Some(n) = limit {
+        page.insert("limit".into(), json!(n));
+    }
+    if !page.is_empty() {
+        body["page"] = Value::Object(page);
+    }
+    body
 }
 
 /// The body of `POST /admin/policies/evaluate`: the AuthZEN request `authzen eval` sends, plus

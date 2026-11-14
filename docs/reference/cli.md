@@ -36,7 +36,7 @@ Secrets are never taken from the argument list by default. That covers the admin
 | --- | --- | --- | --- |
 | Admin token | `ATTENUO_ADMIN_TOKEN` | `--admin-token-file` | `--admin-token-stdin` |
 | Client secret | `ATTENUO_CLIENT_SECRET` | `--client-secret-file` | `--client-secret-stdin` |
-| Delegation token (`call`, `tools`, `authzen eval`) | `ATTENUO_TOKEN` | `--token-file` | `--token -` |
+| Delegation token (`call`, `tools`, `authzen eval`, `authzen search`) | `ATTENUO_TOKEN` | `--token-file` | `--token -` |
 | Parent token (`token exchange`) | `ATTENUO_TOKEN` | `--subject-token-file` | `--subject-token -` |
 
 ```sh
@@ -232,7 +232,7 @@ Call a tool through the proxy (`tools/call`).
 | --- | --- |
 | `--token <JWT\|->` (`ATTENUO_TOKEN`) | Delegation token; `-` reads it from stdin. One of the flag, `--token-file` or `ATTENUO_TOKEN` is required. The flag with a literal token prints a warning. |
 | `--token-file PATH` | Read the delegation token from the first line of a file. |
-| `--dpop-key PATH` (`ATTENUO_DPOP_KEY`) | The DPoP key the token is bound to. Every request then carries a proof and `Authorization: DPoP`. Against a server with `[token] dpop_nonce = "required"` the CLI keeps the `DPoP-Nonce` the server sent, puts it in the proof, and sends a request once more when the server answers `use_dpop_nonce` (RFC 9449 §8); nonces are never printed or logged. Also on `tools` and `authzen eval`, and on `token root` and `token exchange`. |
+| `--dpop-key PATH` (`ATTENUO_DPOP_KEY`) | The DPoP key the token is bound to. Every request then carries a proof and `Authorization: DPoP`. Against a server with `[token] dpop_nonce = "required"` the CLI keeps the `DPoP-Nonce` the server sent, puts it in the proof, and sends a request once more when the server answers `use_dpop_nonce` (RFC 9449 §8); nonces are never printed or logged. Also on `tools`, `authzen eval` and `authzen search`, and on `token root` and `token exchange`. |
 | `--upstream` | MCP upstream name. Required. (`--server` after `call` is a deprecated spelling.) |
 | `--tool` | Tool name. Required. |
 | `--arg` | Tool argument. Repeatable. |
@@ -519,3 +519,23 @@ Ask the decision endpoint whether the token's chain may make a call, without mak
 | `--upstream` | `github` | MCP upstream name. (`--server` after `authzen eval` is a deprecated spelling.) |
 | `--tool` | | Tool name. Required. |
 | `--arg` | | Tool argument. Repeatable. |
+
+### `authzen search`
+
+List the tools of one MCP upstream that the token's chain may call with these arguments, without calling them: AuthZEN action search, `POST /access/v1/search/action` ([AuthZEN conformance](authzen.md#action-search)). The candidates are the tools the server's `[policy] catalog` lists for the upstream. A search writes no audit record, charges no run limit and takes no approval, so an approval-gated tool is never listed.
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--token <JWT\|->` (`ATTENUO_TOKEN`) | | Delegation token, sent as the bearer; `-` reads it from stdin. Or `--token-file PATH`. |
+| `--dpop-key PATH` (`ATTENUO_DPOP_KEY`) | | The DPoP key a bound token needs. |
+| `--upstream` | `github` | MCP upstream name. |
+| `--arg` | | Argument every candidate is decided with, as `context.input`. Repeatable. |
+| `--limit N` | the server's `[authzen] max_batch` | How many catalogued tools one page evaluates (at least 1; a larger value is clamped by the server). A page can list fewer tools, even none, while more pages remain. |
+| `--page-token TOKEN` | | Ask for the page after the one that printed this token. |
+| `--all` | | Follow the pages to the last one and print every result. Not with `--page-token`. |
+
+It prints one `<upstream>/<tool>` per line, then `next page: --page-token <token>` while more pages remain; `--json` prints `{"page": {"next_token", "count"}, "results"}` in the server's shape, with every page's results under `--all`. The exit status is 0 whether or not a tool is listed; a refused request (a bad token, `--upstream` naming one tool, a token the server did not issue) is 1.
+
+```sh
+attenuo authzen search --upstream github --arg repo=alice/public-docs --all
+```
