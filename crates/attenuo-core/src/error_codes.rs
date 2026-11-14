@@ -190,7 +190,7 @@ pub const ERROR_CODES: &[ErrorCode] = &[
     e("invalid_capability", &[r(400, "invalid_grant"), r(400, "invalid_scope")], NO_RPC, "A requested capability is not one a call can have: a server or tool name that breaks the naming rules, or a malformed limit (sent with `error` `invalid_grant`); or a shorthand that is not `server:tool` (a form `scope` at `POST /token`, `capabilities` at `POST /admin/root-token`; sent with `error` `invalid_scope`)."),
     e("invalid_chain", &[r(400, "invalid_chain"), r(400, "invalid_request")], NO_RPC, "The chain in the body does not validate (`POST /admin/policies/evaluate`, or a PEP's unsigned chain at AuthZEN, sent with `error` `invalid_request`)."),
     e("invalid_client", BAD_CLIENT, NO_RPC, "Client authentication failed."),
-    e("invalid_cursor", &[r(400, "invalid_cursor")], NO_RPC, "The paging cursor (or an AuthZEN search's `page.token`) is malformed or belongs to another list or order."),
+    e("invalid_cursor", &[r(400, "invalid_cursor")], NO_RPC, "The paging cursor (or an AuthZEN search's `page.token`) is malformed or belongs to another list, order or query."),
     e("invalid_dpop_proof", &[r(401, "invalid_dpop_proof")], &[j(UNAUTHORIZED, 401)], "The DPoP proof does not verify, is replayed, or is for another key, method or URL."),
     e("invalid_grant", BAD_GRANT, NO_RPC, "The grant (subject token, lease, credential) is not valid."),
     e("invalid_host", &[r(400, "invalid_host")], NO_RPC, "The `Host` header is not a loopback name and `[server] public_url` is unset."),

@@ -252,16 +252,20 @@ pub const SEARCH_ACTION_PATH: &str = "/access/v1/search/action";
 ///   is how many candidates one page evaluates, so a page holds at most that many results and
 ///   may hold fewer, even none, while more remain. `page.next_token` is the token of the next
 ///   page, or `""` after the last; `page.count` is the number of results in this answer.
-///   `page.token` sends it back. The token is an opaque position ([`super::page`]); a request
-///   whose other members changed between pages is not detected and simply continues at that
-///   position.
+///   `page.token` sends it back, with the same `subject`, `resource` and `context`: the token
+///   is an opaque position bound to digests of the chain, the server and the `context` it was
+///   issued for ([`super::page::SearchBinding`]), and one sent with a request whose chain,
+///   server or `context` differs is 400 `invalid_cursor`. `page.limit` may change between
+///   pages, and a policy or catalog reload between pages is not detected (8.2 allows repeats
+///   or skips then).
 ///
 /// # Errors
 ///
 /// 400 `invalid_request` for a body that is not a JSON object or whose `subject` or `resource`
 /// is malformed (as for evaluation); 400 `invalid_page` for a `page` that is not an object, a
 /// `page.token` that is not a string or a `page.limit` that is not a positive integer; 400
-/// `invalid_cursor` for a `page.token` this route did not issue; 400 `invalid_search_resource`
+/// `invalid_cursor` for a `page.token` this route did not issue or issued for another chain,
+/// server or `context`; 400 `invalid_search_resource`
 /// when the resource names no server; 400 `approval_token_not_accepted`; 429 `rate_limited`
 /// over `[limits] authzen_search_requests_per_minute`; and the 401 and 403 of
 /// authentication, as for evaluation.
@@ -279,10 +283,11 @@ pub async fn search_action(
         .map_err(|e| with_challenge(e.into_response()))
 }
 
-/// The `page` of a search request: where to start in the candidate list and how many
-/// candidates to evaluate.
+/// The `page` of a search request: where to start in the candidate list (a token not yet
+/// checked against the request, or none for the first page) and how many candidates to
+/// evaluate.
 struct SearchPage {
-    start: usize,
+    token: Option<super::page::SearchCursor>,
     limit: usize,
 }
 
@@ -294,7 +299,7 @@ impl SearchPage {
         let page = match page {
             None | Some(Value::Null) => {
                 return Ok(Self {
-                    start: 0,
+                    token: None,
                     limit: max,
                 })
             }
@@ -318,14 +323,19 @@ impl SearchPage {
         // AuthZEN's end-of-results token is the empty string; a client that sends it back is
         // asking for the first page again, which is what leaving it out does.
         let token = token.filter(|t| !t.is_empty());
-        let start = super::page::decode_named(
-            "page.token",
-            token,
-            super::page::List::ActionSearch,
-            super::page::Direction::Ascending,
-        )?
-        .map_or(0, |p| usize::try_from(p).unwrap_or(usize::MAX));
-        Ok(Self { start, limit })
+        // Its shape is checked now, before authentication, as the other members of `page`;
+        // whether it belongs to this request once the chain is known (`start`).
+        let token = super::page::decode_search("page.token", token)?;
+        Ok(Self { token, limit })
+    }
+
+    /// The index of the first candidate of this page: 0 without a token, else the token's
+    /// position once it is checked to have been issued for `binding`.
+    fn start(&self, binding: &super::page::SearchBinding) -> Result<usize, ApiError> {
+        match &self.token {
+            None => Ok(0),
+            Some(t) => Ok(usize::try_from(t.position_for(binding)?).unwrap_or(usize::MAX)),
+        }
     }
 }
 
@@ -405,6 +415,10 @@ fn search_actions(state: &AppState, headers: &HeaderMap, body: &Bytes) -> Result
         )
         .with_code("approval_token_not_accepted"));
     }
+    // AuthZEN 1.0 section 8.2: a token sent with another query is refused. The binding is
+    // recomputed from this request, so a token only ever continues the query it came from.
+    let binding = super::page::SearchBinding::new(&a.chain, &server, a.req.context.as_ref());
+    let page_start = page.start(&binding)?;
 
     let engine = state.pipeline.policy_snapshot();
     // Only the catalogued tools the chain's capabilities could permit, the proxy's `tools/list`
@@ -420,7 +434,7 @@ fn search_actions(state: &AppState, headers: &HeaderMap, body: &Bytes) -> Result
             caps.is_some_and(|c| attenuo_proxy::filter::could_permit_tool(c, &server, tool))
         })
         .collect();
-    let start = page.start.min(candidates.len());
+    let start = page_start.min(candidates.len());
     let end = start.saturating_add(page.limit).min(candidates.len());
     let window = &candidates[start..end];
     let allowed = state
@@ -433,11 +447,7 @@ fn search_actions(state: &AppState, headers: &HeaderMap, body: &Bytes) -> Result
         .map(|(tool, _)| json!({ "name": tool, "properties": { "server": server } }))
         .collect();
     let next_token = if end < candidates.len() {
-        super::page::encode(
-            super::page::List::ActionSearch,
-            super::page::Direction::Ascending,
-            end as u64,
-        )
+        super::page::encode_search(end as u64, &binding)
     } else {
         String::new()
     };
