@@ -111,6 +111,7 @@
   - [Security review, pass 12](research/security-review-2026-11-13-pass12.md)
   - [Security review, pass 13](research/security-review-2026-11-13-pass13.md)
   - [Security review, pass 14](research/security-review-2026-11-14-pass14.md)
+  - [Security review, pass 15](research/security-review-2026-11-14-pass15.md)
 - [Open-source project practices](research/oss-project-practices.md)
 - [Secret scan of the full history, 2026-11-05](research/secret-scan-2026-11-05.md)
 - [CI minutes, 2026-11-05](research/ci-minutes-2026-11-05.md)

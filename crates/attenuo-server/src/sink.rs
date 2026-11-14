@@ -956,7 +956,8 @@ impl S3Deliver {
     ///
     /// # Errors
     ///
-    /// The HTTP client cannot be built.
+    /// The HTTP client cannot be built, or `endpoint` is not a base URL with a host as the
+    /// URL parser reads it (`check_s3_endpoint`).
     pub fn new(
         endpoint: String,
         bucket: String,
@@ -965,6 +966,7 @@ impl S3Deliver {
         creds: S3Credentials,
         timeout: Duration,
     ) -> anyhow::Result<Self> {
+        check_s3_endpoint(&endpoint).map_err(|e| anyhow::anyhow!("S3 endpoint {e}"))?;
         let client = reqwest::Client::builder()
             .timeout(timeout)
             .redirect(reqwest::redirect::Policy::none())
@@ -1079,6 +1081,38 @@ fn s3_put_headers(
         headers.push(("x-amz-security-token".to_string(), t.to_string()));
     }
     headers
+}
+
+/// Is `endpoint` an S3 base URL as the HTTP client reads it (SR-119)? It must parse, have a
+/// host, and have no path (`/` at most), query or fragment. Without a host, the request URL
+/// `<endpoint>/<bucket>/<key>` is `http:///<bucket>/<key>`, which the URL parser reads with
+/// the bucket as its host. A backslash, whitespace or a control character is refused: the
+/// parser reads `\` as `/` and drops tabs and line breaks.
+///
+/// # Errors
+///
+/// A message, after the endpoint (callers name it), saying what is wrong.
+pub(crate) fn check_s3_endpoint(endpoint: &str) -> Result<(), String> {
+    // The parser reads `\` as `/` and drops tabs and line breaks, so the string the request
+    // URL is built from would not be the URL sent (as for `derive = "host"`, SR-56).
+    if endpoint
+        .chars()
+        .any(|c| c == '\\' || c.is_whitespace() || c.is_control())
+    {
+        return Err("holds a backslash, whitespace or a control character".into());
+    }
+    let url = reqwest::Url::parse(endpoint).map_err(|e| format!("is not a URL ({e})"))?;
+    if url.host_str().is_none_or(str::is_empty) {
+        return Err("has no host".into());
+    }
+    if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
+        return Err(format!(
+            "must be a base URL without a path, query or fragment (the HTTP client reads it as \
+             path {:?}; requests are path-style: <endpoint>/<bucket>/<key>)",
+            url.path()
+        ));
+    }
+    Ok(())
 }
 
 /// The `host` header value SigV4 signs for `endpoint`: what the HTTP client sends, so the
@@ -1743,9 +1777,66 @@ mod tests {
             .contains("without a path"));
         s3.endpoint = Some("http://127.0.0.1:9000".into());
         s3.validate().unwrap();
+        for ok in [
+            "http://127.0.0.1:9000/",
+            "https://s3.eu-west-1.amazonaws.com",
+            "http://[::1]:9000",
+            "https://S3.Example.com:443",
+        ] {
+            s3.endpoint = Some(ok.into());
+            s3.validate().unwrap_or_else(|e| panic!("{ok}: {e}"));
+        }
         let mut f = SinkSection::new(SinkKind::File);
         f.path = Some("/x".into());
         f.queue_capacity = 0;
         assert!(f.validate().is_err());
+    }
+
+    /// SR-119: an endpoint the URL parser reads with no host (`http://`), or with a path the
+    /// string check missed (a backslash, which WHATWG reads as `/`), is refused at start. With
+    /// `http://` the request URL `http:///<bucket>/<key>` parses with the bucket as its host,
+    /// so the PUT, its signature and any session token went to whatever the bucket names, and
+    /// the signed host (`""`) was not the one sent.
+    #[test]
+    fn an_s3_endpoint_the_url_parser_reads_differently_is_refused_sr119() {
+        // What the parser does with the request URL such an endpoint makes.
+        let u = reqwest::Url::parse("http:///evil.example/attenuo/checkpoints/k.json").unwrap();
+        assert_eq!(u.host_str(), Some("evil.example"));
+        let mut s3 = SinkSection::new(SinkKind::S3);
+        s3.bucket = Some("evil.example".into());
+        for bad in [
+            "http://",
+            "https://",
+            "http:///",
+            "http://minio:9000\\evil",
+            "https://s3.example\\",
+            "http://minio:9000\t",
+        ] {
+            s3.endpoint = Some(bad.into());
+            let e = s3.validate().unwrap_err().to_string();
+            assert!(e.contains("[audit.sink] endpoint"), "{bad}: {e}");
+        }
+        for bad in ["http://", "https://minio:9000\\evil"] {
+            let e = S3Deliver::new(
+                bad.into(),
+                "evil.example".into(),
+                "us-east-1".into(),
+                "p/".into(),
+                example_creds(),
+                Duration::from_secs(1),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(e.contains("endpoint"), "{bad}: {e}");
+        }
+        S3Deliver::new(
+            "http://127.0.0.1:9000/".into(),
+            "b".into(),
+            "us-east-1".into(),
+            "p/".into(),
+            example_creds(),
+            Duration::from_secs(1),
+        )
+        .unwrap();
     }
 }

@@ -8,6 +8,8 @@ use reqwest::{RequestBuilder, StatusCode};
 use serde_json::{json, Value};
 use std::sync::Mutex;
 
+use crate::render::escape_controls;
+
 /// Present `token` with a DPoP proof by `key` for `method` and `url` (RFC 9449 §7.1:
 /// `Authorization: DPoP <token>` and a `DPoP` header whose `ath` covers the token), or as a
 /// plain bearer without a key.
@@ -387,7 +389,9 @@ impl Client {
             .filter(|v| status.is_success() || v.get("jsonrpc").is_some())
         {
             Some(v) => Ok(v),
-            None if status.is_success() => bail!("no JSON-RPC response in body: {text}"),
+            None if status.is_success() => {
+                bail!("no JSON-RPC response in body: {}", escape_controls(&text))
+            }
             None => Err(api_error(status, &text)),
         }
     }
@@ -402,8 +406,12 @@ fn json_reply(reply: Reply) -> Result<Value> {
         ..
     } = reply;
     if status.is_success() {
-        return serde_json::from_str(&text)
-            .with_context(|| format!("server sent non-JSON ({status}): {text}"));
+        return serde_json::from_str(&text).with_context(|| {
+            format!(
+                "server sent non-JSON ({status}): {}",
+                escape_controls(&text)
+            )
+        });
     }
     let err = api_error(status, &text);
     Err(if admin_hint {
@@ -515,7 +523,8 @@ pub(crate) fn refuse_redirect(resp: &reqwest::Response, flag: &str) -> Result<()
 }
 
 /// A server error as `{"error": error, "code": code, "detail": text}`, or the raw body when it
-/// is not that.
+/// is not that, with control characters escaped in the text (SR-118); [`ApiError`]'s `code`
+/// and `detail` keep the values as sent.
 pub(crate) fn api_error(status: StatusCode, body: &str) -> anyhow::Error {
     let mut detail = None;
     let (code, message) = match serde_json::from_str::<Value>(body) {
@@ -528,24 +537,30 @@ pub(crate) fn api_error(status: StatusCode, body: &str) -> anyhow::Error {
             let shown_code = if code == error || Some(code.as_str()) == v["detail"].as_str() {
                 String::new()
             } else {
-                format!(" ({code})")
+                format!(" ({})", escape_controls(&code))
             };
-            // A refusal the server audited (a refused token exchange) names its record.
+            // A refusal the server audited (a refused token exchange) names its record. Every
+            // string of the body is the answerer's, and an upstream MCP server's when the
+            // proxy relays its error body: escaped, so none can drive the terminal (SR-118).
             let message = format!(
-                "server answered {status}: {error}{shown_code}{}{}",
+                "server answered {status}: {}{shown_code}{}{}",
+                escape_controls(error),
                 v["detail"]
                     .as_str()
-                    .map(|d| format!(": {d}"))
+                    .map(|d| format!(": {}", escape_controls(d)))
                     .unwrap_or_default(),
                 v["decision_id"]
                     .as_str()
-                    .map(|id| format!("\ndecision {id}"))
+                    .map(|id| format!("\ndecision {}", escape_controls(id)))
                     .unwrap_or_default()
             );
             (Some(code), message)
         }
         _ if body.trim().is_empty() => (None, format!("server answered {status}")),
-        _ => (None, format!("server answered {status}: {}", body.trim())),
+        _ => (
+            None,
+            format!("server answered {status}: {}", escape_controls(body.trim())),
+        ),
     };
     anyhow::Error::new(ApiError {
         status,
@@ -677,6 +692,41 @@ mod tests {
             text(StatusCode::BAD_REQUEST, r#"{"code":"replayed"}"#),
             r#"server answered 400 Bad Request: {"code":"replayed"}"#
         );
+    }
+
+    /// Whoever answers at the server URL (or an upstream MCP server whose error body the proxy
+    /// relays with its status) chooses every string of a refusal: none of them reaches the
+    /// terminal with a control character in it (SR-118). The CLI's own line break before
+    /// `decision` is the only one left.
+    #[test]
+    fn api_error_escapes_control_characters_sr118() {
+        let text = |status, body| api_error(status, body).to_string();
+        let shown = text(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":"invalid_grant\u001b[2J","code":"replayed\u001b]52;c;aGk=\u0007",
+                "detail":"used\nerror: FORGED\r\u009b31m","decision_id":"d-1\u001b[8m"}"#,
+        );
+        assert_eq!(
+            shown,
+            "server answered 400 Bad Request: invalid_grant\\u{1b}[2J \
+             (replayed\\u{1b}]52;c;aGk=\\u{7}): used\\nerror: FORGED\\r\\u{9b}31m\n\
+             decision d-1\\u{1b}[8m"
+        );
+        assert_eq!(shown.matches('\n').count(), 1, "{shown:?}");
+        assert!(!shown.replace('\n', "").chars().any(char::is_control));
+        // A body that is not an error object, printed as it came, is escaped too.
+        let raw = text(StatusCode::BAD_GATEWAY, "\u{1b}[31mbad gateway\n\u{7}");
+        assert_eq!(
+            raw,
+            "server answered 502 Bad Gateway: \\u{1b}[31mbad gateway\\n\\u{7}"
+        );
+        // The machine fields keep the server's values: a caller compares them, nothing prints them.
+        let e = api_error(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":"x","code":"a\u001bb"}"#,
+        );
+        let api = e.downcast_ref::<ApiError>().unwrap();
+        assert_eq!(api.code.as_deref(), Some("a\u{1b}b"));
     }
 
     #[test]

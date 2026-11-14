@@ -31,11 +31,23 @@ fn fmt_span(secs: u64) -> String {
 }
 
 /// `s` with its control characters escaped (`\u{1b}`) and everything else as it is, for text
-/// that a child or a caller chose and a terminal would otherwise act on (SR-59, SR-72).
-fn escape_controls(s: &str) -> String {
+/// that a child or a caller chose and a terminal would otherwise act on (SR-59, SR-72), and for
+/// what the server, or an upstream MCP server through the proxy, sends to be printed (SR-118).
+pub(crate) fn escape_controls(s: &str) -> String {
+    escape_controls_but(s, &[])
+}
+
+/// As [`escape_controls`], but line feeds and tabs are kept, for text that may run over several
+/// lines, such as a tool's output or description (SR-118). A carriage return is escaped: it
+/// would let a line overwrite itself.
+pub(crate) fn escape_controls_keep_lines(s: &str) -> String {
+    escape_controls_but(s, &['\n', '\t'])
+}
+
+fn escape_controls_but(s: &str, keep: &[char]) -> String {
     s.chars()
         .map(|c| {
-            if c.is_control() {
+            if c.is_control() && !keep.contains(&c) {
                 c.escape_default().collect()
             } else {
                 c.to_string()

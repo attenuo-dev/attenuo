@@ -30,7 +30,7 @@
 # Not part of CI. Needs docker (the daemon running), curl, openssl and python3; the Python
 # SDK step needs httpx. A step whose tool is missing is reported as skipped, and the script
 # then exits non-zero. Skips with exit status 0 when docker is not available. The admin token,
-# the join token and the CA key are random per run and stay in the temp dir. Network use: the
+# the join token and the CA key are random per run and stay in the temp dir (mode 0700). Network use: the
 # image pull and the SPIRE release download (skipped with SPIRE_BIN_DIR).
 #
 # Environment:
@@ -61,8 +61,11 @@ if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
   exit 0
 fi
 
+# mktemp's 0700: the admin token, the attenuo configs and the CA keys at the top are this
+# user's alone. Only conf/ and bin/ are mounted into the container, and they are 0755 for a
+# container user that is not this one (user namespace remapping); the mounts do not need the
+# top directory to be readable, so other local users cannot reach them either (SR-120).
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/attenuo-spire-smoke.XXXXXX")"
-chmod 755 "$WORK"   # mounted read-only into the container
 CONTAINER="attenuo-spire-smoke-$$"
 PIDS=()
 SKIPPED=()
@@ -150,7 +153,7 @@ cat "$WORK/be.pem" "$WORK/ca.pem" > "$WORK/conf/be-chain.pem"
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 1 \
   -keyout "$WORK/other-ca.key" -out "$WORK/other-ca.pem" -subj "/CN=attenuo spire smoke other CA" \
   -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign" 2>/dev/null
-chmod 644 "$WORK/conf/be.key"   # read by the container's root only; the dir is the run's
+chmod 644 "$WORK/conf/be.key"   # for the container's user; $WORK (0700) keeps others out
 
 cat > "$WORK/conf/server.conf" <<EOF
 server {
