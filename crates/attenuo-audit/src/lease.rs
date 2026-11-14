@@ -877,7 +877,9 @@ impl MemoryLeaseStore {
         match subjects.get(lease) {
             Some(s)
                 if s == subject
-                    && (issuer.is_none() || issuers.get(lease).map(String::as_str) == issuer) =>
+                    && (issuer.is_none()
+                        || !issuers.contains_key(lease)
+                        || issuers.get(lease).map(String::as_str) == issuer) =>
             {
                 Ok(())
             }

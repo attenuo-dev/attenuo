@@ -599,7 +599,8 @@ fn subjects_are_write_once_and_only_for_known_leases() {
 
 /// `record_originating_user` keeps the issuer with the subject, write-once: the same pair
 /// again is a no-op, another subject or issuer a conflict, and a lease whose subject was
-/// recorded without an issuer has no originating user and is never given one.
+/// recorded without an issuer has no originating user and is never given one (the same
+/// subject with an issuer is accepted, and changes nothing).
 #[test]
 fn originating_users_are_write_once_and_need_an_issuer() {
     for (name, store) in stores() {
@@ -632,14 +633,19 @@ fn originating_users_are_write_once_and_need_an_issuer() {
         // A subject without an issuer (a lease from before issuers were kept).
         store.record_subject(&id("b"), "alice").unwrap();
         assert_eq!(store.originating_user(&id("b")).unwrap(), None, "{name}");
+        // Registering it again with an issuer is accepted and fills nothing in; another
+        // subject is still a conflict.
+        store
+            .record_originating_user(&id("b"), "https://idp.example", "alice")
+            .unwrap();
+        assert_eq!(store.originating_user(&id("b")).unwrap(), None, "{name}");
         assert!(
             matches!(
-                store.record_originating_user(&id("b"), "https://idp.example", "alice"),
+                store.record_originating_user(&id("b"), "https://idp.example", "bob"),
                 Err(AuditError::BindingConflict(_))
             ),
             "{name}"
         );
-        assert_eq!(store.originating_user(&id("b")).unwrap(), None, "{name}");
         assert!(matches!(
             store.record_originating_user(&id("ghost"), "https://idp.example", "alice"),
             Err(AuditError::UnknownLease(_))

@@ -618,7 +618,12 @@ impl SqliteLeaseStore {
             .query_row([&lease.0], |row| Ok((row.get(0)?, row.get(1)?)))
             .optional()?;
         match recorded {
-            Some((s, i)) if s == subject && (issuer.is_none() || i.as_deref() == issuer) => {}
+            // A row without an issuer is a lease from before issuers were kept: the same subject
+            // is accepted and the row is left as it is (never filled in), so re-registering
+            // such a lease after an upgrade is not a conflict.
+            Some((s, i))
+                if s == subject
+                    && (issuer.is_none() || i.is_none() || i.as_deref() == issuer) => {}
             Some(_) => return Err(AuditError::BindingConflict(lease.0.clone())),
             None => {
                 tx.prepare_cached(

@@ -166,9 +166,10 @@ pub trait LeaseRegistry: Send + Sync {
     /// `issuer`, in one write. Per-user windows are keyed by issuer and subject
     /// ([`crate::window`]), so a lease recorded this way lets the admin lease tree find its
     /// run's windows ([`originating_user`](Self::originating_user)). Write-once: the same
-    /// pair again is a no-op; a different subject, or an issuer other than the one recorded
-    /// (none counts as other), is an error. The default records the subject only, for a
-    /// store that keeps no issuers.
+    /// pair again is a no-op; a different subject, or an issuer other than the one recorded,
+    /// is an error. A lease whose subject was recorded without an issuer (before issuers were
+    /// kept) accepts the same subject and stays without one. The default records the subject
+    /// only, for a store that keeps no issuers.
     ///
     /// # Errors
     ///
