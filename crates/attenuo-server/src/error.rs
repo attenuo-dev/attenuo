@@ -383,12 +383,20 @@ pub const LIMIT_SPLIT_AT_ROOT: &str = "limit_split_at_root";
 pub const TOO_MANY_CAPABILITIES: &str = "too_many_capabilities";
 /// `code` of a request with a `one_of` longer than [`attenuo_core::MAX_ONE_OF_VALUES`] (SR-123).
 pub const ONE_OF_TOO_LONG: &str = "one_of_too_long";
+/// `code` of a request with more argument constraints, over all its capabilities, than
+/// [`attenuo_core::MAX_CONSTRAINTS`] (SR-123).
+pub const TOO_MANY_CONSTRAINTS: &str = "too_many_constraints";
+/// `code` of a request with more `one_of` values, over all its capabilities, than
+/// [`attenuo_core::MAX_ONE_OF_VALUES_TOTAL`] (SR-123).
+pub const TOO_MANY_ONE_OF_VALUES: &str = "too_many_one_of_values";
 
 /// The `code` of a request refused for its size.
 pub(crate) fn size_code(e: &attenuo_core::SizeError) -> &'static str {
     match e {
         attenuo_core::SizeError::TooManyCapabilities { .. } => TOO_MANY_CAPABILITIES,
         attenuo_core::SizeError::OneOfTooLong { .. } => ONE_OF_TOO_LONG,
+        attenuo_core::SizeError::TooManyConstraints { .. } => TOO_MANY_CONSTRAINTS,
+        attenuo_core::SizeError::TooManyOneOfValues { .. } => TOO_MANY_ONE_OF_VALUES,
     }
 }
 

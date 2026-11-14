@@ -1361,12 +1361,91 @@ async fn requests_are_bounded_in_size_sr123() {
     assert_eq!(got.0, StatusCode::OK, "{}", got.1);
 }
 
-/// SR-123 at start: a `[[root_grants]]` entry over either bound does not start.
+/// `n` capabilities on the bank server with two constraints each.
+fn two_each(n: usize) -> Value {
+    (0..n)
+        .map(|i| {
+            json!({"server": "bank", "tool": "get_balance",
+                   "constraints": {"account": {"op": "equals", "value": i},
+                                   "currency": {"op": "equals", "value": "EUR"}}})
+        })
+        .collect()
+}
+
+/// `get_balance` and `get_history`, each with a `one_of` of `n` accounts.
+fn two_lists(n: usize) -> Value {
+    let values: Vec<usize> = (0..n).collect();
+    json!([{"server": "bank", "tool": "get_balance",
+            "constraints": {"account": {"op": "one_of", "value": values}}},
+           {"server": "bank", "tool": "get_history",
+            "constraints": {"account": {"op": "one_of", "value": values}}}])
+}
+
+/// SR-123, the rest: a request also holds at most 1,024 argument constraints and 1,024
+/// `one_of` values over all its capabilities, since attenuation costs each of those times the
+/// parent's capabilities. At `POST /admin/root-token` (with and without `[[root_grants]]`)
+/// and at an exchange.
+#[tokio::test]
+async fn requests_are_bounded_in_total_constraints_and_values_sr123() {
+    let refused = |got: &(StatusCode, Value), code: &str| {
+        assert_eq!(got.0, StatusCode::BAD_REQUEST, "{}", got.1);
+        assert_eq!(got.1["error"], "invalid_scope", "{}", got.1);
+        assert_eq!(got.1["code"], code, "{}", got.1);
+    };
+    for h in [
+        Harness::start().await,
+        with_root_grant(json!(["bank:*"])).await,
+    ] {
+        refused(
+            &h.try_mint_root(two_each(513)).await,
+            "too_many_constraints",
+        );
+        refused(
+            &h.try_mint_root(two_lists(513)).await,
+            "too_many_one_of_values",
+        );
+        h.mint_root(two_each(512)).await;
+        h.mint_root(two_lists(512)).await;
+    }
+    let h = Harness::start().await;
+    let root = h.mint_root(json!(["bank:*"])).await;
+    for (caps, actor, code) in [
+        (two_each(513), "helper", Some("too_many_constraints")),
+        (two_lists(513), "helper", Some("too_many_one_of_values")),
+        (two_each(512), "helper", None),
+        (two_lists(512), "helper2", None),
+    ] {
+        let resp = h
+            .client
+            .post(h.server.url("/token"))
+            .json(&json!({
+                "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+                "subject_token": root.token,
+                "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+                "actor": actor,
+                "authorization_details": [{"type": "attenuo_capabilities", "capabilities": caps}],
+                "client_id": actor,
+                "client_secret": secret(actor),
+            }))
+            .send()
+            .await
+            .unwrap();
+        let got = (resp.status(), resp.json::<Value>().await.unwrap());
+        match code {
+            Some(code) => refused(&got, code),
+            None => assert_eq!(got.0, StatusCode::OK, "{}", got.1),
+        }
+    }
+}
+
+/// SR-123 at start: a `[[root_grants]]` entry over any bound does not start.
 #[test]
 fn a_root_grant_over_the_bounds_does_not_start_sr123() {
     for (caps, says) in [
         (many(1025), "1025 capabilities"),
         (one_of(1025), "1025 values"),
+        (two_each(513), "1026 argument constraints"),
+        (two_lists(513), "1026 `one_of` values"),
     ] {
         let mut cfg = Config::default();
         cfg.issuer.issuer = "https://attenuo.test".into();

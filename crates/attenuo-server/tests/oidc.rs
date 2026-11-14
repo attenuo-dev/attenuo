@@ -1956,6 +1956,26 @@ async fn an_intake_request_is_bounded_in_size_sr123() {
         "invalid_scope",
         "one_of_too_long",
     );
+    // Two lists of 513 values: each within the per-list bound, 1,026 values together.
+    let values: Vec<usize> = (0..513).collect();
+    let two = json!([{"type": "attenuo_capabilities", "capabilities": [
+        {"server": "github", "tool": "read_file", "constraints":
+            {"repo": {"op": "one_of", "value": values}}},
+        {"server": "github", "tool": "list_issues", "constraints":
+            {"repo": {"op": "one_of", "value": values}}}]}])
+    .to_string();
+    let got = present(
+        &h,
+        &jag_with(&h, json!({})),
+        ("authorization_details", &two),
+    )
+    .await;
+    assert_error(
+        &got,
+        StatusCode::BAD_REQUEST,
+        "invalid_scope",
+        "too_many_one_of_values",
+    );
     let got = present(
         &h,
         &jag_with(&h, json!({})),

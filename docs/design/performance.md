@@ -80,6 +80,28 @@ Quoted earlier, unrecorded (2026-10-22): covered 34.3 ns, 449 ns and 4.91 us; re
 
 Reading: a successful check is quadratic in the number of capabilities (each child capability scans the parent set), going from 36 ns to 5.1 us between 1 and 32. That is `O(n * m)` by design (see `CapabilitySet::covers`): the conservative single-parent coverage rule keeps it simple and explainable. It is small next to an uncached policy decision (5.1 us against about 120 us) at realistic set sizes, and it runs once per exchange, not once per call.
 
+### Large requests (SR-123)
+
+The rule is still one covering parent per child capability, but a large check no longer costs the product of the two sides ([security review pass 16](../research/security-review-2026-11-14-pass16.md#sr-123-the-attenuation-against-the-ceiling-was-unbounded-low-fixed)). When a `one_of` list or a set is larger than a few entries, a `one_of` parent is read into a hash set of canonical keys (the JCS bytes of each value, equal exactly when `value_eq` says the values are equal), and each child value is looked up once; a `prefix`, `path_prefix` or `range` parent is checked against a summary of the child's list (the longest common prefix, the common path segments, the least and greatest integer), computed once. Each requested capability is checked against the parents once, not once per pass. Small sets (at most 8 capabilities and 64 pairs, lists of at most 8 values) keep the pairwise code, which is faster there. Reading a set builds it in one sort instead of a `BTreeSet` insertion per capability. A request, a token hop, `[[root_grants]]` and `scopes` hold at most 1,024 capabilities, 1,024 argument constraints, 1,024 values in one `one_of` and 1,024 `one_of` values in all, so the shapes that still cost a product of capability counts (many parents each holding constraints the child must be compared with) stay small.
+
+Measured 2026-11-14, release build, before and after the change ([`criterion-attenuation-sr123`](bench/2026-11-14-vm-criterion-attenuation-sr123.txt); shared 4 vCPU container):
+
+| Case (`bounds/`) | Before | After |
+|---|---|---|
+| `one_of_implies_1024x1024` | 25.6 ms | 0.19 ms |
+| `attenuate_1024_by_1024` | 7.8 ms | 5.0 ms |
+| `one_of_request_vs_parents/1` | 49.7 ms | 0.19 ms |
+| `one_of_request_vs_parents/400` (over the new bounds) | 19.8 s | 60 to 80 ms |
+| `within_bounds_1024_by_1024/equals` | 34.7 ms | 20.8 ms |
+| `within_bounds_1024_by_1024/one_of_of_one` | 39.5 ms | 29.3 ms |
+| `within_bounds_1024_by_1024/equals_600_byte_arrays` | 7.83 s | 50.6 ms |
+| `within_bounds_1024_by_1024/path_prefix` | 230 ms | 30.4 ms |
+| `within_bounds_512_by_512/two_constraints` | 1.79 s | 28.2 ms |
+| `within_bounds_32_by_32/one_of_32` | 24.6 ms | 0.45 ms |
+| `read_400_lists_of_1024` (parse and refuse) | 738 ms | 73 ms |
+
+The small checks above moved by 20 to 120 ns (`covered/1` 44 to 64 ns, `rejected_widening/8` 92 to 211 ns, `covered/32` 6.97 to 6.51 us), and the decide stages did not move beyond noise. The answers are the same: the pairwise code is kept as the oracle of property tests over adversarial JSON (Unicode forms, escapes, `1` against `1.0`, member order, nested arrays and objects), and a test counts the key lookups of an attenuation, which are linear in the lists.
+
 ## End to end: proxy versus direct
 
 Harness: `crates/attenuo-bench` (binary `attenuo-bench`), driven by `scripts/bench-e2e.sh`. Raw results are committed in [`bench/`](bench/) as `<date>-<host>.json` (every number below, plus the metadata) and `.md` (the tables with the hardware).

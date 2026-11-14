@@ -27,9 +27,9 @@ pub enum AttenuationError {
         /// The other.
         second: String,
     },
-    /// The requested set is larger than [`crate::capability::MAX_CAPABILITIES`] or holds a
-    /// `one_of` longer than [`crate::capability::MAX_ONE_OF_VALUES`] (SR-123). Checked before
-    /// anything is compared, since attenuation costs the product of both sides' sizes.
+    /// The requested set is over a bound of [`crate::capability::CapabilitySet::validate_size`]
+    /// (SR-123). Checked before anything is compared, since attenuation costs the product of
+    /// both sides' sizes.
     #[error(transparent)]
     TooLarge(#[from] SizeError),
 }
@@ -53,6 +53,24 @@ pub enum SizeError {
         /// The constrained argument.
         arg: String,
         /// How many values the list holds.
+        count: usize,
+        /// The bound.
+        max: usize,
+    },
+    /// More argument constraints, over all the capabilities, than
+    /// [`crate::capability::MAX_CONSTRAINTS`].
+    #[error("{count} argument constraints requested over all capabilities; one request or token holds at most {max}")]
+    TooManyConstraints {
+        /// How many the set holds.
+        count: usize,
+        /// The bound.
+        max: usize,
+    },
+    /// More `one_of` values, over all the capabilities, than
+    /// [`crate::capability::MAX_ONE_OF_VALUES_TOTAL`].
+    #[error("{count} `one_of` values requested over all capabilities; one request or token holds at most {max}")]
+    TooManyOneOfValues {
+        /// How many the set holds.
         count: usize,
         /// The bound.
         max: usize,

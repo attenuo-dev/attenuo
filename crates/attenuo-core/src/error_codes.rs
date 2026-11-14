@@ -253,6 +253,8 @@ pub const ERROR_CODES: &[ErrorCode] = &[
     e("tenant_mismatch", BAD_GRANT, NO_RPC, "The ID-JAG's `tenant` is not the `[[idps]] tenant` of its issuer."),
     e("token_expired", &[r(401, "unauthorized"), r(400, "invalid_grant")], &[j(UNAUTHORIZED, 401), j(UNAUTHORIZED, 200)], "The token verified but has expired (a bearer, or at `POST /token` the subject token or a hop of its chain)."),
     e("too_many_capabilities", &[r(400, "invalid_scope")], NO_RPC, "A request (an exchange, a hop-0 request, `POST /admin/root-token`) asks for more than 1,024 capabilities, more than one token may hold."),
+    e("too_many_constraints", &[r(400, "invalid_scope")], NO_RPC, "A request (an exchange, a hop-0 request, `POST /admin/root-token`) has more than 1,024 argument constraints over all its capabilities."),
+    e("too_many_one_of_values", &[r(400, "invalid_scope")], NO_RPC, "A request (an exchange, a hop-0 request, `POST /admin/root-token`) has more than 1,024 `one_of` values over all its capabilities."),
     e("too_many_pending_approvals", &[r(429, "too_many_pending_approvals")], NO_RPC, "The run already has the maximum number of pending approvals."),
     e("too_many_sessions", NONE, &[j(TOO_MANY, 429)], "The principal holds `[proxy] max_sessions_per_principal` live sessions."),
     d("tool_not_in_catalog", NONE, DENY, "The tool is not in the catalog and unknown tools are denied."),
