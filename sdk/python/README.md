@@ -415,7 +415,7 @@ for d in decisions:
 
 ### AuthZEN action search
 
-`authzen_search_action` asks which tools of one MCP server the token may call with these arguments (`POST /access/v1/search/action`, AuthZEN section 8.6). The candidates are the tools the server's `[policy] catalog` lists for `server`, and a result is one an evaluation with the same token and arguments would allow now. A search is not a decision: it writes no audit record, charges no run limit and takes no approval, so an approval-gated tool is never a result. Calling the tool, or `authzen_evaluate`, still decides it.
+`authzen_search_action` asks which tools of one MCP server the token may call with these arguments (`POST /access/v1/search/action`, AuthZEN section 8.6). The candidates are the tools the server's `[policy] catalog` lists for `server` that the token's capabilities name, and a result is one an evaluation with the same token and arguments would allow now. A search is not a decision: it writes no audit record, charges no run limit and takes no approval, so an approval-gated tool is never a result. Calling the tool, or `authzen_evaluate`, still decides it.
 
 ```python
 args = {"repo": "alice/docs"}

@@ -534,7 +534,7 @@ Ask the decision endpoint whether the token's chain may make a call, without mak
 
 ### `authzen search`
 
-List the tools of one MCP upstream that the token's chain may call with these arguments, without calling them: AuthZEN action search, `POST /access/v1/search/action` ([AuthZEN conformance](authzen.md#action-search)). The candidates are the tools the server's `[policy] catalog` lists for the upstream. A search writes no audit record, charges no run limit and takes no approval, so an approval-gated tool is never listed.
+List the tools of one MCP upstream that the token's chain may call with these arguments, without calling them: AuthZEN action search, `POST /access/v1/search/action` ([AuthZEN conformance](authzen.md#action-search)). The candidates are the tools the server's `[policy] catalog` lists for the upstream that the token's capabilities name. A search writes no audit record, charges no run limit and takes no approval, so an approval-gated tool is never listed.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
