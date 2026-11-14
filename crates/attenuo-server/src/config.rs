@@ -2732,6 +2732,18 @@ pub struct RootGrant {
 }
 
 impl RootGrant {
+    /// The entry as start-up errors name it: issuer, agent and subject (or "any subject").
+    pub(crate) fn describe(&self) -> String {
+        let subject = match &self.subject {
+            Some(s) => format!("subject {s:?}"),
+            None => "any subject".to_string(),
+        };
+        format!(
+            "issuer {:?}, agent {:?}, {subject}",
+            self.issuer, self.agent
+        )
+    }
+
     /// Does this grant apply to `subject` of `issuer` acting through `agent`?
     pub fn matches(&self, issuer: &str, agent: &str, subject: &str) -> bool {
         self.issuer == issuer
@@ -2930,8 +2942,10 @@ impl Config {
     ///
     /// When a server name in `[[upstreams]]`, the catalog or a `[[root_grants]]` capability is
     /// refused by [`check_server_name`], when the catalog cannot be loaded or does not validate,
-    /// when a `[[root_grants]]` capability does not parse, or when an agent id in `[[agents]]`,
-    /// `[[peps]]` or `[[root_grants]]` is `attenuo`; the message names the section.
+    /// when a `[[root_grants]]` capability does not parse or has limits no token may carry
+    /// ([`Capability::validate_limits`]; the message names the entry by index, issuer, agent
+    /// and subject), or when an agent id in `[[agents]]`, `[[peps]]` or `[[root_grants]]` is
+    /// `attenuo`; the message names the section.
     pub fn check_server_names(&self) -> anyhow::Result<()> {
         for u in &self.upstreams {
             check_server_name(&u.name).map_err(|e| anyhow::anyhow!("[[upstreams]]: {e}"))?;
@@ -2959,7 +2973,7 @@ impl Config {
         for p in &self.peps {
             reserved_agent("[[peps]]", &p.id)?;
         }
-        for g in &self.root_grants {
+        for (index, g) in self.root_grants.iter().enumerate() {
             reserved_agent("[[root_grants]]", &g.agent)?;
             let caps = capability_set(&g.capabilities).map_err(|e| anyhow::anyhow!(e))?;
             // A request is attenuated against the grant at a cost of the product (SR-123).
@@ -2972,6 +2986,16 @@ impl Config {
                     check_server_name(&cap.server)
                         .map_err(|e| anyhow::anyhow!("[[root_grants]]: {e}"))?;
                 }
+                // The check every hop-0 mint makes (`Chain::root`): limits no token
+                // may carry would start and then fail every mint under this grant with
+                // `invalid_capability`, as `[idps.id_jag_ceiling] scopes` did (SR-125).
+                cap.validate_limits().map_err(|e| {
+                    anyhow::anyhow!(
+                        "[[root_grants]] entry {index} ({}): {e}; no token may carry it, so \
+                         every mint under this grant would fail",
+                        g.describe()
+                    )
+                })?;
             }
         }
         Ok(())

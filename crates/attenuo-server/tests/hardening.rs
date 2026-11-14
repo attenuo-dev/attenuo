@@ -753,3 +753,62 @@ fn release_workflow_actions_are_pinned_to_commits() {
         "the release build must not restore a shared cargo cache"
     );
 }
+
+/// A `[[root_grants]]` capability whose limits no token may carry refuses to start, naming the
+/// entry, the capability and the reason; it used to start and then fail every mint under the
+/// grant with `invalid_capability` (the `[[root_grants]]` follow-up of SR-125). A grant with
+/// well-formed limits still starts and mints.
+#[tokio::test]
+async fn root_grant_limits_no_token_may_carry_refuse_to_start() {
+    let grant = |subject: Option<&str>, limits: Value| RootGrant {
+        subject: subject.map(Into::into),
+        issuer: "https://idp.example".into(),
+        agent: "planner".into(),
+        capabilities: vec![CapSpec::Full(
+            serde_json::from_value(json!({"server": "github", "tool": "*", "limits": limits}))
+                .unwrap(),
+        )],
+        attributes: Default::default(),
+        may_act: None,
+    };
+    for (limits, reason) in [
+        (json!({"sum": {"arg": "", "max": 1}}), "`arg` is empty"),
+        (
+            json!({"sum": {"arg": "n", "max": 1, "derive": "host"}}),
+            "takes no `derive`",
+        ),
+    ] {
+        let mut cfg = base_config();
+        cfg.root_grants = vec![
+            grant(None, json!({"calls": 5})),
+            grant(Some("alice"), limits),
+        ];
+        let err = attenuo_server::build(&cfg)
+            .err()
+            .expect("must refuse")
+            .to_string();
+        assert!(
+            err.starts_with(
+                "[[root_grants]] entry 1 (issuer \"https://idp.example\", agent \"planner\", \
+                 subject \"alice\"): limit `sum` of capability `github:* limits="
+            ),
+            "{err}"
+        );
+        assert!(err.contains(reason), "{err}");
+        assert!(
+            err.ends_with("no token may carry it, so every mint under this grant would fail"),
+            "{err}"
+        );
+    }
+    // Well-formed limits start, and a mint under the grant succeeds.
+    let mut cfg = base_config();
+    cfg.root_grants = vec![grant(
+        None,
+        json!({"calls": 5, "sum": {"arg": "n", "max": 9}}),
+    )];
+    let server = start(&cfg).await;
+    assert_eq!(
+        mint_root(&server, "alice", "planner").await.status(),
+        StatusCode::OK
+    );
+}

@@ -87,6 +87,7 @@ Every suspected issue got a test or a reproduction against the real code; six ar
 - **Severity.** Info: a configuration mistake, failing closed, found by the first user.
 - **Fix.** `from_config` calls `validate_limits` on each `scopes` capability, so the server refuses to start, naming the scope token. `[[root_grants]]` capabilities have the same gap (their limits are checked at mint only); changing that would refuse configurations that start today, so it is left with SR-121's row.
 - **Test.** `config_is_checked` (`idp/ceiling.rs`) gained an empty `arg` and a `derive` on a `sum`. Failed before the fix.
+- **`[[root_grants]]` fixed after the pass** (this PR). `Config::check_server_names`, the start-up check of root grant capabilities, calls `validate_limits` on each, the check every hop-0 mint makes, so a root grant capability whose limits no token may carry refuses to start, naming the entry by index, issuer, agent and subject, the capability and the reason. A configuration that started before and failed at mint with `invalid_capability` now stops at start. Root grants are read at start only, so no reload path needed the check. Test `root_grant_limits_no_token_may_carry_refuse_to_start` (`tests/hardening.rs`).
 
 ### SR-126: what the ceiling was is not recorded (Info, proposed)
 
