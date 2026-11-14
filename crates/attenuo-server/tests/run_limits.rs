@@ -1282,3 +1282,109 @@ async fn an_exchange_may_split_a_limited_parent_capability_sr121() {
         "the root hop's capability bounds the total: {limit}"
     );
 }
+
+/// `n` distinct capabilities on the bank server (`get_balance` with one `account` each).
+fn many(n: usize) -> Value {
+    (0..n)
+        .map(|i| {
+            json!({"server": "bank", "tool": "get_balance",
+                   "constraints": {"account": {"op": "equals", "value": i}}})
+        })
+        .collect()
+}
+
+/// `get_balance` with a `one_of` of `n` accounts.
+fn one_of(n: usize) -> Value {
+    json!([{"server": "bank", "tool": "get_balance",
+            "constraints": {"account": {"op": "one_of", "value": (0..n).collect::<Vec<_>>()}}}])
+}
+
+/// SR-123: a request, and so a token, holds at most 1,024 capabilities and a `one_of` at most
+/// 1,024 values, at `POST /admin/root-token` (with and without `[[root_grants]]`) and at an
+/// exchange, before anything is compared.
+#[tokio::test]
+async fn requests_are_bounded_in_size_sr123() {
+    let refused = |got: &(StatusCode, Value), code: &str| {
+        assert_eq!(got.0, StatusCode::BAD_REQUEST, "{}", got.1);
+        assert_eq!(got.1["error"], "invalid_scope", "{}", got.1);
+        assert_eq!(got.1["code"], code, "{}", got.1);
+    };
+    for h in [
+        Harness::start().await,
+        with_root_grant(json!(["bank:*"])).await,
+    ] {
+        refused(&h.try_mint_root(many(1025)).await, "too_many_capabilities");
+        refused(&h.try_mint_root(one_of(1025)).await, "one_of_too_long");
+        h.mint_root(one_of(1024)).await;
+        let root = h.mint_root(many(1024)).await;
+        assert_eq!(
+            decode_chain(&root.token)["chain"]["hops"][0]["capabilities"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1024
+        );
+    }
+
+    let h = Harness::start().await;
+    let root = h.mint_root(json!(["bank:*"])).await;
+    let exchange = |caps: Value, actor: &'static str| {
+        let h = &h;
+        let parent = root.token.clone();
+        async move {
+            let resp = h
+                .client
+                .post(h.server.url("/token"))
+                .json(&json!({
+                    "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+                    "subject_token": parent,
+                    "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+                    "actor": actor,
+                    "authorization_details": [{"type": "attenuo_capabilities", "capabilities": caps}],
+                    "client_id": actor,
+                    "client_secret": secret(actor),
+                }))
+                .send()
+                .await
+                .unwrap();
+            (resp.status(), resp.json::<Value>().await.unwrap())
+        }
+    };
+    refused(
+        &exchange(many(1025), "helper").await,
+        "too_many_capabilities",
+    );
+    refused(&exchange(one_of(1025), "helper").await, "one_of_too_long");
+    let got = exchange(many(1024), "helper").await;
+    assert_eq!(got.0, StatusCode::OK, "{}", got.1);
+    let got = exchange(one_of(1024), "helper2").await;
+    assert_eq!(got.0, StatusCode::OK, "{}", got.1);
+}
+
+/// SR-123 at start: a `[[root_grants]]` entry over either bound does not start.
+#[test]
+fn a_root_grant_over_the_bounds_does_not_start_sr123() {
+    for (caps, says) in [
+        (many(1025), "1025 capabilities"),
+        (one_of(1025), "1025 values"),
+    ] {
+        let mut cfg = Config::default();
+        cfg.issuer.issuer = "https://attenuo.test".into();
+        cfg.issuer.audience = "attenuo-test".into();
+        cfg.agents = agent_configs(AGENTS, secret);
+        cfg.root_grants = vec![attenuo_server::config::RootGrant {
+            subject: None,
+            issuer: "https://idp.example".into(),
+            agent: "helper".into(),
+            capabilities: serde_json::from_value(caps).unwrap(),
+            attributes: BTreeMap::new(),
+            may_act: None,
+        }];
+        let err = cfg.check_server_names().unwrap_err().to_string();
+        assert!(attenuo_server::build(&cfg).is_err());
+        assert!(
+            err.contains(says) && err.contains("[[root_grants]]"),
+            "{err}"
+        );
+    }
+}

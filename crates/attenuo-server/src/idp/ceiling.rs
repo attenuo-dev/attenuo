@@ -110,12 +110,16 @@ impl IdJagCeiling {
                 // would otherwise fail every intake that keeps this capability (SR-125).
                 cap.validate_limits()
                     .map_err(|e| format!("id_jag_ceiling.scopes `{scope}`: {e}"))?;
+                cap.validate_size()
+                    .map_err(|e| format!("id_jag_ceiling.scopes `{scope}`: {e}"))?;
                 if cap.server != "*" {
                     check_server_name(&cap.server)
                         .map_err(|e| format!("id_jag_ceiling.scopes `{scope}`: {e}"))?;
                 }
                 set.insert(cap);
             }
+            set.validate_size()
+                .map_err(|e| format!("id_jag_ceiling.scopes `{scope}`: {e}"))?;
             scopes.insert(scope.clone(), set);
         }
         Ok(Self { resources, scopes })
@@ -193,7 +197,10 @@ fn named_by_details(value: &Value) -> CapabilitySet {
         .into_iter()
         .filter_map(|c| serde_json::from_value::<CapabilityConfig>(c.clone()).ok())
         .map(Capability::from)
-        .filter(|c| c.validate().is_ok() && c.validate_limits().is_ok())
+        // A `one_of` over the bound names nothing, as any capability no token may carry (SR-123).
+        .filter(|c| {
+            c.validate().is_ok() && c.validate_limits().is_ok() && c.validate_size().is_ok()
+        })
         .collect()
 }
 
@@ -439,6 +446,23 @@ mod tests {
             r#"scopes = { "s" = [{ server = "github", tool = "*", limits = { sum = { arg = "n", max = 1, derive = "host" } } }] }"#
         )
         .contains("derive"));
+        // SR-123: a `one_of` over the bound, or a scope naming more capabilities than a token
+        // may hold, refuses to start.
+        let values: Vec<String> = (0..=attenuo_core::MAX_ONE_OF_VALUES)
+            .map(|i| i.to_string())
+            .collect();
+        assert!(bad(&format!(
+            r#"scopes = {{ "s" = [{{ server = "github", tool = "*", constraints = {{ repo = {{ op = "one_of", value = [{}] }} }} }}] }}"#,
+            values.join(", ")
+        ))
+        .contains("1025 values"));
+        let tools: Vec<String> = (0..=attenuo_core::MAX_CAPABILITIES)
+            .map(|i| format!("\"github:t{i}\""))
+            .collect();
+        assert!(
+            bad(&format!(r#"scopes = {{ "s" = [{}] }}"#, tools.join(", ")))
+                .contains("1025 capabilities")
+        );
         // An empty table is accepted: only authorization_details can then name anything.
         let cfg: IdJagCeilingConfig = toml::from_str("").unwrap();
         IdJagCeiling::from_config(&cfg).unwrap();
@@ -468,6 +492,32 @@ mod tests {
         let over = c.apply(&grant, &details(MAX_CLAIM_CAPABILITIES + 1));
         assert!(over.capabilities.is_empty());
         assert_eq!(over.claims, ["authorization_details"]);
+    }
+
+    /// SR-123: an `authorization_details` capability with a `one_of` over
+    /// [`attenuo_core::MAX_ONE_OF_VALUES`] names nothing, so it cannot make the ceiling's
+    /// comparisons costly; one at the bound is kept.
+    #[test]
+    fn a_claim_with_a_long_one_of_names_nothing_sr123() {
+        let c = ceiling();
+        let grant = set(&["github:*"]);
+        let details = |n: usize| {
+            claims(
+                json!({"authorization_details": [{"type": AUTHORIZATION_DETAILS_TYPE,
+                "capabilities": [{"server": "github", "tool": "read_file", "constraints":
+                    {"repo": {"op": "one_of", "value": (0..n).collect::<Vec<_>>()}}}]}]}),
+            )
+        };
+        assert_eq!(
+            c.apply(&grant, &details(attenuo_core::MAX_ONE_OF_VALUES))
+                .capabilities
+                .len(),
+            1
+        );
+        assert!(c
+            .apply(&grant, &details(attenuo_core::MAX_ONE_OF_VALUES + 1))
+            .capabilities
+            .is_empty());
     }
 
     /// The claims hold for a spread of grants and claims with globs, constraints and limits:

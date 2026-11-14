@@ -333,6 +333,7 @@ impl From<attenuo_token::TokenError> for ApiError {
                     .with_description("duplicate_actor")
             }
             TokenError::Chain(ChainError::AttenuationViolated { .. })
+            | TokenError::Chain(ChainError::TooLarge { .. })
             | TokenError::Chain(ChainError::TooDeep { .. }) => "invalid_scope",
             TokenError::ActorNotPermitted(_) => {
                 return ApiError::bad_request("invalid_request", e.to_string())
@@ -377,6 +378,20 @@ pub const CHAIN_TOO_DEEP: &str = "chain_too_deep";
 /// limited capability of the root grant or of the ID-JAG ceiling (SR-121).
 pub const LIMIT_SPLIT_AT_ROOT: &str = "limit_split_at_root";
 
+/// `code` of a request for more capabilities than one token may hold
+/// ([`attenuo_core::MAX_CAPABILITIES`], SR-123).
+pub const TOO_MANY_CAPABILITIES: &str = "too_many_capabilities";
+/// `code` of a request with a `one_of` longer than [`attenuo_core::MAX_ONE_OF_VALUES`] (SR-123).
+pub const ONE_OF_TOO_LONG: &str = "one_of_too_long";
+
+/// The `code` of a request refused for its size.
+pub(crate) fn size_code(e: &attenuo_core::SizeError) -> &'static str {
+    match e {
+        attenuo_core::SizeError::TooManyCapabilities { .. } => TOO_MANY_CAPABILITIES,
+        attenuo_core::SizeError::OneOfTooLong { .. } => ONE_OF_TOO_LONG,
+    }
+}
+
 /// The `detail` of a [`LIMIT_SPLIT_AT_ROOT`] refusal: names the two capabilities as requested
 /// and `of`, where their limits come from, never the limits themselves (SR-124).
 pub(crate) fn limit_split_detail(first: &str, second: &str, of: &str) -> String {
@@ -403,6 +418,11 @@ pub fn mint_refusal(e: attenuo_token::TokenError) -> ApiError {
     use attenuo_core::ChainError as C;
     use attenuo_token::TokenError;
     let code = match &e {
+        TokenError::Chain(C::TooLarge { source, .. })
+        | TokenError::Chain(C::AttenuationViolated {
+            source: attenuo_core::AttenuationError::TooLarge(source),
+            ..
+        }) => size_code(source),
         TokenError::Chain(C::AttenuationViolated { .. }) => SCOPE_EXCEEDS_PARENT,
         TokenError::Chain(C::TooDeep { .. }) => CHAIN_TOO_DEEP,
         TokenError::Chain(C::InvalidName { .. } | C::InvalidLimit { .. }) => INVALID_CAPABILITY,

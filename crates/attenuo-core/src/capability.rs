@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::call::ToolCall;
-use crate::error::AttenuationError;
+use crate::error::{AttenuationError, SizeError};
 use crate::jcs::value_eq;
 use crate::limits::{LimitError, LimitKind, Limits};
 use crate::names::NameError;
@@ -786,6 +786,39 @@ impl Capability {
     }
 }
 
+/// The most capabilities one token request, and one hop of a token, may hold (SR-123).
+/// Attenuation compares every requested capability with the parent's, so its cost is the
+/// product of the two sizes; every path that mints a token bounds the request with
+/// [`CapabilitySet::validate_size`] before comparing anything.
+pub const MAX_CAPABILITIES: usize = 1024;
+
+/// The most values one `one_of` constraint may list (SR-123). Implication between two `one_of`
+/// lists costs the product of their lengths.
+pub const MAX_ONE_OF_VALUES: usize = 1024;
+
+impl Capability {
+    /// Is every `one_of` of this capability at most [`MAX_ONE_OF_VALUES`] long?
+    ///
+    /// # Errors
+    ///
+    /// [`SizeError::OneOfTooLong`] for the first constraint, by argument name, over the bound.
+    pub fn validate_size(&self) -> Result<(), SizeError> {
+        for (arg, c) in &self.constraints {
+            if let ArgConstraint::OneOf(values) = c {
+                if values.len() > MAX_ONE_OF_VALUES {
+                    return Err(SizeError::OneOfTooLong {
+                        capability: format!("{}:{}", self.server, self.tool),
+                        arg: arg.clone(),
+                        count: values.len(),
+                        max: MAX_ONE_OF_VALUES,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// A set of capabilities. A call is permitted if any member permits it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -843,6 +876,23 @@ impl CapabilitySet {
         self.0.iter().try_for_each(Capability::validate_limits)
     }
 
+    /// Is the set no larger than one request or token may be: at most [`MAX_CAPABILITIES`]
+    /// members, each passing [`Capability::validate_size`] (SR-123)? Linear in the set's size.
+    ///
+    /// # Errors
+    ///
+    /// [`SizeError::TooManyCapabilities`], or the [`SizeError::OneOfTooLong`] of the first
+    /// member, in canonical order, with a `one_of` over the bound.
+    pub fn validate_size(&self) -> Result<(), SizeError> {
+        if self.0.len() > MAX_CAPABILITIES {
+            return Err(SizeError::TooManyCapabilities {
+                count: self.0.len(),
+                max: MAX_CAPABILITIES,
+            });
+        }
+        self.0.iter().try_for_each(Capability::validate_size)
+    }
+
     /// [`Capability::path_prefix_warnings`] of every member, in canonical order.
     pub fn path_prefix_warnings(&self) -> Vec<String> {
         self.0
@@ -868,8 +918,9 @@ impl CapabilitySet {
     /// # Errors
     ///
     /// As [`attenuate_with`](Self::attenuate_with): [`AttenuationError::Empty`] for an empty
-    /// `requested`, [`AttenuationError::NotCovered`] for the first requested capability no member
-    /// of `self` covers.
+    /// `requested`, [`AttenuationError::TooLarge`] for one over [`CapabilitySet::validate_size`],
+    /// [`AttenuationError::NotCovered`] for the first requested capability no member of `self`
+    /// covers.
     pub fn attenuate(&self, requested: &CapabilitySet) -> Result<CapabilitySet, AttenuationError> {
         self.attenuate_with(requested, |_, _, _| None)
     }
@@ -895,7 +946,9 @@ impl CapabilitySet {
     ///
     /// # Errors
     ///
-    /// [`AttenuationError::Empty`] when `requested` is empty. [`AttenuationError::NotCovered`],
+    /// [`AttenuationError::Empty`] when `requested` is empty; [`AttenuationError::TooLarge`]
+    /// when it fails [`CapabilitySet::validate_size`], before anything is compared.
+    /// [`AttenuationError::NotCovered`],
     /// naming the capability, when no member of `self` covers a requested capability's calls, or
     /// when the clamped capability is still not covered by its parent (a constraint or limit
     /// clamping cannot fix).
@@ -966,6 +1019,8 @@ impl CapabilitySet {
         if requested.is_empty() {
             return Err(AttenuationError::Empty);
         }
+        // Before anything is compared: the loop below costs the product of both sizes (SR-123).
+        requested.validate_size()?;
         let mut out = Vec::with_capacity(requested.len());
         for c in requested.0.iter() {
             let not_covered = || AttenuationError::NotCovered {
@@ -1989,5 +2044,94 @@ mod tests {
             fetch("https://b.example/").with_limits(Limits::default().with_calls(3)),
         ]);
         assert_eq!(apart.attenuate_root(&two), apart.attenuate(&two));
+    }
+
+    /// SR-123: a request holds at most `MAX_CAPABILITIES` capabilities and a `one_of` at most
+    /// `MAX_ONE_OF_VALUES` values; attenuation refuses a larger one before comparing anything,
+    /// and so do `DelegationChain::root` and `extend`.
+    #[test]
+    fn requests_are_bounded_in_size_sr123() {
+        let many = |n: usize| -> CapabilitySet {
+            (0..n)
+                .map(|i| Capability::new("s", format!("t{i}")))
+                .collect()
+        };
+        let one_of = |n: usize| -> CapabilitySet {
+            CapabilitySet::from_iter([Capability::new("s", "t").with_constraint(
+                "a",
+                ArgConstraint::OneOf((0..n).map(|i| json!(i)).collect()),
+            )])
+        };
+        assert_eq!(many(MAX_CAPABILITIES).validate_size(), Ok(()));
+        assert_eq!(one_of(MAX_ONE_OF_VALUES).validate_size(), Ok(()));
+        assert_eq!(
+            many(MAX_CAPABILITIES + 1).validate_size(),
+            Err(SizeError::TooManyCapabilities {
+                count: MAX_CAPABILITIES + 1,
+                max: MAX_CAPABILITIES
+            })
+        );
+        assert!(matches!(
+            one_of(MAX_ONE_OF_VALUES + 1).validate_size(),
+            Err(SizeError::OneOfTooLong { count: 1025, .. })
+        ));
+        // Refused before the parent is read: even an empty parent answers "too large".
+        let none = CapabilitySet::new();
+        assert!(matches!(
+            none.attenuate(&many(MAX_CAPABILITIES + 1)),
+            Err(AttenuationError::TooLarge(_))
+        ));
+        assert!(matches!(
+            none.attenuate_root(&one_of(MAX_ONE_OF_VALUES + 1)),
+            Err(AttenuationError::TooLarge(_))
+        ));
+        let all = CapabilitySet::from_iter([Capability::new("*", "*")]);
+        assert!(all.attenuate(&many(MAX_CAPABILITIES)).is_ok());
+
+        let user = crate::OriginatingUser {
+            subject: "u".into(),
+            issuer: "i".into(),
+            authenticated_at: time::OffsetDateTime::UNIX_EPOCH,
+            attributes: Default::default(),
+        };
+        let now = time::OffsetDateTime::UNIX_EPOCH + time::Duration::days(1);
+        let hour = time::Duration::hours(1);
+        let lease = |s: &str| crate::LeaseId(s.into());
+        let err = crate::DelegationChain::root(
+            user.clone(),
+            crate::AgentId("a".into()),
+            many(MAX_CAPABILITIES + 1),
+            now,
+            hour,
+            lease("l0"),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, crate::ChainError::TooLarge { index: 0, .. }),
+            "{err}"
+        );
+        let root = crate::DelegationChain::root(
+            user,
+            crate::AgentId("a".into()),
+            all,
+            now,
+            hour,
+            lease("l0"),
+        )
+        .unwrap();
+        let err = root
+            .extend(
+                crate::AgentId("b".into()),
+                one_of(MAX_ONE_OF_VALUES + 1),
+                now,
+                hour,
+                lease("l1"),
+                8,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::ChainError::TooLarge { index: 1, .. }),
+            "{err}"
+        );
     }
 }

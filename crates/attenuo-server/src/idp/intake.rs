@@ -62,7 +62,7 @@ use super::{claims, CredentialKind, IntakeError, ID_JAG_TOKEN_TYPE, ID_TOKEN_TYP
 use crate::actor::{VerifiedActor, ACTOR_TOKEN_TYPE};
 use crate::clientauth::{self, invalid_request, Authenticated, Clients};
 use crate::config::{capability_set, ActorAuth, RootGrant};
-use crate::error::{limit_split_detail, ApiError, LIMIT_SPLIT_AT_ROOT};
+use crate::error::{limit_split_detail, size_code, ApiError, LIMIT_SPLIT_AT_ROOT};
 use crate::routes::token::take_actor_token;
 use crate::routes::{audit_issuance, no_store, register_issued};
 use crate::state::AppState;
@@ -241,6 +241,7 @@ pub(crate) async fn handle(
             LIMIT_SPLIT_AT_ROOT,
             limit_split_detail(&first, &second, "the [[root_grants]] entry"),
         ),
+        attenuo_core::AttenuationError::TooLarge(e) => invalid_scope(size_code(&e), e.to_string()),
         e => invalid_scope("scope_exceeds_grant", e.to_string()),
     })?;
     // `[idps.id_jag_ceiling]` (opt-in): the ID-JAG's `resource`, `scope` and

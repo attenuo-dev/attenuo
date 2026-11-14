@@ -957,6 +957,8 @@ fn generate() -> Cases {
             Err(AttenuationError::NotCovered { .. }) => ("-".to_owned(), "err:not-covered"),
             // Only `attenuate_root` (hop 0, not modelled) answers this.
             Err(e @ AttenuationError::LimitSplit { .. }) => panic!("attenuate answered {e}"),
+            // The generated sets are far below the bounds.
+            Err(e @ AttenuationError::TooLarge(_)) => panic!("attenuate answered {e}"),
         };
         let args = format!("{} {} {result}", encode_set(&p), encode_set(&r));
         cases.push("atten", &args, ans);

@@ -31,7 +31,9 @@ use super::{
     audit_admin, audit_issuance, no_store, parse_json, register_issued, REASON_ADMIN_ACTION,
 };
 use crate::config::{capability_set, CapSpec, RootGrant};
-use crate::error::{limit_split_detail, ApiError, INVALID_CAPABILITY, LIMIT_SPLIT_AT_ROOT};
+use crate::error::{
+    limit_split_detail, size_code, ApiError, INVALID_CAPABILITY, LIMIT_SPLIT_AT_ROOT,
+};
 use crate::state::AppState;
 use attenuo_core::Decision;
 
@@ -228,6 +230,9 @@ fn resolve_grant(grants: &[RootGrant], req: &RootTokenRequest) -> Result<Granted
                 limit_split_detail(&first, &second, "the [[root_grants]] entry"),
             )
             .with_code(LIMIT_SPLIT_AT_ROOT),
+            attenuo_core::AttenuationError::TooLarge(e) => {
+                ApiError::bad_request("invalid_scope", e.to_string()).with_code(size_code(&e))
+            }
             e => {
                 ApiError::bad_request("invalid_scope", e.to_string()).with_code(SCOPE_EXCEEDS_GRANT)
             }

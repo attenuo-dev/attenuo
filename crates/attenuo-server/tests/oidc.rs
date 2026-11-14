@@ -1926,3 +1926,41 @@ async fn a_root_grant_budget_is_not_split_at_intake_sr121() {
     .await;
     assert_eq!(got.0, StatusCode::OK, "{}", got.1);
 }
+
+/// SR-123 at intake: a hop-0 request over 1,024 capabilities, or with a `one_of` over 1,024
+/// values, is refused before it is attenuated against the root grant.
+#[tokio::test]
+async fn an_intake_request_is_bounded_in_size_sr123() {
+    let h = Harness::start().await;
+    let many: Vec<String> = (0..1025).map(|i| format!("github:t{i}")).collect();
+    let got = present(&h, &jag_with(&h, json!({})), ("scope", &many.join(" "))).await;
+    assert_error(
+        &got,
+        StatusCode::BAD_REQUEST,
+        "invalid_scope",
+        "too_many_capabilities",
+    );
+    let long = json!([{"type": "attenuo_capabilities", "capabilities": [
+        {"server": "github", "tool": "read_file", "constraints":
+            {"repo": {"op": "one_of", "value": (0..1025).collect::<Vec<_>>()}}}]}])
+    .to_string();
+    let got = present(
+        &h,
+        &jag_with(&h, json!({})),
+        ("authorization_details", &long),
+    )
+    .await;
+    assert_error(
+        &got,
+        StatusCode::BAD_REQUEST,
+        "invalid_scope",
+        "one_of_too_long",
+    );
+    let got = present(
+        &h,
+        &jag_with(&h, json!({})),
+        ("scope", &many[..1024].join(" ")),
+    )
+    .await;
+    assert_eq!(got.0, StatusCode::OK, "{}", got.1);
+}

@@ -157,6 +157,7 @@ The table is generated from `attenuo_core::error_codes::ERROR_CODES`, the one pl
 | `no_root_grant` | 403, 400 `invalid_scope` |  |  | No `[[root_grants]]` entry covers the agent and user. |
 | `not_found` | 404 |  |  | The resource does not exist, or is not visible to the caller. |
 | `not_yet_valid` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The credential is not valid yet. |
+| `one_of_too_long` | 400 `invalid_scope` |  |  | A requested capability (an exchange, a hop-0 request, `POST /admin/root-token`) has a `one_of` constraint with more than 1,024 values. |
 | `operators_invalid` | 422 |  |  | The reloaded `[[admin.operators]]` list is not TOML or breaks a startup rule; the operators in force are unchanged. |
 | `operators_no_admin` | 422 |  |  | The reloaded `[[admin.operators]]` list would leave no unexpired credential with role `admin`; the operators in force are unchanged. |
 | `overloaded` | 503 `temporarily_unavailable` | `-32006` (503) |  | `[limits] max_in_flight` requests are already running; retry after `Retry-After`. |
@@ -182,6 +183,7 @@ The table is generated from `attenuo_core::error_codes::ERROR_CODES`, the one pl
 | `session_unknown` |  | `-32600` (404) |  | The `Mcp-Session-Id` is not bound; start a new session. |
 | `tenant_mismatch` | 400 `invalid_grant` |  |  | The ID-JAG's `tenant` is not the `[[idps]] tenant` of its issuer. |
 | `token_expired` | 401 `unauthorized`, 400 `invalid_grant` | `-32001` (401), `-32001` (200) |  | The token verified but has expired (a bearer, or at `POST /token` the subject token or a hop of its chain). |
+| `too_many_capabilities` | 400 `invalid_scope` |  |  | A request (an exchange, a hop-0 request, `POST /admin/root-token`) asks for more than 1,024 capabilities, more than one token may hold. |
 | `too_many_pending_approvals` | 429 |  |  | The run already has the maximum number of pending approvals. |
 | `too_many_sessions` |  | `-32007` (429) |  | The principal holds `[proxy] max_sessions_per_principal` live sessions. |
 | `tool_not_in_catalog` |  | `-32003` (200) | yes | The tool is not in the catalog and unknown tools are denied. |

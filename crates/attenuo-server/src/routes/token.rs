@@ -281,9 +281,11 @@ fn refusal_reason(e: &attenuo_token::TokenError) -> Option<&'static str> {
         TokenError::Chain(ChainError::AttenuationViolated { .. }) => REASON_EXCHANGE_WIDENING,
         TokenError::Chain(ChainError::TooDeep { .. }) => REASON_EXCHANGE_TOO_DEEP,
         TokenError::Chain(ChainError::DuplicateAgent { .. }) => REASON_EXCHANGE_DUPLICATE_ACTOR,
-        TokenError::Chain(ChainError::InvalidName { .. } | ChainError::InvalidLimit { .. }) => {
-            REASON_EXCHANGE_INVALID_CAPABILITY
-        }
+        TokenError::Chain(
+            ChainError::InvalidName { .. }
+            | ChainError::InvalidLimit { .. }
+            | ChainError::TooLarge { .. },
+        ) => REASON_EXCHANGE_INVALID_CAPABILITY,
         TokenError::ActorNotPermitted(_) => REASON_EXCHANGE_ACTOR_NOT_PERMITTED,
         TokenError::NoLifetimeLeft(_) => REASON_EXCHANGE_NO_LIFETIME_LEFT,
         _ => REASON_EXCHANGE_REFUSED,

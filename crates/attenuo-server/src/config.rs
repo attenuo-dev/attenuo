@@ -2915,10 +2915,11 @@ impl Config {
         }
         for g in &self.root_grants {
             reserved_agent("[[root_grants]]", &g.agent)?;
-            for cap in capability_set(&g.capabilities)
-                .map_err(|e| anyhow::anyhow!(e))?
-                .iter()
-            {
+            let caps = capability_set(&g.capabilities).map_err(|e| anyhow::anyhow!(e))?;
+            // A request is attenuated against the grant at a cost of the product (SR-123).
+            caps.validate_size()
+                .map_err(|e| anyhow::anyhow!("[[root_grants]] for agent `{}`: {e}", g.agent))?;
+            for cap in caps.iter() {
                 cap.validate()
                     .map_err(|e| anyhow::anyhow!("[[root_grants]]: {e}"))?;
                 if cap.server != "*" {
