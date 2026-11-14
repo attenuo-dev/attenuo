@@ -30,7 +30,7 @@ attenuo is a self-hosted, IdP-neutral reference monitor that sits between agent 
 
 ## 2. Security properties
 
-These are the properties the design sets out to hold. The implementation is checked against them with unit, property and integration tests and with fuzzing. One part of P2, that a call permitted by a later hop's capabilities is permitted by every earlier hop's, also has a machine-checked proof in Lean on a model of the covering rule ([proofs/lean/README.md](https://github.com/attenuo-dev/attenuo/blob/main/proofs/lean/README.md)); the Rust code is not verified against that model. The rest of P2, and P1, P3 and P4, are tested, not proven.
+These are the properties the design sets out to hold. The implementation is checked against them with unit, property and integration tests and with fuzzing. One part of P2, that a call permitted by a later hop's capabilities is permitted by every earlier hop's, also has a machine-checked proof in Lean on a model of the covering rule ([proofs/lean/README.md](https://github.com/attenuo-dev/attenuo/blob/main/proofs/lean/README.md)); the Rust code is not verified against that model, but a differential test (`scripts/check-lean-differential.sh`) checks that the two give the same answers on generated cases. The rest of P2, and P1, P3 and P4, are tested, not proven.
 
 Let a *run* be a tree of hops rooted at an originating user `u`. Hop `h_n` is an agent acting with capability set `C_n`.
 

@@ -122,7 +122,7 @@ How to read it:
 - [x] Output labelling phase 1 (#42) and phase 2, argument-level taint (#55); approvals (#45), approval token (#52), labels on the `GET` listen stream (#47), approval notifier (#159) with a persisted outbox (#168); host names as entities and reads matched when a policy asks (#164).
 - [x] Run limits phase 1 (#50), run usage in policy (#59), `distinct` and URL-host destinations (#61), refund and budgets in `lease tree` (#64); per-user windows, phase 3 step 1 (#212).
 - [x] `decimal` catalog input type (#190); one host grammar for limits (#201); `outbound` catalog flag (#213).
-- [x] Machine-checked attenuation invariant: a Lean 4 model of the covering rule with proofs that `covers` and `implies` are sound, reflexive and transitive, that every hop of a valid chain permits what the last hop permits, and that a successful `attenuate` is covered by its parent ([Lean proof](../design/lean-proof.md)). The proof is about the model; the Rust code is not verified against it.
+- [x] Machine-checked attenuation invariant: a Lean 4 model of the covering rule with proofs that `covers` and `implies` are sound, reflexive and transitive, that every hop of a valid chain permits what the last hop permits, and that a successful `attenuate` is covered by its parent ([Lean proof](../design/lean-proof.md), #304). The proof is about the model; the Rust code is not verified against it, and a differential test checks that the model and the Rust code agree on generated cases (#307).
 
 ### Audit and storage
 
