@@ -1108,9 +1108,41 @@ impl Deliver for S3Deliver {
         if status.is_success() {
             Ok(())
         } else {
-            Err(format!("S3 answered {status}"))
+            match s3_error_code(resp).await {
+                Some(code) => Err(format!("S3 answered {status} ({code})")),
+                None => Err(format!("S3 answered {status}")),
+            }
         }
     }
+}
+
+/// Most bytes of an S3 error answer read to find its `<Code>`.
+const S3_ERROR_BODY_MAX: usize = 4096;
+
+/// The `<Code>` of an S3 error answer (`SignatureDoesNotMatch`, `ExpiredToken`,
+/// `InvalidTokenId`, `AccessDenied`, ...), which tells a wrong secret from an expired session
+/// token where the status alone (403) does not. At most [`S3_ERROR_BODY_MAX`] bytes are read;
+/// a code that is not a short run of ASCII letters and digits is not reported, so the store
+/// cannot put arbitrary text in the log.
+async fn s3_error_code(mut resp: reqwest::Response) -> Option<String> {
+    let mut body = Vec::new();
+    while body.len() < S3_ERROR_BODY_MAX {
+        match resp.chunk().await {
+            Ok(Some(c)) => body.extend_from_slice(&c),
+            _ => break,
+        }
+    }
+    body.truncate(S3_ERROR_BODY_MAX);
+    s3_error_code_of(&body)
+}
+
+fn s3_error_code_of(body: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(body).ok()?;
+    let start = text.find("<Code>")? + "<Code>".len();
+    let len = text[start..].find("</Code>")?;
+    let code = &text[start..start + len];
+    (!code.is_empty() && code.len() <= 64 && code.bytes().all(|b| b.is_ascii_alphanumeric()))
+        .then(|| code.to_string())
 }
 
 /// The headers of the sink's PutObject, every one of them signed: `content-type`, `host`,
@@ -1909,5 +1941,28 @@ mod tests {
             &[],
         )
         .unwrap();
+    }
+
+    /// The `<Code>` of an S3 error answer is reported; anything that is not a short ASCII
+    /// word is not, so a store cannot put its own text in the log.
+    #[test]
+    fn the_s3_error_code_is_read_from_the_answer() {
+        let xml = |code: &str| {
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>{code}</Code>\
+                 <Message>m</Message></Error>"
+            )
+        };
+        for code in ["ExpiredToken", "InvalidTokenId", "SignatureDoesNotMatch"] {
+            assert_eq!(
+                s3_error_code_of(xml(code).as_bytes()).as_deref(),
+                Some(code)
+            );
+        }
+        for bad in ["", "two words", "x\nforged log line", &"A".repeat(65)] {
+            assert_eq!(s3_error_code_of(xml(bad).as_bytes()), None, "{bad:?}");
+        }
+        assert_eq!(s3_error_code_of(b"<html>Forbidden</html>"), None);
+        assert_eq!(s3_error_code_of(&[0xff, 0xfe]), None);
     }
 }

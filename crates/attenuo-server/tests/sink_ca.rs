@@ -2,7 +2,8 @@
 //! with a certificate from a private CA made in the test. Without the setting the request is
 //! refused (the CA is not a web PKI root) and the error names the TLS cause; with the sink's
 //! CA it is delivered; with another CA it is refused; the hostname check stays. Also: an S3
-//! PUT with a session token sends and signs `x-amz-security-token`.
+//! PUT with a session token sends and signs `x-amz-security-token`, and an S3 error answer's
+//! `<Code>` (such as `ExpiredToken`) is in the error the sink logs.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -365,6 +366,35 @@ async fn a_session_token_is_sent_and_signed() {
         creds: &creds,
     });
     assert_eq!(auth, expected);
+}
+
+/// A refused PUT names S3's error code, so an expired session token (`ExpiredToken`) can be
+/// told from a wrong secret (`SignatureDoesNotMatch`); both are 403.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_s3_refusal_names_the_error_code() {
+    let dir = tempfile::tempdir().unwrap();
+    let ca = Ca::new("attenuo test CA");
+    let ca_pem = ca.write(dir.path(), "ca.pem");
+    let store = TlsReceiver::start(
+        &ca,
+        &["127.0.0.1"],
+        (
+            "403 Forbidden",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>ExpiredToken</Code>\
+             <Message>The provided token has expired.</Message></Error>",
+        ),
+    )
+    .await;
+    let sink = push_one(&s3_section(
+        format!("https://127.0.0.1:{}", store.port),
+        Some(ca_pem),
+        Some("expired-token"),
+    ))
+    .await;
+    assert_eq!(
+        last_error(&sink),
+        "S3 answered 403 Forbidden (ExpiredToken)"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
