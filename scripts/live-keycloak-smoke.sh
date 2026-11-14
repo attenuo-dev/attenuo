@@ -16,7 +16,8 @@
 # the local one, and checks: discovery and the JWKS fetch, RS256, `iss`, `aud`/`azp` (a token
 # for `other-app` is refused), the replay refusal, the user block (`email`, `roles`, `mfa`),
 # whether `amr` is sent, the hop-0 exchange with curl (the guide's command, with
-# authorization_details), the Python SDK and the TypeScript SDK, `inspect(verify=True)` and the
+# authorization_details), the Python SDK, the TypeScript SDK and the CLI (`token exchange
+# --subject-token-type id-token`, with its replay refusal), `inspect(verify=True)` and the
 # `kid` of the root token against the server's JWKS, a key rotation at Keycloak, a narrowed
 # child exchange with the CLI, and MCP calls through the proxy (allowed, capability_denied, and
 # policy_deny for a tool whose policy needs `mfa`). Last, it adds Keycloak's AMR mapper and
@@ -385,7 +386,25 @@ else
   echo "skip: no node or no sdk/typescript/dist"; SKIPPED+=(typescript-sdk)
 fi
 
-say "5. key rotation at Keycloak"
+say "5. hop 0 with the CLI (token exchange --subject-token-type id-token)"
+CLI_ID_TOKEN="$(login)"
+cli_hop0() {  # the CLI's hop 0 of $CLI_ID_TOKEN, the secret on stdin
+  printf '%s\n' "$PLANNER_SECRET" | ATTENUO_TOKEN="$CLI_ID_TOKEN" "$CLI" --json token exchange \
+    --subject-token-type id-token --actor planner --client-secret-stdin \
+    --cap '{"server":"github","tool":"get_file_contents","constraints":{"repo":{"op":"prefix","value":"acme/"}}}'
+}
+CLI_ROOT="$(cli_hop0 | jq_py 'd.get("access_token", "")')"
+[ -n "$CLI_ROOT" ] || fail "hop 0 with the CLI refused"
+"$CLI" token inspect "$CLI_ROOT" --verify > "$WORK/inspect-cli.txt"
+grep -q "issuer $REALM" "$WORK/inspect-cli.txt" || fail "CLI root token: issuer not in the user block"
+grep -q '"github-reader"' "$WORK/inspect-cli.txt" || fail "CLI root token: roles attribute"
+ok "CLI: root token for planner, verified, issuer $REALM, roles github-reader"
+if OUT="$(cli_hop0 2>&1)"; then fail "the CLI's second use of one ID token was not refused"; fi
+printf %s "$OUT" | grep -q 'invalid_grant: this credential was already used' \
+  || fail "expected the replay refusal: $OUT"
+ok "CLI: the same ID token again: invalid_grant, already used"
+
+say "6. key rotation at Keycloak"
 REALM_ID="$(kc get realms/acme --fields id --format csv --noquotes)"
 OLD_KID="$(printf %s "$HEADER" | jq_py 'd["kid"]')"
 sleep 31   # past the server's 30 s floor between early JWKS refetches
@@ -399,7 +418,7 @@ NEW_KID="$(jwt_part "$ROTATED" 0 | jq_py 'd["kid"]')"
 grep -q 'unknown kid; refetching JWKS' "$WORK/server.log" || fail "no refetch logged"
 ok "new kid $NEW_KID: one early JWKS refetch, then accepted"
 
-say "6. a narrowed child exchange and MCP calls through the proxy"
+say "7. a narrowed child exchange and MCP calls through the proxy"
 CODER="$(printf '%s\n' "$CODER_SECRET" | ATTENUO_TOKEN="$ROOT_TOKEN" "$CLI" token exchange \
   --actor coder --client-secret-stdin --no-delegation \
   --cap '{"server":"github","tool":"get_file_contents","constraints":{"repo":{"op":"prefix","value":"acme/api"}}}' \
@@ -421,7 +440,7 @@ ok "planner opens an issue: policy_deny, the policy needs mfa and Keycloak sent 
 [ "$(grep -c 'tools/call' "$WORK/fake-mcp.log")" = 1 ] || fail "expected exactly one upstream call"
 ok "one tools/call reached the upstream"
 
-say "7. Keycloak's AMR mapper"
+say "8. Keycloak's AMR mapper"
 kc get serverinfo | jq_py '[p["name"] for p in d["protocolMapperTypes"]["openid-connect"] if p["id"] == "oidc-amr-mapper"]' \
   | sed 's/^/mapper type oidc-amr-mapper: /'
 kc create "clients/$CID/protocol-mappers/models" -r acme -s name=amr -s protocol=openid-connect \
@@ -437,7 +456,7 @@ AMR="$(jwt_part "$(login)" 1 | jq_py 'd.get("amr")')"
 [ "$AMR" = "['pwd']" ] || fail "expected amr ['pwd'], got $AMR"
 ok "with a reference value on the password step: amr = ['pwd'] (mfa stays false)"
 
-say "8. the audit chain"
+say "9. the audit chain"
 ATTENUO_ADMIN_TOKEN="$ADMIN_TOKEN" "$CLI" audit verify
 if [ "${#SKIPPED[@]}" -gt 0 ]; then
   fail "skipped: ${SKIPPED[*]}; this run is incomplete"
