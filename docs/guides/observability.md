@@ -55,7 +55,15 @@ service:
       exporters: [otlp]
 ```
 
-This configuration is **untested** against a real collector here; the server side was tested with an in-process OTLP/HTTP receiver.
+Replace `your-backend:4317` with your tracing backend's OTLP/gRPC address. To see what arrives without a backend, add the collector's `debug` exporter (`debug: { verbosity: detailed }`) to both pipelines: it prints each span and metric to the collector's log.
+
+**What was run.** On 2026-11-14 this configuration, copied from this page, was run against OpenTelemetry Collector **0.165.0** (`otel/opentelemetry-collector-contrib:0.165.0` and the core `otel/opentelemetry-collector:0.165.0`, both with host networking), with the `[telemetry]` block above and `[metrics]` on `127.0.0.1:9100`, by [`scripts/live-collector-smoke.sh`](https://github.com/attenuo-dev/attenuo/blob/main/scripts/live-collector-smoke.sh) (not part of CI; it skips when Docker is absent). What it showed:
+
+- Both images accept the file (`otelcol validate` passes on the contrib image, and both start with it). Version 0.165.0 logs `"otlp" alias is deprecated; use "otlp_grpc" instead` for the exporter: the name still works there; on a collector that has the new name, prefer `otlp_grpc`.
+- With a `debug` exporter added, the spans of a proxied call (`mcp.request`, `attenuo.authenticate`, `attenuo.session_gate`, `attenuo.decide` with `attenuo.lease_check`, `attenuo.run_state`, `attenuo.policy` and `attenuo.audit_append`, `attenuo.upstream`, `attenuo.response`, `attenuo.record_result`), for an allow and a deny, and `attenuo.token.exchange` arrive with the attributes listed below and no others, under `service.name` and the `resource_attributes`; a caller's `traceparent` is a span link on `mcp.request`, its trace id is not adopted, and the upstream receives one `traceparent` naming the `attenuo.upstream` span. No token, subject, argument, secret or upstream URL was in any exported span.
+- The Prometheus receiver scrapes `[metrics] listen`, the two telemetry series below included.
+- The run found that `http.response.status_code`, `attenuo.chain_depth` and `attenuo.audit.seq` reached the collector as strings (`Str(200)`); they are now integers, as the semantic conventions have the status code.
+- Not driven in that run: `attenuo.charge` (no run limit), `attenuo.stream_end`, `attenuo.token.root`, `attenuo.token.renew` and the AuthZEN spans, `parent` mode, and `attenuo.session_tag` (no request carried an `Mcp-Session-Id`); the in-process tests cover them. The script sets `OTEL_TRACES_SAMPLER_ARG=1` so that every call is traced; the guide's `sample_ratio = 0.1` itself was not checked against a count of traces. No real tracing backend was used: the `otlp` exporter's target did not resolve, and only the collector's `debug` output was read.
 
 ## Metrics
 
@@ -84,7 +92,7 @@ One trace per proxied MCP request:
 
 `POST /token` (`attenuo.token.exchange`, or `attenuo.token.root` for an IdP credential), `POST /token/renew` (`attenuo.token.renew`) and the AuthZEN routes (`attenuo.authzen.evaluate`, with an `attenuo.decide` child per evaluation) get one span each, with the method, the route template and the status code. Admin routes export nothing. The resource carries `service.name` and your `resource_attributes`.
 
-A tool or server name that breaks the name rule is exported as the fixed string `invalid_name`. The subject is exported only as `attenuo.subject_digest`: 16 hex digits of an HMAC-SHA256 keyed by a key derived from the issuer's private key, so it groups calls per user without naming the user. Rotating the issuer key changes every digest. With `[logging] redact_subjects = true` the server's log lines carry the same digest (`subject=hmac:<16 hex>`), so a log line and a trace of one user match ([config reference](../reference/config.md#logging)).
+`http.response.status_code`, `attenuo.chain_depth` and `attenuo.audit.seq` are integers, `attenuo.dpop_bound` and `attenuo.tainted` booleans, the rest strings. A tool or server name that breaks the name rule is exported as the fixed string `invalid_name`. The subject is exported only as `attenuo.subject_digest`: 16 hex digits of an HMAC-SHA256 keyed by a key derived from the issuer's private key, so it groups calls per user without naming the user. Rotating the issuer key changes every digest. With `[logging] redact_subjects = true` the server's log lines carry the same digest (`subject=hmac:<16 hex>`), so a log line and a trace of one user match ([config reference](../reference/config.md#logging)).
 
 ## What never leaves the process
 

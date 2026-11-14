@@ -6,7 +6,8 @@ attenuo does not log users in. It trusts your identity provider (IdP) for that, 
 
 - The config keys, the claim mapping and the error codes below come from the code in `crates/attenuo-server/src/config.rs` and `crates/attenuo-server/src/idp/`. The server's own tests exercise them with locally signed tokens. Config shapes in this guide were parsed by the real server.
 - [examples/idp-exchange-demo](https://github.com/attenuo-dev/attenuo/blob/main/examples/idp-exchange-demo/README.md) runs hop 0 end to end, with the dev mint off: OIDC discovery, the JWKS fetch, an ES256 ID token exchanged at `POST /token`, the replay refusal, then a delegation and two proxied calls. Its identity provider is a local mock, for demonstration only, not a real provider.
-- **No provider-specific setup in this guide was run against a live provider.** Every IdP section is marked **untested**. The issuer formats, claim names and console steps come from the providers' public conventions and may be out of date or wrong for your tenant. Check each against your tenant before relying on it, using [Checking your setup](#checking-your-setup).
+- **Keycloak is the one provider run for real**: Keycloak 26.8.2 in dev mode (`start-dev`: plain HTTP on 127.0.0.1 and the built-in dev database), on 2026-11-14, with [`scripts/live-keycloak-smoke.sh`](https://github.com/attenuo-dev/attenuo/blob/main/scripts/live-keycloak-smoke.sh). The [Keycloak section](#keycloak-tested-2682-dev-mode) says which of its statements that run checked. A production Keycloak (HTTPS, a real database, several nodes) and other Keycloak versions were not tried.
+- **No other provider-specific setup in this guide was run against a live provider.** The Auth0, Okta, Entra ID and Google sections, ID-JAG and SPIRE are marked **untested**. Their issuer formats, claim names and console steps come from the providers' public conventions and may be out of date or wrong for your tenant. Check each against your tenant before relying on it, using [Checking your setup](#checking-your-setup).
 
 ## How hop 0 works
 
@@ -158,26 +159,33 @@ Root tokens last `requested_ttl_seconds`, or `[issuer] default_ttl_seconds` (900
 
 In every recipe, the **client id** is the id of the application the user logs in to; it goes under the agent's name in `client_ids` (these examples use an agent called `planner`). The **issuer** must match the `iss` claim exactly. Replace the placeholders.
 
-### Keycloak (untested)
+### Keycloak (tested: 26.8.2, dev mode)
+
+Run on 2026-11-14 against Keycloak 26.8.2 (`keycloak/keycloak:26.8.2`, `sha256:c68e286cacd87b942ac1939a0a1481461109d6acd3a57dc496969a319a76bbf0`) in `start-dev` mode on 127.0.0.1, by [`scripts/live-keycloak-smoke.sh`](https://github.com/attenuo-dev/attenuo/blob/main/scripts/live-keycloak-smoke.sh). The script sets Keycloak up with `kcadm.sh` as the list below says, logs a test user in with the authorization-code flow (it posts Keycloak's login form as a browser would, so the client needs no direct access grant), and runs attenuo with the recipe below, its issuer replaced by the local `http://127.0.0.1:<port>/realms/acme` (plain `http://` is accepted only for a loopback host). Each statement below says whether that run checked it.
 
 At Keycloak:
 
-- Realm `acme`, an OIDC client (for example `agent-platform`) with the standard flow. Its client id goes in `client_ids`.
-- Client scopes `openid`, `email` and `profile` give `sub`, `email` and the basics.
-- For roles, add a mapper of type "User Realm Role" (or "User Client Role") to the client's dedicated scope with token claim name `roles`, multivalued, "Add to ID token" on. Without this, roles sit in a nested `realm_access.roles` claim that attenuo cannot use.
-- For groups, add a "Group Membership" mapper with claim name `groups` and "Add to ID token" on.
-- Keycloak does not send `amr` in ID tokens by default, to our knowledge. If that is right, `mfa` is always `false` until you add a mapper that emits it. Untested.
+- Realm `acme`, an OIDC client (for example `agent-platform`) with the standard flow; the run used a confidential client. Its client id goes in `client_ids`. Keycloak puts the client id in the ID token's `aud` as a string and in `azp`, which is what attenuo checks; an ID token issued to another client of the realm is refused with `credential_audience_mismatch`. Tested.
+- The login asks for the `openid` scope. The client's default scopes then give `sub` (the `basic` scope), `email` and `email_verified` (`email`), and the name claims (`profile`). There is no client scope called `openid`. Tested.
+- For roles, add a mapper of type "User Realm Role" (or "User Client Role") to the client's dedicated scope with token claim name `roles`, multivalued, "Add to ID token" on. Without it the ID token has no role claim at all: Keycloak's default `roles` scope puts `realm_access.roles` in the access token only. Tested for the realm role mapper; the client role mapper was not run. The claim lists the realm's default roles (`default-roles-acme`, `offline_access`, `uma_authorization`) next to the user's own, and a policy on `roles` saw it (`context.originating_user.attributes.roles.contains(...)`). Keycloak 26.8.2 logs that the client's "Full scope allowed" switch, on by default and what lets every realm role reach the token, is deprecated; with it off, the roles must be in the client's scope. That case was not run.
+- For groups, add a "Group Membership" mapper with claim name `groups` and "Add to ID token" on. Tested: created through the admin API without the "Full group path" option, it gives `["engineering"]`; with that option on, Keycloak sends the path (`/engineering`, not run). The recipe below does not copy `groups`: add it to `attribute_claims`, and declare it in `[policy] user_attributes` if a policy is to read it (not run).
+- Keycloak 26.8.2 does not send `amr` in ID tokens by default. Tested: `mfa` is `false`, and a policy that requires `mfa` denies (`policy_deny`). Keycloak has a mapper of type "Authentication Method Reference (AMR)"; added to the client, it sends `amr: []` until the steps of the login flow carry a reference value. With `pwd` set as the reference of the "Username Password Form" step it sends `["pwd"]`, which does not set `mfa`. Both tested. Setting `otp` (or `mfa`) as the reference of the OTP step, for a user who logs in with a second factor, should give `mfa = true`; not tested.
+- Keycloak signs ID tokens with RS256 by default, which the default `allowed_algs` accepts; the realm's JWKS also carries an `RSA-OAEP` encryption key, which does not get in the way. Tested.
+- Key rotation: after a new RS256 key provider with a higher priority was added to the realm, the next ID token carried the new `kid`, attenuo fetched the JWKS again once (`unknown kid; refetching JWKS` in its log) and accepted the token. Tested, more than 30 seconds after the previous fetch, the floor between early refetches.
+- ID tokens live 300 seconds by default, so a root token from one lives at most 300 seconds. Tested (`expires_in` 300).
 
 At attenuo:
 
 ```toml
 [[idps]]
-issuer = "https://keycloak.example.com/realms/acme"   # older Keycloak: .../auth/realms/acme
+issuer = "https://keycloak.example.com/realms/acme"   # older Keycloak, or --http-relative-path=/auth: .../auth/realms/acme (not tested)
 client_ids = { planner = "agent-platform" }
 attribute_claims = ["email", "roles", "amr"]
 ```
 
-Discovery is at `https://keycloak.example.com/realms/acme/.well-known/openid-configuration`.
+Discovery is at `https://keycloak.example.com/realms/acme/.well-known/openid-configuration`; its `issuer` is the realm URL, byte for byte. Tested over plain HTTP on loopback; Keycloak behind HTTPS was not run.
+
+What the run did with that recipe, all passing: hop 0 with the `curl` command of [Checking your setup](#checking-your-setup) (with `authorization_details`, see there), the same ID token again (`replayed`), `attenuo token inspect --verify` of the root token (issuer, `email`, `roles`, `mfa=false`), hop 0 with the Python SDK (`Client.exchange(id_token, "planner", caps, client_id="planner", client_secret=...)`) and the TypeScript SDK (`AttenuoClient.exchange(idToken, "planner", caps, { clientId, clientSecret })`), each followed by `inspect` with verification, whose header `kid` is the one in the server's JWKS; then a narrowed child exchange with the CLI and calls through the proxy: one allowed, one `capability_denied`, and one `policy_deny` for want of `mfa`; and `attenuo audit verify`. The CLI has no command for hop 0 itself: `attenuo token exchange` sends its subject token as an attenuo token, so an ID token given to it is refused (`invalid_grant`, unknown key id). Use `curl` or an SDK for hop 0.
 
 ### Auth0 (untested)
 
@@ -428,6 +436,8 @@ Before you point an agent at it:
      --data-urlencode subject_token_type=urn:ietf:params:oauth:token-type:id_token \
      --data-urlencode scope='github:read_file'
    ```
+
+   A `scope` string asks for the tool with no constraints. When the `[[root_grants]]` entry has constraints (a repository prefix, say), that is more than the grant allows and is refused with `scope_exceeds_grant`; ask with `authorization_details` and the same constraints instead, as [examples/idp-exchange-demo](https://github.com/attenuo-dev/attenuo/blob/main/examples/idp-exchange-demo/run.sh) does. A request refused this way does not spend the ID token (seen with Keycloak: the same token was accepted after a `scope_exceeds_grant`).
 
 4. Inspect the result. The user block should show the right subject, issuer and attributes:
 
