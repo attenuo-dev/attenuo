@@ -11,6 +11,7 @@
   - [Binding tokens to keys](guides/binding-tokens-to-keys.md)
   - [Admin console](guides/admin-console.md)
   - [Observability](guides/observability.md)
+  - [agentgateway](guides/agentgateway.md)
 - [Demo recordings](demo/README.md)
 
 # Concepts
@@ -46,6 +47,7 @@
 - [Run limits phase 3 (proposed, step 1 built)](design/run-limits-phase3.md)
 - [Read-side exfiltration (proposed, steps 1 and 2 built)](design/read-side-exfiltration.md)
 - [Audit retention (proposed)](design/audit-retention.md)
+- [agentgateway external authorization (built, off by default)](design/agentgateway-ext-authz.md)
 
 # Policy
 

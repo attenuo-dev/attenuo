@@ -101,7 +101,7 @@ attenuo is pre-alpha and has not been used in production. Release 0.1.0 is prepa
 
 ## Where to look
 
-- [Guides](docs/guides/README.md): [getting started](docs/guides/getting-started.md), [deploying](docs/guides/deploying.md), [integrating MCP clients](docs/guides/integrating-mcp-clients.md) and [identity providers](docs/guides/identity-providers.md).
+- [Guides](docs/guides/README.md): [getting started](docs/guides/getting-started.md), [deploying](docs/guides/deploying.md), [integrating MCP clients](docs/guides/integrating-mcp-clients.md), [identity providers](docs/guides/identity-providers.md) and [agentgateway as the enforcement point](docs/guides/agentgateway.md).
 - [FAQ](docs/faq.md): why a proxy, how it differs from gateways and policy engines, what happens when it is down.
 - [Comparison](docs/comparison.md): attenuo next to OAuth scopes, gateways, policy engines, IdP agent features and SPIFFE.
 - [Numbers](docs/numbers.md) and [status](docs/status.md) in full.
