@@ -72,7 +72,7 @@ Yes, in two ways, one of which exists today.
 
 `POST /access/v1/evaluation` is a plain AuthZEN endpoint. Any service that guards its own actions can send it the delegation token and a description of the action, and enforce the true or false that comes back. It uses the same lease check, capability check, Cedar policy and audit log as the MCP path. See [the AuthZEN section of the client guide](guides/integrating-mcp-clients.md#using-the-authzen-endpoint-from-a-non-mcp-pep).
 
-The proxy itself only speaks MCP over Streamable HTTP. Local STDIO MCP servers are not covered. There is no proxy for plain REST or gRPC APIs. If you want one, the AuthZEN endpoint is the building block.
+The proxy itself only speaks MCP over Streamable HTTP. A local STDIO MCP server can be put behind it with `attenuo stdio-bridge`, which runs the server as a child process and serves it over HTTP on loopback; the agent must then not be able to start the server itself, and messages from the server to the client are not passed on ([STDIO MCP servers](guides/stdio-servers.md)). There is no proxy for plain REST or gRPC APIs. If you want one, the AuthZEN endpoint is the building block.
 
 ## Is Cedar required?
 

@@ -7,6 +7,7 @@
 - [Guides](guides/README.md)
   - [Getting started](guides/getting-started.md)
   - [Integrating MCP clients](guides/integrating-mcp-clients.md)
+  - [STDIO MCP servers](guides/stdio-servers.md)
   - [Binding tokens to keys](guides/binding-tokens-to-keys.md)
   - [Admin console](guides/admin-console.md)
   - [Observability](guides/observability.md)

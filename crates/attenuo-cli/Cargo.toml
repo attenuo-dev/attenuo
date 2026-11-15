@@ -21,6 +21,8 @@ attenuo-token = { workspace = true }
 attenuo-audit = { workspace = true }
 attenuo-policy = { workspace = true }
 anyhow = { workspace = true }
+# The HTTP side of `stdio-bridge`; already in the workspace through the server and the proxy.
+axum = { workspace = true }
 base64 = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 hex = { workspace = true }
@@ -33,7 +35,6 @@ tokio = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-axum = { workspace = true }
 attenuo-core = { workspace = true }
 attenuo-server = { path = "../attenuo-server" }
 attenuo-proxy = { workspace = true, features = ["testing"] }

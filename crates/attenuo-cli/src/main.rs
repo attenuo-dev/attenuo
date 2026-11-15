@@ -22,6 +22,7 @@ mod operator_cmd;
 mod policy_cmd;
 mod render;
 mod secrets;
+mod stdio_bridge;
 mod watch;
 
 #[cfg(test)]
@@ -135,6 +136,8 @@ async fn run(cli: Cli) -> Result<Outcome> {
     match cli.command {
         Command::Token(TokenCmd::Inspect(args)) => inspect(client.ok(), args, json).await,
         Command::Health(a) => health(&client?, &a, json).await,
+        // Talks to no attenuo server.
+        Command::StdioBridge(a) => stdio_bridge::run(a).await.map(|()| Outcome::Ok),
         Command::Admin(AdminCmd::Operator(OperatorCmd::New {
             name,
             role,
