@@ -10,6 +10,10 @@
  * else `any`) and must report no error. `@modelcontextprotocol/sdk` is not a dependency of this
  * package, so its imports are typed `any`.
  *
+ * The "Everything the package exports" section of `sdk/typescript/README.md` must list every
+ * name `src/index.ts` exports (values and types), and some code of that README must show every
+ * public method of an exported class.
+ *
  * With `ATTENUO_INTEGRATION=1`, the self-contained snippets (no undeclared names, no local file,
  * no MCP SDK) also run, against a real `attenuo-server` started from `config/example.toml` with
  * `[dev] allow_root_mint = true`, as the repository README starts it, and the fake MCP upstream
@@ -207,6 +211,108 @@ describe("README TypeScript snippets", () => {
       }
     }
     expect(errors, errors.join("\n")).toEqual([]);
+  });
+});
+
+/**
+ * The names `src/index.ts` exports, values and types alike, and the public methods (static ones
+ * too) of the classes among them, as `Class.method`.
+ */
+function publicApi(): { names: string[]; methods: string[] } {
+  const index = join(PKG, "src", "index.ts");
+  const program = ts.createProgram([index], {
+    target: ts.ScriptTarget.ES2022,
+    module: ts.ModuleKind.ESNext,
+    moduleResolution: ts.ModuleResolutionKind.Bundler,
+    strict: true,
+    noEmit: true,
+    skipLibCheck: true,
+  });
+  const checker = program.getTypeChecker();
+  const source = program.getSourceFile(index);
+  const mod = source && checker.getSymbolAtLocation(source);
+  if (!mod) throw new Error(`cannot read the exports of ${index}`);
+  const names: string[] = [];
+  const methods = new Set<string>();
+  for (const sym of checker.getExportsOfModule(mod)) {
+    names.push(sym.name);
+    const target = sym.flags & ts.SymbolFlags.Alias ? checker.getAliasedSymbol(sym) : sym;
+    for (const decl of target.declarations ?? []) {
+      if (!ts.isClassDeclaration(decl)) continue;
+      for (const m of decl.members) {
+        // `#private` names are PrivateIdentifiers, so `isIdentifier` leaves them out.
+        if (!ts.isMethodDeclaration(m) || !ts.isIdentifier(m.name)) continue;
+        const hidden = ts.ModifierFlags.Private | ts.ModifierFlags.Protected;
+        if (ts.getCombinedModifierFlags(m) & hidden) continue;
+        methods.add(`${sym.name}.${m.name.text}`);
+      }
+    }
+  }
+  return { names, methods: [...methods].sort() };
+}
+
+const EXPORTS_SECTION = "## Everything the package exports";
+
+/** The package README's "Everything the package exports" section. */
+function exportsSection(): string {
+  const text = readFileSync(join(PKG, "README.md"), "utf8");
+  const start = text.indexOf(`\n${EXPORTS_SECTION}\n`);
+  if (start < 0) throw new Error(`sdk/typescript/README.md has no "${EXPORTS_SECTION}" section`);
+  const end = text.indexOf("\n## ", start + 1);
+  return text.slice(start, end < 0 ? undefined : end);
+}
+
+/** The package README's fenced blocks and inline code spans, where a method is shown in use. */
+function readmeCode(): string {
+  const text = readFileSync(join(PKG, "README.md"), "utf8");
+  const fence = /^```[\w-]*\n([\s\S]*?)^```/gm;
+  const fenced = [...text.matchAll(fence)].map((m) => m[1] ?? "");
+  const spans = [...text.replace(fence, "").matchAll(/`([^`\n]+)`/g)].map((m) => m[1] ?? "");
+  return [...fenced, ...spans].join("\n");
+}
+
+const escape = (s: string) => s.replace(/[$]/g, "\\$");
+
+describe("README export reference", () => {
+  const api = publicApi();
+
+  it("finds the exports and methods", () => {
+    // A change to how they are found must not make the checks below vacuous.
+    expect(api.names).toEqual(expect.arrayContaining(["AttenuoClient", "Token", "SseParser"]));
+    expect(api.names.length).toBeGreaterThan(exported.size); // the types are counted too
+    expect(api.methods).toEqual(
+      expect.arrayContaining(["AdminClient.operatorsReload", "SseParser.feed", "DpopKey.generate"]),
+    );
+  });
+
+  /** The names in the first column of the section's table (a row may list several). */
+  const rows = () =>
+    [...exportsSection().matchAll(/^\|([^|\n]*)\|/gm)].flatMap((row) =>
+      [...(row[1] ?? "").matchAll(/`([A-Za-z_$][\w$]*)/g)].map((m) => m[1] ?? ""),
+    );
+
+  it("lists every export in the table", () => {
+    const listed = new Set(rows());
+    const missing = api.names.filter((n) => !listed.has(n));
+    expect(missing, `exported but not under "${EXPORTS_SECTION}": ${missing.join(", ")}`).toEqual(
+      [],
+    );
+  });
+
+  it("lists only exports", () => {
+    const listed = rows();
+    expect(listed.length).toBeGreaterThan(0);
+    const stale = listed.filter((n) => !api.names.includes(n));
+    expect(stale, `listed but not exported: ${stale.join(", ")}`).toEqual([]);
+  });
+
+  it("shows every public method in code", () => {
+    const code = readmeCode();
+    const missing = api.methods.filter((cm) => {
+      const m = cm.slice(cm.indexOf(".") + 1);
+      return !new RegExp(`(?<![\\w$])${escape(m)}(?![\\w$])`).test(code);
+    });
+    expect(missing, `public but in no code of the README: ${missing.join(", ")}`).toEqual([]);
   });
 });
 
