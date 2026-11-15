@@ -377,7 +377,7 @@ impl Bridge {
 
     fn debug(&self, line: impl FnOnce() -> String) {
         if self.verbose {
-            eprintln!("stdio-bridge: {}", line());
+            errln!("stdio-bridge: {}", line());
         }
     }
 
@@ -609,7 +609,7 @@ impl Bridge {
         let bytes = match line {
             Line::TooLong { len } => {
                 Counts::bump(&self.counts.long_lines);
-                eprintln!(
+                errln!(
                     "stdio-bridge: dropped a {len}-byte line from the STDIO server (over \
                      --max-line-bytes)"
                 );
@@ -622,7 +622,7 @@ impl Bridge {
         }
         let Ok(msg) = serde_json::from_slice::<Value>(&bytes) else {
             Counts::bump(&self.counts.invalid_lines);
-            eprintln!("stdio-bridge: dropped a line from the STDIO server that is not JSON");
+            errln!("stdio-bridge: dropped a line from the STDIO server that is not JSON");
             return;
         };
         match classify_from_child(&msg) {
@@ -655,7 +655,7 @@ impl Bridge {
             }
             FromChild::Invalid => {
                 Counts::bump(&self.counts.invalid_lines);
-                eprintln!(
+                errln!(
                     "stdio-bridge: dropped a line from the STDIO server that is not a JSON-RPC \
                      message"
                 );
@@ -675,7 +675,7 @@ pub(crate) async fn read_child<R: AsyncBufRead + Unpin>(
             Ok(Some(line)) => bridge.on_line(line),
             Ok(None) => break,
             Err(e) => {
-                eprintln!("stdio-bridge: reading the STDIO server's output failed: {e}");
+                errln!("stdio-bridge: reading the STDIO server's output failed: {e}");
                 break;
             }
         }
@@ -801,7 +801,7 @@ pub(crate) async fn run(args: StdioBridgeArgs) -> Result<()> {
     let server = axum::serve(listener, router(bridge.clone()));
 
     outln!("listening on http://{addr}{PATH}")?;
-    eprintln!(
+    errln!(
         "stdio-bridge: serving the STDIO server `{name}` (pid {}) on http://{addr}{PATH}",
         child.id().map_or_else(|| "?".into(), |p| p.to_string())
     );
@@ -822,7 +822,7 @@ pub(crate) async fn run(args: StdioBridgeArgs) -> Result<()> {
     };
     stop_child(&bridge, &mut child).await;
     if let Some(line) = bridge.counts.summary() {
-        eprintln!("{line}");
+        errln!("{line}");
     }
     reader.abort();
     outcome

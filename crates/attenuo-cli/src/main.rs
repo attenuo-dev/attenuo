@@ -79,17 +79,17 @@ async fn main() -> ExitCode {
         }
     };
     for line in secrets::argv_warnings(std::env::args_os()) {
-        eprintln!("{line}");
+        errln!("{line}");
     }
     for line in cli.resolve_deprecated() {
-        eprintln!("{line}");
+        errln!("{line}");
     }
     match run(cli).await {
         Ok(Outcome::Ok) => ExitCode::SUCCESS,
         Ok(Outcome::No) => ExitCode::from(2),
         Ok(Outcome::Exit(code)) => ExitCode::from(code),
         Err(e) => {
-            eprintln!("error: {e:#}");
+            errln!("error: {e:#}");
             ExitCode::FAILURE
         }
     }
@@ -112,7 +112,7 @@ async fn health(client: &Client, a: &HealthArgs, json: bool) -> Result<Outcome> 
 /// Print an offline command's output and map its status to the exit code.
 fn finish(run: policy_cmd::Run, error: &str) -> Result<Outcome> {
     out!("{}", run.stdout)?;
-    eprint!("{}", run.stderr);
+    err!("{}", run.stderr);
     outcome(run.status, error)
 }
 
@@ -163,7 +163,7 @@ async fn run(cli: Cli) -> Result<Outcome> {
             let token = operator_cmd::generate_token()?;
             let (out, err) = operator_cmd::new_output(&name, role, &token, expires_at, json);
             out!("{out}")?;
-            eprint!("{err}");
+            err!("{err}");
             Ok(Outcome::Ok)
         }
         Command::Admin(AdminCmd::Operator(OperatorCmd::Hash)) => {
@@ -214,7 +214,7 @@ async fn run(cli: Cli) -> Result<Outcome> {
             let client = client?;
             let key = dpop_key::load_opt(a.dpop_key.as_deref())?;
             for w in cli::cap_warnings(&cli::parse_caps(&a.caps)?) {
-                eprintln!("warning: {w}");
+                errln!("warning: {w}");
             }
             let resp = client.root(&a.request_body()?, key.as_ref()).await?;
             print_token(&resp, a.print, json)?;
@@ -261,7 +261,7 @@ async fn run(cli: Cli) -> Result<Outcome> {
             )?;
             let caps = cli::parse_caps(&a.caps)?;
             for w in cli::cap_warnings(&caps) {
-                eprintln!("warning: {w}");
+                errln!("warning: {w}");
             }
             let mut body = json!({
                 "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
@@ -731,14 +731,14 @@ async fn run(cli: Cli) -> Result<Outcome> {
                     out!("{}", watch::CLEAR)?;
                 }
                 out!("{}", run.stdout)?;
-                eprint!("{}", run.stderr);
+                err!("{}", run.stderr);
                 if out::closed() {
                     // The reader has gone (`policy test --watch | head`): end with this run's
                     // status, as without `--watch`.
                     return outcome(run.status, "policy test failed to run");
                 }
                 let t = OffsetDateTime::now_utc();
-                eprintln!(
+                errln!(
                     "[{:02}:{:02}:{:02} UTC] watching {} file(s); Ctrl-C to stop",
                     t.hour(),
                     t.minute(),
@@ -1132,7 +1132,7 @@ async fn budget_refund(
         }
         Err(e) => match refund_refusal(&e, decision_id) {
             Some((code, line)) => {
-                eprintln!("error: {line}");
+                errln!("error: {line}");
                 Ok(Outcome::Exit(code))
             }
             None => Err(e),
@@ -1368,7 +1368,7 @@ fn print_text(t: &PrintedText) -> Result<()> {
         outln!("{line}")?;
     }
     for line in &t.stderr {
-        eprintln!("{line}");
+        errln!("{line}");
     }
     Ok(())
 }

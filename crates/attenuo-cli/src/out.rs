@@ -10,6 +10,12 @@
 //!
 //! Each write is flushed, so an error surfaces at the write that hit it rather than at exit,
 //! where the standard library drops it.
+//!
+//! Standard error has the same layer: `err!` and `errln!` in place of `eprint!` and
+//! `eprintln!`, which panic on a failed write too (`attenuo policy test cases.yaml 2>&1 |
+//! head -1`). A closed reader ends the stderr output quietly; any other stderr write error is
+//! dropped, since there is nowhere left to report it. Neither changes the exit status, and
+//! neither touches stdout's state: stdout and stderr may be different pipes.
 
 use std::fmt;
 use std::io::{self, Write};
@@ -65,6 +71,27 @@ fn settle(res: io::Result<()>) -> Result<()> {
     }
 }
 
+/// Set once a write to standard error found the reader gone.
+static ERR_CLOSED: AtomicBool = AtomicBool::new(false);
+
+/// What `err!` calls. A broken pipe ends stderr output; any other error is dropped.
+pub(crate) fn err_write_fmt(args: fmt::Arguments<'_>) {
+    if ERR_CLOSED.load(Ordering::Relaxed) {
+        return;
+    }
+    let mut stderr = io::stderr().lock();
+    settle_err(stderr.write_fmt(args).and_then(|()| stderr.flush()));
+}
+
+/// A closed reader ends stderr output; any other stderr error has nowhere to go.
+fn settle_err(res: io::Result<()>) {
+    if let Err(e) = res {
+        if e.kind() == io::ErrorKind::BrokenPipe {
+            ERR_CLOSED.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
 /// `print!` that ends quietly when the reader has gone and returns any other write error.
 macro_rules! out {
     ($($arg:tt)*) => {
@@ -79,6 +106,23 @@ macro_rules! outln {
     };
     ($($arg:tt)*) => {
         $crate::out::write_fmt(format_args!("{}\n", format_args!($($arg)*)))
+    };
+}
+
+/// `eprint!` that ends quietly when the reader has gone and never panics on a write error.
+macro_rules! err {
+    ($($arg:tt)*) => {
+        $crate::out::err_write_fmt(format_args!($($arg)*))
+    };
+}
+
+/// `eprintln!` that ends quietly when the reader has gone and never panics on a write error.
+macro_rules! errln {
+    () => {
+        $crate::out::err_write_fmt(format_args!("\n"))
+    };
+    ($($arg:tt)*) => {
+        $crate::out::err_write_fmt(format_args!("{}\n", format_args!($($arg)*)))
     };
 }
 
@@ -97,5 +141,16 @@ mod tests {
             "writing to standard output: no space left on device"
         );
         assert!(!closed());
+    }
+
+    /// Another stderr error is dropped and does not end stderr output; the broken pipe is
+    /// covered by `tests/broken_pipe.rs`, for the same reason as above.
+    #[test]
+    fn another_stderr_write_error_is_dropped() {
+        settle_err(Err(io::Error::new(
+            io::ErrorKind::StorageFull,
+            "no space left on device",
+        )));
+        assert!(!ERR_CLOSED.load(Ordering::Relaxed));
     }
 }
