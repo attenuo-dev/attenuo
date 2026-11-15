@@ -424,7 +424,7 @@ The log the server writes to standard output ([deploying guide](../guides/deploy
 
 ## `[telemetry]`
 
-OpenTelemetry trace export over OTLP/HTTP ([observability guide](../guides/observability.md), [ADR-0012](../decisions/0012-opentelemetry-export.md)). Off by default: with the section absent or `enabled = false` no exporter is built and nothing is inserted on upstream requests. Exported spans carry only allow-listed fields: no token, subject, argument, result, URL or error text. Export fails open: a full queue or a dead collector drops spans (counted in `telemetry_spans_dropped_total` and `telemetry_export_failures_total`) and never delays or changes a decision. An unreachable collector does not stop the server; a malformed section does.
+OpenTelemetry trace export over OTLP/HTTP ([observability guide](../guides/observability.md), [ADR-0012](../decisions/0012-opentelemetry-export.md)). Off by default: with the section absent or `enabled = false` no exporter is built and nothing is inserted on upstream requests. Exported spans carry only allow-listed fields: no token, subject, argument, result, URL or error text. Export fails open: a full queue or a dead collector drops spans (counted in `telemetry_spans_dropped_total` and `telemetry_export_failures_total`) and never delays or changes a decision. An unreachable collector does not stop the server; a malformed section does. A key the section does not have or a value of the wrong type refuses to start in any case, but the checks below that refuse to start (the endpoint, `protocol`, `timeout_seconds`, `[telemetry.metrics] export`, ...) run only when export is on: with `enabled = false`, or with `OTEL_SDK_DISABLED=true`, they are not made.
 
 | Key | Default | Meaning |
 | --- | --- | --- |

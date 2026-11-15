@@ -39,7 +39,7 @@ The assistant delegates to a coder that has its own key. A child of a bound toke
 
 ```sh
 # The assistant, with assistant.jwk:
-attenuo token sign-off --subject-token "$ROOT" --dpop-key assistant.jwk \
+ATTENUO_TOKEN="$ROOT" attenuo token sign-off --dpop-key assistant.jwk \
   --child-jkt "$CODER_JKT" --actor coder > sign-off.txt
 
 # The coder, with coder.jwk and the sign-off:
