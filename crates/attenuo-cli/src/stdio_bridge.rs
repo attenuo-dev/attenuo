@@ -48,7 +48,6 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufRea
 use tokio::sync::oneshot;
 
 use crate::cli::StdioBridgeArgs;
-use crate::secrets;
 
 /// The endpoint path the bridge serves.
 pub(crate) const PATH: &str = "/mcp";
@@ -65,14 +64,24 @@ const INTERNAL_ERROR: i64 = -32603;
 /// How long the child gets to exit after its stdin is closed, before it is killed.
 const STOP_GRACE: Duration = Duration::from_secs(2);
 
-/// attenuo's own credentials, removed from the child's environment: the STDIO server is an
-/// upstream, and upstreams are not trusted with them.
-const SECRET_ENV: &[&str] = &[
-    secrets::ADMIN_TOKEN_ENV,
-    secrets::TOKEN_ENV,
-    secrets::CLIENT_SECRET_ENV,
-    "ATTENUO_DPOP_KEY",
-];
+/// Prefix of the variables removed from the child's environment: attenuo's own credentials
+/// and settings (the CLI's `ATTENUO_ADMIN_TOKEN`, `ATTENUO_TOKEN`, `ATTENUO_CLIENT_SECRET` and
+/// `ATTENUO_DPOP_KEY`, the server's `ATTENUO_AUDIT_SINK_TOKEN`,
+/// `ATTENUO_APPROVAL_NOTIFY_SECRET` and `ATTENUO__*` overrides such as
+/// `ATTENUO__ADMIN__TOKEN`). The STDIO server is an upstream, and upstreams are not trusted
+/// with them (SR-134).
+const SECRET_ENV_PREFIX: &str = "ATTENUO_";
+
+/// The variables of `vars` that the child must not get: every name that starts with
+/// [`SECRET_ENV_PREFIX`].
+pub(crate) fn scrubbed_env(vars: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
+    vars.into_iter()
+        .filter(|name| {
+            name.as_encoded_bytes()
+                .starts_with(SECRET_ENV_PREFIX.as_bytes())
+        })
+        .collect()
+}
 
 // ---------------------------------------------------------------------------------------------
 // Line framing
@@ -771,7 +780,7 @@ pub(crate) async fn run(args: StdioBridgeArgs) -> Result<()> {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
         .kill_on_drop(true);
-    for var in SECRET_ENV {
+    for var in scrubbed_env(std::env::vars_os().map(|(name, _)| name)) {
         cmd.env_remove(var);
     }
     let mut child = cmd
@@ -960,6 +969,29 @@ mod tests {
         );
         assert_eq!(c(json!([{"jsonrpc":"2.0","id":1,"result":{}}])), Invalid);
         assert_eq!(c(json!({"jsonrpc":"2.0","id":1})), Invalid);
+    }
+
+    #[test]
+    fn every_attenuo_variable_is_scrubbed_sr134() {
+        let names = [
+            "ATTENUO_ADMIN_TOKEN",
+            "ATTENUO_TOKEN",
+            "ATTENUO_CLIENT_SECRET",
+            "ATTENUO_DPOP_KEY",
+            "ATTENUO_AUDIT_SINK_TOKEN",
+            "ATTENUO_APPROVAL_NOTIFY_SECRET",
+            "ATTENUO__ADMIN__TOKEN",
+            "ATTENUO__AUDIT__SINK__BEARER_TOKEN",
+            "GITHUB_TOKEN",
+            "PATH",
+            "attenuo_token",
+            "XATTENUO_TOKEN",
+        ];
+        let got = scrubbed_env(names.iter().map(OsString::from));
+        assert_eq!(
+            got,
+            names[..8].iter().map(OsString::from).collect::<Vec<_>>()
+        );
     }
 
     #[test]

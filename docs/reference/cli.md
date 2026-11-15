@@ -569,7 +569,7 @@ attenuo authzen search --upstream github --arg repo=alice/public-docs --all
 
 ### `stdio-bridge --listen ADDR -- <COMMAND>...`
 
-Run a local STDIO MCP server as a child process and serve it as a Streamable HTTP MCP endpoint at `http://ADDR/mcp`, so that it can be an [`[[upstreams]]`](config.md#upstreams) entry of the proxy. The guide is [STDIO MCP servers](../guides/stdio-servers.md). Everything after `--` is the command and its arguments. The child inherits the bridge's environment, minus `ATTENUO_ADMIN_TOKEN`, `ATTENUO_TOKEN`, `ATTENUO_CLIENT_SECRET` and `ATTENUO_DPOP_KEY`. Its stderr goes to the bridge's stderr. Once bound, the bridge prints `listening on http://ADDR/mcp` on stdout.
+Run a local STDIO MCP server as a child process and serve it as a Streamable HTTP MCP endpoint at `http://ADDR/mcp`, so that it can be an [`[[upstreams]]`](config.md#upstreams) entry of the proxy. The guide is [STDIO MCP servers](../guides/stdio-servers.md). Everything after `--` is the command and its arguments. The child inherits the bridge's environment, minus every variable whose name starts with `ATTENUO_` (the CLI's and the server's secrets, and the `ATTENUO__*` configuration overrides). Its stderr goes to the bridge's stderr. Once bound, the bridge prints `listening on http://ADDR/mcp` on stdout.
 
 | Option | Default | Meaning |
 | --- | --- | --- |

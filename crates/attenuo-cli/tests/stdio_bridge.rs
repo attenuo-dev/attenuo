@@ -433,6 +433,34 @@ async fn sigterm_stops_the_bridge_and_its_child() {
     assert!(!alive(&pid), "child {pid} outlived the bridge");
 }
 
+/// SR-134: the child gets no `ATTENUO_*` variable of the bridge's environment, the server's
+/// secrets and `ATTENUO__*` overrides included; other variables pass.
+#[cfg(unix)]
+#[test]
+fn the_child_gets_no_attenuo_variable_sr134() {
+    let out = attenuo()
+        .args(["stdio-bridge", "--listen", "127.0.0.1:0", "--"])
+        .args(["sh", "-c", "env | sort >&2"])
+        .env("ATTENUO_ADMIN_TOKEN", "x")
+        .env("ATTENUO_AUDIT_SINK_TOKEN", "x")
+        .env("ATTENUO_APPROVAL_NOTIFY_SECRET", "x")
+        .env("ATTENUO__ADMIN__TOKEN", "x")
+        .env("ATTENUO__AUDIT__SINK__BEARER_TOKEN", "x")
+        .env("SR134_KEPT", "kept")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    // The child exits at once, and the bridge with it.
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("SR134_KEPT=kept"), "{stderr}");
+    let leaked: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.starts_with("ATTENUO_"))
+        .collect();
+    assert!(leaked.is_empty(), "{leaked:?}");
+}
+
 // -------------------------------------------------------------------------------------------
 // End to end: agent -> attenuo proxy -> bridge -> STDIO server
 // -------------------------------------------------------------------------------------------

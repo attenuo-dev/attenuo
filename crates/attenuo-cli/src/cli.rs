@@ -215,8 +215,8 @@ pub(crate) struct StdioBridgeArgs {
     #[arg(long)]
     pub verbose: bool,
     /// The STDIO server's command and its arguments, after `--`. It inherits the bridge's
-    /// environment, without attenuo's own secrets (`ATTENUO_ADMIN_TOKEN`, `ATTENUO_TOKEN`,
-    /// `ATTENUO_CLIENT_SECRET`, `ATTENUO_DPOP_KEY`).
+    /// environment, without any variable whose name starts with `ATTENUO_` (attenuo's own
+    /// secrets and configuration overrides).
     #[arg(required = true, last = true, num_args = 1.., value_name = "COMMAND", value_parser = clap::value_parser!(std::ffi::OsString))]
     pub command: Vec<std::ffi::OsString>,
 }
