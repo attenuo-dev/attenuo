@@ -2160,10 +2160,8 @@ async fn a_scopes_limit_over_several_grant_capabilities_is_one_budget_sr131() {
             .with_limits(attenuo_core::Limits::default().with_sum("amount", max))
     };
     let h = Harness::start_with(move |cfg| {
-        cfg.root_grants[0].capabilities = vec![
-            CapSpec::Full(to("alice", 50)),
-            CapSpec::Full(to("bob", 50)),
-        ];
+        cfg.root_grants[0].capabilities =
+            vec![CapSpec::Full(to("alice", 50)), CapSpec::Full(to("bob", 50))];
         cfg.idps[0].id_jag_ceiling = Some(IdJagCeilingConfig {
             resources: BTreeMap::new(),
             scopes: BTreeMap::from([(
@@ -2201,7 +2199,9 @@ async fn a_scopes_limit_over_several_grant_capabilities_is_one_budget_sr131() {
     let token = got.1["access_token"].as_str().unwrap();
     assert_eq!(
         caps(&h.verify(token).hops[0].capabilities),
-        [r#"banking:send_money{to={"op":"equals","value":"alice"}} limits={"sum":{"arg":"amount","max":50}}"#]
+        [
+            r#"banking:send_money{to={"op":"equals","value":"alice"}} limits={"sum":{"arg":"amount","max":50}}"#
+        ]
     );
     // Without the scope claim the grant alone decides, as before.
     let jag = jag_with(&h, json!({}));
