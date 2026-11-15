@@ -121,6 +121,37 @@ The run rate fell from about 2,900 a second to 1,100 as the corpus grew to longe
 
 Inputs whose request and claims are over 2 MiB of JSON are skipped. The server refuses a body that large, and the earlier run spent 13 s on one input with a 36 MB request, 2.2 s of it in the narrowing, which grows with the size of the input. Fifteen minutes on one VM shows that the properties hold on what this generator reaches in that time. It does not show that they hold everywhere. The generator decides most of what is reached: the step check was out of reach until the inputs were shaped.
 
+## All targets, 5 minutes each (2026-11-15)
+
+Every target in `cargo fuzz list` (22) was run once on `main` at #339, one at a time, on the 4 vCPU VM used for the runs above: `cargo +nightly fuzz run <target> -s none -- -max_total_time=300 -timeout=20`, each from an empty corpus. No target crashed, timed out or reported a property violation, and no artifact was written. Together they executed 191,805,781 inputs.
+
+| Target | Runs | `cov:` |
+|---|---:|---:|
+| `approval_token` | 234,490 | 4,531 |
+| `audit_export_bytes` | 21,321,638 | 1,125 |
+| `audit_export_mutated` | 714,525 | 3,025 |
+| `budget_plan` | 104,664 | 3,437 |
+| `capability_attenuate_root` | 831,065 | 4,040 |
+| `capability_attenuation` | 1,927,373 | 1,953 |
+| `capability_prepared` | 565,240 | 4,569 |
+| `chain_validate` | 38,409,186 | 1,822 |
+| `dpop_proof` | 2,548,945 | 1,767 |
+| `idjag_ceiling` | 444,950 | 5,943 |
+| `limits_charges` | 261,951 | 4,406 |
+| `names` | 57,256,050 | 155 |
+| `ou_sig` | 836,829 | 2,478 |
+| `policy_context` | 491,738 | 6,904 |
+| `policy_usage` | 251,958 | 8,247 |
+| `proxy_jsonrpc` | 746,142 | 9,020 |
+| `proxy_sse` | 3,829,163 | 1,827 |
+| `server_http` | 277,077 | 24,625 |
+| `sse_framer_rewriter` | 1,556,131 | 2,218 |
+| `sse_parse_data` | 13,857,804 | 1,724 |
+| `token_verify_bytes` | 45,294,456 | 1,123 |
+| `token_verify_mutated` | 44,406 | 4,127 |
+
+Five minutes from an empty corpus is a smoke run: it shows that nothing shallow broke in the targets' reach after the changes of 14 November, and nothing more. The slow targets (`token_verify_mutated`, `budget_plan`, `approval_token`) got the fewest inputs.
+
 ## Limits
 
 - Two minutes per target on a busy machine is a smoke test, not a campaign, and ten minutes (second campaign) is a short one. The corpora are not kept in the repository; a long run should start from `seed_corpus` and keep its corpus.
