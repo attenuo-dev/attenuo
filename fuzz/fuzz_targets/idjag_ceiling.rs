@@ -136,6 +136,9 @@ const S_FREE_SERVERS: &[&str] = &["a", "ab", "g0", "g1"];
 
 #[derive(Debug)]
 struct Input {
+    /// Whether the generator used the mode without overlapping limited capabilities. Read
+    /// only by `Debug`, in a crash report: the properties hold in either mode (SR-131).
+    #[allow(dead_code)]
     disjoint: bool,
     grant: CapabilitySet,
     cfg: IdJagCeilingConfig,
