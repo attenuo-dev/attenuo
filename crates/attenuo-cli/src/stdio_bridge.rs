@@ -800,7 +800,7 @@ pub(crate) async fn run(args: StdioBridgeArgs) -> Result<()> {
     let mut reader = tokio::spawn(read_child(bridge.clone(), BufReader::new(stdout), max_line));
     let server = axum::serve(listener, router(bridge.clone()));
 
-    println!("listening on http://{addr}{PATH}");
+    outln!("listening on http://{addr}{PATH}")?;
     eprintln!(
         "stdio-bridge: serving the STDIO server `{name}` (pid {}) on http://{addr}{PATH}",
         child.id().map_or_else(|| "?".into(), |p| p.to_string())

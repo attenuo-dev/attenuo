@@ -7,10 +7,16 @@
 //! be told from one that found nothing to refund (2).
 //! `health` exits 1, never 2, when the server is not healthy (Docker reserves 2 in a
 //! `HEALTHCHECK`).
+//! A reader that closes stdout early (`| head`) changes none of these: the output stops and
+//! nothing goes to stderr (`out.rs`).
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 #![warn(unreachable_pub)]
+
+// First, so its `out!` and `outln!` are in scope in the modules after it.
+#[macro_use]
+mod out;
 
 mod cli;
 mod client;
@@ -96,26 +102,31 @@ async fn health(client: &Client, a: &HealthArgs, json: bool) -> Result<Outcome> 
         .await?;
     let (line, body) = health::judge(a.ready, status, &body).map_err(|e| anyhow::anyhow!(e))?;
     if json {
-        print_json(&body);
+        print_json(&body)?;
     } else {
-        println!("{line}");
+        outln!("{line}")?;
     }
     Ok(Outcome::Ok)
 }
 
 /// Print an offline command's output and map its status to the exit code.
 fn finish(run: policy_cmd::Run, error: &str) -> Result<Outcome> {
-    print!("{}", run.stdout);
+    out!("{}", run.stdout)?;
     eprint!("{}", run.stderr);
-    match run.status {
+    outcome(run.status, error)
+}
+
+/// The exit code for an offline command's status.
+fn outcome(status: policy_cmd::Status, error: &str) -> Result<Outcome> {
+    match status {
         policy_cmd::Status::Ok => Ok(Outcome::Ok),
         policy_cmd::Status::Failed => Ok(Outcome::No),
         policy_cmd::Status::Error => Err(anyhow::anyhow!("{error}")),
     }
 }
 
-fn print_json(v: &Value) {
-    println!("{}", serde_json::to_string_pretty(v).unwrap_or_default());
+fn print_json(v: &Value) -> Result<()> {
+    outln!("{}", serde_json::to_string_pretty(v).unwrap_or_default())
 }
 
 async fn run(cli: Cli) -> Result<Outcome> {
@@ -151,13 +162,13 @@ async fn run(cli: Cli) -> Result<Outcome> {
             let expires_at = expires_at.map(|t| t.replace_nanosecond(0).unwrap_or(t));
             let token = operator_cmd::generate_token()?;
             let (out, err) = operator_cmd::new_output(&name, role, &token, expires_at, json);
-            print!("{out}");
+            out!("{out}")?;
             eprint!("{err}");
             Ok(Outcome::Ok)
         }
         Command::Admin(AdminCmd::Operator(OperatorCmd::Hash)) => {
             let token = stdin.secret("operator token", std::io::stdin().lock())?;
-            print!("{}", operator_cmd::hash_output(&token, json));
+            out!("{}", operator_cmd::hash_output(&token, json))?;
             Ok(Outcome::Ok)
         }
         Command::Key(KeyCmd::Gen {
@@ -165,10 +176,10 @@ async fn run(cli: Cli) -> Result<Outcome> {
         }) => {
             let key = dpop_key::generate(&dpop)?;
             if json {
-                print_json(&json!({"path": dpop, "jkt": key.thumbprint(), "alg": key.alg()}));
+                print_json(&json!({"path": dpop, "jkt": key.thumbprint(), "alg": key.alg()}))?;
             } else {
-                println!("wrote DPoP key {} ({})", dpop.display(), key.alg());
-                println!("jkt  {}", key.thumbprint());
+                outln!("wrote DPoP key {} ({})", dpop.display(), key.alg())?;
+                outln!("jkt  {}", key.thumbprint())?;
             }
             Ok(Outcome::Ok)
         }
@@ -183,15 +194,15 @@ async fn run(cli: Cli) -> Result<Outcome> {
                 print_json(&json!({
                     "path": path, "kid": kid, "alg": key.alg(),
                     "jwk": client_key::public_jwk(&key, &kid),
-                }));
+                }))?;
             } else {
-                println!(
+                outln!(
                     "wrote client key {} ({}, kid {kid})",
                     path.display(),
                     key.alg()
-                );
-                println!("add to the agent's [[agents]] (or the PEP's [[peps]]) entry:");
-                println!("{jwks}");
+                )?;
+                outln!("add to the agent's [[agents]] (or the PEP's [[peps]]) entry:")?;
+                outln!("{jwks}")?;
             }
             Ok(Outcome::Ok)
         }
@@ -206,7 +217,7 @@ async fn run(cli: Cli) -> Result<Outcome> {
                 eprintln!("warning: {w}");
             }
             let resp = client.root(&a.request_body()?, key.as_ref()).await?;
-            print_token(&resp, a.print, json);
+            print_token(&resp, a.print, json)?;
             Ok(Outcome::Ok)
         }
         Command::Token(TokenCmd::SignOff(a)) => {
@@ -225,9 +236,9 @@ async fn run(cli: Cli) -> Result<Outcome> {
                 &a.actor,
             )?;
             if json {
-                print_json(&json!({"subject_token_dpop": proof}));
+                print_json(&json!({"subject_token_dpop": proof}))?;
             } else {
-                println!("{proof}");
+                outln!("{proof}")?;
             }
             Ok(Outcome::Ok)
         }
@@ -339,7 +350,7 @@ async fn run(cli: Cli) -> Result<Outcome> {
             }
             // The header proof is made again, with the server's nonce, if it asks for one.
             let resp = client.exchange(&body, |nonce| Ok(proofs(nonce)?.0)).await?;
-            print_token(&resp, a.print, json);
+            print_token(&resp, a.print, json)?;
             Ok(Outcome::Ok)
         }
         Command::Call(a) => {
@@ -362,7 +373,7 @@ async fn run(cli: Cli) -> Result<Outcome> {
                     json!({"name": a.tool, "arguments": args}),
                 )
                 .await?;
-            Ok(print_call(&resp, json))
+            print_call(&resp, json)
         }
         Command::Tools(a) => {
             let upstream = a.upstream().to_string();
@@ -377,7 +388,7 @@ async fn run(cli: Cli) -> Result<Outcome> {
             let resp = client
                 .mcp(&token, key.as_ref(), &upstream, "tools/list", json!({}))
                 .await?;
-            Ok(print_tools(&resp, json))
+            print_tools(&resp, json)
         }
         Command::Lease(LeaseCmd::Revoke {
             id: None,
@@ -405,9 +416,9 @@ async fn run(cli: Cli) -> Result<Outcome> {
             };
             let resp = client?.admin_post(path, &body).await?;
             if json {
-                print_json(&resp);
+                print_json(&resp)?;
             } else {
-                print!("{}", render::render_selector_revocation(&resp));
+                out!("{}", render::render_selector_revocation(&resp))?;
             }
             Ok(Outcome::Ok)
         }
@@ -427,14 +438,14 @@ async fn run(cli: Cli) -> Result<Outcome> {
                 )
                 .await?;
             if json {
-                print_json(&resp);
+                print_json(&resp)?;
             } else {
-                println!(
+                outln!(
                     "revoked {} lease(s) starting at {} (reason: {})",
                     resp["revoked"],
                     resp["lease_id"].as_str().unwrap_or(&id),
                     resp["reason"].as_str().unwrap_or("-")
-                );
+                )?;
             }
             Ok(Outcome::Ok)
         }
@@ -492,9 +503,9 @@ async fn run(cli: Cli) -> Result<Outcome> {
                 }
             };
             if json {
-                print_json(&resp);
+                print_json(&resp)?;
             } else {
-                print!("{}", render::render_approvals(&resp, &flags));
+                out!("{}", render::render_approvals(&resp, &flags))?;
             }
             Ok(Outcome::Ok)
         }
@@ -503,9 +514,9 @@ async fn run(cli: Cli) -> Result<Outcome> {
                 .admin_get(&format!("/admin/approvals/{}", query_escape(&id)))
                 .await?;
             if json {
-                print_json(&resp);
+                print_json(&resp)?;
             } else {
-                print!("{}", render::render_approval(&resp));
+                out!("{}", render::render_approval(&resp))?;
             }
             Ok(Outcome::Ok)
         }
@@ -525,18 +536,18 @@ async fn run(cli: Cli) -> Result<Outcome> {
                 .admin_get(&format!("/admin/leases/{}", query_escape(&id)))
                 .await?;
             if json {
-                print_json(&resp);
+                print_json(&resp)?;
             } else {
                 let s = |k: &str| resp[k].as_str().unwrap_or("-").to_string();
-                println!("lease    {}", s("lease_id"));
-                println!(
+                outln!("lease    {}", s("lease_id"))?;
+                outln!(
                     "active   {}",
                     if resp["active"] == true { "yes" } else { "no" }
-                );
-                println!("parent   {}", s("parent"));
-                println!("expires  {}", s("expires_at"));
+                )?;
+                outln!("parent   {}", s("parent"))?;
+                outln!("expires  {}", s("expires_at"))?;
                 if !resp["revoked_at"].is_null() {
-                    println!("revoked  {} ({})", s("revoked_at"), s("revoke_reason"));
+                    outln!("revoked  {} ({})", s("revoked_at"), s("revoke_reason"))?;
                 }
             }
             Ok(Outcome::Ok)
@@ -548,9 +559,9 @@ async fn run(cli: Cli) -> Result<Outcome> {
             }
             let resp = client?.admin_get(&path).await?;
             if json {
-                print_json(&resp);
+                print_json(&resp)?;
             } else {
-                print!("{}", render::render_lease_tree(&resp));
+                out!("{}", render::render_lease_tree(&resp))?;
             }
             Ok(Outcome::Ok)
         }
@@ -569,9 +580,9 @@ async fn run(cli: Cli) -> Result<Outcome> {
             };
             let resp = client?.admin_get(&path).await?;
             if json {
-                print_json(&resp);
+                print_json(&resp)?;
             } else {
-                print!("{}", render::render_entry_view(&resp));
+                out!("{}", render::render_entry_view(&resp))?;
             }
             Ok(Outcome::Ok)
         }
@@ -590,10 +601,10 @@ async fn run(cli: Cli) -> Result<Outcome> {
             }
             let resp = client?.admin_get(&path).await?;
             if json {
-                print_json(&resp);
+                print_json(&resp)?;
             } else {
                 let flags = render::repeat_flags(&[("--limit", limit.map(|l| l.to_string()))]);
-                print!("{}", render::render_checkpoints(&resp, &flags));
+                out!("{}", render::render_checkpoints(&resp, &flags))?;
             }
             Ok(Outcome::Ok)
         }
@@ -638,10 +649,10 @@ async fn run(cli: Cli) -> Result<Outcome> {
             let resp = client?.admin_get("/admin/audit/verify").await?;
             let ok = resp["ok"] == true;
             if json {
-                print_json(&resp);
+                print_json(&resp)?;
             } else {
                 for line in verify_lines(&resp) {
-                    println!("{line}");
+                    outln!("{line}")?;
                 }
             }
             Ok(if ok { Outcome::Ok } else { Outcome::No })
@@ -717,10 +728,15 @@ async fn run(cli: Cli) -> Result<Outcome> {
                 let seen = watch::Snapshot::take(&paths);
                 let run = run_once().await;
                 if !json {
-                    print!("{}", watch::CLEAR);
+                    out!("{}", watch::CLEAR)?;
                 }
-                print!("{}", run.stdout);
+                out!("{}", run.stdout)?;
                 eprint!("{}", run.stderr);
+                if out::closed() {
+                    // The reader has gone (`policy test --watch | head`): end with this run's
+                    // status, as without `--watch`.
+                    return outcome(run.status, "policy test failed to run");
+                }
                 let t = OffsetDateTime::now_utc();
                 eprintln!(
                     "[{:02}:{:02}:{:02} UTC] watching {} file(s); Ctrl-C to stop",
@@ -757,18 +773,18 @@ async fn run(cli: Cli) -> Result<Outcome> {
         Command::Policy(PolicyCmd::Show) => {
             let resp = client?.admin_get("/admin/policies").await?;
             if json {
-                print_json(&resp);
+                print_json(&resp)?;
             } else {
-                print!("{}", render::render_policies(&resp));
+                out!("{}", render::render_policies(&resp))?;
             }
             Ok(Outcome::Ok)
         }
         Command::Policy(PolicyCmd::Check) => {
             let resp = client?.admin_get("/admin/policies/check").await?;
             if json {
-                print_json(&resp);
+                print_json(&resp)?;
             } else {
-                print!("{}", render::render_policy_check(&resp));
+                out!("{}", render::render_policy_check(&resp))?;
             }
             Ok(if resp["ok"] == true {
                 Outcome::Ok
@@ -781,9 +797,9 @@ async fn run(cli: Cli) -> Result<Outcome> {
             let body = evaluate_body(&a, &mut stdin)?;
             let resp = client.admin_post("/admin/policies/evaluate", &body).await?;
             if json {
-                print_json(&resp);
+                print_json(&resp)?;
             } else {
-                print!("{}", render::render_evaluation(&resp));
+                out!("{}", render::render_evaluation(&resp))?;
             }
             Ok(if resp["decision"] == "allow" {
                 Outcome::Ok
@@ -796,9 +812,9 @@ async fn run(cli: Cli) -> Result<Outcome> {
                 .admin_post("/admin/operators/reload", &json!({}))
                 .await?;
             if json {
-                print_json(&resp);
+                print_json(&resp)?;
             } else {
-                print!("{}", operator_cmd::reload_output(&resp));
+                out!("{}", operator_cmd::reload_output(&resp))?;
             }
             Ok(Outcome::Ok)
         }
@@ -807,15 +823,15 @@ async fn run(cli: Cli) -> Result<Outcome> {
                 .admin_post("/admin/policies/reload", &json!({}))
                 .await?;
             if json {
-                print_json(&resp);
+                print_json(&resp)?;
             } else {
                 let ids = resp["policy_ids"].as_array().cloned().unwrap_or_default();
-                println!("reloaded {} policies", ids.len());
+                outln!("reloaded {} policies", ids.len())?;
                 for id in ids {
-                    println!("  {}", id.as_str().unwrap_or_default());
+                    outln!("  {}", id.as_str().unwrap_or_default())?;
                 }
                 for w in resp["warnings"].as_array().into_iter().flatten() {
-                    println!("warning: {}", w.as_str().unwrap_or_default());
+                    outln!("warning: {}", w.as_str().unwrap_or_default())?;
                 }
             }
             Ok(Outcome::Ok)
@@ -847,15 +863,15 @@ async fn run(cli: Cli) -> Result<Outcome> {
             let resp = client.authzen(&token, &req, key.as_ref()).await?;
             let allow = resp["decision"] == true;
             if json {
-                print_json(&resp);
+                print_json(&resp)?;
             } else {
                 let ctx = &resp["context"];
-                println!(
+                outln!(
                     "{}  {}",
                     if allow { "ALLOW" } else { "DENY" },
                     ctx["reason"].as_str().unwrap_or("-")
-                );
-                println!("decision {}", ctx["decision_id"].as_str().unwrap_or("-"));
+                )?;
+                outln!("decision {}", ctx["decision_id"].as_str().unwrap_or("-"))?;
                 let pols: Vec<&str> = ctx["policy_ids"]
                     .as_array()
                     .into_iter()
@@ -863,7 +879,7 @@ async fn run(cli: Cli) -> Result<Outcome> {
                     .filter_map(Value::as_str)
                     .collect();
                 if !pols.is_empty() {
-                    println!("policies {}", pols.join(", "));
+                    outln!("policies {}", pols.join(", "))?;
                 }
             }
             Ok(if allow { Outcome::Ok } else { Outcome::No })
@@ -916,20 +932,20 @@ async fn run(cli: Cli) -> Result<Outcome> {
                 print_json(&json!({
                     "page": {"next_token": next.clone().unwrap_or_default(), "count": results.len()},
                     "results": results,
-                }));
+                }))?;
             } else {
                 for r in &results {
-                    println!(
+                    outln!(
                         "{}/{}",
                         r["properties"]["server"].as_str().unwrap_or(&server),
                         r["name"].as_str().unwrap_or("-")
-                    );
+                    )?;
                 }
                 if results.is_empty() {
-                    println!("no permitted tools on this page");
+                    outln!("no permitted tools on this page")?;
                 }
                 if let Some(t) = next {
-                    println!("next page: --page-token {t}");
+                    outln!("next page: --page-token {t}")?;
                 }
             }
             Ok(Outcome::Ok)
@@ -1000,20 +1016,21 @@ fn evaluate_body(a: &cli::EvaluateArgs, stdin: &mut secrets::Stdin) -> Result<Va
     Ok(req)
 }
 
-fn print_token(resp: &Value, only: Option<Field>, json: bool) {
+fn print_token(resp: &Value, only: Option<Field>, json: bool) -> Result<()> {
     match only {
-        Some(Field::Token) => println!("{}", resp["access_token"].as_str().unwrap_or_default()),
-        Some(Field::Lease) => println!("{}", resp["lease"].as_str().unwrap_or_default()),
-        None if json => print_json(resp),
+        Some(Field::Token) => outln!("{}", resp["access_token"].as_str().unwrap_or_default())?,
+        Some(Field::Lease) => outln!("{}", resp["lease"].as_str().unwrap_or_default())?,
+        None if json => print_json(resp)?,
         None => {
-            println!("lease       {}", resp["lease"].as_str().unwrap_or("-"));
-            println!("expires_in  {}s", resp["expires_in"]);
-            println!(
+            outln!("lease       {}", resp["lease"].as_str().unwrap_or("-"))?;
+            outln!("expires_in  {}s", resp["expires_in"])?;
+            outln!(
                 "token       {}",
                 resp["access_token"].as_str().unwrap_or("-")
-            );
+            )?;
         }
     }
+    Ok(())
 }
 
 async fn inspect(client: Option<Client>, args: cli::InspectArgs, json: bool) -> Result<Outcome> {
@@ -1046,38 +1063,38 @@ async fn inspect(client: Option<Client>, args: cli::InspectArgs, json: bool) -> 
             "claims": decoded.claims_json,
             "verified": verified,
             "verify_error": verdict.as_ref().and_then(|v| v.as_ref().err()).map(|e| e.to_string()),
-        }));
+        }))?;
     } else {
         let c = &decoded.claims;
-        print!("{}", render::render_chain_tree(&c.chain, now));
-        println!();
-        println!("iss {}   aud {}   jti {}", c.iss, c.aud, c.jti);
+        out!("{}", render::render_chain_tree(&c.chain, now))?;
+        outln!()?;
+        outln!("iss {}   aud {}   jti {}", c.iss, c.aud, c.jti)?;
         if let Some(kids) = render::fmt_kids(decoded.header["kid"].as_str(), Some(&c.ou_kid)) {
-            println!("{kids}");
+            outln!("{kids}")?;
         }
         if let Ok(exp) = OffsetDateTime::from_unix_timestamp(c.exp) {
-            println!(
+            outln!(
                 "exp {} ({})",
                 render::fmt_time(exp),
                 render::fmt_relative(exp, now)
-            );
+            )?;
         }
         // With --verify, `may_act` is read from the verified claims: the signature covers it.
         let may_act = match &verdict {
             Some(Ok(v)) => v.claims.may_act.as_ref(),
             _ => c.may_act.as_ref(),
         };
-        println!("{}", render::fmt_may_act(may_act));
+        outln!("{}", render::fmt_may_act(may_act))?;
         if let Some(cnf) = &c.cnf {
-            println!(
+            outln!(
                 "bound to DPoP key jkt {} (needs a proof by that key)",
                 cnf.jkt
-            );
+            )?;
         }
         match &verdict {
-            None => println!("signature NOT verified (decoded only; pass --verify to check it)"),
-            Some(Ok(_)) => println!("verified: signature, type, issuer, audience, expiry, chain"),
-            Some(Err(e)) => println!("verification FAILED: {e}"),
+            None => outln!("signature NOT verified (decoded only; pass --verify to check it)")?,
+            Some(Ok(_)) => outln!("verified: signature, type, issuer, audience, expiry, chain")?,
+            Some(Err(e)) => outln!("verification FAILED: {e}")?,
         }
     }
     match verdict {
@@ -1107,9 +1124,9 @@ async fn budget_refund(
     match client.admin_post("/admin/budgets/refund", &body).await {
         Ok(resp) => {
             if json {
-                print_json(&resp);
+                print_json(&resp)?;
             } else {
-                print!("{}", render::render_refund(&resp));
+                out!("{}", render::render_refund(&resp))?;
             }
             Ok(Outcome::Ok)
         }
@@ -1169,9 +1186,9 @@ async fn approval_decide(client: &Client, id: &str, decision: &str, json: bool) 
         )
         .await?;
     if json {
-        print_json(&resp);
+        print_json(&resp)?;
     } else {
-        print!("{}", render::render_approval(&resp));
+        out!("{}", render::render_approval(&resp))?;
     }
     Ok(Outcome::Ok)
 }
@@ -1234,7 +1251,7 @@ async fn approval_verify(
             "claims": claims,
             "valid": verdict.is_ok(),
             "error": error,
-        }));
+        }))?;
     } else {
         let s = |k: &str| claims[k].as_str().unwrap_or("-").to_string();
         let exp = claims["exp"]
@@ -1245,20 +1262,20 @@ async fn approval_verify(
                     .ok()
             })
             .unwrap_or_else(|| "-".into());
-        println!("approval  {}", s("jti"));
-        println!("by        {} ({})", s("sub"), s("by"));
-        println!("chain_id  {}", s("chain_id"));
-        println!("lease     {}", s("lease"));
-        println!("call hash {}", s("ch"));
-        println!("expires   {exp}");
-        println!(
+        outln!("approval  {}", s("jti"))?;
+        outln!("by        {} ({})", s("sub"), s("by"))?;
+        outln!("chain_id  {}", s("chain_id"))?;
+        outln!("lease     {}", s("lease"))?;
+        outln!("call hash {}", s("ch"))?;
+        outln!("expires   {exp}")?;
+        outln!(
             "cnf.jkt   {}",
             claims["cnf"]["jkt"].as_str().unwrap_or("- (bearer hop)")
-        );
-        println!("iss {}   aud {}", s("iss"), s("aud"));
+        )?;
+        outln!("iss {}   aud {}", s("iss"), s("aud"))?;
         match &error {
-            None => println!("VALID (signature, typ, iss, aud, exp and the given binding)"),
-            Some(e) => println!("INVALID: {e}"),
+            None => outln!("VALID (signature, typ, iss, aud, exp and the given binding)")?,
+            Some(e) => outln!("INVALID: {e}")?,
         }
     }
     Ok(if verdict.is_ok() {
@@ -1268,13 +1285,13 @@ async fn approval_verify(
     })
 }
 
-fn print_call(resp: &Value, json: bool) -> Outcome {
+fn print_call(resp: &Value, json: bool) -> Result<Outcome> {
     if json {
-        print_json(resp);
-        return call_outcome(resp);
+        print_json(resp)?;
+        return Ok(call_outcome(resp));
     }
-    print_text(&call_text(resp));
-    call_outcome(resp)
+    print_text(&call_text(resp))?;
+    Ok(call_outcome(resp))
 }
 
 /// `call`'s exit outcome: no for a JSON-RPC error (a denial, an approval to wait for, or any
@@ -1346,22 +1363,23 @@ struct PrintedText {
     stderr: Vec<String>,
 }
 
-fn print_text(t: &PrintedText) {
+fn print_text(t: &PrintedText) -> Result<()> {
     for line in &t.stdout {
-        println!("{line}");
+        outln!("{line}")?;
     }
     for line in &t.stderr {
         eprintln!("{line}");
     }
+    Ok(())
 }
 
-fn print_tools(resp: &Value, json: bool) -> Outcome {
+fn print_tools(resp: &Value, json: bool) -> Result<Outcome> {
     if json {
-        print_json(resp);
+        print_json(resp)?;
     } else {
-        print_text(&tools_text(resp));
+        print_text(&tools_text(resp))?;
     }
-    call_outcome(resp)
+    Ok(call_outcome(resp))
 }
 
 /// What `tools` prints without `--json`. Names and descriptions are the upstream MCP server's
@@ -1466,12 +1484,16 @@ async fn audit_export(
         Some(p) => Box::new(std::io::BufWriter::new(
             std::fs::File::create(p).with_context(|| format!("creating {}", p.display()))?,
         )),
-        None => Box::new(std::io::stdout().lock()),
+        None => Box::new(std::io::BufWriter::new(out::Stdout)),
     };
     match format {
         ExportFormat::Jsonl => {
+            // Stop reading once the reader of stdout has gone (`audit export | head`).
             while let Some(chunk) = resp.chunk().await? {
                 sink.write_all(&chunk)?;
+                if out::closed() {
+                    break;
+                }
             }
         }
         ExportFormat::Json => {
@@ -1523,14 +1545,14 @@ async fn audit_verify_file(
         v["ok"] = json!(ok);
     }
     if json {
-        print_json(&v);
+        print_json(&v)?;
     } else {
         for line in export_lines(&v) {
-            println!("{line}");
+            outln!("{line}")?;
         }
         if v.get("shipped").is_some() {
             for line in shipped_lines(&v["shipped"]) {
-                println!("{line}");
+                outln!("{line}")?;
             }
         }
     }
@@ -1624,9 +1646,9 @@ async fn audit_tail(
 ) -> Result<Outcome> {
     let show = |e: &Value| {
         if json {
-            println!("{e}");
+            outln!("{e}")
         } else {
-            println!("{}", fmt_audit_entry(e));
+            outln!("{}", fmt_audit_entry(e))
         }
     };
     let q = filter.query();
@@ -1661,7 +1683,7 @@ async fn audit_tail(
         }
     }
     for e in newest_first.iter().rev() {
-        show(e);
+        show(e)?;
     }
     if !follow {
         return Ok(Outcome::Ok);
@@ -1670,7 +1692,8 @@ async fn audit_tail(
     // `--follow`), so everything after it is new.
     let mut from = head.unwrap_or(0) + 1;
     let mut cursor: Option<String> = None;
-    loop {
+    // Until the reader goes away (`audit tail -f | head`): the first write after that ends it.
+    while !out::closed() {
         let mut path = format!("/admin/audit?from={from}&limit={MAX_AUDIT_PAGE}{q}");
         if let Some(c) = &cursor {
             path.push_str(&format!("&cursor={}", query_escape(c)));
@@ -1678,7 +1701,7 @@ async fn audit_tail(
         let page = client.admin_get(&path).await?;
         let mut last = None;
         for e in page["entries"].as_array().into_iter().flatten() {
-            show(e);
+            show(e)?;
             last = e["seq"].as_u64().or(last);
         }
         match page["next_cursor"].as_str() {
@@ -1695,6 +1718,7 @@ async fn audit_tail(
             }
         }
     }
+    Ok(Outcome::Ok)
 }
 
 #[cfg(test)]
@@ -1879,18 +1903,18 @@ mod tests {
         let denied = json!({"jsonrpc": "2.0", "id": 1, "error": {
             "code": -32003, "message": "attenuo: denied: policy_deny",
             "data": {"reason": "policy_deny", "decision_id": "d1"}}});
-        assert_eq!(print_call(&denied, false), Outcome::No);
+        assert_eq!(print_call(&denied, false).unwrap(), Outcome::No);
         let ok = json!({"jsonrpc": "2.0", "id": 1, "result": {
             "content": [{"type": "text", "text": "hi"}], "isError": false}});
-        assert_eq!(print_call(&ok, false), Outcome::Ok);
+        assert_eq!(print_call(&ok, false).unwrap(), Outcome::Ok);
     }
 
     #[test]
     fn tools_list_prints_or_fails() {
         let ok = json!({"result": {"tools": [{"name": "read_file", "description": "d"}]}});
-        assert_eq!(print_tools(&ok, false), Outcome::Ok);
+        assert_eq!(print_tools(&ok, false).unwrap(), Outcome::Ok);
         assert_eq!(
-            print_tools(&json!({"error": {"code": -1}}), false),
+            print_tools(&json!({"error": {"code": -1}}), false).unwrap(),
             Outcome::No
         );
     }
@@ -1943,7 +1967,7 @@ mod tests {
             let resp = json!({"jsonrpc": "2.0", "id": 1, "error": err});
             no_controls(&call_text(&resp), &[]);
             no_controls(&tools_text(&resp), &[]);
-            assert_eq!(print_call(&resp, true), Outcome::No);
+            assert_eq!(print_call(&resp, true).unwrap(), Outcome::No);
         }
         assert_eq!(
             call_text(&json!({"error": {"code": -32000, "message": "x\u{1b}"}})).stderr,
