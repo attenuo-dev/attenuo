@@ -388,7 +388,7 @@ const SPLIT_OF_THE_CLAIMS: &str = "two requested capabilities take their limits 
 
 /// The `detail` of a `limit_conflict_at_root` refusal at the ceiling when the capability cannot
 /// be named as requested.
-const CONFLICT_OF_THE_CLAIMS: &str = "a requested capability is under several limited \
+const CONFLICT_OF_THE_CLAIMS: &str = "a requested capability is under one or more limited \
      capabilities of the ID-JAG's claims whose limits one capability cannot carry together";
 
 /// What [`narrow`] gives: the root token's capabilities and, under `[idps.id_jag_ceiling]`,
