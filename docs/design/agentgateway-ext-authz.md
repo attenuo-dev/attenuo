@@ -1,6 +1,6 @@
 # agentgateway external authorization: design
 
-- Status: built, off by default (this PR). Not run against a real agentgateway.
+- Status: built, off by default (#349). Not run against a real agentgateway.
 - Date: 2026-11-15. Base: `main` at 18c6348.
 - Related: [guide](../guides/agentgateway.md), [enforcement points](../concepts/enforcement-points.md), [server pipeline](server.md#the-decision-pipeline), [AuthZEN conformance](../reference/authzen.md), [output labelling](output-labelling.md), [threat model](../spec/threat-model.md).
 
