@@ -272,8 +272,14 @@ impl Counts {
                 &self.child_requests,
                 "request(s) of its own answered with an error",
             ),
-            (&self.unmatched_responses, "response(s) nobody waited for dropped"),
-            (&self.invalid_lines, "line(s) that were not JSON-RPC dropped"),
+            (
+                &self.unmatched_responses,
+                "response(s) nobody waited for dropped",
+            ),
+            (
+                &self.invalid_lines,
+                "line(s) that were not JSON-RPC dropped",
+            ),
             (&self.long_lines, "line(s) over --max-line-bytes dropped"),
         ]
         .iter()
@@ -282,21 +288,37 @@ impl Counts {
             (n > 0).then(|| format!("{n} {what}"))
         })
         .collect();
-        (!parts.is_empty()).then(|| {
-            format!(
-                "stdio-bridge: from the STDIO server: {}",
-                parts.join(", ")
-            )
-        })
+        (!parts.is_empty())
+            .then(|| format!("stdio-bridge: from the STDIO server: {}", parts.join(", ")))
     }
 }
 
 type Writer = Box<dyn AsyncWrite + Send + Unpin>;
 
+/// One line for the child's stdin, and where to say whether it was written.
+type WriteJob = (Vec<u8>, oneshot::Sender<io::Result<()>>);
+
+/// How many lines may wait for the writer.
+const WRITE_QUEUE: usize = 256;
+
+/// Write the queued lines to the child's stdin, each whole, in order, until the queue is
+/// closed; then close stdin. Only this task writes, and nothing cancels it, so a caller that
+/// gives up waiting never leaves half a line behind.
+async fn write_child(mut stdin: Writer, mut jobs: tokio::sync::mpsc::Receiver<WriteJob>) {
+    while let Some((line, done)) = jobs.recv().await {
+        let r = match stdin.write_all(&line).await {
+            Ok(()) => stdin.flush().await,
+            Err(e) => Err(e),
+        };
+        let _ = done.send(r);
+    }
+    let _ = stdin.shutdown().await;
+}
+
 /// What the HTTP handlers and the stdout reader share.
 pub(crate) struct Bridge {
-    /// The child's stdin; `None` once closed.
-    stdin: tokio::sync::Mutex<Option<Writer>>,
+    /// The queue to [`write_child`]; `None` once the child's stdin is to be closed.
+    stdin: Mutex<Option<tokio::sync::mpsc::Sender<WriteJob>>>,
     /// Requests waiting for the child's answer, by bridge id.
     pending: Mutex<HashMap<u64, oneshot::Sender<Value>>>,
     next_id: AtomicU64,
@@ -327,10 +349,12 @@ impl Drop for PendingGuard<'_> {
 }
 
 impl Bridge {
-    /// A bridge writing to `stdin`.
+    /// A bridge writing to `stdin`. Must be called on a Tokio runtime (it starts the writer).
     pub(crate) fn new(stdin: Writer, timeout: Duration, max_request: usize, verbose: bool) -> Self {
+        let (tx, rx) = tokio::sync::mpsc::channel(WRITE_QUEUE);
+        tokio::spawn(write_child(stdin, rx));
         Self {
-            stdin: tokio::sync::Mutex::new(Some(stdin)),
+            stdin: Mutex::new(Some(tx)),
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             init: tokio::sync::Mutex::new(None),
@@ -348,21 +372,28 @@ impl Bridge {
         }
     }
 
-    /// Write one message to the child as one line.
+    /// Write one message to the child as one line. Once queued the line is written whole
+    /// even if this future is dropped (a timeout), so the child may still act on it.
     async fn write(&self, msg: &Value) -> io::Result<()> {
-        let line = encode_line(msg);
-        let mut stdin = self.stdin.lock().await;
-        let Some(w) = stdin.as_mut() else {
-            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "stdin closed"));
-        };
-        w.write_all(&line).await?;
-        w.flush().await
+        let closed = || io::Error::new(io::ErrorKind::BrokenPipe, "stdin closed");
+        let tx = self
+            .stdin
+            .lock()
+            .ok()
+            .and_then(|q| q.clone())
+            .ok_or_else(closed)?;
+        let (done, written) = oneshot::channel();
+        tx.send((encode_line(msg), done))
+            .await
+            .map_err(|_| closed())?;
+        written.await.map_err(|_| closed())?
     }
 
-    /// Close the child's stdin (the STDIO way to ask a server to exit).
-    async fn close_stdin(&self) {
-        if let Some(mut w) = self.stdin.lock().await.take() {
-            let _ = w.shutdown().await;
+    /// Close the child's stdin once the queued lines are written (the STDIO way to ask a
+    /// server to exit).
+    fn close_stdin(&self) {
+        if let Ok(mut q) = self.stdin.lock() {
+            q.take();
         }
     }
 
@@ -790,7 +821,7 @@ pub(crate) async fn run(args: StdioBridgeArgs) -> Result<()> {
 
 /// Stop the child: close its stdin, give it [`STOP_GRACE`] to exit, then kill it.
 async fn stop_child(bridge: &Bridge, child: &mut tokio::process::Child) {
-    bridge.close_stdin().await;
+    bridge.close_stdin();
     if let Ok(Ok(_)) = tokio::time::timeout(STOP_GRACE, child.wait()).await {
         return;
     }
@@ -1028,6 +1059,28 @@ mod tests {
             .unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(bridge.counts.unmatched_responses.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn a_write_given_up_on_still_leaves_whole_lines() {
+        // A child that reads nothing yet: a pipe of 16 bytes fills at once.
+        let (to_child, child_in) = tokio::io::duplex(16);
+        let bridge = Bridge::new(Box::new(to_child), Duration::from_secs(5), 1 << 20, false);
+        let big = json!({"jsonrpc":"2.0","method":"n","params":{"t":"x".repeat(100)}});
+        let given_up = tokio::time::timeout(Duration::from_millis(50), bridge.write(&big)).await;
+        assert!(
+            given_up.is_err(),
+            "the write cannot finish while nothing reads"
+        );
+        let small = json!({"jsonrpc":"2.0","method":"m"});
+        let next = tokio::spawn(async move {
+            bridge.write(&small).await.unwrap();
+            bridge
+        });
+        let mut r = BufReader::new(child_in);
+        assert_eq!(next_written(&mut r).await, big);
+        assert_eq!(next_written(&mut r).await["method"], "m");
+        next.await.unwrap();
     }
 
     #[tokio::test]
