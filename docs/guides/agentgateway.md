@@ -36,7 +36,7 @@ secret_sha256 = "<the sha256sum output>"
 # ... the tools of this server, as for a proxied server
 ```
 
-The route is on the main listener (`[server] listen`), like `/mcp/<server>`. Requests to it share `[proxy] max_request_body_bytes` and `[limits] mcp_requests_per_minute` with the proxy. Keep the secret out of logs and version control; anyone who has it, and an agent's token, can ask attenuo for decisions in that agent's name (each one recorded and charged as a real call).
+The route is on the main listener (`[server] listen`), like `/mcp/<server>`. Requests to it share `[proxy] max_request_body_bytes`, `[limits] mcp_requests_per_minute` and `[limits] max_in_flight` with the proxy, and `[limits] request_timeout_seconds` bounds them as it bounds the routes other than `/mcp/<server>`. Keep the secret out of logs and version control; anyone who has it, and an agent's token, can ask attenuo for decisions in that agent's name (each one recorded and charged as a real call).
 
 ## agentgateway
 

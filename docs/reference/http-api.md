@@ -405,7 +405,7 @@ Every request must carry `x-envoy-auth-partial-body: false`, which the gateway s
 | 400 | `-32600` | `ext_authz_batch_unsupported` | the body is a JSON-RPC batch; nothing is decided |
 | 404 | `-32004` | `unknown_server` | no `[[ext_authz]]` entry is called `server` |
 
-A DPoP proof must name the entry's `dpop_url` and the forwarded method; it is used once, as at the proxy. The other refusals (no or bad token, a dead lease, `request_too_large`, `parse_error`, `rate_limited`) are the proxy's, with the same status and body. Methods other than `POST`, `GET` and `DELETE` get 405 with no body.
+A DPoP proof must name the entry's `dpop_url` and the forwarded method; it is used once, as at the proxy. The other refusals (no or bad token, a dead lease, `request_too_large`, `parse_error`, `rate_limited`) are the proxy's, with the same status and body. `HEAD` is answered as `GET`, as at `/mcp/{server}`. Other methods get 405 with no body. Two answers differ from `/mcp/{server}` because the route is not under `/mcp/`: over `[limits] max_in_flight` it is the 503 `temporarily_unavailable` body of the other routes, not `-32006` `overloaded`, and `[limits] request_timeout_seconds` bounds its handler. Both are non-2xx, so the gateway denies.
 
 ## Approvals
 

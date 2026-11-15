@@ -652,7 +652,8 @@ async fn get_and_delete_need_a_live_lease() {
     let dir = tempfile::tempdir().unwrap();
     let h = Harness::start(dir.path()).await;
     let (token, lease) = h.root(json!(["github:read_file"]), None, None).await;
-    for method in [Method::GET, Method::DELETE] {
+    // axum routes `HEAD` to the `GET` handler, here as at `/mcp/{server}`.
+    for method in [Method::GET, Method::DELETE, Method::HEAD] {
         let req = AgentReq {
             method: method.clone(),
             token: Some(token.clone()),
