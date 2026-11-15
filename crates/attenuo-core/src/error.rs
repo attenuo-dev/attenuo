@@ -18,8 +18,8 @@ pub enum AttenuationError {
     /// under the same limited capability of the root grant or ceiling (it covers the calls of
     /// both), so each would carry the whole figure (SR-121, SR-128).
     #[error(
-        "requested capabilities `{first}` and `{second}` take their limits from the same \
-         limited capability, which bounds one capability of a root token, not several"
+        "requested capabilities `{first}` and `{second}` fall under the same limited \
+         capability, which bounds one capability of a root token, not several"
     )]
     LimitSplit {
         /// One of them, as [`crate::Capability::display`] writes the request.

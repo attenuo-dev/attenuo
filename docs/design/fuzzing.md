@@ -88,7 +88,7 @@ Same 4 vCPU container, `-s none`, `-timeout=20`, one target at a time, on `cb99e
 | `capability_attenuation` (again, the code under it changed) | 300 | 2,103,562 | 1,961 |
 | `limits_charges` (again) | 300 | 498,743 | 4,718 |
 
-The slowest input of `capability_prepared` took 10 s. Its `one_of` values come from the shared JSON generator, which can repeat a string of 9 KB 2,000 times in one value, and the reference clones each value once per comparison. That is the size of the generated input, not a cost of the code under test: a request body that large would be over the server's 2 MiB limit. The ID-JAG ceiling (`IdJagCeiling::apply`, the intake narrowing) is not fuzzed. It is crate-private in `attenuo-server`, which has no `fuzzing` feature, and reaching it over HTTP would need an IdP key server and signed ID-JAGs in the harness.
+The slowest input of `capability_prepared` took 10 s. Its `one_of` values come from the shared JSON generator, which can repeat a string of 9 KB 2,000 times in one value, and the reference clones each value once per comparison. That is the size of the generated input, not a cost of the code under test: a request body that large would be over the server's 2 MiB limit. The ID-JAG ceiling (`IdJagCeiling::apply`, the intake narrowing) was not fuzzed by these targets. It is crate-private in `attenuo-server`, which had no `fuzzing` feature then, and reaching it over HTTP would need an IdP key server and signed ID-JAGs in the harness. It is fuzzed since #339 ([below](#id-jag-ceiling-2026-11-15)).
 
 ## ID-JAG ceiling (2026-11-15)
 
