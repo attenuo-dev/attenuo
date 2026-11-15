@@ -54,10 +54,10 @@ Authorization: Bearer <attenuo token>
 
 ## Try it with the test server
 
-The repository has a small STDIO server for the bridge's tests, `crates/attenuo-cli/examples/stdio_mcp.rs`. Its tools include `read_file`, `create_issue` and `delete_repo`, the names [Getting started](getting-started.md) uses, so you can run that guide against it. Do steps 1 to 3 of Getting started, then build the test server:
+The repository has a small STDIO server for the bridge's tests, `crates/attenuo-cli/examples/stdio_mcp.rs`. Its tools include `read_file`, `create_issue` and `delete_repo`, the names [Getting started](getting-started.md) uses, so you can run that guide against it. Do steps 1 to 3 of Getting started, then build the test server. Step 2 left you in `~/attenuo-try`, so build from the checkout:
 
 ```sh
-cargo build -p attenuo-cli --example stdio_mcp
+(cd $REPO && cargo build -p attenuo-cli --example stdio_mcp)
 ```
 
 In step 4, start the bridge on port 3001 in place of `fake_mcp`:
@@ -66,7 +66,7 @@ In step 4, start the bridge on port 3001 in place of `fake_mcp`:
 $REPO/target/debug/attenuo stdio-bridge --listen 127.0.0.1:3001 -- $REPO/target/debug/examples/stdio_mcp
 ```
 
-Then go on with step 4 (start `attenuo-server`) and steps 5 to 7. The allowed `read_file` call comes back from the STDIO server; the bridge's terminal shows `stdio-mcp: tools/call read_file {...}`. The denied `delete_repo` call never shows up there, and `attenuo audit verify` checks the chain as before.
+Then go on with step 4 (start `attenuo-server`) and steps 5 to 7. The allowed `read_file` call comes back from the STDIO server; the bridge's terminal shows `stdio-mcp: tools/call read_file {...}`. The denied `create_issue` call never shows up there, and `attenuo audit verify` checks the chain as before. Two outputs differ a little from that guide's: `attenuo tools` lists `read_file` with no description, and the echoed call has `name` before `arguments`.
 
 ## What it does not do
 

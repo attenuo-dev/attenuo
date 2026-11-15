@@ -100,7 +100,7 @@ The full list, with the reasons: [design note](../design/agentgateway-ext-authz.
 
 ## Checking attenuo's side by hand
 
-This is the request the gateway sends for a `tools/call`, written as `curl` (untested here):
+This is the request the gateway sends for a `tools/call`, written as `curl`. `$SECRET` is the secret from above and `$TOKEN` an agent's delegation token (`$CODER` in [Getting started](getting-started.md) is one):
 
 ```sh
 curl -i http://127.0.0.1:8080/ext-authz/v1/mcp/github \
