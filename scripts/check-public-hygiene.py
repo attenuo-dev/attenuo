@@ -120,10 +120,14 @@ def main() -> int:
         if status not in ADR_STATUSES:
             problems.append(f"docs/decisions/{adr.name}: status {status!r} not one of {sorted(ADR_STATUSES)}")
 
+    # The README's Status section is a summary; the status page lists every review pass.
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    if "docs/status.md" not in readme:
+        problems.append("README.md: does not link docs/status.md")
+    status_page = (ROOT / "docs/status.md").read_text(encoding="utf-8")
     for review in sorted((ROOT / "docs/research").glob("security-review-*.md")):
-        if f"docs/research/{review.name}" not in readme:
-            problems.append(f"README.md: does not link security review {review.name}")
+        if f"research/{review.name}" not in status_page:
+            problems.append(f"docs/status.md: does not link security review {review.name}")
 
     for w in warnings:
         print(f"warning: {w}")
