@@ -205,9 +205,89 @@ pub fn is_request(msg: &Value) -> bool {
     matches!(msg.get("id"), Some(v) if !v.is_null())
 }
 
+/// Member names of a JSON-RPC message that the proxy reads.
+const ENVELOPE_MEMBERS: &[&str] = &["jsonrpc", "id", "method", "params", "result", "error"];
+/// Member names of `params` that the proxy reads.
+const PARAMS_MEMBERS: &[&str] = &["name", "arguments", "uri", "_meta"];
+
+/// A member name with case folded: two names with one key are one member to a decoder that
+/// matches names without regard to case. Upper then lower case, so that the folds Go's
+/// `encoding/json` makes (`ſ` to `s`, the Kelvin sign to `k`) give one key too; `ß` and
+/// `ss` also give one key, which can only refuse more.
+fn fold_name(name: &str) -> String {
+    name.to_uppercase().to_lowercase()
+}
+
+/// Why `msg` can be read as another message by a decoder that matches member names without
+/// regard to case (Go's `encoding/json`, which takes the last of the names that match a field
+/// and also matches a name that differs from the field's only in case) (SR-133): an object
+/// anywhere in it with two member names that differ only in case, or, in the message or its
+/// `params`, a member name that is one the proxy reads ([`ENVELOPE_MEMBERS`],
+/// [`PARAMS_MEMBERS`]) in another case, such as `Method`. `None` when there is none.
+pub(crate) fn member_case_conflict(msg: &Value) -> Option<&'static str> {
+    fn variant_of(obj: &serde_json::Map<String, Value>, names: &[&str]) -> bool {
+        obj.keys()
+            .any(|k| !names.contains(&k.as_str()) && names.iter().any(|n| fold_name(k) == *n))
+    }
+    fn folded_twice(v: &Value) -> bool {
+        match v {
+            Value::Object(obj) => {
+                let mut seen = std::collections::HashSet::with_capacity(obj.len());
+                obj.keys().any(|k| !seen.insert(fold_name(k))) || obj.values().any(folded_twice)
+            }
+            Value::Array(items) => items.iter().any(folded_twice),
+            _ => false,
+        }
+    }
+    if let Some(obj) = msg.as_object() {
+        if variant_of(obj, ENVELOPE_MEMBERS) {
+            return Some("a member name of the message differs from a JSON-RPC name only in case");
+        }
+        if let Some(params) = obj.get("params").and_then(Value::as_object) {
+            if variant_of(params, PARAMS_MEMBERS) {
+                return Some("a member name of params differs from an MCP name only in case");
+            }
+        }
+    }
+    folded_twice(msg).then_some("two member names of an object differ only in case")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn member_names_that_differ_only_in_case_are_found_sr133() {
+        for ok in [
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                   "params": {"name": "read_file", "arguments": {"path": "/a", "mode": "r"}}}),
+            json!({"jsonrpc": "2.0", "id": 1, "result": {"tools": [{"name": "a"}, {"name": "b"}]}}),
+            // An argument named like a member the proxy reads is only an argument.
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                   "params": {"name": "x", "arguments": {"Method": "a", "NAME": "b"}}}),
+        ] {
+            assert_eq!(member_case_conflict(&ok), None, "{ok}");
+        }
+        for bad in [
+            json!({"jsonrpc": "2.0", "id": 1, "method": "ping", "Method": "tools/call"}),
+            json!({"jsonrpc": "2.0", "id": 1, "METHOD": "tools/call", "params": {"name": "x"}}),
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                   "params": {"name": "read_file", "Name": "delete_repo"}}),
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                   "params": {"Name": "delete_repo", "arguments": {}}}),
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                   "params": {"name": "x", "arguments": {"path": "/a", "Path": "/b"}}}),
+            // Go folds the long s to `s` and the Kelvin sign to `k`.
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                   "params": {"name": "x", "arguments": {"ask": "a", "a\u{17f}k": "b"}}}),
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                   "params": {"name": "x", "arguments": {"key": "a", "\u{212a}ey": "b"}}}),
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                   "params": {"name": "x", "arguments": {"l": [{"a": 1, "A": 2}]}}}),
+        ] {
+            assert!(member_case_conflict(&bad).is_some(), "{bad}");
+        }
+    }
 
     /// K-8: the proxy's own errors carry `data.code`, equal to `data.reason` where that is
     /// present; one without data gets `data: {"code": ...}`.

@@ -123,6 +123,41 @@ async fn duplicate_member_names_cannot_smuggle_a_different_call_upstream() -> an
     Ok(())
 }
 
+/// SR-133: a decoder that matches member names without regard to case (Go's `encoding/json`)
+/// reads `Method` as `method` and takes the last of two names that match, so such a message
+/// would reach it as another message than the one screened. The proxy refuses it and sends
+/// the upstream nothing.
+#[tokio::test]
+async fn member_names_that_differ_only_in_case_never_reach_the_upstream_sr133() -> anyhow::Result<()>
+{
+    let upstream = RawUpstream::default();
+    let up = spawn_router(upstream.router(json_ok)).await?;
+    let proxy = proxy_for(up.url("/mcp")).await?;
+
+    for body in [
+        // No `method` for serde_json: forwarded as a response before the fix.
+        r#"{"jsonrpc":"2.0","id":1,"Method":"tools/call","params":{"name":"delete_repo","arguments":{}}}"#,
+        // `ping` for serde_json, `tools/call` for a decoder that ignores case.
+        r#"{"jsonrpc":"2.0","id":2,"method":"ping","Method":"tools/call","params":{"name":"delete_repo","arguments":{}}}"#,
+        // `read_file` decided, `delete_repo` called.
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_file","Name":"delete_repo","arguments":{}}}"#,
+        // An argument the policy reads, and another the tool reads.
+        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/ok","Path":"/etc"}}}"#,
+    ] {
+        let resp = post_raw(&proxy, body).await?;
+        assert_eq!(resp.status(), 200, "{body}");
+        let v: Value = resp.json().await?;
+        assert_eq!(v["error"]["data"]["code"], "invalid_request", "{body}: {v}");
+    }
+    assert!(upstream.bodies().is_empty(), "{:?}", upstream.bodies());
+
+    // A message with each name once, in its own case, still goes through.
+    let ok = r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/ok"}}}"#;
+    assert_eq!(post_raw(&proxy, ok).await?.status(), 200);
+    assert_eq!(upstream.bodies().len(), 1);
+    Ok(())
+}
+
 /// SR-02: the upstream is untrusted; its redirects must not be followed by the proxy.
 #[tokio::test]
 async fn upstream_redirects_are_not_followed() -> anyhow::Result<()> {

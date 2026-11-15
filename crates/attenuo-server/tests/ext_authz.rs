@@ -617,6 +617,10 @@ async fn bodies_that_are_not_whole_and_unambiguous_are_denied() {
         // serde_json keeps the last `name`, a first-wins upstream the first.
         r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"delete_repo","name":"read_file","arguments":{"repo":"acme/api"}}}"#,
         r#"{"jsonrpc":"2.0","id":1,"method":"ping","method":"tools/call","params":{"name":"read_file","arguments":{}}}"#,
+        // SR-133: no `method` for serde_json (allowed after a lease check before the fix),
+        // `tools/call` for a decoder that ignores case; and two names that differ in case.
+        r#"{"jsonrpc":"2.0","id":1,"Method":"tools/call","params":{"name":"delete_repo","arguments":{"repo":"acme/api"}}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","Name":"delete_repo","arguments":{"repo":"acme/api"}}}"#,
         // Read as 0.1 here, with more digits by an upstream that keeps them.
         r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","arguments":{"repo":"a","n":0.10000000000000001}}}"#,
     ] {
@@ -648,7 +652,8 @@ async fn get_and_delete_need_a_live_lease() {
     let dir = tempfile::tempdir().unwrap();
     let h = Harness::start(dir.path()).await;
     let (token, lease) = h.root(json!(["github:read_file"]), None, None).await;
-    for method in [Method::GET, Method::DELETE] {
+    // axum routes `HEAD` to the `GET` handler, here as at `/mcp/{server}`.
+    for method in [Method::GET, Method::DELETE, Method::HEAD] {
         let req = AgentReq {
             method: method.clone(),
             token: Some(token.clone()),

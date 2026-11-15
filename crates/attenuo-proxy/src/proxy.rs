@@ -1814,6 +1814,25 @@ async fn screen_message(
     out: &mut Screened,
 ) {
     let chain = &who.chain;
+    // An upstream that matches member names without regard to case would read another
+    // message than the one screened here (SR-133): refuse it, as a request that cannot be
+    // read one way. A notification is dropped.
+    if let Some(detail) = jsonrpc::member_case_conflict(&msg) {
+        tracing::warn!(
+            detail,
+            "message refused: member names that differ only in case"
+        );
+        if is_request(&msg) {
+            out.replies.push(attenuo_error(
+                id_of(&msg),
+                CODE_INVALID_REQUEST,
+                "invalid_request",
+                format!("attenuo: invalid request: {detail}"),
+                None,
+            ));
+        }
+        return;
+    }
     // The approval token is for the decision, never for the upstream (ADR-0009). Removed
     // before anything below reads the params, so it is in no `ToolCall` and no call hash.
     let approval_token = match take_approval_token(&mut msg) {

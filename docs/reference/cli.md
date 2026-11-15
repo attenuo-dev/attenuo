@@ -569,7 +569,7 @@ attenuo authzen search --upstream github --arg repo=alice/public-docs --all
 
 ### `stdio-bridge --listen ADDR -- <COMMAND>...`
 
-Run a local STDIO MCP server as a child process and serve it as a Streamable HTTP MCP endpoint at `http://ADDR/mcp`, so that it can be an [`[[upstreams]]`](config.md#upstreams) entry of the proxy. The guide is [STDIO MCP servers](../guides/stdio-servers.md). Everything after `--` is the command and its arguments. The child inherits the bridge's environment, minus `ATTENUO_ADMIN_TOKEN`, `ATTENUO_TOKEN`, `ATTENUO_CLIENT_SECRET` and `ATTENUO_DPOP_KEY`. Its stderr goes to the bridge's stderr. Once bound, the bridge prints `listening on http://ADDR/mcp` on stdout.
+Run a local STDIO MCP server as a child process and serve it as a Streamable HTTP MCP endpoint at `http://ADDR/mcp`, so that it can be an [`[[upstreams]]`](config.md#upstreams) entry of the proxy. The guide is [STDIO MCP servers](../guides/stdio-servers.md). Everything after `--` is the command and its arguments. The child inherits the bridge's environment, minus every variable whose name starts with `ATTENUO_` (the CLI's and the server's secrets, and the `ATTENUO__*` configuration overrides). Its stderr goes to the bridge's stderr. Once bound, the bridge prints `listening on http://ADDR/mcp` on stdout.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
@@ -589,7 +589,7 @@ What the bridge does with each message:
 - `initialize` is sent to the child once. A later `initialize` gets the child's first answer, with its own id, and is not sent on. Only the first `notifications/initialized` reaches the child.
 - The child's notifications (progress, log messages) are dropped. Its requests (sampling, elicitation, roots, ping) are answered at once with JSON-RPC `-32601`. A line that is not a JSON-RPC message is dropped. On exit the bridge prints how many of each it dropped.
 
-The child's arguments and environment are never printed; error messages name only the program. Exit status: 0 after SIGINT or SIGTERM; 1 when the child cannot be started, or exits or closes its stdout (the bridge does not restart it), or `--listen` is refused or in use. On the way out the bridge closes the child's stdin, waits up to 2 seconds for it to exit, then kills it.
+The child's arguments and environment are never printed; error messages name only the program. Exit status: 0 after SIGINT or SIGTERM; 1 when the child cannot be started, or exits or closes its stdout (the bridge does not restart it), or `--listen` is refused or in use. On the way out the bridge closes the child's stdin, waits up to 2 seconds for it to exit, then kills it. Processes the child started are not killed: one that does not exit when its stdin closes outlives the bridge (SR-135).
 
 ```sh
 attenuo stdio-bridge --listen 127.0.0.1:3001 -- npx -y @modelcontextprotocol/server-filesystem /srv/docs
