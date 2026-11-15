@@ -274,7 +274,16 @@ fn check_unambiguous(body: &[u8]) -> Result<(), &'static str> {
         Err(e) if e.to_string().starts_with(DUPLICATE) => return Err("duplicate member name"),
         Err(_) => return Ok(()),
     }
-    check_numbers(body)
+    check_numbers(body)?;
+    // Member names that differ only in case are one member to a decoder that ignores case
+    // (SR-133). The proxy refuses such a message too, as invalid_request; here it is refused
+    // with the other ambiguous bodies, before any decision.
+    match serde_json::from_slice::<Value>(body) {
+        Ok(v) if jsonrpc::member_case_conflict(&v).is_some() => {
+            Err("member names that differ only in case")
+        }
+        _ => Ok(()),
+    }
 }
 
 const DUPLICATE: &str = "duplicate member";
@@ -385,6 +394,22 @@ mod tests {
         assert!(check_unambiguous(br#"{"p":[{"a":1},{"a":2,"a":3}]}"#).is_err());
         // Not JSON: left to the parse, which refuses it.
         assert!(check_unambiguous(b"{not json").is_ok());
+    }
+
+    #[test]
+    fn member_names_that_differ_only_in_case_are_ambiguous_sr133() {
+        for bad in [
+            r#"{"jsonrpc":"2.0","id":1,"method":"ping","Method":"tools/call"}"#,
+            r#"{"jsonrpc":"2.0","id":1,"Method":"tools/call","params":{"name":"x"}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"a","NAME":"b"}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"a","arguments":{"repo":"x","Repo":"y"}}}"#,
+        ] {
+            assert_eq!(
+                check_unambiguous(bad.as_bytes()),
+                Err("member names that differ only in case"),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

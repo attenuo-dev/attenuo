@@ -186,7 +186,7 @@ pub const ERROR_CODES: &[ErrorCode] = &[
     e("dpop_required", &[r(401, "dpop_required")], &[j(UNAUTHORIZED, 401)], "The token is bound to a key and no DPoP proof was sent."),
     e("duplicate_actor", BAD_REQUEST, NO_RPC, "The `actor` is already in the chain."),
     e("expired", CREDENTIAL, NO_RPC, "The credential has expired."),
-    e("ext_authz_ambiguous_body", NONE, &[j(INVALID_REQUEST, 400)], "A gateway forwarded a body with a duplicate member, or a number not written as it is read (`/ext-authz/v1/mcp/{server}`)."),
+    e("ext_authz_ambiguous_body", NONE, &[j(INVALID_REQUEST, 400)], "A gateway forwarded a body with a duplicate member, two member names that differ only in case, or a number not written as it is read (`/ext-authz/v1/mcp/{server}`)."),
     e("ext_authz_batch_unsupported", NONE, &[j(INVALID_REQUEST, 400)], "A gateway forwarded a JSON-RPC batch, which `/ext-authz/v1/mcp/{server}` does not decide."),
     e("ext_authz_body_incomplete", NONE, &[j(INVALID_REQUEST, 403)], "A gateway did not send the whole body (`x-envoy-auth-partial-body` is not `false`)."),
     e("ext_authz_dpop_url_unset", NONE, &[j(UNAUTHORIZED, 401)], "A DPoP proof came through a gateway route whose `[[ext_authz]]` entry has no `dpop_url`."),

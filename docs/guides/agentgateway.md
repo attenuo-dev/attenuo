@@ -93,7 +93,7 @@ Nothing but the URL: the agent sends its MCP requests to the gateway with its at
 - Revocation is seen at the next request; an open listen stream is not ended.
 - Sessions are not bound to the agent that opened them by attenuo, and Cedar sees no `context.session_id`.
 - JSON-RPC batches are refused (`ext_authz_batch_unsupported`).
-- Bodies that parsers can read differently (a member named twice, a number written in a form serde_json would write differently, such as `1e3` or `1.50`) are refused (`ext_authz_ambiguous_body`), because the MCP server receives the agent's bytes, not attenuo's reading of them.
+- Bodies that parsers can read differently (a member named twice, two member names that differ only in case such as `name` and `Name`, a number written in a form serde_json would write differently, such as `1e3` or `1.50`) are refused (`ext_authz_ambiguous_body`), because the MCP server receives the agent's bytes, not attenuo's reading of them.
 - An approval token in `params._meta["dev.attenuo/approval"]` reaches the MCP server, which the proxy would have removed.
 
 The full list, with the reasons: [design note](../design/agentgateway-ext-authz.md#4-what-is-not-covered). Refusals and their codes: [HTTP API](../reference/http-api.md#gateway-external-authorization).
