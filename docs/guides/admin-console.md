@@ -54,7 +54,7 @@ The log, newest first, 100 entries a page: seq, local time (hover for UTC), kind
 - **Older**, **Newer**, **Newest** page through the log. A filtered page can come back shorter than 100 entries; the server stops reading after 50,000 entries per request, and the console keeps asking until it has a page or reaches the end.
 - **Follow** checks every 2 seconds whether the log grew and adds new entries at the top. It reads the head only; it never signs a checkpoint.
 - A chain id narrows the view to that chain. A lease id opens its lease tree. A seq opens the decision.
-- **Export this range** downloads the entries between the oldest and newest seq on screen, unfiltered, with the checkpoints in that range, as `attenuo-audit-{from}-{to}.ndjson`. Check it offline with `attenuo audit verify --file`.
+- **Export this range** downloads the entries between the oldest and newest seq on screen, unfiltered, with the checkpoints in that range, as `attenuo-audit-{from}-{to}.ndjson`. Check it offline with `attenuo audit verify --file`. That check refuses entries newer than the last checkpoint in the file (exit 2), so press **Sign head now** on the Verify page before exporting, or pass `--allow-unsigned-tail` to accept them as covered by the hash chain only.
 
 ### Decision
 
