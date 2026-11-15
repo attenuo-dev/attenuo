@@ -675,23 +675,58 @@ proptest! {
         prop_assert!(parent.attenuate(&requested).is_ok());
     }
 
-    /// Hop 0 (SR-121): `attenuate_root` answers as `attenuate` or refuses a split, and a
-    /// split refused is one `attenuate` would have made, two limited capabilities or more. Under
-    /// a grant of one limited capability the root token holds at most one capability.
+    /// Hop 0 (SR-121, SR-128): `attenuate_root` refuses what `attenuate` refuses, with the
+    /// same error. Otherwise it refuses a split or a conflict of limits where `attenuate`
+    /// answers, or answers with the capabilities `attenuate` gives (the same patterns and
+    /// constraints) where each is within every capability of the grant that covers its calls,
+    /// and each limited capability of the grant covers the calls of at most one of them. With
+    /// no limited capability of the grant over any requested one it is `attenuate`. Under a
+    /// grant of one limited capability the root token holds at most one capability.
     #[test]
-    fn attenuate_root_is_attenuate_without_splits(
+    fn attenuate_root_is_attenuate_under_every_covering_limit(
         parent in capability_set(),
         requested in capability_set(),
         one in capability(),
     ) {
+        let plain = parent.attenuate(&requested);
         match parent.attenuate_root(&requested) {
-            Err(AttenuationError::LimitSplit { .. }) => {
-                let out = parent.attenuate(&requested);
-                prop_assert!(out.is_ok());
-                let out = out.unwrap();
-                prop_assert!(out.iter().filter(|c| !c.limits.is_empty()).count() >= 2);
+            Err(AttenuationError::LimitSplit { .. } | AttenuationError::LimitConflict { .. }) => {
+                prop_assert!(plain.is_ok(), "{:?}", plain);
             }
-            other => prop_assert_eq!(other, parent.attenuate(&requested)),
+            Err(e) => prop_assert_eq!(Err(e), plain),
+            Ok(out) => {
+                prop_assert!(plain.is_ok(), "{:?}", plain);
+                let plain = plain.unwrap();
+                prop_assert!(parent.covers(&out));
+                let calls = |s: &CapabilitySet| -> std::collections::BTreeSet<Capability> {
+                    s.iter()
+                        .map(|c| Capability { limits: Limits::default(), ..c.clone() })
+                        .collect()
+                };
+                prop_assert_eq!(calls(&out), calls(&plain));
+                for c in out.iter() {
+                    for p in parent.iter().filter(|p| p.covers_calls(c)) {
+                        prop_assert!(c.limits.narrows(&p.limits), "{:?} under {:?}", c, p);
+                    }
+                }
+                for p in parent.iter().filter(|p| !p.limits.is_empty()) {
+                    prop_assert!(out.iter().filter(|c| p.covers_calls(c)).count() <= 1);
+                }
+                let unlimited = requested.iter().all(|r| {
+                    parent.iter().all(|p| p.limits.is_empty() || !p.covers_calls(r))
+                });
+                if unlimited {
+                    prop_assert_eq!(out, plain);
+                }
+            }
+        }
+        // `attenuate_root_each` is `attenuate_root` of each alone.
+        let each = parent.attenuate_root_each(requested.iter());
+        for (r, got) in requested.iter().zip(each) {
+            let alone = parent
+                .attenuate_root(&CapabilitySet::from_iter([r.clone()]))
+                .map(|out| out.iter().next().unwrap().clone());
+            prop_assert_eq!(got, alone);
         }
         if !one.limits.is_empty() {
             let single = CapabilitySet::from_iter([one]);

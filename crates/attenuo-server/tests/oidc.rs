@@ -2132,6 +2132,149 @@ async fn a_budget_in_authorization_details_is_kept_sr127() {
     );
 }
 
+/// A harness whose root grant is the unlimited `banking:*` and whose ceiling maps the scope
+/// token `payments` to these capabilities.
+async fn scopes_harness(payments: Vec<attenuo_core::Capability>) -> Harness {
+    Harness::start_with(move |cfg| {
+        cfg.root_grants[0].capabilities = vec![CapSpec::Short("banking:*".into())];
+        cfg.idps[0].id_jag_ceiling = Some(IdJagCeilingConfig {
+            resources: BTreeMap::new(),
+            scopes: BTreeMap::from([(
+                "payments".to_string(),
+                payments.into_iter().map(CapSpec::Full).collect(),
+            )]),
+        });
+    })
+    .await
+}
+
+/// SR-128 under the ceiling: a `scopes` entry with `banking:*` (`calls` 10) and
+/// `banking:send_money` (`calls` 1). A request for `send_money` is under both, so it carries
+/// `calls` 1, whether the ID-JAG has the scope alone (the final ceiling holds both) or also
+/// `authorization_details` naming `send_money` (the final ceiling holds `send_money` with the
+/// 10 that `meet` copied from `banking:*`; the scope step, kept for the split check since
+/// SR-127, lowers it). `send_money` and `get_balance` are both under `banking:*`: a split.
+#[tokio::test]
+async fn overlapping_scopes_limits_are_combined_at_intake_sr128() {
+    let limited = |tool: &str, calls: u64| {
+        attenuo_core::Capability::new("banking", tool)
+            .with_limits(attenuo_core::Limits::default().with_calls(calls))
+    };
+    let h = scopes_harness(vec![limited("*", 10), limited("send_money", 1)]).await;
+    let send = details(&[json!({"server": "banking", "tool": "send_money"})]);
+    for claims in [
+        json!({"scope": "payments"}),
+        json!({"scope": "payments", "authorization_details": send.clone()}),
+    ] {
+        let jag = jag_with(&h, claims.clone());
+        let got = present(&h, &jag, ("authorization_details", &send.to_string())).await;
+        assert_eq!(got.0, StatusCode::OK, "{claims}: {}", got.1);
+        let token = got.1["access_token"].as_str().unwrap();
+        assert_eq!(
+            caps(&h.verify(token).hops[0].capabilities),
+            [r#"banking:send_money limits={"calls":1}"#],
+            "{claims}"
+        );
+    }
+    let two = details(&[
+        json!({"server": "banking", "tool": "send_money"}),
+        json!({"server": "banking", "tool": "get_balance"}),
+    ]);
+    let jag = jag_with(&h, json!({"scope": "payments"}));
+    let got = present(&h, &jag, ("authorization_details", &two.to_string())).await;
+    assert_error(
+        &got,
+        StatusCode::BAD_REQUEST,
+        "invalid_scope",
+        "limit_split_at_root",
+    );
+
+    // "100 in all, at most 30 of it to alice" in `scopes`, the claim naming alice and bob:
+    // alice is under both scope capabilities and bob under the wide one, so the request for
+    // both splits the wide one (it answered 200 with 30 and 100 before).
+    let to = |who: &[&str]| {
+        attenuo_core::Capability::new("banking", "send_money").with_constraint(
+            "to",
+            attenuo_core::ArgConstraint::OneOf(who.iter().map(|w| json!(w)).collect()),
+        )
+    };
+    let sum = |max| attenuo_core::Limits::default().with_sum("amount", max);
+    let h = scopes_harness(vec![
+        to(&["alice", "bob", "carol"]).with_limits(sum(100)),
+        attenuo_core::Capability::new("banking", "send_money")
+            .with_constraint("to", attenuo_core::ArgConstraint::Equals(json!("alice")))
+            .with_limits(sum(30)),
+    ])
+    .await;
+    let both = details(&[payee("alice", None), payee("bob", None)]);
+    let jag = jag_with(
+        &h,
+        json!({"scope": "payments", "authorization_details": both.clone()}),
+    );
+    let got = present(&h, &jag, ("authorization_details", &both.to_string())).await;
+    assert_error(
+        &got,
+        StatusCode::BAD_REQUEST,
+        "invalid_scope",
+        "limit_split_at_root",
+    );
+    let detail = got.1["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("alice") && detail.contains("bob"),
+        "named as requested: {detail}"
+    );
+    assert!(
+        !detail.contains("100") && !detail.contains("30") && !detail.contains("sum"),
+        "{detail}"
+    );
+    // Alice alone: the lower figure.
+    let alice = details(&[payee("alice", None)]);
+    let got = present(&h, &jag, ("authorization_details", &alice.to_string())).await;
+    assert_eq!(got.0, StatusCode::OK, "{}", got.1);
+    let token = got.1["access_token"].as_str().unwrap();
+    assert_eq!(
+        caps(&h.verify(token).hops[0].capabilities),
+        [
+            r#"banking:send_money{to={"op":"equals","value":"alice"}} limits={"sum":{"arg":"amount","max":30}}"#
+        ]
+    );
+}
+
+/// SR-128: two `scopes` capabilities over one requested capability whose `sum` limits count
+/// different arguments. One capability holds one `sum`, so the request is refused with
+/// `limit_conflict_at_root`, named as requested and without the figures, rather than one of
+/// the two limits dropped.
+#[tokio::test]
+async fn limits_one_capability_cannot_carry_are_refused_sr128() {
+    let h = scopes_harness(vec![
+        attenuo_core::Capability::new("banking", "*")
+            .with_limits(attenuo_core::Limits::default().with_sum("amount", 100)),
+        attenuo_core::Capability::new("banking", "send_money")
+            .with_limits(attenuo_core::Limits::default().with_sum("fee", 5)),
+    ])
+    .await;
+    let send = details(&[json!({"server": "banking", "tool": "send_money"})]);
+    let jag = jag_with(&h, json!({"scope": "payments"}));
+    let got = present(&h, &jag, ("authorization_details", &send.to_string())).await;
+    assert_error(
+        &got,
+        StatusCode::BAD_REQUEST,
+        "invalid_scope",
+        "limit_conflict_at_root",
+    );
+    let detail = got.1["detail"].as_str().unwrap();
+    assert!(detail.contains("banking:send_money"), "{detail}");
+    assert!(detail.contains("ID-JAG"), "{detail}");
+    assert!(
+        !detail.contains("100") && !detail.contains("fee") && !detail.contains("amount"),
+        "{detail}"
+    );
+    // A tool only `banking:*` covers is not affected.
+    let balance = details(&[json!({"server": "banking", "tool": "get_balance"})]);
+    let got = present(&h, &jag, ("authorization_details", &balance.to_string())).await;
+    assert_eq!(got.0, StatusCode::OK, "{}", got.1);
+}
+
 /// SR-123 at intake: a hop-0 request over 1,024 capabilities, or with a `one_of` over 1,024
 /// values, is refused before it is attenuated against the root grant.
 #[tokio::test]

@@ -1250,44 +1250,152 @@ impl CapabilitySet {
     /// a ceiling under one) that the root token's capabilities are taken from. A limit there
     /// bounds the run only if a single capability of the root token carries it: each call is
     /// charged against the capabilities that match it, and no parent hop is charged too, as
-    /// at an exchange. So in addition to [`attenuate`](Self::attenuate), two capabilities of
-    /// the result may not take their limits from the same limited capability of `self` (one
-    /// whose [`Limits`] are not empty), whatever limits they request themselves (SR-121). The
-    /// parent of each requested capability is the one [`attenuate`](Self::attenuate) clamps
-    /// it to. Requested capabilities that are the same after clamping are one capability of
-    /// the result and are not a split. A capability of `self` without limits may be split
-    /// freely.
+    /// at an exchange. So in addition to [`attenuate`](Self::attenuate):
+    ///
+    /// - Each capability of the result carries the limits of every limited capability of
+    ///   `self` (one whose [`Limits`] are not empty) that covers the requested capability's
+    ///   calls ([`Capability::covers_calls`]), not only those of the one parent `attenuate`
+    ///   clamps it to: its limits are [`Limits::clamp_to_all`] of them (SR-128). So the root
+    ///   token is charged, for those calls, as the entry itself would be, where every limited
+    ///   capability matching a call is charged.
+    /// - Two capabilities of the result may not fall under the same limited capability of
+    ///   `self` (one that covers the calls of both), whatever limits they request themselves
+    ///   (SR-121, SR-128). Requested capabilities that are the same after clamping are one
+    ///   capability of the result and are not a split. A capability of `self` without limits
+    ///   may be split freely.
+    ///
+    /// A limited capability of `self` that only overlaps a requested capability (neither
+    /// covers the other's calls) bounds nothing here: `bank:*` requested under an entry of
+    /// `bank:*` and a limited `bank:send_money` takes no limit from `bank:send_money`.
     ///
     /// # Errors
     ///
-    /// As [`attenuate`](Self::attenuate), which is checked first; then
-    /// [`AttenuationError::LimitSplit`] naming two requested capabilities, as requested, that
-    /// share a limited parent.
+    /// As [`attenuate`](Self::attenuate), which is checked first; then, for each requested
+    /// capability in canonical order, [`AttenuationError::LimitConflict`] when the limits of
+    /// the capabilities of `self` over it (or its own and theirs) carry one kind on different
+    /// arguments, and [`AttenuationError::LimitSplit`] naming two requested capabilities, as
+    /// requested, under one limited capability of `self`.
     pub fn attenuate_root(
         &self,
         requested: &CapabilitySet,
     ) -> Result<CapabilitySet, AttenuationError> {
         let attenuated = self.attenuate_indexed(requested, |_, _, _| None)?;
+        let over = self.limited_over(requested);
         let parents: Vec<&Capability> = self.0.iter().collect();
-        let mut first: BTreeMap<usize, (&Capability, &Capability)> = BTreeMap::new();
-        for (index, req, child) in &attenuated {
-            if parents[*index].limits.is_empty() {
-                continue;
-            }
-            match first.get(index) {
-                Some((req0, child0)) if *child0 != child => {
-                    return Err(AttenuationError::LimitSplit {
-                        first: req0.display(),
-                        second: req.display(),
-                    });
+        let mut first: BTreeMap<usize, (&Capability, Capability)> = BTreeMap::new();
+        let mut out = Vec::with_capacity(attenuated.len());
+        for ((_, req, child), over) in attenuated.into_iter().zip(over) {
+            let limits: Vec<&Limits> = over.iter().map(|&i| &parents[i].limits).collect();
+            let child = Self::under_all(&limits, req, child)?;
+            for index in over {
+                match first.get(&index) {
+                    Some((req0, child0)) if *child0 != child => {
+                        return Err(AttenuationError::LimitSplit {
+                            first: req0.display(),
+                            second: req.display(),
+                        });
+                    }
+                    Some(_) => {}
+                    None => {
+                        first.insert(index, (req, child.clone()));
+                    }
                 }
-                Some(_) => {}
-                None => {
-                    first.insert(*index, (req, child));
-                }
             }
+            out.push(child);
         }
-        Ok(attenuated.into_iter().map(|(_, _, child)| child).collect())
+        Ok(out.into_iter().collect())
+    }
+
+    /// [`attenuate_root`](Self::attenuate_root) of each of `requested` alone, in the order
+    /// given: `self.attenuate_root(&{c})` for each `c`, with `self` prepared once. A
+    /// capability alone is never a split, so each answer is the capability that
+    /// `attenuate_root` of a set holding it gives for it, or why it is refused on its own. For
+    /// saying which requested capability a refusal is about.
+    pub fn attenuate_root_each<'r>(
+        &self,
+        requested: impl IntoIterator<Item = &'r Capability>,
+    ) -> Vec<Result<Capability, AttenuationError>> {
+        let parents = PreparedSet::new(&self.0);
+        requested
+            .into_iter()
+            .map(|c| {
+                CapabilitySet::from_iter([c.clone()]).validate_size()?;
+                let (_, child) = self.attenuate_one(&parents, c, &|_, _, _| None)?;
+                let prepared = PreparedCap::new(c);
+                let limits: Vec<&Limits> = parents
+                    .0
+                    .iter()
+                    .filter(|p| !p.cap.limits.is_empty() && p.covers_calls(&prepared))
+                    .map(|p| &p.cap.limits)
+                    .collect();
+                Self::under_all(&limits, c, child)
+            })
+            .collect()
+    }
+
+    /// The capability of [`attenuate_root`](Self::attenuate_root)'s result for `req`, given
+    /// `child`, what [`attenuate`](Self::attenuate) clamped it to, and `limits`, those of the
+    /// limited capabilities of the grant that cover its calls: `req` with its limits lowered
+    /// to all of them ([`Limits::clamp_to_all`]). `child` as it is when there are none.
+    ///
+    /// # Errors
+    ///
+    /// [`AttenuationError::LimitConflict`] when the result does not narrow one of them: two of
+    /// them (or `req` and one of them) carry one kind of limit on different arguments.
+    fn under_all(
+        limits: &[&Limits],
+        req: &Capability,
+        child: Capability,
+    ) -> Result<Capability, AttenuationError> {
+        if limits.is_empty() {
+            return Ok(child);
+        }
+        let mut combined = req.clone();
+        combined.limits = req.limits.clamp_to_all(limits);
+        if !limits.iter().all(|p| combined.limits.narrows(p)) {
+            return Err(AttenuationError::LimitConflict {
+                requested: req.display(),
+            });
+        }
+        Ok(combined)
+    }
+
+    /// For each of `requested`, in canonical order, the indices in `self` of the limited
+    /// capabilities that cover its calls ([`Capability::covers_calls`]), in canonical order:
+    /// what [`attenuate_root`](Self::attenuate_root) clamps it to and checks splits by. With
+    /// `self` prepared once unless both sets are small, as in
+    /// [`attenuate_indexed`](Self::attenuate_indexed).
+    fn limited_over(&self, requested: &CapabilitySet) -> Vec<Vec<usize>> {
+        let limited = |p: &Capability| !p.limits.is_empty();
+        if self.small_with(requested) {
+            return requested
+                .0
+                .iter()
+                .map(|c| {
+                    self.0
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, p)| limited(p) && p.covers_calls_direct(c))
+                        .map(|(i, _)| i)
+                        .collect()
+                })
+                .collect();
+        }
+        let parents = PreparedSet::new(&self.0);
+        requested
+            .0
+            .iter()
+            .map(|c| {
+                let c = PreparedCap::new(c);
+                parents
+                    .0
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, p)| limited(p.cap) && p.covers_calls(&c))
+                    .map(|(i, _)| i)
+                    .collect()
+            })
+            .collect()
     }
 
     /// The step of [`attenuate_with`](Self::attenuate_with) for each requested capability, in
@@ -2382,7 +2490,9 @@ mod tests {
         assert_eq!(free.attenuate_root(&two), free.attenuate(&two));
 
         // Two grant capabilities cover both; `attenuate` picks the first that covers as it
-        // is, `web:*` (unlimited, sorts first), so nothing is split.
+        // is, `web:*` (unlimited, sorts first), so neither takes a limit. At hop 0 the limited
+        // `web:fetch` covers the calls of both as well, so they are a split of it (SR-128;
+        // before, `attenuate_root` answered as `attenuate` here).
         let both = CapabilitySet::from_iter([
             Capability::new("web", "*"),
             Capability::new("web", "fetch").with_limits(Limits::default().with_calls(3)),
@@ -2392,11 +2502,19 @@ mod tests {
             .unwrap()
             .iter()
             .all(|c| c.limits.is_empty()));
-        assert_eq!(both.attenuate_root(&two), both.attenuate(&two));
+        assert!(matches!(
+            both.attenuate_root(&two),
+            Err(AttenuationError::LimitSplit { .. })
+        ));
+        // One of them alone takes the limit.
+        let a = CapabilitySet::from_iter([fetch("https://a.example/")]);
+        let out = both.attenuate_root(&a).unwrap();
+        assert_eq!(out.iter().next().unwrap().limits.calls, Some(3), "{out:?}");
 
         // `attenuate` prefers a capability that covers the request as it is: the unlimited
         // `web:fetch{url=a}` is chosen for `fetch(a)` although the limited, unconstrained
-        // `web:fetch` sorts first, so only `fetch(b)` takes the limited one: no split.
+        // `web:fetch` sorts first, so only `fetch(b)` takes the limited one. At hop 0 both are
+        // under the limited one, which covers their calls: a split (SR-128; before, no split).
         let covering_first = CapabilitySet::from_iter([
             Capability::new("web", "fetch").with_limits(Limits::default().with_calls(3)),
             fetch("https://a.example/"),
@@ -2407,12 +2525,8 @@ mod tests {
             1,
             "{out:?}"
         );
-        assert_eq!(covering_first.attenuate_root(&two), Ok(out));
-        // With a third request that also only the limited one covers, it is split.
-        let three =
-            CapabilitySet::from_iter(two.iter().cloned().chain([fetch("https://c.example/")]));
         assert!(matches!(
-            covering_first.attenuate_root(&three),
+            covering_first.attenuate_root(&two),
             Err(AttenuationError::LimitSplit { .. })
         ));
         // Split across two different limited capabilities is not a split of either.
@@ -2421,6 +2535,274 @@ mod tests {
             fetch("https://b.example/").with_limits(Limits::default().with_calls(3)),
         ]);
         assert_eq!(apart.attenuate_root(&two), apart.attenuate(&two));
+    }
+
+    /// SR-128: two limited capabilities of the grant, one covering the other's calls ("100 in
+    /// all, at most 30 of it to alice"). A requested capability under both carries both limits,
+    /// and the wide one bounds one capability of the result, so alice and bob-or-carol is a
+    /// split of it, whichever parent `attenuate` picks for each.
+    #[test]
+    fn every_limited_capability_over_a_request_bounds_it_sr128() {
+        let any = |who: &[&str]| {
+            Capability::new("banking", "send_money").with_constraint(
+                "to",
+                ArgConstraint::OneOf(who.iter().map(|w| json!(w)).collect()),
+            )
+        };
+        let grant = CapabilitySet::from_iter([
+            any(&["alice", "bob", "carol"]).with_limits(Limits::default().with_sum("amount", 100)),
+            to("alice").with_limits(Limits::default().with_sum("amount", 30)),
+        ]);
+        let split = CapabilitySet::from_iter([to("alice"), any(&["bob", "carol"])]);
+        // `attenuate` gives alice the alice capability and the other the wide one.
+        let out = grant.attenuate(&split).unwrap();
+        let mut figures: Vec<u64> = out
+            .iter()
+            .map(|c| c.limits.sum.as_ref().unwrap().max)
+            .collect();
+        figures.sort_unstable();
+        assert_eq!(figures, [30, 100]);
+        let err = grant.attenuate_root(&split).unwrap_err();
+        assert!(
+            matches!(err, AttenuationError::LimitSplit { .. }),
+            "{err:?}"
+        );
+        assert!(!err.to_string().contains("30") && !err.to_string().contains("100"));
+
+        // Each alone: alice under both (the lower figure), bob or carol under the wide one.
+        let alice = grant
+            .attenuate_root(&CapabilitySet::from_iter([to("alice")]))
+            .unwrap();
+        assert_eq!(
+            alice
+                .iter()
+                .next()
+                .unwrap()
+                .limits
+                .sum
+                .as_ref()
+                .unwrap()
+                .max,
+            30
+        );
+        let others = CapabilitySet::from_iter([any(&["bob", "carol"])]);
+        assert_eq!(grant.attenuate_root(&others), grant.attenuate(&others));
+        // A request for all three is covered only by the wide one, as before: the alice
+        // capability only overlaps it, and overlap is not coverage.
+        let all = CapabilitySet::from_iter([any(&["alice", "bob", "carol"])]);
+        assert_eq!(grant.attenuate_root(&all), grant.attenuate(&all));
+
+        // "At most one transfer" under "at most ten calls": `banking:*` sorts first and
+        // neither covers a request with no limits, so `attenuate` gives `calls` 10.
+        let nested = CapabilitySet::from_iter([
+            Capability::new("banking", "*").with_limits(Limits::default().with_calls(10)),
+            Capability::new("banking", "send_money").with_limits(Limits::default().with_calls(1)),
+        ]);
+        let send = CapabilitySet::from_iter([Capability::new("banking", "send_money")]);
+        assert_eq!(
+            nested
+                .attenuate(&send)
+                .unwrap()
+                .iter()
+                .next()
+                .unwrap()
+                .limits
+                .calls,
+            Some(10)
+        );
+        let out = nested.attenuate_root(&send).unwrap();
+        assert_eq!(
+            out.iter().next().unwrap().limits,
+            Limits::default().with_calls(1)
+        );
+        // `banking:*` requested is not under `banking:send_money`: out of scope, `calls` 10.
+        let wide = CapabilitySet::from_iter([Capability::new("banking", "*")]);
+        assert_eq!(nested.attenuate_root(&wide), nested.attenuate(&wide));
+        // `send_money` and `get_balance` are both under `banking:*`: a split of it.
+        let two_tools = CapabilitySet::from_iter([
+            Capability::new("banking", "send_money"),
+            Capability::new("banking", "get_balance"),
+        ]);
+        assert!(matches!(
+            nested.attenuate_root(&two_tools),
+            Err(AttenuationError::LimitSplit { .. })
+        ));
+    }
+
+    /// SR-128: how the limits of several covering capabilities combine, kind by kind, and the
+    /// refusal when one capability cannot carry them.
+    #[test]
+    fn covering_limits_combine_kind_by_kind_sr128() {
+        let tool = || Capability::new("banking", "send_money");
+        let under = |a: Limits, b: Limits| {
+            CapabilitySet::from_iter([
+                Capability::new("banking", "*").with_limits(a),
+                tool().with_limits(b),
+            ])
+        };
+        let req = |l: Limits| CapabilitySet::from_iter([tool().with_limits(l)]);
+        let got = |grant: &CapabilitySet, l: Limits| {
+            grant
+                .attenuate_root(&req(l))
+                .map(|out| out.iter().next().unwrap().limits.clone())
+        };
+        let none = Limits::default();
+        // `calls`: the least; `sum`, `calls_per`, `distinct` on one argument: the least.
+        assert_eq!(
+            got(
+                &under(none.clone().with_calls(10), none.clone().with_calls(1)),
+                none.clone()
+            ),
+            Ok(none.clone().with_calls(1))
+        );
+        assert_eq!(
+            got(
+                &under(
+                    none.clone().with_sum("amount", 100),
+                    none.clone().with_sum("amount", 30)
+                ),
+                none.clone()
+            ),
+            Ok(none.clone().with_sum("amount", 30))
+        );
+        assert_eq!(
+            got(
+                &under(
+                    none.clone().with_calls_per("to", 3),
+                    none.clone().with_calls_per("to", 1)
+                ),
+                none.clone()
+            ),
+            Ok(none.clone().with_calls_per("to", 1))
+        );
+        assert_eq!(
+            got(
+                &under(
+                    none.clone().with_distinct("to", 2),
+                    none.clone().with_distinct("to", 5)
+                ),
+                none.clone()
+            ),
+            Ok(none.clone().with_distinct("to", 2))
+        );
+        // Different kinds are each kept.
+        assert_eq!(
+            got(
+                &under(
+                    none.clone().with_sum("amount", 100),
+                    none.clone().with_distinct("to", 2)
+                ),
+                none.clone()
+            ),
+            Ok(none.clone().with_sum("amount", 100).with_distinct("to", 2))
+        );
+        // A request's own lower figure stands.
+        assert_eq!(
+            got(
+                &under(none.clone().with_calls(10), none.clone().with_calls(5)),
+                none.clone().with_calls(2)
+            ),
+            Ok(none.clone().with_calls(2))
+        );
+        // `calls` taken from one parent can stand for another's `calls_per` or `distinct`,
+        // whichever order they come in.
+        let mixed = under(
+            none.clone().with_calls_per("to", 5),
+            none.clone().with_calls(1),
+        );
+        assert_eq!(got(&mixed, none.clone()), Ok(none.clone().with_calls(1)));
+        let mixed = under(
+            none.clone().with_calls(1),
+            none.clone().with_calls_per("to", 5),
+        );
+        assert_eq!(got(&mixed, none.clone()), Ok(none.clone().with_calls(1)));
+
+        // The same kind on different arguments: one `Limits` holds one of each kind.
+        let conflict = |a: Limits, b: Limits, own: Limits| {
+            let err = under(a, b).attenuate_root(&req(own)).unwrap_err();
+            assert!(
+                matches!(err, AttenuationError::LimitConflict { .. }),
+                "{err:?}"
+            );
+            assert!(err.to_string().contains("banking:send_money"), "{err}");
+        };
+        conflict(
+            none.clone().with_sum("amount", 100),
+            none.clone().with_sum("fee", 5),
+            none.clone(),
+        );
+        conflict(
+            none.clone().with_calls_per("to", 1),
+            none.clone().with_calls_per("from", 1),
+            none.clone(),
+        );
+        conflict(
+            none.clone().with_distinct("to", 2),
+            Limits {
+                distinct: Some(crate::ArgLimit::new("to", 2).derived(crate::limits::Derive::Host)),
+                ..none.clone()
+            },
+            none.clone(),
+        );
+        // The request's own limit against a parent it did not take its limits from.
+        conflict(
+            none.clone(),
+            none.clone().with_sum("amount", 100),
+            none.clone().with_sum("fee", 5),
+        );
+        // A `calls` low enough makes the per-value limits agree.
+        assert_eq!(
+            got(
+                &under(
+                    none.clone().with_calls_per("to", 1),
+                    none.clone().with_calls_per("from", 1)
+                ),
+                none.clone().with_calls(1)
+            ),
+            Ok(none.clone().with_calls(1))
+        );
+        // Not covered still answers first.
+        assert!(matches!(
+            under(
+                none.clone().with_sum("amount", 1),
+                none.clone().with_sum("fee", 1)
+            )
+            .attenuate_root(&CapabilitySet::from_iter([Capability::new("github", "x")])),
+            Err(AttenuationError::NotCovered { .. })
+        ));
+    }
+
+    /// `Limits::clamp_to_all` with one parent is `clamp_to`, and does not depend on the order
+    /// of the parents.
+    #[test]
+    fn clamp_to_all_is_clamp_to_for_one_and_order_free_sr128() {
+        let none = Limits::default();
+        let all = [
+            none.clone(),
+            none.clone().with_calls(2),
+            none.clone().with_calls(7),
+            none.clone().with_sum("amount", 10),
+            none.clone().with_sum("fee", 3),
+            none.clone().with_calls_per("to", 1),
+            none.clone().with_calls_per("to", 4),
+            none.clone().with_distinct("to", 3),
+            none.clone().with_distinct("host", 1),
+            none.clone().with_calls(3).with_calls_per("to", 5),
+        ];
+        for own in &all {
+            for a in &all {
+                assert_eq!(own.clamp_to_all(&[a]), own.clamp_to(a), "{own:?} {a:?}");
+                for b in &all {
+                    let ab = own.clamp_to_all(&[a, b]);
+                    let ba = own.clamp_to_all(&[b, a]);
+                    let ok = |l: &Limits| l.narrows(a) && l.narrows(b);
+                    assert_eq!(ok(&ab), ok(&ba), "{own:?} {a:?} {b:?}");
+                    if ok(&ab) {
+                        assert_eq!(ab, ba, "{own:?} {a:?} {b:?}");
+                    }
+                }
+            }
+        }
     }
 
     /// SR-123: a request holds at most `MAX_CAPABILITIES` capabilities and a `one_of` at most

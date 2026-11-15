@@ -1298,14 +1298,17 @@ fn pay_any(who: &[&str], limits: Value) -> Value {
 /// alone gets both limits (30).
 #[tokio::test]
 async fn overlapping_root_grant_limits_bound_one_capability_sr128() {
-    let mut alice_30 = pay_to("alice");
-    alice_30["limits"] = json!({"sum": {"arg": "amount", "max": 30}});
+    let alice_30_again = || {
+        let mut alice_30 = pay_to("alice");
+        alice_30["limits"] = json!({"sum": {"arg": "amount", "max": 30}});
+        alice_30
+    };
     let h = with_root_grant(json!([
         pay_any(
             &["alice", "bob", "carol"],
             json!({"sum": {"arg": "amount", "max": 100}})
         ),
-        alice_30
+        alice_30_again()
     ]))
     .await;
     let (status, v) = h
@@ -1342,6 +1345,39 @@ async fn overlapping_root_grant_limits_bound_one_capability_sr128() {
     };
     assert!(allowed(&pay("alice", 30).await));
     assert_eq!(denial(&pay("alice", 1).await).0, "budget_exhausted");
+
+    // The entry written out as the request: the alice capability is under the wide one too,
+    // so it is a split of it. The entry as it is (no capabilities requested) is minted, and
+    // every call is charged to both of its capabilities.
+    let (status, v) = h
+        .try_mint_root(json!([
+            pay_any(
+                &["alice", "bob", "carol"],
+                json!({"sum": {"arg": "amount", "max": 100}})
+            ),
+            alice_30_again()
+        ]))
+        .await;
+    assert_eq!(
+        (status, v["code"].clone()),
+        (StatusCode::BAD_REQUEST, json!("limit_split_at_root"))
+    );
+    let whole = h.mint_root(Value::Null).await;
+    let pay_whole = |who: &'static str, amount: i64| {
+        let token = whole.token.clone();
+        let h = &h;
+        async move {
+            h.call(
+                &token,
+                "send_money",
+                json!({"recipient": who, "amount": amount}),
+            )
+            .await
+        }
+    };
+    assert!(allowed(&pay_whole("alice", 30).await));
+    assert_eq!(denial(&pay_whole("bob", 71).await).0, "budget_exhausted");
+    assert!(allowed(&pay_whole("bob", 70).await));
 
     // Bob or carol alone is under the wide one only: 100, as before.
     let root = h
@@ -1383,6 +1419,59 @@ async fn a_nested_root_grant_limit_is_not_skipped_sr128() {
     assert!(allowed(&pay().await));
     assert_eq!(denial(&pay().await).0, "budget_exhausted");
     assert_eq!(denial(&pay().await).0, "budget_exhausted");
+}
+
+/// SR-128: two limited capabilities over one requested capability that set `sum` on different
+/// arguments. One capability holds one `sum`, so `POST /admin/root-token` refuses it with
+/// `limit_conflict_at_root` rather than drop one; the entry as it is (no capabilities
+/// requested) is still minted, and charged by both.
+#[tokio::test]
+async fn root_grant_limits_one_capability_cannot_carry_are_refused_sr128() {
+    let h = with_root_grant(json!([
+        {"server": "bank", "tool": "*", "limits": {"sum": {"arg": "amount", "max": 100}}},
+        {"server": "bank", "tool": "send_money", "limits": {"sum": {"arg": "fee", "max": 5}}}
+    ]))
+    .await;
+    let (status, v) = h
+        .try_mint_root(json!([{"server": "bank", "tool": "send_money"}]))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["error"], "invalid_scope");
+    assert_eq!(v["code"], "limit_conflict_at_root");
+    let detail = v["detail"].as_str().unwrap();
+    assert!(detail.contains("bank:send_money"), "{detail}");
+    assert!(detail.contains("[[root_grants]]"), "{detail}");
+    assert!(
+        !detail.contains("100") && !detail.contains("fee") && !detail.contains("amount"),
+        "never the grant's limits: {detail}"
+    );
+    // The entry written out as the request: its `send_money` is under both, so refused the
+    // same way.
+    let entry = json!([
+        {"server": "bank", "tool": "*", "limits": {"sum": {"arg": "amount", "max": 100}}},
+        {"server": "bank", "tool": "send_money", "limits": {"sum": {"arg": "fee", "max": 5}}}
+    ]);
+    let (status, v) = h.try_mint_root(entry).await;
+    assert_eq!(
+        (status, v["code"].clone()),
+        (StatusCode::BAD_REQUEST, json!("limit_conflict_at_root"))
+    );
+    // The entry as it is (no capabilities requested): both capabilities, each charged.
+    let root = h.mint_root(Value::Null).await;
+    let pay = |fee: i64| {
+        let token = root.token.clone();
+        let h = &h;
+        async move {
+            h.call(
+                &token,
+                "send_money",
+                json!({"recipient": "alice", "amount": 1, "fee": fee}),
+            )
+            .await
+        }
+    };
+    assert!(allowed(&pay(5).await));
+    assert_eq!(denial(&pay(1).await).0, "budget_exhausted");
 }
 
 /// `n` distinct capabilities on the bank server (`get_balance` with one `account` each).

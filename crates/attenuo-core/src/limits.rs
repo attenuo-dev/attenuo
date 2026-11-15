@@ -511,6 +511,35 @@ impl Limits {
         out
     }
 
+    /// [`clamp_to`](Self::clamp_to) for several parents at once, as hop 0 needs it when more
+    /// than one limited capability of a root grant (or ceiling) covers a requested capability's
+    /// calls (SR-128): `self` lowered to every one of `parents`.
+    ///
+    /// - `calls` is the least of `self`'s and every parent's, and is set first, so that whether
+    ///   a parent's `calls_per` or `distinct` is already implied by `calls` does not depend on
+    ///   the order of `parents`.
+    /// - Then each parent in turn is applied as by [`clamp_to`](Self::clamp_to): a `sum`,
+    ///   `calls_per` or `distinct` the result lacks is copied, and one on the same argument
+    ///   (and derivation) is lowered to the parent's figure. So parents carrying the same kind
+    ///   on the same argument give the least of their figures.
+    ///
+    /// One `Limits` holds one limit of each kind. When two parents (or `self` and a parent)
+    /// carry the same kind on different arguments, the second is left alone and the result
+    /// does not narrow that parent ([`narrows`](Self::narrows)): the caller refuses the
+    /// request rather than drop a limit. With one parent this is [`clamp_to`](Self::clamp_to).
+    pub fn clamp_to_all(&self, parents: &[&Limits]) -> Limits {
+        let mut out = self.clone();
+        for p in parents {
+            if let Some(c) = p.calls {
+                out.calls = Some(out.calls.map_or(c, |o| o.min(c)));
+            }
+        }
+        for p in parents {
+            out = out.clamp_to(p);
+        }
+        out
+    }
+
     /// The limits that apply to an argument (`sum`, `calls_per` and `distinct`), with their
     /// kinds.
     fn arg_limits(&self) -> impl Iterator<Item = (LimitKind, &ArgLimit)> {
