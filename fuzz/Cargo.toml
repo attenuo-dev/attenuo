@@ -22,7 +22,7 @@ attenuo-token = { path = "../crates/attenuo-token" }
 attenuo-policy = { path = "../crates/attenuo-policy" }
 attenuo-audit = { path = "../crates/attenuo-audit" }
 attenuo-proxy = { path = "../crates/attenuo-proxy", features = ["fuzzing"] }
-attenuo-server = { path = "../crates/attenuo-server" }
+attenuo-server = { path = "../crates/attenuo-server", features = ["fuzzing"] }
 serde = "1"
 serde_json = "1"
 time = { version = "0.3", features = ["macros"] }
@@ -183,6 +183,13 @@ bench = false
 [[bin]]
 name = "capability_attenuate_root"
 path = "fuzz_targets/capability_attenuate_root.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "idjag_ceiling"
+path = "fuzz_targets/idjag_ceiling.rs"
 test = false
 doc = false
 bench = false
