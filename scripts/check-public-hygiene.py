@@ -12,7 +12,7 @@ Catches the things that crept in before the first public release:
   codebase walkthrough, the task board and milestones under docs/tasks/);
 - pages under docs/ that are personal planning, listed in docs/SUMMARY.md;
 - an ADR whose front matter or status line has an unknown status;
-- a security review pass under docs/research/ that README.md does not link.
+- a security review pass under docs/research/ that docs/status.md does not link.
 
 Exits 1 on any failure. Tracked files only (`git ls-files`).
 
