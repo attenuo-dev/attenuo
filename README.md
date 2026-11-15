@@ -74,7 +74,7 @@ Only allowed calls reach the MCP server, and an allowed call is charged against 
 
 ## What it is not
 
-- **Not a replacement for your API gateway.** It does not do routing or general traffic management. Its `[limits]` (an in-flight cap, request deadlines and optional per-caller rate limits) protect one attenuo process, not the services behind it, and run limits count calls per delegation run, not requests per second. It can sit behind a gateway as the decision point through its AuthZEN endpoint. An adapter for any particular gateway has not been written or tested.
+- **Not a replacement for your API gateway.** It does not do routing or general traffic management. Its `[limits]` (an in-flight cap, request deadlines and optional per-caller rate limits) protect one attenuo process, not the services behind it, and run limits count calls per delegation run, not requests per second. It can sit behind a gateway as the decision point through its AuthZEN endpoint. One gateway adapter exists, for [agentgateway's external authorization](docs/guides/agentgateway.md); it is tested against a stand-in that sends what agentgateway's source sends, and has not been run against agentgateway itself.
 - **Not a prompt-injection detector.** It never reads prompts or model output. It limits what an agent that has already been fooled can do with the authority it was given. In the [injection suite](docs/evaluation/injection-suite.md), 15 of 77 attack calls in the development split still went through the base configuration, because they used a tool and arguments the task legitimately needed. Output labelling and run limits narrow that, but only by asking a person or by a limit someone has to choose for the task.
 - **Not a sandbox.** It only sees calls that go through it. If the agent also holds a direct API key or network path to the tool, attenuo sees nothing. See [what attenuo does not prevent](docs/spec/threat-model.md#what-attenuo-does-not-prevent).
 
@@ -101,7 +101,7 @@ attenuo is pre-alpha and has not been used in production. Release 0.1.0 is prepa
 
 ## Where to look
 
-- [Guides](docs/guides/README.md): [getting started](docs/guides/getting-started.md), [deploying](docs/guides/deploying.md), [integrating MCP clients](docs/guides/integrating-mcp-clients.md) and [identity providers](docs/guides/identity-providers.md).
+- [Guides](docs/guides/README.md): [getting started](docs/guides/getting-started.md), [deploying](docs/guides/deploying.md), [integrating MCP clients](docs/guides/integrating-mcp-clients.md), [identity providers](docs/guides/identity-providers.md) and [agentgateway as the enforcement point](docs/guides/agentgateway.md).
 - [FAQ](docs/faq.md): why a proxy, how it differs from gateways and policy engines, what happens when it is down.
 - [Comparison](docs/comparison.md): attenuo next to OAuth scopes, gateways, policy engines, IdP agent features and SPIFFE.
 - [Numbers](docs/numbers.md) and [status](docs/status.md) in full.

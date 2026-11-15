@@ -64,6 +64,11 @@ pub struct Config {
     /// MCP servers mounted at `/mcp/{name}`.
     #[serde(default)]
     pub upstreams: Vec<UpstreamConfig>,
+    /// `[[ext_authz]]`: servers an external gateway (agentgateway's HTTP `extAuthz`) may ask
+    /// about at `/ext-authz/v1/mcp/{server}`. Empty by default, and then the route is not
+    /// mounted. Checked by [`Config::check_ext_authz`].
+    #[serde(default)]
+    pub ext_authz: Vec<attenuo_proxy::ExtAuthzRoute>,
     /// `[admin]`: the bearer token for `/admin/*`.
     #[serde(default)]
     pub admin: AdminSection,
@@ -2939,6 +2944,47 @@ pub fn check_server_name(name: &str) -> Result<(), String> {
 }
 
 impl Config {
+    /// Check `[[ext_authz]]`: each `server` a valid server name ([`check_server_name`]) named
+    /// once, each `secret_sha256` 64 hex digits, and each `dpop_url` an absolute `http` or
+    /// `https` URL with a host and no query or fragment.
+    ///
+    /// # Errors
+    ///
+    /// When an entry breaks one of these rules; the message names the entry's server.
+    pub fn check_ext_authz(&self) -> anyhow::Result<()> {
+        let mut seen = std::collections::BTreeSet::new();
+        for e in &self.ext_authz {
+            check_server_name(&e.server).map_err(|m| anyhow::anyhow!("[[ext_authz]]: {m}"))?;
+            if !seen.insert(e.server.as_str()) {
+                anyhow::bail!("[[ext_authz]]: server `{}` is listed twice", e.server);
+            }
+            let hex_ok = e.secret_sha256.len() == 64
+                && e.secret_sha256.bytes().all(|b| b.is_ascii_hexdigit());
+            if !hex_ok {
+                anyhow::bail!(
+                    "[[ext_authz]] `{}`: secret_sha256 must be 64 hex characters",
+                    e.server
+                );
+            }
+            if let Some(u) = &e.dpop_url {
+                let ok = reqwest::Url::parse(u).is_ok_and(|p| {
+                    matches!(p.scheme(), "http" | "https")
+                        && p.host_str().is_some()
+                        && p.query().is_none()
+                        && p.fragment().is_none()
+                });
+                if !ok {
+                    anyhow::bail!(
+                        "[[ext_authz]] `{}`: dpop_url must be an absolute http or https URL \
+                         with no query or fragment",
+                        e.server
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Reject server names that contain `/`, are empty or are the reserved `attenuo` in
     /// `[[upstreams]]`, the tool catalog (inline and `catalog_path`) and `[[root_grants]]`
     /// capabilities, and the agent id `attenuo` in `[[agents]]`, `[[peps]]` and

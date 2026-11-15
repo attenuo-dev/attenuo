@@ -343,6 +343,7 @@ fn world() -> &'static World {
                         attenuo_proxy::config::DEFAULT_UPSTREAM_CONNECT_TIMEOUT,
                     upstream_response_timeout:
                         attenuo_proxy::config::DEFAULT_UPSTREAM_RESPONSE_TIMEOUT,
+                    ext_authz: Vec::new(),
                 };
                 attenuo_proxy::router(config, auth.clone())
             })

@@ -29,6 +29,21 @@ impl UpstreamConfig {
     }
 }
 
+/// One server an external gateway may ask about at `/ext-authz/v1/mcp/{server}`
+/// (agentgateway's HTTP `extAuthz`; `docs/design/agentgateway-ext-authz.md`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtAuthzRoute {
+    /// The MCP server name the calls are decided for, as `name` is for an upstream.
+    pub server: String,
+    /// Lowercase hex SHA-256 of the secret the gateway sends in `X-Attenuo-Gateway-Secret`.
+    pub secret_sha256: String,
+    /// The URL the agent calls on the gateway, which a DPoP proof names in `htu`. `None`: a
+    /// request with a `DPoP` header is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dpop_url: Option<String>,
+}
+
 /// Default for [`ProxyConfig::stream_recheck`].
 pub const DEFAULT_STREAM_RECHECK: Duration = Duration::from_secs(2);
 /// Default for [`ProxyConfig::max_upstream_body_bytes`]: 16 MiB.
@@ -114,6 +129,10 @@ pub struct ProxyConfig {
     /// [`DEFAULT_UPSTREAM_RESPONSE_TIMEOUT`].
     #[serde(default = "default_upstream_response_timeout")]
     pub upstream_response_timeout: Duration,
+    /// The servers a gateway may ask about at `/ext-authz/v1/mcp/{server}`. Empty (the
+    /// default): the route is not mounted.
+    #[serde(default)]
+    pub ext_authz: Vec<ExtAuthzRoute>,
 }
 
 fn default_upstream_connect_timeout() -> Duration {
@@ -178,7 +197,14 @@ impl ProxyConfig {
             list_filter: ListFilterMode::Capabilities,
             upstream_connect_timeout: DEFAULT_UPSTREAM_CONNECT_TIMEOUT,
             upstream_response_timeout: DEFAULT_UPSTREAM_RESPONSE_TIMEOUT,
+            ext_authz: Vec::new(),
         }
+    }
+
+    /// Set [`ProxyConfig::ext_authz`].
+    pub fn with_ext_authz(mut self, routes: Vec<ExtAuthzRoute>) -> Self {
+        self.ext_authz = routes;
+        self
     }
 
     /// Set [`ProxyConfig::upstream_connect_timeout`] and

@@ -25,6 +25,7 @@
 - **attenuo: trusted reference monitor.** Its correctness is the security argument. It must be small, fail closed, and have its invariants property-tested.
 - **IdP: trusted for authentication only.** It is not trusted to express per-tool or per-argument authorization.
 - **Policy author and log verifier: trusted.** Policies are code; they get review and tests.
+- **A gateway that uses attenuo as its external authorizer: trusted, when one is configured.** With an `[[ext_authz]]` entry, agentgateway asks attenuo about each request and enforces the answer itself ([design](../design/agentgateway-ext-authz.md)). attenuo decides on the method, headers and body the gateway shows it and cannot see what the gateway then sends. So the gateway is trusted to forward exactly that body, once, only after a 2xx answer, to fail closed when attenuo is down, not to cache answers, and to keep the MCP server out of the agent's reach. It authenticates with a shared secret per server (`X-Attenuo-Gateway-Secret`); anyone holding that secret and an agent's token can obtain decisions in that agent's name, each recorded and charged as a real call. Bodies that parsers could read differently, batches and cut bodies are refused, so that what is decided is what an honest gateway forwards. The tool's answer never passes attenuo on this path, so output labelling does not apply to it.
 
 ## Attacker capabilities
 

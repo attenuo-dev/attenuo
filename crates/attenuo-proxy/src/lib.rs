@@ -216,8 +216,13 @@ pub use auth::{
     ApprovalTicket, AuthDecision, AuthError, Authenticated, Authorizer, CallContext, RequestAuth,
     META_APPROVAL_KEY, REASON_APPROVAL_REQUIRED, REASON_LABEL_ERROR,
 };
-pub use config::{ProxyConfig, UpstreamConfig};
+pub use config::{ExtAuthzRoute, ProxyConfig, UpstreamConfig};
 pub use guard::{StreamEndCause, REASON_UPSTREAM_STREAM_END_SHAPE};
+pub use proxy::ext_authz::{
+    GATEWAY_SECRET_HEADER, PARTIAL_BODY_HEADER, REASON_EXT_AUTHZ_AMBIGUOUS_BODY,
+    REASON_EXT_AUTHZ_BATCH_UNSUPPORTED, REASON_EXT_AUTHZ_BODY_INCOMPLETE,
+    REASON_EXT_AUTHZ_DPOP_URL_UNSET, REASON_EXT_AUTHZ_UNAUTHENTICATED,
+};
 pub use proxy::{
     router, router_with_clock, serve, DECISION_ID_HEADER, REASON_INVALID_NAME,
     REASON_REQUEST_TOO_LARGE, REASON_SESSION_MISMATCH, REASON_SESSION_REGISTRY_FULL,
