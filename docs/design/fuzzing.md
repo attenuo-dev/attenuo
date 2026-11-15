@@ -1,6 +1,6 @@
 # Fuzzing
 
-- Status: first campaign 2026-10-23 (`test/fuzz-targets`); second campaign, 10 minutes per target, 2026-10-23 evening (below); round 2 over run limits, budgets, approval tokens, the usage walker and the server routes, 2026-10-24 ([write-up](../research/fuzzing-2026-10-24-round2.md)); round 3 over the pass 7 SSE parsing (`SseFramer`, `SseRewriter`, `parse_data`, the stream-end scan and rewrite), 2026-10-25 ([write-up](../research/fuzz-round-3-2026-10-25.md)); `decimal` and `set<decimal>` inputs in `policy_context`, checked against an exact-digit oracle, 2026-11-06 (`fuzz/policy-context-decimal`, 300 s, 424 k runs, no crash; the order of `Outcome::policy_ids` varies between identical calls)
+- Status: first campaign 2026-10-23 (`test/fuzz-targets`); second campaign, 10 minutes per target, 2026-10-23 evening (below); round 2 over run limits, budgets, approval tokens, the usage walker and the server routes, 2026-10-24 ([write-up](../research/fuzzing-2026-10-24-round2.md)); round 3 over the pass 7 SSE parsing (`SseFramer`, `SseRewriter`, `parse_data`, the stream-end scan and rewrite), 2026-10-25 ([write-up](../research/fuzz-round-3-2026-10-25.md)); `decimal` and `set<decimal>` inputs in `policy_context`, checked against an exact-digit oracle, 2026-11-06 (`fuzz/policy-context-decimal`, 300 s, 424 k runs, no crash; the order of `Outcome::policy_ids` varies between identical calls); the prepared implication and the hop-0 split rule, `capability_prepared` and `capability_attenuate_root`, 2026-11-15 ([below](#prepared-implication-and-hop-0-2026-11-15))
 - Crate: `fuzz/` (cargo-fuzz, libFuzzer), outside the workspace
 - Related: [threat model](../spec/threat-model.md), [security review pass 3](../research/security-review-2026-10-23.md)
 
@@ -69,6 +69,26 @@ Same container (4 vCPU, shared with other builds), `-s none`, `-timeout=20`, eac
 | `token_verify_mutated` | 78,851 | 4,233 |
 
 The spread in run counts is the targets' setup cost, as in the first campaign: `token_verify_mutated` signs and parses a whole token per input and `proxy_jsonrpc` makes an HTTP round trip. Ten minutes is still short for the slow targets; a campaign on a dedicated machine should give those an hour or more. Corpora were not kept.
+
+## Prepared implication and hop 0 (2026-11-15)
+
+Two targets over the code merged on 2026-11-14: the prepared implication of SR-123 (#329) and the hop-0 split rule of SR-121 (#328).
+
+- `capability_prepared` asks each question twice. The core compares small constraints and sets pair by pair and larger ones through `capability/prepared.rs`; both are private, so the target reaches them by size. Its reference (`fuzz/src/caps.rs`) splits every `one_of` into its values, so the core only ever answers it on the pairwise path, and each set check runs again with the parent padded by a capability that covers nothing but is too large for the pairwise path. It also checks that `jcs::value_key` is equal exactly when `jcs::value_eq` is, on values `serde_json` parses from generated text, and that `validate_size` refuses exactly at the documented bounds.
+- `capability_attenuate_root` checks `attenuate_root` against `attenuate` and against a reference written from its documentation. The split rule is checked per chosen parent, the grant capability `attenuate` clamps a request to, which is what the code promises. Overlapping limited grant capabilities (SR-128, open) are outside it: there a request takes its limits from one of them and is not charged by the other.
+
+Before the runs, each target was checked against a bug planted in the core for the check and then taken out again, one at a time: a `>` turned into `>=` in the path summary, the `keys.len() == 1` test dropped from the `one_of` against `equals` arm, `MAX_CONSTRAINTS` refused one early, and the split check turned off. Each was caught within three minutes. The first one was missed until the generator was biased towards lists of a single kind (all paths, all strings, all integers), so how well a generator reaches the summaries matters as much as the run time.
+
+Same 4 vCPU container, `-s none`, `-timeout=20`, one target at a time, on `cb99e91a` with the targets added. Each started from the corpus of a short trial run. No crash, no timeout and no property violation.
+
+| Target | Run (s) | Runs | Edges (`cov:`) |
+| --- | ---: | ---: | ---: |
+| `capability_prepared` | 600 | 1,085,986 | 4,586 |
+| `capability_attenuate_root` | 600 | 714,282 | 4,048 |
+| `capability_attenuation` (again, the code under it changed) | 300 | 2,103,562 | 1,961 |
+| `limits_charges` (again) | 300 | 498,743 | 4,718 |
+
+The slowest input of `capability_prepared` took 10 s. Its `one_of` values come from the shared JSON generator, which can repeat a string of 9 KB 2,000 times in one value, and the reference clones each value once per comparison. That is the size of the generated input, not a cost of the code under test: a request body that large would be over the server's 2 MiB limit. The ID-JAG ceiling (`IdJagCeiling::apply`, the intake narrowing) is not fuzzed. It is crate-private in `attenuo-server`, which has no `fuzzing` feature, and reaching it over HTTP would need an IdP key server and signed ID-JAGs in the harness.
 
 ## Limits
 

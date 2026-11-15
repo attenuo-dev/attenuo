@@ -172,3 +172,17 @@ path = "fuzz_targets/sse_parse_data.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "capability_prepared"
+path = "fuzz_targets/capability_prepared.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "capability_attenuate_root"
+path = "fuzz_targets/capability_attenuate_root.rs"
+test = false
+doc = false
+bench = false
