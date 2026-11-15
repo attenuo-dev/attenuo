@@ -98,6 +98,7 @@ For an MCP client library on `httpx`, `TokenAuth(provider, dpop_key=key)` adds t
 TypeScript (no extra dependencies; WebCrypto signs):
 
 ```ts
+import { readFileSync } from "node:fs";
 import { AdminClient, DpopKey, mcpFetch, AttenuoClient } from "@attenuo/sdk";
 
 const assistantKey = await DpopKey.fromJwk(JSON.parse(readFileSync("assistant.jwk", "utf8")));

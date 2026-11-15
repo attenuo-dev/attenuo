@@ -150,7 +150,7 @@ from attenuo import BudgetLimit, StatedBudget
 ev = admin.policy_evaluate(
     "github",
     "read_file",
-    {"repo": "alice/other"},
+    {"repo": "alice/public-other"},
     token=coder,
     budget=StatedBudget(limits=[BudgetLimit(hop=1, kind="distinct", arg="repo", used=1)]),
 )
@@ -258,6 +258,7 @@ helper = ob.exchange(
         # Pages from at most two sites: `derive="host"` counts the host of the URL.
         Capability("web", "get_webpage").with_limits(distinct=ArgLimit("url", 2, derive="host")),
     ],
+    client_secret=...,  # the helper's [[agents]] secret, as for any exchange
 )
 ```
 
