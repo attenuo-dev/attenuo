@@ -14,7 +14,7 @@ attenuo is pre-alpha. Do not treat this guide as a statement that it is ready fo
 - **Metrics on a side listener only.** `GET /metrics` (Prometheus text) is served on its own loopback listener when you enable it, with no authentication. See [What to monitor](#what-to-monitor).
 - **Manual key rotation with no overlap.** See [Key rotation](#key-rotation).
 
-The full list of known gaps is at the end of [design/server.md](../design/server.md#known-limits-v0). The open security findings are in the threat model's [residual risks](../spec/threat-model.md#residual-risks-to-track); the eighteen review passes, from [pass 1](../research/security-review-2026-10-22.md) to [pass 18](../research/security-review-2026-11-15-pass18.md), are listed in the [status page](../status.md).
+The full list of known gaps is at the end of [design/server.md](../design/server.md#known-limits-v0). The open security findings are in the threat model's [residual risks](../spec/threat-model.md#residual-risks-to-track); the nineteen review passes, from [pass 1](../research/security-review-2026-10-22.md) to [pass 19](../research/security-review-2026-11-15-pass19.md), are listed in the [status page](../status.md).
 
 ## Production checklist
 
