@@ -148,6 +148,7 @@ pub const ERROR_CODES: &[ErrorCode] = &[
     e("approval_not_pending", &[r(409, "approval_not_pending")], NO_RPC, "The approval is already decided."),
     d("approval_required", NONE, &[j(APPROVAL, 200)], "The policy asks a person to approve this exact call first."),
     e("approval_token_not_accepted", BAD_REQUEST, NO_RPC, "An AuthZEN action search carries `context.approval_token`; an approval token is spent only by the one decision it names."),
+    d("argument_case_mismatch", NONE, DENY, "A top-level call argument name differs only in case from a name the decision reads for the tool (its catalog entry, a constraint or run limit of a capability that covers it, a loaded policy), which an upstream that ignores case would read as that name."),
     e("attribute_fixed_by_grant", &[r(403, "attribute_fixed_by_grant")], NO_RPC, "The root grant fixes this attribute; the request may not set it."),
     d("attribute_type_mismatch", NONE, DENY, "An originating-user attribute does not have its declared type."),
     e("audience_mismatch", CREDENTIAL, NO_RPC, "The credential's audience is not this server."),

@@ -619,3 +619,48 @@ fn a_stuck_audit_writer_denies_within_the_append_timeout() {
     assert!(p.decide(&c, &send(json!(1)), now).is_allow());
     assert!(audit.verify_chain().unwrap().ok);
 }
+
+/// (SR-133's remainder) The argument a `sum`, `distinct` or `calls_per` limit counts, sent in
+/// another case, is refused for its name and charges nothing. Without it at all, every limit
+/// refuses as `limit_arg_invalid` (a missing argument is never "nothing to count").
+#[test]
+fn a_limited_argument_in_another_case_is_refused_and_not_charged() {
+    let now = OffsetDateTime::now_utc();
+    for (limits, arg) in [
+        (Limits::default().with_sum("amount", 50), "amount"),
+        (Limits::default().with_distinct("to", 1), "to"),
+        (Limits::default().with_calls_per("to", 1), "to"),
+    ] {
+        let leases = Arc::new(MemoryLeaseStore::new());
+        leases
+            .register(&LeaseId::new("l1"), None, now + Duration::hours(1))
+            .unwrap();
+        let audit = Arc::new(MemoryAudit::new());
+        let p = pipeline(leases, audit.clone());
+        let c = chain(limits.clone(), now);
+        let mut args = json!({"to": "emma", "amount": 40});
+        let v = args.as_object_mut().unwrap().remove(arg).unwrap();
+        let without = ToolCall::new("bank", "send", args.clone());
+        assert_eq!(
+            p.decide(&c, &without, now).reason,
+            REASON_LIMIT_ARG_INVALID,
+            "{limits:?}"
+        );
+        args[arg.to_uppercase()] = v;
+        let d = p.decide(&c, &ToolCall::new("bank", "send", args), now);
+        assert_eq!(
+            d.reason,
+            attenuo_policy::REASON_ARGUMENT_CASE_MISMATCH,
+            "{limits:?}"
+        );
+        let records = audit.snapshot().unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            records[1].record.reason,
+            attenuo_policy::REASON_ARGUMENT_CASE_MISMATCH
+        );
+        assert!(records[1].record.budget.is_none(), "nothing charged");
+        // The limit is untouched: the exact name is charged from zero.
+        assert!(p.decide(&c, &send(json!(40)), now).is_allow(), "{limits:?}");
+    }
+}

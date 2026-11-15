@@ -803,3 +803,60 @@ fn bad_entries_are_refused_at_startup() {
     }
     base.check_ext_authz().unwrap();
 }
+
+/// SR-133's remainder, through the proxy and the adapter: `Repo` alone is what an upstream
+/// that ignores case reads as `repo`, and the `has repo` forbid never saw it. Both now refuse
+/// it as `argument_case_mismatch`, a decision recorded as a deny with its reason; the exact
+/// name and an unrelated one are decided as before.
+#[tokio::test]
+async fn an_argument_in_another_case_is_refused_by_both_paths_sr133() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::start(dir.path()).await;
+    let (token, _) = h.root(json!(["github:read_file"]), None, None).await;
+    let call = |args: Value| {
+        AgentReq::post(
+            &token,
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                   "params": {"name": "read_file", "arguments": args}}),
+        )
+    };
+    for (case, args, want) in [
+        (
+            "exact",
+            json!({"repo": "acme/secret"}),
+            Err("policy_deny".to_string()),
+        ),
+        (
+            "case",
+            json!({"Repo": "acme/secret"}),
+            Err("argument_case_mismatch".into()),
+        ),
+        (
+            "fold",
+            json!({"REPO": "acme/secret"}),
+            Err("argument_case_mismatch".into()),
+        ),
+        (
+            "unrelated",
+            json!({"repo": "acme/api", "Branch": "main"}),
+            Ok(()),
+        ),
+    ] {
+        assert_eq!(same_decision(&h, case, &call(args)).await, want, "{case}");
+    }
+    let audit = h.audit().await;
+    let refused: Vec<_> = audit
+        .iter()
+        .filter(|e| e["record"]["reason"] == "argument_case_mismatch")
+        .collect();
+    assert_eq!(
+        refused.len(),
+        4,
+        "two cases, each through the proxy and the adapter"
+    );
+    for e in refused {
+        assert_eq!(e["record"]["kind"], "decision");
+        assert_eq!(e["record"]["decision"], "deny");
+        assert_eq!(e["record"]["tool"], "read_file");
+    }
+}

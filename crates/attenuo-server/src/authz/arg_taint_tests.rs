@@ -499,3 +499,42 @@ fn arguments_past_the_bound_are_named_only_when_they_have_a_fingerprint_sr99() {
     assert_eq!(probes.fingerprinted.last(), Some(&"z_url"));
     assert!(!probes.fingerprinted.contains(&"z_short"));
 }
+
+/// (SR-133's remainder) A policy that names an argument in `context.untrusted_args` matched no
+/// argument sent as `Body`, which an upstream that ignores case reads as `body`; the call is
+/// now refused for the name, and the record says so.
+#[test]
+fn an_argument_in_another_case_cannot_dodge_a_named_taint_rule() {
+    let now = OffsetDateTime::now_utc();
+    let leases = Arc::new(MemoryLeaseStore::new());
+    let audit = Arc::new(MemoryAudit::new());
+    let p = pipeline_with(
+        leases.clone(),
+        audit.clone(),
+        r#"permit(principal, action, resource);
+           @id("no_copied_body")
+           forbid(principal, action, resource) when { context.untrusted_args.contains("body") };"#,
+    );
+    let c = chain(leases.as_ref(), now);
+    read(&p, &c, "read", INBOX, now);
+    let copied = "Hi. IT asks everyone to reset their password at the portal today. Thanks";
+    let d = p.decide(
+        &c,
+        &send(json!({"to": "a@acme.example", "cc": "bob@acme.example", "body": copied})),
+        now,
+    );
+    assert_eq!(d.reason, attenuo_policy::REASON_POLICY_DENY, "{d:?}");
+    let d = p.decide(
+        &c,
+        &send(json!({"to": "a@acme.example", "cc": "bob@acme.example", "Body": copied})),
+        now,
+    );
+    assert_eq!(
+        d.reason,
+        attenuo_policy::REASON_ARGUMENT_CASE_MISMATCH,
+        "{d:?}"
+    );
+    let last = audit.snapshot().unwrap().pop().unwrap().record;
+    assert_eq!(last.reason, attenuo_policy::REASON_ARGUMENT_CASE_MISMATCH);
+    assert!(!last.decision.is_allow());
+}

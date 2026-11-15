@@ -29,6 +29,12 @@
 //! for, and every argument of a tool evaluated under [`UnknownTools::Sensitive`] or
 //! [`UnknownTools::Allow`], are passed to Cedar unchecked.
 //!
+//! Before the capability stage, a call with a top-level argument name that differs only in
+//! case from a name the decision reads for the tool (its catalog entry, a constraint or run
+//! limit of a capability that covers it, a name a loaded policy reads) without being that name
+//! is denied with reason `argument_case_mismatch` (SR-133): an upstream that ignores case would
+//! read it as the name every check saw absent.
+//!
 //! # Request shape
 //!
 //! The Cedar request mirrors the shape used by AWS Bedrock AgentCore policies, so policies
@@ -247,6 +253,7 @@
     clippy::cast_possible_wrap
 )]
 
+mod arg_names;
 pub mod authzen;
 mod catalog;
 mod lint;
@@ -308,6 +315,13 @@ pub const REASON_ATTRIBUTE_TYPE_MISMATCH: &str = "attribute_type_mismatch";
 /// Reason code when a call argument does not have the type the catalog declares for it
 /// ([`ToolAttrs::inputs`]). Decided before Cedar, so never `policy_error`.
 pub const REASON_INPUT_TYPE_MISMATCH: &str = "input_type_mismatch";
+
+/// Reason code when a top-level argument name differs only in case from a name the decision
+/// reads for the tool (its catalog entry, a constraint or run limit of a capability that
+/// covers it, or a loaded policy) without being that name. An upstream that matches names
+/// without regard to case (Go's `encoding/json`) would read it as the name the checks saw
+/// absent (SR-133). Decided before the capability stage.
+pub const REASON_ARGUMENT_CASE_MISMATCH: &str = "argument_case_mismatch";
 
 /// Reason code when Cedar denies only through forbids annotated `@obligation("approval")`
 /// and would allow without them (ADR-0009). Always a deny.
@@ -765,6 +779,7 @@ impl PolicyEngineBuilder {
             policies_read_user_window: loaded.reads_user_window,
             policies_read_session_id: loaded.reads_session_id,
             policies_read_arg_taint: loaded.reads_arg_taint,
+            policy_arg_names: loaded.arg_names,
             catalog_names_usage,
             track_usage: self.track_usage,
             schema,
@@ -801,6 +816,8 @@ struct LoadedPolicies {
     /// Some policy may read `context.args_contain_untrusted`, `context.untrusted_args` or
     /// `context.untrusted_outbound` ([`PolicyEngine::reads_arg_taint`]).
     reads_arg_taint: bool,
+    /// The argument names the policies read (`context.input`, `context.untrusted_args`).
+    arg_names: arg_names::PolicyArgNames,
 }
 
 /// The forbids annotated `@obligation("approval")`, and the policy set without them, used to
@@ -899,7 +916,9 @@ fn load_policies(text: &str, schema: &Schema) -> Result<LoadedPolicies, PolicyEr
         }
         Some(set)
     };
+    let arg_names = arg_names::PolicyArgNames::of(&policies).map_err(PolicyError::Parse)?;
     Ok(LoadedPolicies {
+        arg_names,
         reads_usage: policies_read_usage(&policies),
         reads_user_window: policies_read_user_window(&policies),
         reads_session_id: usage::policies_read_context_attr(&policies, "session_id"),
@@ -1072,6 +1091,9 @@ pub struct PolicyEngine {
     /// Some loaded policy may read `context.args_contain_untrusted`,
     /// `context.untrusted_args` or `context.untrusted_outbound`; recomputed on reload.
     policies_read_arg_taint: bool,
+    /// The argument names the loaded policies read, for the argument name check (stage 0a);
+    /// recomputed on reload.
+    policy_arg_names: arg_names::PolicyArgNames,
     /// The catalog declares `amount` or `destination` for some tool.
     catalog_names_usage: bool,
     track_usage: TrackUsage,
@@ -1105,6 +1127,17 @@ impl PolicyEngine {
         // client, and `/` in a server name would make the action and resource ids ambiguous.
         if let Err(e) = call.check_names() {
             return Outcome::deny(REASON_INVALID_NAME, vec![e.to_string()]);
+        }
+
+        // Stage 0a: argument names (SR-133). Every stage below reads arguments by exact name,
+        // and an upstream that ignores case would read `Path` as the `path` they saw absent.
+        if let Err(e) = arg_names::check(
+            call,
+            chain,
+            self.catalog.entry(&call.server, &call.tool),
+            &self.policy_arg_names,
+        ) {
+            return Outcome::deny(REASON_ARGUMENT_CASE_MISMATCH, vec![e]);
         }
 
         // Stage 1: capabilities.
@@ -1438,6 +1471,7 @@ impl PolicyEngine {
             policies_read_user_window: loaded.reads_user_window,
             policies_read_session_id: loaded.reads_session_id,
             policies_read_arg_taint: loaded.reads_arg_taint,
+            policy_arg_names: loaded.arg_names,
             catalog_names_usage: self.catalog_names_usage,
             track_usage: self.track_usage,
         })
