@@ -98,6 +98,80 @@ pub mod sink;
 pub(crate) mod state;
 pub mod telemetry;
 
+/// Thin wrappers over the crate-private `[idps.id_jag_ceiling]` code, for the cargo-fuzz target
+/// `idjag_ceiling` (`fuzz/`). **Not a public API**: behind the `fuzzing` feature, which only
+/// `fuzz/Cargo.toml` enables, hidden from the docs, and free to change or go with any release.
+/// Each wrapper calls the server's own function; none holds logic of its own.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzzing {
+    use attenuo_core::CapabilitySet;
+    use serde_json::{Map, Value};
+
+    use crate::config::IdJagCeilingConfig;
+    use crate::error::ApiError;
+    use crate::idp::ceiling;
+
+    /// A checked `[idps.id_jag_ceiling]` (`idp::ceiling::IdJagCeiling`).
+    #[derive(Debug, Clone)]
+    pub struct IdJagCeiling(ceiling::IdJagCeiling);
+
+    /// `idp::ceiling::Applied`: the ceiling for one ID-JAG.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Applied {
+        /// The ceiling's capabilities.
+        pub capabilities: CapabilitySet,
+        /// The claims that were present and narrowed it, in the order applied.
+        pub claims: Vec<&'static str>,
+        /// The steps before the last that hold a capability with limits.
+        pub limited_steps: Vec<CapabilitySet>,
+    }
+
+    impl IdJagCeiling {
+        /// `IdJagCeiling::from_config`, as the server checks the table at start.
+        ///
+        /// # Errors
+        ///
+        /// The message the server refuses to start with.
+        pub fn from_config(cfg: &IdJagCeilingConfig) -> Result<Self, String> {
+            ceiling::IdJagCeiling::from_config(cfg).map(Self)
+        }
+
+        /// `IdJagCeiling::apply`: the ceiling an ID-JAG with these `claims` leaves of `grant`.
+        pub fn apply(&self, grant: &CapabilitySet, claims: &Map<String, Value>) -> Applied {
+            let a = self.0.apply(grant, claims);
+            Applied {
+                capabilities: a.capabilities,
+                claims: a.claims,
+                limited_steps: a.limited_steps,
+            }
+        }
+    }
+
+    /// Hop-0 narrowing of `requested` against the root grant `granted` and, when given, the
+    /// ceiling and the ID-JAG's `claims`: `idp::intake::narrow` once the ceiling is looked up.
+    ///
+    /// # Errors
+    ///
+    /// The `400 invalid_scope` the intake answers with.
+    pub fn narrow(
+        granted: &CapabilitySet,
+        ceiling: Option<&IdJagCeiling>,
+        claims: &Map<String, Value>,
+        requested: &CapabilitySet,
+    ) -> Result<CapabilitySet, ApiError> {
+        crate::idp::intake::narrow_with(
+            ceiling.map(|c| &c.0),
+            "https://idp.fuzz",
+            "agent:fuzz",
+            claims,
+            granted,
+            requested,
+        )
+        .map(|n| n.capabilities)
+    }
+}
+
 use std::sync::Arc;
 
 use attenuo_proxy::{ProxyConfig, UpstreamConfig};

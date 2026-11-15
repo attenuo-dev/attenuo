@@ -30,6 +30,8 @@ otel = [
     "dep:opentelemetry-http",
     "dep:tracing-opentelemetry",
 ]
+# Wrappers over crate-private ceiling code for the cargo-fuzz targets in `fuzz/`. Not an API.
+fuzzing = []
 
 [dependencies]
 attenuo-core = { workspace = true }

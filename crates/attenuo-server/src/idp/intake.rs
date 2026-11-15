@@ -380,8 +380,8 @@ pub(crate) async fn handle(
 
 /// What [`narrow`] gives: the root token's capabilities and, under `[idps.id_jag_ceiling]`,
 /// the claims that narrowed (for the record) and their names and values (for the log line).
-struct Narrowed {
-    capabilities: CapabilitySet,
+pub(crate) struct Narrowed {
+    pub(crate) capabilities: CapabilitySet,
     ceiling_claims: Option<Vec<&'static str>>,
     ceiling_log: Option<(String, String)>,
 }
@@ -399,6 +399,31 @@ fn narrow(
     granted: &CapabilitySet,
     requested: &CapabilitySet,
 ) -> Result<Narrowed, ApiError> {
+    let ceiling = match kind {
+        CredentialKind::IdJag => state.idps.id_jag_ceiling(&verified.issuer),
+        _ => None,
+    };
+    narrow_with(
+        ceiling,
+        &verified.issuer,
+        agent,
+        &verified.claims,
+        granted,
+        requested,
+    )
+}
+
+/// [`narrow`] once the ceiling is known: `ceiling` is the `[idps.id_jag_ceiling]` of
+/// `issuer` for an ID-JAG, `None` otherwise. Also driven by the `idjag_ceiling` fuzz target,
+/// through `crate::fuzzing` (feature `fuzzing`).
+pub(crate) fn narrow_with(
+    ceiling: Option<&super::ceiling::IdJagCeiling>,
+    issuer: &str,
+    agent: &str,
+    claims: &serde_json::Map<String, Value>,
+    granted: &CapabilitySet,
+    requested: &CapabilitySet,
+) -> Result<Narrowed, ApiError> {
     // `attenuate_root`: a limit of the grant bounds one capability of the root token (SR-121).
     let capabilities = granted.attenuate_root(requested).map_err(|e| match e {
         attenuo_core::AttenuationError::LimitSplit { first, second } => invalid_scope(
@@ -411,17 +436,16 @@ fn narrow(
     // `[idps.id_jag_ceiling]` (opt-in): the ID-JAG's `resource`, `scope` and
     // `authorization_details` narrow the root grant further (draft -06 §4.4.1). Without the
     // table nothing here runs, and the answer and the audit record are as before.
-    match (kind, state.idps.id_jag_ceiling(&verified.issuer)) {
-        (CredentialKind::IdJag, Some(ceiling)) => {
-            let applied = ceiling.apply(granted, &verified.claims);
+    match ceiling {
+        Some(ceiling) => {
+            let applied = ceiling.apply(granted, claims);
             if applied.capabilities.is_empty() {
                 return Err(invalid_scope(
                     "id_jag_ceiling_empty",
                     format!(
                         "the ID-JAG's {} leave nothing of the [[root_grants]] entry for agent `{agent}` \
-                         ([idps.id_jag_ceiling] of `{}`)",
+                         ([idps.id_jag_ceiling] of `{issuer}`)",
                         applied.claims.join(", "),
-                        verified.issuer
                     ),
                 ));
             }
@@ -522,7 +546,7 @@ fn narrow(
             tracing::debug!(claims = ?applied.claims, "ID-JAG ceiling applied");
             let ceiling_log = Some((
                 applied.claims.join(","),
-                ceiling_claim_values(&applied.claims, &verified.claims),
+                ceiling_claim_values(&applied.claims, claims),
             ));
             Ok(Narrowed {
                 capabilities: narrowed,
@@ -530,7 +554,7 @@ fn narrow(
                 ceiling_log,
             })
         }
-        _ => Ok(Narrowed {
+        None => Ok(Narrowed {
             capabilities,
             ceiling_claims: None,
             ceiling_log: None,
