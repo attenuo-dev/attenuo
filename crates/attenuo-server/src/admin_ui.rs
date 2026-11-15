@@ -23,7 +23,8 @@
 //! - With `[admin_ui] allow_write = true` only, the routes that change state
 //!   ([`write_routes`]), which also require `Content-Type: application/json`. Without it,
 //!   `POST /admin/leases/revoke` is still mounted for its dry run (`?preview=true`, JSON
-//!   `Content-Type` required) and answers a revocation with 404.
+//!   `Content-Type` required) and answers a revocation with 404, and `POST
+//!   /admin/approvals/{id}` answers 404 rather than the 405 its `GET` route would give.
 //! - Never `POST /admin/root-token`, whatever `[dev] allow_root_mint` says.
 //!
 //! Every response, errors and 404s included, carries [`SECURITY_HEADERS`]; every response that
@@ -223,6 +224,12 @@ async fn selector_preview_only(
     admin::revoke_by_selector(state, who, q, Body(body)).await
 }
 
+/// `POST /admin/approvals/{id}` on a console listener without `allow_write`: answered 404, as
+/// the write routes are when not mounted, although `GET` on the same path is a read route.
+async fn write_disabled() -> ApiError {
+    ApiError::not_found("writes are disabled on the console listener")
+}
+
 /// The admin routes that change state, mounted on the console listener only with
 /// `[admin_ui] allow_write = true`. Each requires a JSON `Content-Type` ([`require_json`]).
 /// `POST /admin/root-token` is deliberately absent and must never be added.
@@ -247,6 +254,9 @@ pub fn router(state: Arc<AppState>, config: &Config) -> Router {
         api = api.merge(
             Router::new()
                 .route("/admin/leases/revoke", post(selector_preview_only))
+                // The path is mounted for its GET, so without this a decision would be 405,
+                // which the console does not read as "writes are disabled".
+                .route("/admin/approvals/{id}", post(write_disabled))
                 .route_layer(middleware::from_fn(require_json)),
         );
     }
