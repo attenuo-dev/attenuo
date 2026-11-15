@@ -27,12 +27,12 @@ pub enum AttenuationError {
         /// The other.
         second: String,
     },
-    /// At hop 0 ([`crate::CapabilitySet::attenuate_root`]): several limited capabilities of the
+    /// At hop 0 ([`crate::CapabilitySet::attenuate_root`]): one or more limited capabilities of the
     /// root grant or ceiling cover a requested capability's calls, and their limits (or its own
     /// and theirs) include the same kind on different arguments, which one capability cannot
     /// carry together (SR-128). Refused rather than drop one of them.
     #[error(
-        "requested capability `{requested}` is under several limited capabilities whose limits \
+        "requested capability `{requested}` is under one or more limited capabilities whose limits \
          one capability cannot carry together (the same kind of limit on different arguments)"
     )]
     LimitConflict {

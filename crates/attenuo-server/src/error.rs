@@ -377,7 +377,7 @@ pub const CHAIN_TOO_DEEP: &str = "chain_too_deep";
 /// `code` of a hop-0 request in which two capabilities take their limits from the same
 /// limited capability of the root grant or of the ID-JAG ceiling (SR-121).
 pub const LIMIT_SPLIT_AT_ROOT: &str = "limit_split_at_root";
-/// `code` of a hop-0 request with a capability under several limited capabilities of the root
+/// `code` of a hop-0 request with a capability under one or more limited capabilities of the root
 /// grant or of the ID-JAG ceiling whose limits one capability cannot carry together: the same
 /// kind of limit on different arguments (SR-128).
 pub const LIMIT_CONFLICT_AT_ROOT: &str = "limit_conflict_at_root";
@@ -419,7 +419,7 @@ pub(crate) fn limit_split_detail(first: &str, second: &str, of: &str) -> String 
 /// and `of`, where the limits come from, never the limits themselves (SR-124).
 pub(crate) fn limit_conflict_detail(requested: &str, of: &str) -> String {
     format!(
-        "requested capability `{requested}` is under several limited capabilities of {of}, \
+        "requested capability `{requested}` is under one or more limited capabilities of {of}, \
          and a root token capability must carry the limits of each of them, but their limits \
          (or the request's own and theirs) set one kind of limit on different arguments, which \
          one capability cannot carry together: ask for a capability fewer of them cover, \
