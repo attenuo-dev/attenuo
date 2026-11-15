@@ -1,6 +1,6 @@
 # CLI commands
 
-The `attenuo` binary comes from the `attenuo-cli` crate. It talks to a running attenuo server over HTTP, except for `key gen` (`--dpop` and `--client`), `admin operator new` and `admin operator hash`, `policy lint`, `policy test` with `--via local` (the default), `token inspect` without `--verify`, `audit verify --file` with `--jwks`, and `approval verify` with a `--jwks` file, which run offline.
+The `attenuo` binary comes from the `attenuo-cli` crate. It talks to a running attenuo server over HTTP, except for `key gen` (`--dpop` and `--client`), `admin operator new` and `admin operator hash`, `policy lint`, `policy test` with `--via local` (the default), `token inspect` without `--verify`, `audit verify --file` with `--jwks`, and `approval verify` with a `--jwks` file, which run offline, and `stdio-bridge`, which serves a local STDIO MCP server over HTTP and talks to no attenuo server.
 
 ```
 attenuo [--server URL] [--json] <command>
@@ -565,4 +565,32 @@ It prints one `<upstream>/<tool>` per line, then `next page: --page-token <token
 
 ```sh
 attenuo authzen search --upstream github --arg repo=alice/public-docs --all
+```
+
+### `stdio-bridge --listen ADDR -- <COMMAND>...`
+
+Run a local STDIO MCP server as a child process and serve it as a Streamable HTTP MCP endpoint at `http://ADDR/mcp`, so that it can be an [`[[upstreams]]`](config.md#upstreams) entry of the proxy. The guide is [STDIO MCP servers](../guides/stdio-servers.md). Everything after `--` is the command and its arguments. The child inherits the bridge's environment, minus `ATTENUO_ADMIN_TOKEN`, `ATTENUO_TOKEN`, `ATTENUO_CLIENT_SECRET` and `ATTENUO_DPOP_KEY`. Its stderr goes to the bridge's stderr. Once bound, the bridge prints `listening on http://ADDR/mcp` on stdout.
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--listen ADDR` | | IP address and port to serve on, for example `127.0.0.1:3001`. Port 0 picks a free one. Required. |
+| `--allow-non-loopback` | off | Accept a `--listen` address that is not loopback. Without it such an address is refused (exit 1). The bridge does not authenticate its callers: anyone who can reach it calls the STDIO server without attenuo. |
+| `--timeout SECS` | `90` | How long a request waits for the child's answer (1 to 3600). Past it the caller gets HTTP 504 and a JSON-RPC error `-32603` with its own id. A late answer is dropped. Keep it below the proxy's `upstream_response_timeout_seconds` (120 by default), so the bridge answers before the proxy gives up. |
+| `--max-request-bytes BYTES` | `4194304` (4 MiB) | Largest HTTP request body. A larger one is HTTP 413 and is not sent to the child. |
+| `--max-line-bytes BYTES` | `16777216` (16 MiB) | Longest line read from the child's stdout. A longer line is dropped with one line on stderr, and the request it answered times out. |
+| `--verbose` | off | One line on stderr for each message of the child the bridge drops or answers itself. |
+
+What the bridge does with each message:
+
+- A `POST` with a request is written to the child as one line, with its `id` replaced by a number unique to the bridge, and answered with the child's response (`200`, `application/json`) with the caller's `id` put back. Two callers that use the same id each get their own answer.
+- A `POST` with a notification is written to the child and answered `202` with no body. A `POST` with a response is answered `202` and dropped, because the bridge never passes the child's own requests on.
+- A batch (a JSON array) is refused with `400` and JSON-RPC `-32600`. So is a request whose `id` is not a string or a number. A body that is not JSON is `400` and `-32700`. A `Content-Type` other than `application/json` is `415`. A request with an `Origin` header is `403`: the proxy never sends one, and a browser always does.
+- `GET` and `DELETE` on the endpoint are `405`. There is no server-to-client stream and no `Mcp-Session-Id`: the child is one MCP session.
+- `initialize` is sent to the child once. A later `initialize` gets the child's first answer, with its own id, and is not sent on. Only the first `notifications/initialized` reaches the child.
+- The child's notifications (progress, log messages) are dropped. Its requests (sampling, elicitation, roots, ping) are answered at once with JSON-RPC `-32601`. A line that is not a JSON-RPC message is dropped. On exit the bridge prints how many of each it dropped.
+
+The child's arguments and environment are never printed; error messages name only the program. Exit status: 0 after SIGINT or SIGTERM; 1 when the child cannot be started, or exits or closes its stdout (the bridge does not restart it), or `--listen` is refused or in use. On the way out the bridge closes the child's stdin, waits up to 2 seconds for it to exit, then kills it.
+
+```sh
+attenuo stdio-bridge --listen 127.0.0.1:3001 -- npx -y @modelcontextprotocol/server-filesystem /srv/docs
 ```

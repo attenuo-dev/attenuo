@@ -178,6 +178,47 @@ pub(crate) enum Command {
     /// Exits 0 when it is and 1 when it is not or cannot be reached, never 2, so it can be a
     /// container `HEALTHCHECK` (Docker reserves exit status 2 there). Needs no token.
     Health(HealthArgs),
+    /// Run a local STDIO MCP server as a child process and serve it as a Streamable HTTP MCP
+    /// endpoint at `http://<listen>/mcp`, so it can be an `[[upstreams]]` entry of the
+    /// attenuo proxy. The bridge has no authentication of its own: anyone who can reach it
+    /// bypasses attenuo, so it binds loopback only unless `--allow-non-loopback` is given.
+    /// Runs until SIGINT or SIGTERM (exit 0) or until the child exits (exit 1); the child is
+    /// stopped with it.
+    StdioBridge(StdioBridgeArgs),
+}
+
+/// `attenuo stdio-bridge`.
+#[derive(Debug, Args)]
+pub(crate) struct StdioBridgeArgs {
+    /// The address to serve on, an IP address and a port (`127.0.0.1:3001`; port 0 picks a
+    /// free one). The URL is printed on stdout once bound: `listening on http://ADDR/mcp`.
+    #[arg(long, value_name = "ADDR")]
+    pub listen: std::net::SocketAddr,
+    /// Accept a `--listen` address that is not loopback. The bridge does not authenticate
+    /// its callers: anyone who reaches it calls the STDIO server without attenuo.
+    #[arg(long)]
+    pub allow_non_loopback: bool,
+    /// How long a request waits for the STDIO server's answer, in seconds, before it gets a
+    /// JSON-RPC error with HTTP 504. Keep it below the proxy's
+    /// `upstream_response_timeout_seconds` (120 by default).
+    #[arg(long, value_name = "SECS", default_value_t = 90, value_parser = clap::value_parser!(u64).range(1..=3600))]
+    pub timeout: u64,
+    /// Largest HTTP request body accepted, in bytes; a larger one gets HTTP 413.
+    #[arg(long, value_name = "BYTES", default_value_t = 4 * 1024 * 1024, value_parser = clap::value_parser!(u64).range(1..=(1 << 30)))]
+    pub max_request_bytes: u64,
+    /// Longest line read from the STDIO server's stdout, in bytes; a longer one is dropped
+    /// (and the request it answered times out).
+    #[arg(long, value_name = "BYTES", default_value_t = 16 * 1024 * 1024, value_parser = clap::value_parser!(u64).range(1..=(1 << 30)))]
+    pub max_line_bytes: u64,
+    /// Print one line to stderr for each message of the STDIO server the bridge drops
+    /// (notifications, its own requests, answers nobody waits for).
+    #[arg(long)]
+    pub verbose: bool,
+    /// The STDIO server's command and its arguments, after `--`. It inherits the bridge's
+    /// environment, without attenuo's own secrets (`ATTENUO_ADMIN_TOKEN`, `ATTENUO_TOKEN`,
+    /// `ATTENUO_CLIENT_SECRET`, `ATTENUO_DPOP_KEY`).
+    #[arg(required = true, last = true, num_args = 1.., value_name = "COMMAND", value_parser = clap::value_parser!(std::ffi::OsString))]
+    pub command: Vec<std::ffi::OsString>,
 }
 
 /// `attenuo health`.
