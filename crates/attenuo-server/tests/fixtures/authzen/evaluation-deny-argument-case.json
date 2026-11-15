@@ -1,0 +1,46 @@
+{
+  "_note": "AuthZEN 1.0 sections 5.5 and 10.1, a deny (SR-133's remainder): the catalog declares `repo` for create_issue, and the input names it `Repo`. An upstream that matches names without regard to case reads that as `repo`, which every check of the decision would have seen absent, so the call is refused before the capability stage (reason argument_case_mismatch, no policy ids).",
+  "token": {
+    "capabilities": [
+      "github:create_issue"
+    ]
+  },
+  "steps": [
+    {
+      "path": "/access/v1/evaluation",
+      "body": {
+        "subject": {
+          "type": "agent",
+          "id": ""
+        },
+        "action": {
+          "name": "create_issue"
+        },
+        "resource": {
+          "type": "tool",
+          "id": "github/create_issue",
+          "properties": {
+            "server": "github"
+          }
+        },
+        "context": {
+          "input": {
+            "Repo": "alice/public-site"
+          }
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "decision": false,
+          "context": {
+            "reason": "argument_case_mismatch",
+            "policy_ids": [],
+            "diagnostics": [],
+            "decision_id": "<decision_id>"
+          }
+        }
+      }
+    }
+  ]
+}

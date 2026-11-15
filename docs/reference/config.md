@@ -56,6 +56,8 @@ The built-in user attributes `mfa` (bool), `roles` (set of string), `tenant` and
 
 Every action a policy names must be in the catalog: the table `[policy.catalog.github.read_file]` declares `Action::"github/read_file"`.
 
+Argument names are compared exactly, and a call argument whose name differs only in case from one the entry names (`inputs`, `amount`, `destination`, `outbound`), from one a capability constraint or limit names for the tool, or from one a loaded policy reads under `context.input` or tests in `context.untrusted_args`, is denied with reason `argument_case_mismatch` before the capability stage, because an upstream that ignores case (Go's `encoding/json`) would read it as that name. Write the names as the tool's input schema spells them.
+
 Server and tool names follow one rule everywhere (catalog, `[[upstreams]]`, capabilities, `tools/call`): 1 to 128 ASCII letters, digits, `_`, `.` or `-`, compared case-sensitively and never normalized. A tool key may also be an MCP method name made of such segments joined by `/` (`"resources/read"`), which is how the proxy authorizes methods other than `tools/call`. The server refuses to start with a catalog or grant that breaks the rule.
 
 ## `[audit]`

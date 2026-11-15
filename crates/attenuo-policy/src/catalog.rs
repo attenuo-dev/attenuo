@@ -292,6 +292,21 @@ impl ToolAttrs {
         self.outbound_inputs().any(|a| untrusted.contains(a))
     }
 
+    /// Every argument name the entry names: the `inputs`, `amount`, `destination` and each
+    /// `outbound` entry, the last two without a `#host` suffix. The names a call's arguments
+    /// must not differ from only in case ([`crate::REASON_ARGUMENT_CASE_MISMATCH`]).
+    pub fn argument_names(&self) -> impl Iterator<Item = &str> {
+        fn strip(r: &str) -> &str {
+            r.rsplit_once('#').map_or(r, |(arg, _)| arg)
+        }
+        self.inputs
+            .keys()
+            .map(String::as_str)
+            .chain(self.amount.as_deref())
+            .chain(self.destination.as_deref().map(strip))
+            .chain(self.outbound_inputs())
+    }
+
     /// Declare the type of an argument so policies that read `context.input.<name>` validate.
     pub fn with_input(mut self, name: impl Into<String>, ty: ArgType) -> Self {
         self.inputs.insert(name.into(), ty);
@@ -403,6 +418,11 @@ impl ToolCatalog {
             .get(&(server.to_string(), tool.to_string()))
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// The entry for `(server, tool)`, if it is registered.
+    pub(crate) fn entry(&self, server: &str, tool: &str) -> Option<&ToolAttrs> {
+        self.tools.get(&(server.to_string(), tool.to_string()))
     }
 
     /// Is `(server, tool)` registered? Names are compared exactly.
