@@ -125,6 +125,8 @@ pub mod fuzzing {
         pub claims: Vec<&'static str>,
         /// The steps before the last that hold a capability with limits.
         pub limited_steps: Vec<CapabilitySet>,
+        /// What each claim whose capabilities hold limits named.
+        pub limited_claims: Vec<CapabilitySet>,
     }
 
     impl IdJagCeiling {
@@ -144,6 +146,7 @@ pub mod fuzzing {
                 capabilities: a.capabilities,
                 claims: a.claims,
                 limited_steps: a.limited_steps,
+                limited_claims: a.limited_claims,
             }
         }
     }

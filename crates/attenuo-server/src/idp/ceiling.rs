@@ -33,6 +33,10 @@
 //! limits of every limited capability of that set that covers its calls, and intake keeps the
 //! result of each, so the root token carries the limits of every step (SR-128): [`meet`] copies
 //! into a capability the limits of one capability of the earlier step, as attenuation does.
+//! [`meet`] also keeps a capability of the earlier step as it is, with its own limits, when a
+//! capability the claim names covers it, so the same check is made against what each claim
+//! that holds limits named ([`Applied::limited_claims`]): a `scopes` limit over two limited
+//! capabilities of the root grant is still one budget (SR-131).
 //!
 //! [`meet`] is not the greatest lower bound: it keeps a capability of one side when a single
 //! capability of the other side covers it (after clamping limits), the same conservative rule
@@ -79,6 +83,26 @@ pub(crate) struct Applied {
     /// check, which carries the limits of every limited capability of the step over each
     /// requested capability (SR-128).
     pub limited_steps: Vec<CapabilitySet>,
+    /// What each claim named (the capabilities of its `resources` or `scopes` entries, or of
+    /// `authorization_details`), for each claim whose capabilities hold limits, in
+    /// [`CEILING_CLAIMS`] order. [`meet`] keeps a capability of the step before as it is when a
+    /// capability the claim names covers it, with its own limits and without the claim's, so
+    /// two limited grant capabilities under one limited `scopes` capability would each keep
+    /// their own figure and the `scopes` figure would bound neither (SR-131). So the hop-0
+    /// check ([`CapabilitySet::attenuate_root`]) is made against each of these too, after
+    /// `limited_steps`: the result is within each of them, since the ceiling is.
+    pub limited_claims: Vec<CapabilitySet>,
+}
+
+impl Applied {
+    /// The sets hop 0 checks the narrowed request against after `capabilities`, in order:
+    /// `limited_steps`, then `limited_claims`.
+    pub(crate) fn also_checked(&self) -> Vec<&CapabilitySet> {
+        self.limited_steps
+            .iter()
+            .chain(&self.limited_claims)
+            .collect()
+    }
 }
 
 impl IdJagCeiling {
@@ -150,6 +174,7 @@ impl IdJagCeiling {
         let mut capabilities = grant.clone();
         let mut used = Vec::new();
         let mut limited_steps = Vec::new();
+        let mut limited_claims = Vec::new();
         for name in CEILING_CLAIMS {
             let Some(value) = claims.get(name).filter(|v| !v.is_null()) else {
                 continue;
@@ -167,11 +192,17 @@ impl IdJagCeiling {
                 capabilities = next;
             }
             used.push(name);
+            // What the claim named, when it holds limits: `meet` may have kept capabilities
+            // of the step before under one of them with their own limits (SR-131).
+            if has_limits(&named) {
+                limited_claims.push(named);
+            }
         }
         Applied {
             capabilities,
             claims: used,
             limited_steps,
+            limited_claims,
         }
     }
 
@@ -842,5 +873,48 @@ mod tests {
             applied.limited_steps[0].attenuate_root(&narrowed),
             Err(attenuo_core::AttenuationError::LimitSplit { .. })
         ));
+    }
+
+    /// SR-131: `meet` keeps the grant's limited capabilities under a limited `scopes`
+    /// capability with their own limits, so the scope's limit is in neither the ceiling nor a
+    /// step. What the claim named is recorded, and refuses the two as a split.
+    #[test]
+    fn what_a_limited_claim_named_is_kept_for_the_split_check_sr131() {
+        let to = |who: &str, max: u64| {
+            Capability::new("banking", "send_money")
+                .with_constraint("to", ArgConstraint::Equals(json!(who)))
+                .with_limits(Limits::default().with_sum("amount", max))
+        };
+        let grant: CapabilitySet = [to("alice", 50), to("bob", 50)].into_iter().collect();
+        let cfg: IdJagCeilingConfig = toml::from_str(
+            r#"scopes = { payments = [
+                { server = "banking", tool = "send_money", limits = { sum = { arg = "amount", max = 60 } } },
+            ] }"#,
+        )
+        .unwrap();
+        let ceiling = IdJagCeiling::from_config(&cfg).unwrap();
+        let applied = ceiling.apply(&grant, &claims(json!({"scope": "payments"})));
+        // The ceiling is the grant's two, 50 each: 100 against the scope's 60.
+        assert_eq!(applied.capabilities, grant);
+        assert!(applied.limited_steps.is_empty());
+        assert_eq!(applied.limited_claims.len(), 1);
+        assert_eq!(applied.also_checked().len(), 1);
+        let narrowed = applied.capabilities.attenuate_root(&grant).unwrap();
+        assert!(matches!(
+            applied.limited_claims[0].attenuate_root(&narrowed),
+            Err(attenuo_core::AttenuationError::LimitSplit { .. })
+        ));
+        let alice: CapabilitySet = [to("alice", 50)].into_iter().collect();
+        assert_eq!(
+            applied.limited_claims[0].attenuate_root(&alice),
+            Ok(alice.clone())
+        );
+        // A claim without limits records nothing.
+        let cfg: IdJagCeilingConfig =
+            toml::from_str(r#"scopes = { payments = ["banking:send_money"] }"#).unwrap();
+        let applied = IdJagCeiling::from_config(&cfg)
+            .unwrap()
+            .apply(&grant, &claims(json!({"scope": "payments"})));
+        assert!(applied.limited_claims.is_empty());
     }
 }
