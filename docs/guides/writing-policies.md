@@ -80,7 +80,7 @@ The schema declares four optional attributes of `context.originating_user.attrib
 user_attributes = { groups = "set<string>", department = "string" }
 ```
 
-Types are `string`, `long`, `bool` and `set<T>` (for example `set<string>`); `decimal` is for catalog inputs only. The declarations are merged over the built-in four, so you can also re-type one of them. Then guard every use, since attributes are optional:
+Types are `string`, `long`, `bool` and `set<T>` (for example `set<string>`); `decimal` is for catalog inputs only. The declarations are merged over the built-in four, so you can also re-type one of them. Then guard every use, since attributes are optional (this example also needs a `[policy.catalog.github.create_deployment]` entry):
 
 ```cedar
 @id("platform_engineers_may_deploy")
@@ -110,7 +110,7 @@ The request data does not change: attenuo fills only the default attributes. Dec
 
 ## Patterns
 
-All of these assume the catalog above.
+All of these assume the catalog above. The banking examples use the `send_money` entry shown with them, and `merge_only_release_bot` below needs a `github.merge_pull_request` entry; without them `attenuo policy lint --config` reports the action as unrecognized.
 
 ### Read-only agents
 

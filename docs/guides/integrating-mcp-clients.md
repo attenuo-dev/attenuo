@@ -103,7 +103,7 @@ curl -s -X POST https://attenuo.example.com/token \
   }'
 ```
 
-The form encoding takes `scope` instead, a space-separated list of `server:tool` with no constraints:
+The form encoding takes `scope` instead, a space-separated list of `server:tool` with no constraints. It is an alternative to the JSON request, not a second step: a parent token delegates to a given actor once, so sending both with the same `$PLANNER_TOKEN` gets `invalid_grant` / `replayed` on the second.
 
 ```sh
 curl -s -X POST https://attenuo.example.com/token \
@@ -211,7 +211,7 @@ Other proxy errors: `-32004` (HTTP 404) for an unknown upstream name, `-32005` (
 Good client behaviour:
 
 - Return the denial to the model as a plain tool error that says what was denied and why, in your words. Do not paste raw server output into the model's context, and do not invite it to try other routes.
-- Log the `decision_id` next to your own request id. When a user asks "why did the agent not do X", an operator can look it up. Over HTTP: `GET /admin/audit?from=1&limit=1000`, then pick the entry where `record.id` matches. With the CLI and `jq`: `attenuo --json audit tail -n 1000 | jq '.entries[] | select(.record.id == "<decision id>")'`. Untested against a large log.
+- Log the `decision_id` next to your own request id. When a user asks "why did the agent not do X", an operator can look it up. Over HTTP: `GET /admin/audit?from=1&limit=1000`, then pick the entry where `record.id` matches. With the CLI: `attenuo audit show --id <decision id>` (`GET /admin/audit/records/{id}`), which also shows the state of the chain's leases now.
 - Do not loop on a denial. A denial is a decision, not a glitch.
 
 ## Renewing leases

@@ -238,3 +238,40 @@ async fn a_bare_404_from_the_main_listener_hints_at_admin_server() {
     let out = run(env).await;
     assert!(!text(&out.stderr).contains("hint:"), "{out:?}");
 }
+
+const ROOT_MINT_HINT: &str = "hint: POST /admin/root-token exists only when the server's config \
+     sets [dev] allow_root_mint = true (development only)";
+
+#[tokio::test]
+async fn token_root_against_a_server_without_the_dev_mint_names_the_setting() {
+    // The dev mint is off by default, so `POST /admin/root-token` is not mounted and answers
+    // a bare 404 on either listener. The error names the setting, which is the likely cause.
+    let s = split().await;
+    let root = [
+        "token",
+        "root",
+        "--subject",
+        "alice",
+        "--agent",
+        "planner",
+        "--cap",
+        "github:*",
+    ];
+    let out = run(admin_cmd(&["--server", &s.main], &root)).await;
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let err = text(&out.stderr);
+    assert!(err.contains("server answered 404 Not Found\n"), "{err}");
+    assert!(err.contains(ROOT_MINT_HINT), "{err}");
+    // Sent to the main listener with no admin base named, the listener hint stays too.
+    assert!(err.contains(HINT), "{err}");
+
+    let out = run(admin_cmd(
+        &["--server", &s.main, "--admin-server", &s.admin],
+        &root,
+    ))
+    .await;
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let err = text(&out.stderr);
+    assert!(err.contains(ROOT_MINT_HINT), "{err}");
+    assert!(!err.contains(HINT), "{err}");
+}

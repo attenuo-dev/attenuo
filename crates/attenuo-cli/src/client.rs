@@ -63,6 +63,13 @@ struct Reply {
 const ADMIN_LISTENER_HINT: &str = "hint: the server may serve its admin API on a separate \
      listener ([admin] listen); pass --admin-server URL (or set ATTENUO_ADMIN_SERVER)";
 
+/// Added under a 404 without an error code to `POST /admin/root-token`: the server mounts that
+/// route only with the development root mint on, so a server that runs its config as shipped
+/// answers it like an unknown path.
+const ROOT_MINT_HINT: &str = "hint: POST /admin/root-token exists only when the server's config \
+     sets [dev] allow_root_mint = true (development only); for a root token from a user's \
+     identity provider, use `attenuo token exchange --subject-token-type id-token`";
+
 pub(crate) struct Client {
     http: reqwest::Client,
     base: String,
@@ -286,7 +293,7 @@ impl Client {
                 Ok(req)
             })
             .await?;
-        json_reply(reply)
+        json_reply(reply).map_err(|e| with_hint_on_bare_404(e, ROOT_MINT_HINT))
     }
 
     /// The URL of `POST /token`, which DPoP proofs for an exchange name.
@@ -430,11 +437,16 @@ fn is_admin_path(path: &str) -> bool {
 /// `err` with [`ADMIN_LISTENER_HINT`] on a line of its own when it is a 404 without an error
 /// code: the answer to an unknown route. A JSON 404 (`not_found` for a lease, approval or
 /// audit record that does not exist) comes from a route that does exist, so it stays as it is.
-fn with_admin_hint(mut err: anyhow::Error) -> anyhow::Error {
+fn with_admin_hint(err: anyhow::Error) -> anyhow::Error {
+    with_hint_on_bare_404(err, ADMIN_LISTENER_HINT)
+}
+
+/// `err` with `hint` on a line of its own when it is a 404 without an error code.
+fn with_hint_on_bare_404(mut err: anyhow::Error, hint: &str) -> anyhow::Error {
     if let Some(api) = err.downcast_mut::<ApiError>() {
         if api.status == StatusCode::NOT_FOUND && api.code.is_none() {
             api.message.push('\n');
-            api.message.push_str(ADMIN_LISTENER_HINT);
+            api.message.push_str(hint);
         }
     }
     err
