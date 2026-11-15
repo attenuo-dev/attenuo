@@ -383,7 +383,7 @@ pub(crate) async fn handle(
 
 /// The `detail` of a `limit_split_at_root` refusal at the ceiling when the two capabilities
 /// cannot be named as requested.
-const SPLIT_OF_THE_CLAIMS: &str = "two requested capabilities take their limits from the same \
+const SPLIT_OF_THE_CLAIMS: &str = "two requested capabilities fall under the same limited \
      capability of the ID-JAG's claims: ask for one capability covering both instead";
 
 /// The `detail` of a `limit_conflict_at_root` refusal at the ceiling when the capability cannot
