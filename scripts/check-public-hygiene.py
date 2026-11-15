@@ -8,7 +8,8 @@ Catches the things that crept in before the first public release:
 - the project's old name outside the files that record the rename;
 - `<domain>`-style contact placeholders, beyond the known pending ones;
 - files that must never be committed (exported reading guides, daily working logs under
-  docs/log/, the pre-release launch checklist);
+  docs/log/, the pre-release launch checklist, anything under docs/guide/ such as the
+  codebase walkthrough, the task board and milestones under docs/tasks/);
 - pages under docs/ that are personal planning, listed in docs/SUMMARY.md;
 - an ADR whose front matter or status line has an unknown status;
 - a security review pass under docs/research/ that README.md does not link.
@@ -41,14 +42,19 @@ PLACEHOLDER_PENDING: set[str] = set()
 # Pages that talk about the placeholder rather than use it.
 PLACEHOLDER_MENTION_OK = re.compile(r"^docs/research/")
 
-# Exported reading guides; the daily working logs and the launch checklist, which left the
-# repository before it went public (the CHANGELOG and pull request descriptions are the record).
-NEVER_TRACKED = re.compile(r"^(docs/guide/flight-guide-|docs/log/|docs/launch-checklist\.md$)")
+# Internal working documents that left the repository before it went public: the daily working
+# logs, the launch checklist, the codebase walkthrough and any other page under docs/guide/
+# (exported reading guides there are also gitignored), and the task board and milestones under
+# docs/tasks/. The CHANGELOG and pull request descriptions are the record of a change; the
+# design notes, ADRs and reference pages say what is open.
+NEVER_TRACKED = re.compile(r"^(docs/guide/|docs/log/|docs/tasks/|docs/launch-checklist\.md$)")
 PRIVATE_PAGES = (
     "project/research-readiness-plan.md",
     "brief/attenuo-one-page.md",
     "launch-checklist.md",
     "](log/",
+    "](guide/",
+    "](tasks/",
 )
 ADR_STATUSES = {"proposed", "accepted", "rejected", "deprecated", "superseded"}
 

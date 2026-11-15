@@ -34,7 +34,7 @@ attenuo answers a different question: "this caller is acting for Alice, through 
 
 Those are policy and authorization engines. You ask them a question and they answer. They are good at it, and attenuo uses one: Cedar, in-process, for the policy stage.
 
-What an engine does not give you is everything around the question. It does not mint the tokens that carry a delegation chain, check that each hop only narrowed the one above, hold leases, sit in the request path, or keep a hash-chained log of the answers. attenuo supplies those, and calls the policy engine for the "may this call pass" step. A relationship store like OpenFGA or SpiceDB could later feed facts into the policy (who owns which repo). That is on the [task board](tasks/board.md) as later work, not built. A comparison table is in [related work](research/related-work.md#positioning-table).
+What an engine does not give you is everything around the question. It does not mint the tokens that carry a delegation chain, check that each hop only narrowed the one above, hold leases, sit in the request path, or keep a hash-chained log of the answers. attenuo supplies those, and calls the policy engine for the "may this call pass" step. A relationship store like OpenFGA or SpiceDB could later feed facts into the policy (who owns which repo). That is planned in [ADR-0002](decisions/0002-cedar-for-policy.md) (a `RelationResolver` with a SpiceDB-backed implementation), not built. A comparison table is in [related work](research/related-work.md#positioning-table).
 
 ## How is it different from Microsoft Agent 365 or other agent governance products?
 

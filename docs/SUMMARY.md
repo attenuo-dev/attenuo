@@ -11,7 +11,6 @@
   - [Admin console](guides/admin-console.md)
   - [Observability](guides/observability.md)
 - [Demo recordings](demo/README.md)
-- [Codebase walkthrough](guide/codebase-walkthrough.md)
 
 # Concepts
 
@@ -132,5 +131,3 @@
 - [Release 0.1.0](release/0.1.0.md)
 - [Changelog](project/changelog.md)
 - [Security policy](project/security.md)
-- [Task board](tasks/board.md)
-- [Milestones](tasks/milestones.md)

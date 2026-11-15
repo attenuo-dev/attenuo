@@ -2,7 +2,7 @@
 
 - Date: 2026-11-14
 - Branch: `fix/security-pass-15` (base: `b98ab9b` on main, for the review and the fixes)
-- Related: [pass 1 and 2](security-review-2026-10-22.md), [pass 3](security-review-2026-10-23.md), [pass 4](security-review-2026-10-23-pass4.md), [pass 5](security-review-2026-10-24-pass5.md), [pass 6](security-review-2026-10-25-pass6.md), [pass 7](security-review-2026-10-25-pass7.md), [pass 8](security-review-2026-11-05-pass8.md), [pass 9](security-review-2026-11-06-pass9.md), [pass 10](security-review-2026-11-06-pass10.md), [pass 11](security-review-2026-11-12-pass11.md), [pass 12](security-review-2026-11-13-pass12.md), [pass 13](security-review-2026-11-13-pass13.md), [pass 14](security-review-2026-11-14-pass14.md), [threat model](../spec/threat-model.md), [task board](../tasks/board.md)
+- Related: [pass 1 and 2](security-review-2026-10-22.md), [pass 3](security-review-2026-10-23.md), [pass 4](security-review-2026-10-23-pass4.md), [pass 5](security-review-2026-10-24-pass5.md), [pass 6](security-review-2026-10-25-pass6.md), [pass 7](security-review-2026-10-25-pass7.md), [pass 8](security-review-2026-11-05-pass8.md), [pass 9](security-review-2026-11-06-pass9.md), [pass 10](security-review-2026-11-06-pass10.md), [pass 11](security-review-2026-11-12-pass11.md), [pass 12](security-review-2026-11-13-pass12.md), [pass 13](security-review-2026-11-13-pass13.md), [pass 14](security-review-2026-11-14-pass14.md), [threat model](../spec/threat-model.md), task board
 
 ## Scope and method
 

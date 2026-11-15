@@ -76,4 +76,4 @@ The fake server is `crates/attenuo-proxy/examples/fake_mcp.rs`: the proxy crate'
 
 ## What this does not show
 
-The root token comes from the server's development endpoint, which trusts the admin to say who alice is. Real deployments mint it from an OIDC ID token or ID-JAG instead. The `actor` of the exchange authenticates with a client secret from `[[agents]]`; workload identity (an `actor_token` such as a SPIFFE JWT-SVID from an `[[actor_trust]]` issuer) is supported but not used here. See [identity providers](../../docs/guides/identity-providers.md) and the [task board](../../docs/tasks/board.md).
+The root token comes from the server's development endpoint, which trusts the admin to say who alice is. Real deployments mint it from an OIDC ID token or ID-JAG instead. The `actor` of the exchange authenticates with a client secret from `[[agents]]`; workload identity (an `actor_token` such as a SPIFFE JWT-SVID from an `[[actor_trust]]` issuer) is supported but not used here. See [identity providers](../../docs/guides/identity-providers.md).
