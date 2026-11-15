@@ -245,6 +245,10 @@ pub struct RequestAuth<'a> {
     pub path: &'a str,
     /// The `Host` header, used to rebuild the request URL when no public URL is configured.
     pub host: Option<&'a str>,
+    /// The full URL the DPoP proof must name in `htu`, when it is not this server's own URL
+    /// for `path`: the gateway URL the agent called, from an `[[ext_authz]]` entry's
+    /// `dpop_url`. Always from configuration, never from the request. `None` everywhere else.
+    pub url: Option<&'a str>,
 }
 
 /// An authenticated caller.

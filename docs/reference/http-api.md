@@ -117,6 +117,11 @@ The table is generated from `attenuo_core::error_codes::ERROR_CODES`, the one pl
 | `dpop_required` | 401 | `-32001` (401) |  | The token is bound to a key and no DPoP proof was sent. |
 | `duplicate_actor` | 400 `invalid_request` |  |  | The `actor` is already in the chain. |
 | `expired` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The credential has expired. |
+| `ext_authz_ambiguous_body` |  | `-32600` (400) |  | A gateway forwarded a body with a duplicate member, or a number not written as it is read (`/ext-authz/v1/mcp/{server}`). |
+| `ext_authz_batch_unsupported` |  | `-32600` (400) |  | A gateway forwarded a JSON-RPC batch, which `/ext-authz/v1/mcp/{server}` does not decide. |
+| `ext_authz_body_incomplete` |  | `-32600` (403) |  | A gateway did not send the whole body (`x-envoy-auth-partial-body` is not `false`). |
+| `ext_authz_dpop_url_unset` |  | `-32001` (401) |  | A DPoP proof came through a gateway route whose `[[ext_authz]]` entry has no `dpop_url`. |
+| `ext_authz_unauthenticated` |  | `-32001` (403) |  | A request to `/ext-authz/v1/mcp/{server}` lacks the `[[ext_authz]]` entry's gateway secret. |
 | `id_jag_ceiling_empty` | 400 `invalid_scope` |  |  | An ID-JAG from an issuer with `[idps.id_jag_ceiling]`: its `resource`, `scope` and `authorization_details` claims leave nothing of the root grant (each names only what is unmapped, of an unknown type, or not in the grant). |
 | `input_type_mismatch` |  | `-32003` (200) | yes | A call argument does not have the type the catalog declares. |
 | `invalid_agent` | 400 `invalid_grant` |  |  | The agent id of the token to mint is empty (an exchange's `actor`, or `agent` at `POST /admin/root-token`). |
@@ -375,6 +380,30 @@ Other refusals of the proxy. Each also carries its stable code in `data.code` (l
 | 429 | `-32007` | `too_many_sessions` | the principal holds `[proxy] max_sessions_per_principal` live sessions, with `Retry-After: 30` |
 | 429 | `-32007` | `rate_limited` | the run (root lease) used up `[limits] mcp_requests_per_minute`, with `Retry-After` until its minute ends; counted after the token verified, never recorded |
 | 503 | `-32006` | `overloaded` | `[limits] max_in_flight` requests are already being handled, with `Retry-After: 1` |
+
+## Gateway external authorization
+
+Mounted only when `[[ext_authz]]` has an entry ([configuration](config.md#extauthz)); otherwise these paths are unknown. An external gateway (agentgateway's HTTP `extAuthz` mode, [guide](../guides/agentgateway.md)) sends the agent's request here and forwards it to the MCP server only on a 2xx answer. The decision is the proxy's own for `POST /mcp/{server}` ([design](../design/agentgateway-ext-authz.md)), with the gateway's position taken into account.
+
+| Method and path | Auth | Purpose |
+| --- | --- | --- |
+| `POST /ext-authz/v1/mcp/{server}` | `X-Attenuo-Gateway-Secret` of the `[[ext_authz]]` entry of `server`, then the agent's delegation token as forwarded | Decide the one JSON-RPC message in the body as the proxy would. 200 with no body when the proxy would forward it (with `X-Attenuo-Decision-Id` when a call was decided); otherwise the proxy's own answer. |
+| `GET /ext-authz/v1/mcp/{server}` | same | The listen stream: 200 when the token verifies and its lease is live, as the proxy checks before forwarding a `GET`. |
+| `DELETE /ext-authz/v1/mcp/{server}` | same | Session close: as `GET`. |
+
+Every request must carry `x-envoy-auth-partial-body: false`, which the gateway sets when it sends the whole body. `Mcp-Session-Id` is ignored, and the decided call has no session. Answers that differ from the proxy's:
+
+| HTTP status | JSON-RPC code | `data.code` | When |
+| --- | --- | --- | --- |
+| 403 | `-32003`, `-32008`, `-32602` | the proxy's | the proxy would have answered the message itself with this error inside a 200 (a denial, an approval request, invalid params); the body is the same JSON-RPC error |
+| 403 | `-32001` | `ext_authz_unauthenticated` | `X-Attenuo-Gateway-Secret` is missing, sent twice, or not the secret of this server's entry; checked first, nothing is decided or recorded |
+| 403 | `-32600` | `ext_authz_body_incomplete` | `x-envoy-auth-partial-body` is missing or not exactly `false` |
+| 401 | `-32001` | `ext_authz_dpop_url_unset` | the request has a `DPoP` header and the entry has no `dpop_url` |
+| 400 | `-32600` | `ext_authz_ambiguous_body` | an object has two members of one name, or a number is not written as serde_json reads it (`1e3`, `1.50`, `0.10000000000000001`, an integer beyond 64 bits) |
+| 400 | `-32600` | `ext_authz_batch_unsupported` | the body is a JSON-RPC batch; nothing is decided |
+| 404 | `-32004` | `unknown_server` | no `[[ext_authz]]` entry is called `server` |
+
+A DPoP proof must name the entry's `dpop_url` and the forwarded method; it is used once, as at the proxy. The other refusals (no or bad token, a dead lease, `request_too_large`, `parse_error`, `rate_limited`) are the proxy's, with the same status and body. Methods other than `POST`, `GET` and `DELETE` get 405 with no body.
 
 ## Approvals
 

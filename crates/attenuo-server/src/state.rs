@@ -150,6 +150,7 @@ impl AppState {
         clock: Arc<dyn attenuo_core::Clock>,
     ) -> anyhow::Result<Self> {
         config.check_server_names()?;
+        config.check_ext_authz()?;
         for warning in config.root_grant_warnings() {
             tracing::warn!("{warning}");
         }

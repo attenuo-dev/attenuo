@@ -139,6 +139,15 @@ allow_network_filesystem = false
 name = "github"
 url = "http://127.0.0.1:3001/mcp"
 
+# An external gateway (agentgateway's HTTP extAuthz) may ask for the proxy's decision about a
+# request it is about to forward, at /ext-authz/v1/mcp/<server>. Off unless an entry is set.
+# The gateway sends the secret in X-Attenuo-Gateway-Secret; dpop_url is the URL agents call
+# on the gateway, for DPoP-bound tokens. See docs/guides/agentgateway.md.
+# [[ext_authz]]
+# server = "github"
+# secret_sha256 = "<printf %s \"$SECRET\" | sha256sum>"
+# dpop_url = "https://gateway.example/mcp"
+
 [admin]
 # Static bearer for /admin/*, the operator `admin` with role admin (recorded as
 # urn:attenuo:admin). Do not expose /admin publicly. No token ships here: generate one with

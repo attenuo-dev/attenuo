@@ -111,6 +111,11 @@ headers = { X-Team = "ops" }
 name = "github"
 url = "http://127.0.0.1:3001/mcp"
 
+[[ext_authz]]
+server = "github"
+secret_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+dpop_url = "https://gateway.example/mcp"
+
 [[idps]]
 issuer = "https://idp.example"
 jwks_url = "https://idp.example/jwks"

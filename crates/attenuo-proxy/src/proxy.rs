@@ -46,6 +46,8 @@ use crate::session::{
 use crate::stage::Stage;
 use crate::traceparent::{otel_int, TraceParent, OTEL_TARGET, TRACEPARENT_HEADER};
 
+pub(crate) mod ext_authz;
+
 /// Response header carrying the decision record id(s) of every `tools/call` in the request,
 /// comma separated in request order.
 pub const DECISION_ID_HEADER: &str = "x-attenuo-decision-id";
@@ -156,6 +158,8 @@ struct AppState {
     /// ([`router_with_clock`]), and of each stream re-check ([`StreamGuard::with_clock`]).
     /// Awaited results read the system clock.
     clock: Arc<dyn Clock>,
+    /// [`ProxyConfig::ext_authz`], by server name.
+    ext_authz: HashMap<String, ext_authz::Entry>,
 }
 
 impl AppState {
@@ -208,6 +212,11 @@ pub fn router_with_clock(
         .into_iter()
         .map(|u| (u.name, u.url))
         .collect();
+    let ext_authz: HashMap<String, ext_authz::Entry> = config
+        .ext_authz
+        .iter()
+        .map(|r| (r.server.clone(), ext_authz::Entry::from_config(r)))
+        .collect();
     let state = Arc::new(AppState {
         upstreams,
         client,
@@ -227,14 +236,24 @@ pub fn router_with_clock(
         )),
         lease_refusal_records: RecordWindow::with_max_keys(record_window, record_window_max_keys),
         clock,
+        ext_authz,
     });
-    Router::new()
-        .route(
-            "/mcp/{server}",
-            post(handle_post)
-                .get(handle_passthrough)
-                .delete(handle_passthrough),
-        )
+    let mut router = Router::new().route(
+        "/mcp/{server}",
+        post(handle_post)
+            .get(handle_passthrough)
+            .delete(handle_passthrough),
+    );
+    if !state.ext_authz.is_empty() {
+        // Only with an `[[ext_authz]]` entry; otherwise the path is unknown.
+        router = router.route(
+            "/ext-authz/v1/mcp/{server}",
+            post(ext_authz::handle)
+                .get(ext_authz::handle)
+                .delete(ext_authz::handle),
+        );
+    }
+    router
         // The span records the route template, never the URI (SR-90).
         .layer(TraceLayer::new_for_http().make_span_with(crate::http_trace::request_span))
         .with_state(state)
@@ -319,6 +338,7 @@ async fn authenticate(
         method: method.as_str(),
         path: uri.path(),
         host: header_str(headers, header::HOST.as_str()),
+        url: None,
     };
     state.authorizer.authenticate_request(&req, now).await
 }

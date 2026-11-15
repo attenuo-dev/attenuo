@@ -19,6 +19,7 @@
 //! | `GET /metrics` | none | Prometheus metrics, on `[metrics] listen` only (separate port) |
 //! | `GET /readyz` | none | readiness: audit store and lease store answer; `[audit.sink]` health ([`sink`]) |
 //! | `POST/GET/DELETE /mcp/{server}` | delegation token | MCP proxy |
+//! | `POST/GET/DELETE /ext-authz/v1/mcp/{server}` | gateway secret, then the delegation token it forwards | the proxy's decision for a gateway's `extAuthz` check, mounted only with an `[[ext_authz]]` entry |
 //! | `POST /admin/root-token` | admin | dev-only hop-0 mint ([`routes::dev_root`]), mounted only with `[dev] allow_root_mint = true` |
 //! | `POST /admin/leases/{id}/revoke`, `GET /admin/leases/{id}` | admin | leases |
 //! | `POST /admin/leases/revoke?preview` | admin | revoke every lease of one user, one chain, or the chains that opened one MCP session (`session`), with the cascade, audited ([`routes::admin::revoke_by_selector`]) |
@@ -273,7 +274,8 @@ pub fn router(state: Arc<AppState>, upstreams: Vec<UpstreamConfig>, config: &Con
         // Validated in `AppState::from_config`.
         config
             .proxy
-            .apply(ProxyConfig::new(config.server.listen, upstreams)),
+            .apply(ProxyConfig::new(config.server.listen, upstreams))
+            .with_ext_authz(config.ext_authz.clone()),
         authorizer,
         state.clock.clone(),
     );

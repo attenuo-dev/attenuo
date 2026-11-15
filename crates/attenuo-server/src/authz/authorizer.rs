@@ -234,7 +234,10 @@ impl Authorizer for ServerAuthorizer {
         let v = self.verify(req.token, now)?;
         let dpop_bound = match &self.dpop {
             Some(dpop) => {
-                let url = dpop.expected_url(req.host, req.path);
+                // An `[[ext_authz]]` entry names the gateway URL the agent's proof is for.
+                let url = req
+                    .url
+                    .map_or_else(|| dpop.expected_url(req.host, req.path), str::to_owned);
                 dpop.check_presented(
                     v.claims.cnf.as_ref(),
                     req.token,

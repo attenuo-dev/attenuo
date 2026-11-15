@@ -210,6 +210,16 @@ One table per MCP server, using streamable HTTP.
 | `name` | Mount name, served at `/mcp/<name>`. It is the `server` part of capabilities and of action ids. ASCII letters, digits, `_`, `.`, `-`; `attenuo` is reserved. |
 | `url` | Upstream MCP endpoint. |
 
+## `[[ext_authz]]`
+
+One table per MCP server that an external gateway may ask about at `/ext-authz/v1/mcp/<server>` (agentgateway's HTTP `extAuthz`; [guide](../guides/agentgateway.md), [HTTP API](http-api.md#gateway-external-authorization)). None by default, and then the route is not mounted. The decision uses `[proxy]`'s settings (`max_request_body_bytes`, `require_listed_tools`) as a proxied call does.
+
+| Key | Meaning |
+| --- | --- |
+| `server` | The MCP server name the gateway's calls are decided for: the `server` part of capabilities and action ids, under the same naming rule as `[[upstreams]] name` (`attenuo` is reserved). Each name once. It need not be an `[[upstreams]]` entry. |
+| `secret_sha256` | SHA-256 of the secret the gateway sends in `X-Attenuo-Gateway-Secret`, in hex. A secret opens only its own entry's server. Required. |
+| `dpop_url` | Optional. The URL agents call on the gateway, which their DPoP proofs name in `htu` (absolute `http` or `https`, no query or fragment). Unset: a request with a `DPoP` header is refused with `ext_authz_dpop_url_unset`, so DPoP-bound tokens cannot be used through this entry. |
+
 ## `[admin]`
 
 The admin API (`/admin/*`: revoke, reload, approve, export, the dev root mint) and where it is served. By default it is on the main listener. Off a loopback `[server] listen` it needs a listener of its own (`listen`) or the explicit `serve_on_main_listener`, so it is not reachable on the port agents use by accident ([ADR-0013](../decisions/0013-admin-api-listener.md)).
