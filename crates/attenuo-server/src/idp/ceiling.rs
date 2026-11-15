@@ -29,7 +29,10 @@
 //! into each capability it keeps under them, so the split check is made against the root
 //! grant, every intermediate step that holds limits ([`Applied::limited_steps`]) and the
 //! result: a `scopes` limit that `authorization_details` names under two capabilities is still
-//! one budget (SR-127).
+//! one budget (SR-127). Each of those attenuations also lowers a requested capability to the
+//! limits of every limited capability of that set that covers its calls, and intake keeps the
+//! result of each, so the root token carries the limits of every step (SR-128): [`meet`] copies
+//! into a capability the limits of one capability of the earlier step, as attenuation does.
 //!
 //! [`meet`] is not the greatest lower bound: it keeps a capability of one side when a single
 //! capability of the other side covers it (after clamping limits), the same conservative rule
@@ -72,7 +75,9 @@ pub(crate) struct Applied {
     /// every capability that step names under it, so the split check at hop 0
     /// ([`CapabilitySet::attenuate_root`]) is made against each of these as well as against
     /// `capabilities`: otherwise a `scopes` limit named twice by `authorization_details` would
-    /// bound each of two root token capabilities (SR-127).
+    /// bound each of two root token capabilities (SR-127). Intake keeps the result of each
+    /// check, which carries the limits of every limited capability of the step over each
+    /// requested capability (SR-128).
     pub limited_steps: Vec<CapabilitySet>,
 }
 
@@ -810,9 +815,10 @@ mod tests {
         );
         assert_eq!(applied.limited_steps.len(), 1);
 
-        // SR-128's shape in `scopes` ("100 in all, at most 30 to alice"), not changed here:
-        // each recipient takes its limits from another capability of the scope step, so the
-        // step passes, and the two figures are not combined.
+        // SR-128's shape in `scopes` ("100 in all, at most 30 to alice"): the final ceiling
+        // gives each recipient its limits from another capability of the scope step (30 and
+        // 100), but both recipients are under the step's wide capability, so the kept step
+        // refuses the split (since SR-128; before, the step passed and the figures stood).
         let cfg: IdJagCeilingConfig = toml::from_str(
             r#"scopes = { payments = [
                 { server = "banking", tool = "send_money", constraints = { to = { op = "one_of", value = ["alice", "bob", "carol"] } }, limits = { sum = { arg = "amount", max = 100 } } },
@@ -826,12 +832,15 @@ mod tests {
         );
         assert_eq!(applied.limited_steps.len(), 1);
         let narrowed = applied.capabilities.attenuate_root(&both).unwrap();
-        assert!(applied.limited_steps[0].attenuate_root(&narrowed).is_ok());
         let mut figures: Vec<u64> = narrowed
             .iter()
             .filter_map(|c| c.limits.sum.as_ref().map(|s| s.max))
             .collect();
         figures.sort_unstable();
         assert_eq!(figures, [30, 100]);
+        assert!(matches!(
+            applied.limited_steps[0].attenuate_root(&narrowed),
+            Err(attenuo_core::AttenuationError::LimitSplit { .. })
+        ));
     }
 }

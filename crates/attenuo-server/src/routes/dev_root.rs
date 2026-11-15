@@ -32,7 +32,8 @@ use super::{
 };
 use crate::config::{capability_set, CapSpec, RootGrant};
 use crate::error::{
-    limit_split_detail, size_code, ApiError, INVALID_CAPABILITY, LIMIT_SPLIT_AT_ROOT,
+    limit_conflict_detail, limit_split_detail, size_code, ApiError, INVALID_CAPABILITY,
+    LIMIT_CONFLICT_AT_ROOT, LIMIT_SPLIT_AT_ROOT,
 };
 use crate::state::AppState;
 use attenuo_core::Decision;
@@ -223,13 +224,19 @@ fn resolve_grant(grants: &[RootGrant], req: &RootTokenRequest) -> Result<Granted
     let caps = match requested {
         None => ceiling,
         // `attenuate_root`: a limit of the grant bounds one capability of the root token
-        // (SR-121).
+        // (SR-121), and each of the grant's limited capabilities over a requested one bounds it
+        // (SR-128).
         Some(r) => ceiling.attenuate_root(&r).map_err(|e| match e {
             attenuo_core::AttenuationError::LimitSplit { first, second } => ApiError::bad_request(
                 "invalid_scope",
                 limit_split_detail(&first, &second, "the [[root_grants]] entry"),
             )
             .with_code(LIMIT_SPLIT_AT_ROOT),
+            attenuo_core::AttenuationError::LimitConflict { requested } => ApiError::bad_request(
+                "invalid_scope",
+                limit_conflict_detail(&requested, "the [[root_grants]] entry"),
+            )
+            .with_code(LIMIT_CONFLICT_AT_ROOT),
             attenuo_core::AttenuationError::TooLarge(e) => {
                 ApiError::bad_request("invalid_scope", e.to_string()).with_code(size_code(&e))
             }

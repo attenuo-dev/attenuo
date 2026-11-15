@@ -1,40 +1,45 @@
-//! The hop-0 split rule of SR-121 (`CapabilitySet::attenuate_root`,
-//! `AttenuationError::LimitSplit`), on generated grants and requests whose capabilities share
-//! patterns, constraints and small limits, so that several requested capabilities often fall
-//! under one limited grant capability.
+//! The hop-0 rules of SR-121 and SR-128 (`CapabilitySet::attenuate_root`,
+//! `AttenuationError::LimitSplit` and `LimitConflict`), on generated grants and requests whose
+//! capabilities share patterns, constraints and small limits, so that several requested
+//! capabilities often fall under one limited grant capability, and one requested capability
+//! often under several.
 //!
 //! Properties beyond "no panic":
 //!
 //! - `attenuate_root` refuses whenever `attenuate` refuses, with the same error, and otherwise
-//!   answers `attenuate`'s set or `LimitSplit`;
-//! - on success every capability of the result is covered by the grant, by the very grant
-//!   capability it took its limits from;
-//! - the split rule, as the code states it: give each requested capability its parent, the
-//!   grant capability `attenuate` clamps it to (the first, in canonical order, that covers it
-//!   with its limits, else the first that covers its calls). On success, for each grant
-//!   capability with limits, the requested capabilities whose parent it is are all clamped to
-//!   one and the same capability, so at most one capability of the result carries that grant
-//!   capability's limits; and `LimitSplit` is answered exactly when that fails for some
-//!   limited grant capability (both checked against `attenuo_fuzz::caps`'s reference, which
-//!   is written from the documentation with the pairwise implication only);
+//!   answers a set with `attenuate`'s capabilities (the same patterns and constraints, limits
+//!   possibly lower), `LimitSplit` or `LimitConflict`;
+//! - on success every capability of the result is covered by the grant, and its limits are
+//!   within those of every grant capability that covers its calls;
+//! - the split rule of SR-128: each limited grant capability that covers a result capability's
+//!   calls covers the calls of at most one result capability, and that capability's limits
+//!   are within it. Computed here from the requested capabilities, the grant capabilities
+//!   over each (by the pairwise coverage relation) and `attenuo_fuzz::caps::clamp_to_all_ref`:
+//!   `LimitSplit` is answered only when two requested capabilities under one limited grant
+//!   capability give different results, `LimitConflict` only when one capability cannot carry
+//!   the limits over it, and success only when neither happens; the whole answer is also
+//!   checked against `attenuo_fuzz::caps::attenuate_root_ref`, written from the documentation
+//!   with the pairwise implication only;
+//! - with no limited grant capability over any requested one, the answer is `attenuate`'s;
 //! - the answer does not depend on the order in which the request lists its capabilities
 //!   (built from the list in several orders, and read from JSON in reverse order, which keeps
 //!   the other copy of capabilities that are equal but spelled differently);
 //! - the same answers through the pairwise and the prepared attenuation (the grant padded with
 //!   a capability that covers nothing but is too large for the pairwise path).
 //!
-//! Not covered: SR-128 (security review pass 17), a known open gap. When two limited grant
-//! capabilities overlap, a requested capability takes its limits from one of them and is not
-//! charged by the other, so "each limited grant capability that covers a result capability's
-//! calls bounds at most one result capability" does not hold today. The split rule here is
-//! stated per chosen parent, which is what the code promises, so that gap is not reported.
+//! Not covered, by design (SR-128's scope): a limited grant capability that only overlaps a
+//! requested capability (neither covers the other's calls) bounds nothing at hop 0, and the
+//! properties above do not claim it does.
 #![no_main]
 
 use std::collections::BTreeMap;
 
 use arbitrary::{Arbitrary, Result, Unstructured};
 use attenuo_core::{AttenuationError, Capability, CapabilitySet, Limits};
-use attenuo_fuzz::caps::{attenuate_root_ref, caps, covers_ref, padded, parent_of_ref, uses_pad};
+use attenuo_fuzz::caps::{
+    attenuate_root_ref, caps, clamp_to_all_ref, covers_calls_ref, limited_over_ref, padded,
+    uses_pad,
+};
 use libfuzzer_sys::fuzz_target;
 
 #[derive(Debug)]
@@ -111,52 +116,92 @@ fuzz_target!(|input: Input| {
     let plain = grant.attenuate(&requested);
     let root = grant.attenuate_root(&requested);
 
-    // Refuses whenever `attenuate` refuses, with its error; otherwise its set or a split.
+    // Refuses whenever `attenuate` refuses, with its error; otherwise a set, a split or a
+    // conflict.
     match (&plain, &root) {
         (Err(e), r) => assert_eq!(r.as_ref(), Err(e), "attenuate refused, attenuate_root not"),
-        (Ok(a), Ok(b)) => assert_eq!(a, b),
-        (Ok(_), Err(AttenuationError::LimitSplit { .. })) => {}
+        (Ok(_), Ok(_))
+        | (Ok(_), Err(AttenuationError::LimitSplit { .. }))
+        | (Ok(_), Err(AttenuationError::LimitConflict { .. })) => {}
         (Ok(_), Err(e)) => panic!("attenuate accepted, attenuate_root refused with {e:?}"),
     }
 
-    // The split rule, from the requested capabilities and their parents.
+    // The rule, from the requested capabilities and the limited grant capabilities over each.
     let parents: Vec<&Capability> = grant.iter().collect();
-    let mut by_parent: BTreeMap<usize, Vec<Capability>> = BTreeMap::new();
+    let mut under: BTreeMap<usize, Vec<Capability>> = BTreeMap::new();
+    let mut conflict = false;
+    let mut none_over = true;
     if plain.is_ok() {
         for c in requested.iter() {
-            let i = parent_of_ref(&grant, c).expect("attenuate accepted it, so it has a parent");
-            let mut child = c.clone();
-            child.limits = Limits::clamp_to(&c.limits, &parents[i].limits);
-            by_parent.entry(i).or_default().push(child);
+            let over = limited_over_ref(&grant, c);
+            none_over &= over.is_empty();
+            let limits: Vec<&Limits> = over.iter().map(|&i| &parents[i].limits).collect();
+            match clamp_to_all_ref(&c.limits, &limits) {
+                None => conflict = true,
+                Some(l) => {
+                    for &i in &over {
+                        under.entry(i).or_default().push(Capability {
+                            limits: l.clone(),
+                            ..c.clone()
+                        });
+                    }
+                }
+            }
         }
     }
-    let split = by_parent.iter().any(|(i, children)| {
-        !parents[*i].limits.is_empty() && children.iter().any(|c| *c != children[0])
-    });
+    let split = under
+        .values()
+        .any(|children| children.iter().any(|c| *c != children[0]));
+    let calls = |s: &CapabilitySet| -> std::collections::BTreeSet<Capability> {
+        s.iter()
+            .map(|c| Capability {
+                limits: Limits::default(),
+                ..c.clone()
+            })
+            .collect()
+    };
     match &root {
         Ok(out) => {
             assert!(
                 !split,
-                "a limited grant capability bounds two result capabilities"
+                "two requested capabilities under one limited grant capability"
+            );
+            assert!(
+                !conflict,
+                "limits one capability cannot carry were accepted"
             );
             assert!(grant.covers(out), "result not covered by the grant");
-            // Each result capability is one of the clamped requests, under its own parent.
-            for (i, children) in &by_parent {
-                for c in children {
-                    assert!(out.0.contains(c));
-                    assert!(covers_ref(parents[*i], c), "not covered by its parent");
-                }
-                if !parents[*i].limits.is_empty() {
-                    let carried = out.iter().filter(|r| children.contains(r)).count();
+            assert_eq!(
+                calls(out),
+                calls(plain.as_ref().unwrap()),
+                "not attenuate's capabilities"
+            );
+            for c in out.iter() {
+                for p in parents.iter().filter(|p| covers_calls_ref(p, c)) {
                     assert!(
-                        carried <= 1,
-                        "{carried} result capabilities carry grant {i}'s limits"
+                        c.limits.narrows(&p.limits),
+                        "a result capability's limits are not within a grant capability over it"
                     );
                 }
             }
-            assert_eq!(by_parent.values().flatten().count(), requested.len());
+            for p in parents.iter().filter(|p| !p.limits.is_empty()) {
+                let n = out.iter().filter(|c| covers_calls_ref(p, c)).count();
+                assert!(
+                    n <= 1,
+                    "{n} result capabilities under one limited grant capability"
+                );
+            }
+            if none_over {
+                assert_eq!(
+                    &root, &plain,
+                    "no limit over the request, yet not attenuate's"
+                );
+            }
         }
         Err(AttenuationError::LimitSplit { .. }) => assert!(split, "split refused without one"),
+        Err(AttenuationError::LimitConflict { .. }) => {
+            assert!(conflict, "conflict refused without one")
+        }
         Err(_) => {}
     }
 

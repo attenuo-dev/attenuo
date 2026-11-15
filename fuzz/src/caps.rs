@@ -333,32 +333,136 @@ pub fn attenuate_ref(
         .collect())
 }
 
-/// `parent.attenuate_root(requested)` from its documentation: `attenuate`, then a
-/// `LimitSplit` naming the first request and the first later one (canonical order) that take
-/// their limits from the same limited capability of `parent` and differ after clamping.
+/// The indices, in `parent`'s canonical order, of its limited capabilities (limits not empty)
+/// that cover the calls of `c`: the grant capabilities over `c` at hop 0 (SR-128).
+pub fn limited_over_ref(parent: &CapabilitySet, c: &Capability) -> Vec<usize> {
+    parent
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| !p.limits.is_empty() && covers_calls_ref(p, c))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// `own` lowered to every one of `parents` at hop 0, kind by kind, written from the rule
+/// `Limits::clamp_to_all` documents without calling it, or `None` when one `Limits` cannot
+/// carry them (the same kind on different arguments):
+///
+/// - `calls`: the least of `own`'s and the parents'.
+/// - `sum`: `own`'s if it has one, else the first parent's; refused when another (own or
+///   parent) is on another argument; the least `max` of all.
+/// - `calls_per` and `distinct`, per kind: a parent's is *needed* unless the `calls` above is
+///   at most its `max`. With `own`'s: refused when a needed one counts another target
+///   (argument and derivation); the least `max` of `own`'s and every parent's on its target.
+///   Without: none when nothing is needed; refused when the needed ones count different
+///   targets; else the first needed one, with the least `max` of every parent's on its target.
+pub fn clamp_to_all_ref(own: &Limits, parents: &[&Limits]) -> Option<Limits> {
+    let calls = std::iter::once(own.calls)
+        .chain(parents.iter().map(|p| p.calls))
+        .flatten()
+        .min();
+    let sums: Vec<&ArgLimit> = own
+        .sum
+        .iter()
+        .chain(parents.iter().filter_map(|p| p.sum.as_ref()))
+        .collect();
+    let sum = match sums.first() {
+        None => None,
+        Some(first) => {
+            if sums.iter().any(|s| s.arg != first.arg) {
+                return None;
+            }
+            let mut out = (*first).clone();
+            out.max = sums.iter().map(|s| s.max).min().unwrap();
+            Some(out)
+        }
+    };
+    let target = |l: &ArgLimit| (l.arg.clone(), l.derive);
+    let per_value = |own: &Option<ArgLimit>,
+                     of: &dyn Fn(&Limits) -> Option<&ArgLimit>|
+     -> Option<Option<ArgLimit>> {
+        let all: Vec<&ArgLimit> = parents.iter().filter_map(|p| of(p)).collect();
+        let needed: Vec<&ArgLimit> = all
+            .iter()
+            .copied()
+            .filter(|p| !calls.is_some_and(|c| c <= p.max))
+            .collect();
+        let base = match own {
+            Some(o) => o.clone(),
+            None => match needed.first() {
+                None => return Some(None),
+                Some(n) => (*n).clone(),
+            },
+        };
+        if needed.iter().any(|n| target(n) != target(&base)) {
+            return None;
+        }
+        let mut out = base.clone();
+        out.max = all
+            .iter()
+            .filter(|p| target(p) == target(&base))
+            .map(|p| p.max)
+            .chain([base.max])
+            .min()
+            .unwrap();
+        Some(Some(out))
+    };
+    let calls_per = per_value(&own.calls_per, &|l: &Limits| l.calls_per.as_ref())?;
+    let distinct = per_value(&own.distinct, &|l: &Limits| l.distinct.as_ref())?;
+    Some(Limits {
+        calls,
+        sum,
+        calls_per,
+        distinct,
+    })
+}
+
+/// `parent.attenuate_root(requested)` from its documentation (SR-121, SR-128): `attenuate`
+/// first; then, per requested capability in canonical order, its capability in the result is
+/// the request with its limits lowered to those of every limited grant capability over it
+/// ([`limited_over_ref`], [`clamp_to_all_ref`]; `attenuate`'s when there is none), a
+/// `LimitConflict` when one capability cannot carry them, and a `LimitSplit` naming the first
+/// request under a limited grant capability and the first later one under it whose result
+/// differs.
 pub fn attenuate_root_ref(
     parent: &CapabilitySet,
     requested: &CapabilitySet,
 ) -> std::result::Result<CapabilitySet, AttenuationError> {
     let steps = attenuate_indexed_ref(parent, requested)?;
     let parents: Vec<&Capability> = parent.iter().collect();
-    let mut first: BTreeMap<usize, (&Capability, &Capability)> = BTreeMap::new();
-    for (index, req, child) in &steps {
-        if parents[*index].limits.is_empty() {
-            continue;
-        }
-        match first.get(index) {
-            Some((req0, child0)) if *child0 != child => {
-                return Err(AttenuationError::LimitSplit {
-                    first: req0.display(),
-                    second: req.display(),
-                })
+    let mut first: BTreeMap<usize, (&Capability, Capability)> = BTreeMap::new();
+    let mut out = Vec::new();
+    for (_, req, child) in steps {
+        let over = limited_over_ref(parent, req);
+        let child = if over.is_empty() {
+            child
+        } else {
+            let limits: Vec<&Limits> = over.iter().map(|&i| &parents[i].limits).collect();
+            let Some(combined) = clamp_to_all_ref(&req.limits, &limits) else {
+                return Err(AttenuationError::LimitConflict {
+                    requested: req.display(),
+                });
+            };
+            Capability {
+                limits: combined,
+                ..req.clone()
             }
-            Some(_) => {}
-            None => {
-                first.insert(*index, (req, child));
+        };
+        for i in over {
+            match first.get(&i) {
+                Some((req0, child0)) if *child0 != child => {
+                    return Err(AttenuationError::LimitSplit {
+                        first: req0.display(),
+                        second: req.display(),
+                    })
+                }
+                Some(_) => {}
+                None => {
+                    first.insert(i, (req, child.clone()));
+                }
             }
         }
+        out.push(child);
     }
-    Ok(steps.into_iter().map(|(_, _, child)| child).collect())
+    Ok(out.into_iter().collect())
 }

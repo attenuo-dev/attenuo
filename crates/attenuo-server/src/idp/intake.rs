@@ -65,7 +65,10 @@ use super::{claims, CredentialKind, IntakeError, ID_JAG_TOKEN_TYPE, ID_TOKEN_TYP
 use crate::actor::{VerifiedActor, ACTOR_TOKEN_TYPE};
 use crate::clientauth::{self, invalid_request, Authenticated, Clients};
 use crate::config::{capability_set, ActorAuth, RootGrant};
-use crate::error::{limit_split_detail, size_code, ApiError, LIMIT_SPLIT_AT_ROOT};
+use crate::error::{
+    limit_conflict_detail, limit_split_detail, size_code, ApiError, LIMIT_CONFLICT_AT_ROOT,
+    LIMIT_SPLIT_AT_ROOT,
+};
 use crate::routes::token::take_actor_token;
 use crate::routes::{audit_issuance, no_store, register_issued};
 use crate::state::AppState;
@@ -378,6 +381,16 @@ pub(crate) async fn handle(
     Ok(out)
 }
 
+/// The `detail` of a `limit_split_at_root` refusal at the ceiling when the two capabilities
+/// cannot be named as requested.
+const SPLIT_OF_THE_CLAIMS: &str = "two requested capabilities take their limits from the same \
+     capability of the ID-JAG's claims: ask for one capability covering both instead";
+
+/// The `detail` of a `limit_conflict_at_root` refusal at the ceiling when the capability cannot
+/// be named as requested.
+const CONFLICT_OF_THE_CLAIMS: &str = "a requested capability is under several limited \
+     capabilities of the ID-JAG's claims whose limits one capability cannot carry together";
+
 /// What [`narrow`] gives: the root token's capabilities and, under `[idps.id_jag_ceiling]`,
 /// the claims that narrowed (for the record) and their names and values (for the log line).
 pub(crate) struct Narrowed {
@@ -389,7 +402,9 @@ pub(crate) struct Narrowed {
 /// Attenuate `requested` against the root grant `granted`, then, for an ID-JAG from an issuer
 /// with `[idps.id_jag_ceiling]`, against the ceiling its claims leave of the grant. No limit of
 /// the grant, of the ceiling or of a step of the ceiling that holds limits may be split across
-/// two root token capabilities (`limit_split_at_root`, SR-121, SR-127). CPU work on the
+/// two root token capabilities (`limit_split_at_root`, SR-121, SR-127), and each root token
+/// capability carries the limits of every limited capability there that covers its calls
+/// (`limit_conflict_at_root` when one capability cannot carry them all, SR-128). CPU work on the
 /// request: run it on the blocking pool ([`AppState::blocking`]).
 fn narrow(
     state: &AppState,
@@ -424,11 +439,16 @@ pub(crate) fn narrow_with(
     granted: &CapabilitySet,
     requested: &CapabilitySet,
 ) -> Result<Narrowed, ApiError> {
-    // `attenuate_root`: a limit of the grant bounds one capability of the root token (SR-121).
+    // `attenuate_root`: a limit of the grant bounds one capability of the root token (SR-121),
+    // and each limited capability of the grant over a requested one bounds it (SR-128).
     let capabilities = granted.attenuate_root(requested).map_err(|e| match e {
         attenuo_core::AttenuationError::LimitSplit { first, second } => invalid_scope(
             LIMIT_SPLIT_AT_ROOT,
             limit_split_detail(&first, &second, "the [[root_grants]] entry"),
+        ),
+        attenuo_core::AttenuationError::LimitConflict { requested } => invalid_scope(
+            LIMIT_CONFLICT_AT_ROOT,
+            limit_conflict_detail(&requested, "the [[root_grants]] entry"),
         ),
         attenuo_core::AttenuationError::TooLarge(e) => invalid_scope(size_code(&e), e.to_string()),
         e => invalid_scope("scope_exceeds_grant", e.to_string()),
@@ -449,15 +469,15 @@ pub(crate) fn narrow_with(
                     ),
                 ));
             }
-            let narrowed = applied
+            let mut narrowed = applied
                 .capabilities
                 .attenuate_root(&capabilities)
                 .map_err(|e| {
                     // Name a refused capability as the request has it: `capabilities` carry
                     // the root grant's limits, which the caller was not given (SR-124).
-                    // Each requested capability against the grant alone, the grant prepared
-                    // once (SR-123).
-                    let each = granted.attenuate_each(requested.iter());
+                    // Each requested capability against the grant alone, as `attenuate_root`
+                    // gives it, the grant prepared once (SR-123).
+                    let each = granted.attenuate_root_each(requested.iter());
                     let as_requested = |shown: &str| {
                         requested
                             .iter()
@@ -465,19 +485,28 @@ pub(crate) fn narrow_with(
                             .find(|(_, c)| c.as_ref().is_ok_and(|c| c.display() == shown))
                             .map(|(r, _)| r)
                     };
-                    if let attenuo_core::AttenuationError::LimitSplit { first, second } = &e {
-                        let detail = match (as_requested(first), as_requested(second)) {
-                            (Some(a), Some(b)) => limit_split_detail(
-                                &a.display(),
-                                &b.display(),
-                                "the ID-JAG's claims",
-                            ),
-                            _ => "two requested capabilities take their limits from the same \
-                              capability of the ID-JAG's claims: ask for one capability \
-                              covering both instead"
-                                .into(),
-                        };
-                        return invalid_scope(LIMIT_SPLIT_AT_ROOT, detail);
+                    match &e {
+                        attenuo_core::AttenuationError::LimitSplit { first, second } => {
+                            let detail = match (as_requested(first), as_requested(second)) {
+                                (Some(a), Some(b)) => limit_split_detail(
+                                    &a.display(),
+                                    &b.display(),
+                                    "the ID-JAG's claims",
+                                ),
+                                _ => SPLIT_OF_THE_CLAIMS.into(),
+                            };
+                            return invalid_scope(LIMIT_SPLIT_AT_ROOT, detail);
+                        }
+                        attenuo_core::AttenuationError::LimitConflict { requested: shown } => {
+                            let detail = match as_requested(shown) {
+                                Some(r) => {
+                                    limit_conflict_detail(&r.display(), "the ID-JAG's claims")
+                                }
+                                None => CONFLICT_OF_THE_CLAIMS.into(),
+                            };
+                            return invalid_scope(LIMIT_CONFLICT_AT_ROOT, detail);
+                        }
+                        _ => {}
                     }
                     // Then each that passes the grant against the ceiling, prepared once.
                     let under_ceiling = applied
@@ -500,45 +529,64 @@ pub(crate) fn narrow_with(
                 })?;
             // Every earlier step of the ceiling that holds limits: `meet` copied them into
             // each capability a later claim named under them, so two capabilities of the
-            // result may take one limit of `scopes` (SR-127). Checked over the result, so a
-            // request refused above keeps its answer.
-            for step in &applied.limited_steps {
-                step.attenuate_root(&narrowed).map_err(|e| {
-                    let attenuo_core::AttenuationError::LimitSplit { first, second } = e else {
+            // result may take one limit of `scopes` (SR-127), and `meet` copied into each the
+            // limits of one capability of the step, where several limited ones may cover it
+            // (SR-128). Made over the result, so a request refused above keeps its answer, and
+            // the result is the step's: each capability lowered to the limits of every
+            // limited capability of the step over it.
+            for (k, step) in applied.limited_steps.iter().enumerate() {
+                narrowed = step.attenuate_root(&narrowed).map_err(|e| {
+                    let (first, second) = match e {
+                        attenuo_core::AttenuationError::LimitSplit { first, second } => {
+                            (first, Some(second))
+                        }
+                        attenuo_core::AttenuationError::LimitConflict { requested } => {
+                            (requested, None)
+                        }
                         // Not reached: the result is within every step. Fail closed.
-                        return invalid_scope(
-                            "scope_exceeds_id_jag",
-                            "the request asks for more than the ID-JAG's claims allow",
-                        );
+                        _ => {
+                            return invalid_scope(
+                                "scope_exceeds_id_jag",
+                                "the request asks for more than the ID-JAG's claims allow",
+                            )
+                        }
                     };
                     // Named as requested: `narrowed` carries the ceiling's limits (SR-124).
-                    let each = granted.attenuate_each(requested.iter());
-                    let under_ceiling = applied
-                        .capabilities
-                        .attenuate_each(each.iter().filter_map(|c| c.as_ref().ok()));
-                    let mut under_ceiling = under_ceiling.into_iter();
-                    let shown: Vec<(&attenuo_core::Capability, Option<String>)> = requested
-                        .iter()
-                        .zip(&each)
-                        .map(|(r, c)| {
-                            let under = c.is_ok().then(|| under_ceiling.next()).flatten();
-                            (r, under.and_then(|u| u.ok()).map(|u| u.display()))
-                        })
+                    // Each requested capability through the grant, the ceiling and the steps
+                    // before this one, as `attenuate_root` gives it.
+                    let mut shown: Vec<Option<attenuo_core::Capability>> = granted
+                        .attenuate_root_each(requested.iter())
+                        .into_iter()
+                        .map(Result::ok)
                         .collect();
+                    for set in
+                        std::iter::once(&applied.capabilities).chain(&applied.limited_steps[..k])
+                    {
+                        let mut next = set.attenuate_root_each(shown.iter().flatten()).into_iter();
+                        shown = shown
+                            .into_iter()
+                            .map(|c| c.and_then(|_| next.next().and_then(Result::ok)))
+                            .collect();
+                    }
                     let as_requested = |d: &str| {
-                        shown
+                        requested
                             .iter()
-                            .find(|(_, s)| s.as_deref() == Some(d))
-                            .map(|(r, _)| *r)
+                            .zip(&shown)
+                            .find(|(_, s)| s.as_ref().is_some_and(|s| s.display() == d))
+                            .map(|(r, _)| r)
+                    };
+                    let Some(second) = second else {
+                        let detail = match as_requested(&first) {
+                            Some(r) => limit_conflict_detail(&r.display(), "the ID-JAG's claims"),
+                            None => CONFLICT_OF_THE_CLAIMS.into(),
+                        };
+                        return invalid_scope(LIMIT_CONFLICT_AT_ROOT, detail);
                     };
                     let detail = match (as_requested(&first), as_requested(&second)) {
                         (Some(a), Some(b)) => {
                             limit_split_detail(&a.display(), &b.display(), "the ID-JAG's claims")
                         }
-                        _ => "two requested capabilities take their limits from the same \
-                              capability of the ID-JAG's claims: ask for one capability \
-                              covering both instead"
-                            .into(),
+                        _ => SPLIT_OF_THE_CLAIMS.into(),
                     };
                     invalid_scope(LIMIT_SPLIT_AT_ROOT, detail)
                 })?;

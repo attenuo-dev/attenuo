@@ -14,9 +14,9 @@ pub enum AttenuationError {
     /// The requested set is empty; a hop with no capabilities is a configuration error.
     #[error("requested capability set is empty")]
     Empty,
-    /// At hop 0 ([`crate::CapabilitySet::attenuate_root`]): two requested capabilities take
-    /// their limits from the same limited capability of the root grant or ceiling, so each
-    /// would carry the whole figure (SR-121).
+    /// At hop 0 ([`crate::CapabilitySet::attenuate_root`]): two requested capabilities fall
+    /// under the same limited capability of the root grant or ceiling (it covers the calls of
+    /// both), so each would carry the whole figure (SR-121, SR-128).
     #[error(
         "requested capabilities `{first}` and `{second}` take their limits from the same \
          limited capability, which bounds one capability of a root token, not several"
@@ -26,6 +26,18 @@ pub enum AttenuationError {
         first: String,
         /// The other.
         second: String,
+    },
+    /// At hop 0 ([`crate::CapabilitySet::attenuate_root`]): several limited capabilities of the
+    /// root grant or ceiling cover a requested capability's calls, and their limits (or its own
+    /// and theirs) include the same kind on different arguments, which one capability cannot
+    /// carry together (SR-128). Refused rather than drop one of them.
+    #[error(
+        "requested capability `{requested}` is under several limited capabilities whose limits \
+         one capability cannot carry together (the same kind of limit on different arguments)"
+    )]
+    LimitConflict {
+        /// The capability, as [`crate::Capability::display`] writes the request.
+        requested: String,
     },
     /// The requested set is over a bound of [`crate::capability::CapabilitySet::validate_size`]
     /// (SR-123). Checked before anything is compared, since attenuation costs the product of
