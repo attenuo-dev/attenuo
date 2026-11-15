@@ -741,7 +741,7 @@ async def test_authzen_search_action_wire_format_and_paging(make: Any) -> None:
 
     # The iterator follows next_token through an empty page to the last one.
     it = client.authzen_search_action_iter("TOK", "github", limit=2)
-    names = [a.name async for a in it] if inspect.isasyncgen(it) else [a.name for a in it]
+    names = [a.name async for a in it] if hasattr(it, "__aiter__") else [a.name for a in it]
     assert names == ["read_file", "search"]
     assert [json.loads(r.content).get("page") for r in rec.requests[-3:]] == [
         {"limit": 2},
@@ -773,6 +773,7 @@ async def test_authzen_search_action_refusals(make: Any) -> None:
     with pytest.raises(Unauthorized):
         await call(client, "authzen_search_action", "TOK", "github")
 
+    odd: dict[str, Any]
     for odd in ({"decision": True}, {"results": [{"properties": {}}]}):
         client, _ = make(lambda r, odd=odd: httpx.Response(200, json=odd))
         with pytest.raises(AttenuoError, match="action search"):
