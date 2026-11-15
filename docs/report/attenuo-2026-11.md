@@ -120,25 +120,25 @@ Capabilities and static policy cannot separate an injected call that uses a tool
 
 # Implementation
 
-attenuo is a Rust workspace of eight crates, plus two SDKs. Table 1 counts lines (`wc -l`) of the files `git ls-files` lists on commit 511dd41 (2026-11-13): `.rs` for the crates, `.py` and `.ts` for the SDKs. `src/` lines include inline unit tests. The last column is `tests/` and `benches/` for the crates, `tests/` for the Python SDK and `test/` for the TypeScript SDK.
+attenuo is a Rust workspace of eight crates, plus two SDKs. Table 1 counts lines (`wc -l`) of the files `git ls-files` lists on commit acaa347 (2026-11-15): `.rs` for the crates, `.py` and `.ts` for the SDKs. `src/` lines include inline unit tests. The last column is `tests/` and `benches/` for the crates, `tests/` for the Python SDK and `test/` for the TypeScript SDK.
 
 | Component | Responsibility | Lines, `src/` | Lines, tests |
 |----------------|----------------------------------------------|-------:|-------:|
-| `attenuo-core` | chain, capabilities, `⊑`, RFC 8785 JSON, error codes | 8,065 | 1,307 |
-| `attenuo-token` | tokens, `ou_sig`, issuer, verifier, DPoP, client assertions | 3,210 | 1,323 |
+| `attenuo-core` | chain, capabilities, `⊑`, RFC 8785 JSON, error codes | 10,384 | 2,615 |
+| `attenuo-token` | tokens, `ou_sig`, issuer, verifier, DPoP, client assertions | 3,286 | 1,323 |
 | `attenuo-policy` | capability stage, Cedar translation and cache, catalog, AuthZEN types | 8,307 | 3,530 |
-| `attenuo-audit` | hash-chained SQLite log, checkpoints, export verification, lease and replay stores, schema migrations | 13,865 | 9,426 |
-| `attenuo-proxy` | MCP reverse proxy, SSE handling, list filter, result labelling | 9,900 | 7,204 |
-| `attenuo-server` | token endpoint, IdP intake, actor and client auth, AuthZEN, admin API with its operators and listener, request limits, sink, console | 35,283 | 26,127 |
-| `attenuo-cli` | the `attenuo` command line | 8,769 | 4,567 |
+| `attenuo-audit` | hash-chained SQLite log, checkpoints, export verification, lease and replay stores, schema migrations | 14,033 | 9,622 |
+| `attenuo-proxy` | MCP reverse proxy, SSE handling, list filter, result labelling | 9,918 | 7,204 |
+| `attenuo-server` | token endpoint, IdP intake, actor and client auth, AuthZEN, admin API with its operators and listener, request limits, sink, console | 39,400 | 32,884 |
+| `attenuo-cli` | the `attenuo` command line | 9,959 | 5,345 |
 | `attenuo-bench` | end-to-end benchmark harness | 5,102 | 304 |
-| Rust total | | 92,501 | 53,788 |
-| Python SDK | sync and async clients, admin client, offline audit verification | 7,041 | 7,809 |
-| TypeScript SDK | the same API for Node 20+, no runtime dependencies | 6,391 | 7,843 |
+| Rust total | | 100,389 | 62,827 |
+| Python SDK | sync and async clients, admin client, offline audit verification | 7,342 | 8,598 |
+| TypeScript SDK | the same API for Node 20+, no runtime dependencies | 6,644 | 8,571 |
 
-Table: Table 1. Code size by component, counted on 511dd41 (2026-11-13).
+Table: Table 1. Code size by component, counted on acaa347 (2026-11-15).
 
-The fuzz targets add 7,974 lines of Rust outside the workspace (`fuzz/`), and the injection-suite runner and oracle add 5,259 lines of Python (`evaluation/injection-suite/`). An admin console of about 3,200 lines of plain JavaScript, HTML and CSS is embedded in the server (ADR-0008). All state lives in one SQLite file in WAL mode with group commit (`docs/design/performance.md`). At 2366bfc, 1,643 Rust workspace tests passed, none failed and 7 were ignored. At 7dc50a2, two commits earlier (neither later commit touches the SDKs), 774 Python SDK tests and 432 TypeScript SDK tests passed, with the integration tests that need built server binaries included (30 Python, 19 TypeScript); two TypeScript tests of the example agent were skipped.
+The fuzz targets add 7,974 lines of Rust outside the workspace (`fuzz/`), and the injection-suite runner and oracle add 5,259 lines of Python (`evaluation/injection-suite/`). An admin console of about 3,200 lines of plain JavaScript, HTML and CSS is embedded in the server (ADR-0008). All state lives in one SQLite file in WAL mode with group commit (`docs/design/performance.md`). At acaa347, 1,775 Rust workspace tests passed, none failed and 7 were ignored; 799 Python SDK tests and 446 TypeScript SDK tests passed, with the integration tests that need built server binaries included; two TypeScript tests of the example agent were skipped.
 
 **The MCP proxy** mounts each upstream at `/mcp/{server}`, mediates `tools/call`, `resources/read`, `prompts/get` and a few other methods over streamable HTTP, and denies unknown methods. It forwards only allowed calls, without the attenuo token. Because it labels upstream output, it must parse it: it filters list results to the tools the chain covers, and it parses SSE events under the rule that the proxy reads what clients read (security pass 7, section 5.4). **AuthZEN** evaluation, batch and action-search endpoints take the chain from the bearer token. An authenticated enforcement point may instead send it in the body, but then every hop must match what the server issued for its lease. Conformance with AuthZEN 1.0 is checked against the project's own fixtures (`crates/attenuo-server/tests/authzen_conformance.rs`); it has not been tested against another implementation.
 
