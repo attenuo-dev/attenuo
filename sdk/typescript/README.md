@@ -90,6 +90,8 @@ A `Token` carries `lease`, `expiresAt`, `chain` (user and hops with capabilities
 These wrap the read-only operator routes the admin console uses. None of them signs, changes or audits anything.
 
 ```ts
+import { AdminClient } from "@attenuo/sdk";
+
 const admin = new AdminClient(SERVER, process.env.ATTENUO_ADMIN_TOKEN!);
 
 // Newest denials first. A filtered page can come back short (even empty) with nextCursor
@@ -151,7 +153,7 @@ for await (const line of admin.auditExport(1, undefined, {
 const ev = await admin.policyEvaluate(
   "github",
   "read_file",
-  { repo: "alice/other" },
+  { repo: "alice/public-other" },
   { token: coder, budget: { limits: [{ hop: 1, kind: "distinct", arg: "repo", used: 1 }] } },
 );
 console.log(ev.reason); // "budget_exhausted"
@@ -249,18 +251,23 @@ A capability can carry run limits ([ADR-0010](https://github.com/attenuo-dev/att
 ```ts
 import { argLimit, capability, withLimits } from "@attenuo/sdk";
 
-const helper = await ob.exchange(planner, "helper", [
-  // At most one payment, 40 in total, to Emma only.
-  withLimits(capability("banking", "send_money", { recipient: "FR00EMMA" }), {
-    calls: 1,
-    sum: argLimit("amount", 40),
-    calls_per: argLimit("recipient", 1),
-  }),
-  // Pages from at most two sites: `derive: "host"` counts the host of the URL.
-  withLimits(capability("web", "get_webpage"), {
-    distinct: argLimit("url", 2, { derive: "host" }),
-  }),
-]);
+const helper = await ob.exchange(
+  planner,
+  "helper",
+  [
+    // At most one payment, 40 in total, to Emma only.
+    withLimits(capability("banking", "send_money", { recipient: "FR00EMMA" }), {
+      calls: 1,
+      sum: argLimit("amount", 40),
+      calls_per: argLimit("recipient", 1),
+    }),
+    // Pages from at most two sites: `derive: "host"` counts the host of the URL.
+    withLimits(capability("web", "get_webpage"), {
+      distinct: argLimit("url", 2, { derive: "host" }),
+    }),
+  ],
+  { clientSecret }, // the helper's [[agents]] secret, as for any exchange
+);
 ```
 
 The `Limits` and `ArgLimit` types say what each kind takes. The server lowers a figure larger than the parent's, fills in a limit the child leaves out, and charges every call to every hop, so a child can spend at most what its parent has left. A call over a limit is a `DeniedError` with `reason: "budget_exhausted"`; one whose argument a limit cannot count (a missing recipient, a URL without a host) is `limit_arg_invalid`. A kind or derivation the SDK does not know throws a `TypeError` instead of being dropped.
@@ -314,7 +321,8 @@ Server nonces (RFC 9449 §8, `[token] dpop_nonce = "required"`) need no code. `A
 `TokenRefresher` renews the lease at a third of the lease interval, calls your `exchange` function before the token's `exp`, and keeps the current token in `refresher.token`. `start()` returns a disposer.
 
 ```ts
-import { mcpFetch, RefreshError, TokenRefresher } from "@attenuo/sdk";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { mcpUrl, RefreshError, TokenRefresher } from "@attenuo/sdk";
 
 // Each exchange needs a fresh subject token: a parent delegates to a given actor once, so
 // re-exchanging the same parent is refused as `replayed`.
@@ -581,6 +589,8 @@ A denied call surfaces as an `McpError` carrying JSON-RPC code `-32003`; `error.
 `requestInit.headers` is fixed when the transport is built. If your token changes (re-exchange before `exp`), or it is bound to a key (each request then needs a fresh DPoP proof), pass `mcpFetch` as the transport's `fetch` instead: it sets `Authorization` (and `DPoP`) per request.
 
 ```ts
+import { mcpFetch, mcpUrl } from "@attenuo/sdk";
+
 const transport = new StreamableHTTPClientTransport(new URL(mcpUrl(SERVER, "github")), {
   fetch: mcpFetch(() => currentToken, { dpopKey: coderKey }),
 });

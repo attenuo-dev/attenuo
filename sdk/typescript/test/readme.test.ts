@@ -173,6 +173,15 @@ describe("README TypeScript snippets", () => {
     }
   });
 
+  it("import every SDK export they use", () => {
+    // The type check below declares a missing SDK name for the snippet, so a snippet that forgot
+    // its import would pass there and fail with a ReferenceError for a reader who copies it.
+    const unimported = ALL.flatMap((s) =>
+      (undeclared().get(s) ?? []).filter((n) => exported.has(n)).map((n) => `${s.id}: ${n}`),
+    );
+    expect(unimported, unimported.join("\n")).toEqual([]);
+  });
+
   it("type-check against the SDK", () => {
     const names = undeclared();
     const files = ALL.map((_, k) => join(dir, `snippet_${k}.ts`));
