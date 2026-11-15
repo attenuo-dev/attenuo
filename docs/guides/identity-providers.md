@@ -158,7 +158,7 @@ agent = "planner"
 capabilities = ["github:*"]
 ```
 
-A root grant is the ceiling on what a root token for this issuer, this agent and (optionally) this user can carry. The request is attenuated against it. The most specific match wins: an entry pinned to a `subject` first, then one without. No match means no root token (`invalid_scope`, `no_root_grant`). Asking for more than the entry allows is `invalid_scope`, `scope_exceeds_grant`. A limit in the entry bounds the root token once: two requested capabilities that take their limits from the same limited capability of the entry (`send_money` once per recipient under one `sum`) are refused with `invalid_scope`, `limit_split_at_root`; ask for one capability with a `one_of` constraint instead.
+A root grant is the ceiling on what a root token for this issuer, this agent and (optionally) this user can carry. The request is attenuated against it. The most specific match wins: an entry pinned to a `subject` first, then one without. No match means no root token (`invalid_scope`, `no_root_grant`). Asking for more than the entry allows is `invalid_scope`, `scope_exceeds_grant`. A limit in the entry bounds the root token once: two requested capabilities under the same limited capability of the entry (`send_money` once per recipient under one `sum`) are refused with `invalid_scope`, `limit_split_at_root`; ask for one capability with a `one_of` constraint instead. A requested capability under several limited capabilities of the entry (a tighter one within a wider one) carries the limits of each (`[[root_grants]]` in the [configuration reference](../reference/config.md)).
 
 Capabilities can be a `"server:tool"` string (globs allowed) or a table with constraints:
 
@@ -530,7 +530,8 @@ Errors carry a stable `code` (the same value as `error_description`, which older
 | `400 invalid_grant` / `typ_mismatch` | Wrong credential type for the `subject_token_type` you sent |
 | `400 invalid_scope` / `no_root_grant` | No `[[root_grants]]` entry for this issuer and agent |
 | `400 invalid_scope` / `scope_exceeds_grant` | The request asks for more than the entry allows |
-| `400 invalid_scope` / `limit_split_at_root` | Two requested capabilities take their limits from the same limited capability of the entry or of the ID-JAG's claims; ask for one capability covering both (`one_of`, a wider constraint or tool pattern) |
+| `400 invalid_scope` / `limit_split_at_root` | Two requested capabilities fall under the same limited capability of the entry or of the ID-JAG's claims; ask for one capability covering both (`one_of`, a wider constraint or tool pattern) |
+| `400 invalid_scope` / `limit_conflict_at_root` | A requested capability is under several limited capabilities of the entry or of the ID-JAG's claims that set one kind of limit on different arguments, which one capability cannot carry; ask for one fewer of them cover, or change the entry |
 | `400 invalid_scope` / `id_jag_ceiling_empty` | With `[idps.id_jag_ceiling]`: the ID-JAG's `resource`, `scope` or `authorization_details` name nothing the root grant gives (unmapped, of another type, or outside the grant) |
 | `400 invalid_scope` / `scope_exceeds_id_jag` | With `[idps.id_jag_ceiling]`: the request is within the root grant but asks for more than the ID-JAG's claims allow |
 | `400 invalid_scope` / `too_many_capabilities`, `too_many_constraints`, `too_many_one_of_values`, `one_of_too_long` | The request is over a size bound: more than 1,024 capabilities, argument constraints or `one_of` values in all, or a `one_of` of more than 1,024 values |
