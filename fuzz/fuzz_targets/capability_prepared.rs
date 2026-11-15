@@ -9,7 +9,7 @@
 //! - `ArgConstraint::implies` with a `one_of` longer than the pairwise path takes, on either
 //!   side, gives the answer of the pairwise implication applied value by value (`implies_ref`);
 //! - for generated parent and child sets, `CapabilitySet::covers`, `covered`, `attenuate`,
-//!   `attenuate_each` and `attenuate_root` give the reference's answers, and the same answers
+//!   `attenuate_each`, `attenuate_root` and `attenuate_root_each` give the reference's answers, and the same answers
 //!   again with the parent padded by one capability that covers nothing but is too large for
 //!   the pairwise path (so a small pair is compared both ways);
 //! - `jcs::value_key(a) == jcs::value_key(b)` exactly when `jcs::value_eq(a, b)`, for values
@@ -360,6 +360,13 @@ fn check_sets(parent: &CapabilitySet, child: &CapabilitySet) {
             attenuate_ref(parent, &one).map(|s| s.0.into_iter().next().expect("one"))
         })
         .collect();
+    let root_each: Vec<_> = child
+        .iter()
+        .map(|c| {
+            let one: CapabilitySet = [c.clone()].into_iter().collect();
+            attenuate_root_ref(parent, &one).map(|s| s.0.into_iter().next().expect("one"))
+        })
+        .collect();
     for p in [parent.clone(), padded(parent)] {
         assert_eq!(p.covers(child), covers, "covers: {p:?} over {child:?}");
         assert_eq!(p.covered(child), covered, "covered: {p:?} over {child:?}");
@@ -377,6 +384,11 @@ fn check_sets(parent: &CapabilitySet, child: &CapabilitySet) {
             p.attenuate_root(child),
             root,
             "attenuate_root: {p:?} over {child:?}"
+        );
+        assert_eq!(
+            p.attenuate_root_each(child.iter()),
+            root_each,
+            "attenuate_root_each: {p:?}"
         );
     }
     // Per capability, the prepared and the pairwise answers of `covers` agree (a capability

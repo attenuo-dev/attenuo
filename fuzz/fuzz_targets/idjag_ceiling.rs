@@ -29,43 +29,45 @@
 //!    more (the token list grows, log-many times) than the distinct one.
 //! 4. Every `limited_steps` entry holds a limited capability and is within the grant.
 //! 5. When narrowing succeeds, every result capability is covered by the grant, by the final
-//!    ceiling and by every recorded step. For each of those three, as each is checked by the
-//!    server (the grant over the request, the final ceiling over the request as the grant left
-//!    it, each step over the result), no limited capability is the chosen parent (the first
-//!    that covers with its limits, else the first that covers the calls, as in
-//!    `capability_attenuate_root`, from `attenuo_fuzz::caps`'s reference) of two distinct
-//!    result capabilities. The result is also the reference attenuation's.
-//! 6. A budget, in a mode where no two limited capabilities of the grant and the used `scopes`
-//!    entries overlap and no capability without limits overlaps one of the same side (the
-//!    grant's limited capabilities are on servers `g0` and `g1`, which no other grant
-//!    capability and no limited `scopes` capability names; the `scopes` limited capabilities
-//!    are on `s0` and `s1`, which no other `scopes` capability names; each limited one is on
-//!    its own exact `server:tool`; `authorization_details` carries no limits). Each limited
-//!    capability `S` of the grant, and of a `scopes` entry the `scope` claim names, is then the
-//!    only source of limits for the calls it covers, and the sum over result capabilities
-//!    whose calls `S` covers of their `calls` (and of their `sum` on `S`'s argument) is at
-//!    most `S`'s figure. This is stronger than 5 where it holds: it is stated against the
-//!    configured sources, not the intermediate sets, so it holds whatever path `meet` copies a
-//!    limit along. `calls_per` and `distinct` are left out: a per-value bound is not additive.
-//!    Outside the mode it does not hold today, by design or by SR-128 (below).
+//!    ceiling and by every recorded step. For each of those sets (each is checked by the
+//!    server: the grant over the request, the final ceiling over the request as the grant left
+//!    it, each step over the result so far), each limited capability that covers a result
+//!    capability's calls (by the pairwise coverage relation) covers the calls of at most one
+//!    result capability, and that capability's limits are within it (SR-121, SR-128). The
+//!    result is also the reference's: `attenuo_fuzz::caps::attenuate_root_ref` of the grant,
+//!    then of the final ceiling, then of each recorded step, each over the one before.
+//! 6. A budget. Each limited capability `S` of the grant, and, in a mode where no two limited
+//!    capabilities of the grant and the used `scopes` entries overlap and no capability
+//!    without limits overlaps one of the same side (the grant's limited capabilities are on
+//!    servers `g0` and `g1`, which no other grant capability and no limited `scopes`
+//!    capability names; the `scopes` limited capabilities are on `s0` and `s1`, which no other
+//!    `scopes` capability names; each limited one is on its own exact `server:tool`;
+//!    `authorization_details` carries no limits), each limited capability of a `scopes` entry
+//!    the `scope` claim names: the sum over result capabilities whose calls `S` covers of
+//!    their `calls` (and of their `sum` on `S`'s argument) is at most `S`'s figure. This is
+//!    stated against the configured sources, not the intermediate sets, so it holds whatever
+//!    path `meet` copies a limit along. For the grant it holds in every mode since SR-128 (the
+//!    grant is checked over the request with every limited capability over each). For
+//!    `scopes` it is still checked in the mode only: `meet` keeps a grant capability that a
+//!    `scopes` capability covers with its limits in place of the `scopes` capability, so two
+//!    limited grant capabilities under one limited `scopes` capability can each keep their
+//!    own figure, and the `scopes` capability is in no set the server checks. `calls_per` and
+//!    `distinct` are left out: a per-value bound is not additive.
 //! 7. Narrowing does not depend on the order in which the request lists its capabilities: the
 //!    same set, or the same error code.
 //!
-//! Not covered: SR-128 (security review pass 17), a known open gap. Overlapping limited
-//! capabilities of one grant entry, or of one ceiling, are not combined at hop 0: a requested
-//! capability takes its limits from one of them and is not charged by the other. Property 5 is
-//! stated per chosen parent, which is what the code promises, and property 6 only where no two
-//! limited capabilities overlap, so that gap is not reported.
+//! Not covered, by design (SR-128's scope): a limited capability that only overlaps a
+//! requested capability (neither covers the other's calls) bounds nothing at hop 0.
 #![no_main]
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use arbitrary::{Arbitrary, Result, Unstructured};
 use attenuo_core::{ArgConstraint, ArgLimit, Capability, CapabilitySet, Limits};
 use attenuo_fuzz::caps::{
-    attenuate_indexed_ref, capability, caps, constraint, covers_calls_ref, limits, set_covers_ref,
+    attenuate_root_ref, capability, caps, constraint, covers_calls_ref, limits, set_covers_ref,
     ARGS,
 };
 use attenuo_server::config::{CapSpec, IdJagCeilingConfig};
@@ -655,31 +657,25 @@ fn has_limits(set: &CapabilitySet) -> bool {
     set.iter().any(|c| !c.limits.is_empty())
 }
 
-/// Property 5 for one set `parent` checked over `input`: the `(parent index, child)` of each
-/// capability of `input`, mapped to the result capabilities each child stands for by `to_result`.
-/// No limited capability of `parent` may be the chosen parent of two distinct ones.
-fn one_result_per_limited_parent(
-    what: &str,
-    parent: &CapabilitySet,
-    input: &CapabilitySet,
-    to_result: &dyn Fn(&Capability) -> Vec<Capability>,
-) {
-    let steps = attenuate_indexed_ref(parent, input)
-        .unwrap_or_else(|e| panic!("{what}: the reference refuses what the server accepted: {e}"));
-    let parents: Vec<&Capability> = parent.iter().collect();
-    let mut by_parent: BTreeMap<usize, BTreeSet<Capability>> = BTreeMap::new();
-    for (i, _, child) in &steps {
-        if !parents[*i].limits.is_empty() {
-            by_parent.entry(*i).or_default().extend(to_result(child));
-        }
-    }
-    for (i, results) in by_parent {
+/// Property 5 for one set `parent`: each of its limited capabilities that covers the calls of
+/// a capability of `result` covers the calls of at most one, whose limits are within it.
+fn one_result_per_limited_parent(what: &str, parent: &CapabilitySet, result: &CapabilitySet) {
+    for p in parent.iter().filter(|p| !p.limits.is_empty()) {
+        let under: Vec<&Capability> = result.iter().filter(|r| covers_calls_ref(p, r)).collect();
         assert!(
-            results.len() <= 1,
-            "{what}: limited capability {} is the parent of {} result capabilities: {results:?}",
-            parents[i].display(),
-            results.len()
+            under.len() <= 1,
+            "{what}: limited capability {} is over {} result capabilities: {under:?}",
+            p.display(),
+            under.len()
         );
+        for r in under {
+            assert!(
+                r.limits.narrows(&p.limits),
+                "{what}: {} not within limited capability {} over it",
+                r.display(),
+                p.display()
+            );
+        }
     }
 }
 
@@ -707,18 +703,22 @@ fn check_built(ceiling: &IdJagCeiling, cfg: &IdJagCeilingConfig) {
     }
 }
 
-/// Property 6: the limited capabilities of the grant and of the `scopes` entries the claim
-/// names, the only sources of limits in the disjoint mode.
+/// Property 6: the limited capabilities of the grant and, with `scopes` set (the disjoint
+/// mode), of the `scopes` entries the claim names.
 fn sources(
     grant: &CapabilitySet,
     cfg: &IdJagCeilingConfig,
     claims: &Map<String, Value>,
+    scopes: bool,
 ) -> Vec<Capability> {
     let mut out: Vec<Capability> = grant
         .iter()
         .filter(|c| !c.limits.is_empty())
         .cloned()
         .collect();
+    if !scopes {
+        return out;
+    }
     if let Some(Value::String(s)) = claims.get("scope") {
         let tokens: BTreeSet<&str> = s.split_ascii_whitespace().collect();
         for t in tokens {
@@ -826,32 +826,21 @@ fuzz_target!(|input: Input| {
         for step in &applied.limited_steps {
             assert!(step.covers(out), "result not within a recorded step");
         }
-        let capabilities = grant
-            .attenuate_root(&requested)
-            .expect("narrowing passed the grant");
-        let under_ceiling = attenuate_indexed_ref(&applied.capabilities, &capabilities)
-            .expect("passed the ceiling");
-        let reference: CapabilitySet = under_ceiling.iter().map(|(_, _, r)| r.clone()).collect();
+        let mut reference =
+            attenuate_root_ref(&grant, &requested).expect("narrowing passed the grant");
+        for set in std::iter::once(&applied.capabilities).chain(&applied.limited_steps) {
+            reference = attenuate_root_ref(set, &reference).expect("narrowing passed this set");
+        }
         assert_eq!(&reference, out, "the reference narrows to another set");
-        let result_of = |c: &Capability| -> Vec<Capability> {
-            under_ceiling
-                .iter()
-                .filter(|(_, from, _)| *from == c)
-                .map(|(_, _, r)| r.clone())
-                .collect()
-        };
-        one_result_per_limited_parent("grant", &grant, &requested, &result_of);
-        one_result_per_limited_parent("ceiling", &applied.capabilities, &capabilities, &|r| {
-            vec![r.clone()]
-        });
+        one_result_per_limited_parent("grant", &grant, out);
+        one_result_per_limited_parent("ceiling", &applied.capabilities, out);
         for step in &applied.limited_steps {
-            one_result_per_limited_parent("step", step, out, &|r| vec![r.clone()]);
+            one_result_per_limited_parent("step", step, out);
         }
 
-        // 6. Budgets, where no two limited capabilities overlap.
-        if disjoint {
-            check_budgets(&sources(&grant, &cfg, &claims), out);
-        }
+        // 6. Budgets: the grant's in every mode, the `scopes` entries' where no two limited
+        // capabilities overlap.
+        check_budgets(&sources(&grant, &cfg, &claims, disjoint), out);
     }
 
     // 3. again, through the narrowing; 7. the order of the request.
