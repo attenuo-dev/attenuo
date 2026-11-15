@@ -1,4 +1,4 @@
-//! Board item 63: an answer sent before the request body was read to its end (here the
+//! An answer sent before the request body was read to its end (here the
 //! proxy's 401 for a missing or bad token, with the body late or never sent, and the admin
 //! routes' 401) carries `Connection: close`, so a client does not reuse a connection the
 //! server is closing. An answer to a request whose body was read keeps the connection open.

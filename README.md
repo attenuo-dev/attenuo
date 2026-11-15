@@ -103,7 +103,7 @@ attenuo is pre-alpha and has not been used in production. Release 0.1.0 is prepa
 - [FAQ](docs/faq.md): why a proxy, how it differs from gateways and policy engines, what happens when it is down.
 - [Comparison](docs/comparison.md): attenuo next to OAuth scopes, gateways, policy engines, IdP agent features and SPIFFE.
 - [RFC-0001: attenuo](docs/spec/rfc-0001-attenuo.md): what the system is, the token model, the policy and audit design.
-- [docs/](docs/README.md): specifications, architecture decisions, research notes and the task board.
+- [docs/](docs/README.md): specifications, architecture decisions, and research notes.
 - [Python SDK](sdk/python/README.md): `pip install -e sdk/python`, sync and async clients, an admin client, and an [agent example](examples/python-agent/agent.py).
 - [TypeScript SDK](sdk/typescript/README.md): `@attenuo/sdk` (Node 20+, no runtime dependencies), the same API with promises, and an [agent example](examples/typescript-agent/agent.ts).
 - [examples/github-leak-demo](examples/github-leak-demo/README.md): the demo from the top of this page.

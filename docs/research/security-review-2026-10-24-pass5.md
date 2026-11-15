@@ -2,7 +2,7 @@
 
 - Date: 2026-10-24
 - Branch: `review/security-pass-5` (base: `a02bc83` on main)
-- Related: [pass 1 and 2](security-review-2026-10-22.md), [pass 3](security-review-2026-10-23.md), [pass 4](security-review-2026-10-23-pass4.md), [run limits design](../design/run-limits.md), [threat model](../spec/threat-model.md), [task board](../tasks/board.md)
+- Related: [pass 1 and 2](security-review-2026-10-22.md), [pass 3](security-review-2026-10-23.md), [pass 4](security-review-2026-10-23-pass4.md), [run limits design](../design/run-limits.md), [threat model](../spec/threat-model.md), task board
 
 ## Scope and method
 

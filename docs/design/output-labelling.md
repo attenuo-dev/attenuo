@@ -4,7 +4,7 @@
 - Date: 2026-10-24. Base: `main` at 6d2d4a4.
 - Related: [ADR-0009](../decisions/0009-output-labelling.md) (accepted 2026-11-05), [threat model](../spec/threat-model.md), [RFC-0001](../spec/rfc-0001-attenuo.md) section 9 open question 5, [injection suite results](../evaluation/injection-suite.md), [evaluation plan](../research/evaluation-plan.md), [server pipeline](server.md), [ADR-0006](../decisions/0006-lease-based-in-flight-revocation.md) (leases), RFC-0001 section 4.1 (DPoP).
 
-attenuo decides each `tools/call` from three things: the capabilities in the delegation token, the Cedar policy, and the lease state. None of them knows where the arguments of a call came from. The injection suite shows what is left when the token and the policy are both right: the injected call uses a tool and arguments that the task itself needs, so every stage allows it. This note proposes that the proxy label every tool result as untrusted, remembers which runs have read untrusted data, and lets policy require a confirmation before such a run calls a destructive tool. It is the design note the [task board](../tasks/board.md) asks for before any code.
+attenuo decides each `tools/call` from three things: the capabilities in the delegation token, the Cedar policy, and the lease state. None of them knows where the arguments of a call came from. The injection suite shows what is left when the token and the policy are both right: the injected call uses a tool and arguments that the task itself needs, so every stage allows it. This note proposes that the proxy label every tool result as untrusted, remembers which runs have read untrusted data, and lets policy require a confirmation before such a run calls a destructive tool. It was written as the design note to have before any code.
 
 ## 1. Problem
 
@@ -191,7 +191,7 @@ What this says:
 - Option (a) turns 9 of the 10 dev misses into approval requests, at the cost of asking for about one benign call in four. Its whole benefit depends on the person declining the injected calls; with an approver who says yes to everything, nothing changes.
 - Exempting calls whose destination is pinned by the token sounds like a cheap way to cut the benign count, and it would: 6 of the 18 dev hits (`banking-03`, `-06`, `workspace-04`, `slack-02`, `-06`, `travel-04`) have a pinned destination. But the class N misses are, by construction, calls with the right destination: `workspace-06`, `slack-02`, `github-04`, `github-02`, `banking-04`, `workspace-11`, `t-workspace-05` and `-12` would all be exempted. The untrusted part is the content, amount or count, not the recipient. The pin exemption belongs on matched values in (b), not on whole calls in (a).
 - Option (b) roughly halves the benign asks and keeps the attacks that copy attacker text. It does not separate attacks that take a decision from data (`travel-02`, `banking-11`): the benign twin is flagged for the same reason. It is defeated by paraphrase, and an adaptive attacker who knows the matcher will paraphrase.
-- Count limits, not labels, are what `banking-04`, `banking-11` and `t-banking-05` need (a second payment, a larger amount under the cap). That is a separate board item.
+- Count limits, not labels, are what `banking-04`, `banking-11` and `t-banking-05` need (a second payment, a larger amount under the cap). That is a separate design: [run limits](run-limits.md).
 
 ## 5. Interoperability
 

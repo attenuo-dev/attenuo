@@ -75,6 +75,5 @@ Built on branch `feat/cedar-list-filter` (2026-11-05) and merged to `main` as an
 
 ## More Information
 
-- Board: the "Cedar-aware list filtering, remainder" item in [docs/tasks/board.md](../tasks/board.md) points here.
 - Related: [ADR-0005](0005-policy-decision-point.md) (capabilities first, then Cedar), [ADR-0009](0009-output-labelling.md) (approval obligations, run taint), [ADR-0010](0010-run-limits.md) (run usage and budgets in context), [server pipeline, list filtering](../design/server.md#list-filtering).
 - Cedar experimental features: [cedar-policy RFCs](https://github.com/cedar-policy/rfcs/blob/main/README.md#experimental-features).
