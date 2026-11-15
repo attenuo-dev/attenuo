@@ -126,6 +126,8 @@
 
 # Project
 
+- [Status](status.md)
+- [Numbers](numbers.md)
 - [FAQ](faq.md)
 - [Comparison with alternatives](comparison.md)
 - [Release 0.1.0](release/0.1.0.md)
