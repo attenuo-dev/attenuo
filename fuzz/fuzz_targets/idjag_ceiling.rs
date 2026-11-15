@@ -27,32 +27,32 @@
 //!    itself was a cost bug, which equal answers do not show, so the target also counts the
 //!    heap allocations of `apply` on both claims: the repeated claim may cost at most a few
 //!    more (the token list grows, log-many times) than the distinct one.
-//! 4. Every `limited_steps` entry holds a limited capability and is within the grant.
+//! 4. Every `limited_steps` entry holds a limited capability and is within the grant. Every
+//!    `limited_claims` entry (what a claim with limits named, SR-131) holds a limited
+//!    capability, and the ceiling is within it.
 //! 5. When narrowing succeeds, every result capability is covered by the grant, by the final
-//!    ceiling and by every recorded step. For each of those sets (each is checked by the
-//!    server: the grant over the request, the final ceiling over the request as the grant left
-//!    it, each step over the result so far), each limited capability that covers a result
+//!    ceiling, by every recorded step and by what every claim with limits named. For each of
+//!    those sets (each is checked by the server: the grant over the request, the final ceiling
+//!    over the request as the grant left it, each step and then each recorded claim over the
+//!    result so far), each limited capability that covers a result
 //!    capability's calls (by the pairwise coverage relation) covers the calls of at most one
 //!    result capability, and that capability's limits are within it (SR-121, SR-128). The
 //!    result is also the reference's: `attenuo_fuzz::caps::attenuate_root_ref` of the grant,
-//!    then of the final ceiling, then of each recorded step, each over the one before.
-//! 6. A budget. Each limited capability `S` of the grant, and, in a mode where no two limited
-//!    capabilities of the grant and the used `scopes` entries overlap and no capability
-//!    without limits overlaps one of the same side (the grant's limited capabilities are on
-//!    servers `g0` and `g1`, which no other grant capability and no limited `scopes`
-//!    capability names; the `scopes` limited capabilities are on `s0` and `s1`, which no other
-//!    `scopes` capability names; each limited one is on its own exact `server:tool`;
-//!    `authorization_details` carries no limits), each limited capability of a `scopes` entry
-//!    the `scope` claim names: the sum over result capabilities whose calls `S` covers of
-//!    their `calls` (and of their `sum` on `S`'s argument) is at most `S`'s figure. This is
-//!    stated against the configured sources, not the intermediate sets, so it holds whatever
-//!    path `meet` copies a limit along. For the grant it holds in every mode since SR-128 (the
-//!    grant is checked over the request with every limited capability over each). For
-//!    `scopes` it is still checked in the mode only: `meet` keeps a grant capability that a
-//!    `scopes` capability covers with its limits in place of the `scopes` capability, so two
-//!    limited grant capabilities under one limited `scopes` capability can each keep their
-//!    own figure, and the `scopes` capability is in no set the server checks. `calls_per` and
-//!    `distinct` are left out: a per-value bound is not additive.
+//!    then of the final ceiling, then of each recorded step and each recorded claim, each
+//!    over the one before.
+//! 6. A budget. For each limited capability `S` of the grant and of a `scopes` entry the
+//!    `scope` claim names: the sum over result capabilities whose calls `S` covers of their
+//!    `calls` (and of their `sum` on `S`'s argument) is at most `S`'s figure. This is stated
+//!    against the configured sources, not the intermediate sets, so it holds whatever path
+//!    `meet` copies a limit along. It holds on every input: for the grant since SR-128 (the
+//!    grant is checked over the request with every limited capability over each), and for
+//!    `scopes` since SR-131 (what the claim named is checked over the result; before, `meet`
+//!    kept two limited grant capabilities under one limited `scopes` capability with their
+//!    own figures, and the `scopes` capability was in no set the server checked). The
+//!    generator still has a mode in which no two limited capabilities overlap (the grant's on
+//!    servers `g0` and `g1`, the `scopes` ones on `s0` and `s1`, each on its own exact
+//!    `server:tool`, `authorization_details` without limits), where far more requests are
+//!    accepted. `calls_per` and `distinct` are left out: a per-value bound is not additive.
 //! 7. Narrowing does not depend on the order in which the request lists its capabilities: the
 //!    same set, or the same error code.
 //!
@@ -136,6 +136,9 @@ const S_FREE_SERVERS: &[&str] = &["a", "ab", "g0", "g1"];
 
 #[derive(Debug)]
 struct Input {
+    /// Whether the generator used the mode without overlapping limited capabilities. Read
+    /// only by `Debug`, in a crash report: the properties hold in either mode (SR-131).
+    #[allow(dead_code)]
     disjoint: bool,
     grant: CapabilitySet,
     cfg: IdJagCeilingConfig,
@@ -703,22 +706,18 @@ fn check_built(ceiling: &IdJagCeiling, cfg: &IdJagCeilingConfig) {
     }
 }
 
-/// Property 6: the limited capabilities of the grant and, with `scopes` set (the disjoint
-/// mode), of the `scopes` entries the claim names.
+/// Property 6: the limited capabilities of the grant and of the `scopes` entries the claim
+/// names.
 fn sources(
     grant: &CapabilitySet,
     cfg: &IdJagCeilingConfig,
     claims: &Map<String, Value>,
-    scopes: bool,
 ) -> Vec<Capability> {
     let mut out: Vec<Capability> = grant
         .iter()
         .filter(|c| !c.limits.is_empty())
         .cloned()
         .collect();
-    if !scopes {
-        return out;
-    }
     if let Some(Value::String(s)) = claims.get("scope") {
         let tokens: BTreeSet<&str> = s.split_ascii_whitespace().collect();
         for t in tokens {
@@ -767,7 +766,7 @@ fn check_budgets(sources: &[Capability], result: &CapabilitySet) {
 
 fuzz_target!(|input: Input| {
     let Input {
-        disjoint,
+        disjoint: _,
         grant,
         cfg,
         claims,
@@ -802,6 +801,13 @@ fuzz_target!(|input: Input| {
             "the ceiling not within a recorded step"
         );
     }
+    for claim in &applied.limited_claims {
+        assert!(has_limits(claim), "a recorded claim holds no limit");
+        assert!(
+            claim.covers(&applied.capabilities),
+            "the ceiling not within a recorded claim"
+        );
+    }
 
     // 3. Repeats and order of claim values.
     let plain = distinct(&claims);
@@ -823,12 +829,18 @@ fuzz_target!(|input: Input| {
             applied.capabilities.covers(out),
             "result not within the ceiling"
         );
-        for step in &applied.limited_steps {
-            assert!(step.covers(out), "result not within a recorded step");
+        for step in applied.limited_steps.iter().chain(&applied.limited_claims) {
+            assert!(
+                step.covers(out),
+                "result not within a recorded step or claim"
+            );
         }
         let mut reference =
             attenuate_root_ref(&grant, &requested).expect("narrowing passed the grant");
-        for set in std::iter::once(&applied.capabilities).chain(&applied.limited_steps) {
+        for set in std::iter::once(&applied.capabilities)
+            .chain(&applied.limited_steps)
+            .chain(&applied.limited_claims)
+        {
             reference = attenuate_root_ref(set, &reference).expect("narrowing passed this set");
         }
         assert_eq!(&reference, out, "the reference narrows to another set");
@@ -837,10 +849,12 @@ fuzz_target!(|input: Input| {
         for step in &applied.limited_steps {
             one_result_per_limited_parent("step", step, out);
         }
+        for claim in &applied.limited_claims {
+            one_result_per_limited_parent("claim", claim, out);
+        }
 
-        // 6. Budgets: the grant's in every mode, the `scopes` entries' where no two limited
-        // capabilities overlap.
-        check_budgets(&sources(&grant, &cfg, &claims, disjoint), out);
+        // 6. Budgets: the grant's and the `scopes` entries', on every input.
+        check_budgets(&sources(&grant, &cfg, &claims), out);
     }
 
     // 3. again, through the narrowing; 7. the order of the request.

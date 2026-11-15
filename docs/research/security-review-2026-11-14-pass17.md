@@ -24,9 +24,9 @@ Every suspected issue got a test or a reproduction against the real code. Four a
 | Critical | 0 | 0 | 0 | 0 |
 | High | 0 | 0 | 0 | 0 |
 | Medium | 1 | 1 (SR-127, after the pass) | 0 | 0 |
-| Low | 2 | 2 (SR-129; SR-128, after the pass) | 0 | 0 |
+| Low | 3 | 3 (SR-129; SR-128 and SR-131, after the pass) | 0 | 0 |
 | Info | 1 | 1 (SR-130) | 0 | 0 |
-| **Total** | **4** | **4** | **0** | **0** |
+| **Total** | **5** | **5** | **0** | **0** |
 
 | ID | Severity | Component | Title | Status |
 |---|---|---|---|---|
@@ -34,6 +34,7 @@ Every suspected issue got a test or a reproduction against the real code. Four a
 | SR-128 | Low | core and server (`CapabilitySet::attenuate_root`, `attenuate_one`) | Overlapping limited capabilities of one root grant entry (or one ceiling) are not combined at hop 0: a capability takes its limits from one of them, and calls under the others are not charged to them | Fixed after the pass (#341, option 1, `limit_split_at_root` and the new `limit_conflict_at_root`), tests `overlapping_root_grant_limits_bound_one_capability_sr128`, `a_nested_root_grant_limit_is_not_skipped_sr128`, `root_grant_limits_one_capability_cannot_carry_are_refused_sr128`, `overlapping_scopes_limits_are_combined_at_intake_sr128`, `limits_one_capability_cannot_carry_are_refused_sr128` |
 | SR-129 | Low | server (`idp/ceiling.rs` `named_by_scope`, `named_by_resource`) | A `scope` or `resource` claim that repeats one value copied the capabilities it maps to once per repeat: 80 KB of claim made 1.28 million copies and 440 MB | Fixed: each distinct value expanded once; test `a_repeated_claim_value_is_expanded_once_sr129` |
 | SR-130 | Info | server (`Config::check_server_names`, #334) | A `[[root_grants]]` start-up refusal wrote the entry's subject in clear under `[logging] redact_subjects` | Fixed: the subject is left out under that setting; test `root_grant_limits_no_token_may_carry_refuse_to_start` (extended) |
+| SR-131 | Low | server (`idp/ceiling.rs` `meet`, `idp/intake.rs` `narrow`) | Found after the pass, while fixing SR-128. Under `[idps.id_jag_ceiling]`, a limited `scopes` capability over two limited capabilities of the root grant bounded neither: the ceiling kept the grant's two with their own figures, and the `scopes` figure was in no set hop 0 checked | Fixed after the pass (#342): hop 0 also checks the request against what each claim that holds limits named (`Applied::limited_claims`); tests `a_scopes_limit_over_several_grant_capabilities_is_one_budget_sr131`, `what_a_limited_claim_named_is_kept_for_the_split_check_sr131` |
 
 ## Findings
 
@@ -75,6 +76,17 @@ Every suspected issue got a test or a reproduction against the real code. Four a
 - **Severity.** Info: the subject comes from the operator's own file, and only an invalid configuration is refused.
 - **Fix.** Under `redact_subjects` the message says `a subject (not shown: [logging] redact_subjects)`; the index still names the entry. The digest is not used because the issuer key it is derived from is not loaded when the configuration is checked. Without the setting the message is unchanged. The configuration reference says so.
 - **Test.** `root_grant_limits_no_token_may_carry_refuse_to_start` (`tests/hardening.rs`) gained the case: the message names entry 1 and does not contain `alice`. With `describe(false)` put back it fails.
+
+### SR-131: a scopes limit over several limited grant capabilities bounded none of them (Low, fixed)
+
+Found after the pass, on 2026-11-15, while fixing SR-128 (#341): the `idjag_ceiling` fuzz target's budget property for `scopes` could not be stated on every input, and this is why.
+
+- **Confirmed by reading and reproduced.** `meet(G, named)` keeps a capability of `G` unchanged when a single capability the claim names covers it, with its own limits. With a root grant of `send_money` to alice with `sum` 50 and `send_money` to bob with `sum` 50, and `scopes = { payments = [send_money with sum 60] }`, an ID-JAG with `scope = "payments"` gives the ceiling {alice 50, bob 50}: each is within the scope's 60, so each is kept as it is. No step is recorded (the grant is checked on its own, and there is one claim), so the `scopes` capability with its 60 is in no set the hop-0 check looks at. A request for alice and for bob is answered `200` with 50 each: 100 against the scope's 60.
+- **Reproduced** through the whole server by the committed test below, which fails on the code before the fix (it gets `200`).
+- **Attacker.** The agent at hop 0, which chooses its request. The preconditions are the opt-in ceiling, a `scopes` (or `resources`, or `authorization_details`) capability with a limit, and a root grant with two or more limited capabilities under it whose figures are each within the claim's.
+- **Severity.** Low. The root token stays within the root grant, limits included, so nothing the entry itself forbids is reached. What fails is the ceiling's extra bound, for one entry shape. SR-127 (Medium) reached the same excess with an unlimited grant, which is the common case; this needs a grant that already carries its own limits.
+- **Fixed after the pass** (#342). `IdJagCeiling::apply` records what each claim named when it holds limits (`Applied::limited_claims`), and intake runs `attenuate_root` of each over the narrowed request after the kept steps, keeping the result. The request above is refused with `limit_split_at_root` (alice and bob are both under the scope's capability); one recipient alone gets the grant's 50. The check is the strict one of SR-121 and SR-128, so it also refuses the two recipients when the scope's figure would hold both (`sum` 200): ask for one capability the grant covers, or give the grant one capability for both.
+- **Tests.** `a_scopes_limit_over_several_grant_capabilities_is_one_budget_sr131` (`tests/oidc.rs`), `what_a_limited_claim_named_is_kept_for_the_split_check_sr131` (`idp/ceiling.rs`). The `idjag_ceiling` fuzz target now checks the `scopes` budget on every input.
 
 ## Tried and held
 

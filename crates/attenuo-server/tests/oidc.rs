@@ -2148,6 +2148,67 @@ async fn scopes_harness(payments: Vec<attenuo_core::Capability>) -> Harness {
     .await
 }
 
+/// SR-131: a limited `scopes` capability over two limited capabilities of the root grant. The
+/// ceiling keeps the grant's two (each within the scope's figure) with their own limits, so
+/// the scope's figure was in no set hop 0 checked: alice and bob got 50 each, 100 against the
+/// scope's 60. What the claim named is now checked too.
+#[tokio::test]
+async fn a_scopes_limit_over_several_grant_capabilities_is_one_budget_sr131() {
+    let to = |who: &str, max: u64| {
+        attenuo_core::Capability::new("banking", "send_money")
+            .with_constraint("to", attenuo_core::ArgConstraint::Equals(json!(who)))
+            .with_limits(attenuo_core::Limits::default().with_sum("amount", max))
+    };
+    let h = Harness::start_with(move |cfg| {
+        cfg.root_grants[0].capabilities =
+            vec![CapSpec::Full(to("alice", 50)), CapSpec::Full(to("bob", 50))];
+        cfg.idps[0].id_jag_ceiling = Some(IdJagCeilingConfig {
+            resources: BTreeMap::new(),
+            scopes: BTreeMap::from([(
+                "payments".to_string(),
+                vec![CapSpec::Full(
+                    attenuo_core::Capability::new("banking", "send_money")
+                        .with_limits(attenuo_core::Limits::default().with_sum("amount", 60)),
+                )],
+            )]),
+        });
+    })
+    .await;
+    let jag = jag_with(&h, json!({"scope": "payments"}));
+    let both = details(&[payee("alice", None), payee("bob", None)]);
+    let got = present(&h, &jag, ("authorization_details", &both.to_string())).await;
+    assert_error(
+        &got,
+        StatusCode::BAD_REQUEST,
+        "invalid_scope",
+        "limit_split_at_root",
+    );
+    let detail = got.1["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("alice") && detail.contains("bob"),
+        "named as requested: {detail}"
+    );
+    assert!(
+        !detail.contains("50") && !detail.contains("60") && !detail.contains("sum"),
+        "{detail}"
+    );
+    // One of them alone: the grant's figure, which is within the scope's.
+    let alice = details(&[payee("alice", None)]);
+    let got = present(&h, &jag, ("authorization_details", &alice.to_string())).await;
+    assert_eq!(got.0, StatusCode::OK, "{}", got.1);
+    let token = got.1["access_token"].as_str().unwrap();
+    assert_eq!(
+        caps(&h.verify(token).hops[0].capabilities),
+        [
+            r#"banking:send_money{to={"op":"equals","value":"alice"}} limits={"sum":{"arg":"amount","max":50}}"#
+        ]
+    );
+    // Without the scope claim the grant alone decides, as before.
+    let jag = jag_with(&h, json!({}));
+    let got = present(&h, &jag, ("authorization_details", &both.to_string())).await;
+    assert_eq!(got.0, StatusCode::OK, "{}", got.1);
+}
+
 /// SR-128 under the ceiling: a `scopes` entry with `banking:*` (`calls` 10) and
 /// `banking:send_money` (`calls` 1). A request for `send_money` is under both, so it carries
 /// `calls` 1, whether the ID-JAG has the scope alone (the final ceiling holds both) or also

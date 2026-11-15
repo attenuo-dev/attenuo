@@ -534,7 +534,11 @@ pub(crate) fn narrow_with(
             // (SR-128). Made over the result, so a request refused above keeps its answer, and
             // the result is the step's: each capability lowered to the limits of every
             // limited capability of the step over it.
-            for (k, step) in applied.limited_steps.iter().enumerate() {
+            // Then what each claim that holds limits named: `meet` keeps a capability of the
+            // step before under a capability the claim names with its own limits, so the
+            // claim's limit would otherwise bound none of them (SR-131).
+            let also = applied.also_checked();
+            for (k, step) in also.iter().enumerate() {
                 narrowed = step.attenuate_root(&narrowed).map_err(|e| {
                     let (first, second) = match e {
                         attenuo_core::AttenuationError::LimitSplit { first, second } => {
@@ -560,7 +564,7 @@ pub(crate) fn narrow_with(
                         .map(Result::ok)
                         .collect();
                     for set in
-                        std::iter::once(&applied.capabilities).chain(&applied.limited_steps[..k])
+                        std::iter::once(&applied.capabilities).chain(also[..k].iter().copied())
                     {
                         let mut next = set.attenuate_root_each(shown.iter().flatten()).into_iter();
                         shown = shown
