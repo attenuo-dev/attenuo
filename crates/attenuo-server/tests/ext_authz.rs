@@ -10,11 +10,12 @@
 //! No real agentgateway runs here. [`Harness::gateway`] sends what agentgateway's HTTP
 //! `extAuthz` mode sends, as read in its source at commit
 //! `18f83707118b3e2df500cc63299486958a0e86f5`, `crates/agentgateway/src/http/ext_authz.rs`
-//! (`ExtAuthz::check_http`), for a route configured as in `docs/guides/agentgateway.md`
-//! (`path` a fixed string, `includeRequestHeaders: [authorization, dpop]`, the secret in
-//! `addRequestHeaders`, `includeRequestBody` without `allowPartialMessage`): the agent's
-//! method, that fixed path, only the listed headers, `x-envoy-auth-partial-body: false`, and
-//! the agent's body as it came.
+//! (`ExtAuthz::check_http`), and as agentgateway v1.7.0 (commit `26f5aebe`) sent it when run
+//! on 2026-11-16 (`docs/design/agentgateway-ext-authz.md`, section 6), for a route configured
+//! as in `docs/guides/agentgateway.md` (`path` a fixed string, `includeRequestHeaders:
+//! [authorization, dpop]`, the secret in `addRequestHeaders`, `includeRequestBody` without
+//! `allowPartialMessage`): the agent's method, that fixed path, only the listed headers,
+//! `x-envoy-auth-partial-body: false`, and the agent's body as it came.
 
 // Configs are built field by field from `Config::default()`, as in the other server tests.
 #![allow(clippy::field_reassign_with_default)]
