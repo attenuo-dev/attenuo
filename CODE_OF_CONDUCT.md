@@ -59,10 +59,8 @@ representative at an online or offline event.
 ## Enforcement
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
-reported to the community leaders responsible for enforcement at
-the maintainers listed in [MAINTAINERS.md](MAINTAINERS.md), privately, through the
-contact details on their GitHub profiles. A dedicated address will be listed here
-once the project has its own domain.
+reported to the community leaders responsible for enforcement, privately, at
+<attenuo.dev@gmail.com>. The maintainers are listed in [MAINTAINERS.md](MAINTAINERS.md).
 All complaints will be reviewed and investigated promptly and fairly.
 
 All community leaders are obligated to respect the privacy and security of the
