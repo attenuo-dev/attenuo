@@ -211,11 +211,13 @@ const ENVELOPE_MEMBERS: &[&str] = &["jsonrpc", "id", "method", "params", "result
 const PARAMS_MEMBERS: &[&str] = &["name", "arguments", "uri", "_meta"];
 
 /// A member name with case folded: two names with one key are one member to a decoder that
-/// matches names without regard to case. Upper then lower case, so that the folds Go's
-/// `encoding/json` makes (`ſ` to `s`, the Kelvin sign to `k`) give one key too; `ß` and
-/// `ss` also give one key, which can only refuse more.
+/// matches names without regard to case. Go's `encoding/json` joins two names that are equal
+/// rune by rune under Unicode simple case folding (`ſ` with `s`, the Kelvin sign with `k`,
+/// `ẞ` with `ß`); lower, upper, then lower case gives each such pair one key (SR-137: upper
+/// then lower case alone gave `ẞ` and `ß` two keys). `ß` and `ss` also give one key, which
+/// can only refuse more.
 fn fold_name(name: &str) -> String {
-    name.to_uppercase().to_lowercase()
+    name.to_lowercase().to_uppercase().to_lowercase()
 }
 
 /// Why `msg` can be read as another message by a decoder that matches member names without
@@ -284,6 +286,13 @@ mod tests {
                    "params": {"name": "x", "arguments": {"key": "a", "\u{212a}ey": "b"}}}),
             json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                    "params": {"name": "x", "arguments": {"l": [{"a": 1, "A": 2}]}}}),
+            // A JSON-RPC or MCP name with a rune Go folds onto an ASCII letter (pass 20).
+            json!({"j\u{17f}onrpc": "2.0", "id": 1, "method": "tools/call", "params": {}}),
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                   "params": {"name": "x", "argument\u{17f}": {"path": "/etc/passwd"}}}),
+            // Go joins `ß` and the capital sharp s (SR-137).
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                   "params": {"name": "x", "arguments": {"stra\u{df}e": "a", "stra\u{1e9e}e": "b"}}}),
         ] {
             assert!(member_case_conflict(&bad).is_some(), "{bad}");
         }

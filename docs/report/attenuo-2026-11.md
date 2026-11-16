@@ -278,7 +278,7 @@ Not measured: repeated runs with confidence intervals on a quiet machine, most o
 
 Round 2 added five targets over limits, budgets, approval tokens and server routes and found four low or informational bugs (`docs/research/fuzzing-2026-10-24-round2.md`). Round 3 ran two SSE targets for 300 s each and found none (`docs/research/fuzz-round-3-2026-10-25.md`). These campaigns are short. They ran on a busy machine without AddressSanitizer, and their corpora were not kept. CI now compiles every target on each pull request that can change Rust, but it does not fuzz (`.github/workflows/ci.yml`). Beyond those attenuation properties, run limits have their own property and integration tests, such as `exchange_clamps_child_budget_to_parent_remaining` and `concurrent_siblings_cannot_overspend_parent` (`docs/decisions/0010-run-limits.md`).
 
-**Security review.** Nineteen passes were made between 2026-10-22 and 2026-11-15. Pass 2 was the fix round for pass 1, and the other eighteen recorded SR-01 to SR-136 (Table 4).
+**Security review.** Twenty passes were made between 2026-10-22 and 2026-11-16. Pass 2 was the fix round for pass 1, and the other nineteen recorded SR-01 to SR-138 (Table 4).
 
 | Pass | Report under `docs/research/` | Found | High | Medium | Low | Info |
 |----|----------------------------------------|------:|-----:|-------:|----:|-----:|
@@ -300,7 +300,8 @@ Round 2 added five targets over limits, budgets, approval tokens and server rout
 | 17 | `security-review-2026-11-14-pass17.md` | 5 | 0 | 1 | 3 | 1 |
 | 18 | `security-review-2026-11-15-pass18.md` | 1 | 0 | 0 | 0 | 1 |
 | 19 | `security-review-2026-11-15-pass19.md` | 4 | 1 | 0 | 1 | 2 |
-| All | | 136 | 6 | 21 | 58 | 51 |
+| 20 | `security-review-2026-11-16-pass20.md` | 2 | 0 | 0 | 1 | 1 |
+| All | | 138 | 6 | 21 | 59 | 52 |
 
 Table: Table 4. Findings per pass, from each report's summary table (pass 8 from its finding list, which adds SR-90 after the summary). No pass found a Critical.
 

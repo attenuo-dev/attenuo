@@ -21,7 +21,12 @@
 //!   `context.untrusted_args`, whatever action the policy is for ([`PolicyArgNames`]). Cedar's
 //!   strict validation does not bound these by the catalog: a read guarded by `has` of an
 //!   undeclared name loads (with a "policy is impossible" warning) and runs, since evaluation is
-//!   schema-free.
+//!   schema-free. Only a read the policy's text names is collected: an attribute chain from
+//!   `context` (`context.input.path`, `context.input["path"]`, `context has input.path`) and a
+//!   string literal on the other side of a comparison or a set method with
+//!   `context.untrusted_args` itself. A whole-record comparison, a read through an expression
+//!   that yields the record or the set (a conditional, a record literal), and a name computed at
+//!   evaluation time are not (SR-138; the threat model says so).
 //!
 //! An exact name the tool's own entry or capabilities know passes even when a policy for
 //! another tool reads a name that differs from it only in case; a name that matches none
@@ -40,11 +45,14 @@ use serde_json::Value;
 use crate::catalog::ToolAttrs;
 
 /// A name with case folded: two names with one key are one name to a decoder that matches
-/// names without regard to case. Upper then lower case, so that the folds Go's
-/// `encoding/json` makes (`ſ` to `s`, the Kelvin sign to `k`) give one key too, as the
-/// proxy's SR-133 check does; `ß` and `ss` also give one key, which can only refuse more.
+/// names without regard to case. Go's `encoding/json` joins two names that are equal rune by
+/// rune under Unicode simple case folding (`ſ` with `s`, the Kelvin sign with `k`, `ẞ` with
+/// `ß`); lower, upper, then lower case gives each such pair one key, as the proxy's SR-133
+/// check does (SR-137: upper then lower case alone gave `ẞ` and `ß` two keys). Full case
+/// mapping also joins `ß` with `ss` and a ligature with its letters, which Go does not; that
+/// can only refuse more.
 pub(crate) fn fold(name: &str) -> String {
-    name.to_uppercase().to_lowercase()
+    name.to_lowercase().to_uppercase().to_lowercase()
 }
 
 /// The argument names the loaded policies read, by folded name: every `context.input.<name>`
@@ -194,4 +202,203 @@ pub(crate) fn check(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    fn collected(src: &str) -> BTreeSet<String> {
+        let set = PolicySet::from_str(src).unwrap_or_else(|e| panic!("{src}: {e}"));
+        let names = PolicyArgNames::of(&set).unwrap();
+        names.by_fold.into_values().flatten().collect()
+    }
+
+    /// Pass 20, 1a: every Cedar expression form that can read `context.input` or
+    /// `context.untrusted_args`, and whether the name it reads is collected. A `false` row is a
+    /// form whose name cannot be known from the text (a name computed at evaluation time) or
+    /// that reaches the record through another expression; the threat model names them.
+    #[test]
+    fn every_expression_form_is_collected_or_named_as_a_limit_sr138() {
+        let when = |cond: &str| format!("forbid(principal, action, resource) when {{ {cond} }};");
+        let rows: &[(&str, &str, &[&str])] = &[
+            // context.input: attribute access, has, index with a string.
+            ("attribute", "context.input.path == \"x\"", &["path"]),
+            ("has", "context.input has path", &["path"]),
+            ("has with a string", "context.input has \"path\"", &["path"]),
+            ("index", "context.input[\"path\"] == \"x\"", &["path"]),
+            (
+                "index on context",
+                "context[\"input\"][\"path\"] == \"x\"",
+                &["path"],
+            ),
+            ("has on a path", "context has input.path", &["path"]),
+            ("negated has", "!(context.input has path)", &["path"]),
+            ("like", "context.input.path like \"/etc/*\"", &["path"]),
+            ("in", "context.input.dir in Dir::\"etc\"", &["dir"]),
+            (
+                "contains on a member",
+                "context.input.tags.contains(\"a\")",
+                &["tags"],
+            ),
+            (
+                "containsAll on a member",
+                "context.input.tags.containsAll([\"a\"])",
+                &["tags"],
+            ),
+            (
+                "containsAny on a member",
+                "[\"a\"].containsAny(context.input.tags)",
+                &["tags"],
+            ),
+            (
+                "extension call",
+                "decimal(context.input.price) > decimal(\"1.0\")",
+                &["price"],
+            ),
+            ("ip", "ip(context.input.host).isLoopback()", &["host"]),
+            (
+                "member against member",
+                "context.input.a == context.input.B",
+                &["B", "a"],
+            ),
+            (
+                "if/then/else",
+                "if context.input has path then context.input.path == \"x\" else false",
+                &["path"],
+            ),
+            // context.untrusted_args: comparison and every set method, both ways round.
+            (
+                "untrusted ==",
+                "context.untrusted_args == [\"path\"]",
+                &["path"],
+            ),
+            (
+                "untrusted !=",
+                "[\"path\"] != context.untrusted_args",
+                &["path"],
+            ),
+            (
+                "untrusted contains",
+                "context.untrusted_args.contains(\"path\")",
+                &["path"],
+            ),
+            (
+                "untrusted containsAll",
+                "context.untrusted_args.containsAll([\"path\", \"url\"])",
+                &["path", "url"],
+            ),
+            (
+                "untrusted containsAny reversed",
+                "[\"url\"].containsAny(context.untrusted_args)",
+                &["url"],
+            ),
+            (
+                "untrusted in",
+                "\"path\" in context.untrusted_args",
+                &["path"],
+            ),
+            (
+                "untrusted with a conditional name",
+                "context.untrusted_args.contains(if principal has x then \"path\" else \"url\")",
+                &["path", "url"],
+            ),
+            ("untrusted isEmpty", "context.untrusted_args.isEmpty()", &[]),
+            // Not collected: the limits the threat model names.
+            (
+                "whole record",
+                "context.input == {\"path\": \"/etc/passwd\"}",
+                &[],
+            ),
+            (
+                "record through a conditional",
+                "(if principal has x then context.input else context.input) has path",
+                &[],
+            ),
+            (
+                "record through a record literal",
+                "{\"r\": context.input}.r has path",
+                &[],
+            ),
+            (
+                "untrusted through a conditional",
+                "(if principal has x then context.untrusted_args else []).contains(\"path\")",
+                &[],
+            ),
+            (
+                "computed name",
+                "context.untrusted_args.contains(principal.watched_arg)",
+                &[],
+            ),
+        ];
+        for (form, cond, want) in rows {
+            let got = collected(&when(cond));
+            let want: BTreeSet<String> = want.iter().map(|s| s.to_string()).collect();
+            assert_eq!(got, want, "{form}: {cond}");
+        }
+        // A template's body is read like a static policy's, linked or not.
+        let template = r#"@id("t")
+            forbid(principal == ?principal, action, resource) when { context.input has path };"#;
+        assert_eq!(collected(template), BTreeSet::from(["path".to_string()]));
+        let mut set = PolicySet::new();
+        set.add_template(
+            cedar_policy::Template::parse(Some(cedar_policy::PolicyId::new("t")), template)
+                .unwrap(),
+        )
+        .unwrap();
+        set.link(
+            cedar_policy::PolicyId::new("t"),
+            cedar_policy::PolicyId::new("t1"),
+            HashMap::from([(
+                cedar_policy::SlotId::principal(),
+                cedar_policy::EntityUid::from_str("User::\"a\"").unwrap(),
+            )]),
+        )
+        .unwrap();
+        let names = PolicyArgNames::of(&set).unwrap();
+        assert_eq!(names.with_fold("path").collect::<Vec<_>>(), ["path"]);
+    }
+
+    /// Pass 20, 1b: Go's `encoding/json` matches a member to a field whose name has the same
+    /// key under `foldName`: ASCII letters upper-cased, every other rune replaced by the
+    /// smallest rune of its `unicode.SimpleFold` orbit, so two names match when they are equal
+    /// rune by rune under simple case folding. Each group is one such orbit (or a name built
+    /// from them) and must give one key here. Upper then lower case alone gave `ß` the key
+    /// `ss` and `ẞ` the key `ß`, which Go joins (SR-137).
+    #[test]
+    fn the_fold_joins_every_name_go_joins_sr137() {
+        for group in [
+            &["straße", "straẞe", "STRAẞE", "STRAßE"][..],
+            &["ask", "a\u{17f}k", "ASK"],
+            &["key", "\u{212a}ey", "KEY"],
+            &["\u{e5}", "\u{c5}", "\u{212b}"],
+            &["\u{3c9}", "\u{3a9}", "\u{2126}"],
+            &["\u{3c3}", "\u{3c2}", "\u{3a3}"],
+            &["\u{3b1}\u{3c2}", "\u{3b1}\u{3c3}", "\u{391}\u{3a3}"],
+            &["\u{3c3}\u{3b1}", "\u{3c2}\u{3b1}"],
+            &["\u{1c6}", "\u{1c5}", "\u{1c4}"],
+            &["\u{1fb3}", "\u{1fbc}"],
+            &["\u{3b8}", "\u{3d1}", "\u{3f4}", "\u{398}"],
+            &["\u{3b9}", "\u{345}", "\u{1fbe}", "\u{399}"],
+            &["\u{b5}", "\u{3bc}", "\u{39c}"],
+            &["\u{1e61}", "\u{1e9b}", "\u{1e60}"],
+            &["\u{432}", "\u{1c80}", "\u{412}"],
+        ] {
+            let keys: BTreeSet<String> = group.iter().map(|n| fold(n)).collect();
+            assert_eq!(keys.len(), 1, "{group:?} gave {keys:?}");
+        }
+        // Where the fold joins more than Go does, it can only refuse more: full case mapping
+        // makes `ß` one with `ss` and a ligature one with its letters, and the dotless `ı`
+        // upper-cases to `I`. Go keeps each of these apart; so does the fold with `İ`.
+        for (a, b, joined) in [
+            ("stra\u{df}e", "strasse", true),
+            ("\u{fb01}le", "file", true),
+            ("\u{131}d", "id", true),
+            ("\u{130}d", "id", false),
+            ("path", "pat", false),
+        ] {
+            assert_eq!(fold(a) == fold(b), joined, "{a} {b}");
+        }
+    }
 }

@@ -120,4 +120,38 @@ fn audit_verify_cross_checks_shipped_checkpoints_sr21() {
     let junk = path("junk.jsonl");
     let out = run("genuine.jsonl", &["--checkpoints", junk.to_str().unwrap()]);
     assert_ne!(out.status.code(), Some(0));
+
+    // Pass 20: the same answers when the reader of stdout or stderr has already gone.
+    let closed = || {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        writer
+    };
+    for (export, want) in [("genuine.jsonl", 0), ("tampered.jsonl", 2)] {
+        for json in [false, true] {
+            for (out_closed, err_closed) in [(true, false), (false, true), (true, true)] {
+                let mut c = attenuo();
+                if json {
+                    c.arg("--json");
+                }
+                c.args(["audit", "verify", "--file"])
+                    .arg(path(export))
+                    .arg("--jwks")
+                    .arg(path("jwks.json"))
+                    .args(["--checkpoints", shipped_arg]);
+                if out_closed {
+                    c.stdout(closed());
+                }
+                if err_closed {
+                    c.stderr(closed());
+                }
+                let status = c.status().unwrap();
+                assert_eq!(
+                    status.code(),
+                    Some(want),
+                    "{export} json={json} stdout closed={out_closed} stderr closed={err_closed}"
+                );
+            }
+        }
+    }
 }

@@ -96,7 +96,7 @@ attenuo is pre-alpha and has not been used in production. Release 0.1.0 is prepa
 
 - **Tests and fuzzing.** Unit, property and integration tests in Rust and in both SDKs, the SDKs against a real server, and 22 fuzz targets with no open crash.
 - **Proof.** A Lean model of the covering rule proves that delegation never widens authority in the model. The Rust code is not verified against it; a differential test finds the two in agreement on 31,500 generated cases.
-- **Security review.** Nineteen review passes recorded 136 findings; three Info findings are open (SR-117, SR-126, SR-135), the rest are fixed or accepted with reasons. All passes were done by the project itself. There has been no outside audit.
+- **Security review.** Twenty review passes recorded 138 findings; three Info findings are open (SR-117, SR-126, SR-135), the rest are fixed or accepted with reasons. All passes were done by the project itself. There has been no outside audit.
 - **Not tested.** Hosted identity providers (Auth0, Okta, Entra ID, Google), AWS S3, a production SPIRE or Keycloak, and the release workflow. No load test on reference hardware.
 
 ## Where to look

@@ -814,6 +814,99 @@ async fn a_named_operator_decides_and_is_recorded_a_viewer_cannot_adr0016() {
     h.verify_ok().await;
 }
 
+/// Pass 20: on a console listener without `allow_write`, a decision is answered 404 (#354) only
+/// after the admin bearer check: no bearer, or another bearer, is 401; with the bearer, a body
+/// that is not JSON is 415 and a decision is 404, for a pending approval and an unknown id
+/// alike. None of them decides, records or counts anything: the approval stays pending and
+/// the user can still grant it.
+#[tokio::test]
+async fn a_decision_on_a_read_only_console_is_404_after_the_bearer_and_changes_nothing() {
+    let h = Harness::start().await;
+    let token = h.root().await;
+    h.taint(&token).await;
+    let g = h.gated(&token, "alice/site").await;
+    assert!(!h.cfg.admin_ui.allow_write);
+    let ro = spawn_router(attenuo_server::admin_ui::router(h.state.clone(), &h.cfg))
+        .await
+        .unwrap();
+    let before = h.records().await.len();
+    let url = ro.url(&format!("/admin/approvals/{}", g.approval_id));
+    let unknown = ro.url("/admin/approvals/no-such-approval");
+    for decision in ["grant", "decline"] {
+        let body = json!({ "decision": decision });
+        for target in [&url, &unknown] {
+            let r = h.client.post(target).json(&body).send().await.unwrap();
+            assert_eq!(r.status(), StatusCode::UNAUTHORIZED, "no bearer, {target}");
+            let r = h
+                .client
+                .post(target)
+                .bearer_auth(&token)
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                r.status(),
+                StatusCode::UNAUTHORIZED,
+                "agent token, {target}"
+            );
+            let r = h
+                .client
+                .post(target)
+                .bearer_auth(ADMIN)
+                .body(body.to_string())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE, "{target}");
+            let r = h
+                .client
+                .post(target)
+                .bearer_auth(ADMIN)
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::NOT_FOUND, "{target}");
+        }
+    }
+    let shown: Value = h
+        .client
+        .get(url.as_str())
+        .bearer_auth(ADMIN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(shown["state"], "pending");
+    assert!(shown["approver"].is_null(), "{shown}");
+    assert_eq!(h.records().await.len(), before, "nothing was recorded");
+    assert_eq!(
+        metric(
+            &h,
+            "attenuo_approvals_decided_total{outcome=\"granted\",by=\"operator\"}"
+        ),
+        0
+    );
+    assert_eq!(
+        metric(
+            &h,
+            "attenuo_approvals_decided_total{outcome=\"declined\",by=\"operator\"}"
+        ),
+        0
+    );
+    // Still gated, with the same approval, and still the user's to decide.
+    assert_eq!(
+        h.gated(&token, "alice/site").await.approval_id,
+        g.approval_id
+    );
+    h.grant_as_alice(&g.approval_id).await;
+    assert!(allowed(&h.delete(&token, "alice/site").await));
+    h.verify_ok().await;
+}
+
 #[tokio::test]
 async fn operator_grant_on_the_admin_listener() {
     let h = Harness::start().await;
