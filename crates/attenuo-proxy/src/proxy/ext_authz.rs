@@ -13,8 +13,9 @@
 //! - the gateway authenticates with a secret of the `[[ext_authz]]` entry of `{server}`, so a
 //!   route configured for one server cannot ask about another;
 //! - the body must be whole (`x-envoy-auth-partial-body: false`) and unambiguous (no duplicate
-//!   member, every number written as serde_json reads it), because the gateway forwards the
-//!   agent's bytes, not the proxy's re-encoding of what was decided;
+//!   member, every number written as serde_json reads it), because the gateway forwards its
+//!   own parse of the agent's bytes (agentgateway v1.7.0 re-encodes the message), not the
+//!   proxy's re-encoding of what was decided;
 //! - batches are refused: the gateway forwards all or nothing;
 //! - a DPoP proof names the gateway's URL (`dpop_url`), not this server's;
 //! - `Mcp-Session-Id` is ignored: the adapter never sees which principal a session belongs to.
