@@ -341,6 +341,28 @@ fn unicode_folds_are_refused() {
     );
 }
 
+/// Go joins `ß` and the capital sharp s `ẞ` (one `unicode.SimpleFold` orbit) and read
+/// `{"straẞe": ..}` into a field `straße`; the fold gave them two keys (SR-137).
+#[test]
+fn the_capital_sharp_s_is_refused_sr137() {
+    let e = engine(
+        ToolAttrs::new().with_input("stra\u{df}e", ArgType::String),
+        PERMIT,
+    );
+    let ch = wide();
+    for variant in ["stra\u{1e9e}e", "STRA\u{1e9e}E", "STRA\u{df}E"] {
+        assert_eq!(
+            reason(&e, &ch, json!({ variant: "x" })),
+            REASON_ARGUMENT_CASE_MISMATCH,
+            "{variant}"
+        );
+    }
+    assert!(e
+        .authorize(&ch, &call(json!({"stra\u{df}e": "x"})), now())
+        .decision
+        .is_allow());
+}
+
 /// Exact names, unrelated names and nested names pass; a tool nothing is known about passes
 /// whatever the case, as before (this case cannot be closed without the tool's schema).
 #[test]
@@ -449,5 +471,107 @@ fn a_reload_reads_the_new_names() {
     assert_eq!(
         reason(&e, &ch, json!({"Path": "/x"})),
         REASON_ARGUMENT_CASE_MISMATCH
+    );
+}
+
+/// Pass 20, 1c: a tool with no catalog entry. An exact name passes whether a policy reads it,
+/// a capability constrains it, or nothing does; a name that differs only in case from one a
+/// policy reads is refused (the documented case: nothing of the tool's own says which spelling
+/// it uses), unless a capability that covers the tool names that spelling. Under the default
+/// `unknown_tools = "deny"` an exact name is refused for the tool, never for its case.
+#[test]
+fn a_tool_with_no_catalog_entry_keeps_its_exact_names() {
+    let policies = r#"permit(principal, action, resource);
+        forbid(principal, action == Action::"fs/read_file", resource) when {
+          context.input has path && context.input.path like "/etc/*" };"#;
+    let build = |unknown: UnknownTools| {
+        PolicyEngineBuilder::new()
+            .with_catalog(ToolCatalog::new().with("fs", "read_file", ToolAttrs::new()))
+            .with_unknown_tools(unknown)
+            .with_policies_str(policies)
+            .build()
+            .unwrap()
+    };
+    let open = build(UnknownTools::Allow);
+    let other = |args: Value| ToolCall::new("other", "tool", args);
+    let wide = chain(vec![Capability::new("other", "*")]);
+    let narrow = chain(vec![Capability::new("other", "tool")
+        .with_constraint("mode", ArgConstraint::OneOf(vec![json!("r")]))]);
+    for (ch, args) in [
+        (&wide, json!({})),
+        (&wide, json!({"path": "/w/a"})),
+        (
+            &wide,
+            json!({"path": "/w/a", "Unrelated": 1, "nested": {"Path": "x"}}),
+        ),
+        (&narrow, json!({"mode": "r"})),
+        (&narrow, json!({"mode": "r", "path": "/w/a"})),
+    ] {
+        let out = open.authorize(ch, &other(args.clone()), now());
+        assert!(out.decision.is_allow(), "{args}: {out:?}");
+    }
+    for (ch, args) in [
+        (&wide, json!({"Path": "/w/a"})),
+        (&narrow, json!({"Mode": "r"})),
+        (&narrow, json!({"mode": "r", "PATH": "/w/a"})),
+    ] {
+        assert_eq!(
+            open.authorize(ch, &other(args.clone()), now()).reason,
+            REASON_ARGUMENT_CASE_MISMATCH,
+            "{args}"
+        );
+    }
+    // A capability of the tool's own that names `Path` wins over the other tool's `path`.
+    let own = chain(vec![Capability::new("other", "tool")
+        .with_constraint("Path", ArgConstraint::Prefix("/w/".into()))]);
+    let out = open.authorize(&own, &other(json!({"Path": "/w/a"})), now());
+    assert!(out.decision.is_allow(), "{out:?}");
+    assert_eq!(
+        open.authorize(&own, &other(json!({"path": "/w/a"})), now())
+            .reason,
+        REASON_ARGUMENT_CASE_MISMATCH
+    );
+    // Two policies that read two spellings: with nothing of its own, neither is the tool's.
+    let both = PolicyEngineBuilder::new()
+        .with_unknown_tools(UnknownTools::Allow)
+        .with_policies_str(
+            r#"permit(principal, action, resource);
+               forbid(principal, action, resource) when { context.input has path };
+               forbid(principal, action, resource) when { context.input has PATH };"#,
+        )
+        .build()
+        .unwrap();
+    assert_eq!(
+        both.authorize(&wide, &other(json!({"path": 1})), now())
+            .reason,
+        REASON_ARGUMENT_CASE_MISMATCH
+    );
+    // The default refuses the unlisted tool, after the capability stage, for what it is.
+    let closed = build(UnknownTools::Deny);
+    for args in [json!({}), json!({"path": "/w/a"}), json!({"mode": "r"})] {
+        assert_eq!(
+            closed.authorize(&wide, &other(args.clone()), now()).reason,
+            attenuo_policy::REASON_TOOL_NOT_IN_CATALOG,
+            "{args}"
+        );
+    }
+}
+
+/// Pass 20, 1a: a name reached through an expression that yields `context.input` (here a
+/// conditional) is not collected; the threat model names this limit (SR-138). The policy loads
+/// and runs, and the exact name is still refused by it.
+#[test]
+fn a_read_through_a_conditional_is_not_collected_sr138() {
+    let e = engine(
+        ToolAttrs::new(),
+        r#"permit(principal, action, resource);
+           forbid(principal, action, resource) when {
+             (if context.input has mode then context.input else context.input) has path };"#,
+    );
+    let ch = wide();
+    assert_eq!(reason(&e, &ch, json!({"path": "/x"})), REASON_POLICY_DENY);
+    assert_eq!(
+        reason(&e, &ch, json!({"Path": "/x"})),
+        attenuo_policy::REASON_POLICY_ALLOW
     );
 }
