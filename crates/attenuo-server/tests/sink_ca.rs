@@ -19,6 +19,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 /// A certificate authority made for one test.
 struct Ca {
     cert: rcgen::Certificate,
+    params: rcgen::CertificateParams,
     key: rcgen::KeyPair,
 }
 
@@ -35,7 +36,7 @@ impl Ca {
             rcgen::KeyUsagePurpose::CrlSign,
         ];
         let cert = params.self_signed(&key).unwrap();
-        Self { cert, key }
+        Self { cert, params, key }
     }
 
     fn write(&self, dir: &Path, name: &str) -> PathBuf {
@@ -49,7 +50,8 @@ impl Ca {
         let names: Vec<String> = names.iter().map(|s| s.to_string()).collect();
         let mut params = rcgen::CertificateParams::new(names).unwrap();
         params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
-        let cert = params.signed_by(&key, &self.cert, &self.key).unwrap();
+        let issuer = rcgen::Issuer::from_params(&self.params, &self.key);
+        let cert = params.signed_by(&key, &issuer).unwrap();
         (cert.der().clone(), key.serialize_der())
     }
 }
