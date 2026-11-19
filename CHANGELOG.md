@@ -8,6 +8,10 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 
 ## [Unreleased]
 
+### Documentation
+
+- The STDIO servers guide has a walkthrough against a real server, `@modelcontextprotocol/server-filesystem` 2.4.0, with the config, policy and the output of one allowed and three denied calls. The `stdio-bridge` example command is no longer marked untested.
+
 ## [0.1.0] - 2026-11-19
 
 Prepared on 2026-10-24 and tagged `v0.1.0` on 2026-11-19. In each section, the entries added after 2026-10-24 come first.
