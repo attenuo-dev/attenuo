@@ -3,6 +3,9 @@
 //! The file path comes from `--config` or, if that is absent, the `ATTENUO_CONFIG`
 //! environment variable. See `config/example.toml` for an annotated example. Relative paths in
 //! the file are resolved against the current working directory.
+//!
+//! `ATTENUO__<SECTION>__<KEY>` variables override scalar keys of the file before the startup
+//! checks run ([`Config::load_with_env`], `overrides`).
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -14,6 +17,10 @@ use attenuo_proxy::UpstreamConfig;
 use attenuo_token::MayAct;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+mod overrides;
+
+pub use overrides::{EnvOverride, OVERRIDE_PREFIX};
 
 /// Environment variable that names the config file when `--config` is not given.
 pub const CONFIG_ENV: &str = "ATTENUO_CONFIG";
@@ -57,6 +64,11 @@ pub struct Config {
     /// MCP servers mounted at `/mcp/{name}`.
     #[serde(default)]
     pub upstreams: Vec<UpstreamConfig>,
+    /// `[[ext_authz]]`: servers an external gateway (agentgateway's HTTP `extAuthz`) may ask
+    /// about at `/ext-authz/v1/mcp/{server}`. Empty by default, and then the route is not
+    /// mounted. Checked by [`Config::check_ext_authz`].
+    #[serde(default)]
+    pub ext_authz: Vec<attenuo_proxy::ExtAuthzRoute>,
     /// `[admin]`: the bearer token for `/admin/*`.
     #[serde(default)]
     pub admin: AdminSection,
@@ -108,6 +120,19 @@ pub struct Config {
     /// ([`crate::telemetry::TelemetrySection`]).
     #[serde(default)]
     pub telemetry: crate::telemetry::TelemetrySection,
+    /// `[logging]`: the log format and subject redaction ([`crate::logging::LoggingSection`]).
+    #[serde(default)]
+    pub logging: crate::logging::LoggingSection,
+    /// `[limits]`: the in-flight cap, request timeouts and per-caller rate limits of the main
+    /// listener. See [`LimitsSection`].
+    #[serde(default)]
+    pub limits: LimitsSection,
+    /// The file this configuration was read from: set by [`Config::load`] and
+    /// [`Config::load_with_env`], `None` for a configuration built in code or parsed from text.
+    /// Not a key of the file. `POST /admin/operators/reload` re-reads `[[admin.operators]]`
+    /// from it, and refuses with 409 `reload_unavailable` when there is none.
+    #[serde(skip)]
+    pub source_path: Option<PathBuf>,
 }
 
 /// `[authzen]`
@@ -123,7 +148,8 @@ pub struct AuthzenSection {
     pub allow_unsigned_chain: bool,
     /// Most evaluations one `POST /access/v1/evaluations` request may carry. Default 64.
     /// Larger requests are refused with 400 `batch_too_large` before anything is decided or
-    /// audited. Must be at least 1.
+    /// audited. Also the most candidate tools one page of `POST /access/v1/search/action`
+    /// evaluates, and that page's default size. Must be at least 1.
     #[serde(default = "default_max_batch")]
     pub max_batch: usize,
     /// Who gets `context.diagnostics` (the effective capabilities a call fell outside, lease
@@ -187,9 +213,11 @@ pub struct TokenSection {
     #[serde(default = "default_true")]
     pub require_actor_auth: bool,
     /// How the actor of an exchange, and the agent of a hop-0 intake, may authenticate:
-    /// `"secret"` (`[[agents]]` client credentials only), `"actor_token"` (a JWT from an
-    /// `[[actor_trust]]` issuer only) or `"either"` (default). With `require_actor_auth = true`
-    /// one accepted method is mandatory for an exchange; hop 0 always needs one.
+    /// `"secret"` (`[[agents]]` client credentials only: the client secret or a
+    /// `private_key_jwt` assertion, whichever the agent's entry holds), `"actor_token"` (a JWT
+    /// from an `[[actor_trust]]` issuer only) or `"either"` (default). With
+    /// `require_actor_auth = true` one accepted method is mandatory for an exchange; hop 0
+    /// always needs one.
     #[serde(default)]
     pub actor_auth: ActorAuth,
     /// Sender-constrained tokens (DPoP, RFC 9449; SR-24): `"off"`, `"optional"` (default) or
@@ -211,6 +239,15 @@ pub struct TokenSection {
     /// [`crate::dpop`].
     #[serde(default)]
     pub dpop_nonce: DpopNonceMode,
+    /// How far in the future a `private_key_jwt` client assertion's `exp` may be, in seconds
+    /// from the server's clock (RFC 7523 §3: the server may limit how long an assertion it
+    /// accepts lives). Default 300; between 1 and 3600.
+    #[serde(default = "default_client_assertion_max_lifetime")]
+    pub client_assertion_max_lifetime_seconds: u64,
+    /// Clock skew allowed for a client assertion's `exp`, `nbf` and `iat`, in seconds. Default
+    /// 60, the default `clock_skew_seconds` of `[[idps]]` and `[[actor_trust]]`; at most 600.
+    #[serde(default = "default_clock_skew")]
+    pub client_assertion_clock_skew_seconds: u64,
 }
 
 /// Default for `[token] dpop_max_age_seconds`.
@@ -226,6 +263,13 @@ fn default_dpop_replay_capacity() -> usize {
     DEFAULT_DPOP_REPLAY_CAPACITY
 }
 
+/// Default for `[token] client_assertion_max_lifetime_seconds`.
+pub const DEFAULT_CLIENT_ASSERTION_MAX_LIFETIME_SECONDS: u64 = 300;
+
+fn default_client_assertion_max_lifetime() -> u64 {
+    DEFAULT_CLIENT_ASSERTION_MAX_LIFETIME_SECONDS
+}
+
 impl Default for TokenSection {
     fn default() -> Self {
         Self {
@@ -235,6 +279,8 @@ impl Default for TokenSection {
             dpop_max_age_seconds: DEFAULT_DPOP_MAX_AGE_SECONDS,
             dpop_replay_capacity: DEFAULT_DPOP_REPLAY_CAPACITY,
             dpop_nonce: DpopNonceMode::default(),
+            client_assertion_max_lifetime_seconds: DEFAULT_CLIENT_ASSERTION_MAX_LIFETIME_SECONDS,
+            client_assertion_clock_skew_seconds: default_clock_skew(),
         }
     }
 }
@@ -251,6 +297,24 @@ impl TokenSection {
         }
         if self.dpop_replay_capacity == 0 {
             anyhow::bail!("[token] dpop_replay_capacity must be at least 1");
+        }
+        Ok(())
+    }
+
+    /// Startup check of the client assertion settings.
+    ///
+    /// # Errors
+    ///
+    /// When `client_assertion_max_lifetime_seconds` is outside 1..=3600 or
+    /// `client_assertion_clock_skew_seconds` is above 600.
+    pub fn check_client_assertion(&self) -> anyhow::Result<()> {
+        if !(1..=3600).contains(&self.client_assertion_max_lifetime_seconds) {
+            anyhow::bail!(
+                "[token] client_assertion_max_lifetime_seconds must be between 1 and 3600"
+            );
+        }
+        if self.client_assertion_clock_skew_seconds > 600 {
+            anyhow::bail!("[token] client_assertion_clock_skew_seconds must be at most 600");
         }
         Ok(())
     }
@@ -288,10 +352,12 @@ pub enum DpopNonceMode {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActorAuth {
-    /// `[[agents]]` client credentials (HTTP Basic or `client_id` / `client_secret`) only. An
-    /// `actor_token` is refused.
+    /// `[[agents]]` client credentials only: the client secret (HTTP Basic or `client_id` /
+    /// `client_secret`) or a `private_key_jwt` client assertion, per agent as its entry
+    /// allows. An `actor_token` is refused.
     Secret,
-    /// An `actor_token` verified against `[[actor_trust]]` only. Client credentials are refused.
+    /// An `actor_token` verified against `[[actor_trust]]` only. Client credentials of
+    /// either kind (secret or assertion) are refused.
     ActorToken,
     /// Either; when both are sent, both are checked.
     #[default]
@@ -323,6 +389,12 @@ pub struct ActorTrustConfig {
     /// JWT-SVID signing keys as a JWKS. Required with `spiffe_trust_domain`.
     #[serde(default)]
     pub spiffe_bundle_url: Option<String>,
+    /// PEM file of CA certificates trusted, for this entry's key fetches only, in addition to
+    /// the built-in web PKI roots: for a key URL whose certificate a private CA issued. Read
+    /// once at start; a file that is missing, unreadable or holds no certificate refuses to
+    /// start. Verification and the hostname check are unchanged. See [`IdpConfig::ca_pem_path`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_pem_path: Option<PathBuf>,
     /// `aud` the token must carry (string, or an array containing it). Pick a value that no
     /// other relying party uses, such as attenuo's own URL.
     pub audience: String,
@@ -392,7 +464,7 @@ fn default_true() -> bool {
     true
 }
 
-/// One `[[peps]]` entry: `{ id, secret_sha256 }`, as for [`AgentConfig`].
+/// One `[[peps]]` entry: `id` with `secret_sha256`, `jwks` or both, as for [`AgentConfig`].
 pub type PepConfig = AgentConfig;
 
 /// `[server]`
@@ -409,6 +481,13 @@ pub struct ServerSection {
     /// (with an optional port) is accepted.
     #[serde(default)]
     pub public_url: Option<String>,
+    /// Accept an `http://` `public_url` whose host is not a loopback name. Default `false`: the
+    /// server has no TLS of its own, so such a URL means tokens and admin bearers cross the
+    /// network in cleartext, and the server refuses to start (S-9). Terminate TLS at a reverse
+    /// proxy and set an `https://` `public_url` instead. Set this only when the plain-HTTP hop
+    /// is on a network you trust; a warning is still logged at startup.
+    #[serde(default)]
+    pub allow_insecure_http: bool,
 }
 
 impl ServerSection {
@@ -418,8 +497,14 @@ impl ServerSection {
     ///
     /// # Errors
     ///
+    /// An `http://` `public_url` must name a loopback host (`localhost`, `127.0.0.0/8`, `[::1]`)
+    /// unless `allow_insecure_http` is set (S-9).
+    ///
+    /// # Errors
+    ///
     /// When `public_url` does not start with `https://` or `http://`, has no host, or contains
-    /// whitespace, a control character, `?` or `#`; or when it is unset and `listen` is not a
+    /// whitespace, a control character, `?` or `#`; when it is `http://` with a host that is not
+    /// loopback and `allow_insecure_http` is not set; or when it is unset and `listen` is not a
     /// loopback address.
     pub fn check_public_url(&self) -> anyhow::Result<()> {
         match self.public_url.as_deref() {
@@ -439,6 +524,23 @@ impl ServerSection {
                     anyhow::bail!(
                         "[server] public_url = {url:?} must be a base URL such as \
                          https://attenuo.example.com (a host, no query or fragment)"
+                    );
+                }
+                if url.starts_with("http://") && !url_host_is_loopback(url) {
+                    if !self.allow_insecure_http {
+                        anyhow::bail!(
+                            "[server] public_url = {url:?} is plain http:// on a host that is not \
+                             loopback. The server has no TLS of its own, so tokens and the admin \
+                             bearer would cross the network in cleartext. Terminate TLS at a \
+                             reverse proxy and set an https:// public_url, or set \
+                             [server] allow_insecure_http = true if this hop is on a network you \
+                             trust."
+                        );
+                    }
+                    tracing::warn!(
+                        public_url = %url,
+                        "[server] allow_insecure_http = true: public_url is plain http:// off \
+                         loopback, so tokens cross the network in cleartext"
                     );
                 }
                 Ok(())
@@ -473,11 +575,36 @@ pub fn is_loopback_host(host: &str) -> bool {
     port_ok && (name.eq_ignore_ascii_case("localhost") || name == "127.0.0.1" || name == "[::1]")
 }
 
+/// Does the absolute URL `url` name a loopback host: `localhost`, an address in `127.0.0.0/8`
+/// or `[::1]`? `false` for anything that does not parse as a URL with a host.
+///
+/// Used where plain `http://` is accepted only on the machine itself: `[server] public_url`
+/// (S-9) and the JWKS and SPIFFE bundle fetches (S-8). `localhost` passes on its name; the
+/// key-fetch client connects it to `127.0.0.1` or `[::1]` itself rather than ask the system
+/// resolver, which could send it to DNS (`idp::jwks::fetch_client`, SR-107). Nothing is
+/// fetched from `public_url`.
+pub fn url_host_is_loopback(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    // The parser lowercases domain names and prints IPv6 addresses in brackets.
+    host == "localhost"
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
 impl Default for ServerSection {
     fn default() -> Self {
         Self {
             listen: default_listen(),
             public_url: None,
+            allow_insecure_http: false,
         }
     }
 }
@@ -665,6 +792,25 @@ pub struct AuditSection {
     /// audit checkpoints above. Ignored for `":memory:"`.
     #[serde(default = "default_wal_checkpoint_seconds")]
     pub wal_checkpoint_seconds: u64,
+    /// Most audit appends that may wait for the writer thread at once. One more fails at once,
+    /// and its decision is denied with `audit_error` (metric
+    /// `audit_append_shed_total{cause="queue_full"}`). Default 1024, between 16 and 1000000.
+    #[serde(default = "default_append_queue_max")]
+    pub append_queue_max: u64,
+    /// How long, in seconds, an audit append waits for the writer thread before it fails and
+    /// its decision is denied with `audit_error` (metric
+    /// `audit_append_shed_total{cause="timeout"}`), so a hung disk denies calls instead of
+    /// piling up blocked threads. Default 10, between 1 and 300.
+    #[serde(default = "default_append_timeout_seconds")]
+    pub append_timeout_seconds: u64,
+    /// Start even when `sqlite_path`'s directory is on a network filesystem (NFS, SMB/CIFS,
+    /// 9p, CephFS, Lustre, AFS, ...). Default `false`: the server refuses to start there,
+    /// because SQLite in WAL mode needs every process on one host and file locks there may
+    /// not keep a second writer out (multi-replica design, step 2). Set it only when one host
+    /// ever mounts the filesystem and its locking is known to work; the server then logs a
+    /// warning at every start. Ignored for `":memory:"`.
+    #[serde(default)]
+    pub allow_network_filesystem: bool,
     /// `[audit.sink]`: ship every signed checkpoint off the host as it is created (SR-21).
     /// Unset by default.
     #[serde(default)]
@@ -741,8 +887,17 @@ pub struct SinkSection {
     #[serde(default)]
     pub secret_access_key: Option<String>,
     /// s3: session token for temporary credentials. Falls back to `AWS_SESSION_TOKEN`.
+    /// Like the keys, read once at start: when the temporary credentials expire, every PUT is
+    /// refused until the server is restarted with new ones.
     #[serde(default)]
     pub session_token: Option<String>,
+    /// webhook and s3: PEM file of CA certificates trusted, for the sink's requests only, in
+    /// addition to the built-in web PKI roots: for a receiver or an S3-compatible store whose
+    /// certificate a private CA issued. Read once at start; a file that is missing, unreadable
+    /// or holds no certificate refuses to start. Verification and the hostname check are
+    /// unchanged. As `[[idps]] ca_pem_path`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_pem_path: Option<PathBuf>,
     /// Checkpoints waiting to be delivered, at most. When full, the oldest queued one is
     /// dropped (a later checkpoint covers every entry an earlier one does) and
     /// `attenuo_audit_sink_dropped_total` counts it. Default 1024.
@@ -798,6 +953,7 @@ impl SinkSection {
             access_key_id: None,
             secret_access_key: None,
             session_token: None,
+            ca_pem_path: None,
             queue_capacity: default_sink_queue_capacity(),
             max_lag_seconds: default_sink_max_lag_seconds(),
             fail_readiness: false,
@@ -822,6 +978,7 @@ impl SinkSection {
             set("bearer_token", self.bearer_token.is_some()),
         ];
         let file = [set("path", self.path.is_some())];
+        let https = [set("ca_pem_path", self.ca_pem_path.is_some())];
         let s3 = [
             set("endpoint", self.endpoint.is_some()),
             set("bucket", self.bucket.is_some()),
@@ -834,7 +991,13 @@ impl SinkSection {
         let kind = self.kind;
         let foreign: Vec<&str> = match kind {
             SinkKind::Webhook => file.iter().chain(&s3).flatten().copied().collect(),
-            SinkKind::File => webhook.iter().chain(&s3).flatten().copied().collect(),
+            SinkKind::File => webhook
+                .iter()
+                .chain(&s3)
+                .chain(&https)
+                .flatten()
+                .copied()
+                .collect(),
             SinkKind::S3 => webhook.iter().chain(&file).flatten().copied().collect(),
         };
         if !foreign.is_empty() {
@@ -879,6 +1042,11 @@ impl SinkSection {
                          (requests are path-style: <endpoint>/<bucket>/<key>)"
                     );
                 }
+                // As the HTTP client reads it (SR-119): `http://` has no host, and the
+                // request URL `http:///<bucket>/<key>` would take the bucket as its host; a
+                // backslash is a `/` to the URL parser, so a path the check above missed.
+                crate::sink::check_s3_endpoint(ep)
+                    .map_err(|e| anyhow::anyhow!("[audit.sink] endpoint = {ep:?} {e}"))?;
                 let bucket = self.bucket.as_deref().unwrap_or_default();
                 if bucket.is_empty() || bucket.contains('/') {
                     anyhow::bail!("[audit.sink] bucket = {bucket:?} is not a bucket name");
@@ -908,8 +1076,61 @@ impl Default for AuditSection {
             checkpoint_interval_seconds: default_checkpoint_interval_seconds(),
             durability: attenuo_audit::Durability::default(),
             wal_checkpoint_seconds: default_wal_checkpoint_seconds(),
+            append_queue_max: default_append_queue_max(),
+            append_timeout_seconds: default_append_timeout_seconds(),
+            allow_network_filesystem: false,
             sink: None,
         }
+    }
+}
+
+/// Smallest `[audit] append_queue_max`.
+pub const MIN_APPEND_QUEUE_MAX: u64 = 16;
+/// Largest `[audit] append_queue_max`.
+pub const MAX_APPEND_QUEUE_MAX: u64 = 1_000_000;
+/// Largest `[audit] append_timeout_seconds`.
+pub const MAX_APPEND_TIMEOUT_SECONDS: u64 = 300;
+
+fn default_append_queue_max() -> u64 {
+    attenuo_audit::DEFAULT_APPEND_QUEUE as u64
+}
+
+fn default_append_timeout_seconds() -> u64 {
+    attenuo_audit::DEFAULT_APPEND_TIMEOUT.as_secs()
+}
+
+impl AuditSection {
+    /// The bounds on audit appends waiting for the writer: (`append_queue_max`,
+    /// `append_timeout_seconds`). Checked at startup.
+    ///
+    /// # Errors
+    ///
+    /// When `append_queue_max` is outside `MIN_APPEND_QUEUE_MAX` to `MAX_APPEND_QUEUE_MAX`
+    /// or `append_timeout_seconds` outside 1 to `MAX_APPEND_TIMEOUT_SECONDS`; the message
+    /// names the first.
+    pub fn append_limits(&self) -> anyhow::Result<(usize, std::time::Duration)> {
+        for (name, value, min, max) in [
+            (
+                "append_queue_max",
+                self.append_queue_max,
+                MIN_APPEND_QUEUE_MAX,
+                MAX_APPEND_QUEUE_MAX,
+            ),
+            (
+                "append_timeout_seconds",
+                self.append_timeout_seconds,
+                1,
+                MAX_APPEND_TIMEOUT_SECONDS,
+            ),
+        ] {
+            if !(min..=max).contains(&value) {
+                anyhow::bail!("[audit] {name} must be between {min} and {max}, not {value}");
+            }
+        }
+        Ok((
+            usize::try_from(self.append_queue_max)?,
+            std::time::Duration::from_secs(self.append_timeout_seconds),
+        ))
     }
 }
 
@@ -1439,14 +1660,187 @@ fn seconds_or_off(seconds: u64) -> Option<time::Duration> {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AdminSection {
-    /// Static bearer token for `/admin/*`. When unset, every admin endpoint answers 403.
-    /// v0 only: replace with real operator authentication before exposing the server.
+    /// Static bearer token for `/admin/*`: the operator `admin`, role `admin`, recorded as
+    /// `urn:attenuo:admin` (ADR-0016). With neither this nor [`operators`](Self::operators),
+    /// every admin endpoint answers 403.
     ///
-    /// Outside a loopback `listen` address the server refuses to start when this is missing,
-    /// shorter than [`MIN_ADMIN_TOKEN_LEN`] bytes or a known placeholder; on loopback it only
-    /// warns. Generate one with `openssl rand -hex 32`, or set [`ADMIN_TOKEN_ENV`].
+    /// Outside a loopback `listen` address the server refuses to start when no admin
+    /// credential is configured, or when this is set and shorter than [`MIN_ADMIN_TOKEN_LEN`]
+    /// bytes or a known placeholder; on loopback it only warns. Generate one with `openssl rand -hex 32`, or set [`ADMIN_TOKEN_ENV`].
     #[serde(default)]
     pub token: Option<String>,
+    /// Serve the admin API (`/admin/*`) on a listener of its own at this address, and not on
+    /// `[server] listen` (S-1). Unset by default: the admin API is then served on the main
+    /// listener, which the server accepts only when `[server] listen` is a loopback address or
+    /// [`serve_on_main_listener`](Self::serve_on_main_listener) is set. With `listen` set, the
+    /// main listener answers `/admin/*` as it answers any unknown path. The listener has the
+    /// same admin bearer, request logging and shutdown as the main one; `/healthz` and
+    /// `/readyz` stay on the main listener. Suggested: `127.0.0.1:9102`.
+    #[serde(default)]
+    pub listen: Option<SocketAddr>,
+    /// Serve the admin API on `[server] listen` although that address is not loopback. Default
+    /// `false`: without `listen` and without this, the server refuses to start off loopback, so
+    /// that revoke, reload, approve, export and the dev root mint are not reachable on the port
+    /// agents use unless an operator said so. Set it only when something in front of the
+    /// server keeps `/admin/*` away from agents and the internet (a reverse proxy that does not
+    /// forward `/admin/`, or a demo container that binds `0.0.0.0` behind a loopback-only
+    /// published port); a warning is logged at startup. Cannot be combined with `listen`.
+    #[serde(default)]
+    pub serve_on_main_listener: bool,
+    /// `[[admin.operators]]`: named admin credentials with a role (ADR-0016), next to
+    /// [`token`](Self::token), which stays the operator `admin` with role `admin`. Read from
+    /// the file only (an array of tables cannot be set by an environment override), at
+    /// startup and again by `POST /admin/operators/reload`, which re-reads this array alone
+    /// and swaps it in without a restart. Checked by [`Config::check_admin_operators`].
+    #[serde(default)]
+    pub operators: Vec<AdminOperator>,
+}
+
+/// One `[[admin.operators]]` entry: a named admin credential (ADR-0016).
+///
+/// ```toml
+/// [[admin.operators]]
+/// name = "alice"
+/// token_sha256 = "<64 lowercase hex characters>"
+/// role = "operator"
+/// expires_at = "2026-12-31T23:59:59Z"   # optional
+/// ```
+///
+/// `attenuo admin operator new --name alice --role operator` generates a token and prints
+/// the entry. The file holds only the token's digest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminOperator {
+    /// Unique, `[a-z0-9_-]{1,64}`, never `admin` (the name of `[admin] token`). Recorded as
+    /// the actor of the operator's admin actions (`urn:attenuo:admin:<name>`).
+    pub name: String,
+    /// SHA-256 of the operator's bearer token, 64 lowercase hex characters.
+    pub token_sha256: String,
+    /// `viewer`, `operator` or `admin` ([`crate::operators::AdminRole`]).
+    pub role: crate::operators::AdminRole,
+    /// When the token stops authenticating: an RFC 3339 time with an offset
+    /// (`"2026-12-31T23:59:59Z"`, quoted or as a TOML offset date-time). From then on the
+    /// token is answered 401 `admin_credential_expired`. Optional: without it the token is
+    /// valid until the entry is removed. A time that does not parse refuses the file; an
+    /// entry that has already expired is accepted with a warning naming it.
+    #[serde(
+        default,
+        with = "rfc3339_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub expires_at: Option<time::OffsetDateTime>,
+}
+
+/// `expires_at` of an `[[admin.operators]]` entry: an RFC 3339 time with an offset, written
+/// as a string or as a TOML offset date-time; serialized as an RFC 3339 string.
+mod rfc3339_option {
+    use serde::de::Error as _;
+    use serde::{Deserialize, Deserializer, Serializer};
+    use time::format_description::well_known::Rfc3339;
+    use time::OffsetDateTime;
+
+    pub(super) fn serialize<S: Serializer>(
+        v: &Option<OffsetDateTime>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        match v {
+            Some(t) => s.serialize_str(&t.format(&Rfc3339).map_err(serde::ser::Error::custom)?),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<Option<OffsetDateTime>, D::Error> {
+        let text = match toml::Value::deserialize(d)? {
+            toml::Value::String(s) => s,
+            toml::Value::Datetime(dt) => dt.to_string(),
+            other => {
+                return Err(D::Error::custom(format!(
+                    "expires_at must be an RFC 3339 time with an offset (like \
+                     \"2026-12-31T23:59:59Z\"), not a {}",
+                    other.type_str()
+                )))
+            }
+        };
+        OffsetDateTime::parse(&text, &Rfc3339)
+            .map(Some)
+            .map_err(|_| {
+                D::Error::custom(format!(
+                    "expires_at `{text}` is not an RFC 3339 time with an offset (like \
+                     2026-12-31T23:59:59Z)"
+                ))
+            })
+    }
+}
+
+impl AdminSection {
+    /// Where the admin API is served: `listen` when set, else `server_listen`.
+    pub fn api_listen(&self, server_listen: SocketAddr) -> SocketAddr {
+        self.listen.unwrap_or(server_listen)
+    }
+
+    /// Whether `/admin/*` is mounted on the main listener (`listen` unset).
+    pub fn on_main_listener(&self) -> bool {
+        self.listen.is_none()
+    }
+
+    /// Startup check (S-1): the admin API is served off a loopback `[server] listen` only with
+    /// `serve_on_main_listener = true`; `listen` and `serve_on_main_listener` exclude each
+    /// other, and `listen` must differ from `server_listen`. Logs the startup warnings.
+    ///
+    /// # Errors
+    ///
+    /// When `listen` is unset, `server_listen` is not loopback and `serve_on_main_listener` is
+    /// not set; when both `listen` and `serve_on_main_listener` are set; or when `listen` is
+    /// `server_listen` (a fixed port, not 0).
+    pub fn check_listen(&self, server_listen: SocketAddr) -> anyhow::Result<()> {
+        match self.listen {
+            Some(listen) => {
+                if self.serve_on_main_listener {
+                    anyhow::bail!(
+                        "[admin] listen = {listen} and [admin] serve_on_main_listener = true \
+                         contradict each other: listen moves the admin API off the main \
+                         listener. Keep one of the two."
+                    );
+                }
+                if listen == server_listen && listen.port() != 0 {
+                    anyhow::bail!(
+                        "[admin] listen = {listen} is [server] listen too: give the admin API \
+                         a port of its own (for example 127.0.0.1:9102)"
+                    );
+                }
+                if !listen.ip().is_loopback() {
+                    tracing::warn!(
+                        %listen,
+                        "[admin] listener is not on loopback: restrict it with network policy \
+                         to the hosts operators use"
+                    );
+                }
+                Ok(())
+            }
+            None if server_listen.ip().is_loopback() => Ok(()),
+            None if self.serve_on_main_listener => {
+                tracing::warn!(
+                    listen = %server_listen,
+                    "!!! [admin] serve_on_main_listener = true: /admin/* (revoke, reload, \
+                     approve, export) is served on [server] listen, which is not loopback. \
+                     Keep /admin/ away from agents and the internet in front of the server, or \
+                     set [admin] listen. !!!"
+                );
+                Ok(())
+            }
+            None => anyhow::bail!(
+                "[server] listen = {server_listen} is not a loopback address and the admin API \
+                 (/admin/*: revoke, reload, approve, export) would be served on it, next to the \
+                 agent-facing routes. Set [admin] listen to an address of its own (for example \
+                 127.0.0.1:9102) and point the CLI's --server, or the SDKs' AdminClient, at it \
+                 for admin commands. To keep the admin API on the main listener (only when \
+                 something in front of the server keeps /admin/ away from agents), set [admin] \
+                 serve_on_main_listener = true."
+            ),
+        }
+    }
 }
 
 /// `[dev]`: development-only switches. Everything here defaults to off.
@@ -1454,9 +1848,65 @@ pub struct AdminSection {
 #[serde(deny_unknown_fields)]
 pub struct DevSection {
     /// Mount `POST /admin/root-token`, which mints hop-0 tokens for a user nobody verified.
-    /// Default `false`; when `true` the server logs a warning at startup.
+    /// Default `false`; when `true` the server logs a warning at startup, and refuses to start
+    /// when the admin API's listener (`[admin] listen` when set, else `[server] listen`) is not
+    /// a loopback address (S-3) unless
+    /// [`allow_root_mint_off_loopback`](Self::allow_root_mint_off_loopback) is also set.
     #[serde(default)]
     pub allow_root_mint: bool,
+    /// Demo containers only: accept `allow_root_mint` although the admin API's listener is not
+    /// a loopback address. Meant for a container that must bind `0.0.0.0` inside its own network
+    /// namespace while the host publishes the port on loopback only (the docker-compose demo).
+    /// Never set it in a deployment. Default `false`.
+    #[serde(default)]
+    pub allow_root_mint_off_loopback: bool,
+}
+
+impl DevSection {
+    /// Startup check (S-3): the dev root mint is refused when `listen` (the listener the admin
+    /// API, and so the route, is mounted on: `[admin] listen` when set, else `[server] listen`,
+    /// see [`AdminSection::api_listen`]) is not a loopback address, unless
+    /// `allow_root_mint_off_loopback` is set. Logs the startup warnings.
+    ///
+    /// # Errors
+    ///
+    /// When `allow_root_mint` is set, `listen` is not loopback and
+    /// `allow_root_mint_off_loopback` is not set.
+    pub fn check(&self, listen: SocketAddr) -> anyhow::Result<()> {
+        if !self.allow_root_mint {
+            if self.allow_root_mint_off_loopback {
+                tracing::warn!(
+                    "[dev] allow_root_mint_off_loopback = true has no effect without \
+                     allow_root_mint = true"
+                );
+            }
+            return Ok(());
+        }
+        if !listen.ip().is_loopback() {
+            if !self.allow_root_mint_off_loopback {
+                anyhow::bail!(
+                    "[dev] allow_root_mint = true and the admin API's listener ({listen}: \
+                     [admin] listen when set, else [server] listen) is not a loopback address. \
+                     POST /admin/root-token mints root tokens for users nobody \
+                     has verified, so it is refused off loopback. Mint root tokens from an OIDC \
+                     ID token or ID-JAG instead ([[idps]]), or bind that listener to 127.0.0.1 \
+                     for local development. (A demo container that binds 0.0.0.0 behind a \
+                     loopback-only published port may set [dev] \
+                     allow_root_mint_off_loopback = true; never in a deployment.)"
+                );
+            }
+            tracing::warn!(
+                %listen,
+                "!!! [dev] allow_root_mint_off_loopback = true: the unverified root mint is \
+                 served on a listener that is not loopback. Demo containers only. !!!"
+            );
+        }
+        tracing::warn!(
+            "!!! [dev] allow_root_mint = true: POST /admin/root-token mints root tokens for \
+             users nobody has verified. Development only; never enable this in a deployment. !!!"
+        );
+        Ok(())
+    }
 }
 
 /// `[metrics]`: the Prometheus endpoint, on its own listener so it is never reachable on the
@@ -1545,8 +1995,9 @@ pub struct AdminUiSection {
     /// Mount the routes that change state (`POST /admin/leases/{id}/revoke`,
     /// `POST /admin/policies/reload`, `POST /admin/approvals/{id}` and
     /// `POST /admin/budgets/refund`) on the console listener. Default `false`, so read-only is
-    /// enforced by the server and not only by the page: those paths answer 404 there. The main
-    /// listener keeps every admin route whatever this says.
+    /// enforced by the server and not only by the page: those paths answer 404 there. The admin
+    /// API's own listener (`[admin] listen`, else the main listener) keeps every admin route
+    /// whatever this says.
     #[serde(default)]
     pub allow_write: bool,
 }
@@ -1649,6 +2100,34 @@ pub struct ProxySection {
     /// hidden tool that is called is decided and audited as usual.
     #[serde(default)]
     pub list_filter: attenuo_proxy::ListFilterMode,
+    /// How long, in seconds, the proxy waits for a TCP (and TLS) connection to an upstream.
+    /// A connection not made in time answers `502` `upstream_unreachable`: nothing was sent,
+    /// so a retry is safe. Default 5, between 1 and 300.
+    #[serde(default = "default_upstream_connect_timeout_seconds")]
+    pub upstream_connect_timeout_seconds: u64,
+    /// How long, in seconds, the proxy waits for an upstream's response headers, and for the
+    /// rest of a body it buffers (a JSON answer it filters or labels), counted from sending
+    /// the request. Past it the proxy answers `504` `upstream_timeout`: the upstream may have
+    /// acted on the request. A streamed body (SSE, the `GET` listen stream, a body relayed as
+    /// it arrives) is not cut once its headers are in; `stream_recheck_seconds` governs those.
+    /// Default 30, between 1 and 3600. Raise it for tools that answer in JSON after running
+    /// for longer.
+    #[serde(default = "default_upstream_response_timeout_seconds")]
+    pub upstream_response_timeout_seconds: u64,
+}
+
+/// Largest `[proxy] upstream_connect_timeout_seconds`.
+pub const MAX_UPSTREAM_CONNECT_TIMEOUT_SECONDS: u64 = 300;
+
+/// Largest `[proxy] upstream_response_timeout_seconds`: an hour.
+pub const MAX_UPSTREAM_RESPONSE_TIMEOUT_SECONDS: u64 = 3_600;
+
+fn default_upstream_connect_timeout_seconds() -> u64 {
+    attenuo_proxy::config::DEFAULT_UPSTREAM_CONNECT_TIMEOUT.as_secs()
+}
+
+fn default_upstream_response_timeout_seconds() -> u64 {
+    attenuo_proxy::config::DEFAULT_UPSTREAM_RESPONSE_TIMEOUT.as_secs()
 }
 
 /// Largest `[proxy] record_window_seconds`: an hour.
@@ -1681,6 +2160,8 @@ impl Default for ProxySection {
             record_window_seconds: default_record_window_seconds(),
             record_window_max_keys: default_record_window_max_keys(),
             list_filter: attenuo_proxy::ListFilterMode::Capabilities,
+            upstream_connect_timeout_seconds: default_upstream_connect_timeout_seconds(),
+            upstream_response_timeout_seconds: default_upstream_response_timeout_seconds(),
         }
     }
 }
@@ -1782,11 +2263,46 @@ impl ProxySection {
         ))
     }
 
+    /// The upstream deadlines: (`upstream_connect_timeout_seconds`,
+    /// `upstream_response_timeout_seconds`). Checked at startup.
+    ///
+    /// # Errors
+    ///
+    /// When `upstream_connect_timeout_seconds` is outside 1 to
+    /// `MAX_UPSTREAM_CONNECT_TIMEOUT_SECONDS` or `upstream_response_timeout_seconds` outside 1
+    /// to `MAX_UPSTREAM_RESPONSE_TIMEOUT_SECONDS`; the message names the first.
+    pub fn upstream_timeouts(&self) -> anyhow::Result<(std::time::Duration, std::time::Duration)> {
+        for (name, value, max) in [
+            (
+                "upstream_connect_timeout_seconds",
+                self.upstream_connect_timeout_seconds,
+                MAX_UPSTREAM_CONNECT_TIMEOUT_SECONDS,
+            ),
+            (
+                "upstream_response_timeout_seconds",
+                self.upstream_response_timeout_seconds,
+                MAX_UPSTREAM_RESPONSE_TIMEOUT_SECONDS,
+            ),
+        ] {
+            if !(1..=max).contains(&value) {
+                anyhow::bail!("[proxy] {name} must be between 1 and {max}, not {value}");
+            }
+        }
+        Ok((
+            std::time::Duration::from_secs(self.upstream_connect_timeout_seconds),
+            std::time::Duration::from_secs(self.upstream_response_timeout_seconds),
+        ))
+    }
+
     /// Apply this section to a proxy configuration.
     pub fn apply(&self, config: attenuo_proxy::ProxyConfig) -> attenuo_proxy::ProxyConfig {
         let (window, max_keys) = self.record_window().unwrap_or((
             attenuo_proxy::records::DEFAULT_RECORD_WINDOW,
             attenuo_proxy::records::DEFAULT_RECORD_WINDOW_MAX_KEYS,
+        ));
+        let (connect, response) = self.upstream_timeouts().unwrap_or((
+            attenuo_proxy::config::DEFAULT_UPSTREAM_CONNECT_TIMEOUT,
+            attenuo_proxy::config::DEFAULT_UPSTREAM_RESPONSE_TIMEOUT,
         ));
         config
             .with_stream_recheck(
@@ -1803,6 +2319,200 @@ impl ProxySection {
             .with_max_sessions_per_principal(self.max_sessions_per_principal)
             .with_record_window(window, max_keys)
             .with_list_filter(self.list_filter)
+            .with_upstream_timeouts(connect, response)
+    }
+}
+
+/// `[limits]`: basic protection of one server process against too much work at once
+/// (audit finding S-4). Every figure is per process: with one replica, per server.
+///
+/// - `max_in_flight` caps the requests of the main listener being handled at once; one more
+///   is answered `503` with `Retry-After` at once instead of queueing. `/healthz` and `/readyz`
+///   are never refused by it, and the `[metrics]`, `[admin] listen` and `[admin_ui]` listeners
+///   are not counted. A request counts until its answer starts: a streamed MCP answer (SSE,
+///   the `GET` listen stream) stops counting once its headers are sent.
+/// - `header_read_timeout_seconds` bounds the wait for a request's headers on every listener,
+///   the idle time of a kept-alive connection included; past it the connection is closed.
+/// - `request_body_timeout_seconds` bounds the read of a request body, from the moment its
+///   headers are in; past it the answer is `408` (`400` with the JSON-RPC shape on `/mcp`).
+/// - `request_timeout_seconds` bounds the time to an answer of every route of the main
+///   listener except `/mcp/{server}` (bounded by the `[proxy]` upstream deadlines, and whose
+///   streams must stay open) and `/admin/*` (an audit verify or export of a large log may take
+///   longer); past it the answer is `503` with `Retry-After`.
+/// - `token_requests_per_minute`, `token_unauthenticated_requests_per_minute`,
+///   `mcp_requests_per_minute` and `authzen_search_requests_per_minute` are per-caller
+///   fixed-window rate limits, off (0) by default: `POST /token` per authenticated agent,
+///   `POST /token` requests that authenticated no agent per peer address, `/mcp/{server}` per
+///   run (the chain's root lease), and `POST /access/v1/search/action` per run, in a table of
+///   its own. Over the limit the answer is `429` with `Retry-After`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LimitsSection {
+    /// Most requests the main listener handles at once; one more gets `503` `overloaded`.
+    /// 0 turns the cap off. Default 1024, at most 1000000.
+    #[serde(default = "default_max_in_flight")]
+    pub max_in_flight: u64,
+    /// How long, in seconds, a connection may take to send a request's headers, or stay idle
+    /// between requests. Default 30, between 1 and 300.
+    #[serde(default = "default_header_read_timeout_seconds")]
+    pub header_read_timeout_seconds: u64,
+    /// How long, in seconds, a request body may take to arrive once the headers are in.
+    /// Default 30, between 1 and 3600.
+    #[serde(default = "default_request_body_timeout_seconds")]
+    pub request_body_timeout_seconds: u64,
+    /// How long, in seconds, a route other than `/mcp/{server}` and `/admin/*` may take to
+    /// answer. Default 60, between 1 and 3600.
+    #[serde(default = "default_request_timeout_seconds")]
+    pub request_timeout_seconds: u64,
+    /// `POST /token` requests per minute per authenticated agent (client credentials or actor
+    /// token). 0 (the default) turns it off; at most 1000000.
+    #[serde(default)]
+    pub token_requests_per_minute: u64,
+    /// `POST /token` requests per minute per peer address (IPv6 by /64) that authenticated no
+    /// agent: refused before authentication, failed it, or (with `[token] require_actor_auth =
+    /// false`) sent no credentials. Once a peer has used them up, every `POST /token` from it
+    /// is refused until the minute ends. 0 (the default) turns it off; at most 1000000.
+    #[serde(default)]
+    pub token_unauthenticated_requests_per_minute: u64,
+    /// Requests per minute to `/mcp/{server}` per run (the delegation chain's root lease),
+    /// counted once the token and its DPoP proof have verified. 0 (the default) turns it off;
+    /// at most 1000000.
+    #[serde(default)]
+    pub mcp_requests_per_minute: u64,
+    /// AuthZEN action searches (`POST /access/v1/search/action`) per minute per run (the
+    /// chain's root lease, from the bearer token or a PEP's issued unsigned chain), counted
+    /// once the caller has authenticated and before any candidate is evaluated. Its own table:
+    /// searches do not use up `mcp_requests_per_minute`, nor the reverse. Evaluations are not
+    /// counted (they are audited). 0 (the default) turns it off; at most 1000000.
+    #[serde(default)]
+    pub authzen_search_requests_per_minute: u64,
+    /// Most callers each rate limit tracks at once. Callers whose minute has ended are dropped
+    /// first; when every tracked caller is inside its minute, a new caller is refused (`429`)
+    /// until one ends. Default 10000, between 100 and 1000000.
+    #[serde(default = "default_rate_limit_max_keys")]
+    pub rate_limit_max_keys: u64,
+}
+
+/// Default `[limits] max_in_flight`.
+pub const DEFAULT_MAX_IN_FLIGHT: u64 = 1_024;
+/// Default `[limits] header_read_timeout_seconds` (hyper's own default).
+pub const DEFAULT_HEADER_READ_TIMEOUT_SECONDS: u64 = 30;
+/// Default `[limits] request_body_timeout_seconds`.
+pub const DEFAULT_REQUEST_BODY_TIMEOUT_SECONDS: u64 = 30;
+/// Default `[limits] request_timeout_seconds`.
+pub const DEFAULT_REQUEST_TIMEOUT_SECONDS: u64 = 60;
+/// Default `[limits] rate_limit_max_keys`.
+pub const DEFAULT_RATE_LIMIT_MAX_KEYS: u64 = 10_000;
+/// Largest `[limits] max_in_flight` and largest per-minute rate.
+pub const MAX_LIMITS_COUNT: u64 = 1_000_000;
+
+fn default_max_in_flight() -> u64 {
+    DEFAULT_MAX_IN_FLIGHT
+}
+
+fn default_header_read_timeout_seconds() -> u64 {
+    DEFAULT_HEADER_READ_TIMEOUT_SECONDS
+}
+
+fn default_request_body_timeout_seconds() -> u64 {
+    DEFAULT_REQUEST_BODY_TIMEOUT_SECONDS
+}
+
+fn default_request_timeout_seconds() -> u64 {
+    DEFAULT_REQUEST_TIMEOUT_SECONDS
+}
+
+fn default_rate_limit_max_keys() -> u64 {
+    DEFAULT_RATE_LIMIT_MAX_KEYS
+}
+
+impl Default for LimitsSection {
+    fn default() -> Self {
+        Self {
+            max_in_flight: DEFAULT_MAX_IN_FLIGHT,
+            header_read_timeout_seconds: DEFAULT_HEADER_READ_TIMEOUT_SECONDS,
+            request_body_timeout_seconds: DEFAULT_REQUEST_BODY_TIMEOUT_SECONDS,
+            request_timeout_seconds: DEFAULT_REQUEST_TIMEOUT_SECONDS,
+            token_requests_per_minute: 0,
+            token_unauthenticated_requests_per_minute: 0,
+            mcp_requests_per_minute: 0,
+            authzen_search_requests_per_minute: 0,
+            rate_limit_max_keys: DEFAULT_RATE_LIMIT_MAX_KEYS,
+        }
+    }
+}
+
+impl LimitsSection {
+    /// Check every key's range. Called at startup.
+    ///
+    /// # Errors
+    ///
+    /// When a timeout is outside its range (`header_read_timeout_seconds` 1 to 300, the other
+    /// two 1 to 3600), `max_in_flight` or a rate is over 1000000, or `rate_limit_max_keys` is
+    /// outside 100 to 1000000; the message names the first.
+    pub fn check(&self) -> anyhow::Result<()> {
+        for (name, value, min, max) in [
+            ("max_in_flight", self.max_in_flight, 0, MAX_LIMITS_COUNT),
+            (
+                "header_read_timeout_seconds",
+                self.header_read_timeout_seconds,
+                1,
+                300,
+            ),
+            (
+                "request_body_timeout_seconds",
+                self.request_body_timeout_seconds,
+                1,
+                3_600,
+            ),
+            (
+                "request_timeout_seconds",
+                self.request_timeout_seconds,
+                1,
+                3_600,
+            ),
+            (
+                "token_requests_per_minute",
+                self.token_requests_per_minute,
+                0,
+                MAX_LIMITS_COUNT,
+            ),
+            (
+                "token_unauthenticated_requests_per_minute",
+                self.token_unauthenticated_requests_per_minute,
+                0,
+                MAX_LIMITS_COUNT,
+            ),
+            (
+                "mcp_requests_per_minute",
+                self.mcp_requests_per_minute,
+                0,
+                MAX_LIMITS_COUNT,
+            ),
+            (
+                "authzen_search_requests_per_minute",
+                self.authzen_search_requests_per_minute,
+                0,
+                MAX_LIMITS_COUNT,
+            ),
+            (
+                "rate_limit_max_keys",
+                self.rate_limit_max_keys,
+                100,
+                MAX_LIMITS_COUNT,
+            ),
+        ] {
+            if !(min..=max).contains(&value) {
+                anyhow::bail!("[limits] {name} must be between {min} and {max}, not {value}");
+            }
+        }
+        Ok(())
+    }
+
+    /// `header_read_timeout_seconds` as a duration (clamped into its range, so an unchecked
+    /// section still gives a usable value).
+    pub fn header_read_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.header_read_timeout_seconds.clamp(1, 300))
     }
 }
 
@@ -1826,6 +2536,16 @@ pub struct IdpConfig {
     /// JWKS location. When absent, `jwks_uri` from `<issuer>/.well-known/openid-configuration`.
     #[serde(default)]
     pub jwks_url: Option<String>,
+    /// PEM file of CA certificates trusted, for this entry's key fetches only (the discovery
+    /// document, the JWKS, and the refetch on an unknown `kid`), in addition to the built-in
+    /// web PKI roots: for an IdP whose certificate a private CA issued. Never instead of
+    /// them, and never for another entry. Certificate verification and the hostname check are
+    /// unchanged, as are the `https://` rule and the refusal of redirects. Read once at start
+    /// (no reload re-reads it; a new file needs a restart). A file that is missing,
+    /// unreadable, empty or holds no certificate refuses to start. A relative path is resolved
+    /// against the working directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_pem_path: Option<PathBuf>,
     /// JWS algorithms accepted from this IdP. Only asymmetric algorithms are allowed.
     #[serde(default = "default_idp_algs")]
     pub allowed_algs: Vec<String>,
@@ -1844,6 +2564,78 @@ pub struct IdpConfig {
     /// client id equal to its agent id; the server warns at startup for each such agent.
     #[serde(default)]
     pub client_ids: BTreeMap<String, String>,
+    /// For a multi-tenant issuer (one `iss` for several tenants): the tenant whose users this
+    /// entry trusts. When set, an ID-JAG must carry a `tenant` claim equal to it
+    /// (draft-ietf-oauth-identity-assertion-authz-grant-06 §4.4.1), else `missing_claim` or
+    /// `tenant_mismatch`. ID tokens are not affected. Default: unset, `tenant` is not checked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
+    /// Opt-in: narrow the root token minted from this issuer's ID-JAGs to what the ID-JAG's own
+    /// `resource`, `scope` and `authorization_details` claims name, under `[[root_grants]]`
+    /// (draft-ietf-oauth-identity-assertion-authz-grant-06 §4.4.1). See
+    /// [`IdJagCeilingConfig`]. Default: unset, those claims are ignored and the root token is
+    /// bounded by the root grant and the request only. ID tokens are never affected, so an
+    /// agent that can present this issuer's ID tokens (its `client_ids` entry, or its agent
+    /// id, is their `aud`) is not bound by the ceiling unless [`credentials`](Self::credentials)
+    /// leaves ID tokens out (SR-122); the server warns at start when it does not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id_jag_ceiling: Option<IdJagCeilingConfig>,
+    /// The credentials this issuer's users may be brought in with at hop 0: `"id_token"`
+    /// (an OIDC ID token), `"id-jag"` (an ID-JAG), or both. A credential of a kind not listed
+    /// is refused with `credential_type_not_accepted`, before its signature is checked and
+    /// before it is used up. Default: both. An empty list, or a name not in this list, refuses
+    /// to start. Approval ID tokens (`[approvals]`) are not affected (SR-122).
+    #[serde(default = "default_idp_credentials")]
+    pub credentials: Vec<IdpCredential>,
+}
+
+/// A credential kind an `[[idps]] credentials` list names. The names are the ones the audit
+/// record's `credential` member uses, which are also the ends of the RFC 8693 token type URNs
+/// (`urn:ietf:params:oauth:token-type:id_token`, `...:id-jag`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IdpCredential {
+    /// An OIDC ID token.
+    #[serde(rename = "id_token")]
+    IdToken,
+    /// An ID-JAG (draft-ietf-oauth-identity-assertion-authz-grant).
+    #[serde(rename = "id-jag")]
+    IdJag,
+}
+
+/// Default `[[idps]] credentials`: both kinds.
+pub const DEFAULT_IDP_CREDENTIALS: &[IdpCredential] =
+    &[IdpCredential::IdToken, IdpCredential::IdJag];
+
+fn default_idp_credentials() -> Vec<IdpCredential> {
+    DEFAULT_IDP_CREDENTIALS.to_vec()
+}
+
+/// `[idps.id_jag_ceiling]`: how an ID-JAG's `resource`, `scope` and `authorization_details`
+/// claims name attenuo capabilities, so that the root token carries no more than both the
+/// `[[root_grants]]` entry and the ID-JAG allow.
+///
+/// - `authorization_details` entries of attenuo's own type, `attenuo_capabilities`, name
+///   capabilities directly (the token's capability objects, read strictly: an unknown member
+///   makes that capability name nothing); entries of any other type name nothing.
+/// - `resource` values name upstream servers through [`resources`](Self::resources): each
+///   mapped server stands for `<server>:*`. An unmapped value names nothing.
+/// - `scope` tokens (space-separated) name capabilities through [`scopes`](Self::scopes). An
+///   unmapped token names nothing.
+///
+/// Each claim the ID-JAG carries narrows the ceiling further; a claim it does not carry
+/// narrows nothing. When what is left is empty, the request is refused
+/// (`id_jag_ceiling_empty`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdJagCeilingConfig {
+    /// Resource identifier (an exact `resource` value, RFC 8707) to the `[[upstreams]]` server
+    /// names it stands for. Compared as strings, with no URL normalisation.
+    #[serde(default)]
+    pub resources: BTreeMap<String, Vec<String>>,
+    /// Scope token to the capabilities it stands for, written as in `[[root_grants]]
+    /// capabilities` (`"server:tool"` with globs, or a full table).
+    #[serde(default)]
+    pub scopes: BTreeMap<String, Vec<CapSpec>>,
 }
 
 fn default_idp_algs() -> Vec<String> {
@@ -1864,16 +2656,52 @@ fn default_clock_skew() -> u64 {
 
 /// One `[[agents]]` entry: an OAuth client that may exchange user credentials for root tokens.
 ///
-/// `id` is the `client_id` and becomes the root hop's agent id. `secret_sha256` is the
-/// lowercase hex SHA-256 of the client secret (`printf %s "$SECRET" | sha256sum`).
+/// `id` is the `client_id` and becomes the root hop's agent id. The client authenticates with
+/// a secret (`secret_sha256`, the lowercase hex SHA-256 of the client secret:
+/// `printf %s "$SECRET" | sha256sum`), with a JWT signed by one of its keys (`jwks`,
+/// `private_key_jwt`, RFC 7523 §2.2; see `crate::clientauth`), or with either when both are
+/// set. At least one of the two is required.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentConfig {
     /// The OAuth `client_id`; for an agent, also the root hop's agent id.
     pub id: String,
-    /// Lowercase hex SHA-256 of the client secret.
-    pub secret_sha256: String,
+    /// Lowercase hex SHA-256 of the client secret. Unset: the client cannot authenticate
+    /// with a secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_sha256: Option<String>,
+    /// The client's public keys, a JWK Set as JSON text (`{"keys": [...]}`), for
+    /// `private_key_jwt` client assertions. Only public, asymmetric signing keys of the
+    /// algorithms in [`CLIENT_ASSERTION_ALGS`]. Unset: the client cannot authenticate with an
+    /// assertion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwks: Option<String>,
 }
+
+impl AgentConfig {
+    /// An entry that authenticates with a client secret, given as its SHA-256 hex digest.
+    pub fn with_secret_sha256(id: impl Into<String>, secret_sha256: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            secret_sha256: Some(secret_sha256.into()),
+            jwks: None,
+        }
+    }
+
+    /// An entry that authenticates with `private_key_jwt` only, with the keys of this JWK Set.
+    pub fn with_jwks(id: impl Into<String>, jwks: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            secret_sha256: None,
+            jwks: Some(jwks.into()),
+        }
+    }
+}
+
+/// The JWS algorithms a `private_key_jwt` client assertion may be signed with, and so the
+/// algorithms of the keys `[[agents]] jwks` and `[[peps]] jwks` may hold: the asymmetric
+/// algorithms the server accepts from identity providers ([`DEFAULT_IDP_ALGS`]).
+pub const CLIENT_ASSERTION_ALGS: &[&str] = DEFAULT_IDP_ALGS;
 
 /// One `[[root_grants]]` entry: the ceiling of what a root token for users of `issuer`, held
 /// by `agent`, may carry.
@@ -1909,6 +2737,24 @@ pub struct RootGrant {
 }
 
 impl RootGrant {
+    /// The entry as start-up errors name it: issuer, agent and subject (or "any subject").
+    /// With `redact_subjects` (`[logging] redact_subjects`) a subject is not written out: it
+    /// names a user, which that setting keeps out of the server's output, and the entry's
+    /// index in the message already tells which entry it is (SR-130).
+    pub(crate) fn describe(&self, redact_subjects: bool) -> String {
+        let subject = match &self.subject {
+            Some(_) if redact_subjects => {
+                "a subject (not shown: [logging] redact_subjects)".to_string()
+            }
+            Some(s) => format!("subject {s:?}"),
+            None => "any subject".to_string(),
+        };
+        format!(
+            "issuer {:?}, agent {:?}, {subject}",
+            self.issuer, self.agent
+        )
+    }
+
     /// Does this grant apply to `subject` of `issuer` acting through `agent`?
     pub fn matches(&self, issuer: &str, agent: &str, subject: &str) -> bool {
         self.issuer == issuer
@@ -2063,6 +2909,18 @@ pub fn capability_set(specs: &[CapSpec]) -> Result<CapabilitySet, String> {
     specs.iter().map(CapSpec::to_capability).collect()
 }
 
+/// One warning per `prefix` constraint in `grants` that sits on an argument that looks like a
+/// file path ([`Capability::path_prefix_warnings`]), each starting with `[[root_grants]]`. A
+/// capability that does not parse gives none: [`Config::check_server_names`] refuses it.
+pub fn root_grant_warnings(grants: &[RootGrant]) -> Vec<String> {
+    grants
+        .iter()
+        .filter_map(|g| capability_set(&g.capabilities).ok())
+        .flat_map(|set| set.path_prefix_warnings())
+        .map(|w| format!("[[root_grants]] {w}"))
+        .collect()
+}
+
 /// A server name used in `[[upstreams]]`, the catalog or capabilities must follow
 /// [`attenuo_core::names`] (no `/`: the Cedar resource and action ids are
 /// `"<server>/<tool>"`, which would be ambiguous, SR-13). `attenuo` is reserved for the
@@ -2086,6 +2944,47 @@ pub fn check_server_name(name: &str) -> Result<(), String> {
 }
 
 impl Config {
+    /// Check `[[ext_authz]]`: each `server` a valid server name ([`check_server_name`]) named
+    /// once, each `secret_sha256` 64 hex digits, and each `dpop_url` an absolute `http` or
+    /// `https` URL with a host and no query or fragment.
+    ///
+    /// # Errors
+    ///
+    /// When an entry breaks one of these rules; the message names the entry's server.
+    pub fn check_ext_authz(&self) -> anyhow::Result<()> {
+        let mut seen = std::collections::BTreeSet::new();
+        for e in &self.ext_authz {
+            check_server_name(&e.server).map_err(|m| anyhow::anyhow!("[[ext_authz]]: {m}"))?;
+            if !seen.insert(e.server.as_str()) {
+                anyhow::bail!("[[ext_authz]]: server `{}` is listed twice", e.server);
+            }
+            let hex_ok = e.secret_sha256.len() == 64
+                && e.secret_sha256.bytes().all(|b| b.is_ascii_hexdigit());
+            if !hex_ok {
+                anyhow::bail!(
+                    "[[ext_authz]] `{}`: secret_sha256 must be 64 hex characters",
+                    e.server
+                );
+            }
+            if let Some(u) = &e.dpop_url {
+                let ok = reqwest::Url::parse(u).is_ok_and(|p| {
+                    matches!(p.scheme(), "http" | "https")
+                        && p.host_str().is_some()
+                        && p.query().is_none()
+                        && p.fragment().is_none()
+                });
+                if !ok {
+                    anyhow::bail!(
+                        "[[ext_authz]] `{}`: dpop_url must be an absolute http or https URL \
+                         with no query or fragment",
+                        e.server
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Reject server names that contain `/`, are empty or are the reserved `attenuo` in
     /// `[[upstreams]]`, the tool catalog (inline and `catalog_path`) and `[[root_grants]]`
     /// capabilities, and the agent id `attenuo` in `[[agents]]`, `[[peps]]` and
@@ -2095,8 +2994,11 @@ impl Config {
     ///
     /// When a server name in `[[upstreams]]`, the catalog or a `[[root_grants]]` capability is
     /// refused by [`check_server_name`], when the catalog cannot be loaded or does not validate,
-    /// when a `[[root_grants]]` capability does not parse, or when an agent id in `[[agents]]`,
-    /// `[[peps]]` or `[[root_grants]]` is `attenuo`; the message names the section.
+    /// when a `[[root_grants]]` capability does not parse, is over the size bounds (SR-123) or
+    /// has limits no token may carry ([`Capability::validate_limits`]), or when an agent id in
+    /// `[[agents]]`, `[[peps]]` or `[[root_grants]]` is `attenuo`. The message names the
+    /// section; for `[[root_grants]]` it also names the entry by index (from 0, in file
+    /// order), issuer, agent and subject.
     pub fn check_server_names(&self) -> anyhow::Result<()> {
         for u in &self.upstreams {
             check_server_name(&u.name).map_err(|e| anyhow::anyhow!("[[upstreams]]: {e}"))?;
@@ -2124,27 +3026,55 @@ impl Config {
         for p in &self.peps {
             reserved_agent("[[peps]]", &p.id)?;
         }
-        for g in &self.root_grants {
-            reserved_agent("[[root_grants]]", &g.agent)?;
-            for cap in capability_set(&g.capabilities)
-                .map_err(|e| anyhow::anyhow!(e))?
-                .iter()
-            {
+        for (index, g) in self.root_grants.iter().enumerate() {
+            // Every refusal names the entry: its index from 0 in file order, issuer, agent
+            // and subject, since several entries may share an agent or an issuer.
+            let entry = format!(
+                "[[root_grants]] entry {index} ({})",
+                g.describe(self.logging.redact_subjects)
+            );
+            reserved_agent(&entry, &g.agent)?;
+            let caps =
+                capability_set(&g.capabilities).map_err(|e| anyhow::anyhow!("{entry}: {e}"))?;
+            // A request is attenuated against the grant at a cost of the product (SR-123).
+            caps.validate_size()
+                .map_err(|e| anyhow::anyhow!("{entry}: {e}"))?;
+            for cap in caps.iter() {
                 cap.validate()
-                    .map_err(|e| anyhow::anyhow!("[[root_grants]]: {e}"))?;
+                    .map_err(|e| anyhow::anyhow!("{entry}: {e}"))?;
                 if cap.server != "*" {
-                    check_server_name(&cap.server)
-                        .map_err(|e| anyhow::anyhow!("[[root_grants]]: {e}"))?;
+                    check_server_name(&cap.server).map_err(|e| anyhow::anyhow!("{entry}: {e}"))?;
                 }
+                // The check every hop-0 mint makes (`Chain::root`): limits no token
+                // may carry would start and then fail every mint under this grant with
+                // `invalid_capability`, as `[idps.id_jag_ceiling] scopes` did (SR-125).
+                cap.validate_limits().map_err(|e| {
+                    anyhow::anyhow!(
+                        "{entry}: {e}; no token may carry it, so every mint under this grant \
+                         would fail"
+                    )
+                })?;
             }
         }
         Ok(())
     }
 
-    /// Problems with `[admin] token`, or `None` when it is acceptable.
+    /// Warnings about `[[root_grants]]` capabilities ([`root_grant_warnings`]), which the server
+    /// logs at startup. `attenuo policy lint --config` prints the same ones.
+    pub fn root_grant_warnings(&self) -> Vec<String> {
+        root_grant_warnings(&self.root_grants)
+    }
+
+    /// Problems with the admin credentials, or `None` when they are acceptable: no
+    /// credential at all (no `[admin] token` and no `[[admin.operators]]`), or an `[admin]
+    /// token` that is weak. An operator's token is generated by the CLI and only its digest is
+    /// configured, so there is nothing to check about its strength here.
     pub fn admin_token_problem(&self) -> Option<String> {
         let token = match self.admin.token.as_deref() {
-            None => return Some("[admin] token is not set".into()),
+            None if !self.admin.operators.is_empty() => return None,
+            None => {
+                return Some("[admin] token is not set and there are no [[admin.operators]]".into())
+            }
             Some(t) => t,
         };
         if PLACEHOLDER_ADMIN_TOKENS
@@ -2162,14 +3092,16 @@ impl Config {
     }
 
     /// Refuse a weak or missing admin token unless the server listens on loopback only, where
-    /// it is a warning (SR-15). An enabled `[admin_ui]` listener counts as a listener here,
-    /// since it serves the admin API too.
+    /// it is a warning (SR-15). An enabled `[admin_ui]` listener and an `[admin] listen`
+    /// listener count as listeners here, since they serve the admin API too.
     ///
     /// # Errors
     ///
-    /// When [`admin_token_problem`](Self::admin_token_problem) finds a problem (unset, a published
-    /// placeholder, shorter than `MIN_ADMIN_TOKEN_LEN` bytes) and `[server] listen` or an enabled
-    /// `[admin_ui] listen` is not a loopback address. On loopback only the problem is a warning.
+    /// When [`admin_token_problem`](Self::admin_token_problem) finds a problem (no admin
+    /// credential at all, or an `[admin] token` that is a published placeholder or shorter than
+    /// `MIN_ADMIN_TOKEN_LEN` bytes) and `[server] listen`, `[admin]
+    /// listen` or an enabled `[admin_ui] listen` is not a loopback address. On loopback only the
+    /// problem is a warning.
     pub fn check_admin_token(&self) -> anyhow::Result<()> {
         let Some(problem) = self.admin_token_problem() else {
             return Ok(());
@@ -2179,7 +3111,11 @@ impl Config {
             .admin_ui
             .enabled
             .then_some(("[admin_ui] listen", self.admin_ui.listen));
+        // So does an admin API listener of its own. `[server] listen` keeps counting when the
+        // admin API is not on it: a weak token is refused on any server reachable off loopback.
+        let admin = self.admin.listen.map(|addr| ("[admin] listen", addr));
         let exposed = std::iter::once(("[server] listen", self.server.listen))
+            .chain(admin)
             .chain(console)
             .find(|(_, addr)| !addr.ip().is_loopback());
         let Some((key, addr)) = exposed else {
@@ -2193,7 +3129,27 @@ impl Config {
         anyhow::bail!(
             "{problem}, and {key} = {addr} is not loopback. Set a random token of at \
              least {MIN_ADMIN_TOKEN_LEN} bytes (`openssl rand -hex 32`) in [admin] token or \
-             {ADMIN_TOKEN_ENV}."
+             {ADMIN_TOKEN_ENV}, or add [[admin.operators]] (`attenuo admin operator new`)."
+        )
+    }
+
+    /// Check `[[admin.operators]]` (ADR-0016): every name passes
+    /// [`crate::operators::check_operator_name`] and is unique, every `token_sha256` is 64
+    /// lowercase hex characters, no two operators share a digest, and no operator's digest is
+    /// that of `[admin] token` (call it after [`apply_env`](Self::apply_env), so the token in
+    /// force is the one compared).
+    ///
+    /// # Errors
+    ///
+    /// On the first entry that breaks one of those rules; the message names the entry, never
+    /// a digest or the token.
+    pub fn check_admin_operators(&self) -> anyhow::Result<()> {
+        crate::operators::check_operators(
+            &self.admin.operators,
+            self.admin
+                .token
+                .as_deref()
+                .map(crate::operators::token_sha256),
         )
     }
 
@@ -2217,21 +3173,113 @@ impl Config {
         Ok(toml::from_str(text)?)
     }
 
+    /// Parse TOML text, then apply the `ATTENUO__<SECTION>__<KEY>` overrides found in `env`
+    /// (name and value pairs, normally [`std::env::vars_os`]). Returns the keys that were
+    /// overridden, which the server logs by name. Every other variable in `env` is ignored,
+    /// including `ATTENUO_ADMIN_TOKEN` and `ATTENUO_LOG_FORMAT`, which keep applying where they
+    /// did ([`apply_env`](Self::apply_env), [`crate::logging::LoggingSection::resolve_format`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`from_toml`](Self::from_toml) for the text. For the variables: one names no
+    /// overridable key (unknown, a list, a table of names, an array of tables, an optional
+    /// section the file lacks, or a `[dev]` key), has a value that is empty or does not parse
+    /// as the key's type, sets the same key as another variable, or sets `[admin] token` or
+    /// `[logging] format` while `ATTENUO_ADMIN_TOKEN` or `ATTENUO_LOG_FORMAT` is set too. The
+    /// message names every such variable and none of their values.
+    pub fn from_toml_with_env<I, K, V>(
+        text: &str,
+        env: I,
+    ) -> anyhow::Result<(Self, Vec<EnvOverride>)>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<std::ffi::OsString>,
+        V: Into<std::ffi::OsString>,
+    {
+        let base = Self::from_toml(text)?;
+        let file: toml::Table = text.parse()?;
+        overrides::apply(file, base, env)
+    }
+
     /// Read and parse a file.
     ///
     /// # Errors
     ///
     /// When the file cannot be read, or as [`from_toml`](Self::from_toml); the message names the
-    /// path.
+    /// path. The path is kept as [`source_path`](Self::source_path).
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| anyhow::anyhow!("reading config {}: {e}", path.display()))?;
-        Self::from_toml(&text).map_err(|e| anyhow::anyhow!("parsing {}: {e}", path.display()))
+        let mut config = Self::from_toml(&text)
+            .map_err(|e| anyhow::anyhow!("parsing {}: {e}", path.display()))?;
+        config.source_path = Some(path.to_path_buf());
+        Ok(config)
+    }
+
+    /// Read and parse a file, then apply the environment overrides in `env`, as
+    /// [`from_toml_with_env`](Self::from_toml_with_env).
+    ///
+    /// # Errors
+    ///
+    /// When the file cannot be read or parsed (the message names the path), or as
+    /// [`from_toml_with_env`](Self::from_toml_with_env) for the variables.
+    pub fn load_with_env<I, K, V>(path: &Path, env: I) -> anyhow::Result<(Self, Vec<EnvOverride>)>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<std::ffi::OsString>,
+        V: Into<std::ffi::OsString>,
+    {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("reading config {}: {e}", path.display()))?;
+        let base = Self::from_toml(&text)
+            .map_err(|e| anyhow::anyhow!("parsing {}: {e}", path.display()))?;
+        let file: toml::Table = text
+            .parse()
+            .map_err(|e| anyhow::anyhow!("parsing {}: {e}", path.display()))?;
+        let (mut config, applied) = overrides::apply(file, base, env)?;
+        config.source_path = Some(path.to_path_buf());
+        Ok((config, applied))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn prefix_on_a_path_argument_in_root_grants_is_a_warning_not_an_error() {
+        let text = r#"
+            [server]
+            listen = "127.0.0.1:0"
+
+            [[root_grants]]
+            issuer = "https://idp.example"
+            agent = "coder"
+            capabilities = [
+                "fs:list",
+                { server = "fs", tool = "read_file", constraints = { path = { op = "prefix", value = "/workspace/" } } },
+                { server = "fs", tool = "write_file", constraints = { path = { op = "path_prefix", value = "/workspace/" } } },
+                { server = "web", tool = "fetch", constraints = { url = { op = "prefix", value = "https://a.example/" } } },
+            ]
+        "#;
+        let cfg = Config::from_toml(text).unwrap();
+        cfg.check_server_names().unwrap();
+        let warnings = cfg.root_grant_warnings();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].starts_with("[[root_grants]] fs:read_file argument \"path\": `prefix`"),
+            "{warnings:?}"
+        );
+        // A malformed `path_prefix` is a config error, like a malformed range.
+        let bad = text.replace(
+            r#"op = "path_prefix", value = "/workspace/""#,
+            r#"op = "path_prefix", value = "/workspace/../etc""#,
+        );
+        let err = Config::from_toml(&bad).unwrap_err().to_string();
+        assert!(
+            err.contains("a path_prefix constraint's path holds a `.` or `..` segment"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn proxy_limits_have_defaults_and_refuse_zero_sr36() {
         let cfg = Config::from_toml("").unwrap();
@@ -2562,11 +3610,49 @@ mod tests {
 
     use super::*;
 
+    /// The `[limits]` defaults: a cap, the three deadlines, and every rate limit off.
+    #[test]
+    fn limits_defaults() {
+        let l = Config::from_toml("").unwrap().limits;
+        assert_eq!(
+            (
+                l.max_in_flight,
+                l.header_read_timeout_seconds,
+                l.request_body_timeout_seconds,
+                l.request_timeout_seconds,
+            ),
+            (1_024, 30, 30, 60)
+        );
+        assert_eq!(
+            (
+                l.token_requests_per_minute,
+                l.token_unauthenticated_requests_per_minute,
+                l.mcp_requests_per_minute,
+                l.authzen_search_requests_per_minute,
+                l.rate_limit_max_keys,
+            ),
+            (0, 0, 0, 0, 10_000)
+        );
+        l.check().unwrap();
+        // The edges of each range are accepted.
+        let edges = Config::from_toml(
+            "[limits]\nmax_in_flight = 0\nheader_read_timeout_seconds = 300\n\
+             request_body_timeout_seconds = 1\nrequest_timeout_seconds = 3600\n\
+             mcp_requests_per_minute = 1000000\nauthzen_search_requests_per_minute = 1000000\n\
+             rate_limit_max_keys = 100\n",
+        )
+        .unwrap();
+        edges.limits.check().unwrap();
+    }
+
     #[test]
     fn example_config_parses() {
         let text = include_str!("../../../config/example.toml");
         let cfg = Config::from_toml(text).unwrap();
         assert_eq!(cfg.server.listen, "127.0.0.1:8080".parse().unwrap());
+        // The example spells out the `[limits]` defaults.
+        assert_eq!(cfg.limits, LimitsSection::default());
+        cfg.limits.check().unwrap();
         assert_eq!(cfg.upstreams.len(), 1);
         assert!(
             cfg.admin.token.is_none(),
@@ -2633,6 +3719,14 @@ mod tests {
             attenuo_audit::Durability::Full
         );
         assert!(Config::from_toml("[audit]\ndurability = \"off\"\n").is_err());
+        assert!(!cfg.audit.allow_network_filesystem);
+        assert!(
+            Config::from_toml("[audit]\nallow_network_filesystem = true\n")
+                .unwrap()
+                .audit
+                .allow_network_filesystem
+        );
+        assert!(Config::from_toml("[audit]\nallow_network_filesystem = \"yes\"\n").is_err());
         assert_eq!(cfg.issuer.default_ttl_seconds, 900);
         assert!(cfg.admin.token.is_none());
         assert!(
@@ -2647,6 +3741,56 @@ mod tests {
         assert!(cfg.token.require_actor_auth, "actor auth is on by default");
         assert_eq!(cfg.token.actor_auth, ActorAuth::Either);
         assert!(cfg.actor_trust.is_empty());
+    }
+
+    /// `[[agents]]` and `[[peps]]` take `jwks` (an inline JWK Set) next to or instead of
+    /// `secret_sha256`; `[token]` has the client assertion bounds.
+    #[test]
+    fn client_keys_and_assertion_settings_parse() {
+        let cfg = Config::from_toml(
+            r#"
+            [token]
+            client_assertion_max_lifetime_seconds = 120
+
+            [[agents]]
+            id = "coder"
+            jwks = '''{"keys": [{"kty": "OKP", "crv": "Ed25519", "kid": "k1",
+                       "x": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"}]}'''
+
+            [[agents]]
+            id = "planner"
+            secret_sha256 = "00"
+
+            [[peps]]
+            id = "gw"
+            secret_sha256 = "00"
+            jwks = '{"keys": []}'
+            "#,
+        )
+        .unwrap();
+        assert!(cfg.agents[0].secret_sha256.is_none());
+        assert!(cfg.agents[0].jwks.as_deref().unwrap().contains("Ed25519"));
+        assert!(cfg.agents[1].jwks.is_none());
+        assert!(cfg.peps[0].secret_sha256.is_some() && cfg.peps[0].jwks.is_some());
+        assert_eq!(cfg.token.client_assertion_max_lifetime_seconds, 120);
+        assert_eq!(cfg.token.client_assertion_clock_skew_seconds, 60);
+        cfg.token.check_client_assertion().unwrap();
+        let d = TokenSection::default();
+        assert_eq!(
+            d.client_assertion_max_lifetime_seconds,
+            DEFAULT_CLIENT_ASSERTION_MAX_LIFETIME_SECONDS
+        );
+        d.check_client_assertion().unwrap();
+        for bad in [
+            "[token]\nclient_assertion_max_lifetime_seconds = 0\n",
+            "[token]\nclient_assertion_max_lifetime_seconds = 3601\n",
+            "[token]\nclient_assertion_clock_skew_seconds = 601\n",
+        ] {
+            let cfg = Config::from_toml(bad).unwrap();
+            assert!(cfg.token.check_client_assertion().is_err(), "{bad}");
+        }
+        // A jwks given as a table instead of JSON text is refused when parsing.
+        assert!(Config::from_toml("[[agents]]\nid = \"a\"\njwks = { keys = [] }\n").is_err());
     }
 
     #[test]
@@ -2884,6 +4028,100 @@ mod tests {
         assert!(docker.check_admin_token().is_err());
     }
 
+    /// ADR-0016: `[[admin.operators]]` parse, and startup refuses bad names, duplicate names,
+    /// malformed digests, two operators with one digest and an operator with the digest of
+    /// `[admin] token`.
+    #[test]
+    fn admin_operators_are_checked() {
+        use crate::operators::{token_sha256_hex, AdminRole};
+        let a = token_sha256_hex("alice-token");
+        let b = token_sha256_hex("bob-token");
+        let cfg = Config::from_toml(&format!(
+            "[admin]\ntoken = \"legacy-token-0123456789abcdef01234\"\n\
+             [[admin.operators]]\nname = \"alice\"\ntoken_sha256 = \"{a}\"\nrole = \"viewer\"\n\
+             [[admin.operators]]\nname = \"bob\"\ntoken_sha256 = \"{b}\"\nrole = \"operator\"\n"
+        ))
+        .unwrap();
+        assert_eq!(cfg.admin.operators.len(), 2);
+        assert_eq!(cfg.admin.operators[1].role, AdminRole::Operator);
+        cfg.check_admin_operators().unwrap();
+        // An unknown role or key does not parse.
+        for bad in [
+            format!("[[admin.operators]]\nname = \"x\"\ntoken_sha256 = \"{a}\"\nrole = \"root\"\n"),
+            format!("[[admin.operators]]\nname = \"x\"\ntoken_sha256 = \"{a}\"\nrole = \"admin\"\ntoken = \"t\"\n"),
+            "[[admin.operators]]\nname = \"x\"\nrole = \"admin\"\n".to_string(),
+        ] {
+            assert!(Config::from_toml(&bad).is_err(), "{bad}");
+        }
+        let with = |ops: Vec<(&str, String)>, token: Option<&str>| {
+            let mut cfg = Config::default();
+            cfg.admin.token = token.map(Into::into);
+            cfg.admin.operators = ops
+                .into_iter()
+                .map(|(name, token_sha256)| AdminOperator {
+                    name: name.into(),
+                    token_sha256,
+                    role: AdminRole::Viewer,
+                    expires_at: None,
+                })
+                .collect();
+            cfg.check_admin_operators().map_err(|e| e.to_string())
+        };
+        with(
+            vec![("alice", a.clone()), ("bob", b.clone())],
+            Some("legacy"),
+        )
+        .unwrap();
+        for (ops, token, want) in [
+            (vec![("admin", a.clone())], None, "reserved"),
+            (vec![("Alice", a.clone())], None, "a-z"),
+            (vec![("", a.clone())], None, "1 to 64"),
+            (
+                vec![("alice", a.clone()), ("alice", b.clone())],
+                None,
+                "used twice",
+            ),
+            (vec![("alice", a.to_uppercase())], None, "lowercase hex"),
+            (vec![("alice", a[..10].to_string())], None, "lowercase hex"),
+            (
+                vec![("alice", a.clone()), ("bob", a.clone())],
+                None,
+                "same token_sha256",
+            ),
+            (
+                vec![("alice", a.clone())],
+                Some("alice-token"),
+                "[admin] token",
+            ),
+        ] {
+            let err = with(ops, token).unwrap_err();
+            assert!(err.contains(want), "{err}");
+            // Neither a digest nor the token is repeated.
+            assert!(!err.contains(&a) && !err.contains("alice-token"), "{err}");
+        }
+    }
+
+    /// ADR-0016: off loopback, operators alone are enough, but a legacy token that is set must
+    /// still be strong.
+    #[test]
+    fn operators_count_as_an_admin_credential_off_loopback() {
+        let mut cfg = Config::default();
+        cfg.server.listen = "0.0.0.0:8080".parse().unwrap();
+        let err = cfg.check_admin_token().unwrap_err().to_string();
+        assert!(err.contains("[[admin.operators]]"), "{err}");
+        cfg.admin.operators.push(AdminOperator {
+            name: "alice".into(),
+            token_sha256: crate::operators::token_sha256_hex("t"),
+            role: crate::operators::AdminRole::Admin,
+            expires_at: None,
+        });
+        cfg.check_admin_token().unwrap();
+        cfg.admin.token = Some("change-me".into());
+        assert!(cfg.check_admin_token().is_err());
+        cfg.admin.token = Some("0123456789abcdef0123456789abcdef".into());
+        cfg.check_admin_token().unwrap();
+    }
+
     #[test]
     fn admin_ui_is_disabled_by_default() {
         let cfg = Config::from_toml("").unwrap();
@@ -2982,6 +4220,218 @@ mod tests {
         .unwrap();
         docker.server.check_public_url().unwrap();
         assert!(Config::default().server.check_public_url().is_ok());
+    }
+
+    /// S-9: an `http://` `public_url` off loopback is refused unless `allow_insecure_http`;
+    /// https (TLS at a reverse proxy) and loopback http need no new key.
+    #[test]
+    fn plain_http_public_url_off_loopback_needs_allow_insecure_http_s9() {
+        let at = |url: &str, insecure: bool| ServerSection {
+            listen: "0.0.0.0:8080".parse().unwrap(),
+            public_url: Some(url.into()),
+            allow_insecure_http: insecure,
+        };
+        for ok in [
+            "https://attenuo.example.com",
+            "https://10.0.0.5:8443/attenuo",
+            "http://127.0.0.1:8080",
+            "http://127.1.2.3",
+            "http://localhost:8080",
+            "http://LOCALHOST",
+            "http://[::1]:8080/base",
+        ] {
+            at(ok, false).check_public_url().unwrap();
+        }
+        for bad in [
+            "http://attenuo.example.com",
+            "http://10.0.0.5:8080",
+            "http://0.0.0.0:8080",
+            "http://[::]:8080",
+            "http://localhost.example.com",
+            "http://127.0.0.1.nip.io",
+        ] {
+            let err = at(bad, false).check_public_url().unwrap_err().to_string();
+            assert!(err.contains("allow_insecure_http"), "{bad}: {err}");
+            assert!(err.contains("https://"), "{bad}: {err}");
+            at(bad, true).check_public_url().unwrap();
+        }
+        // The flag does not loosen anything else.
+        assert!(at("ftp://a.example", true).check_public_url().is_err());
+        let toml = Config::from_toml(
+            "[server]\nlisten = \"0.0.0.0:8080\"\npublic_url = \"http://a.example\"\n\
+             allow_insecure_http = true\n",
+        )
+        .unwrap();
+        assert!(toml.server.allow_insecure_http);
+        toml.server.check_public_url().unwrap();
+        assert!(!Config::default().server.allow_insecure_http);
+    }
+
+    #[test]
+    fn url_host_is_loopback_parses_the_host() {
+        for yes in [
+            "http://localhost",
+            "http://127.0.0.1:1/x",
+            "http://127.255.0.1",
+            "http://[::1]",
+            "https://localhost:8443",
+        ] {
+            assert!(url_host_is_loopback(yes), "{yes}");
+        }
+        for no in [
+            "http://user@example.com",
+            "http://localhost@example.com",
+            "http://example.com/127.0.0.1",
+            "http://[::2]",
+            "http://10.0.0.1",
+            "not a url",
+            "http://",
+        ] {
+            assert!(!url_host_is_loopback(no), "{no}");
+        }
+    }
+
+    /// S-1: off a loopback `[server] listen`, the admin API needs a listener of its own or the
+    /// explicit `serve_on_main_listener`; on loopback nothing changes. The two keys exclude each
+    /// other, and the admin listener cannot be the main one.
+    #[test]
+    fn admin_api_off_loopback_needs_its_own_listener_or_the_opt_in_s1() {
+        let addr = |a: &str| a.parse::<SocketAddr>().unwrap();
+        let admin = |listen: Option<&str>, on_main: bool| AdminSection {
+            token: None,
+            listen: listen.map(addr),
+            serve_on_main_listener: on_main,
+            operators: Vec::new(),
+        };
+        // Loopback, nothing configured: on the main listener, as before.
+        for main in ["127.0.0.1:8080", "[::1]:8080"] {
+            let a = admin(None, false);
+            a.check_listen(addr(main)).unwrap();
+            assert!(a.on_main_listener());
+            assert_eq!(a.api_listen(addr(main)), addr(main));
+            admin(None, true).check_listen(addr(main)).unwrap();
+        }
+        for main in ["0.0.0.0:8080", "10.1.2.3:8080", "[::]:8080"] {
+            let err = admin(None, false)
+                .check_listen(addr(main))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("not a loopback address"), "{err}");
+            assert!(err.contains("[admin] listen"), "{err}");
+            assert!(err.contains("serve_on_main_listener = true"), "{err}");
+            admin(None, true).check_listen(addr(main)).unwrap();
+            for own in ["127.0.0.1:9102", "10.0.0.7:9102", "0.0.0.0:9102"] {
+                let a = admin(Some(own), false);
+                a.check_listen(addr(main)).unwrap();
+                assert!(!a.on_main_listener());
+                assert_eq!(a.api_listen(addr(main)), addr(own));
+                let err = admin(Some(own), true)
+                    .check_listen(addr(main))
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains("contradict"), "{err}");
+            }
+        }
+        let err = admin(Some("127.0.0.1:8080"), false)
+            .check_listen(addr("127.0.0.1:8080"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("port of its own"), "{err}");
+        // Port 0 (tests): two different ports once bound.
+        admin(Some("127.0.0.1:0"), false)
+            .check_listen(addr("127.0.0.1:0"))
+            .unwrap();
+        // From TOML: absent by default, both keys read.
+        let cfg = Config::from_toml("").unwrap();
+        assert_eq!(cfg.admin.listen, None);
+        assert!(!cfg.admin.serve_on_main_listener);
+        let cfg = Config::from_toml(
+            "[server]\nlisten = \"0.0.0.0:8080\"\n\n[admin]\nlisten = \"127.0.0.1:9102\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.admin.listen, Some(addr("127.0.0.1:9102")));
+        cfg.admin.check_listen(cfg.server.listen).unwrap();
+        let cfg = Config::from_toml(
+            "[server]\nlisten = \"0.0.0.0:8080\"\n\n[admin]\nserve_on_main_listener = true\n",
+        )
+        .unwrap();
+        cfg.admin.check_listen(cfg.server.listen).unwrap();
+        // Every shipped config still starts: the loopback ones as they are, the docker demo
+        // through the opt-in (its port is published on the host's loopback only).
+        for text in [
+            include_str!("../../../examples/github-leak-demo/config.toml"),
+            include_str!("../../../examples/multi-hop-demo/config.toml"),
+            include_str!("../../../examples/github-leak-demo/config.docker.toml"),
+            include_str!("../../../config/example.toml"),
+        ] {
+            let cfg = Config::from_toml(text).unwrap();
+            cfg.admin.check_listen(cfg.server.listen).unwrap();
+        }
+    }
+
+    /// SR-15 with S-1: an `[admin] listen` off loopback is exposure, as `[server] listen` is.
+    #[test]
+    fn an_admin_listener_off_loopback_needs_a_strong_admin_token() {
+        let mut cfg = Config::default();
+        cfg.admin.token = Some("short".into());
+        cfg.admin.listen = Some("127.0.0.1:9102".parse().unwrap());
+        cfg.check_admin_token().unwrap();
+        cfg.admin.listen = Some("0.0.0.0:9102".parse().unwrap());
+        let err = cfg.check_admin_token().unwrap_err().to_string();
+        assert!(err.contains("[admin] listen = 0.0.0.0:9102"), "{err}");
+        cfg.admin.token = Some("0123456789abcdef0123456789abcdef".into());
+        cfg.check_admin_token().unwrap();
+    }
+
+    /// S-3: the dev root mint is refused when `[server] listen` is not loopback, unless the
+    /// demo-only `allow_root_mint_off_loopback` is set.
+    #[test]
+    fn dev_root_mint_is_refused_off_loopback_s3() {
+        let dev = |mint: bool, off: bool| DevSection {
+            allow_root_mint: mint,
+            allow_root_mint_off_loopback: off,
+        };
+        let addr = |a: &str| a.parse::<SocketAddr>().unwrap();
+        for listen in ["0.0.0.0:8080", "10.1.2.3:8080", "[::]:8080"] {
+            let err = dev(true, false)
+                .check(addr(listen))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("not a loopback address"), "{err}");
+            assert!(err.contains("allow_root_mint_off_loopback"), "{err}");
+            dev(true, true).check(addr(listen)).unwrap();
+            dev(false, false).check(addr(listen)).unwrap();
+            dev(false, true).check(addr(listen)).unwrap();
+        }
+        for listen in ["127.0.0.1:8080", "[::1]:8080"] {
+            dev(true, false).check(addr(listen)).unwrap();
+        }
+        // Through the whole config: the same refusal, from TOML.
+        let mut cfg = Config::from_toml(
+            "[server]\nlisten = \"0.0.0.0:8080\"\n\n[dev]\nallow_root_mint = true\n",
+        )
+        .unwrap();
+        assert!(cfg.dev.check(cfg.server.listen).is_err());
+        cfg.server.listen = addr("127.0.0.1:8080");
+        cfg.dev.check(cfg.server.listen).unwrap();
+        // Every shipped config that turns the mint on still loads: the loopback demos as they
+        // are, the docker variant through the demo-only opt-in.
+        for text in [
+            include_str!("../../../examples/github-leak-demo/config.toml"),
+            include_str!("../../../examples/multi-hop-demo/config.toml"),
+            include_str!("../../../examples/github-leak-demo/config.docker.toml"),
+            include_str!("../../../config/example.toml"),
+        ] {
+            let cfg = Config::from_toml(text).unwrap();
+            cfg.dev.check(cfg.server.listen).unwrap();
+            cfg.server.check_public_url().unwrap();
+        }
+        let docker = Config::from_toml(include_str!(
+            "../../../examples/github-leak-demo/config.docker.toml"
+        ))
+        .unwrap();
+        assert!(docker.dev.allow_root_mint && docker.dev.allow_root_mint_off_loopback);
+        assert!(!docker.server.listen.ip().is_loopback());
     }
 
     #[test]

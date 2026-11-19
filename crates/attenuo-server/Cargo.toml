@@ -6,7 +6,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-readme.workspace = true
+readme = "README.md"
 rust-version.workspace = true
 keywords = ["mcp", "authorization", "authzen", "rfc8693", "agents"]
 categories = ["authentication", "web-programming::http-server"]
@@ -30,6 +30,8 @@ otel = [
     "dep:opentelemetry-http",
     "dep:tracing-opentelemetry",
 ]
+# Wrappers over crate-private ceiling code for the cargo-fuzz targets in `fuzz/`. Not an API.
+fuzzing = []
 
 [dependencies]
 attenuo-core = { workspace = true }
@@ -45,17 +47,22 @@ clap = { workspace = true }
 futures-util = { workspace = true }
 hex = { workspace = true }
 http-body = { workspace = true }
+hyper = { workspace = true, features = ["http1", "server"] }
+hyper-util = { workspace = true, features = ["tokio", "server", "http1"] }
 jsonwebtoken = { workspace = true }
 reqwest = { workspace = true }
 ring = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_urlencoded = { workspace = true }
+form_urlencoded = { workspace = true }
+serde_path_to_error = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
+tower = { workspace = true, features = ["util"] }
 tower-http = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -68,12 +75,31 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+# `SqliteLeaseStore::write_turns`, for the write count of the `allowed_call` bench and tests.
+attenuo-audit = { workspace = true, features = ["testing"] }
 attenuo-proxy = { workspace = true, features = ["testing"] }
 rusqlite = { workspace = true }
 tempfile = { workspace = true }
+# A test CA, its certificates and an HTTPS key server, for `[[idps]]` / `[[actor_trust]]`
+# `ca_pem_path` (tests/key_url_ca.rs and the unit tests of `idp::jwks`).
+rcgen = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
 # Paused time (`tokio::time::pause`) for the stream re-check test in `tests/e2e.rs`.
 tokio = { workspace = true, features = ["test-util"] }
 
 [[bench]]
 name = "decide"
+harness = false
+
+[[bench]]
+name = "allowed_call"
+harness = false
+
+[[bench]]
+name = "audit_reads"
+harness = false
+
+[[bench]]
+name = "token_cache"
 harness = false

@@ -1,6 +1,6 @@
 # CLI commands
 
-The `attenuo` binary comes from the `attenuo-cli` crate. It talks to a running attenuo server over HTTP, except for `key gen`, `policy lint`, `policy test` with `--via local` (the default), `token inspect` without `--verify`, `audit verify --file` with `--jwks`, and `approval verify` with a `--jwks` file, which run offline.
+The `attenuo` binary comes from the `attenuo-cli` crate. It talks to a running attenuo server over HTTP, except for `key gen` (`--dpop` and `--client`), `admin operator new` and `admin operator hash`, `policy lint`, `policy test` with `--via local` (the default), `token inspect` without `--verify`, `audit verify --file` with `--jwks`, and `approval verify` with a `--jwks` file, which run offline, and `stdio-bridge`, which serves a local STDIO MCP server over HTTP and talks to no attenuo server.
 
 ```
 attenuo [--server URL] [--json] <command>
@@ -10,22 +10,25 @@ attenuo [--server URL] [--json] <command>
 
 | Option | Environment | Default | Meaning |
 | --- | --- | --- | --- |
-| `--server`, `--url` | `ATTENUO_SERVER` | `http://127.0.0.1:8080` | Base URL of the attenuo server. Goes before the subcommand. |
+| `--server`, `--url` | `ATTENUO_SERVER` | `http://127.0.0.1:8080` | Base URL of the attenuo server. Goes before the subcommand. Every request goes here, except requests to `/admin/*` when `--admin-server` is set. Give the final URL: the CLI follows no redirect (SR-112), and a 3xx answer is an error (exit 1) naming the URL, the status and the `Location`, for example `error: http://attenuo.internal:8080/token answered 308 Permanent Redirect (Location https://attenuo.internal/token); attenuo does not follow redirects, so --server must be the final URL, the one that answers without a redirect`. The same holds for `--admin-server` and for an `approval verify --jwks` URL. |
+| `--admin-server URL` | `ATTENUO_ADMIN_SERVER` | `--server` | Base URL of the admin API, for a server with `[admin] listen` ([network exposure](../guides/deploying.md#network-exposure)): the main listener answers `/admin/*` as an unknown path. Every request to `/admin/*` goes here. Those are the requests of `token root`, `lease`, `audit` other than `audit verify --file`, `approval list`, `show`, `grant` and `decline`, `budget refund`, `policy reload`, `show`, `check` and `evaluate`, `policy test --via admin-evaluate`, and `admin operator reload`. Everything else, including `health` and the JWKS that `token inspect --verify`, `approval verify` and `audit verify --file` fetch, still goes to `--server`, so one invocation can use both. Unset or empty, `/admin/*` goes to `--server` as well, and a `404` without an error code from it (the main listener's answer to a path it does not serve) gets a second line, `hint: the server may serve its admin API on a separate listener ([admin] listen); pass --admin-server URL (or set ATTENUO_ADMIN_SERVER)`. A JSON `404` `not_found` (an unknown lease, approval or audit record) gets no hint. Goes before or after the subcommand. |
 | `--admin-token-stdin` | | off | Read the admin token from the first line of standard input. The three admin token options go before or after the subcommand. |
 | `--admin-token-file PATH` | | none | Read the admin token from the first line of a file. |
 | `--admin-token TOKEN` | `ATTENUO_ADMIN_TOKEN` | none | Bearer for `/admin/*`. Prefer the environment variable, stdin or a file: an argument is readable by other local users (`ps`, `/proc/<pid>/cmdline`) and lands in shell history, so the CLI prints a warning to stderr when it is used. |
 | `--json` | | off | Print machine-readable JSON instead of text. Works after any subcommand. |
 
-The `--server` flag of `call`, `tools` and `authzen eval` is different. It names the MCP upstream, for example `github`.
+The MCP upstream a subcommand talks to (`call`, `tools`, `authzen eval`, `policy evaluate`, `audit tail`) is its `--upstream`, for example `github`. Those subcommands still accept the old spelling `--server <name>` after the subcommand, which is deprecated: it works as before, is hidden from `--help`, and prints a one-line warning to stderr. Giving both is an error.
 
 ## Exit status
 
 | Status | Meaning |
 | --- | --- |
 | 0 | Success; for a command that asks a question (`call`, `tools`, `token inspect --verify`, `policy evaluate`, `authzen eval`, `policy test`, `policy lint`, `policy check`, `audit verify`, `approval verify`), the answer was yes. |
-| 1 | An error: the server could not be reached or answered with an error, a file could not be read, a test file could not be run, or the command line could not be parsed (unknown flag, missing argument). The message goes to stderr as `error: ...`; for a command line, it is clap's usage message. `--help` and `--version` exit 0. |
+| 1 | An error: the server could not be reached or answered with an error, a file could not be read, a test file could not be run, or the command line could not be parsed (unknown flag, missing argument). The message goes to stderr as `error: ...`; for a command line, it is clap's usage message. `--help` and `--version` exit 0. `health` exits 1, not 2, when the server answers but is not healthy or ready. |
 | 2 | The answer was no: a denial or `APPROVAL REQUIRED`, a JSON-RPC error from `tools`, a token that fails `--verify`, a failed test case, policy errors, a broken audit chain or invalid checkpoint, an invalid approval token; for `budget refund`, nothing to refund. |
 | 3, 4 | `budget refund` only: already refunded, charge pruned (see [`budget refund`](#budget-refund-id---reason-text)). |
+
+A refusal from a REST route reads `error: server answered <status>: <error> (<code>): <detail>`: the OAuth-style `error`, then the stable `code` in parentheses, then the server's `detail`, for example `error: server answered 400 Bad Request: invalid_grant (replayed): this credential was already used; present a fresh one`. Match on the code, which is never reworded ([Errors](http-api.md#errors)); the detail is for people. The ` (<code>)` is left out when the code is the `error` itself or the whole `detail` (`unauthorized: token_expired`), and so is `: <detail>` when there is none. A body that is not an error object is printed as it came. Control characters in any of these strings are printed escaped (`\u{1b}`), so an answer cannot drive the terminal (SR-118). `--json` does not change this: an error is always this text on stderr, never JSON on stdout.
 
 ## Secrets
 
@@ -35,36 +38,50 @@ Secrets are never taken from the argument list by default. That covers the admin
 | --- | --- | --- | --- |
 | Admin token | `ATTENUO_ADMIN_TOKEN` | `--admin-token-file` | `--admin-token-stdin` |
 | Client secret | `ATTENUO_CLIENT_SECRET` | `--client-secret-file` | `--client-secret-stdin` |
-| Delegation token (`call`, `tools`, `authzen eval`) | `ATTENUO_TOKEN` | `--token-file` | `--token -` |
-| Parent token (`token exchange`) | `ATTENUO_TOKEN` | `--subject-token-file` | `--subject-token -` |
+| Delegation token (`call`, `tools`, `authzen eval`, `authzen search`) | `ATTENUO_TOKEN` | `--token-file` | `--token -` |
+| Parent token, or the IdP credential at hop 0 (`token exchange`) | `ATTENUO_TOKEN` | `--subject-token-file` | `--subject-token -` |
 
 ```sh
 export ATTENUO_ADMIN_TOKEN=$(cat /run/secrets/attenuo-admin)
 printf '%s\n' "$CODER_SECRET" | ATTENUO_TOKEN="$ROOT" attenuo token exchange --actor coder --client-secret-stdin --cap github:read_file
 attenuo --admin-token-file /run/secrets/attenuo-admin lease show "$LEASE"
-printf '%s\n' "$CODER" | attenuo call --token - --server github --tool read_file --arg repo=acme/api
+printf '%s\n' "$CODER" | attenuo call --token - --upstream github --tool read_file --arg repo=acme/api
 ```
 
 `token inspect -` also reads a token from stdin.
 
 ## Argument forms
 
-- `--cap server:tool` is a capability. Globs are allowed. Repeat the flag, or comma-separate plain values. A value that starts with `{` is a full capability as JSON, which can carry constraints and run `limits` (`{"server":"banking","tool":"send_money","limits":{"calls":1,"sum":{"arg":"amount","max":100}}}`). Commands that print capabilities show limits after the constraints: `banking:send_money [calls <= 1, sum(amount) <= 100]`. `distinct` and a derived value work the same way: `--cap '{"server":"web","tool":"get_webpage","limits":{"distinct":{"arg":"url","derive":"host","max":2}}}'` prints as `web:get_webpage [distinct url#host <= 2]`. A limit kind or derivation the CLI does not know is refused before anything is sent. Constraints use the same JSON form as in a token, `{"op": ..., "value": ...}`; there is no separate `--constraint` flag. A `range` bounds an integer argument, both ends inclusive, either end optional: `--cap '{"server":"banking","tool":"send_money","constraints":{"amount":{"op":"range","value":{"min":0,"max":2000}}}}'` prints as `banking:send_money {0 <= amount <= 2000}` (`amount <= 2000` or `amount >= 0` with one bound). A range with no bound, `min` greater than `max`, a non-integer bound or a member other than `min` and `max` is refused before anything is sent. On exchange the child's range must sit inside the parent's, or the server answers `invalid_scope` (`exchange_widening`).
+- `--cap server:tool` is a capability. Globs are allowed. Repeat the flag, or comma-separate plain values. A value that starts with `{` is a full capability as JSON, which can carry constraints and run `limits` (`{"server":"banking","tool":"send_money","limits":{"calls":1,"sum":{"arg":"amount","max":100}}}`). Commands that print capabilities show limits after the constraints: `banking:send_money [calls <= 1, sum(amount) <= 100]`. `distinct` and a derived value work the same way: `--cap '{"server":"web","tool":"get_webpage","limits":{"distinct":{"arg":"url","derive":"host","max":2}}}'` prints as `web:get_webpage [distinct url#host <= 2]`. A limit kind or derivation the CLI does not know is refused before anything is sent. Constraints use the same JSON form as in a token, `{"op": ..., "value": ...}`; there is no separate flag for constraints. A `range` bounds an integer argument, both ends inclusive, either end optional: `--cap '{"server":"banking","tool":"send_money","constraints":{"amount":{"op":"range","value":{"min":0,"max":2000}}}}'` prints as `banking:send_money {0 <= amount <= 2000}` (`amount <= 2000` or `amount >= 0` with one bound). A range with no bound, `min` greater than `max`, a non-integer bound or a member other than `min` and `max` is refused before anything is sent. On exchange the child's range must sit inside the parent's, or the server answers `invalid_scope` (`exchange_widening`). A `path_prefix` holds a file path compared by `/` segment: `--cap '{"server":"fs","tool":"read_file","constraints":{"path":{"op":"path_prefix","value":"/workspace/"}}}'` prints as `fs:read_file {path is a path under "/workspace/"}`; a path with a `.` or `..` segment, `//`, a backslash, a control character or `%2e`, `%2f` or `%5c` is refused before anything is sent. `token root` and `token exchange` print `warning: ...` on stderr for a `prefix` on an argument that looks like a file path, and send the request anyway ([`prefix` or `path_prefix`](../concepts/capabilities-and-attenuation.md#prefixes-of-strings-and-of-paths)).
 - `--arg key=value` sets a string argument. `--arg key:=json` sets any JSON value, such as a number or an object.
 - `--attr key=value` follows the same rule for user attributes.
 
 ## Commands
 
+### `health`
+
+Check that the server is up: `GET /healthz`, or with `--ready`, `GET /readyz` ([health and readiness](../guides/deploying.md#health-and-readiness)). Needs no token. Prints `ok (attenuo-server <version>)` or `ready {...checks...}` and exits 0; exits 1 with `error: ...` on stderr when the server cannot be reached within the timeout, answers another status (for `/readyz`, the message names the failing check), or answers 200 with a body that is not attenuo's (another service on the port). It never exits 2, because Docker reserves that status for health checks. The release image's `HEALTHCHECK` is `attenuo --server http://127.0.0.1:8080 health`. Point it at the main listener: the admin listener (`[admin] listen`) has no `/healthz`.
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--ready` | off | Ask `/readyz` (audit log and lease store answer, the last audit append succeeded) instead of `/healthz`. |
+| `--timeout SECS` | `5` | Give up after this many seconds (1 to 300), connecting and answering together. |
+
+```sh
+attenuo --server http://127.0.0.1:8080 health            # liveness
+attenuo --server http://127.0.0.1:8080 health --ready    # readiness, for a load balancer or readinessProbe
+```
+
 ### `token root`
 
-Mint a root (hop 0) token. This uses the development endpoint, so it needs the admin token and `[dev] allow_root_mint = true` on the server.
+Mint a root (hop 0) token. This uses the development endpoint, so it needs the admin token and `[dev] allow_root_mint = true` on the server. Without the setting the route does not exist, and the `404` gets a line `hint: POST /admin/root-token exists only when the server's config sets [dev] allow_root_mint = true (development only); ...`. For a root token from a user's IdP credential, use `token exchange --subject-token-type id-token` instead ([Hop 0](#hop-0-from-an-id-token)).
 
 | Option | Meaning |
 | --- | --- |
 | `--subject` | The user the agent acts for. Required. |
 | `--issuer` | Issuer of the user's identity. Default `https://idp.example`. |
 | `--agent` | The root agent. Required. |
-| `--cap` | Capability to request. Omit to take the `[[root_grants]]` ceiling. |
+| `--cap` | Capability to request. Omit to take the `[[root_grants]]` ceiling. With `[[root_grants]]` set, two `--cap` under one limited capability of the entry are refused (`invalid_scope` / `limit_split_at_root`): ask for one capability with a `one_of` instead. |
 | `--ttl-seconds` | Requested lifetime. |
 | `--attr` | User attribute. Repeatable. |
 | `--may-act <AGENT>` | Only this agent may exchange the root token (RFC 8693 `may_act`). Repeatable, or comma-separated. Must be within the `[[root_grants]]` entry's `may_act` when it has one. Without it and without `--no-delegation` the grant's `may_act` applies; when the grant has none, or the server has no `[[root_grants]]`, the root token has no `may_act`, so any authenticated agent may exchange it. Values that are all empty are refused. |
@@ -74,26 +91,29 @@ Mint a root (hop 0) token. This uses the development endpoint, so it needs the a
 
 ### `token exchange`
 
-RFC 8693 exchange: delegate a subset of a token's capabilities to a sub-agent.
+RFC 8693 exchange: delegate a subset of a token's capabilities to a sub-agent. With `--subject-token-type id-token` or `id-jag` it is hop 0 instead: an agent trades a user's credential from an `[[idps]]` issuer for a root token (see [Hop 0](#hop-0-from-an-id-token)).
 
 | Option | Meaning |
 | --- | --- |
-| `--subject-token-file PATH` | Read the parent token from the first line of a file. |
-| `--subject-token <JWT\|->` (`ATTENUO_TOKEN`) | The parent token; `-` reads it from stdin. One of the flag, the file or `ATTENUO_TOKEN` is required. The flag with a literal token prints a warning. |
-| `--actor` | The sub-agent that will hold the new token. Required. |
+| `--subject-token-file PATH` | Read the parent token (at hop 0, the IdP credential) from the first line of a file. |
+| `--subject-token <JWT\|->` (`ATTENUO_TOKEN`) | The parent token (at hop 0, the IdP credential); `-` reads it from stdin. One of the flag, the file or `ATTENUO_TOKEN` is required. The flag with a literal token prints a warning. |
+| `--subject-token-type jwt\|id-token\|id-jag` | What the subject token is, sent as `subject_token_type`. `jwt` (the default, `urn:ietf:params:oauth:token-type:jwt`): an attenuo token, exchanged from hop n to hop n+1. `id-token` (`...:id_token`, an OIDC ID token) or `id-jag` (`...:id-jag`, an ID-JAG): hop 0. |
+| `--actor` | The sub-agent that will hold the new token; at hop 0, the agent presenting the credential. Required. |
 | `--client-secret-stdin` | Read the agent's client secret from the first line of standard input. |
 | `--client-secret-file PATH` | Read it from the first line of a file. |
 | `--client-secret` (`ATTENUO_CLIENT_SECRET`) | The agent's client secret, required when the server has `require_actor_auth` (the default). Prefer the environment variable, stdin or a file; the flag prints a warning. |
 | `--client-id` | Client id to authenticate with. Defaults to `--actor`. |
-| `--cap` | Capability to hand over. Required, repeatable. Must be covered by the parent. |
-| `--ttl-seconds` | Requested lifetime, clamped to the parent's expiry. |
+| `--client-key PATH` | Authenticate with `private_key_jwt` (RFC 7523) instead of a secret, for an agent whose `[[agents]]` entry has `jwks`: sign a client assertion with this private JWK (Ed25519 or P-256, as `key gen --client` writes). The assertion's `iss` and `sub` are the client id, its `kid` the file's, its `jti` fresh, and it lives one minute. Cannot be combined with the `--client-secret` forms; `ATTENUO_CLIENT_SECRET` is then ignored. |
+| `--client-assertion-audience ISSUER` | The assertion's `aud`, which must be the server's `[issuer] issuer`. Defaults to the subject token's `iss`; required at hop 0, where the subject token's `iss` is the IdP's. Needs `--client-key`. |
+| `--cap` | Capability to hand over. Required, repeatable. Must be covered by the parent; at hop 0, by the `[[root_grants]]` entry, and two `--cap` under one limited capability of the entry are refused (`invalid_scope` / `limit_split_at_root`): ask for one capability with a `one_of` instead. |
+| `--ttl-seconds` | Requested lifetime, clamped to the parent's expiry; at hop 0, to the credential's. |
 | `--actor-token <JWT\|->` | Authenticate `--actor` with an RFC 8693 actor token, such as a SPIFFE JWT-SVID from an `[[actor_trust]]` issuer, instead of a client secret. `-` reads it from stdin. Each token works for one exchange. |
 | `--actor-token-file <PATH>` | Read the actor token from a file, for example the JWT-SVID a SPIFFE helper writes. Cannot be combined with `--actor-token`. |
 | `--may-act <AGENT>` | Only this agent may exchange the new token (RFC 8693 `may_act`). Repeatable, or comma-separated. Without it and without `--no-delegation` the new token has no `may_act`, so any authenticated agent may exchange it; it does not inherit the parent's list. Values that are all empty are refused. |
 | `--no-delegation` | Send `may_act: []`: no agent may exchange the new token. Cannot be combined with `--may-act`. |
-| `--dpop-key PATH` | Bind the new token to this DPoP key. Required when the parent is bound. When the parent is bound to the same key, the proof also covers the parent. |
-| `--subject-token-dpop-file PATH` | The parent holder's sign-off (`subject_token_dpop`), made with `token sign-off` for this exchange's `--dpop-key` and `--actor`. Required when the parent is bound to a key other than `--dpop-key`. |
-| `--subject-dpop-key PATH` | Instead of `--subject-token-dpop-file`, when this process may hold the parent's key too: the sign-off is made here. Cannot be combined with `--subject-token-dpop-file`. |
+| `--dpop-key PATH` | Bind the new token to this DPoP key. Required when the parent is bound. When the parent is bound to the same key, the proof also covers the parent. At hop 0, required for an ID-JAG with a `cnf` key, which must be this key. |
+| `--subject-token-dpop-file PATH` | The parent holder's sign-off (`subject_token_dpop`), made with `token sign-off` for this exchange's `--dpop-key` and `--actor`. Required when the parent is bound to a key other than `--dpop-key`. Refused at hop 0. |
+| `--subject-dpop-key PATH` | Instead of `--subject-token-dpop-file`, when this process may hold the parent's key too: the sign-off is made here. Cannot be combined with `--subject-token-dpop-file`. Refused at hop 0. |
 | `--print token\|lease` | Print only that value. |
 
 ```sh
@@ -101,16 +121,26 @@ ATTENUO_TOKEN="$PARENT" attenuo token exchange --actor coder \
   --cap github:read_file --actor-token-file /run/spiffe/coder.jwt --may-act reviewer
 ```
 
+#### Hop 0 from an ID token
+
+With `--subject-token-type id-token` the subject token is a user's OIDC ID token, and the request is the hop-0 exchange of [Identity providers](../guides/identity-providers.md): `subject_token_type` `urn:ietf:params:oauth:token-type:id_token`, the capabilities as `authorization_details`, and the agent's credentials. The answer is a root token for the user and `--actor`. `--subject-token-type id-jag` sends an ID-JAG the same way (`...:id-jag`, as a token exchange; the CLI does not send the `jwt-bearer` grant). The server's rules for hop 0 apply: the agent always authenticates (client secret, `--client-key` or `--actor-token`), `--cap` must be within its `[[root_grants]]` entry (and, for an ID-JAG under `[idps.id_jag_ceiling]`, within what its claims leave of it), two `--cap` may not fall under one limited capability of the entry (`invalid_scope` / `limit_split_at_root`), a `--cap` under limited capabilities whose limits one capability cannot carry together is refused (`invalid_scope` / `limit_conflict_at_root`), the entry's `credentials` must list the credential's kind (`invalid_grant` / `credential_type_not_accepted`), `--may-act` and `--no-delegation` within the entry's `may_act`, and each credential mints one root token (a second use is `invalid_grant` / `replayed`). The sign-off flags are refused before anything is sent, since there is no parent token, and so is `--client-key` without `--client-assertion-audience`.
+
+```sh
+printf '%s\n' "$PLANNER_SECRET" | ATTENUO_TOKEN="$ID_TOKEN" attenuo token exchange \
+  --subject-token-type id-token --actor planner --client-secret-stdin \
+  --cap '{"server":"github","tool":"get_file_contents","constraints":{"repo":{"op":"prefix","value":"acme/"}}}'
+```
+
 A refused exchange that the server audited (its subject token verified) prints the record id under the error, as `decision <id>`, for `audit show --id`:
 
 ```text
-error: server answered 400 Bad Request: invalid_request: agent `reviewer` is not permitted to act on this token (may_act)
-decision 6685bd7f-cbb3-48e5-ab05-f2b8ceae9a61
+error: server answered 400 Bad Request: invalid_request (actor_not_permitted): agent `reviewer` is not permitted to act on this token (may_act)
+decision 6c65098c-383f-4119-8c0f-95ce3a384bdc
 ```
 
 ### `token sign-off`
 
-Made by the holder of a bound parent token, to consent to one exchange that binds the child to another key. Prints a proof by `--dpop-key` (the parent's key) for `POST` to the server's `/token`, with `ath` of the parent token and the claims `child_jkt` and `child_actor`; with `--json`, `{"subject_token_dpop": ...}`. The server accepts it only for an exchange whose `DPoP` key and `actor` are the ones it names, within `[token] dpop_max_age_seconds`, once. Hand it to the sub-agent, which passes it with `--subject-token-dpop-file`; the parent's key stays with the parent.
+Made by the holder of a bound parent token, to consent to one exchange that binds the child to another key. Prints a proof by `--dpop-key` (the parent's key) for `POST` to the server's `/token`, with `ath` of the parent token and the claims `child_jkt` and `child_actor`; with `--json`, `{"subject_token_dpop": ...}`. The server accepts it only for an exchange whose `DPoP` key and `actor` are the ones it names, within `[token] dpop_max_age_seconds`, once. Hand it to the sub-agent, which passes it with `token exchange --subject-token-dpop-file`; the parent's key stays with the parent.
 
 | Option | Meaning |
 | --- | --- |
@@ -120,19 +150,80 @@ Made by the holder of a bound parent token, to consent to one exchange that bind
 | `--actor AGENT` | The sub-agent that will make the exchange. Required. |
 
 ```sh
-attenuo token sign-off --subject-token "$ROOT" --dpop-key assistant.jwk \
+ATTENUO_TOKEN="$ROOT" attenuo token sign-off --dpop-key assistant.jwk \
   --child-jkt "$CODER_JKT" --actor coder > sign-off.txt
 ```
 
 ### `key gen --dpop <PATH>`
 
-Write a new Ed25519 DPoP key (RFC 9449) to `PATH` as a private JWK, mode 0600, and print its thumbprint (`jkt`, what a bound token's `cnf.jkt` will be). An existing file is never overwritten (exit code 1). Pass the file to `--dpop-key`; the Python and TypeScript SDKs read the same format. See [Binding tokens to keys](../guides/binding-tokens-to-keys.md).
+Write a new Ed25519 DPoP key (RFC 9449) to `PATH` as a private JWK, mode 0600, and print its thumbprint (`jkt`, what a bound token's `cnf.jkt` will be). An existing file is never overwritten (exit code 1). Pass the file to the command that uses the key (`token root --dpop-key`, `token exchange --dpop-key`, `call --dpop-key`); the Python and TypeScript SDKs read the same format. See [Binding tokens to keys](../guides/binding-tokens-to-keys.md).
 
 ```console
 $ attenuo key gen --dpop coder.jwk
 wrote DPoP key coder.jwk (EdDSA)
 jkt  4MMDxQj9pafXPrWH6dxBeoSk2DpHFpEZvXvsmr6JibU
 ```
+
+### `key gen --client <PATH> [--kid KID]`
+
+Write a new Ed25519 client key for `private_key_jwt` (RFC 7523) to `PATH` as a private JWK, mode 0600, and print the `jwks` line, with only its public half, to paste into the agent's `[[agents]]` entry (or a PEP's `[[peps]]` entry). The `kid` is `--kid`, or the key's RFC 7638 thumbprint. An existing file is never overwritten (exit code 1). Pass the file to `token exchange --client-key`; the SDKs read the same format. With `--json`: `{path, kid, alg, jwk}`. To rotate, generate a key with a new `kid`, add it to the entry's `jwks` next to the old one, restart, move the agent over, then remove the old key ([config](config.md#agents)).
+
+```console
+$ attenuo key gen --client coder-client.jwk --kid coder-2026-11
+wrote client key coder-client.jwk (EdDSA, kid coder-2026-11)
+add to the agent's [[agents]] (or the PEP's [[peps]]) entry:
+jwks = '''{"keys":[{"kty":"OKP","crv":"Ed25519","x":"…","kid":"coder-2026-11","alg":"EdDSA","use":"sig"}]}'''
+```
+
+### `admin operator new --name <NAME> --role <ROLE>` / `admin operator hash`
+
+Make the credential of a named admin operator ([ADR-0016](../decisions/0016-admin-operators.md)). Offline: nothing is written to disk and nothing is sent to a server.
+
+`admin operator new` generates a token from 32 random bytes (base64url, 43 characters) and prints it once on stdout, then a blank line, then the `[[admin.operators]]` entry for the server's config, which holds only the token's SHA-256. A two-line reminder goes to stderr. `--role` is `viewer`, `operator` or `admin` ([roles](config.md#admin)). `--name` is `[a-z0-9_-]{1,64}` and not `admin`; a name the server would refuse is refused here (exit code 1, nothing on stdout). `--expires-in <DURATION>` (a whole number and a unit, `s`, `m`, `h` or `d`: `90d`, `12h`; at most `3650d`) or `--expires-at <RFC3339>` (a time with an offset, in the future), not both, adds `expires_at` to the entry: from then on the server answers the token 401 `admin_credential_expired`. With `--json`, stdout is one object with `name`, `role`, `token`, `token_sha256`, `expires_at` (`null` without an expiry) and `toml` (the entry). Hand the token to the operator over a secure channel, add the entry to the config file and run [`admin operator reload`](#admin-operator-reload) (or restart the server).
+
+```console
+$ attenuo admin operator new --name alice --role operator
+q3J0bXk1Wm5hZ2FvN2dLc2l0bU9lQk1HWWJ0QkxzRmc
+
+[[admin.operators]]
+name = "alice"
+token_sha256 = "42a700cb2073e31b8140cd98dee7d52ab967d8331ede74514a895d9e41c5163f"
+role = "operator"
+The token above is shown once and is stored nowhere: give it to `alice` over a secure channel.
+Add the [[admin.operators]] entry to the server's config file, then run `attenuo admin operator reload` (or restart the server).
+```
+
+```console
+$ attenuo admin operator new --name contractor --role viewer --expires-in 30d
+…
+[[admin.operators]]
+name = "contractor"
+token_sha256 = "…"
+role = "viewer"
+expires_at = "2026-12-13T09:00:00Z"
+```
+
+`admin operator hash` reads a token from the first line of stdin and prints its `token_sha256` (`{"token_sha256": ...}` with `--json`), for a token made some other way. It cannot be combined with `--admin-token-stdin`.
+
+```sh
+openssl rand -base64 32 | tr '+/' '-_' | tr -d '=' | tee alice.token | attenuo admin operator hash
+```
+
+The operator then uses the token like any admin token (`ATTENUO_ADMIN_TOKEN`, `--admin-token-file`, `--admin-token-stdin`); a command whose route the operator's role does not reach exits 1 with `admin_role_insufficient`.
+
+### `admin operator reload`
+
+Ask the server to re-read `[[admin.operators]]` from the config file it was started with and put them in force without a restart (`POST /admin/operators/reload`, role `admin`). Prints the operators added, removed and changed (role, token or expiry), by name; `--json` prints the server's answer. Only the operators are re-read: `[admin] token` and the rest of the file are not reloaded. Use it to add an operator, to withdraw a leaked token (remove its entry, or give it an `expires_at` in the past, then reload), or to change a role.
+
+```console
+$ attenuo admin operator reload
+reloaded operators: 1 added, 1 removed, 1 changed
+  added    alice
+  removed  bob
+  changed  carol
+```
+
+A refusal exits 1 with the server's code, and the operators in force stay as they were: `operators_invalid` (the file is not TOML, or an entry breaks a [startup rule](config.md#adminoperators)), `operators_no_admin` (the new list would leave no unexpired credential with role `admin`, and there is no `[admin] token`), `reload_unavailable` (the server was not started from a config file), `config_unreadable` (the file cannot be read), or `admin_role_insufficient` (the token's role is below `admin`).
 
 ### `token inspect <JWT>`
 
@@ -154,16 +245,18 @@ Call a tool through the proxy (`tools/call`).
 | --- | --- |
 | `--token <JWT\|->` (`ATTENUO_TOKEN`) | Delegation token; `-` reads it from stdin. One of the flag, `--token-file` or `ATTENUO_TOKEN` is required. The flag with a literal token prints a warning. |
 | `--token-file PATH` | Read the delegation token from the first line of a file. |
-| `--dpop-key PATH` (`ATTENUO_DPOP_KEY`) | The DPoP key the token is bound to. Every request then carries a proof and `Authorization: DPoP`. Against a server with `[token] dpop_nonce = "required"` the CLI keeps the `DPoP-Nonce` the server sent, puts it in the proof, and sends a request once more when the server answers `use_dpop_nonce` (RFC 9449 §8); nonces are never printed or logged. Also on `tools` and `authzen eval`, and on `token root` and `token exchange`. |
-| `--server`, `--upstream` | MCP upstream name. Required. |
+| `--dpop-key PATH` (`ATTENUO_DPOP_KEY`) | The DPoP key the token is bound to. Every request then carries a proof and `Authorization: DPoP`. Against a server with `[token] dpop_nonce = "required"` the CLI keeps the `DPoP-Nonce` the server sent, puts it in the proof, and sends a request once more when the server answers `use_dpop_nonce` (RFC 9449 §8); nonces are never printed or logged. Also on `tools`, `authzen eval` and `authzen search`, and on `token root` and `token exchange`. |
+| `--upstream` | MCP upstream name. Required. (`--server` after `call` is a deprecated spelling.) |
 | `--tool` | Tool name. Required. |
 | `--arg` | Tool argument. Repeatable. |
+
+The text output prints the tool's text content with its line breaks and tabs, and every other control character escaped (`\u{1b}`, `\r`): the result, an error message and the fields of a denial come from the server or the upstream MCP server, and must not drive the terminal (SR-118). `--json` prints the answer as JSON, whose strings escape control characters anyway.
 
 A call that needs an approval prints `APPROVAL REQUIRED` followed by the approval id, its expiry, the call hash and the decision id, and exits 2, like a denial. Once the approval is granted, run the identical command again: it is allowed once.
 
 ### `tools`
 
-List the tools the token may see (`tools/list`). Takes `--token` (or `--token-file`, or `ATTENUO_TOKEN`) and `--server`.
+List the tools the token may see (`tools/list`). Takes `--token` (or `--token-file`, or `ATTENUO_TOKEN`) and `--upstream` (`--server` after `tools` is a deprecated spelling), and `--dpop-key PATH` (`ATTENUO_DPOP_KEY`) for a token bound to a key, as `call` does. Tool names and descriptions are the upstream's: the text output escapes their control characters, keeping a description's line breaks and tabs (SR-118).
 
 ### `lease revoke <ID> [--reason TEXT]`
 
@@ -208,7 +301,7 @@ Show a lease's state. Needs the admin token.
 
 ### `lease tree <ID> [--max-nodes N]`
 
-A dry run of `lease revoke`: shows what a revocation of `ID` would reach and changes nothing (`GET /admin/leases/{id}/tree`). Prints the lease's ancestors nearest first, then the lease and everything delegated from it as an indented tree. Each lease shows the agent it was issued to, its state (`active, expires ...`, `REVOKED <time> (<reason>)` or `expired ...`) and the audit `seq` that issued it. The last line is `would revoke N lease(s)`, the count a revoke sent now would return. `--max-nodes` caps the listing (server default 1000, at most 10000); when the cap cuts it short, a `truncated:` line says so, and `would revoke` still counts the whole subtree. Needs the admin token.
+A dry run of `lease revoke`: shows what a revocation of `ID` would reach and changes nothing (`GET /admin/leases/{id}/tree`). Prints the lease's ancestors nearest first, then the lease and everything delegated from it as an indented tree. Each lease shows the agent it was issued to, its state (`active, expires ...`, `REVOKED <time> (<reason>)` or `expired ...`) and the audit `seq` that issued it. The last line is `would revoke N lease(s)`, the count a revoke sent now would return. `--max-nodes` caps the listing (server default 1000, at most 10000); when the cap cuts it short, a `truncated:` line says so, and `would revoke` still counts the whole subtree. Needs the admin token. In the examples ids are shortened and times are cut to the second; the CLI prints them in full (`2026-10-23T22:13:22.418406557Z`).
 
 ```console
 $ attenuo lease tree 4cf28235-...
@@ -233,6 +326,18 @@ root lease (no ancestors)
         limit bank/send_money calls 1/2 (1 left)
         limit bank/send_money calls_per to 1/1 (0 left, 1 values)
         limit web/get_webpage distinct url#host 2/2 (0 left)
+would revoke 1 lease(s) if revoked now
+```
+
+The run's root lease (the first line when `ID` is the root, otherwise the last ancestor) also gets the per-user windows of the run's originating user ([run limits phase 3](../design/run-limits-phase3.md)), from the tree's `user_windows` member, after its budget lines: one `window <kind> <start> <server>/<tool>: <calls> calls, amount <amount>` line per tool the run used and window kind a loaded policy reads, with the window's start in UTC. The figures count every run of that user, not only this one. A run issued before the server kept the user's issuer (schema version 4) prints `user windows not recorded (lease issued before schema version 4)` instead; a run with no usage, or a deployment whose policies read no window, adds nothing, and so does a server older than the member. When the server's cap cut the list, a `user windows truncated: only N listed` line follows.
+
+```console
+$ attenuo lease tree 7a1c90e2-...
+root lease (no ancestors)
+7a1c90e2-...  planner  active, expires 2026-10-24T14:20:00Z  issued #1
+│    usage bank/send_money: 1 calls, amount 40, 1 destinations
+│    window day 2026-10-24T00:00:00Z bank/send_money: 3 calls, amount 120
+└─ 5e21d4b0-...  coder  active, expires 2026-10-24T14:20:00Z  issued #2
 would revoke 1 lease(s) if revoked now
 ```
 
@@ -266,16 +371,16 @@ Show the most recent audit entries, oldest of them first. Filters keep only matc
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `-n`, `--lines` | 20 | How many entries. |
-| `--before SEQ` | the head | Show the `-n` matching entries just below `SEQ` instead of the newest. To page back, pass the oldest `seq` shown. Not with `--follow`. |
+| `--before SEQ` | the head | Show the `-n` matching entries just below `SEQ` instead of the newest (the range `to=SEQ-1` of `GET /admin/audit`). To page back, pass the oldest `seq` shown. Not with `--follow`. |
 | `-f`, `--follow` | off | Keep polling for new matching entries. |
 | `--interval-ms` | 1000 | Polling interval with `--follow`. |
 | `--kind` | all | Record kind: `decision`, `tool_result`, `approval_request`, `approval_grant`, `exchange`, `root_token`, `lease_renew`, `lease_revoke` or `admin`. Repeatable, or comma-separated; any of them matches. |
-| `--decision` | all | `allow` or `deny`. |
+| `--decision` | all | `allow` or `deny`. It matches every kind whose record carries that decision: the `tool_result` record of an allowed call is `allow` too, so add `--kind decision` to get only decision records (for example to find the `id=` for `budget refund`). |
 | `--reason` | all | The record's `reason` (`policy_deny`, `lease_revoked`, ...). |
 | `--subject` | all | The originating user. |
 | `--agent` | all | An agent anywhere in the record's chain. |
 | `--lease` | all | A lease anywhere in the record's chain. |
-| `--server` | all | The MCP upstream the call went to. This `--server` comes after `audit tail`; the attenuo server URL is the global `--server` before the subcommand. |
+| `--upstream` | all | The MCP upstream the call went to (the record's `server`). `--server` after `audit tail` is a deprecated spelling; the attenuo server URL is the global `--server` before the subcommand. |
 | `--tool` | all | The tool. attenuo's own records use `token.root`, `token.exchange`, `lease.renew` and `admin.*`. |
 | `--chain-id` | all | The delegation chain (the lease id of its first hop). |
 | `--since`, `--until` | | RFC 3339 times: records with `at` in `[since, until)`. |
@@ -289,7 +394,7 @@ attenuo audit tail --tool token.exchange --reason exchange_widening
 attenuo audit show --id 6685bd7f-cbb3-48e5-ab05-f2b8ceae9a61
 ```
 
-The filters are the query parameters of `GET /admin/audit` (see [Querying the audit log](http-api.md#querying-the-audit-log)): exact matches, combined with AND. A bad kind, decision or time is refused before any request. The CLI reads newest first (`order=desc&before=N`) and keeps following `prev` until it has `-n` entries, because a filtered page can come back short, even empty, when the server stops scanning. `--follow` then reads forward from the head the same way, following `next`. With `--json` each entry is one JSON line.
+The filters are the query parameters of `GET /admin/audit` (see [Querying the audit log](http-api.md#querying-the-audit-log)): exact matches, combined with AND. A bad kind, decision or time is refused before any request. The CLI reads newest first (`order=desc`, with `to` for `--before`) and keeps following `next_cursor` until it has `-n` entries, because a filtered page can come back short, even empty, when the server stops scanning. `--follow` then reads forward with `from` just above the head, follows `next_cursor` while it is set, and polls again from above the last `seq` it read. With `--json` each entry is one JSON line.
 
 Every line starts with the sequence number and the time. Decisions, token issuance, lease and admin records show `ALLOW` or `DENY`, `server/tool`, the agents and user, the `reason` and the record id. Records that are not decisions show their kind where `ALLOW`/`DENY` would be, and the details of that kind in place of the reason. Shown here with ids and times shortened:
 
@@ -310,9 +415,9 @@ Every line starts with the sequence number and the time. Decisions, token issuan
 
 One entry with its context, from `GET /admin/audit/entries/{seq}` or, with `--id`, `GET /admin/audit/records/{id}` (the `decision_id` that denials and AuthZEN answers return). Prints the entry line as `audit tail` does, then the record's kind, chain, policies and hashes, the state of each lease in its chain now (root first; `unknown to the lease registry` for a lease the registry does not hold), the stored checkpoint that covers the entry (or that none does yet), and whether the policy was reloaded after it. A missing entry is a 404 and a malformed id a 400 (exit 1). `--json` prints the server's `{entry, lease_states, covered_by_checkpoint, policy_reloaded_after}`. Needs the admin token.
 
-### `audit checkpoints [--before SEQ] [--limit N]`
+### `audit checkpoints [--cursor CURSOR] [--limit N]`
 
-List stored checkpoints, newest first, one line each (`seq`, time, `kid`, head hash), from `GET /admin/audit/checkpoints`. When more are older, the last line gives the `--before` for the next page. Read-only: unlike `GET /admin/audit/checkpoint` it never signs a new checkpoint. `--limit` defaults to the server's 100, at most 1000. Needs the admin token.
+List stored checkpoints, newest first, one line each (`seq`, time, `kid`, head hash), from `GET /admin/audit/checkpoints`. When more are older, the last line is `older: audit checkpoints --cursor <next_cursor>` (with the `--limit` you gave, if any), the command for the next page. Read-only: unlike `GET /admin/audit/checkpoint` it never signs a new checkpoint. `--limit` defaults to the server's 100, at most 1000. Needs the admin token.
 
 ### `audit verify`
 
@@ -322,12 +427,12 @@ With `--file` it verifies an export offline instead and needs no admin token. Th
 
 | Option | Meaning |
 | --- | --- |
-| `--file <PATH>` | An export from `audit export` (JSON Lines, or the `--format json` object, format `attenuo-audit-export-v2`; older `v1` exports are refused). Re-hashes every entry, checks the links, verifies each checkpoint signature and its head hash. Fails a file that is shorter than the range in its header, one that holds entries outside it, and one with entries after its last valid checkpoint. A filtered export (`audit export --kind`, `--chain-id`, `--tool` or `--decision`) is refused with an error: its chain has gaps, so nothing shows it is complete. |
+| `--file <PATH>` | An export from `audit export` (JSON Lines, or the object of `audit export --format json`, format `attenuo-audit-export-v2`; older `v1` exports are refused). Re-hashes every entry, checks the links, verifies each checkpoint signature and its head hash. Fails a file that is shorter than the range in its header, one that holds entries outside it, and one with entries after its last valid checkpoint. A filtered export (`audit export --kind`, `--chain-id`, `--tool` or `--decision`) is refused with an error: its chain has gaps, so nothing shows it is complete. |
 | `--jwks <PATH>` | JWKS file with the issuer keys (what `/.well-known/jwks.json` returns). Without it, the JWKS is fetched from `--server`. Only with `--file`. |
 | `--checkpoints <PATH>` | Checkpoints shipped off the host by `[audit.sink]`: the file sink's JSON Lines, webhook bodies one per line, or bare checkpoint lines. Each one inside the export's range must equal the export's checkpoint at that `seq` and match the entry hash there; a checkpoint signed again after it was shipped, or deleted, is a mismatch (exit 2). Two different shipped checkpoints for one `seq` and shipped copies that do not verify against the JWKS are reported too. The Python SDK (`attenuo.audit.cross_check`) and the TypeScript SDK (`crossCheck`) report the same findings. With `--json` the report gains a `shipped` object (`in_range`, `matched`, `beyond_range`, `mismatches`) and the top-level `ok` covers both checks. Only with `--file`. |
 | `--allow-unsigned-tail` | Accept entries after the file's last valid checkpoint, which only the hash chain covers: an export taken while the log was ahead of its newest checkpoint. They are still reported (`unsigned_tail`). Entries outside the header's range fail either way. Only with `--file`. |
 
-To get an export that passes without the flag, sign the head first (`GET /admin/audit/checkpoint`) and export up to it, or export up to an existing checkpoint with `--to`.
+To get an export that passes without the flag, sign the head first (`GET /admin/audit/checkpoint`) and export up to it, or export up to an existing checkpoint with `audit export --to`.
 
 ### `audit export`
 
@@ -366,12 +471,12 @@ Dry run: what the loaded policies decide for one call (`POST /admin/policies/eva
 | --- | --- |
 | `--token <JWT\|->` (`ATTENUO_TOKEN`) / `--token-file PATH` | The delegation token whose chain makes the call. An expired token is accepted and reported as expired. |
 | `--chain-file PATH` | A delegation chain as JSON instead of a token. The server checks only its shape, so the answer says `admin supplied`. Not with `--token` or `--token-file`. |
-| `--server`, `--upstream` | MCP upstream name. Required. |
+| `--upstream` | MCP upstream name. Required. (`--server` after `policy evaluate` is a deprecated spelling.) |
 | `--tool` | Tool name. Required. |
 | `--arg` | Tool argument. Repeatable. |
 
 ```sh
-ATTENUO_TOKEN="$CODER" attenuo policy evaluate --server github --tool create_issue --arg repo=acme/api
+ATTENUO_TOKEN="$CODER" attenuo policy evaluate --upstream github --tool create_issue --arg repo=acme/api
 ```
 
 ### `policy test <FILE>...`
@@ -397,13 +502,16 @@ attenuo --server https://attenuo.internal policy test --via authzen --token-file
 With `--via admin-evaluate` the server also decides with its own policies, catalog and clock, but each case's own chain is sent (`subject.properties.chain`, checked by the server for shape and against its `max_depth`, not for having been issued by it), with the case's `session`, `approval`, `usage` and `budget` as the run's state. The route checks no lease, charges nothing and writes no audit record. So every case replays as written and none is skipped. A case's `budget` goes as the dry run's `budget` block, with only the members the case sets: limits in the case's chain that match the call are checked against it by the server's own limit check (`budget_exhausted` when spent, unlike offline, where `budget` only sets `context.budget`), and with no such limit Cedar sees the figures as given, as offline. The chain is stamped at the current time, because the server validates it at its own clock; an explicit `user.authenticated_at_unix` moves with it, keeping its distance from the file's `now`, and a `note:` says that `now` is not sent. A case without `session` or `usage` is sent as an untainted run with no usage, so nothing is read from the server's store. A case the server refuses with 400 (a chain deeper than its `max_depth`, an approval `by` other than `user`, `operator` or `policy`, a negative `budget` figure) is that case's error, reported as failed; any other refusal (a wrong admin token, a server without the route) or an unreachable server stops that file (exit 1). The unexercised list is computed against the test file's local `policies` file, as with `authzen`.
 
 ```sh
-attenuo --server https://attenuo.internal --admin-token-file /run/secrets/attenuo-admin \
+# --admin-server: the admin API's address, for a server that sets [admin] listen
+attenuo --admin-server http://127.0.0.1:9102 --admin-token-file /run/secrets/attenuo-admin \
   policy test --via admin-evaluate config/policies/default_test.yaml
 ```
 
 ### `policy lint <POLICY>`
 
 Parse a Cedar policy file and validate it against the generated schema. Prints errors with line and column. Exit 0 if clean, 2 if there are errors.
+
+With `--config`, it also reads the config's `[[root_grants]]` capabilities and prints `<config>: warning: [[root_grants]] ...` for each `prefix` constraint on an argument that looks like a file path, recommending `path_prefix` ([why](../concepts/capabilities-and-attenuation.md#prefixes-of-strings-and-of-paths)). These warnings do not change the exit code; `--json` lists them under `capability_warnings`. It does not run the server's start-up checks on `[[root_grants]]` (the reserved agent id, a capability that does not parse, a server or tool name that is not allowed, the size bounds, limits no token may carry): a configuration that passes `policy lint` can still refuse to start, and the server's message names the entry.
 
 | Option | Meaning |
 | --- | --- |
@@ -417,7 +525,7 @@ Approvals of gated calls, as the operator (admin token, `ATTENUO_ADMIN_TOKEN`).
 
 | Command | Does |
 | --- | --- |
-| `approval list [--chain-id ID] [--state pending\|granted\|declined\|consumed] [--limit N]` | `GET /admin/approvals`: one line per approval, newest first (id, state, call, run, expiry). `--limit` 1 to 500. |
+| `approval list [--chain-id ID] [--state pending\|granted\|declined\|consumed] [--limit N] [--cursor CURSOR \| --all]` | `GET /admin/approvals`: one line per approval, newest first (id, state, call, run, expiry). One page (`--limit` 1 to 500, server default 100); when more exist the last line is `more: approval list ... --cursor <next_cursor>, or --all`, the command for the next page with the filters and `--limit` you gave. `--all` follows the cursor and lists every match (`--json` then prints `{approvals, next_cursor: null}` with all of them). |
 | `approval show <ID>` | `GET /admin/approvals/{id}`: the exact call with its arguments, the call hash, user, agents, run and lease, the labels the run carried with their audit seqs, the times, and who decided. |
 | `approval grant <ID>` | `POST /admin/approvals/{id}` with `grant`. The agent's identical retry then runs once. Recorded as `by = "operator"`. |
 | `approval decline <ID>` | The same with `decline`. |
@@ -435,6 +543,54 @@ Ask the decision endpoint whether the token's chain may make a call, without mak
 | --- | --- | --- |
 | `--token <JWT\|->` (`ATTENUO_TOKEN`) | | Delegation token, sent as the bearer; `-` reads it from stdin. Or `--token-file PATH`. |
 | `--dpop-key PATH` (`ATTENUO_DPOP_KEY`) | | The DPoP key a bound token needs. |
-| `--server` | `github` | MCP server name. |
+| `--upstream` | `github` | MCP upstream name. (`--server` after `authzen eval` is a deprecated spelling.) |
 | `--tool` | | Tool name. Required. |
 | `--arg` | | Tool argument. Repeatable. |
+
+### `authzen search`
+
+List the tools of one MCP upstream that the token's chain may call with these arguments, without calling them: AuthZEN action search, `POST /access/v1/search/action` ([AuthZEN conformance](authzen.md#action-search)). The candidates are the tools the server's `[policy] catalog` lists for the upstream that the token's capabilities name. A search writes no audit record, charges no run limit and takes no approval, so an approval-gated tool is never listed.
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--token <JWT\|->` (`ATTENUO_TOKEN`) | | Delegation token, sent as the bearer; `-` reads it from stdin. Or `--token-file PATH`. |
+| `--dpop-key PATH` (`ATTENUO_DPOP_KEY`) | | The DPoP key a bound token needs. |
+| `--upstream` | `github` | MCP upstream name. |
+| `--arg` | | Argument every candidate is decided with, as `context.input`. Repeatable. |
+| `--limit N` | the server's `[authzen] max_batch` | How many catalogued tools one page evaluates (at least 1; a larger value is clamped by the server). A page can list fewer tools, even none, while more pages remain. |
+| `--page-token TOKEN` | | Ask for the page after the one that printed this token, with the same delegation token, server and arguments (`--limit` may change); otherwise 400 `invalid_cursor`. |
+| `--all` | | Follow the pages to the last one and print every result. Not with `--page-token`. |
+
+It prints one `<upstream>/<tool>` per line, then `next page: --page-token <token>` while more pages remain; `--json` prints `{"page": {"next_token", "count"}, "results"}` in the server's shape, with every page's results under `--all`. The exit status is 0 whether or not a tool is listed; a refused request (a bad token, `--upstream` naming one tool, a token the server did not issue) is 1.
+
+```sh
+attenuo authzen search --upstream github --arg repo=alice/public-docs --all
+```
+
+### `stdio-bridge --listen ADDR -- <COMMAND>...`
+
+Run a local STDIO MCP server as a child process and serve it as a Streamable HTTP MCP endpoint at `http://ADDR/mcp`, so that it can be an [`[[upstreams]]`](config.md#upstreams) entry of the proxy. The guide is [STDIO MCP servers](../guides/stdio-servers.md). Everything after `--` is the command and its arguments. The child inherits the bridge's environment, minus every variable whose name starts with `ATTENUO_` (the CLI's and the server's secrets, and the `ATTENUO__*` configuration overrides). Its stderr goes to the bridge's stderr. Once bound, the bridge prints `listening on http://ADDR/mcp` on stdout.
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--listen ADDR` | | IP address and port to serve on, for example `127.0.0.1:3001`. Port 0 picks a free one. Required. |
+| `--allow-non-loopback` | off | Accept a `--listen` address that is not loopback. Without it such an address is refused (exit 1). The bridge does not authenticate its callers: anyone who can reach it calls the STDIO server without attenuo. |
+| `--timeout SECS` | `90` | How long a request waits for the child's answer (1 to 3600). Past it the caller gets HTTP 504 and a JSON-RPC error `-32603` with its own id. A late answer is dropped. Keep it below the proxy's `upstream_response_timeout_seconds` (120 by default), so the bridge answers before the proxy gives up. |
+| `--max-request-bytes BYTES` | `4194304` (4 MiB) | Largest HTTP request body. A larger one is HTTP 413 and is not sent to the child. |
+| `--max-line-bytes BYTES` | `16777216` (16 MiB) | Longest line read from the child's stdout. A longer line is dropped with one line on stderr, and the request it answered times out. |
+| `--verbose` | off | One line on stderr for each message of the child the bridge drops or answers itself. |
+
+What the bridge does with each message:
+
+- A `POST` with a request is written to the child as one line, with its `id` replaced by a number unique to the bridge, and answered with the child's response (`200`, `application/json`) with the caller's `id` put back. Two callers that use the same id each get their own answer.
+- A `POST` with a notification is written to the child and answered `202` with no body. A `POST` with a response is answered `202` and dropped, because the bridge never passes the child's own requests on.
+- A batch (a JSON array) is refused with `400` and JSON-RPC `-32600`. So is a request whose `id` is not a string or a number. A body that is not JSON is `400` and `-32700`. A `Content-Type` other than `application/json` is `415`. A request with an `Origin` header is `403`: the proxy never sends one, and a browser always does.
+- `GET` and `DELETE` on the endpoint are `405`. There is no server-to-client stream and no `Mcp-Session-Id`: the child is one MCP session.
+- `initialize` is sent to the child once. A later `initialize` gets the child's first answer, with its own id, and is not sent on. Only the first `notifications/initialized` reaches the child.
+- The child's notifications (progress, log messages) are dropped. Its requests (sampling, elicitation, roots, ping) are answered at once with JSON-RPC `-32601`. A line that is not a JSON-RPC message is dropped. On exit the bridge prints how many of each it dropped.
+
+The child's arguments and environment are never printed; error messages name only the program. Exit status: 0 after SIGINT or SIGTERM; 1 when the child cannot be started, or exits or closes its stdout (the bridge does not restart it), or `--listen` is refused or in use. On the way out the bridge closes the child's stdin, waits up to 2 seconds for it to exit, then kills it. Processes the child started are not killed: one that does not exit when its stdin closes outlives the bridge (SR-135).
+
+```sh
+attenuo stdio-bridge --listen 127.0.0.1:3001 -- npx -y @modelcontextprotocol/server-filesystem /srv/docs
+```

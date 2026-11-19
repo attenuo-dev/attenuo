@@ -7,7 +7,7 @@ mod common;
 
 use std::process::{Command, Output};
 
-use attenuo_audit::LeaseStore;
+use attenuo_audit::RunState;
 use attenuo_core::LeaseId;
 use attenuo_proxy::session::{session_digest, session_tag};
 use attenuo_proxy::testing::spawn_router;
@@ -49,13 +49,10 @@ async fn lease_revoke_by_user_by_chain_and_by_session() {
         .into_owned();
     cfg.admin.token = Some(ADMIN.into());
     cfg.dev.allow_root_mint = true;
-    cfg.agents = vec![AgentConfig {
-        id: "coder".into(),
-        secret_sha256: {
-            use sha2::Digest;
-            hex::encode(sha2::Sha256::digest(b"coder-secret"))
-        },
-    }];
+    cfg.agents = vec![AgentConfig::with_secret_sha256("coder", {
+        use sha2::Digest;
+        hex::encode(sha2::Sha256::digest(b"coder-secret"))
+    })];
     let (router, state) = attenuo_server::build(&cfg).unwrap();
     let server = spawn_router(router).await.unwrap();
     let url = server.url("").trim_end_matches('/').to_string();

@@ -1,0 +1,31 @@
+{
+  "_note": "AuthZEN 1.0 section 8 (Action Search API): the bearer still verifies but its lease was revoked, so no action is permitted and results is empty, as each evaluation would be decision false with reason lease_revoked. Not an error.",
+  "token": {
+    "revoke": true
+  },
+  "steps": [
+    {
+      "path": "/access/v1/search/action",
+      "body": {
+        "subject": {
+          "type": "agent",
+          "id": ""
+        },
+        "resource": {
+          "type": "mcp_server",
+          "id": "github"
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "page": {
+            "next_token": "",
+            "count": 0
+          },
+          "results": []
+        }
+      }
+    }
+  ]
+}

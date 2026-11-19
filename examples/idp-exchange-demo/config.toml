@@ -1,0 +1,76 @@
+# attenuo-server config for the IdP exchange demo (see README.md).
+#
+# run.sh copies this file, rewrites the two ports, the mock IdP's issuer URL and the policy
+# path, and starts the server from the copy. Nothing here is secret: the admin token and agent
+# secrets are demo values that are accepted only because the server listens on loopback.
+
+[server]
+listen = "127.0.0.1:18091"
+
+[issuer]
+issuer = "http://127.0.0.1:18091"
+audience = "attenuo"
+default_ttl_seconds = 900
+# No key path: an ephemeral key per start, which is what a throwaway demo wants.
+
+[policy]
+policies_path = "examples/idp-exchange-demo/policy.cedar"
+
+[policy.catalog.github.get_file_contents]
+readonly = true
+inputs = { repo = "string", path = "string" }
+
+[policy.catalog.github.create_issue]
+inputs = { repo = "string", title = "string" }
+
+[audit]
+sqlite_path = ":memory:"
+
+[[upstreams]]
+name = "github"
+url = "http://127.0.0.1:13003/mcp"
+
+[admin]
+# A placeholder is accepted only because listen is loopback (the server warns). Never reuse it.
+token = "demo-admin-token"
+
+# The identity provider whose ID tokens start every chain. In this demo it is the mock IdP
+# (crates/attenuo-server/examples/mock_idp.rs) that run.sh starts on a free loopback port;
+# run.sh replaces the issuer below with its URL. attenuo reads the JWKS location from
+# <issuer>/.well-known/openid-configuration. Plain http:// is accepted only because the host is
+# loopback; a real IdP must be https://.
+[[idps]]
+issuer = "http://127.0.0.1:19001"
+# The planner runs inside the application alice logs in to, registered at the IdP as
+# "agent-platform": an ID token is accepted from the planner only when its `aud` says so.
+client_ids = { planner = "agent-platform" }
+allowed_algs = ["ES256"]
+attribute_claims = ["email", "amr"]
+
+# What the planner may hold for any user of that IdP: read files and open issues, both only
+# under acme/. may_act: only the coder may exchange the planner's token.
+[[root_grants]]
+issuer = "http://127.0.0.1:19001"
+agent = "planner"
+may_act = ["coder"]
+capabilities = [
+  { server = "github", tool = "get_file_contents", constraints = { repo = { op = "prefix", value = "acme/" } } },
+  { server = "github", tool = "create_issue", constraints = { repo = { op = "prefix", value = "acme/" } } },
+]
+
+# The agents authenticate as themselves on every /token request: the planner when it presents
+# alice's ID token, the coder when it receives the planner's delegation.
+# secret_sha256 = printf %s demo-planner-secret | sha256sum
+[[agents]]
+id = "planner"
+secret_sha256 = "f8f82239a8652a9aa55b00c919a7e74adb59e69badc440e2a5da7684ffee4786"
+
+# secret_sha256 = printf %s demo-coder-secret | sha256sum
+[[agents]]
+id = "coder"
+secret_sha256 = "f0f962bada9d92c8a30f5c55a388ce47d1074ddff4bfdb099ef67ad43003baeb"
+
+# The point of this demo: no dev shortcut. POST /admin/root-token is not mounted, so the only
+# way to a root token is POST /token with an ID token from the IdP above.
+[dev]
+allow_root_mint = false

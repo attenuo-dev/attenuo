@@ -1,0 +1,184 @@
+{
+  "_note": "AuthZEN 1.0 sections 8.2 and 10.1.2: refused searches are 400 with a specific code, before anything is evaluated. A page.token this route did not issue (invalid_cursor; here a well-formed cursor of another list), a page.limit of 0 or a page that is not an object (invalid_page), a resource that names a tool instead of a server (invalid_search_resource), and context.approval_token, which is spent only by the one decision it names (approval_token_not_accepted). A page.limit above [authzen] max_batch is clamped, not refused.",
+  "token": {},
+  "steps": [
+    {
+      "path": "/access/v1/search/action",
+      "body": {
+        "subject": {
+          "type": "agent",
+          "id": ""
+        },
+        "resource": {
+          "type": "mcp_server",
+          "id": "github"
+        },
+        "page": {
+          "token": "not a token"
+        }
+      },
+      "expect": {
+        "status": 400,
+        "body": {
+          "error": "invalid_cursor",
+          "code": "invalid_cursor",
+          "detail": "<any>"
+        }
+      }
+    },
+    {
+      "path": "/access/v1/search/action",
+      "body": {
+        "subject": {
+          "type": "agent",
+          "id": ""
+        },
+        "resource": {
+          "type": "mcp_server",
+          "id": "github"
+        },
+        "page": {
+          "token": "AQEBAAAAAAAAAAE"
+        }
+      },
+      "expect": {
+        "status": 400,
+        "body": {
+          "error": "invalid_cursor",
+          "code": "invalid_cursor",
+          "detail": "<any>"
+        }
+      }
+    },
+    {
+      "path": "/access/v1/search/action",
+      "body": {
+        "subject": {
+          "type": "agent",
+          "id": ""
+        },
+        "resource": {
+          "type": "mcp_server",
+          "id": "github"
+        },
+        "page": {
+          "limit": 0
+        }
+      },
+      "expect": {
+        "status": 400,
+        "body": {
+          "error": "invalid_request",
+          "code": "invalid_page",
+          "detail": "<any>"
+        }
+      }
+    },
+    {
+      "path": "/access/v1/search/action",
+      "body": {
+        "subject": {
+          "type": "agent",
+          "id": ""
+        },
+        "resource": {
+          "type": "mcp_server",
+          "id": "github"
+        },
+        "page": "first"
+      },
+      "expect": {
+        "status": 400,
+        "body": {
+          "error": "invalid_request",
+          "code": "invalid_page",
+          "detail": "<any>"
+        }
+      }
+    },
+    {
+      "path": "/access/v1/search/action",
+      "body": {
+        "subject": {
+          "type": "agent",
+          "id": ""
+        },
+        "resource": {
+          "type": "tool",
+          "id": "github/read_file"
+        }
+      },
+      "expect": {
+        "status": 400,
+        "body": {
+          "error": "invalid_request",
+          "code": "invalid_search_resource",
+          "detail": "<any>"
+        }
+      }
+    },
+    {
+      "path": "/access/v1/search/action",
+      "body": {
+        "subject": {
+          "type": "agent",
+          "id": ""
+        },
+        "resource": {
+          "type": "mcp_server",
+          "id": "github"
+        },
+        "context": {
+          "approval_token": "x"
+        }
+      },
+      "expect": {
+        "status": 400,
+        "body": {
+          "error": "invalid_request",
+          "code": "approval_token_not_accepted",
+          "detail": "<any>"
+        }
+      }
+    },
+    {
+      "path": "/access/v1/search/action",
+      "body": {
+        "subject": {
+          "type": "agent",
+          "id": ""
+        },
+        "resource": {
+          "type": "mcp_server",
+          "id": "github"
+        },
+        "page": {
+          "limit": 1000000
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "page": {
+            "next_token": "",
+            "count": 2
+          },
+          "results": [
+            {
+              "name": "create_issue",
+              "properties": {
+                "server": "github"
+              }
+            },
+            {
+              "name": "pay",
+              "properties": {
+                "server": "github"
+              }
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

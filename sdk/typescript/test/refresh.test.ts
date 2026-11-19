@@ -96,8 +96,8 @@ async function advance(x: Rig, ms: number): Promise<void> {
   await x.r.tick();
 }
 
-const apiError = (status: number, error: string, detail = "") =>
-  jsonResponse({ error, detail }, status);
+const apiError = (status: number, error: string, detail = "", code?: string) =>
+  jsonResponse(code === undefined ? { error, detail } : { error, code, detail }, status);
 
 describe("TokenRefresher", () => {
   it("renews at a third of the lease interval", async () => {
@@ -206,6 +206,22 @@ describe("TokenRefresher", () => {
     [apiError(400, "invalid_grant", "an ancestor lease is not live: lease_expired"), "lease_lost"],
     [apiError(401, "unauthorized", "token_expired"), "token_expired"],
     [apiError(401, "unauthorized", "invalid_token"), "refused"],
+    // A server that sends the lease reason as `code`: read it, whatever `detail` says.
+    [apiError(400, "invalid_grant", "lease_revoked", "lease_revoked"), "lease_revoked"],
+    [apiError(400, "invalid_grant", "gone", "lease_unknown"), "lease_revoked"],
+    [
+      apiError(400, "invalid_grant", "an ancestor lease is not live: x", "lease_expired"),
+      "lease_lost",
+    ],
+    [
+      apiError(400, "invalid_grant", "an ancestor lease is not live: x", "lease_revoked"),
+      "lease_revoked",
+    ],
+    // `code` wins over `detail` when they disagree.
+    [apiError(400, "invalid_grant", "lease_revoked", "lease_expired"), "lease_lost"],
+    // A server that sends the generic class as `code` still has the reason in `detail`.
+    [apiError(400, "invalid_grant", "lease_revoked", "invalid_grant"), "lease_revoked"],
+    [apiError(401, "unauthorized", "expired", "token_expired"), "token_expired"],
   ])("treats a renew refusal as terminal (%#)", async (resp, reason) => {
     const x = await rig({ ttl: 1000, interval: 30 });
     x.script.push(resp);

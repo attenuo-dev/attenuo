@@ -239,6 +239,23 @@ test('lease tree of the run and its revoke preview match `attenuo lease tree`', 
   await bothThemes('lease-tree');
 });
 
+test('lease page of the run: user windows match `attenuo lease tree`', async () => {
+  await c.go(`#/lease/${data.rootLease}`);
+  const panel = c.page.locator('section.panel', { has: c.page.locator('h2', { hasText: 'User windows' }) });
+  await panel.waitFor();
+  const { stdout } = cli(E, ['lease', 'tree', data.rootLease]);
+  const want = [...stdout.matchAll(/window (\S+) (\S+) (\S+): (\d+) calls, amount (\d+)/g)]
+    .map((m) => [m[3], m[1], m[2], m[4], m[5]]);
+  // The approved create_issue of alice's run was charged to her day window.
+  assert.ok(want.some((w) => w[0] === 'github/create_issue' && w[1] === 'day' && Number(w[3]) >= 1),
+    `the CLI shows alice's day window of create_issue:\n${stdout}`);
+  const got = [];
+  for (const row of await panel.locator('tbody tr').all()) got.push(await row.locator('td').allInnerTexts());
+  // Tool, Window, Start (UTC), Calls, Amount: the same lines as the CLI's.
+  assert.deepEqual(got, want);
+  await bothThemes('lease-user-windows');
+});
+
 test('leaving the page closes an open revoke dialog', async () => {
   await c.go(`#/lease/${data.rootLease}`);
   await c.page.locator('ul.leases').waitFor();
@@ -735,6 +752,45 @@ test('revoke by session on a console without allow_write: preview yes, revoke re
   } finally {
     await probe.close();
   }
+});
+
+test('audit explorer pages back and forward through the cursor without gaps', async () => {
+  // Grow the log past two pages (100 each): every policy reload appends one admin record.
+  let head = (await admin('/admin/audit?order=desc&limit=1')).head;
+  for (; head < 230; head++) {
+    const r = await fetch(`${E.server}/admin/policies/reload`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${E.adminToken}`, 'Content-Type': 'application/json' },
+      body: '{}',
+    });
+    assert.equal(r.status, 200, 'policy reload');
+  }
+  head = (await admin('/admin/audit?order=desc&limit=1')).head;
+  const seqCells = c.page.locator('#main table tbody tr td:first-child');
+  const seqs = async () => (await seqCells.allInnerTexts()).map(Number);
+  const range = (hi, n) => Array.from({ length: n }, (_, i) => hi - i);
+  const topIs = (seq) => c.page.locator('#main table tbody tr:first-child td:first-child', { hasText: new RegExp(`^${seq}$`) }).waitFor();
+  const button = (name) => c.page.getByRole('button', { name, exact: true });
+
+  await c.go('#/audit');
+  await topIs(head);
+  const newest = await seqs();
+  assert.deepEqual(newest, range(head, 100), 'the newest page');
+  assert.equal(await button('Newer').isDisabled(), true, 'nothing newer than the head');
+  await button('Older').click();
+  await topIs(head - 100);
+  assert.deepEqual(await seqs(), range(head - 100, 100), 'the next older page, no gap and no repeat');
+  await button('Older').click();
+  await topIs(head - 200);
+  assert.deepEqual(await seqs(), range(head - 200, head - 200), 'the oldest page reaches seq 1');
+  assert.equal(await button('Older').isDisabled(), true, 'nothing older than seq 1');
+  await button('Newer').click();
+  await topIs(head - 100);
+  assert.deepEqual(await seqs(), range(head - 100, 100), 'Newer comes back to the page above');
+  await button('Newest').click();
+  await topIs(head);
+  assert.deepEqual(await seqs(), newest);
+  await bothThemes('audit-paged');
 });
 
 test('the CSP violation recorder works (a deliberate inline style is reported)', async () => {

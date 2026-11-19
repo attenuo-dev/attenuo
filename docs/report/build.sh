@@ -13,7 +13,19 @@ src="$here/$name.md"
 html="$here/$name.html"
 pdf="$here/$name.pdf"
 css="$(mktemp --suffix=.css)"
-trap 'rm -f "$css"' EXIT
+links="$(mktemp --suffix=.lua)"
+trap 'rm -f "$css" "$links"' EXIT
+
+# The Markdown links to other docs relatively (../research/x.md), which the mdBook site
+# resolves. A PDF is read on its own, so point those links at the repository instead.
+cat >"$links" <<'LUA'
+local base = "https://github.com/attenuo-dev/attenuo/blob/main/docs/"
+function Link(el)
+  local rest = el.target:match("^%.%./(.*)$")
+  if rest then el.target = base .. rest end
+  return el
+end
+LUA
 
 cat >"$css" <<'CSS'
 @page { size: A4; }
@@ -43,11 +55,17 @@ pre {
 pre code { font-size: 1em; }
 table {
   border-collapse: collapse; margin: 0.8em auto; font-size: 0.82em; width: 100%;
-  break-inside: avoid; text-align: left;
+  text-align: left;
 }
-caption { caption-side: bottom; font-size: 0.95em; padding-top: 0.4em; text-align: left; }
+tr { break-inside: avoid; }
+thead { display: table-header-group; }
+img { break-inside: avoid; }
+p:has(> img) { break-after: avoid; }
+caption { caption-side: top; font-size: 0.95em; padding-bottom: 0.4em; break-after: avoid; text-align: left; }
 th, td { padding: 0.18em 0.5em; border-bottom: 1px solid #ccc; vertical-align: top; }
 thead th { border-bottom: 1.5px solid #444; }
+img { display: block; max-width: 100%; height: auto; margin: 0.9em auto 0.3em; }
+h3 { font-size: 1em; margin: 0.9em 0 0.3em; break-after: avoid; }
 a { color: #1a4d8f; text-decoration: none; word-break: break-word; }
 section.footnotes, ol li { word-break: break-word; }
 h1#references ~ ol { font-size: 0.86em; text-align: left; }
@@ -60,7 +78,9 @@ pandoc "$src" \
   --standalone \
   --number-sections \
   --embed-resources \
+  --resource-path "$here" \
   --css "$css" \
+  --lua-filter "$links" \
   --metadata lang=en \
   --output "$html"
 echo "wrote $html"

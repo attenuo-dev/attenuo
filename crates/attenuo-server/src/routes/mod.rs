@@ -4,13 +4,15 @@ pub mod admin;
 pub mod approvals;
 pub mod authzen;
 pub mod dev_root;
+pub mod extract;
 pub mod ops;
+pub mod page;
 pub mod policies;
 pub mod renew;
 pub mod token;
 pub mod wellknown;
 
-use attenuo_audit::{HopLimit, LeaseStore};
+use attenuo_audit::{HopLimit, LeaseRegistry, RunLimits};
 use attenuo_core::{Decision, DecisionRecord, DelegationChain, LeaseId, RecordKind, ToolCall};
 use axum::body::Bytes;
 use axum::http::{header, HeaderMap, HeaderValue};
@@ -20,6 +22,7 @@ use time::OffsetDateTime;
 
 use crate::error::{ApiError, REASON_INVALID_TOKEN};
 use crate::metrics::TokenKind;
+use crate::operators::AdminIdentity;
 use crate::state::AppState;
 
 /// Logical server name used in audit records for events the server itself performs.
@@ -62,11 +65,11 @@ pub(crate) fn no_store(headers: &mut HeaderMap) {
 }
 
 /// Register the lease of a token this server just minted, bind it to the token's chain, and
-/// record the chain's originating user (`LeaseStore::record_subject`) so the lease can be
+/// record the chain's originating user (`LeaseRegistry::record_subject`) so the lease can be
 /// revoked by user.
 ///
 /// The lease expiry is [`AppState::initial_lease_expiry`]. The binding is the digest of the
-/// chain exactly as the signed token carries it (`LeaseStore::bind`), so an AuthZEN body chain
+/// chain exactly as the signed token carries it (`LeaseRegistry::bind`), so an AuthZEN body chain
 /// can later be matched against what was issued (SR-08).
 pub(crate) fn register_issued(
     state: &AppState,
@@ -85,10 +88,13 @@ pub(crate) fn register_issued(
         .leases
         .register(lease, parent, state.initial_lease_expiry(now, token_exp))?;
     state.leases.bind(lease, &chain.digest())?;
-    // So that `POST /admin/leases/revoke` with `{"user": ...}` finds this lease.
-    state
-        .leases
-        .record_subject(lease, &chain.originating_user.subject)?;
+    // So that `POST /admin/leases/revoke` with `{"user": ...}` finds this lease, and the admin
+    // lease tree finds the run's per-user windows (keyed by issuer and subject).
+    state.leases.record_originating_user(
+        lease,
+        &chain.originating_user.issuer,
+        &chain.originating_user.subject,
+    )?;
     // Run limits (ADR-0010): keep the hop's limits as issued (after clamping), for the admin
     // console. Display only, so a failure is logged and the issuance stands.
     if let Some(hop) = chain.hops.last() {
@@ -116,9 +122,10 @@ pub(crate) fn register_issued(
 /// Prefix of subjects reserved for the server's own audit records. No user can have one:
 /// IdP intake and the dev root mint refuse a subject that starts with it (SR-34).
 pub const RESERVED_SUBJECT_PREFIX: &str = "urn:attenuo:";
-/// `originating_subject` of audit records for actions taken with the admin bearer. It starts
-/// with [`RESERVED_SUBJECT_PREFIX`], so no IdP user can produce records that look like admin
-/// actions (SR-34).
+/// `originating_subject` of audit records for actions taken with `[admin] token`, and the
+/// prefix of the subjects of named operators (`urn:attenuo:admin:<name>`,
+/// [`crate::operators::AdminIdentity::subject`]). It starts with [`RESERVED_SUBJECT_PREFIX`],
+/// so no IdP user can produce records that look like admin actions (SR-34).
 pub const ADMIN_SUBJECT: &str = "urn:attenuo:admin";
 /// Audit `reason` of a successful admin action.
 pub const REASON_ADMIN_ACTION: &str = "admin_action";
@@ -130,16 +137,20 @@ pub fn is_reserved_subject(subject: &str) -> bool {
         .is_some_and(|p| p.eq_ignore_ascii_case(RESERVED_SUBJECT_PREFIX))
 }
 
-/// Record an action taken with the admin bearer (lease revocation, policy reload, dev root
+/// Record an action taken by an admin credential (lease revocation, policy reload, dev root
 /// mint) in the audit log (SR-15).
 ///
 /// There is no delegation chain behind an admin request, so the record names
-/// `originating_subject` = [`ADMIN_SUBJECT`] (`urn:attenuo:admin`), no agents, depth 0 and
+/// `originating_subject` = the operator's subject ([`AdminIdentity::subject`]:
+/// `urn:attenuo:admin` for `[admin] token`, `urn:attenuo:admin:<name>` for a named operator),
+/// no agents, depth 0 and
 /// the chain digest of nothing (`sha256` of JSON `null`). `leases` holds the leases the action
 /// touched, `server` is `attenuo` and `tool` is `admin.<action>`; the arguments are stored as
 /// a digest as usual.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn audit_admin(
     state: &AppState,
+    actor: &AdminIdentity,
     tool: &str,
     decision: Decision,
     reason: &str,
@@ -159,7 +170,7 @@ pub(crate) fn audit_admin(
         chain_id: None,
         decision,
         reason: reason.to_string(),
-        originating_subject: ADMIN_SUBJECT.to_string(),
+        originating_subject: actor.subject(),
         agents: Vec::new(),
         chain_depth: 0,
         chain_digest: attenuo_core::digest::sha256_json(&Value::Null),

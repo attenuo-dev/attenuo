@@ -153,7 +153,10 @@ class ProxyDecisions:
         """The ``mcp`` package's HTTP client, with the hook installed."""
         from mcp.client import streamable_http
 
-        client = streamable_http.create_mcp_http_client(headers=headers)
+        # Re-exported there without __all__, so `mypy --strict` rejects the attribute when mcp
+        # is installed; Any keeps the check passing with and without it.
+        transport: Any = streamable_http
+        client = transport.create_mcp_http_client(headers=headers)
         hooks = client.event_hooks
         client.event_hooks = {
             "request": list(hooks.get("request", [])),
@@ -300,12 +303,12 @@ def main(argv: list[str] | None = None) -> int:
         ok = asyncio.run(run_dry(token, revoke, report))
     ob.close()
 
-    report = admin.audit_verify()
-    print(f"[audit] chain ok={report.ok}, {report.entries} entries")
+    verified = admin.audit_verify()
+    print(f"[audit] chain ok={verified.ok}, {verified.entries} entries")
     for e in admin.audit_tail(10):
         print(f"  #{e.seq} {e.decision:<5} {e.server}/{e.tool}  reason={e.reason}")
     admin.close()
-    good = ok and report.ok
+    good = ok and verified.ok
     print("RESULT: " + ("ok" if good else "FAILED"))
     return 0 if good else 1
 

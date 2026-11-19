@@ -17,6 +17,7 @@ In May 2025 researchers showed that a malicious issue in a public repository cou
 
 You need a Rust toolchain, `curl` and `python3`.
 
+<!-- check: skip clones the repository over the network; run.sh itself runs in CI job demo -->
 ```sh
 git clone https://github.com/attenuo-dev/attenuo.git
 cd attenuo
@@ -73,39 +74,44 @@ Only allowed calls reach the MCP server, and an allowed call is charged against 
 
 ## What it is not
 
-- **Not a replacement for your API gateway.** It does not do routing, rate limiting or general traffic management. Run limits count calls per delegation run, not requests per second. It can sit behind a gateway as the decision point through its AuthZEN endpoint. An adapter for any particular gateway has not been written or tested.
+- **Not a replacement for your API gateway.** It does not do routing or general traffic management. Its `[limits]` (an in-flight cap, request deadlines and optional per-caller rate limits) protect one attenuo process, not the services behind it, and run limits count calls per delegation run, not requests per second. It can sit behind a gateway as the decision point through its AuthZEN endpoint. One gateway adapter exists, for [agentgateway's external authorization](docs/guides/agentgateway.md); it has been run once against agentgateway v1.7.0, on one machine, on loopback.
 - **Not a prompt-injection detector.** It never reads prompts or model output. It limits what an agent that has already been fooled can do with the authority it was given. In the [injection suite](docs/evaluation/injection-suite.md), 15 of 77 attack calls in the development split still went through the base configuration, because they used a tool and arguments the task legitimately needed. Output labelling and run limits narrow that, but only by asking a person or by a limit someone has to choose for the task.
 - **Not a sandbox.** It only sees calls that go through it. If the agent also holds a direct API key or network path to the tool, attenuo sees nothing. See [what attenuo does not prevent](docs/spec/threat-model.md#what-attenuo-does-not-prevent).
 
+**Not affiliated with Tenuo.** [Tenuo](https://github.com/tenuo-ai/tenuo) is a separate open-source project with a similar name and a related goal. The two are unrelated. In Tenuo the holder of a warrant narrows it offline; in attenuo every narrowing is a token exchange at a server you run (RFC 8693), so a running chain can be revoked at once. attenuo also applies a Cedar policy to each call and keeps a hash-chained log of every decision. The [comparison](docs/comparison.md) puts the two side by side.
+
 ## Numbers
 
-All of these come from a shared 4-core development container, not a reference machine. Read them as indicative.
+All measured on a shared 4-core development container, so read them as indicative. Every figure, its caveats and its run are in [docs/numbers.md](docs/numbers.md).
 
-- **Injection suite.** The development split has 63 synthetic cases with 77 attack calls and 130 benign calls. With attenuo's tokens, suite policies and leases, 15 of the 77 attack calls got through, and 3 benign calls were refused by static suite policies. With output labelling added (a destructive call after an untrusted read needs an approval), 1 attack call got through without an approval, a read, at the price of 71 approval requests. Adding a uniform `calls: 1` limit to labelling also leaves 1, and the limit refuses 10 more benign calls in tasks that legitimately repeat a tool. With the run limit each task states written into its grant and no labelling, 7 attack calls got through and 4 benign calls were refused (1 of them by a limit), with no approval asked; those figures were written after reading the cases. On the 26 held-out test cases written after the policies were frozen (38 attack and 29 benign calls), the base configuration let 7 attack calls through and refused 3 benign calls, and labelling left 1 attack call, a read. Caveats: the call sequences are hand-written and no model is in the loop. The cases, the policies and the limits were written by the same author, and the approver is a script that knows which calls are attacks. So this checks the corpus against the code and does not measure effectiveness. See [injection-suite.md](docs/evaluation/injection-suite.md) and [run limits, section 7](docs/design/run-limits.md#7-measured).
-- **Latency added.** Through the real proxy with one client, attenuo added about 0.4 to 0.8 ms at the median (425 to 771 microseconds, one to three hops, in-memory or file-backed audit). Load was closed-loop and each cell is good to roughly plus or minus 20 percent. See [performance.md](docs/design/performance.md#after-the-policy-stage-and-wal-work). A `sum` limit adds about 0.8 to 1.0 ms at the median, because its charge is synced to disk ([run limits on the hot path](docs/design/performance.md#output-labelling-and-run-limits-on-the-hot-path-2026-10-24)). Measured on 2026-10-25, after security pass 5, a `calls` limit adds about 210 to 270 microseconds at the median ([bench note](docs/design/bench/2026-10-25-vm-per-value-limits.md)), a `calls_per` limit about 0.2 to 0.3 ms, `distinct` about 0.4 ms for a new value, and `distinct` on a list argument about 50 microseconds per new value per hop, about 35 ms at the 256-value cap ([per-value limits](docs/design/performance.md#per-value-limits-on-current-main-2026-10-25)).
-- **Policy stage.** A Cedar decision takes about 12 to 13 microseconds when the per-chain request cache hits and 122 to 163 microseconds when it does not (one and three hops, [criterion output](docs/design/bench/2026-10-23-vm-criterion-policy_stage.txt)). The cache keys on chain and tool, so the first call of a chain pays the uncached cost. See [performance.md](docs/design/performance.md#after-the-policy-stage-and-wal-work).
-- **AgentDojo.** Replaying each attack's tool calls with no model, 592 of 609 attacks landed without attenuo and 15 with grants derived from each task's known solution (an upper bound on what grants can do, not a realistic setting). With real models, no attack succeeded: four models (Haiku, Sonnet, Opus, Fable) on one sample without attenuo, and Haiku and Sonnet with attenuo on the workspace half. Those runs with attenuo therefore measure only its cost to task completion. See [the report](docs/report/attenuo-2026-11.md), section 5.2.
-- **Throughput.** With a file-backed audit log at `durability = "normal"` and one hop, the benchmark measured 1,252, 4,049 and 6,254 allowed calls per second at 1, 8 and 32 clients. That setting can lose the newest audit records on a power failure (up to five seconds or 256 commits). See [the run](docs/design/bench/2026-10-23-vm-policy-stage.md). Open-loop load was measured only for the allow call at one hop and for token exchange; repeated runs with confidence intervals and a quiet machine are listed in [performance.md](docs/design/performance.md#not-measured) as not measured.
+- **With a model that follows attacks** (AgentDojo, local `qwen2.5:14b`, grants written by a planner model): 207 of 936 attacks landed alone and 25 of 936 behind attenuo. The cost: with no attack, 38 instead of 49 of 96 tasks finished. One model, one run per case ([details](docs/evaluation/agentdojo-local-model.md)).
+- **Replay with no model** (AgentDojo's own attack calls): 592 of 609 attacks landed without attenuo, 13 of 609 with planner-written grants and the suite policy, keeping 75 of 97 benign tasks ([details](docs/evaluation/agentdojo-planner-grants.md)).
+- **Own injection suite, held-out split:** 7 of 38 attack calls got through and 3 of 29 benign calls were refused. The cases and the policies have the same author, so this checks the corpus against the code and does not measure effectiveness ([details](docs/evaluation/injection-suite.md)).
+- **Latency added:** about 0.4 to 0.8 ms at the median per proxied call with one client; a Cedar decision takes about 12 to 13 microseconds on a cache hit ([performance](docs/design/performance.md)).
+- **Throughput:** 1,252 to 6,254 allowed calls per second at 1 to 32 clients, one hop, file-backed audit log at `durability = "normal"`.
 
 ## Status
 
-attenuo is pre-alpha and has not been used in production. Release 0.1.0 is prepared but not tagged; its draft notes, upgrade notes and known limitations are in [docs/release/0.1.0.md](docs/release/0.1.0.md).
+attenuo is pre-alpha and has not been used in production. Release 0.1.0, the first, was tagged on 2026-11-19 ([release notes](docs/release/0.1.0.md)). The full account is in [docs/status.md](docs/status.md).
 
-- **Security review.** Ten review passes have been done in this repository, between 2026-10-22 and 2026-11-06: [pass 1](docs/research/security-review-2026-10-22.md), [3](docs/research/security-review-2026-10-23.md), [4](docs/research/security-review-2026-10-23-pass4.md), [5](docs/research/security-review-2026-10-24-pass5.md), [6](docs/research/security-review-2026-10-25-pass6.md), [7](docs/research/security-review-2026-10-25-pass7.md), [8](docs/research/security-review-2026-11-05-pass8.md), [9](docs/research/security-review-2026-11-06-pass9.md) and [10](docs/research/security-review-2026-11-06-pass10.md). Pass 2 was the fix round for pass 1. Together they recorded 101 findings, SR-01 to SR-101: none Critical, 5 High (all in pass 1), 19 Medium, 46 Low and 31 Info. Every finding is fixed or accepted with its reasoning in its report, except three Info findings still open: SR-83 (release toolchain pinning), SR-100 and SR-101. The project did all ten passes itself; there has been no outside audit.
-- **Tests and fuzzing.** On `main` at 9d715e8 (2026-11-06, #217), 1313 Rust tests passed with 7 ignored (`cargo test --workspace --locked`), 404 Python SDK tests (none skipped, integration tests included) and 259 TypeScript SDK tests (2 skipped: the examples need `npm install`). The last full `scripts/release-check.sh` run, on the 0.1.0 preparation branch (merged as d7f3889), also passed the injection suite's 47 checks (12 skipped without built binaries); see the [2026-10-24 log](docs/log/2026-10-24.md). There are [19 fuzz targets](docs/design/fuzzing.md) (tokens, DPoP, chains, capability attenuation, the proxy, SSE, audit export, since round 2 run-limit charges, budget plans, approval tokens, the usage walker and the server's HTTP routes, and since round 3 the proxy's SSE framing and data parsing). The [second campaign](docs/design/fuzzing.md#second-campaign-10-minutes-per-target-2026-10-23-evening) ran the first twelve for 10 minutes each, about 282 million inputs in all, with no crash. Those campaigns found five bugs (three in token and proxy handling, two in audit verification), and [round 2](docs/research/fuzzing-2026-10-24-round2.md#findings) found four more (FZ2-1 to FZ2-4, low or info), all fixed. [Round 3](docs/research/fuzz-round-3-2026-10-25.md) (300 s per target over the pass 7 SSE parsing) found none.
-- **Not tested.** Every identity-provider recipe (Keycloak, Auth0, Okta, Entra ID, Google, ID-JAG) is untested against a real provider; the server's tests use assertions it signs itself. The Docker setup is untested. There has been no production use and no load test on reference hardware.
+- **Tests and fuzzing.** Unit, property and integration tests in Rust and in both SDKs, the SDKs against a real server, and 22 fuzz targets with no open crash.
+- **Proof.** A Lean model of the covering rule proves that delegation never widens authority in the model. The Rust code is not verified against it; a differential test finds the two in agreement on 31,500 generated cases.
+- **Security review.** Twenty review passes recorded 138 findings; three Info findings are open (SR-117, SR-126, SR-135), the rest are fixed or accepted with reasons. All passes were done by the project itself. There has been no outside audit.
+- **Not tested.** Hosted identity providers (Auth0, Okta, Entra ID, Google), AWS S3, a production SPIRE or Keycloak, and the release workflow. No load test on reference hardware.
 
 ## Where to look
 
-- [Guides](docs/guides/README.md): [getting started](docs/guides/getting-started.md), [deploying](docs/guides/deploying.md), [integrating MCP clients](docs/guides/integrating-mcp-clients.md) and [identity providers](docs/guides/identity-providers.md).
+- [Guides](docs/guides/README.md): [getting started](docs/guides/getting-started.md), [deploying](docs/guides/deploying.md), [integrating MCP clients](docs/guides/integrating-mcp-clients.md), [identity providers](docs/guides/identity-providers.md) and [agentgateway as the enforcement point](docs/guides/agentgateway.md).
 - [FAQ](docs/faq.md): why a proxy, how it differs from gateways and policy engines, what happens when it is down.
 - [Comparison](docs/comparison.md): attenuo next to OAuth scopes, gateways, policy engines, IdP agent features and SPIFFE.
+- [Numbers](docs/numbers.md) and [status](docs/status.md) in full.
 - [RFC-0001: attenuo](docs/spec/rfc-0001-attenuo.md): what the system is, the token model, the policy and audit design.
-- [docs/](docs/README.md): specifications, architecture decisions, research notes, task board and engineering log.
+- [docs/](docs/README.md): specifications, architecture decisions, and research notes.
 - [Python SDK](sdk/python/README.md): `pip install -e sdk/python`, sync and async clients, an admin client, and an [agent example](examples/python-agent/agent.py).
 - [TypeScript SDK](sdk/typescript/README.md): `@attenuo/sdk` (Node 20+, no runtime dependencies), the same API with promises, and an [agent example](examples/typescript-agent/agent.ts).
 - [examples/github-leak-demo](examples/github-leak-demo/README.md): the demo from the top of this page.
 - [examples/multi-hop-demo](examples/multi-hop-demo/README.md): alice, a planner and a coder, each exchange narrower than the last, a run limit, and one revocation of the whole chain by `chain_id`.
+- [examples/idp-exchange-demo](examples/idp-exchange-demo/README.md): the chain starts at an identity provider: alice's OIDC ID token, from a local mock IdP, is exchanged at `POST /token` for the root token with the dev mint off, then narrowed for a coder.
 - [examples/claude-agent-sdk](examples/claude-agent-sdk/README.md) and [examples/langchain-agent](examples/langchain-agent/README.md): an orchestrator delegating to a coder sub-agent in the Claude Agent SDK and in LangChain, each hop with its own token, through the proxy. A `run.sh` dry-run needs no API key. All examples are listed in [examples/README.md](examples/README.md).
 - [docs/guides/writing-policies.md](docs/guides/writing-policies.md): writing Cedar policies for agents and testing them offline with `attenuo policy test` and `attenuo policy lint`, including a CI recipe.
 - [CONTRIBUTING.md](CONTRIBUTING.md): how to build, test and submit changes.
@@ -127,6 +133,7 @@ attenuo is pre-alpha and has not been used in production. Release 0.1.0 is prepa
 
 ## Building
 
+<!-- check: skip builds and tests the whole workspace, which CI job test does -->
 ```sh
 cargo build --workspace
 cargo test --workspace
@@ -136,17 +143,52 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the full set of checks CI runs.
 
 ## Run the server yourself
 
-Run the server with the example config. It generates an issuer key in `data/` on first start, keeps the audit log and lease registry in `data/attenuo.sqlite`, and proxies an MCP server expected at `http://127.0.0.1:3001/mcp` as `github` (edit `[[upstreams]]` to point at yours).
+<!-- scripts/check-doc-commands.sh README.md (CI job getting-started) runs every sh block of this page in order and compares its output with the text or json block right after it. Run it when you change a command or an output here. The "check:" comments before some blocks tell it how to run them. -->
 
+Run the server with the example config. It generates an issuer key in `data/` on first start, keeps the audit log and lease registry in `data/attenuo.sqlite`, and proxies an MCP server expected at `http://127.0.0.1:3001/mcp` as `github` (edit `[[upstreams]]` to point at yours, or start the repository's fake one there, as below). Build the server, the CLI and the fake MCP server (the commands below run them from `target/debug/`; use `$CARGO_TARGET_DIR/debug/` if you set it):
+
+<!-- check: build -->
 ```sh
 cargo build -p attenuo-server
-export ATTENUO_ADMIN_TOKEN=$(openssl rand -hex 32)   # the /admin bearer; overrides [admin] token
-cargo run -p attenuo-server -- --config config/example.toml   # or ATTENUO_CONFIG=config/example.toml
+cargo build -p attenuo-cli
+cargo build -p attenuo-proxy --features testing --example fake_mcp
 ```
 
-The example ships no admin token. On a loopback `listen` address a missing, short or placeholder token only produces a warning (and without one the admin routes answer 403); on any other address the server refuses to start unless the token is at least 32 bytes and not a published placeholder. Revocations, policy reloads and dev root mints are written to the audit log as admin actions.
+The flows below start from a root token. A deployment mints it from the user's identity provider ([hop 0](#hop-0-from-your-identity-provider)). To try them without one, run a copy of the example config with the development-only root mint switched on ([development only](#development-only-a-root-token-without-an-idp)), and pick an admin token:
 
-The flows below use `curl` and `jq`. [Getting started](docs/guides/getting-started.md) covers the same ground step by step.
+```sh
+mkdir -p data
+sed 's/^allow_root_mint = false/allow_root_mint = true/' config/example.toml > data/dev.toml
+export ATTENUO_ADMIN_TOKEN=$(openssl rand -hex 32)   # the /admin bearer; overrides [admin] token
+```
+
+Start the fake MCP server in one terminal:
+
+<!-- check: background -->
+```sh
+target/debug/examples/fake_mcp --port 3001
+```
+
+and attenuo in a second one, from the checkout, with the same `ATTENUO_ADMIN_TOKEN` exported:
+
+<!-- check: background -->
+```sh
+target/debug/attenuo-server --config data/dev.toml   # or ATTENUO_CONFIG=data/dev.toml
+```
+
+With an identity provider, run `config/example.toml` as it ships instead. The example ships no admin token. On a loopback `listen` address a missing, short or placeholder token only produces a warning (and without one the admin routes answer 403); on any other address the server refuses to start unless the token is at least 32 bytes and not a published placeholder, or named operators with their own tokens and roles are configured instead (`[[admin.operators]]`, `attenuo admin operator new`). Revocations, policy reloads and dev root mints are written to the audit log as admin actions, under the operator who took them.
+
+The flows below use `curl` and `jq`, in a third terminal with the same `ATTENUO_ADMIN_TOKEN`. [Getting started](docs/guides/getting-started.md) covers the same ground step by step.
+
+```sh
+SRV=http://127.0.0.1:8080
+ADMIN=$ATTENUO_ADMIN_TOKEN   # as the server got it
+curl -s $SRV/healthz
+```
+
+```json
+{"status":"ok","version":"0.1.0"}
+```
 
 ### Hop 0 from your identity provider
 
@@ -169,9 +211,8 @@ capabilities = ["github:*"]
 
 An ID token is accepted only from the agent whose `client_ids` entry its `aud` names (an agent without an entry must have a client id equal to its agent id). The agent exchanges the user's ID token for a root delegation token (RFC 8693), authenticating with its own client credentials. The token's originating user comes from the verified ID token: `sub`, `iss`, `auth_time`, the configured `attribute_claims`, and an `mfa` flag derived from `amr`.
 
+<!-- check: skip needs an ID token from a real identity provider; the next section mints the root token without one -->
 ```sh
-SRV=http://127.0.0.1:8080
-ADMIN=$ATTENUO_ADMIN_TOKEN   # see below
 ID_TOKEN=...   # from your IdP's login flow
 
 # 1. Exchange the user's ID token for a root token held by "planner".
@@ -183,46 +224,11 @@ ROOT=$(curl -s -X POST $SRV/token -u planner:planner-secret-change-me \
 ROOT_TOKEN=$(echo "$ROOT" | jq -r .access_token); ROOT_LEASE=$(echo "$ROOT" | jq -r .lease)
 ```
 
-For an ID-JAG, send `subject_token_type=urn:ietf:params:oauth:token-type:id-jag` (or `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer` with `assertion=`). Its `aud` must be `[issuer] issuer` and its `client_id` must be the authenticated agent. Failures come back as `invalid_client` (401), or as `invalid_grant` or `invalid_scope` (400), each with a stable `error_description` code such as `audience_mismatch`, `expired`, `unknown_kid` or `scope_exceeds_grant`.
-
-### Delegate, call, revoke
-
-```sh
-# 2. RFC 8693 exchange: planner delegates read_file only to a "coder" sub-agent. The coder
-#    authenticates as itself ([[agents]]); only it can receive a token in its name.
-CHILD_TOKEN=$(curl -s -X POST $SRV/token -u coder:coder-secret-change-me \
-  --data-urlencode grant_type=urn:ietf:params:oauth:grant-type:token-exchange \
-  --data-urlencode subject_token=$ROOT_TOKEN \
-  --data-urlencode subject_token_type=urn:ietf:params:oauth:token-type:jwt \
-  --data-urlencode actor=coder \
-  --data-urlencode scope=github:read_file | jq -r .access_token)
-
-# 3. Call through the proxy: read_file is allowed (forwarded upstream).
-mcp() { curl -s -X POST $SRV/mcp/github -H "Authorization: Bearer $CHILD_TOKEN" \
-  -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' -d "$1"; }
-mcp '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","arguments":{"repo":"acme/api"}}}'
-
-# 4. See a denial: the coder was never delegated create_issue.
-mcp '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"create_issue","arguments":{"repo":"acme/api","title":"x"}}}'
-# {"jsonrpc":"2.0","id":2,"error":{"code":-32003,"message":"attenuo: denied: capability_denied",...}}
-
-# 5. Revoke the ROOT lease; the revocation cascades to the coder's lease.
-curl -s -X POST $SRV/admin/leases/$ROOT_LEASE/revoke -H "Authorization: Bearer $ADMIN" \
-  -H 'content-type: application/json' -d '{"reason":"demo"}'
-# {"lease_id":"...","revoked":2,"reason":"demo","audit_id":"..."}
-
-# 6. The coder's next call is denied.
-mcp '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_file","arguments":{"repo":"acme/api"}}}'
-# ... "message":"attenuo: denied: lease_revoked" ...
-
-# Every decision and issuance is in the hash-chained audit log.
-curl -s $SRV/admin/audit/verify -H "Authorization: Bearer $ADMIN"   # {"entries":5,"ok":true,"first_bad_seq":null,"checkpoints":...,...}
-curl -s "$SRV/admin/audit?from=1&limit=20" -H "Authorization: Bearer $ADMIN" | jq '.entries[].record | {decision,reason,tool,agents}'
-```
+For an ID-JAG, send `subject_token_type=urn:ietf:params:oauth:token-type:id-jag` (or `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer` with `assertion=`). Its `aud` must be `[issuer] issuer` and its `client_id` must be the authenticated agent. The CLI sends the same exchange with `attenuo token exchange --subject-token-type id-token` (or `id-jag`; see the [CLI reference](docs/reference/cli.md#hop-0-from-an-id-token)). Failures come back as `invalid_client` (401), or as `invalid_grant` or `invalid_scope` (400), each with a stable `code` (also in `error_description`, deprecated as a machine field) such as `audience_mismatch`, `expired`, `unknown_kid` or `scope_exceeds_grant`.
 
 ### Development only: a root token without an IdP
 
-To try the flow without an identity provider, set `[dev] allow_root_mint = true`. This mounts `POST /admin/root-token`, which mints a root token for whichever user the admin names. Nothing about that user is verified, so the server logs a warning at startup. With the setting off (the default) the route does not exist and answers 404. Use it in place of step 1:
+`data/dev.toml` above sets `[dev] allow_root_mint = true` (`config/example.toml` ships with `false`). This mounts `POST /admin/root-token`, which mints a root token for whichever user the admin names. Nothing about that user is verified, so it is for local development only: the server logs a warning at startup, and refuses to start with the setting on when the admin API's listener (`[admin] listen` when set, else `[server] listen`) is not a loopback address. With the setting off (the default) the route does not exist and answers 404. Use it in place of step 1:
 
 ```sh
 ROOT=$(curl -s -X POST $SRV/admin/root-token -H "Authorization: Bearer $ADMIN" \
@@ -231,38 +237,165 @@ ROOT=$(curl -s -X POST $SRV/admin/root-token -H "Authorization: Bearer $ADMIN" \
 ROOT_TOKEN=$(echo "$ROOT" | jq -r .access_token); ROOT_LEASE=$(echo "$ROOT" | jq -r .lease)
 ```
 
-Other endpoints: `POST /token/renew` (extend your lease), `POST /access/v1/evaluation` and `/evaluations` (AuthZEN, single and batch; the delegation token as bearer is required unless `[authzen] allow_unsigned_chain` is set for authenticated `[[peps]]`), `GET /.well-known/jwks.json`, `GET /.well-known/authzen-configuration`, `POST /admin/policies/reload`, `GET /admin/leases/{id}`, `GET /admin/leases/{id}/tree`, `POST /approvals/{id}` (the user grants or declines with an ID token) and `/admin/approvals` (the operator does), `POST /admin/budgets/refund`, `GET /admin/audit/checkpoint` (signed), `GET /admin/audit/export`, `GET /healthz`, `GET /readyz`. The request pipeline is described in [docs/design/server.md](docs/design/server.md). Set `RUST_LOG=debug` for more logging.
+### Delegate, call, revoke
+
+RFC 8693 exchange: the planner delegates `read_file` only to a `coder` sub-agent. The coder authenticates as itself (`[[agents]]`); only it can receive a token in its name.
+
+```sh
+CHILD_TOKEN=$(curl -s -X POST $SRV/token -u coder:coder-secret-change-me \
+  --data-urlencode grant_type=urn:ietf:params:oauth:grant-type:token-exchange \
+  --data-urlencode subject_token=$ROOT_TOKEN \
+  --data-urlencode subject_token_type=urn:ietf:params:oauth:token-type:jwt \
+  --data-urlencode actor=coder \
+  --data-urlencode scope=github:read_file | jq -r .access_token)
+```
+
+Call through the proxy: `read_file` is allowed and forwarded upstream.
+
+```sh
+mcp() { curl -s -X POST $SRV/mcp/github -H "Authorization: Bearer $CHILD_TOKEN" \
+  -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' -d "$1"; }
+mcp '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","arguments":{"repo":"acme/api"}}}'
+```
+
+```json
+{"id":1,"jsonrpc":"2.0","result":{"content":[{"text":"{\"arguments\":{\"repo\":\"acme/api\"},\"name\":\"read_file\"}","type":"text"}],"isError":false}}
+```
+
+The fake server echoes the call. The proxy records the answer in the audit log as untrusted output: an argument of a later call in the run that copies a value from it is listed in that call's `untrusted_args`, as in the next answer.
+
+A denial: the coder was never delegated `create_issue`.
+
+```sh
+mcp '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"create_issue","arguments":{"repo":"acme/api","title":"x"}}}'
+```
+
+```json
+{"jsonrpc":"2.0","id":2,"error":{"code":-32003,"message":"attenuo: denied: capability_denied","data":{"reason":"capability_denied","decision_id":"86bdd6bf-1cce-4b77-9d3d-fa6fc2b4f0e7","untrusted_args":[{"arg":"repo","seq":5,"kind":"leaf"},{"arg":"repo","seq":5,"kind":"entity"}],"code":"capability_denied"}}}
+```
+
+Revoke the root lease. The revocation cascades to the coder's lease, and the coder's next call is denied.
+
+```sh
+curl -s -X POST $SRV/admin/leases/$ROOT_LEASE/revoke -H "Authorization: Bearer $ADMIN" \
+  -H 'content-type: application/json' -d '{"reason":"demo"}'
+```
+
+```json
+{"lease_id":"3cdebe33-0a21-45ee-aadb-5badd8e77f24","revoked":2,"reason":"demo","audit_id":"4e1f2c18-a341-4e2b-a4a8-ccc0f7c996b8"}
+```
+
+```sh
+mcp '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_file","arguments":{"repo":"acme/api"}}}'
+```
+
+```json
+{"jsonrpc":"2.0","id":3,"error":{"code":-32003,"message":"attenuo: denied: lease_revoked","data":{"reason":"lease_revoked","decision_id":"88b41a87-13fe-4dbb-8b11-3af7f7dfd8f9","code":"lease_revoked"}}}
+```
+
+Every decision and issuance is in the hash-chained audit log.
+
+```sh
+curl -s $SRV/admin/audit/verify -H "Authorization: Bearer $ADMIN"
+```
+
+```json
+{"entries":8,"ok":true,"first_bad_seq":null,"checkpoints":0,"last_signed_seq":null,"unsigned_tail":8,"bad_checkpoints":[]}
+```
+
+```sh
+curl -s "$SRV/admin/audit?from=1&limit=20" -H "Authorization: Bearer $ADMIN" | jq -c '.entries[].record | {decision,reason,tool,agents}'
+```
+
+```json
+{"decision":"allow","reason":"token_issued","tool":"token.root","agents":["planner"]}
+{"decision":"allow","reason":"admin_action","tool":"admin.root_token","agents":[]}
+{"decision":"allow","reason":"token_issued","tool":"token.exchange","agents":["planner","coder"]}
+{"decision":"allow","reason":"policy_allow","tool":"read_file","agents":["planner","coder"]}
+{"decision":"allow","reason":"tool_result","tool":"read_file","agents":["planner","coder"]}
+{"decision":"deny","reason":"capability_denied","tool":"create_issue","agents":["planner","coder"]}
+{"decision":"allow","reason":"admin_action","tool":"admin.lease.revoke","agents":[]}
+{"decision":"deny","reason":"lease_revoked","tool":"read_file","agents":["planner","coder"]}
+```
+
+Other endpoints: `POST /token/renew` (extend your lease), `POST /access/v1/evaluation`, `/evaluations` and `/search/action` (AuthZEN, single, batch and action search; the delegation token as bearer is required unless `[authzen] allow_unsigned_chain` is set for authenticated `[[peps]]`), `GET /.well-known/jwks.json`, `GET /.well-known/authzen-configuration`, `POST /admin/policies/reload`, `GET /admin/leases/{id}`, `GET /admin/leases/{id}/tree`, `POST /approvals/{id}` (the user grants or declines with an ID token) and `/admin/approvals` (the operator does), `POST /admin/budgets/refund`, `GET /admin/audit/checkpoint` (signed), `GET /admin/audit/export`, `GET /healthz`, `GET /readyz`. The request pipeline is described in [docs/design/server.md](docs/design/server.md). Set `RUST_LOG=debug` for more logging, `[logging] format = "json"` (or `ATTENUO_LOG_FORMAT=json`) for one JSON object per line, and `[logging] redact_subjects = true` to write user subjects into log lines as a keyed digest ([config reference](docs/reference/config.md#logging)).
 
 ## Command line
 
 `attenuo` (crate `attenuo-cli`) talks HTTP to a running server, so the quick start above becomes:
 
 ```sh
-cargo build -p attenuo-cli
 export ATTENUO_SERVER=http://127.0.0.1:8080   # and ATTENUO_ADMIN_TOKEN, as the server got it
 export PATH=$PWD/target/debug:$PATH   # or $CARGO_TARGET_DIR/debug
 
-attenuo token root --subject alice --issuer https://idp.example --agent planner --cap 'github:*'
-printf '%s\n' coder-secret-change-me | ATTENUO_TOKEN="$ROOT_TOKEN" attenuo token exchange --actor coder --client-secret-stdin --cap github:read_file
+# token root uses the dev mint: it needs [dev] allow_root_mint = true (data/dev.toml above; local
+# development only). With the example config as shipped it gets a 404.
+ROOT_JSON=$(attenuo --json token root --subject alice --issuer https://idp.example --agent planner --cap 'github:*')
+ROOT_TOKEN=$(echo "$ROOT_JSON" | jq -r .access_token); ROOT_LEASE=$(echo "$ROOT_JSON" | jq -r .lease)
+CHILD_TOKEN=$(printf '%s\n' coder-secret-change-me | ATTENUO_TOKEN="$ROOT_TOKEN" attenuo token exchange --actor coder --client-secret-stdin --cap github:read_file --print token)
 attenuo token inspect "$CHILD_TOKEN" --verify      # the chain as a tree; --verify checks it against the server's JWKS
-printf '%s\n' "$CHILD_TOKEN" | attenuo call --token - --server github --tool read_file --arg repo=acme/api
+```
+
+```text
+user alice  (issuer https://idp.example)
+  authenticated 2026-11-13T12:39:13Z
+  attributes mfa=false
+└─ agent planner
+     can   github:*
+     until 2026-11-13T12:54:13Z (in 14m 59s)
+     lease 54cd811d-a767-4487-b875-61cf6ea785c1
+   └─ agent coder  <- holds this token
+        can   github:read_file
+        until 2026-11-13T12:54:13Z (in 14m 59s)
+        lease 6ef1b201-6aec-4c2c-8b86-1165773cf251
+
+iss http://127.0.0.1:8080   aud attenuo   jti 41ef2119-6fd8-4ad8-b0c6-6aa5a7375bbf
+kid SIGySX_YgqyWpmQNxea9Cw   ou_kid SIGySX_YgqyWpmQNxea9Cw
+exp 2026-11-13T12:54:13Z (in 14m 59s)
+may_act (absent): any authenticated agent may exchange this token
+verified: signature, type, issuer, audience, expiry, chain
+```
+
+```sh
+printf '%s\n' "$CHILD_TOKEN" | attenuo call --token - --upstream github --tool read_file --arg repo=acme/api
 attenuo lease revoke "$ROOT_LEASE" --reason demo
-attenuo audit tail -n 10 --follow
 attenuo audit verify
 ```
 
-Other subcommands: `tools` (`tools/list`), `lease show`, `lease tree` (the delegation tree under a lease, with each hop's run limits and what is left), `approval` (list, show, grant and decline approvals), `budget refund` (give back what one decision charged, for a call whose effect did not happen), `policy reload`, `authzen eval`. Output is for people by default and JSON with `--json`. Exit status is 0 on success, 1 on an error and 2 when the server said no (a denied call, a negative AuthZEN decision, a broken audit chain). Secrets stay out of the argument list: use the environment variables, `-stdin` flags or `-file` flags described in the [CLI reference](docs/reference/cli.md).
+```text
+ALLOWED
+{"arguments":{"repo":"acme/api"},"name":"read_file"}
+revoked 2 lease(s) starting at 54cd811d-a767-4487-b875-61cf6ea785c1 (reason: demo)
+audit chain OK: 14 entries verified
+checkpoints: none signed yet
+```
 
-A `Dockerfile` and `docker-compose.yml` run the same pair of servers in containers (untested).
+The chain has 14 entries here because the `curl` flow above wrote the first 8. `audit tail` shows the newest; `--follow` keeps polling until Ctrl-C:
+
+```sh
+attenuo audit tail -n 3
+```
+
+```text
+#12   2026-11-13T12:39:13.679764325Z  ALLOW github/read_file  planner > coder for alice  reason=policy_allow  id=ac0c...
+#13   2026-11-13T12:39:13.687373923Z  tool_result  github/read_file  planner > coder for alice  decision=ac0c...  label=untrusted size=117  id=9f45...
+#14   2026-11-13T12:39:13.698017447Z  ALLOW attenuo/admin.lease.revoke  by urn:attenuo:admin  reason=admin_action  id=12be...
+```
+
+Other subcommands: `tools` (`tools/list`), `lease show`, `lease tree` (the delegation tree under a lease, with each hop's run limits and what is left), `approval` (list, show, grant and decline approvals), `budget refund` (give back what one decision charged, for a call whose effect did not happen), `policy reload`, `authzen eval`, `authzen search` (AuthZEN action search), `health` (the container health check), `stdio-bridge` (serve a local STDIO MCP server over HTTP so attenuo can front it, [guide](docs/guides/stdio-servers.md)), `key gen` (DPoP and client keys) and `admin operator` (named admin credentials, offline). Output is for people by default and JSON with `--json`. Exit status is 0 on success, 1 on an error and 2 when the server said no (a denied call, a negative AuthZEN decision, a broken audit chain). Secrets stay out of the argument list: use the environment variables, `-stdin` flags or `-file` flags described in the [CLI reference](docs/reference/cli.md).
+
+A `Dockerfile` and `docker-compose.yml` run the same pair of servers in containers: the release image for the server and a separate `demo` image for the fake GitHub server. `scripts/compose-smoke.sh` builds both and plays the scenario through them; see the [demo's README](examples/github-leak-demo/README.md#run-it-in-docker).
 
 ## Python SDK
 
-[`sdk/python`](sdk/python/README.md) is a Python client (`pip install -e sdk/python`, Python 3.10 or newer, depends on `httpx`) for agents written in Python: token exchange with typed capabilities, constraints and run limits, calls through the proxy that raise `Denied(reason, decision_id)` on a denial and `ApprovalRequired` when a policy asks for an approval (`call_tool_with_approval` waits for it and retries once), lease renewal, a token refresher that renews leases and re-exchanges before `exp`, AuthZEN evaluation, token inspection, and an admin client for revocation and the audit log. There is an async variant of each client. [`examples/python-agent`](examples/python-agent/agent.py) shows a planner delegating to a coder, with a run limit and an approval, and a second script wires the official `mcp` client to the proxy.
+[`sdk/python`](sdk/python/README.md) is a Python client (`pip install -e sdk/python`, Python 3.10 or newer, depends on `httpx`) for agents written in Python: token exchange with typed capabilities, constraints and run limits, calls through the proxy that raise `Denied(reason, decision_id)` on a denial and `ApprovalRequired` when a policy asks for an approval (`call_tool_with_approval` waits for it and retries once), lease renewal, a token refresher that renews leases and re-exchanges before `exp`, AuthZEN evaluation (single and batch), action search and discovery, granting or declining an approval as the run's user, closing a proxy session, token inspection, and an admin client for revocation, budget refunds and the audit log. A timeout raises `TransportTimeout`; a server refusing for its load raises `Unavailable` (503) or `RateLimited` (429), retried only with `max_retries`. There is an async variant of each client. [`examples/python-agent`](examples/python-agent/agent.py) shows a planner delegating to a coder, with a run limit and an approval, and a second script wires the official `mcp` client to the proxy.
 
 ```python
+import os
+
 from attenuo import AdminClient, Capability, Client, Denied, Prefix
 
-admin = AdminClient("http://127.0.0.1:8080", "dev-admin-token-change-me")
+admin = AdminClient("http://127.0.0.1:8080", os.environ["ATTENUO_ADMIN_TOKEN"])  # as the server got it
 root = admin.mint_root_dev("alice", "https://idp.example", "planner", ["github:*"])   # dev only
 with Client("http://127.0.0.1:8080") as ob:
     coder = ob.exchange(
@@ -279,12 +412,12 @@ It is pre-alpha like the rest and is not published to PyPI.
 
 ## TypeScript SDK
 
-[`sdk/typescript`](sdk/typescript/README.md) is the same client for Node 20 or newer as the npm package `@attenuo/sdk` (ESM and CJS, strict types, no runtime dependencies, global `fetch`, Ed25519 verification through WebCrypto): `AttenuoClient` for exchange (capabilities with `withLimits` for run limits), renew, `callTool` (throws `DeniedError` with `reason` and `decisionId`), `callToolWithApproval`, `listTools`, AuthZEN and `inspect`, and `AdminClient` for revocation, the audit log and policy reload. `TokenRefresher` keeps a token alive (lease renewal, re-exchange before `exp`). `mcpUrl` and `mcpHeaders` point the official `@modelcontextprotocol/sdk` client at the proxy. [`examples/typescript-agent`](examples/typescript-agent/agent.ts) shows a planner delegating to a coder, with a run limit and an approval.
+[`sdk/typescript`](sdk/typescript/README.md) is the same client for Node 20 or newer as the npm package `@attenuo/sdk` (ESM and CJS, strict types, no runtime dependencies, global `fetch`, Ed25519 verification through WebCrypto): `AttenuoClient` for exchange (capabilities with `withLimits` for run limits), renew, `callTool` (throws `DeniedError` with `reason` and `decisionId`), `callToolWithApproval`, `listTools`, AuthZEN (`authzenEvaluate`, `authzenEvaluateBatch`, `authzenSearchAction`, `authzenSearchActionIter`, `authzenConfiguration`), `grantApproval` / `declineApproval` for the run's user, `closeSession` and `inspect`, and `AdminClient` for revocation, budget refunds, the audit log and policy reload. A timeout throws `TransportTimeoutError`; a server refusing for its load throws `UnavailableError` (503) or `RateLimitedError` (429), retried only with `maxRetries`. `TokenRefresher` keeps a token alive (lease renewal, re-exchange before `exp`). `mcpUrl` and `mcpHeaders` point the official `@modelcontextprotocol/sdk` client at the proxy. [`examples/typescript-agent`](examples/typescript-agent/agent.ts) shows a planner delegating to a coder, with a run limit and an approval.
 
 ```ts
 import { AdminClient, DeniedError, AttenuoClient, capability, prefix } from "@attenuo/sdk";
 
-const admin = new AdminClient("http://127.0.0.1:8080", "dev-admin-token-change-me");
+const admin = new AdminClient("http://127.0.0.1:8080", process.env.ATTENUO_ADMIN_TOKEN!); // as the server got it
 const root = await admin.mintRootDev("alice", "https://idp.example", "planner", {
   capabilities: ["github:*"], // dev only
 });

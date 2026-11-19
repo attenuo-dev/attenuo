@@ -14,6 +14,9 @@ pub(super) const APPROVAL_COLUMNS: &str =
      decision_id, chain, created_at, expires_at, state, approver_subject, approver_method, \
      decided_at, consumed_by, jkt, untrusted_args";
 
+/// How many columns [`APPROVAL_COLUMNS`] names: the index of a column selected after them.
+pub(super) const APPROVAL_COLUMN_COUNT: usize = 19;
+
 pub(super) fn approval_from_row(r: &Row<'_>) -> Result<Approval, AuditError> {
     let text = |i: usize| -> Result<String, AuditError> { Ok(r.get::<_, String>(i)?) };
     let opt =
@@ -61,25 +64,6 @@ pub(super) fn approval_in(conn: &Connection, id: &str) -> Result<Option<Approval
     }
 }
 
-/// Add the `approvals` columns that came after the table: `jkt` (approval tokens) and
-/// `untrusted_args` (output labelling phase 2), each in the same release cycle as the table
-/// and never shipped without it, but cheap to carry. A missing value reads as `NULL`: an
-/// approval with no key binding, or with no matched arguments.
-pub(super) fn add_approval_columns(conn: &Connection) -> Result<(), AuditError> {
-    let cols: Vec<String> = conn
-        .prepare("SELECT name FROM pragma_table_info('approvals')")?
-        .query_map([], |r| r.get(0))?
-        .collect::<Result<_, _>>()?;
-    for column in ["jkt", "untrusted_args"] {
-        if !cols.iter().any(|c| c == column) {
-            conn.execute_batch(&format!(
-                "ALTER TABLE approvals ADD COLUMN {column} TEXT NULL"
-            ))?;
-        }
-    }
-    Ok(())
-}
-
 /// Approvals of one run for one call hash in one state. Expiry is compared in Rust: the
 /// stored times are RFC 3339 text, which does not sort as time across offsets.
 pub(super) fn approvals_for_call(
@@ -121,4 +105,14 @@ pub(super) fn pending_of_run(
         }
     }
     Ok(n)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn column_count_matches_the_column_list() {
+        assert_eq!(APPROVAL_COLUMNS.split(',').count(), APPROVAL_COLUMN_COUNT);
+    }
 }

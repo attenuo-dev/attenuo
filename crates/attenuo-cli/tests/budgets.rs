@@ -80,10 +80,7 @@ async fn refund_and_tree_budgets_against_a_real_server() {
     cfg.dev.allow_root_mint = true;
     cfg.agents = ["planner", "coder"]
         .iter()
-        .map(|id| AgentConfig {
-            id: (*id).into(),
-            secret_sha256: sha256_hex(&format!("{id}-secret")),
-        })
+        .map(|id| AgentConfig::with_secret_sha256(*id, sha256_hex(&format!("{id}-secret"))))
         .collect();
     let (router, _state) = attenuo_server::build(&cfg).unwrap();
     let server = spawn_router(router).await.unwrap();
@@ -108,7 +105,7 @@ async fn refund_and_tree_budgets_against_a_real_server() {
     let coder: Value = serde_json::from_str(&ok(&run(c).await)).unwrap();
     let mut c = attenuo();
     c.env("ATTENUO_TOKEN", coder["access_token"].as_str().unwrap())
-        .args(["--server", &url, "call", "--server", "github"])
+        .args(["--server", &url, "call", "--upstream", "github"])
         .args(["--tool", "read_file", "--arg", "repo=alice/docs"]);
     ok(&run(c).await);
     assert_eq!(upstream.recorded_calls().len(), 1);

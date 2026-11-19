@@ -11,7 +11,7 @@ use attenuo_core::{AgentId, Capability, CapabilitySet, OriginatingUser};
 use attenuo_core::{DelegationChain, LeaseId, ToolCall, UntrustedArg, UntrustedKind};
 use attenuo_policy::{ArgType, PolicyEngineBuilder, ToolAttrs, ToolCatalog, UsageContext};
 use serde_json::{json, Value};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use time::{Duration, OffsetDateTime};
 
 /// `ask_on_a_new_site` written against `resource.outbound`, so it needs no tool name.
@@ -62,7 +62,7 @@ fn pipeline(leases: Arc<dyn LeaseStore>, policy: &str) -> (Pipeline, Arc<MemoryA
         .build()
         .unwrap();
     let audit = Arc::new(MemoryAudit::new());
-    let p = Pipeline::new(Arc::new(RwLock::new(engine)), leases, audit.clone());
+    let p = Pipeline::new(Arc::new(SharedPolicy::new(engine)), leases, audit.clone());
     (p, audit)
 }
 
@@ -235,8 +235,8 @@ fn read_page(p: &Pipeline, c: &DelegationChain, now: OffsetDateTime) -> u64 {
 
 fn untrusted_outbound(p: &Pipeline, c: &DelegationChain, call: &ToolCall) -> bool {
     let run = p.run_labels(c);
-    let taint = p.arg_taint(c, call, &run.session);
-    let engine = p.policy().read().unwrap();
+    let taint = p.arg_taint(&p.policy_snapshot(), c, call, &run.session);
+    let engine = p.policy().snapshot();
     let attrs = engine.effective_attrs(&call.server, &call.tool).unwrap();
     attrs.untrusted_outbound(&taint.context.untrusted)
 }

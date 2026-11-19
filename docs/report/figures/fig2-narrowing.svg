@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 276" width="800" height="276" font-family="Helvetica, Arial, DejaVu Sans, sans-serif">
+<rect width="800" height="276" fill="#ffffff"/>
+<defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#1b1f23"/></marker><marker id="r" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#b5472f"/></marker></defs>
+<rect x="20" y="20" width="760" height="62" rx="6" fill="#eef1f4" stroke="#1b1f23" stroke-width="1.3"/>
+<text x="32" y="40" font-size="12.5" font-weight="600" fill="#1b1f23">User's grant to the orchestrator (hop 0)</text>
+<rect x="32.0" y="50" width="176.0" height="22" rx="4" fill="#ffffff" stroke="#1f8a7d" stroke-width="1.1"/>
+<text x="120.0" y="65" font-size="10.5" text-anchor="middle" fill="#1b1f23">github / *</text>
+<rect x="216.0" y="50" width="176.0" height="22" rx="4" fill="#ffffff" stroke="#1f8a7d" stroke-width="1.1"/>
+<text x="304.0" y="65" font-size="10.5" text-anchor="middle" fill="#1b1f23">repo: any</text>
+<rect x="400.0" y="50" width="176.0" height="22" rx="4" fill="#ffffff" stroke="#1f8a7d" stroke-width="1.1"/>
+<text x="488.0" y="65" font-size="10.5" text-anchor="middle" fill="#1b1f23">calls: no limit</text>
+<rect x="584.0" y="50" width="176.0" height="22" rx="4" fill="#ffffff" stroke="#1f8a7d" stroke-width="1.1"/>
+<text x="672.0" y="65" font-size="10.5" text-anchor="middle" fill="#1b1f23">expires 10:30</text>
+<rect x="90" y="112" width="620" height="62" rx="6" fill="#eef1f4" stroke="#1b1f23" stroke-width="1.3"/>
+<text x="102" y="132" font-size="12.5" font-weight="600" fill="#1b1f23">Orchestrator's grant to the coder (hop 1)</text>
+<rect x="102.0" y="142" width="141.0" height="22" rx="4" fill="#ffffff" stroke="#1f8a7d" stroke-width="1.1"/>
+<text x="172.5" y="157" font-size="10.5" text-anchor="middle" fill="#1b1f23">github / read_file</text>
+<rect x="251.0" y="142" width="141.0" height="22" rx="4" fill="#ffffff" stroke="#1f8a7d" stroke-width="1.1"/>
+<text x="321.5" y="157" font-size="10.5" text-anchor="middle" fill="#1b1f23">repo: prefix alice/public-</text>
+<rect x="400.0" y="142" width="141.0" height="22" rx="4" fill="#ffffff" stroke="#1f8a7d" stroke-width="1.1"/>
+<text x="470.5" y="157" font-size="10.5" text-anchor="middle" fill="#1b1f23">calls: at most 20</text>
+<rect x="549.0" y="142" width="141.0" height="22" rx="4" fill="#ffffff" stroke="#1f8a7d" stroke-width="1.1"/>
+<text x="619.5" y="157" font-size="10.5" text-anchor="middle" fill="#1b1f23">expires 10:15</text>
+<rect x="120" y="204" width="560" height="62" rx="6" fill="#eef1f4" stroke="#1b1f23" stroke-width="1.3"/>
+<text x="132" y="224" font-size="12.5" font-weight="600" fill="#1b1f23">Coder's grant to a helper (hop 2)</text>
+<rect x="132.0" y="234" width="126.0" height="22" rx="4" fill="#ffffff" stroke="#1f8a7d" stroke-width="1.1"/>
+<text x="195.0" y="249" font-size="10.5" text-anchor="middle" fill="#1b1f23">github / read_file</text>
+<rect x="266.0" y="234" width="126.0" height="22" rx="4" fill="#ffffff" stroke="#1f8a7d" stroke-width="1.1"/>
+<text x="329.0" y="249" font-size="10.5" text-anchor="middle" fill="#1b1f23">repo = alice/public-site</text>
+<rect x="400.0" y="234" width="126.0" height="22" rx="4" fill="#ffffff" stroke="#1f8a7d" stroke-width="1.1"/>
+<text x="463.0" y="249" font-size="10.5" text-anchor="middle" fill="#1b1f23">calls: at most 5</text>
+<rect x="534.0" y="234" width="126.0" height="22" rx="4" fill="#ffffff" stroke="#1f8a7d" stroke-width="1.1"/>
+<text x="597.0" y="249" font-size="10.5" text-anchor="middle" fill="#1b1f23">expires 10:05</text>
+<line x1="400" y1="82" x2="400" y2="110" stroke="#1b1f23" stroke-width="1.3" marker-end="url(#a)"/>
+<text x="412" y="101" font-size="10.5" text-anchor="start" fill="#1b1f23">exchange: accepted only if narrower</text>
+<line x1="400" y1="174" x2="400" y2="202" stroke="#1b1f23" stroke-width="1.3" marker-end="url(#a)"/>
+<text x="412" y="193" font-size="10.5" text-anchor="start" fill="#1b1f23">exchange: accepted only if narrower</text>
+</svg>

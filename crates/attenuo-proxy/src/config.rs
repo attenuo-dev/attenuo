@@ -29,12 +29,31 @@ impl UpstreamConfig {
     }
 }
 
+/// One server an external gateway may ask about at `/ext-authz/v1/mcp/{server}`
+/// (agentgateway's HTTP `extAuthz`; `docs/design/agentgateway-ext-authz.md`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtAuthzRoute {
+    /// The MCP server name the calls are decided for, as `name` is for an upstream.
+    pub server: String,
+    /// Lowercase hex SHA-256 of the secret the gateway sends in `X-Attenuo-Gateway-Secret`.
+    pub secret_sha256: String,
+    /// The URL the agent calls on the gateway, which a DPoP proof names in `htu`. `None`: a
+    /// request with a `DPoP` header is refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dpop_url: Option<String>,
+}
+
 /// Default for [`ProxyConfig::stream_recheck`].
 pub const DEFAULT_STREAM_RECHECK: Duration = Duration::from_secs(2);
 /// Default for [`ProxyConfig::max_upstream_body_bytes`]: 16 MiB.
 pub const DEFAULT_MAX_UPSTREAM_BODY_BYTES: usize = 16 * 1024 * 1024;
 /// Default for [`ProxyConfig::max_request_body_bytes`]: 4 MiB.
 pub const DEFAULT_MAX_REQUEST_BODY_BYTES: usize = 4 * 1024 * 1024;
+/// Default for [`ProxyConfig::upstream_connect_timeout`].
+pub const DEFAULT_UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Default for [`ProxyConfig::upstream_response_timeout`].
+pub const DEFAULT_UPSTREAM_RESPONSE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Everything the proxy needs to serve: its upstreams, its listen address, and its limits.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,6 +116,31 @@ pub struct ProxyConfig {
     /// `tools/list` (ADR-0011, see [`crate::screen`]).
     #[serde(default)]
     pub list_filter: ListFilterMode,
+    /// How long to wait for the connection to an upstream (TCP and TLS). Not connected in
+    /// time answers `502` with reason [`crate::proxy::REASON_UPSTREAM_UNREACHABLE`]: nothing
+    /// was sent. Default [`DEFAULT_UPSTREAM_CONNECT_TIMEOUT`].
+    #[serde(default = "default_upstream_connect_timeout")]
+    pub upstream_connect_timeout: Duration,
+    /// How long to wait, from sending a request, for the upstream's response headers, and for
+    /// the rest of a body the proxy buffers (a JSON answer it filters, labels or merges
+    /// replies into). Past it the answer is `504` with reason
+    /// [`crate::proxy::REASON_UPSTREAM_TIMEOUT`]. A body relayed as it arrives (SSE, the `GET`
+    /// listen stream) is never cut by it once the headers are in. Default
+    /// [`DEFAULT_UPSTREAM_RESPONSE_TIMEOUT`].
+    #[serde(default = "default_upstream_response_timeout")]
+    pub upstream_response_timeout: Duration,
+    /// The servers a gateway may ask about at `/ext-authz/v1/mcp/{server}`. Empty (the
+    /// default): the route is not mounted.
+    #[serde(default)]
+    pub ext_authz: Vec<ExtAuthzRoute>,
+}
+
+fn default_upstream_connect_timeout() -> Duration {
+    DEFAULT_UPSTREAM_CONNECT_TIMEOUT
+}
+
+fn default_upstream_response_timeout() -> Duration {
+    DEFAULT_UPSTREAM_RESPONSE_TIMEOUT
 }
 
 fn default_record_window() -> Duration {
@@ -151,7 +195,24 @@ impl ProxyConfig {
             record_window: crate::records::DEFAULT_RECORD_WINDOW,
             record_window_max_keys: crate::records::DEFAULT_RECORD_WINDOW_MAX_KEYS,
             list_filter: ListFilterMode::Capabilities,
+            upstream_connect_timeout: DEFAULT_UPSTREAM_CONNECT_TIMEOUT,
+            upstream_response_timeout: DEFAULT_UPSTREAM_RESPONSE_TIMEOUT,
+            ext_authz: Vec::new(),
         }
+    }
+
+    /// Set [`ProxyConfig::ext_authz`].
+    pub fn with_ext_authz(mut self, routes: Vec<ExtAuthzRoute>) -> Self {
+        self.ext_authz = routes;
+        self
+    }
+
+    /// Set [`ProxyConfig::upstream_connect_timeout`] and
+    /// [`ProxyConfig::upstream_response_timeout`].
+    pub fn with_upstream_timeouts(mut self, connect: Duration, response: Duration) -> Self {
+        self.upstream_connect_timeout = connect;
+        self.upstream_response_timeout = response;
+        self
     }
 
     /// Set [`ProxyConfig::list_filter`].

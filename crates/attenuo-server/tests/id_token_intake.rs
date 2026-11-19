@@ -7,7 +7,10 @@
 // Configs are built field by field from `Config::default()`, as in the other server tests.
 #![allow(clippy::field_reassign_with_default)]
 
+mod common;
+
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use attenuo_proxy::testing::{spawn_router, Spawned};
 use attenuo_server::config::{AgentConfig, CapSpec, IdpConfig, RootGrant};
@@ -127,6 +130,12 @@ impl EcIdp {
 }
 
 async fn server_trusting(idp: &EcIdp) -> Spawned {
+    let (router, _state) = attenuo_server::build(&config_trusting(idp)).unwrap();
+    spawn_router(router).await.unwrap()
+}
+
+/// `planner` may present ID tokens of `idp` for `github:*`.
+fn config_trusting(idp: &EcIdp) -> Config {
     let mut cfg = Config::default();
     cfg.idps = vec![IdpConfig {
         issuer: idp.issuer.clone(),
@@ -136,12 +145,16 @@ async fn server_trusting(idp: &EcIdp) -> Spawned {
         attribute_claims: vec![],
         jwks_ttl_seconds: 300,
         clock_skew_seconds: 60,
+        tenant: None,
+        id_jag_ceiling: None,
+        credentials: attenuo_server::config::DEFAULT_IDP_CREDENTIALS.to_vec(),
+        ca_pem_path: None,
         client_ids: BTreeMap::from([("planner".to_string(), CLIENT_AUD.to_string())]),
     }];
-    cfg.agents = vec![AgentConfig {
-        id: "planner".into(),
-        secret_sha256: hex::encode(Sha256::digest(PLANNER_SECRET.as_bytes())),
-    }];
+    cfg.agents = vec![AgentConfig::with_secret_sha256(
+        "planner",
+        hex::encode(Sha256::digest(PLANNER_SECRET.as_bytes())),
+    )];
     cfg.root_grants = vec![RootGrant {
         subject: None,
         issuer: idp.issuer.clone(),
@@ -150,11 +163,14 @@ async fn server_trusting(idp: &EcIdp) -> Spawned {
         attributes: BTreeMap::new(),
         may_act: None,
     }];
-    let (router, _state) = attenuo_server::build(&cfg).unwrap();
-    spawn_router(router).await.unwrap()
+    cfg
 }
 
 async fn intake(server: &Spawned, id_token: &str) -> (StatusCode, Value) {
+    intake_at(&server.url("/token"), id_token).await
+}
+
+async fn intake_at(token_url: &str, id_token: &str) -> (StatusCode, Value) {
     let body = serde_urlencoded::to_string([
         ("grant_type", EXCHANGE),
         ("subject_token", id_token),
@@ -165,7 +181,7 @@ async fn intake(server: &Spawned, id_token: &str) -> (StatusCode, Value) {
     ])
     .unwrap();
     let resp = reqwest::Client::new()
-        .post(server.url("/token"))
+        .post(token_url)
         .header("content-type", "application/x-www-form-urlencoded")
         .body(body)
         .send()
@@ -229,6 +245,10 @@ async fn server_with_two_clients(idp: &EcIdp) -> Spawned {
         attribute_claims: vec![],
         jwks_ttl_seconds: 300,
         clock_skew_seconds: 60,
+        tenant: None,
+        id_jag_ceiling: None,
+        credentials: attenuo_server::config::DEFAULT_IDP_CREDENTIALS.to_vec(),
+        ca_pem_path: None,
         client_ids: BTreeMap::from([
             ("planner".to_string(), "planner-app".to_string()),
             ("coder".to_string(), "coder-app".to_string()),
@@ -237,10 +257,7 @@ async fn server_with_two_clients(idp: &EcIdp) -> Spawned {
     let secret = |id: &str| hex::encode(Sha256::digest(format!("{id}-secret").as_bytes()));
     cfg.agents = ["planner", "coder", "reviewer"]
         .iter()
-        .map(|id| AgentConfig {
-            id: (*id).into(),
-            secret_sha256: secret(id),
-        })
+        .map(|id| AgentConfig::with_secret_sha256(*id, secret(id)))
         .collect();
     cfg.root_grants = ["planner", "coder", "reviewer"]
         .iter()
@@ -336,4 +353,120 @@ async fn without_client_ids_the_agent_id_is_the_default_audience() {
         body["error_description"], "credential_audience_mismatch",
         "{body}"
     );
+}
+
+/// The server's config of [`config_trusting`] on a database file in `dir`.
+fn config_on_file(idp: &EcIdp, dir: &tempfile::TempDir) -> Config {
+    let mut cfg = config_trusting(idp);
+    cfg.audit.sqlite_path = dir
+        .path()
+        .join("attenuo.sqlite")
+        .to_string_lossy()
+        .into_owned();
+    cfg
+}
+
+async fn start_on(cfg: &Config) -> (common::Running, Arc<attenuo_server::AppState>) {
+    let (router, state) = attenuo_server::build(cfg).unwrap();
+    (
+        common::Running::start(cfg.clone(), state.clone(), router).await,
+        state,
+    )
+}
+
+/// How many single-use markers the database file holds.
+fn markers(state: &attenuo_server::AppState) -> i64 {
+    state
+        .leases
+        .with_connection(|c| {
+            Ok(c.query_row("SELECT COUNT(*) FROM used_credentials", [], |r| r.get(0))?)
+        })
+        .unwrap()
+}
+
+/// Hop-0 hardening: an ID token redeemed before a restart is still redeemed after it, on the
+/// same database file, both when it is keyed by (`iss`, `jti`) and when it has no `jti` and is
+/// keyed by its digest. Before, the replay cache was in memory and a restart forgot it, so the
+/// same login minted a second root token until it expired. A fresh token still works.
+#[tokio::test]
+async fn an_id_token_redeemed_before_a_restart_is_refused_after_it() {
+    let idp = EcIdp::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config_on_file(&idp, &dir);
+    let without_jti = idp.id_token("alice");
+    let with_jti = idp.id_token_aud("alice", json!(CLIENT_AUD), None, 1);
+
+    let (server, state) = start_on(&cfg).await;
+    for token in [&without_jti, &with_jti] {
+        let (status, body) = intake_at(&server.url("/token"), token).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    assert_eq!(markers(&state), 2);
+    server.stop(state).await;
+
+    let (server, state) = start_on(&cfg).await;
+    assert_eq!(markers(&state), 2, "the markers are in the file");
+    for token in [&without_jti, &with_jti] {
+        let (status, body) = intake_at(&server.url("/token"), token).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "invalid_grant", "{body}");
+        assert_eq!(body["error_description"], "replayed", "{body}");
+    }
+    let fresh = idp.id_token_aud("alice", json!(CLIENT_AUD), None, 2);
+    let (status, body) = intake_at(&server.url("/token"), &fresh).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    server.stop(state).await;
+}
+
+/// Several redemptions of one ID token at the same moment, on the file store: exactly one
+/// mints a root token, every other one is a replay.
+#[tokio::test]
+async fn simultaneous_redemptions_of_one_id_token_mint_one_root_token() {
+    let idp = EcIdp::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config_on_file(&idp, &dir);
+    let (server, state) = start_on(&cfg).await;
+    let url = server.url("/token");
+    for round in 0..3 {
+        let token = idp.id_token_aud("alice", json!(CLIENT_AUD), None, 100 + round);
+        let tasks: Vec<_> = (0..8)
+            .map(|_| {
+                let (url, token) = (url.clone(), token.clone());
+                tokio::spawn(async move { intake_at(&url, &token).await })
+            })
+            .collect();
+        let mut ok = 0;
+        for t in tasks {
+            let (status, body) = t.await.unwrap();
+            if status == StatusCode::OK {
+                ok += 1;
+            } else {
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+                assert_eq!(body["error_description"], "replayed", "{body}");
+            }
+        }
+        assert_eq!(ok, 1, "round {round}");
+    }
+    server.stop(state).await;
+}
+
+/// A marker that cannot be written refuses the redemption: 503 `temporarily_unavailable`,
+/// `replay_store_unavailable`, and no token.
+#[tokio::test]
+async fn an_id_token_whose_use_cannot_be_recorded_is_refused() {
+    let idp = EcIdp::start().await;
+    let (router, state) = attenuo_server::build(&config_trusting(&idp)).unwrap();
+    let server = spawn_router(router).await.unwrap();
+    state
+        .leases
+        .with_connection(|c| Ok(c.execute_batch("DROP TABLE used_credentials")?))
+        .unwrap();
+    let (status, body) = intake(&server, &idp.id_token("alice")).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["error"], "temporarily_unavailable", "{body}");
+    assert_eq!(
+        body["error_description"], "replay_store_unavailable",
+        "{body}"
+    );
+    assert!(body.get("access_token").is_none(), "{body}");
 }

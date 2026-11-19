@@ -1,5 +1,7 @@
 # Getting started
 
+<!-- scripts/check-getting-started.sh (CI job getting-started) runs every sh block of this page in order and compares its output with the text or json block right after it. Run it when you change a command or an output here. The "check:" comments before some blocks tell it how to run them. -->
+
 This guide takes you from a fresh checkout to a working proxy. You build attenuo, start it in front of an MCP server, mint a token, make an allowed call and a denied call, revoke the token, and read the audit log. It takes about ten minutes, most of it compiling.
 
 attenuo is pre-alpha. This guide runs everything on one machine and uses a development shortcut for the first token. [Identity providers](identity-providers.md) shows how to replace the shortcut with a real login. [Deploying](deploying.md) covers what to change before anyone else can reach the server.
@@ -12,6 +14,7 @@ attenuo is pre-alpha. This guide runs everything on one machine and uses a devel
 
 ## 1. Build
 
+<!-- check: build -->
 ```sh
 git clone https://github.com/attenuo-dev/attenuo.git
 cd attenuo
@@ -109,12 +112,14 @@ The config has more keys than this. `config/example.toml` in the repository is t
 
 In one terminal:
 
+<!-- check: background -->
 ```sh
 $REPO/target/debug/examples/fake_mcp --port 3001
 ```
 
 In a second terminal, from `~/attenuo-try` (set `REPO` again there):
 
+<!-- check: background -->
 ```sh
 $REPO/target/debug/attenuo-server --config attenuo.toml
 ```
@@ -178,6 +183,9 @@ user alice  (issuer https://idp.example)
         until 2026-10-22T22:29:20Z (in 14m 59s)
         lease c5e66077-7b36-43d2-8333-69d31b0e1e24
 
+iss http://127.0.0.1:8080   aud attenuo   jti 0f6a1a4e-5c0e-4a53-9d55-1f3d1c9b2b7e
+kid bjV6lpkuX53lv6qotD1Dsg   ou_kid bjV6lpkuX53lv6qotD1Dsg
+exp 2026-10-22T22:29:20Z (in 14m 59s)
 may_act (absent): any authenticated agent may exchange this token
 verified: signature, type, issuer, audience, expiry, chain
 ```
@@ -188,21 +196,23 @@ The exchange authenticates as `coder` with its client secret (from `ATTENUO_CLIE
 
 ```sh
 export ATTENUO_TOKEN="$CODER"   # or --token-file PATH, or --token - to read it from stdin
-attenuo tools --server github
-attenuo call --server github --tool read_file --arg repo=acme/api --arg path=README.md
+attenuo tools --upstream github
+attenuo call --upstream github --tool read_file --arg repo=acme/api --arg path=README.md
 ```
 
 ```text
+read_file            fake tool read_file
 ALLOWED
-{"name":"read_file","arguments":{"repo":"acme/api","path":"README.md"}}
+{"arguments":{"path":"README.md","repo":"acme/api"},"name":"read_file"}
 ```
 
 `tools` lists only the tools the token may call. The call went through the whole pipeline: token check, lease check, capability check, Cedar policy, audit append, then the upstream.
 
 Now one that should fail. `coder` was never given `create_issue`:
 
+<!-- check: exit 2 -->
 ```sh
-attenuo call --server github --tool create_issue --arg repo=acme/api --arg title=x
+attenuo call --upstream github --tool create_issue --arg repo=acme/api --arg title=x
 echo $?
 ```
 
@@ -223,16 +233,19 @@ curl -s -X POST http://127.0.0.1:8080/mcp/github \
 ```
 
 ```json
-{"jsonrpc":"2.0","id":2,"error":{"code":-32003,"message":"attenuo: denied: capability_denied","data":{"reason":"capability_denied","decision_id":"98849dc3-f053-4649-9b1a-fae0c2f11426"}}}
+{"jsonrpc":"2.0","id":2,"error":{"code":-32003,"message":"attenuo: denied: capability_denied","data":{"reason":"capability_denied","decision_id":"98849dc3-f053-4649-9b1a-fae0c2f11426","untrusted_args":[{"arg":"repo","seq":5,"kind":"leaf"},{"arg":"repo","seq":5,"kind":"entity"}],"code":"capability_denied"}}}
 ```
+
+`untrusted_args` says that the `repo` argument copies text from an untrusted tool result of this run, audit entry 5: the fake server echoed `acme/api` back in its answer to the `read_file` call. Policies can act on that ([output labelling](../design/output-labelling.md)); here the capability check refused the call first.
 
 ## 8. Revoke
 
 Revoking a lease cuts off that hop and everything delegated from it. Revoke the root lease:
 
+<!-- check: exit 2 -->
 ```sh
 attenuo lease revoke "$ROOT_LEASE" --reason "trying it out"
-attenuo call --server github --tool read_file --arg repo=acme/api --arg path=README.md
+attenuo call --upstream github --tool read_file --arg repo=acme/api --arg path=README.md
 ```
 
 ```text
@@ -251,17 +264,20 @@ attenuo audit verify
 ```
 
 ```text
-#1  2026-10-22T22:14:20Z  ALLOW attenuo/token.root          planner for alice          reason=token_issued
-#2  2026-10-22T22:14:20Z  ALLOW attenuo/admin.root_token    by urn:attenuo:admin      reason=admin_action
-#3  2026-10-22T22:14:20Z  ALLOW attenuo/token.exchange      planner > coder for alice  reason=token_issued
-#4  2026-10-22T22:14:20Z  ALLOW github/read_file             planner > coder for alice  reason=policy_allow
-#5  2026-10-22T22:14:20Z  DENY  github/create_issue          planner > coder for alice  reason=capability_denied
-#6  2026-10-22T22:14:21Z  ALLOW attenuo/admin.lease.revoke  by urn:attenuo:admin      reason=admin_action
-#7  2026-10-22T22:14:21Z  DENY  github/read_file             planner > coder for alice  reason=lease_revoked
-audit chain OK: 7 entries verified
+#1    2026-10-22T22:14:20Z  ALLOW attenuo/token.root  planner for alice  reason=token_issued  id=ee0f...
+#2    2026-10-22T22:14:20Z  ALLOW attenuo/admin.root_token  by urn:attenuo:admin  reason=admin_action  id=7c60...
+#3    2026-10-22T22:14:20Z  ALLOW attenuo/token.exchange  planner > coder for alice  reason=token_issued  id=b574...
+#4    2026-10-22T22:14:20Z  ALLOW github/read_file  planner > coder for alice  reason=policy_allow  id=38df...
+#5    2026-10-22T22:14:20Z  tool_result  github/read_file  planner > coder for alice  decision=38df...  label=untrusted size=140  id=6805...
+#6    2026-10-22T22:14:20Z  DENY  github/create_issue  planner > coder for alice  reason=capability_denied  id=b662...
+#7    2026-10-22T22:14:20Z  DENY  github/create_issue  planner > coder for alice  reason=capability_denied  id=54ea...
+#8    2026-10-22T22:14:21Z  ALLOW attenuo/admin.lease.revoke  by urn:attenuo:admin  reason=admin_action  id=ae49...
+#9    2026-10-22T22:14:21Z  DENY  github/read_file  planner > coder for alice  reason=lease_revoked  id=89ef...
+audit chain OK: 9 entries verified
+checkpoints: none signed yet
 ```
 
-Timestamps and ids are shortened here. Every row names the agents and the user separately, and admin actions (the development root mint, the revocation) are recorded too. Each row also carries the hash of the row before it. `audit verify` walks the whole chain from the start and exits 1 if any row was changed, removed or reordered. The log stores a digest of the call arguments, not the arguments themselves. Use `audit tail --follow` to watch decisions as they happen.
+Timestamps and ids are shortened here. Every row names the agents and the user separately, and admin actions (the development root mint, the revocation) are recorded too. Entry 5 is the `tool_result` record of the allowed read (its size and label, not its content), and entries 6 and 7 are the two refused `create_issue` calls, from the CLI and from `curl`. Each row also carries the hash of the row before it. `audit verify` walks the whole chain from the start and exits 2 if any row was changed, removed or reordered. The log stores a digest of the call arguments, not the arguments themselves. Use `audit tail --follow` to watch decisions as they happen.
 
 The same data is available over HTTP:
 
@@ -294,7 +310,7 @@ If the new file does not parse or does not validate against the catalog, the old
 
 - Replay a real incident end to end with [examples/github-leak-demo](https://github.com/attenuo-dev/attenuo/blob/main/examples/github-leak-demo/README.md). `run.sh` does the whole thing in about a second once the workspace is built; the first run spends about a minute and a half compiling on a 4-core machine.
 - Watch delegation narrow over three hops with [examples/multi-hop-demo](https://github.com/attenuo-dev/attenuo/blob/main/examples/multi-hop-demo/README.md): a planner hands a coder less than it holds, the coder cannot pass its token on, and one `lease revoke --chain-id` ends the run.
-- Replace the development mint with a real login: [Identity providers](identity-providers.md).
+- Replace the development mint with a real login: [Identity providers](identity-providers.md). [examples/idp-exchange-demo](https://github.com/attenuo-dev/attenuo/blob/main/examples/idp-exchange-demo/README.md) runs that exchange end to end against a local mock IdP.
 - Put this on something other than your laptop: [Deploying](deploying.md).
 - Write the agent side: [Integrating MCP clients](integrating-mcp-clients.md).
 - Read how a request is decided: [design/server.md](../design/server.md).

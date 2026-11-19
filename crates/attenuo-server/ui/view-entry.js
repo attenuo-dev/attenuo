@@ -213,7 +213,7 @@ function timelinePanel(entry) {
       h('td', null, mono(e.record.reason))));
     replace(box,
       table(['Seq', 'Time', 'Kind', 'Decision', 'Agents', 'Server / tool', 'Reason'], rows, { short: true }),
-      page.next !== null ? h('p', { class: 'small muted' }, `Showing the first ${TIMELINE_LIMIT}; the explorer has the rest.`) : null);
+      page.next_cursor !== null ? h('p', { class: 'small muted' }, `Showing the first ${TIMELINE_LIMIT}; the explorer has the rest.`) : null);
   }).catch((e) => replace(box, empty(`Could not load the chain: ${e.message}`)));
   return panel;
 }

@@ -245,7 +245,7 @@ fn entries_after_the_declared_range_fail_the_export_f5() {
     assert!(!r.report.ok && r.outside_range == 1 && r.truncated);
 }
 
-/// Fuzzing F4, the board's reproducer: a valid export whose first entry is renumbered to
+/// Fuzzing F4's reproducer: a valid export whose first entry is renumbered to
 /// `u64::MAX` and re-hashed fails cleanly instead of overflowing in the chain walk.
 #[test]
 fn an_export_entry_at_u64_max_fails_cleanly_f4() {

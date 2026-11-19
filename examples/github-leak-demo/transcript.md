@@ -4,7 +4,6 @@ Output of `examples/github-leak-demo/run.sh` from one real run. Ports, lease ids
 
 ```text
 
-
 == Setup
 # attenuo at http://127.0.0.1:34201 proxies a fake GitHub MCP server at port 51751 as 'github'.
 # Policy: read_file only when repo like "alice/public-*"; create_issue there only after an approval. See policy.cedar.
@@ -24,6 +23,7 @@ examples/github-leak-demo/policy_test.yaml
   ✓ a three-agent chain is fine  (allow: policy_allow [read_file_public_repos_only])
 
 11 passed, 0 failed (11 cases in 1 file)
+all 5 policies exercised
 
 == 1. Alice's assistant gets a broad token (any github tool), like the over-privileged PAT
 $ attenuo token root --subject alice --agent assistant --cap "github:*"
@@ -60,18 +60,18 @@ may_act (absent): any authenticated agent may exchange this token
 verified: signature, type, issuer, audience, expiry, chain
 
 == 4. The coder reads a public repo as intended: allowed
-$ ATTENUO_TOKEN="$CODER" attenuo call --server github --tool read_file --arg repo=alice/public-docs --arg path=README.md
+$ ATTENUO_TOKEN="$CODER" attenuo call --upstream github --tool read_file --arg repo=alice/public-docs --arg path=README.md
 ALLOWED
 {"arguments":{"path":"README.md","repo":"alice/public-docs"},"name":"read_file"}
 
 == 5. A malicious issue tells the coder to read alice/private-salaries: denied by policy
 # read_file is in the token, but the policy only lets it touch alice/public-*.
-$ ATTENUO_TOKEN="$CODER" attenuo call --server github --tool read_file --arg repo=alice/private-salaries --arg path=2025.csv
+$ ATTENUO_TOKEN="$CODER" attenuo call --upstream github --tool read_file --arg repo=alice/private-salaries --arg path=2025.csv
 DENIED  policy_deny
 decision 1d7ce4d2-d683-45dc-ad2a-b0f6d9f08076
 
 == 6. The injection tries to copy the data out through create_issue: denied, never delegated
-$ ATTENUO_TOKEN="$CODER" attenuo call --server github --tool create_issue --arg repo=alice/public-docs --arg title=leak
+$ ATTENUO_TOKEN="$CODER" attenuo call --upstream github --tool create_issue --arg repo=alice/public-docs --arg title=leak
 DENIED  capability_denied
 decision ba3131d8-8302-49bd-84a1-25001c8c8ac2
 
@@ -86,7 +86,7 @@ expires  2026-10-24T16:25:29.222491365Z
 revoked  2026-10-24T16:20:29.312083173Z (agent session compromised)
 
 == 8. The coder's next call, even the legitimate one, is denied: the revocation cascaded
-$ ATTENUO_TOKEN="$CODER" attenuo call --server github --tool read_file --arg repo=alice/public-docs --arg path=README.md
+$ ATTENUO_TOKEN="$CODER" attenuo call --upstream github --tool read_file --arg repo=alice/public-docs --arg path=README.md
 DENIED  lease_revoked
 decision 091d844b-2140-4f8a-a837-69005b866db9
 

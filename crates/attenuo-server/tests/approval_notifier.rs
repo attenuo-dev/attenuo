@@ -11,12 +11,14 @@
 // Configs are built field by field from `Config::default()`, as in the other server tests.
 #![allow(clippy::field_reassign_with_default)]
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use attenuo_audit::LeaseStore;
+use attenuo_audit::ApprovalStore;
 use attenuo_core::{Clock, ManualClock, ToolCall};
 use attenuo_policy::ToolAttrs;
 use attenuo_proxy::testing::{spawn_router, FakeMcpServer, Spawned};
@@ -28,6 +30,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
 use axum::Router;
+use common::Running;
 use serde_json::{json, Value};
 
 const ADMIN: &str = "notifier-test-admin";
@@ -150,7 +153,9 @@ fn assert_signed(headers: &HeaderMap, body: &[u8]) {
 }
 
 struct Harness {
-    server: Spawned,
+    /// Run through `attenuo_server::run`, as `serve` runs it, so that [`Harness::stop`] stops
+    /// it the same way.
+    server: Running,
     state: Arc<AppState>,
     /// The server's clock, notifier included: [`Harness::advance`] steps it.
     clock: Arc<ManualClock>,
@@ -206,7 +211,7 @@ impl Harness {
         tweak(&mut cfg);
         let (router, state) = attenuo_server::build_with_clock(&cfg, clock.clone()).unwrap();
         Self {
-            server: spawn_router(router).await.unwrap(),
+            server: Running::start(cfg, state.clone(), router).await,
             state,
             clock,
             _upstream_task: upstream_task,
@@ -248,16 +253,20 @@ impl Harness {
     }
 
     /// Stop the way `serve` does after a signal, with no grace for the notifier: what was
-    /// not delivered stays in the outbox. Returns the directory holding the database.
+    /// not delivered stays in the outbox. Returns once the server has let go of the database
+    /// ([`Running::stop`]), with the directory holding it, so a server started on it next
+    /// finds it free.
     async fn stop(self) -> tempfile::TempDir {
         let Self {
             server,
             state,
             _upstream_task,
+            client,
             dir,
             ..
         } = self;
-        drop(server);
+        drop(client);
+        // `run` gives the notifier its grace after the drain; it finds it already stopped.
         let s = state.clone();
         tokio::task::spawn_blocking(move || {
             s.approval_notifier
@@ -267,7 +276,7 @@ impl Harness {
         })
         .await
         .unwrap();
-        drop(state);
+        server.stop(state).await;
         dir
     }
 

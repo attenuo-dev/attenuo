@@ -1,13 +1,12 @@
 use super::authorizer::VerifiedTokens;
 use super::*;
-use attenuo_audit::LeaseStore;
-use attenuo_audit::{MemoryAudit, MemoryLeaseStore};
+use attenuo_audit::{LeaseRegistry, MemoryAudit, MemoryLeaseStore};
 use attenuo_core::{AgentId, Capability, CapabilitySet, LeaseId, OriginatingUser};
 use attenuo_core::{Decision, DelegationChain, ToolCall};
 use attenuo_policy::PolicyEngineBuilder;
 use attenuo_proxy::Authorizer;
 use serde_json::json;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use time::Duration;
 use time::OffsetDateTime;
 
@@ -39,7 +38,11 @@ fn setup() -> (
         LeaseId::new("l1"),
     )
     .unwrap();
-    let p = Pipeline::new(Arc::new(RwLock::new(engine)), leases.clone(), audit.clone());
+    let p = Pipeline::new(
+        Arc::new(SharedPolicy::new(engine)),
+        leases.clone(),
+        audit.clone(),
+    );
     (p, leases, audit, chain)
 }
 
@@ -193,6 +196,18 @@ async fn verified_tokens_are_cached_but_expiry_is_rechecked() {
     let again = auth.authenticate(&issued.token, now).await.unwrap();
     assert_eq!(again, issued.chain, "served from the cache");
 
+    // A hit shares the cached claims instead of copying them, and the entry holds the chain
+    // once, as `claims.chain`.
+    let (hit, was_hit) = auth.verify_inner(&issued.token, now).unwrap();
+    assert!(was_hit);
+    {
+        let chains = auth.verified.chains.lock().unwrap();
+        let cached = chains.get(&VerifiedTokens::key(&issued.token)).unwrap();
+        assert!(Arc::ptr_eq(&hit.claims, cached));
+        assert_eq!(cached.chain, issued.chain);
+    }
+    assert_eq!(hit.into_chain(), issued.chain);
+
     // Past the token's expiry the cached chain is refused, like a fresh verification.
     let later = issued.expires_at + Duration::seconds(1);
     assert!(auth.authenticate(&issued.token, later).await.is_err());
@@ -224,8 +239,9 @@ async fn oversized_tokens_are_verified_but_not_cached() {
         authenticated_at: now,
         attributes: Default::default(),
     };
-    // A long constraint list, as a child narrowing `github:read_*` could carry.
-    let values: Vec<serde_json::Value> = (0..2000)
+    // A long constraint list, as a child narrowing `github:read_*` could carry, within the
+    // 1,024 values a `one_of` may hold (SR-123).
+    let values: Vec<serde_json::Value> = (0..attenuo_core::MAX_ONE_OF_VALUES)
         .map(|i| json!(format!("acme/repo-{i:05}")))
         .collect();
     let cap = Capability::new("github", "read_*")
@@ -267,19 +283,47 @@ fn verified_token_cache_stays_bounded() {
     let issued = issuer
         .issue_root(user, AgentId::new("planner"), caps, None, now)
         .unwrap();
-    let v = issuer.verifier().verify(&issued.token, now).unwrap();
+    let v = Arc::new(issuer.verifier().verify(&issued.token, now).unwrap().claims);
     let cache = VerifiedTokens::new(3);
     for i in 0..10 {
-        cache.insert(VerifiedTokens::key(&format!("t{i}")), &v, now);
+        cache.insert(VerifiedTokens::key(&format!("t{i}")), v.clone(), now);
         assert!(cache.chains.lock().unwrap().len() <= 3);
     }
     // Expired entries go first when the cache is full.
     let expired_at = v.chain.hops[0].expires_at;
     let cache = VerifiedTokens::new(2);
-    cache.insert(VerifiedTokens::key("a"), &v, now);
-    cache.insert(VerifiedTokens::key("b"), &v, now);
-    cache.insert(VerifiedTokens::key("c"), &v, expired_at);
+    cache.insert(VerifiedTokens::key("a"), v.clone(), now);
+    cache.insert(VerifiedTokens::key("b"), v.clone(), now);
+    cache.insert(VerifiedTokens::key("c"), v.clone(), expired_at);
     let chains = cache.chains.lock().unwrap();
     assert_eq!(chains.len(), 1);
     assert!(chains.contains_key(&VerifiedTokens::key("c")));
+}
+
+/// An allowed call with no approval token and no granted approval writes once, its audit
+/// append: the approval lookup reads without the write lock (audit finding A-4).
+#[test]
+fn an_allowed_call_without_an_approval_writes_only_its_record() {
+    use attenuo_audit::{Durability, SqliteAudit, SqliteLeaseStore};
+    let (_, _, _, chain) = setup();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("audit.db");
+    let leases = Arc::new(SqliteLeaseStore::open_with(&path, Durability::Normal).unwrap());
+    let audit = Arc::new(SqliteAudit::open_with(&path, Durability::Normal).unwrap());
+    let now = OffsetDateTime::now_utc();
+    leases
+        .register(&LeaseId::new("l1"), None, now + Duration::hours(1))
+        .unwrap();
+    let engine = PolicyEngineBuilder::new()
+        .with_policies_str("permit(principal, action, resource);")
+        .with_unknown_tools(attenuo_policy::UnknownTools::Allow)
+        .build()
+        .unwrap();
+    let p = Pipeline::new(Arc::new(SharedPolicy::new(engine)), leases.clone(), audit);
+    let call = ToolCall::new("github", "read_file", json!({}));
+    for _ in 0..5 {
+        let before = leases.write_turns();
+        assert!(p.decide(&chain, &call, now).is_allow());
+        assert_eq!(leases.write_turns() - before, 1, "the audit append alone");
+    }
 }

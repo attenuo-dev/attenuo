@@ -1,7 +1,12 @@
-# ADR-0001: Enforce delegation and per-call authorization in a separate layer
+---
+status: accepted
+date: 2026-10-22
+decision-makers: [7Mudit]
+consulted: []
+informed: []
+---
 
-- Status: accepted
-- Date: 2026-10-22
+# ADR-0001. Enforce delegation and per-call authorization in a separate layer
 
 ## Context
 

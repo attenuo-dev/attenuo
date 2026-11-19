@@ -14,6 +14,79 @@ pub enum AttenuationError {
     /// The requested set is empty; a hop with no capabilities is a configuration error.
     #[error("requested capability set is empty")]
     Empty,
+    /// At hop 0 ([`crate::CapabilitySet::attenuate_root`]): two requested capabilities fall
+    /// under the same limited capability of the root grant or ceiling (it covers the calls of
+    /// both), so each would carry the whole figure (SR-121, SR-128).
+    #[error(
+        "requested capabilities `{first}` and `{second}` fall under the same limited \
+         capability, which bounds one capability of a root token, not several"
+    )]
+    LimitSplit {
+        /// One of them, as [`crate::Capability::display`] writes the request.
+        first: String,
+        /// The other.
+        second: String,
+    },
+    /// At hop 0 ([`crate::CapabilitySet::attenuate_root`]): one or more limited capabilities of the
+    /// root grant or ceiling cover a requested capability's calls, and their limits (or its own
+    /// and theirs) include the same kind on different arguments, which one capability cannot
+    /// carry together (SR-128). Refused rather than drop one of them.
+    #[error(
+        "requested capability `{requested}` is under one or more limited capabilities whose limits \
+         one capability cannot carry together (the same kind of limit on different arguments)"
+    )]
+    LimitConflict {
+        /// The capability, as [`crate::Capability::display`] writes the request.
+        requested: String,
+    },
+    /// The requested set is over a bound of [`crate::capability::CapabilitySet::validate_size`]
+    /// (SR-123). Checked before anything is compared, since attenuation costs the product of
+    /// both sides' sizes.
+    #[error(transparent)]
+    TooLarge(#[from] SizeError),
+}
+
+/// Why a capability set is too large to be requested or carried by a token (SR-123).
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum SizeError {
+    /// More capabilities than [`crate::capability::MAX_CAPABILITIES`].
+    #[error("{count} capabilities requested; one request or token holds at most {max}")]
+    TooManyCapabilities {
+        /// How many the set holds.
+        count: usize,
+        /// The bound.
+        max: usize,
+    },
+    /// A `one_of` constraint with more values than [`crate::capability::MAX_ONE_OF_VALUES`].
+    #[error("`one_of` on argument {arg:?} of `{capability}` lists {count} values; at most {max} are allowed")]
+    OneOfTooLong {
+        /// The capability's `server:tool`.
+        capability: String,
+        /// The constrained argument.
+        arg: String,
+        /// How many values the list holds.
+        count: usize,
+        /// The bound.
+        max: usize,
+    },
+    /// More argument constraints, over all the capabilities, than
+    /// [`crate::capability::MAX_CONSTRAINTS`].
+    #[error("{count} argument constraints requested over all capabilities; one request or token holds at most {max}")]
+    TooManyConstraints {
+        /// How many the set holds.
+        count: usize,
+        /// The bound.
+        max: usize,
+    },
+    /// More `one_of` values, over all the capabilities, than
+    /// [`crate::capability::MAX_ONE_OF_VALUES_TOTAL`].
+    #[error("{count} `one_of` values requested over all capabilities; one request or token holds at most {max}")]
+    TooManyOneOfValues {
+        /// How many the set holds.
+        count: usize,
+        /// The bound.
+        max: usize,
+    },
 }
 
 /// Why a delegation chain is not valid.
@@ -48,6 +121,15 @@ pub enum ChainError {
         /// What was not covered.
         #[source]
         source: AttenuationError,
+    },
+    /// A hop's capabilities are more than one token may hold ([`SizeError`], SR-123).
+    #[error("hop {index}: {source}")]
+    TooLarge {
+        /// Position of the hop.
+        index: usize,
+        /// What is too large.
+        #[source]
+        source: SizeError,
     },
     /// The chain has more hops than allowed.
     #[error("chain depth {depth} exceeds the maximum of {max}")]

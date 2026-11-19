@@ -7,6 +7,7 @@ import {
   DeniedError,
   DpopKey,
   RpcError,
+  UnauthorizedError,
   VerificationError,
   callHash,
   verifyApprovalToken,
@@ -467,5 +468,65 @@ describe("approval tokens", () => {
     );
     const params = (calls[0]?.body as Record<string, Record<string, unknown>>).params;
     expect(params?._meta).toEqual({ "dev.attenuo/approval": "T" });
+  });
+});
+
+describe("the user's own decision (K-5)", () => {
+  it("posts the decision with the ID token as a plain bearer", async () => {
+    const approver = { subject: "alice", method: "id_token", by: "user" };
+    const { fetch, calls } = mockFetch((s) =>
+      (s.body as { decision: string }).decision === "grant"
+        ? approval("granted", false, { approver, approval_token: "a.b.c" })
+        : approval("declined", false, { approver }),
+    );
+    const ob = new AttenuoClient(URL_, {
+      fetch,
+      token: "DELEGATION",
+      dpopKey: await DpopKey.generate(),
+    });
+    const granted = await ob.grantApproval(APPROVAL_ID, " ID-TOKEN ");
+    expect(calls[0]!.method).toBe("POST");
+    expect(calls[0]!.url.pathname).toBe(`/approvals/${APPROVAL_ID}`);
+    // The ID token, never the client's delegation token, never DPoP.
+    expect(calls[0]!.headers.get("authorization")).toBe("Bearer ID-TOKEN");
+    expect(calls[0]!.headers.has("dpop")).toBe(false);
+    expect(calls[0]!.body).toEqual({ decision: "grant" });
+    expect(granted).toMatchObject({ state: "granted", usable: true, approvalToken: "a.b.c" });
+    expect(granted.approver?.by).toBe("user");
+
+    const declined = await ob.declineApproval(APPROVAL_ID, "ID-TOKEN");
+    expect(calls[1]!.body).toEqual({ decision: "decline" });
+    expect(declined).toMatchObject({ state: "declined", usable: false });
+  });
+
+  it.each([
+    [403, "agent_token_refused", undefined],
+    [403, "wrong_user", undefined],
+    [409, "approval_not_pending", undefined],
+    [400, "invalid_grant", "replayed"],
+    [404, "not_found", undefined],
+  ])("throws %i %s as an ApiError", async (status, error, description) => {
+    const body: Record<string, unknown> = { error, detail: "refused" };
+    if (description !== undefined) body.error_description = description;
+    const { fetch } = mockFetch(() => jsonResponse(body, status));
+    const err = await new AttenuoClient(URL_, { fetch })
+      .grantApproval(APPROVAL_ID, "ID-TOKEN")
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect(err).toMatchObject({ status, error, description });
+  });
+
+  it("throws a 401 as UnauthorizedError, and refuses bad input before sending", async () => {
+    const body = { error: "invalid_token", detail: "expired", error_description: "expired" };
+    const { fetch, calls } = mockFetch(() => jsonResponse(body, 401));
+    const ob = new AttenuoClient(URL_, { fetch });
+    const err = await ob.declineApproval(APPROVAL_ID, "ID-TOKEN").catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(UnauthorizedError);
+    expect(err).toMatchObject({ error: "invalid_token", description: "expired" });
+    for (const bad of ["", "  "]) {
+      await expect(ob.grantApproval(APPROVAL_ID, bad)).rejects.toThrow(/idToken/);
+    }
+    await expect(ob.grantApproval("..", "ID-TOKEN")).rejects.toBeInstanceOf(TypeError);
+    expect(calls).toHaveLength(1);
   });
 });

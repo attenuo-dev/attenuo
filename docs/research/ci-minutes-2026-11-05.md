@@ -25,7 +25,7 @@ Wall time per job on the latest run on main (run 42084513100, `ci.yml` at `bd4f8
 
 The macOS leg was already off pull requests: `ci.yml` built its matrix as `["ubuntu-latest"]` on `pull_request` and added `macos-latest` only on pushes to main and manual dispatch. On main it was a problem of a different kind. In runs 42084513100 and 42068167069 the macOS job has no runner, no steps and no log: its annotations read "The job was not acquired by Runner of type hosted even after multiple attempts" and "Due to capacity constraints, jobs targeting macOS arm64 runners may experience longer queue times". GitHub gave up after 15.0 minutes and marked the job cancelled and the run failed, while every Linux job had passed. Of the 15 CI runs on main that day, 10 were cancelled by a newer push, 3 failed this way, and 2 passed; in those 2 the macOS job ran in 1.7 and 2.6 minutes.
 
-So the 15 minutes were queue time, not runner time. Actions bills from the moment a runner picks a job up, and these jobs were never picked up, so they most likely cost nothing; the cost was a red main. When the job did run it cost 2 to 3 minutes, billed as 20 to 30. (This could not be confirmed from the API: the run `timing` endpoint now returns 0 for every job, and the billing endpoints are organisation-level, which this environment cannot read.)
+So the 15 minutes were queue time, not runner time. Actions bills from the moment a runner picks a job up, and these jobs were never picked up, so they most likely cost nothing; the cost was a red main. When the job did run it cost 2 to 3 minutes, billed as 20 to 30. (This could not be confirmed from the API: the run `timing` endpoint now returns 0 for every job, and the billing endpoints are organisation-level and were not read.)
 
 ### What a run cost
 
@@ -77,15 +77,14 @@ At the volume of 2026-11-05 (18 pull request runs, 15 main runs), that is about 
 
 That is a quarter to a third off, not 20 times. At about 20 billed Linux minutes for each run that touches code, a day of 30 or more runs still costs 600 or more minutes, so the Free plan's 2,000 lasts about three days. The levers that are left are not workflow tuning:
 
-- Fewer runs: batch small documentation and log changes into fewer pull requests, or drop the full CI run on the push to main for a pull request that was up to date with main when it merged (its tree was already tested; keep the fuzz build and audit there). Both are a decision about coverage for the maintainers, not made here.
+- Fewer runs: batch small documentation changes into fewer pull requests, or drop the full CI run on the push to main for a pull request that was up to date with main when it merged (its tree was already tested; keep the fuzz build and audit there). Both trade coverage for minutes and are not adopted here.
 - A public repository: standard GitHub-hosted runners are free and unmetered for public repositories, macOS included.
-- A paid plan or a spending limit above zero, if the repository stays private.
 
 ## Branch protection
 
-The repository has no branch protection yet (writing settings is refused in this environment). When it is switched on, mark only `ci-ok` as a required status check, not the individual jobs.
+The repository has no branch protection yet. When it is switched on, mark only `ci-ok` as a required status check, not the individual jobs.
 
-The rule behind that: a job skipped by its `if:` reports the status "skipped", and branch protection counts a skipped required check as passed. So if the individual jobs were required and the `changes` job failed, every Rust job would be skipped and the pull request would look green. A whole workflow skipped by `paths` or `paths-ignore` is worse the other way: it reports nothing, and a required check from it stays pending forever. `ci-ok` runs on every pull request (`if: always()`), needs every per-change job, and fails if any of them failed or was cancelled, while treating a skip on purpose as a pass. The macOS job is not in its `needs`, so it is never a required check. The [launch checklist](../launch-checklist.md) says the same.
+The rule behind that: a job skipped by its `if:` reports the status "skipped", and branch protection counts a skipped required check as passed. So if the individual jobs were required and the `changes` job failed, every Rust job would be skipped and the pull request would look green. A whole workflow skipped by `paths` or `paths-ignore` is worse the other way: it reports nothing, and a required check from it stays pending forever. `ci-ok` runs on every pull request (`if: always()`), needs every per-change job, and fails if any of them failed or was cancelled, while treating a skip on purpose as a pass. The macOS job is not in its `needs`, so it is never a required check.
 
 ## Not validated
 

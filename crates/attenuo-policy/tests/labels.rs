@@ -393,6 +393,26 @@ fn annotation_import_only_narrows() {
     );
 }
 
+/// The narrowing imported from tool annotations survives a reload in both directions: an
+/// import into the engine in force before the swap holds in the reloaded engine, and one
+/// into the reloaded engine holds for a decision still running on the old one.
+#[test]
+fn imported_narrowing_is_shared_across_a_reload() {
+    let policies = format!(
+        "{ASK_AFTER_TAINT}\npermit (principal, action, resource) when {{ resource.readonly || \
+         context.session.tainted }};"
+    );
+    let old = engine(&policies, AnnotationImport::Narrowing);
+    let new = old.with_policies_reloaded(&policies).unwrap();
+    assert!(old.import_annotations("fs", "read", Some(false), None));
+    assert!(!new.effective_attrs("fs", "read").unwrap().readonly);
+    assert!(new.import_annotations("fs", "append", None, Some(true)));
+    assert!(old
+        .effective_attrs("fs", "append")
+        .unwrap()
+        .is_destructive());
+}
+
 #[test]
 fn shipped_example_policies_pass_their_tests() {
     let path =

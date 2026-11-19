@@ -19,6 +19,6 @@ The working-tree scan adds only the local, git-ignored fuzz corpus (generated to
 
 **Words.** `FICO` appears in no file of any commit and in no commit message. `Invisible` appears only as the ordinary English word (the Code of Conduct's "visible or invisible disability", two threat-model sentences, one bench note).
 
-**Kept.** [`.gitleaks.toml`](../../.gitleaks.toml) allowlists exactly the paths and shapes above, so `gitleaks git .` now reports `no leaks found` and a future real secret would still be reported. Run it before each release and before the repository changes visibility.
+**Kept.** [`.gitleaks.toml`](https://github.com/attenuo-dev/attenuo/blob/main/.gitleaks.toml) allowlists exactly the paths and shapes above, so `gitleaks git .` now reports `no leaks found` and a future real secret would still be reported. Run it before each release and before the repository changes visibility.
 
 **Not done.** No history rewrite, because nothing needs one. Commit messages were not scanned by gitleaks (it scans diffs); they were grepped for the two words only.

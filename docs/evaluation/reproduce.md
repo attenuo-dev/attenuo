@@ -25,9 +25,9 @@ Five steps, each printed with a heading and its time:
 
 1. **environment**: the commit (`git rev-parse HEAD`, marked if the tree has uncommitted changes), the `rustc`, `cargo` and Python versions, and where the binaries and the baseline are.
 2. **build**: `cargo build --release` of `attenuo-server`, `attenuo` and the `fake_mcp` test upstream.
-3. **demos**: [`examples/github-leak-demo/run.sh`](../../examples/github-leak-demo/README.md) and [`examples/multi-hop-demo/run.sh`](../../examples/multi-hop-demo/README.md) on those binaries. Each demo checks every step's exit status and output, and the number of calls that reached the fake upstream, and fails otherwise.
-4. **suite**: `run.py --split all --tag reproduce`, every arm of both splits ([the suite's README](../../evaluation/injection-suite/README.md) has the method).
-5. **compare**: [`compare_results.py`](../../evaluation/injection-suite/compare_results.py) takes the per-arm rows (the rows of the "Arms compared" tables that start with `| attenuo` or `| Suite policy`, 12 per split) from the new results file and from the committed [`results/2026-11-05-type-check-stage.md`](../../evaluation/injection-suite/results/2026-11-05-type-check-stage.md), and compares them byte for byte, together with the two files' lists of problems (below).
+3. **demos**: [`examples/github-leak-demo/run.sh`](https://github.com/attenuo-dev/attenuo/blob/main/examples/github-leak-demo/README.md) and [`examples/multi-hop-demo/run.sh`](https://github.com/attenuo-dev/attenuo/blob/main/examples/multi-hop-demo/README.md) on those binaries. Each demo checks every step's exit status and output, and the number of calls that reached the fake upstream, and fails otherwise.
+4. **suite**: `run.py --split all --tag reproduce`, every arm of both splits ([the suite's README](https://github.com/attenuo-dev/attenuo/blob/main/evaluation/injection-suite/README.md) has the method).
+5. **compare**: [`compare_results.py`](https://github.com/attenuo-dev/attenuo/blob/main/evaluation/injection-suite/compare_results.py) takes the per-arm rows (the rows of the "Arms compared" tables that start with `| attenuo` or `| Suite policy`, 12 per split) from the new results file and from the committed [`results/2026-11-05-type-check-stage.md`](https://github.com/attenuo-dev/attenuo/blob/main/evaluation/injection-suite/results/2026-11-05-type-check-stage.md), and compares them byte for byte, together with the two files' lists of problems (below).
 
 The results files the suite writes (`results/<date>-reproduce.md` and `.json`) are deleted at the end, since the committed baseline is the reference. `KEEP_RESULTS=1` keeps them, for instance to look at the per-call JSON after a difference.
 
@@ -58,4 +58,4 @@ What it does not check: the other tables of the results file (per-taxonomy, appr
 
 Open an issue with the diff the script printed, the output of its **environment** step, your OS and CPU, and, if you can, the `results/<date>-reproduce.json` from a run with `KEEP_RESULTS=1`. A difference is either a bug in attenuo, a bug in the suite, or a dependency that behaves differently on your machine; all three are worth knowing about.
 
-If you changed anything under `evaluation/injection-suite/cases/` or `policies/`, the test split is refused (exit status 2 from `run.py`) and the numbers are not comparable; see [Dev and test splits](../../evaluation/injection-suite/README.md#dev-and-test-splits).
+If you changed anything under `evaluation/injection-suite/cases/` or `policies/`, the test split is refused (exit status 2 from `run.py`) and the numbers are not comparable; see [Dev and test splits](https://github.com/attenuo-dev/attenuo/blob/main/evaluation/injection-suite/README.md#dev-and-test-splits).

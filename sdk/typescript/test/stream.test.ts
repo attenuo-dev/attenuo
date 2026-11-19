@@ -10,6 +10,7 @@ import {
   RpcError,
   SseParser,
   type StreamEvent,
+  TransportTimeoutError,
   UnauthorizedError,
 } from "../src/index.js";
 import { jsonResponse, mockFetch } from "./helpers.js";
@@ -489,7 +490,22 @@ describe("callToolStream", () => {
     const ob = new AttenuoClient(URL_, { fetch: signalled, timeoutMs: 50 });
     const { seen, err } = await collectUntilError(ob.callToolStream("TOK", "github", "read_file"));
     expect(seen).toHaveLength(1);
-    expect((err as Error).name).toBe("TimeoutError");
+    // The client's own timer: a TransportTimeoutError around the abort reason (K-12).
+    expect(err).toBeInstanceOf(TransportTimeoutError);
+    expect((err as Error).message).toContain("no data within 50ms");
+    expect(((err as TransportTimeoutError).cause as Error).name).toBe("TimeoutError");
+
+    // The caller's own abort mid-stream is thrown as it came, not as a timeout.
+    const ctl = new AbortController();
+    const reason = new DOMException("stop", "AbortError");
+    const ob2 = new AttenuoClient(URL_, { fetch: signalled, timeoutMs: 5000 });
+    const run = collectUntilError(
+      ob2.callToolStream("TOK", "github", "read_file", {}, { signal: ctl.signal }),
+    );
+    setTimeout(() => ctl.abort(reason), 30);
+    const aborted = await run;
+    expect(aborted.seen).toHaveLength(1);
+    expect(aborted.err).toBe(reason);
   });
 
   /** A body that sends `head` and then a keep-alive comment every 20 ms until it is aborted. */
@@ -534,6 +550,7 @@ describe("callToolStream", () => {
     const elapsed = Date.now() - start;
     expect(seen).toHaveLength(1);
     expect(err).toBeInstanceOf(AttenuoError);
+    expect(err).toBeInstanceOf(TransportTimeoutError);
     expect((err as Error).message).toContain("stream deadline of 200ms elapsed");
     expect(elapsed).toBeGreaterThanOrEqual(190);
     expect(elapsed).toBeLessThan(800);

@@ -2,7 +2,17 @@ from __future__ import annotations
 
 import pytest
 
-from attenuo import ArgLimit, Capability, Equals, Limits, OneOf, Prefix, Range
+from attenuo import (
+    ArgLimit,
+    Capability,
+    Equals,
+    Limits,
+    OneOf,
+    PathPrefix,
+    Prefix,
+    Range,
+    path_problem,
+)
 from attenuo.capability import capabilities_to_json
 
 
@@ -17,6 +27,83 @@ def test_prefix_matches_rust_cli_shape() -> None:
         "tool": "read_file",
         "constraints": {"repo": {"op": "prefix", "value": "alice/public-"}},
     }
+
+
+def test_path_prefix_matches_rust_shape_and_round_trips() -> None:
+    cap = Capability("fs", "read_file", path=PathPrefix("/workspace/"), dir=PathPrefix("docs"))
+    assert cap.to_json()["constraints"] == {
+        "dir": {"op": "path_prefix", "value": "docs"},
+        "path": {"op": "path_prefix", "value": "/workspace/"},
+    }
+    assert Capability.from_json(cap.to_json()) == cap
+    assert Capability.from_json(cap.to_json()).constraints["path"] == PathPrefix("/workspace/")
+    assert PathPrefix("/w").to_json() != Prefix("/w").to_json()
+
+
+@pytest.mark.parametrize(
+    ("path", "why"),
+    [
+        ("", "is empty"),
+        ("/workspace/../etc", "holds a `.` or `..` segment"),
+        ("/workspace/..", "holds a `.` or `..` segment"),
+        ("./src", "holds a `.` or `..` segment"),
+        ("/workspace/.", "holds a `.` or `..` segment"),
+        ("/workspace//a", "holds an empty segment (`//`)"),
+        ("//workspace", "holds an empty segment (`//`)"),
+        ("C:\\work", "holds a backslash"),
+        ("/w\x00", "holds a control character"),
+        ("/w\tx", "holds a control character"),
+        ("/w\x7f", "holds a control character"),
+        ("/w\x85", "holds a control character"),
+        ("/w/%2e%2e", "holds a percent-encoded `.`, `/` or `\\`"),
+        ("/w/%2E", "holds a percent-encoded `.`, `/` or `\\`"),
+        ("/w%2Fx", "holds a percent-encoded `.`, `/` or `\\`"),
+        ("/w%5cx", "holds a percent-encoded `.`, `/` or `\\`"),
+        (
+            "/w/%252e",
+            "holds a percent escape that is itself percent-encoded (`%25` and two hex digits)",
+        ),
+        ("/w/\uff0e\uff0e", "holds a character that normalises to `.`, `/` or `\\`"),
+        ("/w\uff0fx", "holds a character that normalises to `.`, `/` or `\\`"),
+    ],
+)
+def test_path_prefix_refuses_what_the_server_refuses(path: str, why: str) -> None:
+    assert path_problem(path) == why
+    with pytest.raises(ValueError, match="a path_prefix constraint's path"):
+        PathPrefix(path)
+    with pytest.raises(ValueError):
+        Capability.from_json(
+            {"server": "s", "tool": "t", "constraints": {"p": {"op": "path_prefix", "value": path}}}
+        )
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/",
+        "/workspace",
+        "/workspace/",
+        "docs",
+        "a/b/",
+        "~/x",
+        "/a%20b",
+        "/...",
+        "/caf\u00e9",
+        "/100%25",
+    ],
+)
+def test_path_prefix_accepts_plain_paths(path: str) -> None:
+    assert path_problem(path) is None
+    assert PathPrefix(path).to_json() == {"op": "path_prefix", "value": path}
+
+
+def test_path_prefix_value_must_be_a_string() -> None:
+    with pytest.raises(ValueError):
+        PathPrefix(1)  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        Capability.from_json(
+            {"server": "s", "tool": "t", "constraints": {"p": {"op": "path_prefix", "value": 1}}}
+        )
 
 
 def test_one_of_and_equals() -> None:

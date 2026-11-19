@@ -7,20 +7,27 @@ import {
   ApprovalRequiredError,
   AttenuoError,
   DeniedError,
+  RateLimitedError,
   RpcError,
   UnauthorizedError,
+  UnavailableError,
 } from "./errors.js";
 import type { DpopKeyLike } from "./dpop.js";
-import { bearer, decodeToken, parseTime, type Token } from "./token.js";
+import { b64urlDecode, bearer, decodeToken, parseTime, type Token } from "./token.js";
 
 export const TOKEN_EXCHANGE_GRANT = "urn:ietf:params:oauth:grant-type:token-exchange";
 export const TYPE_JWT = "urn:ietf:params:oauth:token-type:jwt";
 export const TYPE_ID_TOKEN = "urn:ietf:params:oauth:token-type:id_token";
+/** RFC 7523 §2.2 `client_assertion_type` of a `private_key_jwt` client assertion. */
+export const CLIENT_ASSERTION_TYPE = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
 export const AUTHORIZATION_DETAILS_TYPE = "attenuo_capabilities";
 
 export const CODE_UNAUTHORIZED = -32001;
 export const CODE_DENIED = -32003;
 export const CODE_APPROVAL_REQUIRED = -32008;
+export const CODE_UNAVAILABLE = -32006;
+export const CODE_TOO_MANY = -32007;
+export const RETRY_AFTER_HEADER = "retry-after";
 export const DECISION_ID_HEADER = "x-attenuo-decision-id";
 export const SESSION_HEADER = "mcp-session-id";
 export const MCP_ACCEPT = "application/json, text/event-stream";
@@ -163,14 +170,104 @@ export interface AuthzenDecision {
   approvalId?: string;
   callHash?: string;
   expiresAt?: Date;
+  /** Set on a batch entry the server could not decide (it counts as a deny). */
+  error?: AuthzenEntryError;
+}
+
+/**
+ * Why one entry of an AuthZEN batch failed (`context.error`): the HTTP `status` and error `code` a
+ * single evaluation of it would have answered (`invalid_request`, `unknown_tool`, ...) and the
+ * server's `message`. The rest of the batch is decided as usual.
+ */
+export interface AuthzenEntryError {
+  status: number;
+  code: string;
+  message: string;
+}
+
+/**
+ * One call to decide in `authzenEvaluateBatch`: the tool `server/tool` with `args`. A
+ * `[server, tool]` or `[server, tool, args]` tuple is taken too.
+ */
+export interface AuthzenEvaluation {
+  server: string;
+  tool: string;
+  args?: Json;
+}
+
+export type AuthzenEvaluationLike =
+  | AuthzenEvaluation
+  | readonly [server: string, tool: string]
+  | readonly [server: string, tool: string, args: Json | undefined];
+
+/** AuthZEN's `evaluations_semantic` for a batch (AuthZEN 1.0 section 7.1.2.1). */
+export type EvaluationsSemantic = "execute_all" | "deny_on_first_deny" | "permit_on_first_permit";
+
+const SEMANTICS: readonly string[] = [
+  "execute_all",
+  "deny_on_first_deny",
+  "permit_on_first_permit",
+];
+
+/**
+ * The AuthZEN discovery document (`GET /.well-known/authzen-configuration`, AuthZEN 1.0 section
+ * 9): the decision point's base URL and its two evaluation endpoints, as the server publishes
+ * them (from `[server] public_url`).
+ */
+export interface AuthzenConfiguration {
+  policyDecisionPoint: string;
+  accessEvaluationEndpoint: string;
+  accessEvaluationsEndpoint: string;
+  /** `""` when the server does not publish action search. */
+  searchActionEndpoint: string;
+  raw: Json;
+}
+
+/**
+ * One result of an AuthZEN action search: the tool `server/name` that an evaluation with the
+ * same token and arguments would allow now.
+ */
+export interface AuthzenAction {
+  name: string;
+  server: string;
+}
+
+/**
+ * One page of `POST /access/v1/search/action`. `nextToken` is the token of the next page,
+ * undefined after the last (the server's `""`). A page can hold fewer results than its `limit`,
+ * even none, while `nextToken` is set: `limit` bounds how many catalogued tools one page
+ * evaluates, not how many it returns.
+ */
+export interface AuthzenActionPage {
+  actions: AuthzenAction[];
+  nextToken: string | undefined;
+  raw: Json;
+}
+
+/** Paging of `authzenSearchAction`: `pageToken` is the `nextToken` of the previous page. */
+export interface AuthzenSearchOptions {
+  pageToken?: string;
+  limit?: number;
 }
 
 // --- plain HTTP -------------------------------------------------------------------------------
 
-export function errorFromResponse(status: number, text: string): ApiError {
+/**
+ * The `ApiError` (`UnauthorizedError` for a 401) for a non-success answer. `decisionId` is the
+ * body's `decision_id` when `headers` carry an `X-Attenuo-Decision-Id` that vouches for it (see
+ * `provenDecisionId`). A JSON-RPC error body (the proxy's 401) gives its `data.reason` and `data`.
+ * The server's load refusals are `UnavailableError` (503 `temporarily_unavailable`, or the proxy's
+ * `-32006`) and `RateLimitedError` (429 `rate_limited`, or the proxy's `-32007`); see `rpcRefusal`
+ * for the proxy's.
+ */
+export function errorFromResponse(status: number, text: string, headers?: Headers): ApiError {
   let error = "http_error";
   let detail = text.trim();
   let description: string | undefined;
+  let code: string | undefined;
+  let claimed: unknown;
+  let reason: string | undefined;
+  let data: Json | undefined;
   let body: unknown;
   try {
     body = JSON.parse(text);
@@ -183,21 +280,129 @@ export function errorFromResponse(status: number, text: string): ApiError {
       error = b.error;
       detail = String(b.detail ?? "");
       if (typeof b.error_description === "string") description = b.error_description;
+      if (typeof b.code === "string" && b.code !== "") code = b.code;
+      claimed = b.decision_id;
     } else if (typeof b.error === "object" && b.error !== null) {
       // A JSON-RPC error body (the proxy's 401).
       const e = b.error as Json;
       error = String(e.code ?? "rpc_error");
       detail = String(e.message ?? "");
+      data = (typeof e.data === "object" && e.data !== null ? e.data : {}) as Json;
+      claimed = data.decision_id;
+      reason = typeof data.reason === "string" && data.reason !== "" ? data.reason : "unauthorized";
+      code = typeof data.code === "string" && data.code !== "" ? data.code : reason;
     }
   }
-  const Cls = status === 401 ? UnauthorizedError : ApiError;
-  return new Cls(status, error, detail, description);
+  const decisionId = provenDecisionId(headers?.get(DECISION_ID_HEADER) ?? undefined, claimed);
+  const b = typeof body === "object" && body !== null ? (body as Json) : undefined;
+  const refusal =
+    data !== undefined
+      ? rpcRefusal(status, headers, (b?.error as Json).code, detail, data)
+      : typeof b?.error === "string"
+        ? restRefusal(status, headers, error, detail, description)
+        : undefined;
+  if (refusal !== undefined) return refusal;
+  if (status === 401) {
+    return new UnauthorizedError(
+      status,
+      error,
+      detail,
+      description,
+      decisionId,
+      reason,
+      data,
+      code,
+    );
+  }
+  return new ApiError(status, error, detail, description, decisionId, code);
+}
+
+/**
+ * `Retry-After` in whole seconds; undefined when it is missing or not a plain non-negative number
+ * (an HTTP-date is not read: the server sends seconds only).
+ */
+export function retryAfterOf(headers?: Headers): number | undefined {
+  const value = headers?.get(RETRY_AFTER_HEADER)?.trim();
+  if (value === undefined || !/^[0-9]+$/.test(value)) return undefined;
+  return Number(value);
+}
+
+/**
+ * The server's own 503 `temporarily_unavailable` or 429 `rate_limited` answer of a REST route as
+ * `UnavailableError` or `RateLimitedError`, else undefined.
+ */
+function restRefusal(
+  status: number,
+  headers: Headers | undefined,
+  error: string,
+  detail: string,
+  description: string | undefined,
+): ApiError | undefined {
+  const reason = description || error;
+  if (status === 503 && error === "temporarily_unavailable") {
+    return new UnavailableError(reason, retryAfterOf(headers), detail);
+  }
+  if (status === 429 && error === "rate_limited") {
+    return new RateLimitedError(reason, retryAfterOf(headers), detail);
+  }
+  return undefined;
+}
+
+/**
+ * The proxy's own 503 `-32006` or 429 `-32007` as `UnavailableError` or `RateLimitedError`, else
+ * undefined. The proxy sets `Retry-After` on these and never relays one from an upstream, so an
+ * answer without it is an upstream's own error.
+ */
+function rpcRefusal(
+  status: number,
+  headers: Headers | undefined,
+  code: unknown,
+  message: string,
+  data: Json,
+): ApiError | undefined {
+  if (!headers?.has(RETRY_AFTER_HEADER)) return undefined;
+  const reason = typeof data.reason === "string" && data.reason !== "" ? data.reason : undefined;
+  if (status === 503 && code === CODE_UNAVAILABLE) {
+    return new UnavailableError(
+      reason ?? "temporarily_unavailable",
+      retryAfterOf(headers),
+      message,
+      data,
+    );
+  }
+  if (status === 429 && code === CODE_TOO_MANY) {
+    return new RateLimitedError(reason ?? "rate_limited", retryAfterOf(headers), message, data);
+  }
+  return undefined;
+}
+
+const RETRIED_REASONS: Record<number, string> = { 503: "overloaded", 429: "rate_limited" };
+
+/**
+ * The error of a refusal that the client's `maxRetries` may retry: 503 `overloaded` or 429
+ * `rate_limited` from the server's `[limits]`, refused before any work. Undefined for any other
+ * answer, `request_timeout` and every denial included. Reads a clone of the body, so `res` can
+ * still be read.
+ */
+export async function retryableRefusal(
+  res: Response,
+): Promise<UnavailableError | RateLimitedError | undefined> {
+  const wanted = RETRIED_REASONS[res.status];
+  if (wanted === undefined) return undefined;
+  const err = errorFromResponse(res.status, await res.clone().text(), res.headers);
+  if (
+    (err instanceof UnavailableError || err instanceof RateLimitedError) &&
+    err.reason === wanted
+  ) {
+    return err;
+  }
+  return undefined;
 }
 
 /** The JSON body of a success response; throws `ApiError` otherwise. */
 export async function jsonBody(res: Response): Promise<unknown> {
   const text = await res.text();
-  if (!res.ok) throw errorFromResponse(res.status, text);
+  if (!res.ok) throw errorFromResponse(res.status, text, res.headers);
   try {
     return JSON.parse(text);
   } catch {
@@ -235,6 +440,20 @@ export interface ExchangeOptions {
    * token authenticates one exchange.
    */
   actorToken?: string;
+  /**
+   * A `private_key_jwt` client assertion (RFC 7523 §2.2) instead of `clientSecret`, for an
+   * agent whose `[[agents]]` entry lists public keys (`jwks`). Make one per request with
+   * `DpopKey.clientAssertion(agentId, serverIssuer)` from the agent's private key. Sent with
+   * `client_assertion_type` `urn:ietf:params:oauth:client-assertion-type:jwt-bearer`; never
+   * together with a client secret. The `use_dpop_nonce` retry and the `maxRetries` retry of a load
+   * refusal send the same assertion again, which the server allows because those refusals leave
+   * it unused; the load retry is not made when its wait would reach the assertion's `exp`, and the
+   * `RateLimitedError` (or `UnavailableError`) is thrown instead. Then mint a new assertion and
+   * call again, or mint it with a `lifetime` that covers the waits (at most the server's
+   * `client_assertion_max_lifetime_seconds`, 300 by default). Treat an assertion as spent after
+   * any other answer.
+   */
+  clientAssertion?: string;
   /** RFC 8693 §4.4 `may_act` for the new token: the agents allowed to exchange it next. */
   mayAct?: readonly string[];
   /**
@@ -256,8 +475,15 @@ export function exchangeBody(
   capabilities: CapabilityLike | readonly CapabilityLike[],
   opts: ExchangeOptions,
 ): Json {
-  if (opts.clientId !== undefined && !opts.clientSecret) {
-    throw new TypeError("clientId and clientSecret go together");
+  if (opts.clientAssertion !== undefined && opts.clientAssertion.trim() === "") {
+    throw new TypeError("clientAssertion is empty");
+  }
+  if (opts.clientAssertion !== undefined && opts.clientSecret) {
+    // RFC 6749 §2.3: one client authentication method per request.
+    throw new TypeError("use clientSecret or clientAssertion, not both");
+  }
+  if (opts.clientId !== undefined && !opts.clientSecret && opts.clientAssertion === undefined) {
+    throw new TypeError("clientId goes with clientSecret or clientAssertion");
   }
   if (opts.actorToken !== undefined && opts.actorToken.trim() === "") {
     throw new TypeError("actorToken is empty");
@@ -268,7 +494,10 @@ export function exchangeBody(
   // Agent credentials (a client secret or an actor token) alone do not make this hop 0: the
   // server also requires them, as the actor's, on a hop n+1 exchange. Hop 0 is an IdP
   // credential, not a delegation token.
-  const authenticated = Boolean(opts.clientSecret) || opts.actorToken !== undefined;
+  const authenticated =
+    Boolean(opts.clientSecret) ||
+    opts.actorToken !== undefined ||
+    opts.clientAssertion !== undefined;
   const intake = authenticated && !isDelegationToken(subjectToken);
   const body: Json = {
     grant_type: TOKEN_EXCHANGE_GRANT,
@@ -284,12 +513,42 @@ export function exchangeBody(
     body.client_id = clientId;
     body.client_secret = opts.clientSecret;
   }
+  if (opts.clientAssertion !== undefined) {
+    // The server reads the client id from the assertion's `sub`.
+    if (opts.clientId !== undefined) body.client_id = opts.clientId;
+    body.client_assertion_type = CLIENT_ASSERTION_TYPE;
+    body.client_assertion = opts.clientAssertion.trim();
+  }
   if (opts.actorToken !== undefined) {
     body.actor_token = opts.actorToken.trim();
     body.actor_token_type = TYPE_JWT;
   }
   if (mayAct !== undefined) body.may_act = mayAct;
   return body;
+}
+
+/**
+ * The `exp` (Unix seconds) of the `client_assertion` in a `POST /token` `body`, read without
+ * verifying anything; undefined when the body has none or its `exp` cannot be read.
+ *
+ * A load refusal (429 `rate_limited`, 503 `overloaded`) leaves the assertion unspent, so the
+ * retry may send it again, but only before it expires: the client's retry does not wait past
+ * this time.
+ */
+export function assertionExpiry(body: Json): number | undefined {
+  const assertion: unknown = body.client_assertion;
+  if (typeof assertion !== "string") return undefined;
+  const parts = assertion.split(".");
+  if (parts.length !== 3) return undefined;
+  let claims: unknown;
+  try {
+    claims = JSON.parse(new TextDecoder().decode(b64urlDecode(parts[1]!)));
+  } catch {
+    return undefined;
+  }
+  if (typeof claims !== "object" || claims === null || Array.isArray(claims)) return undefined;
+  const exp = (claims as { exp?: unknown }).exp;
+  return typeof exp === "number" && Number.isFinite(exp) ? Math.trunc(exp) : undefined;
 }
 
 /** The RFC 8693 §4.4 `may_act` claim for a list of agent ids. */
@@ -360,7 +619,167 @@ export function authzenFromResponse(body: unknown): AuthzenDecision {
   if (typeof ctx.call_hash === "string" && ctx.call_hash !== "") d.callHash = ctx.call_hash;
   const expiresAt = optTime(ctx.expires_at);
   if (expiresAt !== undefined) d.expiresAt = expiresAt;
+  const error = entryError(ctx.error);
+  if (error !== undefined) d.error = error;
   return d;
+}
+
+/**
+ * The `POST /access/v1/evaluations` body: the subject as the top-level default (the server fills
+ * it from the verified chain) and one `action`/`resource`/`context` entry per call. A
+ * `TypeError` for no call (the server answers an empty batch as a single evaluation) or an
+ * unknown `semantic`.
+ */
+export function authzenBatchBody(
+  evaluations: readonly AuthzenEvaluationLike[],
+  semantic?: EvaluationsSemantic,
+): Json {
+  const entries = evaluations.map((ev) => {
+    const one: AuthzenEvaluation = Array.isArray(ev)
+      ? { server: ev[0] as string, tool: ev[1] as string, args: ev[2] as Json | undefined }
+      : (ev as AuthzenEvaluation);
+    if (typeof one?.server !== "string" || typeof one.tool !== "string") {
+      throw new TypeError(`an evaluation is {server, tool, args?} or a tuple, got ${String(ev)}`);
+    }
+    const body = authzenBody(one.server, one.tool, one.args);
+    delete body.subject;
+    return body;
+  });
+  if (entries.length === 0) throw new TypeError("an AuthZEN batch needs at least one evaluation");
+  const body: Json = { subject: { type: "agent", id: "" }, evaluations: entries };
+  if (semantic !== undefined) {
+    if (!SEMANTICS.includes(semantic)) {
+      throw new TypeError(`semantic must be one of ${SEMANTICS.join(", ")}, got ${semantic}`);
+    }
+    body.options = { evaluations_semantic: semantic };
+  }
+  return body;
+}
+
+/**
+ * The decisions of a batch answer, in request order. A batch stopped by its semantic answers
+ * fewer entries than it asked.
+ */
+export function authzenBatchFromResponse(body: unknown): AuthzenDecision[] {
+  const items = asObject(body, "AuthZEN batch").evaluations;
+  if (!Array.isArray(items)) {
+    throw new AttenuoError(
+      `unexpected AuthZEN batch response: ${JSON.stringify(body)?.slice(0, 200)}`,
+    );
+  }
+  return items.map((item) =>
+    authzenFromResponse(
+      typeof item === "object" && item !== null && !Array.isArray(item) ? item : {},
+    ),
+  );
+}
+
+export function authzenConfigurationFromJson(body: unknown): AuthzenConfiguration {
+  const b = asObject(body, "AuthZEN configuration");
+  return {
+    policyDecisionPoint: String(b.policy_decision_point ?? ""),
+    accessEvaluationEndpoint: String(b.access_evaluation_endpoint ?? ""),
+    accessEvaluationsEndpoint: String(b.access_evaluations_endpoint ?? ""),
+    searchActionEndpoint: String(b.search_action_endpoint ?? ""),
+    raw: b,
+  };
+}
+
+/**
+ * The `POST /access/v1/search/action` body: the subject (filled in by the server from the
+ * verified chain), the MCP `server` as the resource, the arguments every candidate is decided
+ * with, and `page` when a token or limit is given.
+ */
+export function authzenSearchActionBody(
+  server: string,
+  args?: Json,
+  opts: AuthzenSearchOptions = {},
+): Json {
+  const body: Json = {
+    subject: { type: "agent", id: "" },
+    resource: { type: "mcp_server", id: server },
+    context: { input: args ?? {} },
+  };
+  const page: Json = {};
+  if (opts.pageToken !== undefined && opts.pageToken !== "") page.token = opts.pageToken;
+  if (opts.limit !== undefined) page.limit = opts.limit;
+  if (Object.keys(page).length > 0) body.page = page;
+  return body;
+}
+
+export function authzenSearchActionFromResponse(body: unknown): AuthzenActionPage {
+  const b = asObject(body, "AuthZEN action search");
+  if (!Array.isArray(b.results)) {
+    throw new AttenuoError(
+      `unexpected AuthZEN action search response: ${JSON.stringify(body)?.slice(0, 200)}`,
+    );
+  }
+  const actions = b.results.map((item: unknown): AuthzenAction => {
+    const r = item as Json | null;
+    if (typeof r !== "object" || r === null || typeof r.name !== "string") {
+      throw new AttenuoError(
+        `unexpected AuthZEN action search result: ${JSON.stringify(item)?.slice(0, 200)}`,
+      );
+    }
+    const props = r.properties as Json | null | undefined;
+    const server = typeof props === "object" && props !== null ? props.server : undefined;
+    return { name: r.name, server: typeof server === "string" ? server : "" };
+  });
+  const page = b.page as Json | null | undefined;
+  const token = typeof page === "object" && page !== null ? page.next_token : undefined;
+  return {
+    actions,
+    nextToken: typeof token === "string" && token !== "" ? token : undefined,
+    raw: b,
+  };
+}
+
+function entryError(v: unknown): AuthzenEntryError | undefined {
+  if (typeof v !== "object" || v === null || Array.isArray(v)) return undefined;
+  const e = v as Json;
+  return {
+    status: typeof e.status === "number" && Number.isInteger(e.status) ? e.status : 0,
+    code: String(e.code ?? ""),
+    message: String(e.message ?? ""),
+  };
+}
+
+/** The body of `POST /approvals/{id}`; a `TypeError` for anything but `grant` or `decline`. */
+export function approvalDecisionBody(decision: string): Json {
+  if (decision !== "grant" && decision !== "decline") {
+    throw new TypeError(`decision must be "grant" or "decline", got ${JSON.stringify(decision)}`);
+  }
+  return { decision };
+}
+
+/**
+ * `Authorization: Bearer` for the user's OIDC ID token. Never DPoP: the server verifies the ID
+ * token as at hop 0, and refuses a delegation token there (`agent_token_refused`).
+ */
+export function idTokenHeaders(idToken: string): Record<string, string> {
+  const token = typeof idToken === "string" ? idToken.trim() : "";
+  if (token === "") throw new TypeError("idToken must be the user's OIDC ID token");
+  return { authorization: `Bearer ${token}` };
+}
+
+/**
+ * The answer to `DELETE /mcp/{server}`: `true` when the upstream closed the session, `false` when
+ * it does not let clients close sessions (405, as MCP allows). The proxy's own refusals throw
+ * what a call would (`rpcResult`).
+ */
+export async function sessionClosed(res: Response): Promise<boolean> {
+  if (res.ok) {
+    await res.body?.cancel();
+    return true;
+  }
+  if (res.status === 405) {
+    await res.body?.cancel();
+    return false;
+  }
+  const sse = (res.headers.get("content-type") ?? "").includes("event-stream");
+  const text = await res.text();
+  rpcMessageResult(res, parseRpcBody(text, sse), text);
+  throw errorFromResponse(res.status, text, res.headers);
 }
 
 // --- MCP / JSON-RPC ---------------------------------------------------------------------------
@@ -395,23 +814,30 @@ export function parseRpcBody(text: string, sse: boolean): Json | undefined {
 }
 
 /**
- * The decision id of a denial the proxy produced, else `undefined` (SR-32). The proxy sets
- * `X-Attenuo-Decision-Id` (comma separated, request order) and forwards no such header from an
- * upstream; an upstream is untrusted and can put any `-32003` error in its own body. A denial
- * counts only when `data.decision_id` is one of the ids in that header.
+ * `claimed` when it is one of the ids in the `X-Attenuo-Decision-Id` header value, else
+ * `undefined` (SR-32). The server and the proxy set that header (comma separated, request order)
+ * on every response that carries their decisions, and the proxy forwards no such header from an
+ * upstream; an upstream is untrusted and can put any error, and any `decision_id`, in its own
+ * body, so an id counts only when the header names it too.
  */
-function proxyDecisionId(headerValue: string | undefined, data: Json): string | undefined {
-  const claimed = data.decision_id;
+function provenDecisionId(headerValue: string | undefined, claimed: unknown): string | undefined {
   if (typeof claimed !== "string" || claimed === "" || !headerValue) return undefined;
   return headerValue.split(",").some((p) => p.trim() === claimed) ? claimed : undefined;
+}
+
+/** The decision id of a `-32003` or `-32008` the proxy produced (`provenDecisionId`). */
+function proxyDecisionId(headerValue: string | undefined, data: Json): string | undefined {
+  return provenDecisionId(headerValue, data.decision_id);
 }
 
 /**
  * The `result` of a JSON-RPC response, or the right error. Denials (`-32003` that the proxy
  * vouches for with `X-Attenuo-Decision-Id`) throw `DeniedError`; a `-32003` without that proof
  * is an upstream's own error and throws `RpcError`. A `-32008` with the same proof throws
- * `ApprovalRequiredError`. `-32001` or HTTP 401 throws `UnauthorizedError`; any other JSON-RPC
- * error throws `RpcError`.
+ * `ApprovalRequiredError`. `-32001` or HTTP 401 throws `UnauthorizedError` with the error's
+ * `data.reason` as `reason` and, when the header vouches for it, its `data.decision_id`. HTTP 503
+ * with `-32006` throws `UnavailableError` and HTTP 429 with `-32007` `RateLimitedError`, when the
+ * answer carries `Retry-After`; any other JSON-RPC error throws `RpcError`.
  */
 export async function rpcResult(res: Response): Promise<{ result: Json; decisionId?: string }> {
   const sse = (res.headers.get("content-type") ?? "").includes("event-stream");
@@ -431,7 +857,7 @@ export function rpcMessageResult(
   const headerId = res.headers.get(DECISION_ID_HEADER) ?? undefined;
   if (!msg) {
     if (res.ok) throw new AttenuoError(`no JSON-RPC response in body: ${text.slice(0, 200)}`);
-    throw errorFromResponse(res.status, text);
+    throw errorFromResponse(res.status, text, res.headers);
   }
   const err = msg.error;
   if (typeof err === "object" && err !== null) {
@@ -440,7 +866,9 @@ export function rpcMessageResult(
     const message = String(e.message ?? "");
     if (e.code === CODE_DENIED) {
       const id = proxyDecisionId(headerId, data);
-      if (id !== undefined) throw new DeniedError(String(data.reason ?? "unknown"), id, message);
+      if (id !== undefined) {
+        throw new DeniedError(String(data.reason ?? "unknown"), id, message, data);
+      }
     }
     if (e.code === CODE_APPROVAL_REQUIRED) {
       const id = proxyDecisionId(headerId, data);
@@ -456,15 +884,32 @@ export function rpcMessageResult(
           optTime(data.expires_at),
           callHash,
           message,
+          data,
         );
       }
     }
     if (e.code === CODE_UNAUTHORIZED || res.status === 401) {
-      throw new UnauthorizedError(401, "unauthorized", message);
+      // Only the proxy answers with HTTP 401. A `-32001` inside a 200 answer can be an upstream's
+      // own error, so its `data.reason` is not taken as the server's word.
+      const reason =
+        res.status === 401 && typeof data.reason === "string" && data.reason !== ""
+          ? data.reason
+          : "";
+      throw new UnauthorizedError(
+        401,
+        "unauthorized",
+        message,
+        undefined,
+        proxyDecisionId(headerId, data),
+        reason || "unauthorized",
+        data,
+      );
     }
+    const refusal = rpcRefusal(res.status, res.headers, e.code, message, data);
+    if (refusal !== undefined) throw refusal;
     throw new RpcError(typeof e.code === "number" ? e.code : 0, message, e.data);
   }
-  if (!res.ok) throw errorFromResponse(res.status, text);
+  if (!res.ok) throw errorFromResponse(res.status, text, res.headers);
   const result = msg.result;
   const r =
     typeof result === "object" && result !== null && !Array.isArray(result) ? (result as Json) : {};

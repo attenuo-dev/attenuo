@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use attenuo_audit::WalStats;
+use attenuo_audit::{AppendStats, WalStats};
 use attenuo_core::{LimitKind, OutputLabel};
 use attenuo_proxy::guard::STREAM_END_TOOL;
 use attenuo_proxy::records::is_lease_refusal_tool;
@@ -72,6 +72,59 @@ pub enum ExhaustedAt {
     Charge = 1,
 }
 
+/// Which `[limits]` rate limit refused a request (the `limit` label of
+/// `requests_rate_limited_total`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateLimitedBy {
+    /// `token_requests_per_minute`, per authenticated agent.
+    Token = 0,
+    /// `token_unauthenticated_requests_per_minute`, per peer address.
+    TokenUnauthenticated = 1,
+    /// `mcp_requests_per_minute`, per run.
+    Mcp = 2,
+    /// `authzen_search_requests_per_minute`, per run.
+    AuthzenSearch = 3,
+}
+
+impl RateLimitedBy {
+    /// Every limit, in index order.
+    pub const ALL: [RateLimitedBy; 4] = [
+        RateLimitedBy::Token,
+        RateLimitedBy::TokenUnauthenticated,
+        RateLimitedBy::Mcp,
+        RateLimitedBy::AuthzenSearch,
+    ];
+
+    /// The label value.
+    pub fn label(self) -> &'static str {
+        match self {
+            RateLimitedBy::Token => "token",
+            RateLimitedBy::TokenUnauthenticated => "token_unauthenticated",
+            RateLimitedBy::Mcp => "mcp",
+            RateLimitedBy::AuthzenSearch => "authzen_search",
+        }
+    }
+}
+
+/// Why a rate limit refused a request (the `cause` label of `requests_rate_limited_total`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateLimitCause {
+    /// The caller used up its requests of the minute.
+    Limit = 0,
+    /// A new caller, and every tracked caller is inside its minute
+    /// (`[limits] rate_limit_max_keys`).
+    TableFull = 1,
+}
+
+/// Which `[limits]` deadline a request missed (the `kind` label of `request_timeouts_total`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeoutKind {
+    /// `request_body_timeout_seconds`.
+    Body = 0,
+    /// `request_timeout_seconds`.
+    Handler = 1,
+}
+
 /// Who returned a run-limit charge (the `source` label of `budget_refunds_total`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefundSource {
@@ -87,6 +140,15 @@ struct WalSource(Box<dyn Fn() -> Option<WalStats> + Send + Sync>);
 impl std::fmt::Debug for WalSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("WalSource")
+    }
+}
+
+/// Reads the audit store's shed appends at render time (see [`Metrics::set_append_source`]).
+struct AppendSource(Box<dyn Fn() -> Option<AppendStats> + Send + Sync>);
+
+impl std::fmt::Debug for AppendSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AppendSource")
     }
 }
 
@@ -108,6 +170,12 @@ pub struct Metrics {
     /// [`RUN_STATE_KINDS`].
     run_state_pruned: [AtomicU64; 4],
     audit_append_errors: AtomicU64,
+    /// When the last audit append failed, as milliseconds since `epoch` plus one; 0 when the
+    /// last append succeeded or none has failed (`/readyz`, see
+    /// [`audit_append_failing`](Metrics::audit_append_failing)).
+    audit_append_failed_at: AtomicU64,
+    /// The instant `audit_append_failed_at` counts from.
+    epoch: std::time::Instant,
     audit_checkpoints: AtomicU64,
     /// `[audit.sink]` (SR-21): checkpoints delivered, delivery attempts that failed,
     /// checkpoints dropped from a full queue, the queue depth, and when the oldest undelivered
@@ -156,6 +224,8 @@ pub struct Metrics {
     run_lock_wait: Histogram,
     /// The background WAL checkpointer of the audit store, when there is one.
     wal: OnceLock<WalSource>,
+    /// The audit store's shed appends ([`attenuo_audit::SqliteAudit::append_stats`]).
+    append: OnceLock<AppendSource>,
     /// `GET` listen streams ended, by [`StreamEndCause::index`].
     streams_ended: [AtomicU64; StreamEndCause::ALL.len()],
     /// `stream.end` records not written, by [`StreamEndCause::index`] of the reason (only the
@@ -167,6 +237,11 @@ pub struct Metrics {
     lease_refusal_suppressed: Mutex<BTreeMap<(String, usize), u64>>,
     /// `tools/list` entries the list screen hid (ADR-0011), by [`LIST_HIDE_REASONS`] index.
     list_entries_hidden: [AtomicU64; LIST_HIDE_REASONS.len()],
+    /// `[limits]`: requests refused by the in-flight cap, by a rate limit (by
+    /// [`RateLimitedBy`] and [`RateLimitCause`]), and past a deadline (by [`TimeoutKind`]).
+    requests_shed: AtomicU64,
+    rate_limited: [[AtomicU64; 2]; 4],
+    request_timeouts: [AtomicU64; 2],
 }
 
 /// The reasons of `proxy_list_entries_hidden_total`, the list screen's hide reasons.
@@ -188,6 +263,8 @@ impl Default for Metrics {
             leases_pruned: AtomicU64::default(),
             run_state_pruned: Default::default(),
             audit_append_errors: AtomicU64::default(),
+            audit_append_failed_at: AtomicU64::default(),
+            epoch: std::time::Instant::now(),
             audit_checkpoints: AtomicU64::default(),
             audit_sink_delivered: AtomicU64::default(),
             audit_sink_failures: AtomicU64::default(),
@@ -214,10 +291,14 @@ impl Default for Metrics {
             taint_matches: Default::default(),
             run_lock_wait: Histogram::new(&STAGE_BUCKETS),
             wal: OnceLock::new(),
+            append: OnceLock::new(),
             streams_ended: Default::default(),
             stream_end_suppressed: Default::default(),
             lease_refusal_suppressed: Mutex::default(),
             list_entries_hidden: Default::default(),
+            requests_shed: AtomicU64::default(),
+            rate_limited: Default::default(),
+            request_timeouts: Default::default(),
         }
     }
 }
@@ -372,6 +453,21 @@ impl Metrics {
         }
     }
 
+    /// Count one request refused by `[limits] max_in_flight`.
+    pub fn request_shed(&self) {
+        self.requests_shed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count one request refused by a `[limits]` rate limit.
+    pub fn rate_limited(&self, by: RateLimitedBy, cause: RateLimitCause) {
+        self.rate_limited[by as usize][cause as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count one request past a `[limits]` deadline.
+    pub fn request_timed_out(&self, kind: TimeoutKind) {
+        self.request_timeouts[kind as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Record how long one authorization decision took.
     pub fn observe_authorize(&self, d: Duration) {
         self.authorize.observe(d);
@@ -383,12 +479,45 @@ impl Metrics {
         self.audit_append.observe(d);
     }
 
-    /// Run an audit append and record its duration.
-    pub fn time_audit_append<R>(&self, append: impl FnOnce() -> R) -> R {
+    /// Run an audit append, record its duration and note whether it failed (see
+    /// [`audit_append_result`](Self::audit_append_result)).
+    ///
+    /// # Errors
+    ///
+    /// Whatever `append` returns, unchanged.
+    pub fn time_audit_append<T, E>(&self, append: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
         let started = std::time::Instant::now();
         let out = append();
         self.observe_audit_append(started.elapsed());
+        self.audit_append_result(out.is_ok());
         out
+    }
+
+    /// Note how an audit append ended, for `/readyz`: a failure marks the audit log failing,
+    /// the next success clears it. Every append the server makes reports here.
+    pub fn audit_append_result(&self, ok: bool) {
+        let at = if ok {
+            0
+        } else {
+            u64::try_from(self.epoch.elapsed().as_millis())
+                .unwrap_or(u64::MAX - 1)
+                .saturating_add(1)
+        };
+        self.audit_append_failed_at.store(at, Ordering::Relaxed);
+    }
+
+    /// Whether the most recent audit append failed, less than `hold` ago. `/readyz` reports
+    /// not ready while this holds (A-12). The flag clears on the next successful append; the
+    /// `hold` bounds it too, because a server that readiness has taken out of rotation gets
+    /// no traffic and so no append that could clear it: after `hold` it is offered traffic
+    /// again, and the next failure takes it out once more.
+    pub fn audit_append_failing(&self, hold: Duration) -> bool {
+        let at = self.audit_append_failed_at.load(Ordering::Relaxed);
+        if at == 0 {
+            return false;
+        }
+        let failed = Duration::from_millis(at - 1);
+        self.epoch.elapsed().saturating_sub(failed) < hold
     }
 
     /// Record how long one stage of a proxied call took (see [`Stage`]).
@@ -408,6 +537,16 @@ impl Metrics {
     /// series are then left out.
     pub fn set_wal_source(&self, source: impl Fn() -> Option<WalStats> + Send + Sync + 'static) {
         let _ = self.wal.set(WalSource(Box::new(source)));
+    }
+
+    /// Read the audit store's shed appends through `source` at every render
+    /// (`audit_append_shed_total`). Set once; later calls are ignored. Until it is set, or
+    /// when `source` returns `None`, the series read zero.
+    pub fn set_append_source(
+        &self,
+        source: impl Fn() -> Option<AppendStats> + Send + Sync + 'static,
+    ) {
+        let _ = self.append.set(AppendSource(Box::new(source)));
     }
 
     /// Count one run-limit counter charged by an allowed call (ADR-0010).
@@ -638,6 +777,21 @@ impl Metrics {
             "Audit log appends that failed.",
             &self.audit_append_errors,
         );
+        let shed = self.append.get().and_then(|a| (a.0)()).unwrap_or_default();
+        header_lines(
+            &mut out,
+            "audit_append_shed_total",
+            "Audit appends that failed instead of waiting for the writer, by cause: queue_full \
+             ([audit] append_queue_max appends already waiting) or timeout (no answer within \
+             [audit] append_timeout_seconds). Their decisions are denied with audit_error.",
+            "counter",
+        );
+        for (cause, n) in [("queue_full", shed.queue_full), ("timeout", shed.timeouts)] {
+            let _ = writeln!(
+                out,
+                "{PREFIX}_audit_append_shed_total{{cause=\"{cause}\"}} {n}"
+            );
+        }
         simple_counter(
             &mut out,
             "audit_checkpoints_total",
@@ -729,6 +883,49 @@ impl Metrics {
                     escape(route)
                 );
             }
+        }
+        simple_counter(
+            &mut out,
+            "requests_shed_total",
+            "Requests answered 503 overloaded at once because [limits] max_in_flight requests \
+             were already being handled. /healthz and /readyz are never shed.",
+            &self.requests_shed,
+        );
+        header_lines(
+            &mut out,
+            "requests_rate_limited_total",
+            "Requests answered 429 by a [limits] rate limit, by limit (token: per agent, \
+             token_unauthenticated: per peer address, mcp: per run, authzen_search: action \
+             searches per run) and cause (limit: the caller used up its minute; table_full: a new caller while rate_limit_max_keys \
+             callers were inside their minute).",
+            "counter",
+        );
+        for by in RateLimitedBy::ALL {
+            for (cause, c) in ["limit", "table_full"]
+                .iter()
+                .zip(&self.rate_limited[by as usize])
+            {
+                let _ = writeln!(
+                    out,
+                    "{PREFIX}_requests_rate_limited_total{{limit=\"{}\",cause=\"{cause}\"}} {}",
+                    by.label(),
+                    c.load(Ordering::Relaxed)
+                );
+            }
+        }
+        header_lines(
+            &mut out,
+            "request_timeouts_total",
+            "Requests past a [limits] deadline, by kind (body: the body did not arrive within \
+             request_body_timeout_seconds; handler: no answer within request_timeout_seconds).",
+            "counter",
+        );
+        for (kind, c) in ["body", "handler"].iter().zip(&self.request_timeouts) {
+            let _ = writeln!(
+                out,
+                "{PREFIX}_request_timeouts_total{{kind=\"{kind}\"}} {}",
+                c.load(Ordering::Relaxed)
+            );
         }
         self.authorize.render(
             &mut out,
@@ -1299,9 +1496,9 @@ mod tests {
         m.observe_audit_append(Duration::from_millis(7));
         let slow = m.time_audit_append(|| {
             std::thread::sleep(Duration::from_millis(30));
-            "done"
+            Ok::<_, ()>("done")
         });
-        assert_eq!(slow, "done");
+        assert_eq!(slow, Ok("done"));
         m.audit_checkpoint();
         m.audit_checkpoint();
         let text = m.render();
@@ -1404,6 +1601,26 @@ mod tests {
             assert!(text.contains(&format!("{line}\n")), "{line}\n{text}");
         }
         assert!(!text.contains("attenuo_audit_checkpoint_last_timestamp_seconds 0\n"));
+    }
+
+    /// `audit_append_shed_total` reads zero until the store reports, then its counts.
+    #[test]
+    fn renders_audit_append_shedding() {
+        let m = Metrics::new();
+        let text = m.render();
+        check_text_format(&text).unwrap();
+        assert!(text.contains("attenuo_audit_append_shed_total{cause=\"queue_full\"} 0\n"));
+        assert!(text.contains("attenuo_audit_append_shed_total{cause=\"timeout\"} 0\n"));
+        m.set_append_source(|| {
+            Some(AppendStats {
+                queue_full: 3,
+                timeouts: 7,
+            })
+        });
+        let text = m.render();
+        check_text_format(&text).unwrap();
+        assert!(text.contains("attenuo_audit_append_shed_total{cause=\"queue_full\"} 3\n"));
+        assert!(text.contains("attenuo_audit_append_shed_total{cause=\"timeout\"} 7\n"));
     }
 
     #[test]
@@ -1527,5 +1744,24 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    /// A-12: a failed append marks the audit log failing until the next success, or until
+    /// the hold has passed.
+    #[test]
+    fn a_failed_append_marks_the_audit_log_failing_until_the_next_success() {
+        let m = Metrics::new();
+        let hold = Duration::from_secs(30);
+        assert!(!m.audit_append_failing(hold));
+        assert_eq!(
+            m.time_audit_append(|| Err::<(), _>("disk full")),
+            Err("disk full")
+        );
+        assert!(m.audit_append_failing(hold));
+        assert!(!m.audit_append_failing(Duration::ZERO), "past the hold");
+        assert_eq!(m.time_audit_append(|| Ok::<_, ()>(1)), Ok(1));
+        assert!(!m.audit_append_failing(hold));
+        m.audit_append_result(false);
+        assert!(m.audit_append_failing(hold));
     }
 }

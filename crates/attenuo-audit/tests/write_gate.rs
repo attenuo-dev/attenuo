@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use attenuo_audit::{
     AuditSink, ChargeOutcome, Durability, LeaseStore, MemoryAudit, MemoryLeaseStore, RunLabel,
-    SqliteAudit, SqliteLeaseStore, DEFAULT_WAL_CHECKPOINT_INTERVAL,
+    RunLimits, SqliteAudit, SqliteLeaseStore, DEFAULT_WAL_CHECKPOINT_INTERVAL,
 };
 use attenuo_core::{Charge, Decision, LeaseId, LimitKind};
 use common::{chain, record_for, t0};

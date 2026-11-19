@@ -39,3 +39,18 @@ updates:
     commit-message:
       prefix: "chore(docker)"
     labels: ["dependencies", "docker"]
+
+  # The hash-pinned release tooling for the Python package (SR-83): Dependabot recompiles
+  # sdk/python/release-requirements.txt from release-requirements.in with pip-compile and the
+  # options in its header. It also reads sdk/python/pyproject.toml here.
+  - package-ecosystem: pip
+    directory: "/sdk/python"
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: "ci(deps)"
+    groups:
+      release-tooling:
+        patterns: ["*"]
+    labels: ["dependencies", "python"]

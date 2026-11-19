@@ -33,12 +33,15 @@ from cryptography.hazmat.primitives.serialization import (
     NoEncryption,
     PrivateFormat,
 )
+from cryptography.hazmat.primitives.serialization import PublicFormat as _PublicFormat
 
 from attenuo import (
     AdminClient,
     ApiError,
     ApprovalRequired,
     AsyncClient,
+    AuthzenAction,
+    AuthzenEvaluation,
     BudgetLimit,
     Capability,
     Client,
@@ -47,7 +50,9 @@ from attenuo import (
     EvaluationLabels,
     EvaluationUsage,
     Prefix,
+    RateLimited,
     RefreshError,
+    RpcError,
     StatedApproval,
     StatedBudget,
     StatedSession,
@@ -55,6 +60,7 @@ from attenuo import (
     Token,
     TokenRefresher,
     Unauthorized,
+    _retry,
     call_hash,
 )
 from attenuo.audit import entry_hash
@@ -131,11 +137,16 @@ def binaries() -> tuple[Path, Path]:
 
 
 class Stack:
-    def __init__(self, url: str, work: Path) -> None:
+    def __init__(self, url: str, work: Path, restart: Callable[[], None]) -> None:
         self.url = url
         self.work = work
         #: The issuer's private key, when the test generated it (``sink_stack``).
         self.issuer_key: Ed25519PrivateKey | None = None
+        #: The ``signer`` agent's client key, when its entry lists it (``assertion_stack``).
+        self.client_key: DpopKey | None = None
+        #: Stop the server and start it again on the same port and config (a server with
+        #: an ephemeral issuer key or ``:memory:`` audit store forgets its tokens).
+        self.restart = restart
 
     def upstream_calls(self) -> list[str]:
         log = (self.work / "fake-mcp.log").read_text()
@@ -245,23 +256,17 @@ def run_stack(
     fake_out = (work / "fake-mcp.out").open("wb")
     fake_log = (work / "fake-mcp.log").open("wb")
     server_log = (work / "server.log").open("wb")
-    try:
-        procs.append(
-            subprocess.Popen(
-                [str(fake_bin), "--port", str(mcp_port), *(fake_args or [])],
-                stdout=fake_out,
-                stderr=fake_log,
-            )
+    url = f"http://127.0.0.1:{ob_port}"
+
+    def start_server() -> subprocess.Popen[bytes]:
+        return subprocess.Popen(
+            [str(server_bin), "--config", str(work / "config.toml")],
+            stdout=server_log,
+            stderr=subprocess.STDOUT,
+            env={**os.environ, "RUST_LOG": "warn"},
         )
-        procs.append(
-            subprocess.Popen(
-                [str(server_bin), "--config", str(work / "config.toml")],
-                stdout=server_log,
-                stderr=subprocess.STDOUT,
-                env={**os.environ, "RUST_LOG": "warn"},
-            )
-        )
-        url = f"http://127.0.0.1:{ob_port}"
+
+    def wait_ready() -> None:
         deadline = time.monotonic() + 20
         while time.monotonic() < deadline:
             try:
@@ -277,7 +282,24 @@ def run_stack(
             time.sleep(0.1)
         else:
             pytest.fail(f"server did not start:\n{(work / 'server.log').read_text()}")
-        yield Stack(url, work)
+
+    def restart() -> None:
+        procs[1].terminate()
+        procs[1].wait(timeout=10)
+        procs[1] = start_server()
+        wait_ready()
+
+    try:
+        procs.append(
+            subprocess.Popen(
+                [str(fake_bin), "--port", str(mcp_port), *(fake_args or [])],
+                stdout=fake_out,
+                stderr=fake_log,
+            )
+        )
+        procs.append(start_server())
+        wait_ready()
+        yield Stack(url, work, restart)
     finally:
         for p in procs:
             p.terminate()
@@ -315,6 +337,7 @@ def test_call_tool_stream_relays_events_and_raises_on_revocation(sse_stack: Stac
     with pytest.raises(Denied) as denied:
         next(ob.call_tool_stream(coder, "github", "read_file", {"repo": "alice/private-x"}))
     assert denied.value.reason == "policy_deny"
+    assert denied.value.stable_code == "policy_deny"
 
     # The upstream holds the response back for 20 s; revoke the lease after the first event.
     held = ob.call_tool_stream(coder, "github", "read_file", {**args, "hold_ms": 20000})
@@ -326,6 +349,7 @@ def test_call_tool_stream_relays_events_and_raises_on_revocation(sse_stack: Stac
         next(held)
     assert time.monotonic() - started < 10  # one re-check interval (1 s), with slack
     assert cut.value.reason == "lease_revoked"
+    assert cut.value.stable_code == "lease_revoked"
     assert cut.value.decision_id
     end = admin.audit_record(cut.value.decision_id).entry
     assert (end.tool, end.decision, end.reason) == ("stream.end", "deny", "lease_revoked")
@@ -422,9 +446,11 @@ def test_github_leak_scenario(stack: Stack) -> None:
         ob.exchange(root, "reviewer", ["github:read_file"])
     assert unauthenticated.value.status == 401
 
-    # 11. A bad bearer is a 401, not a denial.
-    with pytest.raises(Unauthorized):
+    # 11. A bad bearer is a 401, not a denial, and says why.
+    with pytest.raises(Unauthorized) as bad_bearer:
         ob.call_tool("not.a.token", "github", "read_file", {"repo": "alice/public-docs"})
+    assert bad_bearer.value.reason == "invalid_token"
+    assert bad_bearer.value.decision_id is None  # a token that does not verify writes no record
 
     # 12. Revoke the root lease: the cascade takes the coder and the tester with it.
     revoked = admin.revoke_lease(root.lease, "agent session compromised")
@@ -437,8 +463,15 @@ def test_github_leak_scenario(stack: Stack) -> None:
     assert after.value.reason == "lease_revoked"
     with pytest.raises(Denied):
         ob.call_tool(tester, "github", "read_file", {"repo": "alice/public-docs"})
-    with pytest.raises(ApiError):
+    # A request without a per-call decision is a 401 that names the reason and its record.
+    with pytest.raises(Unauthorized) as listing:
+        ob.list_tools(tester, "github")
+    assert listing.value.reason == "lease_revoked"
+    assert listing.value.decision_id
+    with pytest.raises(ApiError) as renewal:
         ob.renew(coder)  # a revoked lease is final
+    assert (renewal.value.status, renewal.value.error) == (400, "invalid_grant")
+    assert renewal.value.decision_id
 
     # 13. The audit log has every decision, and its hash chain verifies.
     report = admin.audit_verify()
@@ -449,6 +482,10 @@ def test_github_leak_scenario(stack: Stack) -> None:
     assert by_id[policy_denied.value.decision_id].reason == "policy_deny"
     assert by_id[cap_denied.value.decision_id].reason == "capability_denied"
     assert by_id[after.value.decision_id].reason == "lease_revoked"
+    listed = by_id[listing.value.decision_id]
+    assert (listed.tool, listed.reason) == ("tools/list", "lease_revoked")
+    renew_record = by_id[renewal.value.decision_id]
+    assert (renew_record.tool, renew_record.reason) == ("lease.renew", "lease_revoked")
 
     # 14. Only the intended reads (one for the coder, one for the tester) reached upstream.
     assert len(stack.upstream_calls()) == 2
@@ -516,20 +553,31 @@ def test_dpop_bound_chain(stack: Stack) -> None:
 
     # The same token without the key: refused everywhere.
     with Client(stack.url) as thief:
+        # Every route says why the same way: `reason`, for the proxy as for REST routes.
         with pytest.raises(Unauthorized) as no_proof:
             thief.call_tool(coder, "github", "read_file", {"repo": "alice/public-docs"})
         assert no_proof.value.status == 401
+        assert no_proof.value.reason == "dpop_required"
+        with pytest.raises(Unauthorized) as no_proof_list:
+            thief.list_tools(coder, "github")
+        assert no_proof_list.value.reason == "dpop_required"
         with pytest.raises(Unauthorized) as renew:
             thief.renew(coder)
         assert renew.value.error == "dpop_required"
+        assert renew.value.reason == "dpop_required"
         with pytest.raises(Unauthorized) as exchange:
             thief.exchange(coder, "tester", ["github:read_file"], client_secret=TESTER_SECRET)
         assert exchange.value.error == "dpop_required"
+        assert exchange.value.reason == "dpop_required"
     # Another key does not help either.
     with Client(stack.url, dpop_key=DpopKey.generate()) as other:
         with pytest.raises(Unauthorized) as wrong_key:
             other.renew(coder)
         assert wrong_key.value.error == "invalid_dpop_proof"
+        assert wrong_key.value.reason == "invalid_dpop_proof"
+        with pytest.raises(Unauthorized) as wrong_key_call:
+            other.call_tool(coder, "github", "read_file", {"repo": "alice/public-docs"})
+        assert wrong_key_call.value.reason == "invalid_dpop_proof"
 
     # The audit log records the bound use.
     entries = admin.audit_tail(50)
@@ -571,6 +619,9 @@ def test_dpop_server_nonce(nonce_stack: Stack) -> None:
         assert ob.authzen_evaluate(root, "github", "read_file", {"repo": "alice/public-x"})
         coder = ob.exchange(root, "coder", ["github:read_file"], client_secret=CODER_SECRET)
         assert coder.dpop_jkt == key.thumbprint
+        # Action search signs its own URL and picks up the nonce like evaluation.
+        found = ob.authzen_search_action(coder, "github", {"repo": "alice/public-x"})
+        assert [a.name for a in found.actions] == ["read_file"]
 
     # Through the `httpx` auth an MCP client library would use.
     auth = TokenAuth(lambda: coder, dpop_key=key)
@@ -606,6 +657,232 @@ async def test_dpop_server_nonce_async(nonce_stack: Stack) -> None:
             assert res.decision_id
             assert (await ob.renew(root)).expires_in > 0
         admin.revoke_lease(root.lease)
+
+
+# ---- private_key_jwt client assertions and the retries that send them again ---------------
+#
+# The server leaves a client assertion unused when it refuses the request with
+# `use_dpop_nonce` or `429 rate_limited` (SR-108, SR-111), because the client is told to send
+# the same request again. These tests check that the SDK's retries then succeed against the
+# real server, and that the load retry does not send an assertion that will have expired.
+
+
+def signer_agent(key: DpopKey) -> str:
+    """An `[[agents]]` entry for `signer` that authenticates with `key`'s client assertions."""
+    jwks = json.dumps({"keys": [key.public_jwk]})
+    return f"[[agents]]\nid = \"signer\"\njwks = '{jwks}'\n\n"
+
+
+@pytest.fixture(scope="module")
+def assertion_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Stack]:
+    """The stack with `[token] dpop_nonce = "required"` and the `signer` agent, which has a
+    client key and no secret."""
+    key = DpopKey.generate()
+    work = tmp_path_factory.mktemp("attenuo-it-assertion")
+    for s in run_stack(work, '[token]\ndpop_nonce = "required"\n\n' + signer_agent(key)):
+        s.client_key = key
+        yield s
+
+
+@pytest.fixture(scope="module")
+def limited_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Stack]:
+    """The stack with `[limits] token_requests_per_minute = 1` and the `signer` agent. Its
+    issuer key and audit store (leases, spent credentials) are files, so a restart keeps the
+    tokens and every spent assertion and forgets only the rate limit's minute: the tests
+    restart it in place of waiting the minute out."""
+    key = DpopKey.generate()
+    work = tmp_path_factory.mktemp("attenuo-it-limited")
+    pem = work / "issuer.pem"
+    issuer = Ed25519PrivateKey.generate()
+    pem.write_bytes(issuer.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()))
+    pem.chmod(0o600)
+    for s in run_stack(
+        work,
+        "[limits]\ntoken_requests_per_minute = 1\n\n" + signer_agent(key),
+        issuer_key=pem,
+        edits={'sqlite_path = ":memory:"': f'sqlite_path = "{work / "audit.sqlite"}"'},
+    ):
+        s.client_key = key
+        yield s
+
+
+class Sent:
+    """One `POST /token` a :class:`Recording` transport passed on, and the answer."""
+
+    def __init__(self, request: httpx.Request, response: httpx.Response) -> None:
+        self.assertion = json.loads(request.content).get("client_assertion")
+        self.status = response.status_code
+        body = response.json()
+        self.error = body.get("error") if isinstance(body, dict) else None
+
+
+class Recording(httpx.BaseTransport):
+    """The real HTTP transport, keeping each `/token` request and its answer."""
+
+    def __init__(self) -> None:
+        self.inner = httpx.HTTPTransport()
+        self.sent: list[Sent] = []
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        response = self.inner.handle_request(request)
+        if request.url.path == "/token":
+            response.read()
+            self.sent.append(Sent(request, response))
+        return response
+
+
+class AsyncRecording(httpx.AsyncBaseTransport):
+    """:class:`Recording` for the async client."""
+
+    def __init__(self) -> None:
+        self.inner = httpx.AsyncHTTPTransport()
+        self.sent: list[Sent] = []
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        response = await self.inner.handle_async_request(request)
+        if request.url.path == "/token":
+            await response.aread()
+            self.sent.append(Sent(request, response))
+        return response
+
+
+def roots_for(url: str, n: int, key: DpopKey | None = None) -> list[Token]:
+    with AdminClient(url, ADMIN_TOKEN) as admin:
+        return [
+            admin.mint_root_dev(
+                "alice", "https://idp.example", "assistant", ["github:*"], dpop_key=key
+            )
+            for _ in range(n)
+        ]
+
+
+def test_client_assertion_survives_the_nonce_retry(assertion_stack: Stack) -> None:
+    """A fresh client's first exchange is refused `use_dpop_nonce`; the retry sends the same
+    assertion with a proof that carries the nonce, and the server accepts it. The next
+    exchange has the nonce already: one request."""
+    url, client_key = assertion_stack.url, assertion_stack.client_key
+    assert client_key is not None
+    key = DpopKey.generate()
+    first_root, later_root = roots_for(url, 2, key)
+    rec = Recording()
+    caps = ["github:read_file"]
+    with Client(url, dpop_key=key, transport=rec) as ob:
+        assertion = client_key.client_assertion("signer", url)
+        child = ob.exchange(first_root, "signer", caps, client_assertion=assertion)
+        assert child.dpop_jkt == key.thumbprint
+        assert child.chain.hops[-1].agent == "signer"
+        assert [(x.status, x.error) for x in rec.sent] == [(401, "use_dpop_nonce"), (200, None)]
+        assert [x.assertion for x in rec.sent] == [assertion, assertion]
+
+        rec.sent.clear()
+        assertion = client_key.client_assertion("signer", url)
+        child = ob.exchange(later_root, "signer", caps, client_assertion=assertion)
+        assert child.dpop_jkt == key.thumbprint
+        assert [(x.status, x.assertion) for x in rec.sent] == [(200, assertion)]
+        # The bound child works through the proxy.
+        res = ob.call_tool(child, "github", "read_file", {"repo": "alice/public-docs"})
+        assert res.decision_id
+
+
+async def test_client_assertion_survives_the_nonce_retry_async(assertion_stack: Stack) -> None:
+    """The async client, as :func:`test_client_assertion_survives_the_nonce_retry`."""
+    url, client_key = assertion_stack.url, assertion_stack.client_key
+    assert client_key is not None
+    key = DpopKey.generate()
+    first_root, later_root = roots_for(url, 2, key)
+    rec = AsyncRecording()
+    caps = ["github:read_file"]
+    async with AsyncClient(url, dpop_key=key, transport=rec) as ob:
+        assertion = client_key.client_assertion("signer", url)
+        child = await ob.exchange(first_root, "signer", caps, client_assertion=assertion)
+        assert child.dpop_jkt == key.thumbprint
+        assert [(x.status, x.error) for x in rec.sent] == [(401, "use_dpop_nonce"), (200, None)]
+        assert [x.assertion for x in rec.sent] == [assertion, assertion]
+
+        rec.sent.clear()
+        assertion = client_key.client_assertion("signer", url)
+        await ob.exchange(later_root, "signer", caps, client_assertion=assertion)
+        assert [(x.status, x.assertion) for x in rec.sent] == [(200, assertion)]
+
+
+def test_rate_limited_exchange_resends_its_assertion_only_while_it_lasts(
+    limited_stack: Stack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`max_retries` against `token_requests_per_minute = 1`. Over the limit, the server
+    answers 429 with `Retry-After` until the agent's minute ends. With an assertion that lasts
+    past that, the client waits and sends the same assertion again, and it is accepted: the
+    429 did not spend it (the restart that stands in for the wait keeps spent assertions).
+    With one that would expire first, the client raises `RateLimited` at once, and the caller
+    mints a new one."""
+    s = limited_stack
+    s.restart()  # a minute of its own
+    client_key = s.client_key
+    assert client_key is not None
+    roots = roots_for(s.url, 3)
+    waits: list[float] = []
+
+    def wait_out_the_minute(seconds: float) -> None:
+        waits.append(seconds)
+        s.restart()
+
+    monkeypatch.setattr(_retry, "_sleep", wait_out_the_minute)
+    monkeypatch.setattr(_retry, "_random", lambda: 0.0)
+    rec = Recording()
+    caps = ["github:read_file"]
+    with Client(s.url, transport=rec, max_retries=1, max_retry_delay=120) as ob:
+        first = client_key.client_assertion("signer", s.url)
+        ob.exchange(roots[0], "signer", caps, client_assertion=first)
+        assert waits == []
+
+        rec.sent.clear()
+        lasting = client_key.client_assertion("signer", s.url, lifetime=300)
+        child = ob.exchange(roots[1], "signer", caps, client_assertion=lasting)
+        assert child.chain.hops[-1].agent == "signer"
+        assert len(waits) == 1 and 1 <= waits[0] <= 60
+        assert [(x.status, x.error) for x in rec.sent] == [(429, "rate_limited"), (200, None)]
+        assert [x.assertion for x in rec.sent] == [lasting, lasting]
+
+        rec.sent.clear()
+        short = client_key.client_assertion("signer", s.url, lifetime=5)
+        with pytest.raises(RateLimited) as e:
+            ob.exchange(roots[2], "signer", caps, client_assertion=short)
+        assert e.value.retry_after is not None and e.value.retry_after > 5
+        assert len(waits) == 1  # no wait, no second request
+        assert [(x.status, x.assertion) for x in rec.sent] == [(429, short)]
+
+        # What the caller does: wait out `retry_after` (here: restart), mint, call again.
+        s.restart()
+        fresh = client_key.client_assertion("signer", s.url)
+        ob.exchange(roots[2], "signer", caps, client_assertion=fresh)
+        assert [x.status for x in rec.sent] == [429, 200]
+
+
+async def test_rate_limited_exchange_resends_its_assertion_async(
+    limited_stack: Stack, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The async client's load retry sends the same assertion again, and it is accepted."""
+    s = limited_stack
+    s.restart()
+    client_key = s.client_key
+    assert client_key is not None
+    roots = roots_for(s.url, 2)
+    waits: list[float] = []
+
+    async def wait_out_the_minute(seconds: float) -> None:
+        waits.append(seconds)
+        s.restart()
+
+    monkeypatch.setattr(_retry, "_asleep", wait_out_the_minute)
+    rec = AsyncRecording()
+    caps = ["github:read_file"]
+    async with AsyncClient(s.url, transport=rec, max_retries=1, max_retry_delay=120) as ob:
+        first = client_key.client_assertion("signer", s.url)
+        await ob.exchange(roots[0], "signer", caps, client_assertion=first)
+        rec.sent.clear()
+        lasting = client_key.client_assertion("signer", s.url, lifetime=300)
+        await ob.exchange(roots[1], "signer", caps, client_assertion=lasting)
+        assert len(waits) == 1
+        assert [(x.status, x.assertion) for x in rec.sent] == [(429, lasting), (200, lasting)]
 
 
 def test_too_many_pending_approvals(stack: Stack) -> None:
@@ -1018,6 +1295,9 @@ def test_dry_run_with_a_stated_budget_session_approval_and_usage(stack: Stack) -
     with pytest.raises(Denied) as over:
         ob.call_tool(coder, "github", "read_file", read)
     assert over.value.reason == "budget_exhausted"
+    # The refusal names the limit, as the dry run did.
+    assert over.value.limit == BudgetLimit(hop=1, kind="calls", used=2, arg=None, max=2)
+    assert over.value.data["limit"] == over.value.limit.to_json()
     admin.revoke_lease(root.lease)
     admin.close()
     ob.close()
@@ -1347,3 +1627,310 @@ def test_shipped_checkpoint_tampering_is_reported_at_the_same_seq_by_rust_python
     assert "shipped checkpoint does not verify" in got[0][2]
     admin.close()
     ob.close()
+
+
+# ---- K-5: budget refund, AuthZEN batch and discovery, user decision, session close ---------
+
+
+def test_refund_budget(stack: Stack) -> None:
+    """An allowed call charged to a ``calls`` limit is refunded once by its decision id: the
+    run gets the call back, a second refund is 409, an unknown id 404."""
+    admin = AdminClient(stack.url, ADMIN_TOKEN)
+    ob = Client(stack.url)
+    root = admin.mint_root_dev("alice", "https://idp.example", "assistant", ["github:*"])
+    coder = ob.exchange(
+        root,
+        "coder",
+        [Capability("github", "read_file").with_limits(calls=1)],
+        client_secret=CODER_SECRET,
+    )
+    read = {"repo": "alice/public-docs", "path": "README.md"}
+    first = ob.call_tool(coder, "github", "read_file", read)
+    assert first.decision_id
+    with pytest.raises(Denied) as spent:
+        ob.call_tool(coder, "github", "read_file", read)
+    assert spent.value.reason == "budget_exhausted"
+
+    refund = admin.refund_budget(first.decision_id, "upstream failed")
+    assert refund.decision_id == first.decision_id
+    assert refund.refunded >= 1 and refund.reason == "upstream failed"
+    assert refund.audit_id is not None
+    assert ob.call_tool(coder, "github", "read_file", read).decision_id  # the call is back
+
+    with pytest.raises(ApiError) as again:
+        admin.refund_budget(first.decision_id)
+    assert (again.value.status, again.value.error) == (409, "already_refunded")
+    assert again.value.decision_id is None
+    with pytest.raises(ApiError) as unknown:
+        admin.refund_budget("00000000-0000-4000-8000-000000000000")
+    assert (unknown.value.status, unknown.value.error) == (404, "not_found")
+    admin.revoke_lease(root.lease)
+    ob.close()
+    admin.close()
+
+
+async def test_authzen_batch_and_discovery(stack: Stack) -> None:
+    """A batch is one decision per call, in order; ``deny_on_first_deny`` stops at the first
+    deny; discovery names this server's endpoints. The async client agrees."""
+    admin = AdminClient(stack.url, ADMIN_TOKEN)
+    ob = Client(stack.url)
+    root = admin.mint_root_dev("alice", "https://idp.example", "assistant", ["github:*"])
+    coder = ob.exchange(root, "coder", ["github:read_file"], client_secret=CODER_SECRET)
+    read = {"repo": "alice/public-docs", "path": "README.md"}
+    issue = {"repo": "alice/public-docs", "title": "t"}
+
+    allow, deny = ob.authzen_evaluate_batch(
+        coder,
+        [AuthzenEvaluation("github", "read_file", read), ("github", "create_issue", issue)],
+    )
+    assert allow and allow.decision_id and allow.error is None
+    assert not deny and deny.reason == "capability_denied" and deny.decision_id
+
+    stopped = ob.authzen_evaluate_batch(
+        coder,
+        [("github", "create_issue", issue), ("github", "read_file", read)],
+        semantic="deny_on_first_deny",
+    )
+    assert [d.decision for d in stopped] == [False]
+
+    with pytest.raises(Unauthorized):
+        ob.authzen_evaluate_batch("not-a-token", [("github", "read_file", read)])
+
+    cfg = ob.authzen_configuration()
+    assert cfg.policy_decision_point == stack.url
+    assert cfg.access_evaluation_endpoint == f"{stack.url}/access/v1/evaluation"
+    assert cfg.access_evaluations_endpoint == f"{stack.url}/access/v1/evaluations"
+
+    async with AsyncClient(stack.url) as aob:
+        assert (await aob.authzen_configuration()) == cfg
+        (one,) = await aob.authzen_evaluate_batch(coder, [("github", "read_file", read)])
+        assert one.decision
+    admin.revoke_lease(root.lease)
+    ob.close()
+    admin.close()
+
+
+async def test_authzen_search_action(stack: Stack) -> None:
+    """Action search answers the catalogued tools that evaluation would allow, pages by
+    ``limit``, and agrees with evaluation; the async client agrees, and a bad token or a
+    ``server`` naming one tool is refused."""
+    admin = AdminClient(stack.url, ADMIN_TOKEN)
+    ob = Client(stack.url)
+    root = admin.mint_root_dev("alice", "https://idp.example", "assistant", ["github:*"])
+    coder = ob.exchange(root, "coder", ["github:read_file"], client_secret=CODER_SECRET)
+    public = {"repo": "alice/public-docs", "path": "README.md"}
+    private = {"repo": "alice/private-salaries", "path": "pay.csv"}
+
+    page = ob.authzen_search_action(coder, "github", public)
+    assert page.actions == [AuthzenAction("read_file", "github")] and page.next_token is None
+    assert ob.authzen_evaluate(coder, "github", "read_file", public)
+    # The policy forbids the private repo, so nothing is a result for these arguments.
+    assert ob.authzen_search_action(coder, "github", private).actions == []
+    assert not ob.authzen_evaluate(coder, "github", "read_file", private)
+
+    # One candidate per page: the catalog is create_issue, delete_repo, read_file. The first
+    # page is approval-gated create_issue, never a result, so it comes back empty with a token.
+    first = ob.authzen_search_action(root, "github", public, limit=1)
+    assert first.actions == [] and first.next_token
+    paged = list(ob.authzen_search_action_iter(root, "github", public, limit=1))
+    assert paged == list(ob.authzen_search_action_iter(root, "github", public))
+    assert AuthzenAction("read_file", "github") in paged
+    assert AuthzenAction("create_issue", "github") not in paged
+    for action in paged:
+        assert ob.authzen_evaluate(root, "github", action.name, public), action
+
+    with pytest.raises(Unauthorized):
+        ob.authzen_search_action("not-a-token", "github", public)
+    with pytest.raises(ApiError) as one_tool:
+        ob.authzen_search_action(coder, "github/read_file", public)
+    assert (one_tool.value.status, one_tool.value.code) == (400, "invalid_search_resource")
+    with pytest.raises(ApiError) as bad_page:
+        ob.authzen_search_action(coder, "github", public, page_token="not-a-token")
+    assert bad_page.value.code == "invalid_cursor"
+
+    assert ob.authzen_configuration().search_action_endpoint == (
+        f"{stack.url}/access/v1/search/action"
+    )
+    async with AsyncClient(stack.url) as aob:
+        assert [a async for a in aob.authzen_search_action_iter(root, "github", public)] == paged
+        assert (await aob.authzen_search_action(coder, "github", public)) == page
+    admin.revoke_lease(root.lease)
+    assert ob.authzen_search_action(coder, "github", public).actions == []
+    ob.close()
+    admin.close()
+
+
+def test_close_session(fresh_stack: Stack) -> None:
+    """``DELETE /mcp/{server}`` reaches the upstream; another run's attempt on the session is
+    the proxy's audited ``session_mismatch``; an unknown session is its ``-32600``."""
+    stack = fresh_stack
+    admin = AdminClient(stack.url, ADMIN_TOKEN)
+    ob = Client(stack.url)
+    root = admin.mint_root_dev("alice", "https://idp.example", "assistant", ["github:*"])
+    coder = ob.exchange(root, "coder", ["github:read_file"], client_secret=CODER_SECRET)
+    sid = ob.initialize(coder, "github")
+    assert sid, "the fake upstream assigns a session id"
+    other = admin.mint_root_dev("alice", "https://idp.example", "assistant", ["github:*"])
+    with pytest.raises(Denied) as mismatch:
+        ob.close_session(other, "github", sid)
+    assert mismatch.value.reason == "session_mismatch" and mismatch.value.decision_id
+    assert ob.close_session(coder, "github", sid) is True
+    with pytest.raises(RpcError) as unknown:
+        ob.close_session(coder, "github", "no-such-session")
+    assert unknown.value.code == -32600
+    assert unknown.value.stable_code == "session_unknown"
+    admin.revoke_lease(other.lease)
+    admin.revoke_lease(root.lease)
+    ob.close()
+    admin.close()
+
+
+class Idp:
+    """A stand-in OIDC issuer: an Ed25519 key, its JWKS served on a local port."""
+
+    ISSUER = "https://idp.example"
+
+    def __init__(self) -> None:
+        import http.server
+        import threading
+
+        self.key = Ed25519PrivateKey.generate()
+        raw = self.key.public_key().public_bytes(Encoding.Raw, _PublicFormat.Raw)
+        jwks = json.dumps(
+            {"keys": [{"kty": "OKP", "crv": "Ed25519", "kid": "idp-1", "x": _b64(raw)}]}
+        ).encode()
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                self.send_response(200)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(jwks)))
+                self.end_headers()
+                self.wfile.write(jwks)
+
+            def log_message(self, *args: Any) -> None:
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}/jwks"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def id_token(self, subject: str, audience: str, jti: str) -> str:
+        now = int(time.time())
+        head = {"alg": "EdDSA", "typ": "JWT", "kid": "idp-1"}
+        claims = {
+            "iss": self.ISSUER,
+            "sub": subject,
+            "aud": audience,
+            "iat": now,
+            "exp": now + 300,
+            "jti": jti,
+        }
+        signing = f"{_b64(json.dumps(head).encode())}.{_b64(json.dumps(claims).encode())}"
+        return f"{signing}.{_b64(self.key.sign(signing.encode()))}"
+
+
+def _b64(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+@pytest.fixture(scope="module")
+def idp_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[tuple[Stack, Idp]]:
+    """The demo stack with ``[[idps]]`` trusting a local issuer, so a test can sign the
+    originating user's ID token."""
+    idp = Idp()
+    section = f'[[idps]]\nissuer = "{Idp.ISSUER}"\njwks_url = "{idp.url}"\n\n'
+    try:
+        for s in run_stack(tmp_path_factory.mktemp("attenuo-it-idp"), section):
+            yield s, idp
+    finally:
+        idp.server.shutdown()
+
+
+def test_user_decides_an_approval_with_their_id_token(idp_stack: tuple[Stack, Idp]) -> None:
+    """``POST /approvals/{id}`` with the originating user's ID token: a delegation token is
+    refused, the user's token grants, the granted call goes through, and the same ID token
+    cannot decide a second time."""
+    stack, idp = idp_stack
+    admin = AdminClient(stack.url, ADMIN_TOKEN)
+    ob = Client(stack.url)
+    root = admin.mint_root_dev("alice", Idp.ISSUER, "assistant", ["github:*"])
+    issue = {"repo": "alice/public-docs", "title": "from the user"}
+    with pytest.raises(ApprovalRequired) as held:
+        ob.call_tool(root, "github", "create_issue", issue)
+    approval_id = held.value.approval_id
+    assert approval_id
+
+    with pytest.raises(ApiError) as agent:
+        ob.grant_approval(approval_id, root.jwt)
+    assert (agent.value.status, agent.value.error) == (403, "agent_token_refused")
+    with pytest.raises(ApiError) as other:
+        ob.grant_approval(approval_id, idp.id_token("mallory", "demo-approval-page", "j-0"))
+    assert (other.value.status, other.value.error) == (403, "wrong_user")
+
+    id_token = idp.id_token("alice", "demo-approval-page", "j-1")
+    granted = ob.grant_approval(approval_id, id_token)
+    assert granted.state == "granted" and granted.usable
+    assert granted.approver is not None and granted.approver["by"] == "user"
+    result = ob.call_tool(
+        root, "github", "create_issue", issue, approval_token=granted.approval_token
+    )
+    assert result.decision_id
+
+    with pytest.raises(ApprovalRequired) as second:
+        ob.call_tool(root, "github", "create_issue", {**issue, "title": "again"})
+    assert second.value.approval_id
+    with pytest.raises(ApiError) as replay:
+        ob.decline_approval(second.value.approval_id, id_token)
+    assert (replay.value.status, replay.value.error) == (400, "invalid_grant")
+    declined = ob.decline_approval(
+        second.value.approval_id, idp.id_token("alice", "demo-approval-page", "j-2")
+    )
+    assert declined.state == "declined"
+    admin.revoke_lease(root.lease)
+    ob.close()
+    admin.close()
+
+
+@pytest.fixture(scope="module")
+def idp_assertion_stack(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[Stack, Idp]]:
+    """The stack with `[token] dpop_nonce = "required"`, `[[idps]]` trusting a local issuer,
+    and the `signer` agent (client key, no secret) granted alice's root tokens."""
+    idp, key = Idp(), DpopKey.generate()
+    section = (
+        '[token]\ndpop_nonce = "required"\n\n'
+        f'[[idps]]\nissuer = "{Idp.ISSUER}"\njwks_url = "{idp.url}"\n\n'
+        f"{signer_agent(key)}"
+        f'[[root_grants]]\nsubject = "alice"\nissuer = "{Idp.ISSUER}"\nagent = "signer"\n'
+        'capabilities = ["github:*"]\n\n'
+    )
+    try:
+        for s in run_stack(tmp_path_factory.mktemp("attenuo-it-idp-assertion"), section):
+            s.client_key = key
+            yield s, idp
+    finally:
+        idp.server.shutdown()
+
+
+def test_hop0_client_assertion_survives_the_nonce_retry(
+    idp_assertion_stack: tuple[Stack, Idp],
+) -> None:
+    """Hop 0 (IdP intake) authenticated by a client assertion, DPoP-bound, against a server
+    that requires its nonce: the first request is refused `use_dpop_nonce`, the retry sends
+    the same assertion and the same ID token and gets the root token (SR-111 in
+    `idp/intake.rs`)."""
+    stack, idp = idp_assertion_stack
+    client_key = stack.client_key
+    assert client_key is not None
+    key = DpopKey.generate()
+    rec = Recording()
+    with Client(stack.url, dpop_key=key, transport=rec) as ob:
+        assertion = client_key.client_assertion("signer", stack.url)
+        id_token = idp.id_token("alice", "signer", "hop0-1")
+        root = ob.exchange(id_token, "signer", ["github:read_file"], client_assertion=assertion)
+        assert root.dpop_jkt == key.thumbprint
+        assert root.chain.hops[-1].agent == "signer"
+        assert [(x.status, x.error) for x in rec.sent] == [(401, "use_dpop_nonce"), (200, None)]
+        assert [x.assertion for x in rec.sent] == [assertion, assertion]

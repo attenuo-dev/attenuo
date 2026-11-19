@@ -138,17 +138,22 @@ impl Harness {
             attribute_claims: vec![],
             jwks_ttl_seconds: 300,
             clock_skew_seconds: 0,
+            tenant: None,
+            id_jag_ceiling: None,
+            credentials: attenuo_server::config::DEFAULT_IDP_CREDENTIALS.to_vec(),
+            ca_pem_path: None,
             client_ids: BTreeMap::new(),
         }];
-        cfg.agents = vec![AgentConfig {
-            id: "planner".into(),
-            secret_sha256: sha256_hex(PLANNER_SECRET),
-        }];
+        cfg.agents = vec![AgentConfig::with_secret_sha256(
+            "planner",
+            sha256_hex(PLANNER_SECRET),
+        )];
         cfg.actor_trust = vec![ActorTrustConfig {
             issuer: None,
             jwks_url: None,
             spiffe_trust_domain: Some(TRUST_DOMAIN.into()),
             spiffe_bundle_url: Some(keys.url("/bundle")),
+            ca_pem_path: None,
             audience: ISSUER.into(),
             subject_to_agent: SubjectToAgent::Map(BTreeMap::from([
                 (PLANNER_ID.to_string(), "planner".to_string()),
@@ -481,8 +486,8 @@ async fn hop_0_follows_actor_auth_modes() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(code(&v), ("invalid_request", "client_auth_not_accepted"));
     let (status, v) = h.post(&secret_only[..4]).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(code(&v), ("invalid_request", "actor_token_required"));
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(code(&v), ("invalid_client", "actor_token_required"));
     let (status, v) = h.intake(&id_token, &h.jwt_svid(PLANNER_ID), &[]).await;
     assert_eq!(status, StatusCode::OK, "{v}");
 
@@ -508,4 +513,71 @@ async fn hop_0_follows_actor_auth_modes() {
     let (status, v) = h.post(&secret_only[..4]).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "{v}");
     assert_eq!(code(&v), ("invalid_client", "client_auth_missing"));
+}
+
+/// Hop 0 with no credential at all (no secret, no assertion, no actor token) is 401
+/// `invalid_client` in every `[token] actor_auth` mode, for an ID token and for an ID-JAG
+/// (draft -06 §4.4), and the answer is the same whether `client_id` names a configured agent
+/// or not (SR-110).
+#[tokio::test]
+async fn intake_without_any_credential_is_invalid_client_in_every_mode() {
+    for (mode, expected) in [
+        (ActorAuth::Either, "client_auth_missing"),
+        (ActorAuth::Secret, "client_auth_missing"),
+        (ActorAuth::ActorToken, "actor_token_required"),
+    ] {
+        let h = Harness::start(|cfg| cfg.token.actor_auth = mode).await;
+        let id_token = h.id_token("alice", "planner");
+        let by_id_token = vec![
+            ("grant_type", EXCHANGE),
+            ("subject_token", id_token.as_str()),
+            ("subject_token_type", ID_TOKEN),
+            ("scope", "github:read_file"),
+        ];
+        // The ID-JAG is not looked at before the agent authenticates, so any string will do.
+        let by_id_jag = vec![
+            ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
+            ("assertion", "eyJhbGciOiJSUzI1NiJ9.e30.c2ln"),
+            ("scope", "github:read_file"),
+        ];
+        for base in [by_id_token, by_id_jag] {
+            let mut answers = Vec::new();
+            for client_id in [None, Some("planner"), Some("nobody")] {
+                let mut pairs = base.clone();
+                if let Some(id) = client_id {
+                    pairs.push(("client_id", id));
+                }
+                let resp = h
+                    .client
+                    .post(h.server.url("/token"))
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(serde_urlencoded::to_string(&pairs).unwrap())
+                    .send()
+                    .await
+                    .unwrap();
+                let status = resp.status();
+                let challenge = resp
+                    .headers()
+                    .get("www-authenticate")
+                    .map(|v| v.to_str().unwrap().to_owned());
+                let v: Value = resp.json().await.unwrap();
+                assert_eq!(
+                    status,
+                    StatusCode::UNAUTHORIZED,
+                    "{mode:?} {client_id:?}: {v}"
+                );
+                assert_eq!(
+                    code(&v),
+                    ("invalid_client", expected),
+                    "{mode:?} {client_id:?}"
+                );
+                assert!(challenge.is_some(), "{mode:?}: no WWW-Authenticate");
+                answers.push((status, challenge, v));
+            }
+            assert_eq!(
+                answers[1], answers[2],
+                "{mode:?}: known and unknown client_id differ"
+            );
+        }
+    }
 }

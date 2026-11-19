@@ -2,6 +2,8 @@
 //! edge cases, and a fixed token issuer whose key the targets can use to re-sign mutated
 //! tokens (so the checks after the signature are reached).
 
+pub mod caps;
+
 use std::sync::OnceLock;
 
 use arbitrary::{Result, Unstructured};

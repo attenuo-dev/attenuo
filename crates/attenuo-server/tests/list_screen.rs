@@ -275,7 +275,7 @@ async fn policy_mode_hides_tools_no_call_could_use_and_writes_no_record() {
         let metrics = h.state.metrics.render();
         assert_eq!(hidden_metric(&metrics, "policy"), 3, "sse {sse}");
         assert_eq!(hidden_metric(&metrics, "not_in_catalog"), 2, "sse {sse}");
-        assert!(h.state.pipeline.policy().read().unwrap().screened_tools() > 0);
+        assert!(h.state.pipeline.policy().snapshot().screened_tools() > 0);
     }
 }
 
@@ -336,13 +336,7 @@ async fn a_policy_reload_changes_the_hidden_set() {
     let h = Harness::start(ListFilterMode::Policy).await;
     let token = h.mint(false).await;
     assert!(!h.list(&token).await.contains(&"update_issue".to_string()));
-    let generation = h
-        .state
-        .pipeline
-        .policy()
-        .read()
-        .unwrap()
-        .policy_generation();
+    let generation = h.state.pipeline.policy().snapshot().policy_generation();
 
     h.reload(&format!(
         "{POLICY}\n@id(\"updates\") permit(principal, action == Action::\"github/update_issue\", resource);\n\
@@ -350,12 +344,7 @@ async fn a_policy_reload_changes_the_hidden_set() {
     ))
     .await;
     assert_eq!(
-        h.state
-            .pipeline
-            .policy()
-            .read()
-            .unwrap()
-            .policy_generation(),
+        h.state.pipeline.policy().snapshot().policy_generation(),
         generation + 1
     );
     let after = h.list(&token).await;

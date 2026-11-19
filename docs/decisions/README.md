@@ -50,7 +50,12 @@ Only the `status` and `date` fields and the More Information section of an accep
 | [0008](0008-admin-console.md) | Admin console: vanilla static files embedded in `attenuo-server`, on a separate opt-in listener, admin token held in page memory | accepted |
 | [0009](0009-output-labelling.md) | Output labelling: the proxy labels every upstream result untrusted, taints the delegation run, and policy can require a call-bound approval for destructive tools | accepted |
 | [0010](0010-run-limits.md) | Run limits: count and amount budgets declared per token hop, charged against every hop of the chain in the decision's transaction, and exposed to Cedar as context | accepted |
-| [0011](0011-cedar-aware-list-filtering.md) | Cedar-aware list filtering: opt in, hide a tool only when the policy denies it for every possible call, with approval-gated tools always kept | proposed |
-| [0012](0012-opentelemetry-export.md) | OpenTelemetry export: allow-listed decision spans over OTLP/HTTP, off by default, linked not adopted, joined to the signed record by decision id | proposed |
+| [0011](0011-cedar-aware-list-filtering.md) | Cedar-aware list filtering: opt in, hide a tool only when the policy denies it for every possible call, with approval-gated tools always kept | accepted |
+| [0012](0012-opentelemetry-export.md) | OpenTelemetry export: allow-listed decision spans over OTLP/HTTP, off by default, linked not adopted, joined to the signed record by decision id | accepted |
+| [0013](0013-admin-api-listener.md) | Admin API listener: `/admin/*` on an opt-in listener of its own, and refused on a main listener off loopback unless the operator opts in | proposed |
+| [0014](0014-request-limits.md) | Request limits: an in-flight cap and deadlines on by default, per-run and per-agent rate limits in process and off by default | proposed |
+| [0015](0015-audit-retention.md) | Audit retention: archive a prefix of the log at a signed checkpoint, prune it in the server behind a signed anchor, off by default | proposed |
+| [0016](0016-admin-operators.md) | Admin operators: named admin bearer tokens stored as SHA-256 digests, three fixed roles checked from one route table, and the operator recorded as the actor | proposed |
+| [0017](0017-private-key-jwt.md) | Client authentication with `private_key_jwt`: public keys inline in `[[agents]]` and `[[peps]]`, `aud` fixed to the issuer identifier, and every assertion used once | proposed |
 
 Add a row for each new ADR.
