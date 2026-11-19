@@ -10,7 +10,7 @@
 | 4 | 15.2–23.8 s | Calls | Terminal: read_file public → ALLOWED; read_file private-salaries → DENIED policy_deny; create_issue → DENIED capability_denied. "1 call reached the upstream server." |
 | 5 | 23.8–29.3 s | Revoke | assistant → coder → reviewer flip ACTIVE to REVOKED. "Revoke one lease. Every agent below it stops." |
 | 6 | 29.3–35 s | Numbers | Bars: 38/38 direct vs 7/38 behind attenuo. 3/29 benign denied, 0.4–0.8 ms. Fine print: synthetic cases written by the authors. |
-| 7 | 35–39 s | Outro | Mark + attenuo, tags (self-hosted, Rust, Cedar, MCP proxy, Apache-2.0), "Open source soon", @mudit_builds. |
+| 7 | 35–39 s | Outro | Mark + attenuo, tags (self-hosted, Rust, Cedar, MCP proxy, Apache-2.0), "Open source now", the repository address, @mudit_builds. |
 
 ## LinkedIn cut (71 s)
 
@@ -33,6 +33,6 @@ The Calls scene alone, faster typing, 960 px, 15 fps.
 
 ## Suggested post copy (drafts, not posted)
 
-**X:** AI agents get one broad token, and one injected issue is enough to leak private repos. I built attenuo: every tool call is checked against what the user actually delegated, and every hand-off can only narrow. Self-hosted, Rust, Cedar. Open source soon.
+**X:** AI agents get one broad token, and one injected issue is enough to leak private repos. I built attenuo: every tool call is checked against what the user actually delegated, and every hand-off can only narrow. Self-hosted, Rust, Cedar. Open source now: github.com/attenuo-dev/attenuo
 
 **LinkedIn:** lead with the incident, then the research framing (delegation narrowing, per-call policy, revocation, signed audit), the honest numbers with their caveat, and the open questions. Ask researchers working on agent security for feedback.
