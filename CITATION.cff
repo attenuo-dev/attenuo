@@ -14,6 +14,8 @@ authors:
     given-names: Mudit
 repository-code: "https://github.com/attenuo-dev/attenuo"
 license: Apache-2.0
+version: "0.1.0"
+date-released: "2026-11-19"
 keywords:
   - authorization
   - AI agents

@@ -1,6 +1,6 @@
 # API compatibility before 1.0
 
-attenuo is pre-alpha at version 0.1.0 (untagged). Versions follow SemVer 2.0, and before 1.0 a minor release may break things ([CONTRIBUTING](https://github.com/attenuo-dev/attenuo/blob/main/CONTRIBUTING.md#releases)). This page says what that means for each surface a client, a policy author or an operator codes against: what we try not to break, what may still change, how a change is announced, and what is not versioned at all yet. It describes what the code does on `main`, and where the code and this page disagree, the code is right.
+attenuo is pre-alpha at version 0.1.0. Versions follow SemVer 2.0, and before 1.0 a minor release may break things ([CONTRIBUTING](https://github.com/attenuo-dev/attenuo/blob/main/CONTRIBUTING.md#releases)). This page says what that means for each surface a client, a policy author or an operator codes against: what we try not to break, what may still change, how a change is announced, and what is not versioned at all yet. It describes what the code does on `main`, and where the code and this page disagree, the code is right.
 
 ## The rules
 
