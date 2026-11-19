@@ -498,12 +498,16 @@ async fn write_routes_are_absent_without_allow_write() {
     for path in [
         "/admin/leases/x/revoke",
         "/admin/policies/reload",
+        "/admin/operators/reload",
         "/admin/budgets/refund",
+        // GET on this path is a read route; a decision is still 404, not 405, so the console
+        // says writes are disabled.
+        "/admin/approvals/x",
     ] {
         let r = Harness::client()
             .post(h.console.url(path))
             .bearer_auth(ADMIN)
-            .json(&json!({}))
+            .json(&json!({"decision": "grant"}))
             .send()
             .await
             .unwrap();
@@ -828,7 +832,7 @@ async fn selector_revocation_works_on_the_console_with_allow_write() {
 /// there, and with `allow_write` it revokes the chain. The raw id is never echoed back.
 #[tokio::test]
 async fn session_revocation_on_the_console_previews_without_allow_write_and_revokes_with_it() {
-    use attenuo_audit::LeaseStore;
+    use attenuo_audit::RunState;
     use attenuo_proxy::session::{session_digest, session_tag};
 
     const RAW: &str = "console-raw-session-id";

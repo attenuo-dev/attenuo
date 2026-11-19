@@ -87,9 +87,12 @@ class ProxyDecisions:
         auth: Any = None,
     ) -> Any:
         """An ``McpHttpClientFactory``: the ``mcp`` package's client, with the hook installed."""
-        from mcp.client.streamable_http import create_mcp_http_client
+        from mcp.client import streamable_http
 
-        client = create_mcp_http_client(headers=headers, timeout=timeout, auth=auth)
+        # Re-exported there without __all__, so `mypy --strict` rejects the attribute when mcp
+        # is installed; Any keeps the check passing with and without it.
+        transport: Any = streamable_http
+        client = transport.create_mcp_http_client(headers=headers, timeout=timeout, auth=auth)
         hooks = client.event_hooks
         client.event_hooks = {
             "request": list(hooks.get("request", [])),
@@ -261,9 +264,11 @@ def denial_interceptor(
             return await handler(request)
         except BaseException as exc:
             held = next((a for e in leaves(exc) if (a := approval_of(e, log.decisions))), None)
-            if held is None or held[0] is None or wait_for_approval is None:
+            if held is None or wait_for_approval is None:
                 return failed(request, exc)
-        approval, decision = held
+            approval, decision = held
+            if approval is None:
+                return failed(request, exc)
         log.entries.append((request.name, "approval_required", decision))
         print(f"  HELD    {request.name} {request.args}  approval={approval} decision={decision}")
         if on_approval is not None:

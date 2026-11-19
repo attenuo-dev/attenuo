@@ -167,6 +167,7 @@ pub mod screen;
 pub mod session;
 pub mod sse;
 pub mod stage;
+pub mod subject_log;
 pub mod traceparent;
 
 #[cfg(any(test, feature = "testing"))]
@@ -215,15 +216,21 @@ pub use auth::{
     ApprovalTicket, AuthDecision, AuthError, Authenticated, Authorizer, CallContext, RequestAuth,
     META_APPROVAL_KEY, REASON_APPROVAL_REQUIRED, REASON_LABEL_ERROR,
 };
-pub use config::{ProxyConfig, UpstreamConfig};
+pub use config::{ExtAuthzRoute, ProxyConfig, UpstreamConfig};
 pub use guard::{StreamEndCause, REASON_UPSTREAM_STREAM_END_SHAPE};
+pub use proxy::ext_authz::{
+    GATEWAY_SECRET_HEADER, PARTIAL_BODY_HEADER, REASON_EXT_AUTHZ_AMBIGUOUS_BODY,
+    REASON_EXT_AUTHZ_BATCH_UNSUPPORTED, REASON_EXT_AUTHZ_BODY_INCOMPLETE,
+    REASON_EXT_AUTHZ_DPOP_URL_UNSET, REASON_EXT_AUTHZ_UNAUTHENTICATED,
+};
 pub use proxy::{
     router, router_with_clock, serve, DECISION_ID_HEADER, REASON_INVALID_NAME,
     REASON_REQUEST_TOO_LARGE, REASON_SESSION_MISMATCH, REASON_SESSION_REGISTRY_FULL,
     REASON_TOOL_NOT_LISTED, REASON_TOO_MANY_SESSIONS, REASON_UPSTREAM_BODY_TOO_LARGE,
-    REASON_UPSTREAM_NOT_EVENT_STREAM,
+    REASON_UPSTREAM_NOT_EVENT_STREAM, REASON_UPSTREAM_TIMEOUT, REASON_UPSTREAM_UNREACHABLE,
 };
 pub use screen::ListFilterMode;
 pub use session::{SessionOwner, SessionRegistry};
 pub use stage::Stage;
-pub use traceparent::{TraceHook, TraceParent, OTEL_TARGET};
+pub use subject_log::{LoggedSubject, SubjectLog};
+pub use traceparent::{otel_int, TraceHook, TraceParent, OTEL_TARGET};

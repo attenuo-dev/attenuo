@@ -5,8 +5,11 @@ attenuo speaks MCP Streamable HTTP at `<server>/mcp/<upstream>` and wants
 the header; the rest is the MCP client's normal setup.
 
     pip install -e sdk/python mcp
-    ATTENUO_SERVER=http://127.0.0.1:8080 ATTENUO_ADMIN_TOKEN=demo-admin-token \\
+    ATTENUO_SERVER=http://127.0.0.1:18080 ATTENUO_ADMIN_TOKEN=demo-admin-token \\
         python examples/python-agent/mcp_client_example.py
+
+against the server and fake upstream started as in `agent.py`'s header (the GitHub-leak demo's
+config, which listens on 127.0.0.1:18080).
 
 Tested with `mcp` 2.3.0 (which builds on `httpx2`) and with `mcp` 1.30.0 against the fake GitHub
 MCP server of the demo; both have `streamable_http_client`. The fallback for older `mcp` 1.x

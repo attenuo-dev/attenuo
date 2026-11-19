@@ -6,6 +6,8 @@ import {
   formatCapability,
   oneOf,
   parseCapability,
+  pathPrefix,
+  pathProblem,
   prefix,
   range,
   withLimits,
@@ -21,6 +23,73 @@ describe("capability", () => {
       tool: "read_file",
       constraints: { repo: { op: "prefix", value: "alice/public-" } },
     });
+  });
+
+  it("serializes pathPrefix like the Rust Capability and reads it back", () => {
+    const cap = capability("fs", "read_file", {
+      path: pathPrefix("/workspace/"),
+      dir: pathPrefix("docs"),
+    });
+    expect(cap.constraints).toEqual({
+      dir: { op: "path_prefix", value: "docs" },
+      path: { op: "path_prefix", value: "/workspace/" },
+    });
+    expect(capabilitiesToJson([cap])).toEqual([cap]);
+    expect(pathPrefix("/w")).not.toEqual(prefix("/w"));
+  });
+
+  it("refuses a path_prefix path the server refuses, saying why", () => {
+    const cases: [string, string][] = [
+      ["", "is empty"],
+      ["/workspace/../etc", "holds a `.` or `..` segment"],
+      ["/workspace/..", "holds a `.` or `..` segment"],
+      ["./src", "holds a `.` or `..` segment"],
+      ["/workspace/.", "holds a `.` or `..` segment"],
+      ["/workspace//a", "holds an empty segment (`//`)"],
+      ["//workspace", "holds an empty segment (`//`)"],
+      ["C:\\work", "holds a backslash"],
+      ["/w\u0000", "holds a control character"],
+      ["/w\tx", "holds a control character"],
+      ["/w\u007f", "holds a control character"],
+      ["/w\u0085", "holds a control character"],
+      ["/w/%2e%2e", "holds a percent-encoded `.`, `/` or `\\`"],
+      ["/w/%2E", "holds a percent-encoded `.`, `/` or `\\`"],
+      ["/w%2Fx", "holds a percent-encoded `.`, `/` or `\\`"],
+      ["/w%5cx", "holds a percent-encoded `.`, `/` or `\\`"],
+      [
+        "/w/%252e",
+        "holds a percent escape that is itself percent-encoded (`%25` and two hex digits)",
+      ],
+      ["/w/\uff0e\uff0e", "holds a character that normalises to `.`, `/` or `\\`"],
+      ["/w\uff0fx", "holds a character that normalises to `.`, `/` or `\\`"],
+    ];
+    for (const [path, why] of cases) {
+      expect(pathProblem(path), path).toBe(why);
+      expect(() => pathPrefix(path), path).toThrow(`a path_prefix constraint's path ${why}`);
+      expect(
+        () =>
+          capabilitiesToJson([
+            { server: "s", tool: "t", constraints: { p: { op: "path_prefix", value: path } } },
+          ]),
+        path,
+      ).toThrow(TypeError);
+    }
+    for (const ok of [
+      "/",
+      "/workspace",
+      "/workspace/",
+      "docs",
+      "a/b/",
+      "~/x",
+      "/a%20b",
+      "/...",
+      "/caf\u00e9",
+      "/100%25",
+    ]) {
+      expect(pathProblem(ok), ok).toBeUndefined();
+      expect(pathPrefix(ok)).toEqual({ op: "path_prefix", value: ok });
+    }
+    expect(() => pathPrefix(1 as unknown as string)).toThrow(TypeError);
   });
 
   it("omits empty constraints", () => {

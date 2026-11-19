@@ -2,7 +2,7 @@
 
 - Date: 2026-11-05
 - Branch: `security/pass8` (base: `bd4f8dd` on main)
-- Related: [pass 1 and 2](security-review-2026-10-22.md), [pass 3](security-review-2026-10-23.md), [pass 4](security-review-2026-10-23-pass4.md), [pass 5](security-review-2026-10-24-pass5.md), [pass 6](security-review-2026-10-25-pass6.md), [pass 7](security-review-2026-10-25-pass7.md), [threat model](../spec/threat-model.md), [task board](../tasks/board.md)
+- Related: [pass 1 and 2](security-review-2026-10-22.md), [pass 3](security-review-2026-10-23.md), [pass 4](security-review-2026-10-23-pass4.md), [pass 5](security-review-2026-10-24-pass5.md), [pass 6](security-review-2026-10-25-pass6.md), [pass 7](security-review-2026-10-25-pass7.md), [threat model](../spec/threat-model.md), task board
 
 ## Scope and method
 

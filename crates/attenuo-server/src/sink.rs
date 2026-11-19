@@ -22,7 +22,9 @@
 //!
 //! Three deliverers: [`WebhookDeliver`] (`POST`, any 2xx), [`FileDeliver`] (append one JSON
 //! line, `fsync`), and [`S3Deliver`] (`PUT` with AWS Signature Version 4, implemented here on
-//! `ring` HMAC and `sha2`).
+//! `ring` HMAC and `sha2`). The webhook and S3 clients check the receiver's certificate against
+//! the built-in web PKI roots plus the CA certificates of `ca_pem_path`, read once at start;
+//! the S3 credentials are read once at start too, and nothing refreshes them.
 //!
 //! The queue itself ([`Queue`]) is generic over what it carries, so the approval notifier
 //! (`[approvals.notify]`, [`crate::notify`]) runs on the same code with its own metrics and
@@ -556,7 +558,8 @@ impl CheckpointSink {
     ///
     /// # Errors
     ///
-    /// When `cfg` does not validate, when the webhook or S3 client cannot be built, when an S3 sink
+    /// When `cfg` does not validate, when `ca_pem_path` cannot be read or holds no usable CA
+    /// certificate, when the webhook or S3 client cannot be built, when an S3 sink
     /// has no access key id or secret access key (in the config or `AWS_ACCESS_KEY_ID` and
     /// `AWS_SECRET_ACCESS_KEY`), when a file sink's path cannot be opened for appending, or as
     /// [`with_deliver`](Self::with_deliver).
@@ -567,6 +570,7 @@ impl CheckpointSink {
     ) -> anyhow::Result<Self> {
         cfg.validate()?;
         let timeout = Duration::from_secs(cfg.timeout_seconds);
+        let roots = sink_roots(cfg)?;
         let deliver: Box<dyn Deliver> = match cfg.kind {
             SinkKind::Webhook => Box::new(WebhookDeliver::new(
                 cfg.url.clone().unwrap_or_default(),
@@ -574,9 +578,10 @@ impl CheckpointSink {
                     .clone()
                     .or_else(|| std::env::var(SINK_TOKEN_ENV).ok().filter(|t| !t.is_empty())),
                 timeout,
+                &roots,
             )?),
             SinkKind::File => Box::new(FileDeliver::new(cfg.path.clone().unwrap_or_default())?),
-            SinkKind::S3 => Box::new(S3Deliver::from_config(cfg, timeout)?),
+            SinkKind::S3 => Box::new(S3Deliver::from_config(cfg, timeout, &roots)?),
         };
         let mut sink =
             Self::with_deliver(deliver, SinkLimits::from_config(cfg), public_url, metrics)?;
@@ -785,6 +790,67 @@ fn run<T: QueueItem>(shared: Arc<Shared<T>>, deliver: Box<dyn Deliver<T>>) {
     }
 }
 
+/// The extra CA certificates of `[audit.sink] ca_pem_path` (none when unset), read once.
+///
+/// # Errors
+///
+/// The file cannot be read or holds no PEM certificate; the message names the key and path.
+fn sink_roots(cfg: &SinkSection) -> anyhow::Result<Vec<reqwest::Certificate>> {
+    let Some(path) = cfg.ca_pem_path.as_deref() else {
+        return Ok(Vec::new());
+    };
+    let fail = |e: String| {
+        anyhow::anyhow!(
+            "[audit.sink] ca_pem_path {:?}: {e}",
+            path.display().to_string()
+        )
+    };
+    let roots = crate::idp::jwks::read_ca_pem(path).map_err(fail)?;
+    // Build once here so a certificate that is not a usable trust anchor fails at start,
+    // naming the file, and not as a client-build error without it.
+    sink_client(Duration::from_secs(1), &roots).map_err(|e| {
+        fail(format!(
+            "a certificate cannot be used as a trust anchor ({})",
+            crate::idp::jwks::error_chain(&e)
+        ))
+    })?;
+    let endpoint = cfg.url.as_deref().or(cfg.endpoint.as_deref());
+    if endpoint.is_some_and(|u| u.starts_with("http://")) {
+        tracing::warn!(
+            "[audit.sink] ca_pem_path is set but the sink's URL is http://: the CA is not used \
+             and requests are not encrypted"
+        );
+    }
+    Ok(roots)
+}
+
+/// The HTTP client of a webhook or S3 sink: `timeout` per request, no redirects followed, and
+/// the built-in web PKI roots plus `extra_roots` (`ca_pem_path`) trusted.
+fn sink_client(
+    timeout: Duration,
+    extra_roots: &[reqwest::Certificate],
+) -> reqwest::Result<reqwest::Client> {
+    extra_roots
+        .iter()
+        .fold(
+            reqwest::Client::builder()
+                .timeout(timeout)
+                .redirect(reqwest::redirect::Policy::none()),
+            |b, c| b.add_root_certificate(c.clone()),
+        )
+        .build()
+}
+
+/// A failed request as the sink logs it: reqwest's error without the URL (its query may hold
+/// a credential, SR-94), followed by its causes, so a TLS failure names itself (`invalid peer
+/// certificate: UnknownIssuer`) and is not only `error sending request`.
+fn request_failed(e: reqwest::Error) -> String {
+    format!(
+        "request failed: {}",
+        crate::idp::jwks::error_chain(&e.without_url())
+    )
+}
+
 /// `POST` the shipped checkpoint as JSON.
 #[derive(Debug)]
 pub struct WebhookDeliver {
@@ -795,16 +861,19 @@ pub struct WebhookDeliver {
 
 impl WebhookDeliver {
     /// A webhook deliverer for `url`, with `bearer` as `Authorization: Bearer` when set. Each
-    /// request times out after `timeout`; redirects are not followed.
+    /// request times out after `timeout`; redirects are not followed. `extra_roots` are
+    /// trusted in addition to the built-in web PKI roots.
     ///
     /// # Errors
     ///
     /// The HTTP client cannot be built.
-    pub fn new(url: String, bearer: Option<String>, timeout: Duration) -> anyhow::Result<Self> {
-        let client = reqwest::Client::builder()
-            .timeout(timeout)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?;
+    pub fn new(
+        url: String,
+        bearer: Option<String>,
+        timeout: Duration,
+        extra_roots: &[reqwest::Certificate],
+    ) -> anyhow::Result<Self> {
+        let client = sink_client(timeout, extra_roots)?;
         Ok(Self {
             client,
             url,
@@ -827,10 +896,7 @@ impl Deliver for WebhookDeliver {
             req = req.bearer_auth(t);
         }
         // The URL is left out of the error: its query may hold a credential (SR-94).
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| format!("request failed: {}", e.without_url()))?;
+        let resp = req.send().await.map_err(request_failed)?;
         let status = resp.status();
         if status.is_success() {
             Ok(())
@@ -912,7 +978,11 @@ pub struct S3Deliver {
 }
 
 impl S3Deliver {
-    fn from_config(cfg: &SinkSection, timeout: Duration) -> anyhow::Result<Self> {
+    fn from_config(
+        cfg: &SinkSection,
+        timeout: Duration,
+        extra_roots: &[reqwest::Certificate],
+    ) -> anyhow::Result<Self> {
         let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
         let access_key_id = cfg
             .access_key_id
@@ -948,15 +1018,19 @@ impl S3Deliver {
                     .or_else(|| env("AWS_SESSION_TOKEN")),
             },
             timeout,
+            extra_roots,
         )
     }
 
     /// An S3 deliverer for `bucket` at `endpoint` (a trailing `/` is dropped), naming objects
     /// under `prefix`. Each request times out after `timeout`; redirects are not followed.
+    /// `extra_roots` are trusted in addition to the built-in web PKI roots. The credentials
+    /// are kept as given: nothing refreshes them (temporary ones need a restart).
     ///
     /// # Errors
     ///
-    /// The HTTP client cannot be built.
+    /// The HTTP client cannot be built, or `endpoint` is not a base URL with a host as the
+    /// URL parser reads it (`check_s3_endpoint`).
     pub fn new(
         endpoint: String,
         bucket: String,
@@ -964,11 +1038,10 @@ impl S3Deliver {
         prefix: String,
         creds: S3Credentials,
         timeout: Duration,
+        extra_roots: &[reqwest::Certificate],
     ) -> anyhow::Result<Self> {
-        let client = reqwest::Client::builder()
-            .timeout(timeout)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?;
+        check_s3_endpoint(&endpoint).map_err(|e| anyhow::anyhow!("S3 endpoint {e}"))?;
+        let client = sink_client(timeout, extra_roots)?;
         Ok(Self {
             client,
             endpoint: endpoint.trim_end_matches('/').to_string(),
@@ -1000,22 +1073,15 @@ impl Deliver for S3Deliver {
             uri_encode(&self.key(s), false)
         );
         let url = format!("{}{}", self.endpoint, path);
-        let host = self
-            .endpoint
-            .split_once("://")
-            .map_or("", |(_, h)| h)
-            .to_string();
-        let payload_hash = hex::encode(Sha256::digest(&body));
         let amz_date = amz_date(SystemTime::now());
-        let mut headers = vec![
-            ("content-type".to_string(), "application/json".to_string()),
-            ("host".to_string(), host),
-            ("x-amz-content-sha256".to_string(), payload_hash.clone()),
-            ("x-amz-date".to_string(), amz_date.clone()),
-        ];
-        if let Some(t) = &self.creds.session_token {
-            headers.push(("x-amz-security-token".to_string(), t.clone()));
-        }
+        let digest = Sha256::digest(&body);
+        let payload_hash = hex::encode(digest);
+        let headers = s3_put_headers(
+            signed_host(&self.endpoint),
+            &digest,
+            &amz_date,
+            self.creds.session_token.as_deref(),
+        );
         let auth = sigv4_authorization(&SigV4Request {
             method: "PUT",
             canonical_uri: &path,
@@ -1037,16 +1103,133 @@ impl Deliver for S3Deliver {
                 req = req.header(k.as_str(), v.as_str());
             }
         }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| format!("request failed: {}", e.without_url()))?;
+        let resp = req.send().await.map_err(request_failed)?;
         let status = resp.status();
         if status.is_success() {
             Ok(())
         } else {
-            Err(format!("S3 answered {status}"))
+            match s3_error_code(resp).await {
+                Some(code) => Err(format!("S3 answered {status} ({code})")),
+                None => Err(format!("S3 answered {status}")),
+            }
         }
+    }
+}
+
+/// Most bytes of an S3 error answer read to find its `<Code>`.
+const S3_ERROR_BODY_MAX: usize = 4096;
+
+/// The `<Code>` of an S3 error answer (`SignatureDoesNotMatch`, `ExpiredToken`,
+/// `InvalidTokenId`, `AccessDenied`, ...), which tells a wrong secret from an expired session
+/// token where the status alone (403) does not. At most [`S3_ERROR_BODY_MAX`] bytes are read;
+/// a code that is not a short run of ASCII letters and digits is not reported, so the store
+/// cannot put arbitrary text in the log.
+async fn s3_error_code(mut resp: reqwest::Response) -> Option<String> {
+    let mut body = Vec::new();
+    while body.len() < S3_ERROR_BODY_MAX {
+        match resp.chunk().await {
+            Ok(Some(c)) => body.extend_from_slice(&c),
+            _ => break,
+        }
+    }
+    body.truncate(S3_ERROR_BODY_MAX);
+    s3_error_code_of(&body)
+}
+
+fn s3_error_code_of(body: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(body).ok()?;
+    let start = text.find("<Code>")? + "<Code>".len();
+    let len = text[start..].find("</Code>")?;
+    let code = &text[start..start + len];
+    (!code.is_empty() && code.len() <= 64 && code.bytes().all(|b| b.is_ascii_alphanumeric()))
+        .then(|| code.to_string())
+}
+
+/// The headers of the sink's PutObject, every one of them signed: `content-type`, `host`,
+/// `x-amz-checksum-sha256` (base64 of the body's SHA-256), `x-amz-content-sha256` (its hex),
+/// `x-amz-date`, `x-amz-sdk-checksum-algorithm` (`SHA256`) and, with STS credentials,
+/// `x-amz-security-token`.
+///
+/// The checksum pair is what an upload into an Object Lock bucket with a retention period
+/// needs: AWS's PutObject reference says "The `Content-MD5` or `x-amz-sdk-checksum-algorithm`
+/// header is required", and that `x-amz-sdk-checksum-algorithm` must come with the matching
+/// `x-amz-checksum-<algorithm>` header, here `x-amz-checksum-sha256`, "the Base64 encoded,
+/// 256-bit SHA256 digest of the object". S3 also checks the body against it (`BadDigest` on
+/// a mismatch). SHA-256 because the sink computes it already; no MD5 is needed.
+fn s3_put_headers(
+    host: String,
+    body_sha256: &[u8],
+    amz_date: &str,
+    session_token: Option<&str>,
+) -> Vec<(String, String)> {
+    use base64::Engine as _;
+    let mut headers = vec![
+        ("content-type".to_string(), "application/json".to_string()),
+        ("host".to_string(), host),
+        (
+            "x-amz-checksum-sha256".to_string(),
+            base64::engine::general_purpose::STANDARD.encode(body_sha256),
+        ),
+        ("x-amz-content-sha256".to_string(), hex::encode(body_sha256)),
+        ("x-amz-date".to_string(), amz_date.to_string()),
+        (
+            "x-amz-sdk-checksum-algorithm".to_string(),
+            "SHA256".to_string(),
+        ),
+    ];
+    if let Some(t) = session_token {
+        headers.push(("x-amz-security-token".to_string(), t.to_string()));
+    }
+    headers
+}
+
+/// Is `endpoint` an S3 base URL as the HTTP client reads it (SR-119)? It must parse, have a
+/// host, and have no path (`/` at most), query or fragment. Without a host, the request URL
+/// `<endpoint>/<bucket>/<key>` is `http:///<bucket>/<key>`, which the URL parser reads with
+/// the bucket as its host. A backslash, whitespace or a control character is refused: the
+/// parser reads `\` as `/` and drops tabs and line breaks.
+///
+/// # Errors
+///
+/// A message, after the endpoint (callers name it), saying what is wrong.
+pub(crate) fn check_s3_endpoint(endpoint: &str) -> Result<(), String> {
+    // The parser reads `\` as `/` and drops tabs and line breaks, so the string the request
+    // URL is built from would not be the URL sent (as for `derive = "host"`, SR-56).
+    if endpoint
+        .chars()
+        .any(|c| c == '\\' || c.is_whitespace() || c.is_control())
+    {
+        return Err("holds a backslash, whitespace or a control character".into());
+    }
+    let url = reqwest::Url::parse(endpoint).map_err(|e| format!("is not a URL ({e})"))?;
+    if url.host_str().is_none_or(str::is_empty) {
+        return Err("has no host".into());
+    }
+    if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
+        return Err(format!(
+            "must be a base URL without a path, query or fragment (the HTTP client reads it as \
+             path {:?}; requests are path-style: <endpoint>/<bucket>/<key>)",
+            url.path()
+        ));
+    }
+    Ok(())
+}
+
+/// The `host` header value SigV4 signs for `endpoint`: what the HTTP client sends, so the
+/// host as the URL parser normalizes it (lowercased) and the port only when it is not the
+/// scheme's default (`http://s3:80` sends `Host: s3`). Signing the endpoint as written made
+/// S3 answer 403 for an endpoint with an explicit default port.
+fn signed_host(endpoint: &str) -> String {
+    match reqwest::Url::parse(endpoint) {
+        Ok(url) => match (url.host_str(), url.port()) {
+            (Some(h), Some(p)) => format!("{h}:{p}"),
+            (Some(h), None) => h.to_string(),
+            (None, _) => String::new(),
+        },
+        Err(_) => endpoint
+            .split_once("://")
+            .map_or("", |(_, h)| h)
+            .to_string(),
     }
 }
 
@@ -1114,8 +1297,9 @@ fn hmac(key: &[u8], data: &[u8]) -> Vec<u8> {
     ring::hmac::sign(&k, data).as_ref().to_vec()
 }
 
-/// The `Authorization` header value for `r` (AWS Signature Version 4, header form).
-pub fn sigv4_authorization(r: &SigV4Request<'_>) -> String {
+/// The SigV4 canonical request of `r` and its signed-header list: headers lowercased, values
+/// with runs of whitespace folded to one space, sorted by name.
+fn sigv4_canonical_request(r: &SigV4Request<'_>) -> (String, String) {
     let mut headers: Vec<(String, String)> = r
         .headers
         .iter()
@@ -1140,6 +1324,12 @@ pub fn sigv4_authorization(r: &SigV4Request<'_>) -> String {
         signed_headers,
         r.payload_sha256
     );
+    (canonical_request, signed_headers)
+}
+
+/// The `Authorization` header value for `r` (AWS Signature Version 4, header form).
+pub fn sigv4_authorization(r: &SigV4Request<'_>) -> String {
+    let (canonical_request, signed_headers) = sigv4_canonical_request(r);
     let date = &r.amz_date[..8];
     let scope = format!("{date}/{}/{}/aws4_request", r.region, r.service);
     let string_to_sign = format!(
@@ -1443,6 +1633,7 @@ mod tests {
             "http://127.0.0.1:1/ingest/path-marker?token=secret-marker".into(),
             None,
             Duration::from_secs(2),
+            &[],
         )
         .unwrap();
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -1558,6 +1749,99 @@ mod tests {
         );
     }
 
+    /// The sink's PutObject carries the checksum headers an Object Lock bucket asks for
+    /// (`x-amz-sdk-checksum-algorithm` with `x-amz-checksum-sha256`), and both are signed, in
+    /// the canonical (sorted) order.
+    #[test]
+    fn the_put_object_canonical_request_signs_the_checksum_headers() {
+        let body = b"Welcome to Amazon S3.";
+        let digest = Sha256::digest(body);
+        let headers = s3_put_headers(
+            "127.0.0.1:9000".into(),
+            &digest,
+            "20130524T000000Z",
+            Some("session-token"),
+        );
+        let payload_sha256 = hex::encode(digest);
+        let r = SigV4Request {
+            method: "PUT",
+            canonical_uri: "/bucket/checkpoints/key.json",
+            canonical_query: "",
+            headers: &headers,
+            payload_sha256: &payload_sha256,
+            region: "us-east-1",
+            service: "s3",
+            amz_date: "20130524T000000Z",
+            creds: &example_creds(),
+        };
+        let (canonical, signed) = sigv4_canonical_request(&r);
+        let hex_hash = "44ce7dd67c959e0d3524ffac1771dfbba87d2b6b4b4e99e42034a8b803f8b072";
+        assert_eq!(hex::encode(digest), hex_hash);
+        let b64 = "RM591nyVng01JP+sF3Hfu6h9K2tLTpnkIDSouAP4sHI=";
+        assert_eq!(
+            canonical,
+            format!(
+                "PUT\n/bucket/checkpoints/key.json\n\n\
+                 content-type:application/json\n\
+                 host:127.0.0.1:9000\n\
+                 x-amz-checksum-sha256:{b64}\n\
+                 x-amz-content-sha256:{hex_hash}\n\
+                 x-amz-date:20130524T000000Z\n\
+                 x-amz-sdk-checksum-algorithm:SHA256\n\
+                 x-amz-security-token:session-token\n\n\
+                 content-type;host;x-amz-checksum-sha256;x-amz-content-sha256;x-amz-date;\
+                 x-amz-sdk-checksum-algorithm;x-amz-security-token\n\
+                 {hex_hash}"
+            )
+        );
+        assert_eq!(
+            signed,
+            "content-type;host;x-amz-checksum-sha256;x-amz-content-sha256;x-amz-date;\
+             x-amz-sdk-checksum-algorithm;x-amz-security-token"
+        );
+        // The checksum is the standard (padded) base64 of the same SHA-256 as the hex.
+        use base64::Engine as _;
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .unwrap(),
+            digest.to_vec()
+        );
+        // Without STS credentials there is no token header, and the rest is unchanged.
+        let plain = s3_put_headers("h".into(), &digest, "20130524T000000Z", None);
+        assert_eq!(plain.len(), headers.len() - 1);
+        assert!(plain.iter().all(|(k, _)| k != "x-amz-security-token"));
+    }
+
+    /// The signed `host` is the one reqwest sends: a default port (`:80` for http, `:443` for
+    /// https) is not sent, so it must not be signed, or S3 answers 403 SignatureDoesNotMatch
+    /// (seen against MinIO at `http://127.0.0.1:80`); the host is sent lowercased.
+    #[test]
+    fn signed_host_is_the_host_header_sent() {
+        assert_eq!(signed_host("http://127.0.0.1:9000"), "127.0.0.1:9000");
+        assert_eq!(signed_host("http://127.0.0.1:80"), "127.0.0.1");
+        assert_eq!(
+            signed_host("https://s3.eu-west-1.amazonaws.com:443"),
+            "s3.eu-west-1.amazonaws.com"
+        );
+        assert_eq!(signed_host("http://minio:443"), "minio:443");
+        assert_eq!(signed_host("https://S3.Example.com"), "s3.example.com");
+        assert_eq!(signed_host("http://[::1]:9000"), "[::1]:9000");
+        for endpoint in [
+            "http://127.0.0.1:80",
+            "https://S3.Example.com:443",
+            "http://[::1]:9000",
+            "http://minio:9000",
+        ] {
+            let url = reqwest::Url::parse(&format!("{endpoint}/bucket/key")).unwrap();
+            let sent = match url.port() {
+                Some(p) => format!("{}:{p}", url.host_str().unwrap()),
+                None => url.host_str().unwrap().to_string(),
+            };
+            assert_eq!(signed_host(endpoint), sent, "{endpoint}");
+        }
+    }
+
     #[test]
     fn amz_date_and_uri_encoding() {
         let t = SystemTime::UNIX_EPOCH + Duration::from_secs(1_369_353_600);
@@ -1594,9 +1878,91 @@ mod tests {
             .contains("without a path"));
         s3.endpoint = Some("http://127.0.0.1:9000".into());
         s3.validate().unwrap();
+        for ok in [
+            "http://127.0.0.1:9000/",
+            "https://s3.eu-west-1.amazonaws.com",
+            "http://[::1]:9000",
+            "https://S3.Example.com:443",
+        ] {
+            s3.endpoint = Some(ok.into());
+            s3.validate().unwrap_or_else(|e| panic!("{ok}: {e}"));
+        }
         let mut f = SinkSection::new(SinkKind::File);
         f.path = Some("/x".into());
         f.queue_capacity = 0;
         assert!(f.validate().is_err());
+    }
+
+    /// SR-119: an endpoint the URL parser reads with no host (`http://`), or with a path the
+    /// string check missed (a backslash, which WHATWG reads as `/`), is refused at start. With
+    /// `http://` the request URL `http:///<bucket>/<key>` parses with the bucket as its host,
+    /// so the PUT, its signature and any session token went to whatever the bucket names, and
+    /// the signed host (`""`) was not the one sent.
+    #[test]
+    fn an_s3_endpoint_the_url_parser_reads_differently_is_refused_sr119() {
+        // What the parser does with the request URL such an endpoint makes.
+        let u = reqwest::Url::parse("http:///evil.example/attenuo/checkpoints/k.json").unwrap();
+        assert_eq!(u.host_str(), Some("evil.example"));
+        let mut s3 = SinkSection::new(SinkKind::S3);
+        s3.bucket = Some("evil.example".into());
+        for bad in [
+            "http://",
+            "https://",
+            "http:///",
+            "http://minio:9000\\evil",
+            "https://s3.example\\",
+            "http://minio:9000\t",
+        ] {
+            s3.endpoint = Some(bad.into());
+            let e = s3.validate().unwrap_err().to_string();
+            assert!(e.contains("[audit.sink] endpoint"), "{bad}: {e}");
+        }
+        for bad in ["http://", "https://minio:9000\\evil"] {
+            let e = S3Deliver::new(
+                bad.into(),
+                "evil.example".into(),
+                "us-east-1".into(),
+                "p/".into(),
+                example_creds(),
+                Duration::from_secs(1),
+                &[],
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(e.contains("endpoint"), "{bad}: {e}");
+        }
+        S3Deliver::new(
+            "http://127.0.0.1:9000/".into(),
+            "b".into(),
+            "us-east-1".into(),
+            "p/".into(),
+            example_creds(),
+            Duration::from_secs(1),
+            &[],
+        )
+        .unwrap();
+    }
+
+    /// The `<Code>` of an S3 error answer is reported; anything that is not a short ASCII
+    /// word is not, so a store cannot put its own text in the log.
+    #[test]
+    fn the_s3_error_code_is_read_from_the_answer() {
+        let xml = |code: &str| {
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>{code}</Code>\
+                 <Message>m</Message></Error>"
+            )
+        };
+        for code in ["ExpiredToken", "InvalidTokenId", "SignatureDoesNotMatch"] {
+            assert_eq!(
+                s3_error_code_of(xml(code).as_bytes()).as_deref(),
+                Some(code)
+            );
+        }
+        for bad in ["", "two words", "x\nforged log line", &"A".repeat(65)] {
+            assert_eq!(s3_error_code_of(xml(bad).as_bytes()), None, "{bad:?}");
+        }
+        assert_eq!(s3_error_code_of(b"<html>Forbidden</html>"), None);
+        assert_eq!(s3_error_code_of(&[0xff, 0xfe]), None);
     }
 }

@@ -2,7 +2,7 @@
 //! originating user's usage of a destructive tool across all their runs, per fixed UTC hour and
 //! day, read for `context.usage.user_window` and charged with the call's run usage.
 
-use attenuo_audit::LeaseStore;
+use attenuo_audit::RunLimits;
 use attenuo_core::windows::window_charges;
 use attenuo_core::{
     OriginatingUser, RecordUserWindow, RecordWindow, ToolCall, WindowKind, WindowMeasure,
@@ -41,7 +41,7 @@ pub(super) fn user_stripe(user: &OriginatingUser, stripes: usize) -> usize {
 /// for a call that keeps no usage or when no kind is kept. When the run's usage itself was
 /// unreadable, the worst case is already in place and the windows are not read.
 pub(super) fn read_windows(
-    leases: &dyn LeaseStore,
+    leases: &dyn RunLimits,
     view: &mut BudgetView,
     user: &OriginatingUser,
     call: &ToolCall,

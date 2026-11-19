@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use attenuo_audit::LeaseStore;
+use attenuo_audit::LeaseRegistry;
 use attenuo_core::{AgentId, Capability, CapabilitySet, LeaseId, OriginatingUser, ToolCall};
 use attenuo_policy::authzen;
 use attenuo_policy::{ArgType, ToolAttrs};
@@ -83,9 +83,11 @@ impl Harness {
         cfg.dev.allow_root_mint = true;
         cfg.agents = AGENTS
             .iter()
-            .map(|id| attenuo_server::config::AgentConfig {
-                id: (*id).into(),
-                secret_sha256: sha256_hex(&format!("{id}-secret")),
+            .map(|id| {
+                attenuo_server::config::AgentConfig::with_secret_sha256(
+                    *id,
+                    sha256_hex(&format!("{id}-secret")),
+                )
             })
             .collect();
         let (router, state) = attenuo_server::build(&cfg).unwrap();
@@ -575,7 +577,7 @@ async fn policy_routes_need_the_admin_token() {
 #[tokio::test]
 async fn dry_run_says_untracked_when_the_engine_keeps_no_usage() {
     let h = Harness::start().await;
-    assert!(!h.state.pipeline.policy().read().unwrap().tracks_usage());
+    assert!(!h.state.pipeline.policy().snapshot().tracks_usage());
     let root = h.mint_root(&["github:*"]).await;
     let body = with_token(
         call_body("create_issue", json!({"repo": "alice/public-site"})),

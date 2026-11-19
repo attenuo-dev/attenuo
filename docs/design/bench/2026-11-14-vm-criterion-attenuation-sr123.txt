@@ -1,0 +1,101 @@
+$ cargo bench -p attenuo-core --bench attenuation -- --warm-up-time 1 --measurement-time 3 --noplot 'covers|bounds/(one_of_implies|attenuate_1024|one_of_request_vs_parents/1$|within|read)'
+$ cargo bench -p attenuo-server --bench decide -- --warm-up-time 1 --measurement-time 3 --noplot 'decide/(verify|authenticate|policy)/|decide/decide_memory/'
+# SR-123 (one_of implication through canonical keys, bounds on the constraints and one_of values of a request)
+# rustc 1.99.1 (58cf8f9c3 2026-10-13), release bench profile
+# shared 4 vCPU container (nproc 4); other agents may be active
+# progress lines (Benchmarking ..., Finished, Running) and criterion change lines removed; estimates are [low point high]
+# the bench file is the one of this change in both runs (before: the two new bound constants written as 1,024 by hand)
+# bounds/one_of_request_vs_parents/400 was not in these two runs: 19.833 s [19.030 s, 20.671 s] before (same machine, 15:50),
+#   about 60 to 80 ms after (three runs of the whole group on this branch between 16:29 and 16:51)
+# decide/verify is dominated by the signature check and moves by up to 2x between runs here: a rerun of
+#   decide/(verify|authenticate) on the after tree at 16:58 gave verify 120.96 us (1 hop) and 168.58 us (3 hops)
+
+## before: 312c3188 (main)
+# uptime before:  16:41:57 up 15:59,  0 user,  load average: 0.96, 1.31, 1.32
+covers/covered/1        time:   [43.095 ns 44.248 ns 45.526 ns]
+covers/rejected_widening/1
+                        time:   [19.263 ns 19.765 ns 20.293 ns]
+covers/covered/8        time:   [610.50 ns 633.24 ns 657.80 ns]
+covers/rejected_widening/8
+                        time:   [90.424 ns 92.424 ns 94.243 ns]
+covers/covered/32       time:   [6.7591 µs 6.9744 µs 7.1905 µs]
+covers/rejected_widening/32
+                        time:   [309.87 ns 319.35 ns 329.40 ns]
+bounds/one_of_implies_1024x1024
+                        time:   [20.999 ms 25.609 ms 27.911 ms]
+bounds/attenuate_1024_by_1024
+                        time:   [6.0842 ms 7.8324 ms 8.9597 ms]
+bounds/one_of_request_vs_parents/1
+                        time:   [42.670 ms 49.707 ms 55.988 ms]
+bounds/within_bounds_1024_by_1024/equals
+                        time:   [33.934 ms 34.748 ms 35.637 ms]
+bounds/within_bounds_1024_by_1024/one_of_of_one
+                        time:   [37.875 ms 39.480 ms 41.306 ms]
+bounds/within_bounds_1024_by_1024/equals_600_byte_arrays
+                        time:   [7.3572 s 7.8314 s 8.3086 s]
+bounds/within_bounds_1024_by_1024/path_prefix
+                        time:   [220.10 ms 230.28 ms 240.04 ms]
+bounds/within_bounds_512_by_512/two_constraints
+                        time:   [1.6626 s 1.7907 s 1.9360 s]
+bounds/within_bounds_32_by_32/one_of_32
+                        time:   [22.727 ms 24.564 ms 25.832 ms]
+bounds/read_400_lists_of_1024
+                        time:   [669.05 ms 737.94 ms 816.78 ms]
+decide/verify/1_hop     time:   [116.54 µs 121.77 µs 128.14 µs]
+decide/authenticate/1_hop
+                        time:   [1.5341 µs 1.5681 µs 1.6074 µs]
+decide/policy/1_hop     time:   [22.625 µs 23.161 µs 23.758 µs]
+decide/decide_memory/1_hop
+                        time:   [132.39 µs 140.07 µs 146.90 µs]
+decide/verify/3_hop     time:   [210.92 µs 212.49 µs 213.90 µs]
+decide/authenticate/3_hop
+                        time:   [3.9383 µs 3.9566 µs 3.9748 µs]
+decide/policy/3_hop     time:   [22.941 µs 23.468 µs 24.129 µs]
+decide/decide_memory/3_hop
+                        time:   [192.52 µs 198.10 µs 203.68 µs]
+# uptime after:  16:51:55 up 16:09,  0 user,  load average: 2.32, 2.45, 1.86
+
+## after: 4cf62ec0 (this change)
+# uptime before:  16:52:29 up 16:10,  0 user,  load average: 1.35, 2.20, 1.80
+covers/covered/1        time:   [63.168 ns 64.170 ns 65.269 ns]
+covers/rejected_widening/1
+                        time:   [43.864 ns 46.002 ns 48.362 ns]
+covers/covered/8        time:   [669.85 ns 685.94 ns 702.35 ns]
+covers/rejected_widening/8
+                        time:   [205.71 ns 211.04 ns 217.07 ns]
+covers/covered/32       time:   [6.3926 µs 6.5102 µs 6.6642 µs]
+covers/rejected_widening/32
+                        time:   [312.69 ns 319.05 ns 326.97 ns]
+bounds/one_of_implies_1024x1024
+                        time:   [172.72 µs 187.40 µs 206.66 µs]
+bounds/attenuate_1024_by_1024
+                        time:   [4.5631 ms 4.9540 ms 5.3052 ms]
+bounds/one_of_request_vs_parents/1
+                        time:   [172.59 µs 185.13 µs 190.90 µs]
+bounds/within_bounds_1024_by_1024/equals
+                        time:   [18.672 ms 20.786 ms 22.662 ms]
+bounds/within_bounds_1024_by_1024/one_of_of_one
+                        time:   [25.605 ms 29.302 ms 35.975 ms]
+bounds/within_bounds_1024_by_1024/equals_600_byte_arrays
+                        time:   [46.395 ms 50.589 ms 57.422 ms]
+bounds/within_bounds_1024_by_1024/path_prefix
+                        time:   [29.052 ms 30.415 ms 33.376 ms]
+bounds/within_bounds_512_by_512/two_constraints
+                        time:   [25.461 ms 28.216 ms 32.104 ms]
+bounds/within_bounds_32_by_32/one_of_32
+                        time:   [426.56 µs 450.03 µs 507.55 µs]
+bounds/read_400_lists_of_1024
+                        time:   [66.034 ms 73.436 ms 81.021 ms]
+decide/verify/1_hop     time:   [208.77 µs 216.55 µs 223.22 µs]
+decide/authenticate/1_hop
+                        time:   [1.7413 µs 1.7985 µs 1.8513 µs]
+decide/policy/1_hop     time:   [23.502 µs 24.419 µs 25.342 µs]
+decide/decide_memory/1_hop
+                        time:   [134.78 µs 138.64 µs 142.66 µs]
+decide/verify/3_hop     time:   [115.86 µs 117.77 µs 120.10 µs]
+decide/authenticate/3_hop
+                        time:   [3.0803 µs 3.1636 µs 3.2472 µs]
+decide/policy/3_hop     time:   [24.420 µs 25.589 µs 26.900 µs]
+decide/decide_memory/3_hop
+                        time:   [200.61 µs 204.89 µs 208.91 µs]
+# uptime after:  16:58:24 up 16:15,  0 user,  load average: 2.09, 2.21, 1.90

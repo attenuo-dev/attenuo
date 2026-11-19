@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock, TryLockError};
 use std::time::Duration;
 
@@ -12,12 +12,11 @@ use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 use time::OffsetDateTime;
 
 use super::connection::{
-    check_hash_version, check_record_fields, file_of, open_connection, open_memory_connection,
-    relaxed_sync_of, restore_sync, with_full_sync, Durability, WriteGate, SYNC_FULL, SYNC_NORMAL,
+    file_of, open_connection, open_memory_connection, relaxed_sync_of, restore_sync,
+    with_full_sync, Durability, WriteGate, BUSY_TIMEOUT, SYNC_FULL, SYNC_NORMAL,
 };
-use super::schema::{
-    create_record_id_index, AUDIT_SCHEMA, CHECKPOINT_SCHEMA, META_SCHEMA, RECORD_ID_EXPR,
-};
+use super::migrations::{check_entry_hash, migrate, SchemaState};
+use super::schema::RECORD_ID_EXPR;
 #[cfg(any(test, feature = "testing"))]
 use super::wal::WalTimings;
 use super::wal::{
@@ -242,6 +241,65 @@ struct Checkpointing {
 /// Most appends committed in one transaction by the writer thread.
 pub const MAX_BATCH: usize = 256;
 
+/// Default of [`SqliteAudit::with_append_limits`]'s queue: appends that may wait for the
+/// writer at once. Above the tokio blocking pool's default of 512 threads, so a server under
+/// load waits for the writer as before and only a writer that stopped draining sheds.
+pub const DEFAULT_APPEND_QUEUE: usize = 1024;
+
+/// Default of [`SqliteAudit::with_append_limits`]'s timeout: how long an append waits for the
+/// writer before it fails.
+pub const DEFAULT_APPEND_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How many appends this log has shed rather than waited for ([`SqliteAudit::append_stats`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AppendStats {
+    /// Appends refused at once because the writer's queue was full.
+    pub queue_full: u64,
+    /// Appends that waited the whole append timeout without an answer.
+    pub timeouts: u64,
+}
+
+/// The counters behind [`AppendStats`].
+#[derive(Debug, Default)]
+struct ShedCounters {
+    queue_full: AtomicU64,
+    timeouts: AtomicU64,
+}
+
+/// [`Job::claim`] states. A job moves from `WAITING` to `TAKEN` (the writer will commit it) or
+/// to `ABANDONED` (its caller gave up; the writer drops it unwritten), never both.
+const WAITING: u8 = 0;
+const TAKEN: u8 = 1;
+const ABANDONED: u8 = 2;
+
+/// Rows a whole-log read (verify) takes per read transaction on the reader connection.
+const VERIFY_PAGE: i64 = 1000;
+
+/// The read-only connection a store on a file in WAL mode reads through (see "Reads" on
+/// [`SqliteAudit`]); `None` for an in-memory database or a file in another journal mode,
+/// where a second connection would block the writer or see another database.
+fn open_reader(writer: &Connection) -> Result<Option<Connection>, AuditError> {
+    let Some(path) = writer.path().filter(|p| !p.is_empty()).map(PathBuf::from) else {
+        return Ok(None);
+    };
+    let mode: String = writer.query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
+    if !mode.eq_ignore_ascii_case("wal") {
+        return Ok(None);
+    }
+    let reader = Connection::open_with_flags(
+        &path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    // A reader waits for a lock only while the WAL index is being rebuilt or reset; give it
+    // the same patience as the writer.
+    reader.busy_timeout(BUSY_TIMEOUT)?;
+    reader.set_prepared_statement_cache_capacity(READER_STATEMENT_CACHE);
+    Ok(Some(reader))
+}
+
+/// Prepared statements kept on the reader connection: one per query above.
+const READER_STATEMENT_CACHE: usize = 32;
+
 /// Hash-chained audit log in SQLite.
 ///
 /// **Group commit.** [`append`](AuditSink::append) hands the record to a single writer thread
@@ -253,6 +311,14 @@ pub const MAX_BATCH: usize = 256;
 /// sequence numbers in the order they reached the channel. If a batch fails, its records are
 /// retried one transaction each, so one bad record fails only its own append; every append
 /// either gets its committed entry back or an error, never a guess.
+///
+/// **Bounded waits.** The writer's queue holds at most [`DEFAULT_APPEND_QUEUE`] appends and
+/// each waits at most [`DEFAULT_APPEND_TIMEOUT`] for the writer to take it
+/// ([`with_append_limits`](Self::with_append_limits)); past either the append fails with
+/// [`AuditError::Overloaded`] and is never written, so a hung disk denies decisions instead
+/// of blocking threads without end. The writer takes a batch only once it holds the
+/// connection, and the callers of a taken batch (at most [`MAX_BATCH`]) wait for its commit
+/// however long it takes, so an append that fails was not committed (SR-102).
 ///
 /// **Inline commit.** When no append is waiting for the writer and the connection is free, an
 /// append commits on the caller's thread instead, the same one-record transaction the writer
@@ -274,8 +340,17 @@ pub const MAX_BATCH: usize = 256;
 /// [`CHECKPOINT_PRESYNC_LEAD`](super::CHECKPOINT_PRESYNC_LEAD) entries before each checkpoint, so that commit's sync has
 /// only the last few entries' pages to write.
 ///
-/// Reads, checkpoints and [`with_connection`](Self::with_connection) take the same lock and
-/// see only committed batches.
+/// **Reads.** On a file in WAL mode, every query (verify, export, search, lookups, `head`)
+/// runs on a separate read-only connection with its own lock, so a long read never holds the
+/// connection an append needs: WAL lets one writer and readers proceed together, and a reader
+/// sees the last transaction committed before its own read began. A whole-log read (verify)
+/// is paged: it fixes the newest seq and reads the checkpoints in one read transaction at the
+/// start, then reads the entries up to that seq a page at a time, each page in its own short
+/// read transaction, so it neither sees an append that started after it nor pins one WAL
+/// snapshot for the whole walk (which would keep the WAL from being checkpointed). An
+/// in-memory store, or one whose file is not in WAL mode, reads on the writer's connection
+/// as before. Signed checkpoints and [`with_connection`](Self::with_connection) use the
+/// writer's connection and lock.
 pub struct SqliteAudit {
     pub(super) inner: Arc<Inner>,
     /// Started by the first append that finds the store busy, after the builders have run.
@@ -283,6 +358,12 @@ pub struct SqliteAudit {
     /// The background WAL checkpointer, if [`with_wal_checkpoints`](Self::with_wal_checkpoints)
     /// started one.
     pub(super) wal: Option<WalCheckpointer>,
+    /// A second, read-only connection on the same file for every query (see
+    /// [`read_conn`](Self::read_conn)); `None` for a store that is not a file in WAL mode,
+    /// whose reads share the writer's connection.
+    pub(super) reader: Option<Mutex<Connection>>,
+    /// The file's schema version and what this open did to it.
+    schema: SchemaState,
 }
 
 /// What the writer thread and the readers share.
@@ -298,9 +379,54 @@ pub(super) struct Inner {
     file: Option<PathBuf>,
     /// Held across every write transaction (see [`WriteGate`]).
     pub(super) gate: WriteGate,
+    /// The writer's queue capacity, at least 1 ([`SqliteAudit::with_append_limits`]).
+    append_queue: usize,
+    /// How long an append waits for the writer ([`SqliteAudit::with_append_limits`]).
+    append_timeout: Duration,
+    /// Appends shed so far.
+    shed: ShedCounters,
     /// Tests: every commit and the `synchronous` level it ran at, in one log with the hook.
     #[cfg(test)]
     probe: Option<Arc<Mutex<Vec<String>>>>,
+    /// Tests: the writer stops here once it has taken a batch, before committing it.
+    #[cfg(test)]
+    pub(super) take_gate: Option<Arc<TakeGate>>,
+}
+
+/// Tests: holds the writer between taking a batch and committing it, so a test can make an
+/// append's wait run out at exactly that point.
+#[cfg(test)]
+#[derive(Default)]
+pub(super) struct TakeGate {
+    state: Mutex<(bool, bool)>,
+    changed: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl TakeGate {
+    /// The writer: note that a batch is taken and wait until the test lets it commit.
+    fn hold(&self) {
+        let mut s = self.state.lock().unwrap();
+        s.0 = true;
+        self.changed.notify_all();
+        while !s.1 {
+            s = self.changed.wait(s).unwrap();
+        }
+    }
+
+    /// Wait until the writer has taken a batch.
+    pub(super) fn wait_taken(&self) {
+        let mut s = self.state.lock().unwrap();
+        while !s.0 {
+            s = self.changed.wait(s).unwrap();
+        }
+    }
+
+    /// Let the writer commit.
+    pub(super) fn release(&self) {
+        self.state.lock().unwrap().1 = true;
+        self.changed.notify_all();
+    }
 }
 
 /// Why [`Inner::commit_tx`] wrote nothing. Either way the records come back.
@@ -335,18 +461,35 @@ struct Job {
     /// [`AuditSink::append_synced`]: the batch that carries this record commits at `FULL`.
     sync: bool,
     reply: mpsc::SyncSender<Result<AuditEntry, AuditError>>,
+    /// [`WAITING`], [`TAKEN`] or [`ABANDONED`]: decides, once, whether the writer commits
+    /// the record or its caller has given up on it.
+    claim: Arc<AtomicU8>,
+}
+
+impl Job {
+    /// The writer's side of [`Job::claim`]: `Some` when the caller still waits, and from now
+    /// on the record is the writer's to commit; `None` when the caller gave up, and the
+    /// record is dropped unwritten.
+    fn take(self) -> Option<Self> {
+        self.claim
+            .compare_exchange(WAITING, TAKEN, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+            .then_some(self)
+    }
 }
 
 /// Handle on the writer thread. Dropping it closes the channel; the thread finishes the batch
 /// in hand and exits, and the drop waits for it.
 struct Writer {
-    jobs: Option<mpsc::Sender<Job>>,
+    /// Bounded ([`Inner::append_queue`]): a writer that stopped draining (a hung disk) fills
+    /// it, and further appends fail at once instead of piling up.
+    jobs: Option<mpsc::SyncSender<Job>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Writer {
     fn start(inner: Arc<Inner>) -> Self {
-        let (tx, rx) = mpsc::channel::<Job>();
+        let (tx, rx) = mpsc::sync_channel::<Job>(inner.append_queue.max(1));
         match std::thread::Builder::new()
             .name("attenuo-audit-writer".into())
             .spawn(move || writer_loop(&inner, &rx))
@@ -366,18 +509,67 @@ impl Writer {
         }
     }
 
-    fn append(&self, record: DecisionRecord, sync: bool) -> Result<AuditEntry, AuditError> {
+    /// Queue `record` for the writer and wait for its entry.
+    ///
+    /// A full queue fails at once. A job the writer has not taken within
+    /// `inner.append_timeout` is withdrawn, never written, and the caller gets
+    /// [`AuditError::Overloaded`], so its decision fails closed. The writer takes a job only
+    /// once it holds the connection, right before the commit; a caller whose job was taken
+    /// waits for the commit's outcome however long it takes, as an inline commit does. So an
+    /// error always means the record is not in the log and never will be, and the caller may
+    /// undo what it charged (SR-102). Which records are committed, and in what order, is
+    /// decided by the writer alone, so the chain stays linear whatever the callers do.
+    fn append(
+        &self,
+        inner: &Inner,
+        record: DecisionRecord,
+        sync: bool,
+    ) -> Result<AuditEntry, AuditError> {
         let stopped = || AuditError::Storage("the audit writer is not running".into());
         let jobs = self.jobs.as_ref().ok_or_else(stopped)?;
         let (reply, answer) = mpsc::sync_channel(1);
-        jobs.send(Job {
+        let claim = Arc::new(AtomicU8::new(WAITING));
+        match jobs.try_send(Job {
             record,
             reply,
             sync,
-        })
-        .map_err(|_| stopped())?;
-        // A writer that panicked drops the reply sender: the append fails, it is not assumed.
-        answer.recv().map_err(|_| stopped())?
+            claim: Arc::clone(&claim),
+        }) {
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Full(_)) => {
+                inner.shed.queue_full.fetch_add(1, Ordering::Relaxed);
+                return Err(AuditError::Overloaded("the audit writer's queue is full"));
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => return Err(stopped()),
+        }
+        // Tests: start the wait only once the writer holds the batch, so it runs out there.
+        #[cfg(test)]
+        if let Some(gate) = &inner.take_gate {
+            gate.wait_taken();
+        }
+        match answer.recv_timeout(inner.append_timeout) {
+            Ok(result) => result,
+            // A writer that panicked drops the reply sender: the append fails, it is not
+            // assumed.
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(stopped()),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if claim
+                    .compare_exchange(WAITING, ABANDONED, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    inner.shed.timeouts.fetch_add(1, Ordering::Relaxed);
+                    return Err(AuditError::Overloaded(
+                        "the audit writer did not take the record within the append timeout",
+                    ));
+                }
+                // Taken: the writer holds the connection and is committing the record. Wait
+                // for the outcome, as an inline commit does, so that an error always means
+                // the record was not written and the caller may roll back what it charged
+                // (SR-102). Only the one batch in hand can wait here: the writer takes no
+                // other while it commits.
+                answer.recv().unwrap_or_else(|_| Err(stopped()))
+            }
+        }
     }
 }
 
@@ -392,19 +584,44 @@ impl Drop for Writer {
 
 fn writer_loop(inner: &Inner, jobs: &mpsc::Receiver<Job>) {
     while let Ok(first) = jobs.recv() {
-        let mut batch = vec![first];
+        let mut batch: Vec<Job> = vec![first];
         while batch.len() < MAX_BATCH {
             match jobs.try_recv() {
                 Ok(job) => batch.push(job),
                 Err(_) => break,
             }
         }
+        // Claim the jobs only once the connection is held, right before the commit: a job
+        // whose caller gave up meanwhile (the connection was busy) is dropped unwritten, and
+        // a claimed job is committed or fails without further waits on anything but the
+        // commit itself, whose outcome its caller waits for (SR-102).
+        let mut conn = match inner.conn.lock() {
+            Ok(c) => c,
+            Err(_) => {
+                for job in batch.into_iter().filter_map(Job::take) {
+                    let _ = job.reply.send(Err(AuditError::Poisoned));
+                }
+                continue;
+            }
+        };
+        // Jobs whose callers gave up are dropped here, before anything is written; the rest
+        // keep the order in which they reached the queue.
+        let batch: Vec<Job> = batch.into_iter().filter_map(Job::take).collect();
+        if batch.is_empty() {
+            continue;
+        }
+        #[cfg(test)]
+        if let Some(gate) = &inner.take_gate {
+            gate.hold();
+        }
         // One record that must be synced makes the whole batch commit at `FULL`: one sync
         // covers them all.
         let sync = batch.iter().any(|j| j.sync);
         let (records, replies): (Vec<_>, Vec<_>) =
             batch.into_iter().map(|j| (j.record, j.reply)).unzip();
-        for (reply, result) in replies.into_iter().zip(inner.append_batch(records, sync)) {
+        let results = inner.append_locked(&mut conn, records, sync);
+        drop(conn);
+        for (reply, result) in replies.into_iter().zip(results) {
             // The caller always waits for its answer; a send can only fail if it panicked.
             let _ = reply.send(result);
         }
@@ -413,7 +630,9 @@ fn writer_loop(inner: &Inner, jobs: &mpsc::Receiver<Job>) {
 
 impl Inner {
     /// Commit `records` in order, as one transaction when possible. One result per record.
-    /// With `sync`, every commit runs at `synchronous=FULL`.
+    /// With `sync`, every commit runs at `synchronous=FULL`. Tests only: the writer locks the
+    /// connection itself and calls [`append_locked`](Self::append_locked).
+    #[cfg(test)]
     pub(super) fn append_batch(
         &self,
         records: Vec<DecisionRecord>,
@@ -719,26 +938,30 @@ impl SqliteAudit {
         Self::from_connection(open_memory_connection()?)
     }
 
-    /// Wrap an existing connection, creating the schema if needed.
+    /// Wrap an existing connection, bringing its file to
+    /// [`SCHEMA_VERSION`](crate::SCHEMA_VERSION) first (see [`schema`](Self::schema)).
+    ///
+    /// The migration runs on this connection, before the read-only reader connection is
+    /// opened, so the reader never sees a file mid-migration and never migrates. On a file
+    /// that is already current (a [`SqliteLeaseStore`](super::SqliteLeaseStore) on the same
+    /// file migrated it) it only reads `user_version`.
     ///
     /// # Errors
     ///
-    /// [`AuditError::Storage`] when the log predates records with `kind` and `chain_id`, or was
-    /// written with another entry hash construction than
-    /// [`ENTRY_HASH_VERSION`](crate::log::ENTRY_HASH_VERSION), such as one written before RFC
-    /// 8785 canonical JSON (SR-20): there is no migration, start a new file.
-    /// [`AuditError::Sqlite`] when the schema, the meta row or the record-id index cannot be
-    /// written (a read-only or foreign database, for example).
-    pub fn from_connection(conn: Connection) -> Result<Self, AuditError> {
-        check_record_fields(&conn)?;
-        conn.execute_batch(AUDIT_SCHEMA)?;
-        conn.execute_batch(CHECKPOINT_SCHEMA)?;
-        conn.execute_batch(META_SCHEMA)?;
-        check_hash_version(&conn)?;
-        // After the version check, so a log this version refuses is not changed by it.
-        create_record_id_index(&conn)?;
+    /// [`AuditError::SchemaTooNew`] when a newer attenuo wrote the file. [`AuditError::Storage`]
+    /// when the log predates records with `kind` and `chain_id`, or was written with another
+    /// entry hash construction than [`ENTRY_HASH_VERSION`](crate::log::ENTRY_HASH_VERSION),
+    /// such as one written before RFC 8785 canonical JSON (SR-20): there is no migration for
+    /// those, start a new file; or when a migration fails (the file stays at the version
+    /// before it). [`AuditError::Sqlite`] when the schema cannot be read or written (a
+    /// read-only or foreign database, for example).
+    pub fn from_connection(mut conn: Connection) -> Result<Self, AuditError> {
+        let schema = migrate(&mut conn)?;
+        check_entry_hash(&conn, false)?;
         let relaxed_sync = relaxed_sync_of(&conn)?;
         let file = file_of(&conn);
+        // After the migration: the reader only ever sees a current file.
+        let reader = open_reader(&conn)?.map(Mutex::new);
         Ok(Self {
             inner: Arc::new(Inner {
                 conn: Arc::new(Mutex::new(conn)),
@@ -747,11 +970,99 @@ impl SqliteAudit {
                 relaxed_sync,
                 gate: WriteGate::for_file(file.as_deref()),
                 file,
+                append_queue: DEFAULT_APPEND_QUEUE,
+                append_timeout: DEFAULT_APPEND_TIMEOUT,
+                shed: ShedCounters::default(),
                 #[cfg(test)]
                 probe: None,
+                #[cfg(test)]
+                take_gate: None,
             }),
             writer: OnceLock::new(),
             wal: None,
+            reader,
+            schema,
+        })
+    }
+
+    /// The file's schema version and whether this open migrated it (for the start-up log).
+    pub fn schema(&self) -> SchemaState {
+        self.schema
+    }
+
+    /// The connection queries run on: the read-only reader when there is one, else the
+    /// writer's connection. Only reads go through here.
+    fn read_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, AuditError> {
+        match &self.reader {
+            Some(r) => Ok(r.lock()?),
+            None => Ok(self.inner.conn.lock()?),
+        }
+    }
+
+    /// The newest seq and every stored checkpoint, read in one read transaction: the snapshot
+    /// a whole-log verify walks. A checkpoint is written in the same transaction as the entry
+    /// it names or after it, so in one snapshot a checkpoint past the newest seq means the log
+    /// was truncated, never that an append was half seen.
+    pub(super) fn verify_snapshot(&self) -> Result<(i64, Vec<Checkpoint>), AuditError> {
+        let mut conn = self.read_conn()?;
+        let tx = conn.transaction()?;
+        let upper: i64 =
+            tx.query_row("SELECT COALESCE(MAX(seq), 0) FROM audit", [], |r| r.get(0))?;
+        let checkpoints: Vec<Checkpoint> = {
+            let mut stmt = tx.prepare_cached(
+                "SELECT seq, head_hash, at, kid, signature FROM checkpoints ORDER BY seq",
+            )?;
+            let rows = stmt.query_map([], checkpoint_from_row)?;
+            rows.collect::<Result<_, _>>()?
+        };
+        tx.commit()?;
+        Ok((upper, checkpoints))
+    }
+
+    /// Every entry with `seq <= upper`, in order, read [`VERIFY_PAGE`] rows at a time, each
+    /// page under the read lock for just that page. A row that cannot be decoded comes back
+    /// as its error ([`AuditError::Corrupt`]) in its place; a failed query ends the walk
+    /// with that error.
+    pub(super) fn entries_through(
+        &self,
+        upper: i64,
+    ) -> impl Iterator<Item = Result<AuditEntry, AuditError>> + '_ {
+        let sql = format!(
+            "SELECT {ENTRY_COLUMNS} FROM audit WHERE seq >= ?1 AND seq <= ?2 ORDER BY seq \
+             LIMIT ?3"
+        );
+        let mut next: i64 = i64::MIN;
+        let mut page: std::collections::VecDeque<Result<AuditEntry, AuditError>> =
+            std::collections::VecDeque::new();
+        let mut done = false;
+        std::iter::from_fn(move || loop {
+            if let Some(item) = page.pop_front() {
+                return Some(item);
+            }
+            if done {
+                return None;
+            }
+            let read = (|| -> Result<(), AuditError> {
+                let conn = self.read_conn()?;
+                let mut stmt = conn.prepare_cached(&sql)?;
+                let mut rows = stmt.query(params![next, upper, VERIFY_PAGE])?;
+                let mut n = 0;
+                while let Some(row) = rows.next()? {
+                    n += 1;
+                    // The raw seq pages on even when the row does not decode.
+                    let seq: i64 = row.get(0)?;
+                    next = seq.saturating_add(1);
+                    page.push_back(entry_from_row(row));
+                }
+                if n < VERIFY_PAGE || next > upper {
+                    done = true;
+                }
+                Ok(())
+            })();
+            if let Err(e) = read {
+                done = true;
+                page.push_back(Err(e));
+            }
         })
     }
 
@@ -767,7 +1078,7 @@ impl SqliteAudit {
     ///
     /// A zero `interval` changes nothing (SQLite checkpoints on the writer, every 1,000
     /// pages), and so does a store that is not a file in WAL mode, such as an in-memory one.
-    /// Readers are unaffected: every read goes through the store's own connection, which sees
+    /// Readers are unaffected: every read goes through the store's own connections, which see
     /// every committed row whether or not it has been copied into the database file yet.
     ///
     /// # Errors
@@ -803,10 +1114,10 @@ impl SqliteAudit {
         let activity = Arc::clone(&self.inner.activity);
         let _ = activity.wal_kick.set(kick.clone());
         {
-            let writer = self.inner.conn.lock()?;
+            let mut writer = self.inner.conn.lock()?;
             writer.pragma_update(None, "wal_autocheckpoint", 0)?;
             // After the pragma: setting `wal_autocheckpoint` installs SQLite's own hook.
-            writer.wal_hook(Some(note_wal_pages));
+            writer.wal_hook(Some(note_wal_pages))?;
         }
         self.wal = Some(WalCheckpointer::start(
             conn,
@@ -854,6 +1165,34 @@ impl SqliteAudit {
     /// thread (which holds the other reference), so the `Arc` is still unique.
     fn inner_mut(&mut self) -> &mut Inner {
         Arc::get_mut(&mut self.inner).expect("SqliteAudit builders must run before any append")
+    }
+
+    /// Bound the appends that wait for the writer thread: at most `queue` (at least 1) wait at
+    /// once, and each waits at most `timeout` for the writer to take it. A full queue, or a
+    /// wait that runs out, fails the append with [`AuditError::Overloaded`] (counted in
+    /// [`append_stats`](Self::append_stats)) and the record is never written, so a writer
+    /// stuck on a hung disk turns into failed appends, and denied decisions, instead of an
+    /// ever-growing number of blocked threads. The appends of the one batch the writer has
+    /// taken wait for its commit without a deadline, so their outcome is never a guess
+    /// (SR-102). Group commit is unchanged: what reaches the writer is batched and committed in
+    /// queue order. An append committed inline, on the caller's thread (when nothing waits
+    /// and the connection is free), has no deadline: a thread cannot be taken out of a stuck
+    /// write, and it holds the connection, so every later append goes to the queue and is
+    /// bounded there. Defaults: [`DEFAULT_APPEND_QUEUE`], [`DEFAULT_APPEND_TIMEOUT`]. Call it
+    /// before the first append.
+    pub fn with_append_limits(mut self, queue: usize, timeout: Duration) -> Self {
+        let inner = self.inner_mut();
+        inner.append_queue = queue.max(1);
+        inner.append_timeout = timeout;
+        self
+    }
+
+    /// How many appends were shed so far ([`with_append_limits`](Self::with_append_limits)).
+    pub fn append_stats(&self) -> AppendStats {
+        AppendStats {
+            queue_full: self.inner.shed.queue_full.load(Ordering::Relaxed),
+            timeouts: self.inner.shed.timeouts.load(Ordering::Relaxed),
+        }
     }
 
     /// Sign checkpoints with `signer`: one every `every` appended entries (0 turns the
@@ -966,7 +1305,7 @@ impl SqliteAudit {
     /// [`AuditError::Poisoned`] when a writer panicked holding the log's lock, or
     /// [`AuditError::Sqlite`] when the query fails or a row has the wrong shape.
     pub fn last_checkpoint(&self) -> Result<Option<Checkpoint>, AuditError> {
-        let conn = self.inner.conn.lock()?;
+        let conn = self.read_conn()?;
         let mut stmt = conn.prepare_cached(
             "SELECT seq, head_hash, at, kid, signature FROM checkpoints \
              ORDER BY seq DESC LIMIT 1",
@@ -982,7 +1321,7 @@ impl SqliteAudit {
     /// [`AuditError::Poisoned`] when a writer panicked holding the log's lock, or
     /// [`AuditError::Sqlite`] when the query fails or a row has the wrong shape.
     pub fn checkpoints_between(&self, from: u64, to: u64) -> Result<Vec<Checkpoint>, AuditError> {
-        let conn = self.inner.conn.lock()?;
+        let conn = self.read_conn()?;
         let mut stmt = conn.prepare_cached(
             "SELECT seq, head_hash, at, kid, signature FROM checkpoints \
              WHERE seq >= ?1 AND seq <= ?2 ORDER BY seq",
@@ -999,6 +1338,9 @@ impl SqliteAudit {
 
     /// Walk the chain and verify every stored checkpoint against `keys`.
     ///
+    /// The walk covers the log as it was when the call began (see "Reads" on [`SqliteAudit`]):
+    /// appends made meanwhile are neither walked nor waited for, and are not held up.
+    ///
     /// # Errors
     ///
     /// [`AuditError::Poisoned`] when a writer panicked holding the log's lock,
@@ -1009,18 +1351,13 @@ impl SqliteAudit {
         &self,
         keys: &CheckpointKeys,
     ) -> Result<SignedVerifyReport, AuditError> {
-        let sql = format!("SELECT {ENTRY_COLUMNS} FROM audit ORDER BY seq");
-        let conn = self.inner.conn.lock()?;
-        let checkpoints: Vec<Checkpoint> = {
-            let mut stmt = conn.prepare(
-                "SELECT seq, head_hash, at, kid, signature FROM checkpoints ORDER BY seq",
-            )?;
-            let rows = stmt.query_map([], checkpoint_from_row)?;
-            rows.collect::<Result<_, _>>()?
-        };
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map([], |row| Ok(entry_from_row(row)))?;
-        verify_with_checkpoints(rows.map(|r| r?), &checkpoints, keys, Start::Genesis)
+        let (upper, checkpoints) = self.verify_snapshot()?;
+        verify_with_checkpoints(
+            self.entries_through(upper),
+            &checkpoints,
+            keys,
+            Start::Genesis,
+        )
     }
 
     /// Run `f` against the underlying connection while holding the write lock.
@@ -1034,10 +1371,10 @@ impl SqliteAudit {
     /// returns.
     pub fn with_connection<R>(
         &self,
-        f: impl FnOnce(&Connection) -> Result<R, AuditError>,
+        f: impl FnOnce(&mut Connection) -> Result<R, AuditError>,
     ) -> Result<R, AuditError> {
-        let conn = self.inner.conn.lock()?;
-        f(&conn)
+        let mut conn = self.inner.conn.lock()?;
+        f(&mut conn)
     }
 
     /// Entries for one originating subject, newest first, at most `limit`.
@@ -1052,7 +1389,7 @@ impl SqliteAudit {
             "SELECT {ENTRY_COLUMNS} FROM audit WHERE originating_subject = ?1 \
              ORDER BY seq DESC LIMIT ?2"
         );
-        let conn = self.inner.conn.lock()?;
+        let conn = self.read_conn()?;
         query_entries(&conn, &sql, &[&subject, &usize_to_i64(limit)])
     }
 
@@ -1091,8 +1428,9 @@ impl SqliteAudit {
     /// returns is decoded (and cross-checked against `record_json`) and must also pass
     /// [`EntryFilter::matches`].
     ///
-    /// Rows are read in batches of `limit` and the store's lock is released between batches,
-    /// so a long scan does not hold up appends. The cost grows with the window, not the page:
+    /// Rows are read on the reader connection (see "Reads" on [`SqliteAudit`]) in batches of
+    /// `limit`, and its lock is released between batches, so a long scan holds up neither
+    /// appends nor other reads for long. The cost grows with the window, not the page:
     /// callers bound the window.
     ///
     /// # Errors
@@ -1155,7 +1493,7 @@ impl SqliteAudit {
         let mut hi = i64::try_from(hi).unwrap_or(i64::MAX);
         while lo <= hi {
             let rows = {
-                let conn = self.inner.conn.lock()?;
+                let conn = self.read_conn()?;
                 query_entries(
                     &conn,
                     &sql,
@@ -1211,7 +1549,7 @@ impl SqliteAudit {
             return Ok(None);
         };
         let sql = format!("SELECT {ENTRY_COLUMNS} FROM audit WHERE seq = ?1");
-        let conn = self.inner.conn.lock()?;
+        let conn = self.read_conn()?;
         Ok(query_entries(&conn, &sql, &[&seq])?.pop())
     }
 
@@ -1227,7 +1565,7 @@ impl SqliteAudit {
     pub fn entry_by_record_id(&self, id: &str) -> Result<Option<AuditEntry>, AuditError> {
         let sql =
             format!("SELECT {ENTRY_COLUMNS} FROM audit WHERE {RECORD_ID_EXPR} = ?1 ORDER BY seq");
-        let conn = self.inner.conn.lock()?;
+        let conn = self.read_conn()?;
         let found = query_entries(&conn, &sql, &[&id])?;
         // Record ids are random UUIDs, so one row at most is expected; take the first whose
         // decoded record really has that id.
@@ -1246,7 +1584,7 @@ impl SqliteAudit {
         before: u64,
         limit: usize,
     ) -> Result<Vec<Checkpoint>, AuditError> {
-        let conn = self.inner.conn.lock()?;
+        let conn = self.read_conn()?;
         let mut stmt = conn.prepare_cached(
             "SELECT seq, head_hash, at, kid, signature FROM checkpoints \
              WHERE seq < ?1 ORDER BY seq DESC LIMIT ?2",
@@ -1274,7 +1612,7 @@ impl SqliteAudit {
         let Ok(seq) = i64::try_from(seq) else {
             return Ok(None);
         };
-        let conn = self.inner.conn.lock()?;
+        let conn = self.read_conn()?;
         let mut stmt = conn.prepare_cached(
             "SELECT seq, head_hash, at, kid, signature FROM checkpoints \
              WHERE seq >= ?1 ORDER BY seq LIMIT 1",
@@ -1307,7 +1645,7 @@ impl SqliteAudit {
              WHERE kind = ?1 AND tool = ?2 AND decision = ?3 AND seq > ?4 \
              ORDER BY seq LIMIT 1"
         );
-        let conn = self.inner.conn.lock()?;
+        let conn = self.read_conn()?;
         Ok(query_entries(
             &conn,
             &sql,
@@ -1341,7 +1679,7 @@ impl SqliteAudit {
             "SELECT {ENTRY_COLUMNS} FROM audit WHERE chain_id = ?1 \
              AND kind IN ('root_token', 'exchange') ORDER BY seq"
         );
-        let conn = self.inner.conn.lock()?;
+        let conn = self.read_conn()?;
         let mut stmt = conn.prepare_cached(&sql)?;
         let mut rows = stmt.query([chain_id])?;
         while let Some(row) = rows.next()? {
@@ -1365,7 +1703,7 @@ impl SqliteAudit {
     /// decoded.
     pub fn by_chain(&self, chain_digest: &str) -> Result<Vec<AuditEntry>, AuditError> {
         let sql = format!("SELECT {ENTRY_COLUMNS} FROM audit WHERE chain_digest = ?1 ORDER BY seq");
-        let conn = self.inner.conn.lock()?;
+        let conn = self.read_conn()?;
         query_entries(&conn, &sql, &[&chain_digest])
     }
 
@@ -1385,7 +1723,7 @@ impl SqliteAudit {
         let sql = format!(
             "SELECT {ENTRY_COLUMNS} FROM audit WHERE leases LIKE ?1 ESCAPE '\\' ORDER BY seq"
         );
-        let conn = self.inner.conn.lock()?;
+        let conn = self.read_conn()?;
         let candidates = query_entries(&conn, &sql, &[&pattern])?;
         // Confirm against the decoded record; LIKE is only a prefilter.
         Ok(candidates
@@ -1401,7 +1739,7 @@ impl SqliteAudit {
     /// [`AuditError::Poisoned`] when a writer panicked holding the log's lock, or
     /// [`AuditError::Sqlite`] when the count query fails.
     pub fn len(&self) -> Result<u64, AuditError> {
-        let conn = self.inner.conn.lock()?;
+        let conn = self.read_conn()?;
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM audit", [], |r| r.get(0))?;
         Ok(u64::try_from(n).unwrap_or(0))
     }
@@ -1437,7 +1775,7 @@ impl SqliteAudit {
         let result = self
             .writer
             .get_or_init(|| Writer::start(Arc::clone(&self.inner)))
-            .append(record, sync);
+            .append(&self.inner, record, sync);
         activity.pending.fetch_sub(1, Ordering::AcqRel);
         result
     }
@@ -1460,7 +1798,7 @@ impl AuditSink for SqliteAudit {
     }
 
     fn head(&self) -> Result<Option<AuditEntry>, AuditError> {
-        let mut conn = self.inner.conn.lock()?;
+        let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         head_in(&tx)
     }
@@ -1468,7 +1806,7 @@ impl AuditSink for SqliteAudit {
     fn range(&self, from_seq: u64, limit: usize) -> Result<Vec<AuditEntry>, AuditError> {
         let sql =
             format!("SELECT {ENTRY_COLUMNS} FROM audit WHERE seq >= ?1 ORDER BY seq LIMIT ?2");
-        let conn = self.inner.conn.lock()?;
+        let conn = self.read_conn()?;
         query_entries(
             &conn,
             &sql,
@@ -1480,13 +1818,10 @@ impl AuditSink for SqliteAudit {
     }
 
     fn verify_chain(&self) -> Result<VerifyReport, AuditError> {
-        let sql = format!("SELECT {ENTRY_COLUMNS} FROM audit ORDER BY seq");
-        let conn = self.inner.conn.lock()?;
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map([], |row| Ok(entry_from_row(row)))?;
+        let (upper, _) = self.verify_snapshot()?;
         // A row that cannot be decoded (corrupt JSON, column/JSON disagreement) surfaces as
         // `AuditError::Corrupt`, which `verify_entries` reports as a break at that seq.
-        verify_entries(rows.map(|r| r?))
+        verify_entries(self.entries_through(upper))
     }
 
     fn checkpoint(&self) -> Result<(u64, String), AuditError> {
@@ -1554,5 +1889,16 @@ impl SqliteAudit {
     pub(super) fn with_probe(mut self, log: Arc<Mutex<Vec<String>>>) -> Self {
         self.inner_mut().probe = Some(log);
         self
+    }
+
+    /// Stop the writer at `gate` after it takes each batch (see [`TakeGate`]).
+    pub(super) fn with_take_gate(mut self, gate: Arc<TakeGate>) -> Self {
+        self.inner_mut().take_gate = Some(gate);
+        self
+    }
+
+    /// Send every later append to the writer thread, as if one were already waiting there.
+    pub(super) fn never_inline(&self) {
+        self.inner.activity.pending.fetch_add(1, Ordering::AcqRel);
     }
 }

@@ -18,6 +18,13 @@ use time::OffsetDateTime;
 /// existing file is never overwritten.
 pub(crate) fn generate(path: &Path) -> Result<DpopKey> {
     let key = DpopKey::generate().context("generating a DPoP key")?;
+    write_new(path, &key.private_jwk())?;
+    Ok(key)
+}
+
+/// Write the private JWK `jwk` to a new file at `path`, mode 0600 on Unix. An existing file is
+/// never overwritten.
+pub(crate) fn write_new(path: &Path, jwk: &Value) -> Result<()> {
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -31,11 +38,11 @@ pub(crate) fn generate(path: &Path) -> Result<DpopKey> {
             path.display()
         )
     })?;
-    let mut text = serde_json::to_string_pretty(&key.private_jwk())?;
+    let mut text = serde_json::to_string_pretty(jwk)?;
     text.push('\n');
     file.write_all(text.as_bytes())
         .with_context(|| format!("writing {}", path.display()))?;
-    Ok(key)
+    Ok(())
 }
 
 /// Read a private JWK from `path`.
@@ -111,6 +118,18 @@ pub(crate) fn exchange_proofs(
         _ => None,
     };
     Ok((header, sign_off))
+}
+
+/// The `DPoP` header of a request that mints a token bound to `key` and presents no attenuo
+/// token (`token exchange` at hop 0): a proof for `POST url` with the server's `nonce`, if any,
+/// and no `ath`. `None` without a key.
+pub(crate) fn new_token_proof(
+    url: &str,
+    key: Option<&Path>,
+    nonce: Option<&str>,
+) -> Result<Option<String>> {
+    let now = OffsetDateTime::now_utc();
+    Ok(load_opt(key)?.map(|k| k.proof_with_nonce("POST", url, None, nonce, now)))
 }
 
 /// `attenuo token sign-off`: the parent holder's consent (`subject_token_dpop`) to an

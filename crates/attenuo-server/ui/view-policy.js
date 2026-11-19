@@ -6,7 +6,7 @@
 import {
   h, append, replace, mono, time, pill, decisionPill, table, empty, loading, kv, explainReason, jsonTree,
 } from './dom.js';
-import { api, showNotice } from './api.js';
+import { api, showNotice, roleAllows } from './api.js';
 
 // GET /admin/policies, fetched once per login. Lock forgets it with the token.
 let cached = null;
@@ -61,7 +61,9 @@ async function showLoaded(box) {
 
 function checkPanel(afterReload) {
   const out = h('div', { class: 'stack' });
-  const reloadNote = h('span', { class: 'small muted' }, 'Reload is enabled after a check with no errors.');
+  const reloadNote = h('span', { class: 'small muted' }, roleAllows('admin')
+    ? 'Reload is enabled after a check with no errors.'
+    : 'Reloading needs the admin role.');
   const reloadBtn = h('button', { type: 'button', class: 'primary', disabled: true, on: { click: reload } }, 'Reload');
   const checkBtn = h('button', { type: 'button', on: { click: check } }, 'Check file on disk');
 
@@ -87,7 +89,7 @@ function checkPanel(afterReload) {
             : pill('same as loaded', '')),
         kv([['File', mono(c.path)], ['sha256 on disk', mono(c.sha256)], ['sha256 loaded', c.loaded_sha256 ? mono(c.loaded_sha256) : null]]),
         issues.length ? table(['Severity', 'Line', 'Col', 'Policy', 'Stage', 'Message'], issues, { short: true }) : null);
-      reloadBtn.disabled = !c.ok;
+      reloadBtn.disabled = !c.ok || !roleAllows('admin');
     } catch (e) {
       if (e.status === 401) return;
       replace(out, h('p', { class: 'callout' }, e.status === 409

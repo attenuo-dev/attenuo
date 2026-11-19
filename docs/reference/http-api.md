@@ -1,69 +1,334 @@
 # HTTP endpoints
 
-All routes the server mounts, from the route table in `crates/attenuo-server/src/lib.rs` and the proxy router. Errors on non-MCP routes look like `{"error": "<code>", "detail": "<text>"}`. The codes for `/token` are listed in [design/server.md](../design/server.md#error-codes).
+All routes the server mounts, from the route table in `crates/attenuo-server/src/lib.rs` and the proxy router. What may change before 1.0, and how a change is announced, is in [API compatibility](api-compatibility.md). Errors on non-MCP routes look like `{"error": "<error>", "code": "<code>", "detail": "<text>"}`; every error carries a stable `code`, listed under [Errors](#errors). The codes for `/token` are explained in [design/server.md](../design/server.md#error-codes).
 
-A 401 for a bearer token (`/token/renew`, AuthZEN, `/admin/*`) is `{"error": "unauthorized", "detail": "<reason>", "error_description": "<reason>"}`, where the reason is one of `missing_token`, `invalid_token` or `token_expired`. Why a token did not verify (wrong key, audience, issuer, malformed) is logged at debug level and never returned. A token bound to a key (DPoP, below) adds `dpop_required` and `invalid_dpop_proof`. The same goes for a JWKS the server cannot fetch (503 `temporarily_unavailable`, sub-code `jwks_unavailable`): the URL and the transport error are logged, not returned. A hop-0 credential (ID token or ID-JAG) refused at `POST /token` is `400 invalid_grant` with the sub-code (`audience_mismatch`, `unknown_kid`, ...) as both `detail` and `error_description`; the verifier's message, which names the issuer, the audience or the `kid`, is logged at debug level. A refused `actor_token` is answered the same way, as `400 invalid_request` with its `actor_token_...` sub-code in both fields.
+A 401 for a bearer token (`/token/renew`, AuthZEN, `/admin/*`) is `{"error": "unauthorized", "code": "<reason>", "detail": "<reason>", "error_description": "<reason>"}`, where the reason is one of `missing_token`, `invalid_token` or `token_expired`. Why a token did not verify (wrong key, audience, issuer, malformed) is logged at debug level and never returned. A token bound to a key (DPoP, below) adds `dpop_required` and `invalid_dpop_proof`. The same goes for a JWKS the server cannot fetch (503 `temporarily_unavailable`, sub-code `jwks_unavailable`): the URL and the transport error are logged, not returned. A hop-0 credential (ID token or ID-JAG) refused at `POST /token` is `400 invalid_grant` with the sub-code (`audience_mismatch`, `unknown_kid`, ...) as both `detail` and `error_description`; the verifier's message, which names the issuer, the audience or the `kid`, is logged at debug level. A refused `actor_token` is answered the same way, as `400 invalid_request` with its `actor_token_...` sub-code in both fields.
+
+A request the server cannot read is refused in the same shape on every non-MCP route, the console listener included: a query parameter that does not parse (`?from=abc`, `?preview=maybe`) or a path parameter that does not parse or is not UTF-8 once percent-decoded (`/admin/audit/entries/abc`) is 400 `invalid_request`, and a body that is not JSON is 400 `invalid_request`. A body over 2 MiB is 413 `request_too_large`. `detail` names the parameter and the expected type (`the path parameter `seq` is not a valid u64`) and never repeats the value sent. The main listener reads a JSON body whatever its `Content-Type`; only `POST /token` uses it, to choose between a form and JSON. The console listener requires `Content-Type: application/json` on a `POST` (415 `unsupported_media_type` otherwise). At the MCP proxy a server name that is not UTF-8 (`/mcp/%FF`) is HTTP 400 with JSON-RPC `-32600` and `id: null`.
 
 An HTTP/1 answer sent before the request body was read to its end carries `Connection: close`, and the server closes the connection after it. Most refusals are decided on the headers alone: a missing or bad token on `/mcp/{server}` (401, `use_dpop_nonce` included), a declared body over `[proxy] max_request_body_bytes` (413), and a missing admin bearer (401). A client sends its retry on a new connection. Answers to requests whose body was read, and to requests with no body, keep the connection open. HTTP/2 answers never carry the header.
+
+## Errors
+
+Every error the server or its proxy sends carries a stable `code`: snake_case ASCII, documented below, and never reworded, so a client may match on it. The texts (`detail`, `message`) are for people and may change in any release. A code that a later release stops sending is announced as described in [API compatibility](api-compatibility.md). There are three shapes, one per kind of route:
+
+- **REST** (every route except `/mcp/{server}`, the AuthZEN routes and the console listener included). `error` is the OAuth-style error (RFC 6749 §5.2, RFC 6750 §3.1) and stays as it was; `code` is the precise code: the specific reason of the refusal, which is `error_description` when the answer has one, and otherwise either a reason with no `error_description` (a refused renewal's `lease_revoked`, for example) or, when no more specific reason exists, `error` itself:
+
+  ```json
+  {"error": "invalid_grant", "code": "audience_mismatch", "detail": "audience_mismatch", "error_description": "audience_mismatch"}
+  ```
+
+  ```json
+  {"error": "invalid_grant", "code": "lease_revoked", "detail": "lease_revoked", "decision_id": "10ce6d75-b2e0-4aa7-a563-7b2fc5a8b223"}
+  ```
+
+  ```json
+  {"error": "invalid_request", "code": "invalid_request", "detail": "the query parameter `limit` is not a valid u32"}
+  ```
+
+- **JSON-RPC** (the MCP proxy at `/mcp/{server}`). The number in `error.code` is the JSON-RPC error code; the stable code is `data.code`. Where `data.reason` is present it is the same string, and it stays:
+
+  ```json
+  {"jsonrpc": "2.0", "id": 7, "error": {"code": -32003, "message": "attenuo: denied: policy_deny", "data": {"code": "policy_deny", "reason": "policy_deny", "decision_id": "10ce6d75-b2e0-4aa7-a563-7b2fc5a8b223"}}}
+  ```
+
+  An error the upstream sent is relayed unchanged and has no `data.code` from the proxy; an upstream error in the shape of the proxy's stream end is rewritten to `upstream_stream_end_shape` (see [MCP proxy](#mcp-proxy)).
+
+- **AuthZEN** (`/access/v1/evaluation`, `/access/v1/evaluations`, `/access/v1/search/action`). A request the PDP refuses as a whole (no token, a malformed body, a batch too large, a search page token it did not issue) is answered in the REST shape. A batch entry that fails is a deny whose `context.error` carries `status`, `code` and `message`:
+
+  ```json
+  {"decision": false, "context": {"error": {"status": 400, "code": "invalid_request", "message": "each evaluation must be an object"}}}
+  ```
+
+  A decision is not an error: a denied evaluation is `{"decision": false, "context": {"reason": "policy_deny", ...}}`, with no `code`.
+
+**`code` and `reason`.** A deny of the decision pipeline has a `reason` (in the audit record, in AuthZEN `context.reason`, in the proxy's `data.reason`). Every deny reason that reaches the wire is in the table below, marked in the "Deny `reason`" column, and the proxy's `data.code` for such a denial is the same string as `data.reason`. Reasons of allowed decisions (`policy_allow`, `capability_allow`) and of other audit records (`token_issued`, `lease_renewed`, `approval_granted`, ...) are not error codes. The audit reasons of refused exchanges (`exchange_widening`, `exchange_replayed`, ...) are audit-only; the 400 that answers the exchange carries the code in its own column of the table under [Token](#token).
+
+**Deprecated machine fields.** Before `code` existed, the precise code was read from `error_description` and, on a 401 and a refused hop-0 credential or `actor_token`, from `detail`. Both still carry it, and keep it at least until the next minor release (see [API compatibility](api-compatibility.md)), but RFC 6749 means `error_description` for people, so read `code` instead. The CLI, the SDKs and the console read `code`, falling back to the old fields for a server that does not send it.
+
+The table is generated from `attenuo_core::error_codes::ERROR_CODES`, the one place the server keeps every code with its HTTP status, its `error` member and its JSON-RPC number; a test fails when this page, or a code named in the sources, differs from it. "REST status" lists each status the code is sent with, and the `error` member when it is not the code itself. "JSON-RPC" lists the number and the HTTP status of the answer that carries it (200 for an error inside a JSON-RPC response or an SSE event).
+
+<!-- error-codes:start (generated from attenuo_core::error_codes; see crates/attenuo-server/tests/error_codes.rs) -->
+| `code` | REST status (`error`) | JSON-RPC (HTTP status) | Deny `reason` | Meaning |
+| --- | --- | --- | --- | --- |
+| `actor_mismatch` | 400 `invalid_request` |  |  | The authenticated agent or actor token is not the request's `actor`. |
+| `actor_not_permitted` | 400 `invalid_request` |  |  | The actor is not in the parent token's `may_act`. |
+| `actor_token_audience_mismatch` | 400 `invalid_request` |  |  | The actor token's audience is not this server. |
+| `actor_token_bad_signature` | 400 `invalid_request` |  |  | The actor token's signature does not verify. |
+| `actor_token_expired` | 400 `invalid_request` |  |  | The actor token has expired, or expires now. |
+| `actor_token_invalid_spiffe_id` | 400 `invalid_request` |  |  | The actor token's subject is not a valid SPIFFE id. |
+| `actor_token_malformed` | 400 `invalid_request` |  |  | The actor token is not a well-formed JWT. |
+| `actor_token_missing_claim` | 400 `invalid_request` |  |  | The actor token lacks a required claim. |
+| `actor_token_missing_kid` | 400 `invalid_request` |  |  | The actor token names no `kid`. |
+| `actor_token_not_accepted` | 400 `invalid_request` |  |  | `[token] actor_auth` does not accept actor tokens. |
+| `actor_token_not_yet_valid` | 400 `invalid_request` |  |  | The actor token is not valid yet. |
+| `actor_token_required` | 401 `invalid_client` |  |  | `[token] actor_auth` requires an actor token. |
+| `actor_token_typ_mismatch` | 400 `invalid_request` |  |  | The actor token's `typ` header is not accepted. |
+| `actor_token_type_unsupported` | 400 `invalid_request` |  |  | `actor_token_type` is not `urn:ietf:params:oauth:token-type:jwt`. |
+| `actor_token_unknown_kid` | 400 `invalid_request` |  |  | The actor token's `kid` is not in its issuer's keys. |
+| `actor_token_unmapped_subject` | 400 `invalid_request` |  |  | The actor token's subject maps to no agent. |
+| `actor_token_unsupported_alg` | 400 `invalid_request` |  |  | The actor token's algorithm is not accepted. |
+| `actor_token_untrusted_issuer` | 400 `invalid_request` |  |  | The actor token's issuer is not an `[[actor_trust]]` entry. |
+| `admin_credential_expired` | 401 `unauthorized` |  |  | The admin bearer is an `[[admin.operators]]` credential whose `expires_at` has passed. |
+| `admin_disabled` | 403 |  |  | The admin API is turned off. |
+| `admin_role_insufficient` | 403 |  |  | The admin credential's role is below the one the route needs; the message names the role needed. |
+| `agent_token_refused` | 403 |  |  | A delegation token cannot decide an approval. |
+| `already_refunded` | 409 |  |  | The budget charge was already refunded. |
+| `approval_expired` | 409 |  |  | The approval, or the lease it is bound to, has expired. |
+| `approval_invalid` |  | `-32003` (200) | yes | A presented approval token does not verify, is for another call, or names an approval that is no longer granted. |
+| `approval_not_pending` | 409 |  |  | The approval is already decided. |
+| `approval_required` |  | `-32008` (200) | yes | The policy asks a person to approve this exact call first. |
+| `approval_token_not_accepted` | 400 `invalid_request` |  |  | An AuthZEN action search carries `context.approval_token`; an approval token is spent only by the one decision it names. |
+| `argument_case_mismatch` |  | `-32003` (200) | yes | A top-level call argument name differs only in case from a name the decision reads for the tool (its catalog entry, a constraint or run limit of a capability that covers it, a loaded policy), which an upstream that ignores case would read as that name. |
+| `attribute_fixed_by_grant` | 403 |  |  | The root grant fixes this attribute; the request may not set it. |
+| `attribute_type_mismatch` |  | `-32003` (200) | yes | An originating-user attribute does not have its declared type. |
+| `audience_mismatch` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The credential's audience is not this server. |
+| `audit_error` |  | `-32003` (200) | yes | The decision could not be written to the audit log (fail closed). |
+| `bad_signature` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The credential's signature does not verify. |
+| `batch_too_large` | 400 |  |  | An AuthZEN batch has more entries than `[authzen] max_batch`. |
+| `budget_error` |  | `-32003` (200) | yes | The run-limit counters could not be read or written (fail closed). |
+| `budget_exhausted` |  | `-32003` (200) | yes | The call would exceed a run limit of the token. |
+| `capability_denied` |  | `-32003` (200) | yes | The token's capabilities do not permit the call. |
+| `chain_mismatch` | 400 |  |  | The chain in the body is not the bearer token's chain. |
+| `chain_not_issued` | 403 |  |  | A PEP's unsigned body chain was not issued by this server. |
+| `chain_too_deep` | 400 `invalid_scope` |  |  | An exchange's chain would be deeper than `[issuer] max_depth`. |
+| `charge_pruned` | 410 |  |  | The budget charge of the decision was pruned. |
+| `check_unavailable` | 409 |  |  | The policy check cannot run in this configuration. |
+| `client_assertion_audience_mismatch` | 401 `invalid_client` |  |  | The client assertion's `aud` is not exactly this server's issuer identifier (`[issuer] issuer`). |
+| `client_assertion_expired` | 401 `invalid_client` |  |  | The client assertion has expired. |
+| `client_assertion_lifetime_too_long` | 401 `invalid_client` |  |  | The client assertion's `exp` is further ahead than `[token] client_assertion_max_lifetime_seconds`. |
+| `client_assertion_malformed` | 401 `invalid_client` |  |  | The client assertion is not a well-formed JWT, or its `typ` names another kind of token. |
+| `client_assertion_missing_claim` | 401 `invalid_client` |  |  | The client assertion lacks `exp` or `jti`. |
+| `client_assertion_not_yet_valid` | 401 `invalid_client` |  |  | The client assertion's `nbf` or `iat` is in the future. |
+| `client_assertion_replayed` | 401 `invalid_client` |  |  | The client assertion (its `jti`) was already used. |
+| `client_assertion_subject_mismatch` | 401 `invalid_client` |  |  | The client assertion's `iss` and `sub` are not both the client id, or differ from the request's client id. |
+| `client_assertion_type_unsupported` | 400 `invalid_request` |  |  | `client_assertion_type` is not `urn:ietf:params:oauth:client-assertion-type:jwt-bearer`. |
+| `client_assertion_unsupported_alg` | 401 `invalid_client` |  |  | The client assertion's `alg` is not one the server accepts (RS256, ES256, EdDSA). |
+| `client_auth_missing` | 401 `invalid_client` |  |  | No client credentials were sent. |
+| `client_auth_not_accepted` | 400 `invalid_request` |  |  | `[token] actor_auth` does not accept client credentials. |
+| `client_authentication_failed` | 401 `invalid_client` |  |  | The client id or secret is wrong, the client has no credential of the kind sent, or a client assertion is not signed by one of the client's keys (unknown client, unknown `kid`, a key of another algorithm, a bad signature: one answer). |
+| `client_id_mismatch` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The credential was issued to another client. |
+| `config_unreadable` | 500 `server_error` |  |  | The config file the server was started with cannot be read, so the operators were not reloaded; the cause is in the server log only. |
+| `credential_audience_mismatch` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The ID token was not issued to the presenting agent: its `aud` or `azp` names another client. |
+| `credential_expired` | 400 `invalid_grant` |  |  | The hop-0 credential expires before the token could be issued. |
+| `credential_pop_mismatch` | 400 `invalid_grant` |  |  | The DPoP proof is by another key than the one the ID-JAG is bound to (`cnf.jkt`). |
+| `credential_pop_required` | 400 `invalid_grant` |  |  | The ID-JAG is bound to a key (`cnf`) and the request has no DPoP proof that this server checks. |
+| `credential_type_not_accepted` | 400 `invalid_grant` |  |  | The credential's issuer is an `[[idps]]` entry whose `credentials` does not list this kind (an ID token or an ID-JAG). |
+| `dpop_replay_cache_full` | 503 `temporarily_unavailable` | `-32006` (503) |  | Too many DPoP proofs are in flight; retry later. |
+| `dpop_required` | 401 | `-32001` (401) |  | The token is bound to a key and no DPoP proof was sent. |
+| `duplicate_actor` | 400 `invalid_request` |  |  | The `actor` is already in the chain. |
+| `expired` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The credential has expired. |
+| `ext_authz_ambiguous_body` |  | `-32600` (400) |  | A gateway forwarded a body with a duplicate member, two member names that differ only in case, or a number not written as it is read (`/ext-authz/v1/mcp/{server}`). |
+| `ext_authz_batch_unsupported` |  | `-32600` (400) |  | A gateway forwarded a JSON-RPC batch, which `/ext-authz/v1/mcp/{server}` does not decide. |
+| `ext_authz_body_incomplete` |  | `-32600` (403) |  | A gateway did not send the whole body (`x-envoy-auth-partial-body` is not `false`). |
+| `ext_authz_dpop_url_unset` |  | `-32001` (401) |  | A DPoP proof came through a gateway route whose `[[ext_authz]]` entry has no `dpop_url`. |
+| `ext_authz_unauthenticated` |  | `-32001` (403) |  | A request to `/ext-authz/v1/mcp/{server}` lacks the `[[ext_authz]]` entry's gateway secret. |
+| `id_jag_ceiling_empty` | 400 `invalid_scope` |  |  | An ID-JAG from an issuer with `[idps.id_jag_ceiling]`: its `resource`, `scope` and `authorization_details` claims leave nothing of the root grant (each names only what is unmapped, of an unknown type, or not in the grant). |
+| `input_type_mismatch` |  | `-32003` (200) | yes | A call argument does not have the type the catalog declares. |
+| `invalid_agent` | 400 `invalid_grant` |  |  | The agent id of the token to mint is empty (an exchange's `actor`, or `agent` at `POST /admin/root-token`). |
+| `invalid_capability` | 400 `invalid_grant`, 400 `invalid_scope` |  |  | A requested capability is not one a call can have: a server or tool name that breaks the naming rules, or a malformed limit (sent with `error` `invalid_grant`); or a shorthand that is not `server:tool` (a form `scope` at `POST /token`, `capabilities` at `POST /admin/root-token`; sent with `error` `invalid_scope`). |
+| `invalid_chain` | 400, 400 `invalid_request` |  |  | The chain in the body does not validate (`POST /admin/policies/evaluate`, or a PEP's unsigned chain at AuthZEN, sent with `error` `invalid_request`). |
+| `invalid_client` | 401 |  |  | Client authentication failed. |
+| `invalid_cursor` | 400 |  |  | The paging cursor (or an AuthZEN search's `page.token`) is malformed or belongs to another list, order or query. |
+| `invalid_dpop_proof` | 401 | `-32001` (401) |  | The DPoP proof does not verify, is replayed, or is for another key, method or URL. |
+| `invalid_grant` | 400 |  |  | The grant (subject token, lease, credential) is not valid. |
+| `invalid_host` | 400 |  |  | The `Host` header is not a loopback name and `[server] public_url` is unset. |
+| `invalid_name` |  | `-32003` (200) | yes | The call's server or tool name breaks the naming rules. |
+| `invalid_page` | 400 `invalid_request` |  |  | An AuthZEN search's `page` is not an object, its `token` not a string, or its `limit` not an integer of at least 1. |
+| `invalid_params` |  | `-32602` (200) |  | The JSON-RPC params of a decided method are not valid. |
+| `invalid_request` | 400 | `-32600` (400) |  | The request is malformed: a missing or invalid parameter or body. |
+| `invalid_scope` | 400 |  |  | A subject token whose own chain widens a hop or is deeper than `[issuer] max_depth`; a request that asks for more is `scope_exceeds_parent`, `chain_too_deep` or `scope_exceeds_grant`. |
+| `invalid_search_resource` | 400 `invalid_request` |  |  | An AuthZEN action search's `resource` names no MCP server (`resource.properties.server`, or a `resource.id` without `/`). |
+| `invalid_subject` | 400 `invalid_grant` |  |  | The user subject of the root token to mint is empty. |
+| `invalid_token` | 401 `unauthorized`, 400 | `-32001` (401) |  | The token is malformed, not issued here, or does not verify. |
+| `jwks_unavailable` | 503 `temporarily_unavailable`, 401 `invalid_token` |  |  | The issuer's keys cannot be fetched; retry later. |
+| `label_error` |  | `-32003` (200) | yes | The call's result could not be recorded, so it is withheld. |
+| `lease_error` |  | `-32001` (401), `-32003` (200) | yes | The lease store could not be read (fail closed). |
+| `lease_expired` | 400 `invalid_grant` | `-32001` (401), `-32001` (200), `-32003` (200) | yes | A lease of the chain has expired (at `POST /token` and `POST /token/renew`, an ancestor lease of the token). |
+| `lease_revoked` | 409, 400 `invalid_grant` | `-32001` (401), `-32001` (200), `-32003` (200) | yes | A lease of the chain (at `POST /token` and `POST /token/renew`, the token's own lease or an ancestor's), or the one an approval is bound to, has been revoked. |
+| `lease_unknown` | 400 `invalid_grant` | `-32001` (401), `-32001` (200), `-32003` (200) | yes | A lease of the chain is unknown to the lease store (fail closed); at `POST /token` and `POST /token/renew`, the token's own lease or an ancestor's. |
+| `limit_arg_invalid` |  | `-32003` (200) | yes | The call lacks an argument a run limit counts, or has a value it cannot count. |
+| `limit_conflict_at_root` | 400 `invalid_scope` |  |  | The hop-0 request (an IdP credential at `POST /token`, or `POST /admin/root-token` when `[[root_grants]]` is set) has a capability under one or more limited capabilities of the root grant or of the ID-JAG's claims (each covers its calls), and their limits, or its own and theirs, set one kind of limit on different arguments, which one capability cannot carry together; ask for a capability fewer of them cover. A conflict with the request's own limit is `scope_exceeds_grant` (or `scope_exceeds_id_jag`) instead when attenuation clamps the capability to the limited capability it conflicts with (SR-132). |
+| `limit_split_at_root` | 400 `invalid_scope` |  |  | The hop-0 request (an IdP credential at `POST /token`, or `POST /admin/root-token` when `[[root_grants]]` is set) has two capabilities under the same limited capability of the root grant or of the ID-JAG's claims (it covers the calls of both, whether or not it is the one each takes its limits from); ask for one capability with a `one_of` or wider constraint instead. |
+| `malformed_client_auth` | 401 `invalid_client` |  |  | The HTTP Basic credentials are malformed. |
+| `malformed_request` | 400 `invalid_request` |  |  | The token request is missing a field or has an invalid one (at `POST /token`, also a body that is not JSON or a well-formed form). |
+| `malformed_token` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The credential is not a well-formed JWT. |
+| `may_act_exceeds_grant` | 400 `invalid_request` |  |  | `may_act` names agents the grant does not allow. |
+| `missing_claim` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The credential lacks a required claim. |
+| `missing_kid` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The credential names no `kid`. |
+| `missing_token` | 401 `unauthorized` | `-32001` (401) |  | No credential was sent. |
+| `multiple_client_auth` | 400 `invalid_request` |  |  | Client credentials were sent in more than one way (HTTP Basic and the body, or a secret and a client assertion). |
+| `no_agents_configured` | 401 `invalid_client` |  |  | No `[[agents]]` are configured, so no agent can authenticate. |
+| `no_capabilities_requested` | 400 `invalid_request` |  |  | The token request (`POST /token`, `POST /admin/root-token`) asks for no capability. |
+| `no_lifetime_left` | 400 `invalid_request` |  |  | The new token would expire immediately. |
+| `no_peps_configured` | 401 `invalid_client` |  |  | No `[[peps]]` are configured, so no PEP can authenticate. |
+| `no_root_grant` | 403, 400 `invalid_scope` |  |  | No `[[root_grants]]` entry covers the agent and user. |
+| `not_found` | 404 |  |  | The resource does not exist, or is not visible to the caller. |
+| `not_yet_valid` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The credential is not valid yet. |
+| `one_of_too_long` | 400 `invalid_scope` |  |  | A requested capability (an exchange, a hop-0 request, `POST /admin/root-token`) has a `one_of` constraint with more than 1,024 values. |
+| `operators_invalid` | 422 |  |  | The reloaded `[[admin.operators]]` list is not TOML or breaks a startup rule; the operators in force are unchanged. |
+| `operators_no_admin` | 422 |  |  | The reloaded `[[admin.operators]]` list would leave no unexpired credential with role `admin`; the operators in force are unchanged. |
+| `overloaded` | 503 `temporarily_unavailable` | `-32006` (503) |  | `[limits] max_in_flight` requests are already running; retry after `Retry-After`. |
+| `parse_error` |  | `-32700` (400) |  | The body is not JSON. |
+| `policy_deny` |  | `-32003` (200) | yes | The Cedar policy denies the call. |
+| `policy_error` |  | `-32003` (200) | yes | The call could not be evaluated safely (fail closed). |
+| `policy_invalid` | 422 |  |  | The policy set does not parse or validate. |
+| `rate_limited` | 429 | `-32007` (429) |  | A rate limit is used up; retry after `Retry-After`. |
+| `reload_unavailable` | 409 |  |  | The policy, or the admin operators, cannot be reloaded in this configuration (no policy file; a server not started from a config file). |
+| `replay_cache_full` | 503 `temporarily_unavailable` |  |  | Too many single-use credentials are in flight; retry later. |
+| `replay_store_unavailable` | 503 `temporarily_unavailable` |  |  | The use of a single-use credential could not be recorded, so it is refused (fail closed); retry later. |
+| `replayed` | 400 `invalid_grant` |  |  | The credential or delegation was already used. |
+| `request_timeout` | 408, 503 `temporarily_unavailable` |  |  | The body did not arrive in time (408), or the route did not answer in time (503). |
+| `request_too_large` | 413 | `-32600` (413) |  | The request body is over the size limit. |
+| `reserved_agent` | 400 `invalid_request` |  |  | The `actor` is the reserved agent `attenuo`. |
+| `reserved_subject` | 400 `invalid_request`, 400 `invalid_grant` |  |  | The subject is reserved. |
+| `scope_exceeds_grant` | 400 `invalid_scope` |  |  | The hop-0 request (an IdP credential at `POST /token`, or `POST /admin/root-token`) asks for more than the root grant allows. |
+| `scope_exceeds_id_jag` | 400 `invalid_scope` |  |  | An ID-JAG from an issuer with `[idps.id_jag_ceiling]`: the request is within the root grant but asks for more than the ID-JAG's own claims allow. |
+| `scope_exceeds_parent` | 400 `invalid_scope` |  |  | An exchange asks for more than the subject token holds. |
+| `server_error` | 500 |  |  | An internal error; the cause is in the server log only. |
+| `session_mismatch` |  | `-32003` (403) |  | The `Mcp-Session-Id` belongs to another principal. |
+| `session_registry_full` |  | `-32006` (503) |  | No free session slot (`[proxy] max_sessions`). |
+| `session_unknown` |  | `-32600` (404) |  | The `Mcp-Session-Id` is not bound; start a new session. |
+| `tenant_mismatch` | 400 `invalid_grant` |  |  | The ID-JAG's `tenant` is not the `[[idps]] tenant` of its issuer. |
+| `token_expired` | 401 `unauthorized`, 400 `invalid_grant` | `-32001` (401), `-32001` (200) |  | The token verified but has expired (a bearer, or at `POST /token` the subject token or a hop of its chain). |
+| `too_many_capabilities` | 400 `invalid_scope` |  |  | A request (an exchange, a hop-0 request, `POST /admin/root-token`) asks for more than 1,024 capabilities, more than one token may hold. |
+| `too_many_constraints` | 400 `invalid_scope` |  |  | A request (an exchange, a hop-0 request, `POST /admin/root-token`) has more than 1,024 argument constraints over all its capabilities. |
+| `too_many_one_of_values` | 400 `invalid_scope` |  |  | A request (an exchange, a hop-0 request, `POST /admin/root-token`) has more than 1,024 `one_of` values over all its capabilities. |
+| `too_many_pending_approvals` | 429 |  |  | The run already has the maximum number of pending approvals. |
+| `too_many_sessions` |  | `-32007` (429) |  | The principal holds `[proxy] max_sessions_per_principal` live sessions. |
+| `tool_not_in_catalog` |  | `-32003` (200) | yes | The tool is not in the catalog and unknown tools are denied. |
+| `tool_not_listed` |  | `-32003` (200) | yes | The upstream never listed the tool and the catalog does not know it. |
+| `ttl_out_of_range` | 400 `invalid_grant` |  |  | The requested lifetime gives no representable expiry (`POST /admin/root-token`; an exchange clamps it to the parent's instead). |
+| `typ_mismatch` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The credential's `typ` header does not match its kind. |
+| `unknown_kid` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The credential's `kid` is not in its issuer's keys. |
+| `unknown_server` |  | `-32004` (404) |  | No `[[upstreams]]` entry has this name. |
+| `unsupported_alg` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The credential's signing algorithm is not accepted. |
+| `unsupported_grant_type` | 400 |  |  | The `grant_type` is not supported. |
+| `unsupported_media_type` | 415 |  |  | The console listener requires `Content-Type: application/json`. |
+| `unsupported_token_type` | 400 `invalid_request` |  |  | The `subject_token_type` is not supported (neither the JWT URN of an exchange nor a hop-0 credential type). |
+| `untrusted_issuer` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The credential's issuer is not an `[[idps]]` entry. |
+| `upstream_body_too_large` |  | `-32005` (502) |  | An upstream body the proxy buffers is over `[proxy] max_upstream_body_bytes`. |
+| `upstream_invalid_response` |  | `-32005` (502) |  | The upstream's answer is not one the proxy can filter or label. |
+| `upstream_not_event_stream` |  | `-32005` (502) |  | The upstream answered a `GET` with something other than an event stream. |
+| `upstream_stream_end_shape` |  | `-32005` (200) |  | The upstream sent an error in the shape of the proxy's stream end; the original is in `data.upstream_error`. |
+| `upstream_timeout` |  | `-32005` (504) |  | The upstream did not answer in time; it may have acted on the request. |
+| `upstream_unreachable` |  | `-32005` (502) |  | The upstream could not be reached; nothing was sent. |
+| `use_dpop_nonce` | 401 | `-32001` (401) |  | The DPoP proof lacks the current server nonce; retry with `DPoP-Nonce`. |
+| `wrong_user` | 403 |  |  | The ID token is another user's. |
+<!-- error-codes:end -->
+
+## Paging
+
+Every route that returns a list a client may need to read past one answer pages the same way: `GET /admin/audit`, `GET /admin/audit/checkpoints` and `GET /admin/approvals`.
+
+- **Request.** `limit` is the page size; `cursor` is the `next_cursor` of the previous page, sent back unchanged with the same filters (and `order`, where there is one). Leave `cursor` out for the first page.
+- **Answer.** The items (`entries`, `checkpoints` or `approvals`) and `next_cursor`: a string for the next page, or `null` when there is nothing after this one. A page can hold fewer than `limit` items, even none, while `next_cursor` is set (a filtered audit page reads a bounded range of the log): keep following it until it is `null`.
+- **Limits.** Each route documents its default and maximum `limit`. A `limit` of 0 or above the maximum is 400 `invalid_request`; it is not clamped.
+- **Cursors are opaque.** Do not build or parse one; its encoding may change. A cursor that is malformed, was issued by another list route or for the other `order`, or comes from another format version is 400 `invalid_cursor`, with a `detail` that says which and never repeats the cursor. A cursor does not expire: it holds a position, not a server-side session, and still works after the item it points past has been removed.
+- **Stable under writes.** The cursor holds a keyset position (an audit or checkpoint `seq`, or the approval's position in the store), never an offset. An approval's position is above that of every approval created before it and is never given again, also after approvals are removed or pruned, so a new approval never sorts below a cursor a client holds. Items appended or created while a client pages do not shift the items it has not read yet, so every item that existed when paging started is returned exactly once. Newest-first lists show new items only on a fresh first page; the oldest-first audit list returns entries appended before it reaches the head, once each.
+
+The cursor is the unpadded base64url form of 11 bytes: a format version, the list it belongs to, the direction it pages in, and the position. It carries no subject, filter value or query, and it has no integrity tag: every list route is an admin route whose caller may read the whole list anyway, so a forged cursor could only start a page at another position the caller could reach by paging. What the server checks is that the cursor is well-formed and belongs to this route and order.
+
+Action search (`POST /access/v1/search/action`) pages with AuthZEN's `page.token` / `page.next_token` instead, a longer token of the same format version: the 11 bytes, whose position is an offset into the candidate tools, followed by truncated SHA-256 digests of the delegation chain, the MCP server and the canonical `context` the token was issued for. Send it back with the same `subject`, `resource` and `context`; `page.limit` may change. A token sent with another chain, server or `context` is 400 `invalid_cursor`, and `detail` says which differs. The digests hold no request data and are no integrity tag either: the server recomputes them from the request it is sent with, so they only tie a token to its query ([AuthZEN action search](authzen.md#action-search)).
+
+Two routes are not paged this way. `GET /admin/audit/export` streams a whole range (`from`, `to`) in one answer, because the export's header, hash chain and checkpoints are verified as one file; cut it into ranges instead. `GET /admin/leases/{lease_id}/tree` returns a bounded snapshot of one lease tree (`max_nodes`, `truncated`) next to a count of the whole subtree; a breadth-first walk has no stable key to resume from, and the revoke it previews acts on the whole tree anyway.
 
 ## DPoP (sender-constrained tokens)
 
 Optional, RFC 9449. See [Binding tokens to keys](../guides/binding-tokens-to-keys.md) and [RFC-0001 section 4.1](../spec/rfc-0001-attenuo.md#41-sender-constrained-tokens-dpop).
 
 - **Binding.** A `DPoP` header (one proof by an Ed25519 or P-256 key, for this method and URL) on `POST /token` or `POST /admin/root-token` binds the new token to the key: its `cnf.jkt` is the key's thumbprint and the response says `"token_type": "DPoP"`. A child of a bound token is always bound. To bind it to a key other than the parent's, the body adds `subject_token_dpop`, the sign-off: a proof by the parent's key with `ath` of `subject_token`, `child_jkt` (the new key's thumbprint) and `child_actor` (the `actor`). See [Binding tokens to keys](../guides/binding-tokens-to-keys.md).
-- **Use.** A bound token is accepted only with a `DPoP` proof by its key that carries `ath`, on every route that takes a token: `/mcp/{server}`, `/token/renew`, `/access/v1/evaluation(s)` and `/token` (as `subject_token`). Send `Authorization: DPoP <token>`; `Bearer` is also accepted.
+- **Use.** A bound token is accepted only with a `DPoP` proof by its key that carries `ath`, on every route that takes a token: `/mcp/{server}`, `/token/renew`, `/access/v1/evaluation(s)`, `/access/v1/search/action` and `/token` (as `subject_token`). Send `Authorization: DPoP <token>`; `Bearer` is also accepted.
 - **Nonces.** With `[token] dpop_nonce = "required"`, every response to a request with a `DPoP` header, and every `WWW-Authenticate: DPoP` challenge, carries `DPoP-Nonce: <nonce>`. A `DPoP` header proof must carry the latest one in its `nonce` claim; the exchange sign-off needs none.
 - **Errors.** 401 `dpop_required` (no proof where one is needed), `invalid_dpop_proof` (wrong key, method, URL or `ath`, `iat` outside `[token] dpop_max_age_seconds`, replayed `jti`, bad signature, several `DPoP` headers) or `use_dpop_nonce` (a valid proof without a current server nonce; retry with the response's `DPoP-Nonce`), with `WWW-Authenticate: DPoP error="…", algs="EdDSA ES256"`. The proxy uses JSON-RPC `-32001` with the same `data.reason`. A full replay cache is 503 `temporarily_unavailable` with `error_description` `dpop_replay_cache_full`.
 - `htu` is `[server] public_url` plus the path, or `http://<Host>` plus the path when `public_url` is unset. The query is not compared.
+
+Every route of the main listener is subject to [`[limits]`](config.md#limits): a request that finds `max_in_flight` requests already running is `503` `temporarily_unavailable` with `error_description` `overloaded` and `Retry-After: 1` (never `/healthz` or `/readyz`); a body that does not arrive within `request_body_timeout_seconds` is `408` `request_timeout`; a route other than `/mcp/{server}` and `/admin/*` that does not answer within `request_timeout_seconds` is `503` with `error_description` `request_timeout` and `Retry-After: 1`. With the rate limits on, `POST /token` over `token_requests_per_minute` (per agent) or `token_unauthenticated_requests_per_minute` (per peer address), and `POST /access/v1/search/action` over `authzen_search_requests_per_minute` (per run, the chain's root lease, also for a PEP's unsigned chain), are `429` `rate_limited` with `Retry-After`; AuthZEN evaluation and batch evaluation are not rate limited (each decision is audited). When the per-peer table is full, a request from an address not in it that carries client credentials is authenticated first: an agent that authenticates is served, and anything else gets the same `429` (see [`[limits]`](config.md#limits)). Headers that take longer than `header_read_timeout_seconds` to arrive get the connection closed. The SDKs raise the `503` as Python `Unavailable` / TypeScript `UnavailableError` and the `429` as `RateLimited` / `RateLimitedError`, with `reason` and the `Retry-After` seconds, never as a denial; the `408` stays a plain `ApiError`. They retry `overloaded` and `rate_limited` only when the client is built with `max_retries` / `maxRetries`, never `request_timeout`.
+
+## Client authentication
+
+An agent (on `POST /token`) or a PEP (on the AuthZEN endpoints) proves who it is in one of two ways, decided by what its `[[agents]]` or `[[peps]]` entry holds ([config](config.md#agents)):
+
+- **Client secret.** `client_id` / `client_secret` in the body (`pep_id` / `pep_secret` for a PEP), or HTTP Basic. The entry holds `secret_sha256`.
+- **Client assertion** (`private_key_jwt`, RFC 7523 §2.2). The body carries `client_assertion_type` = `urn:ietf:params:oauth:client-assertion-type:jwt-bearer` and `client_assertion`, a JWT the client signs with a private key whose public half is in the entry's `jwks`. `client_id` (or `pep_id`) may be sent too and must then equal the assertion's `sub`. The CLI makes one with `attenuo token exchange --client-key`, the SDKs with `DpopKey.client_assertion` / `clientAssertion`.
+
+A request uses one way only: Basic and a body credential, or a secret and an assertion, is 400 `invalid_request` / `multiple_client_auth` (RFC 6749 §2.3). Sending only one of the two assertion fields is `malformed_request`; another `client_assertion_type` is 400 `client_assertion_type_unsupported`.
+
+A request with no credential at all (no secret, no assertion, and at `POST /token` no `actor_token`) is 401 `invalid_client` (RFC 6749 §5.2), with `WWW-Authenticate: Basic realm="attenuo"`: `client_auth_missing`, or `actor_token_required` when `[token] actor_auth = "actor_token"`. Both are decided before any agent or PEP is looked up, so the answer is the same for a known and an unknown client id or `actor` (SR-110).
+
+An assertion is accepted when all of this holds, checked in this order:
+
+| Check | Refusal (`error_description`) |
+| --- | --- |
+| a compact JWS whose `typ`, if present, is not that of another token kind (`attenuo+jwt`, `at+jwt`, `dpop+jwt`, `oauth-id-jag+jwt`) | `client_assertion_malformed` |
+| `iss` and `sub` are both the client id (and equal `client_id` when it is sent) | `client_assertion_subject_mismatch` |
+| `alg` is RS256, ES256 or EdDSA, and `kid`, if present, is a string | `client_assertion_unsupported_alg`, `client_assertion_malformed` |
+| the client exists and has `jwks`; `kid` names one of its keys (it may be left out only when the entry has one key); that key is for `alg`; and the signature verifies with it | `client_authentication_failed` |
+| `aud` is `[issuer] issuer`: that string, or an array holding only it | `client_assertion_audience_mismatch` |
+| `exp` and `jti` are present, `jti` at most 256 bytes | `client_assertion_missing_claim` |
+| `exp` has not passed and is at most `[token] client_assertion_max_lifetime_seconds` ahead; `nbf` and `iat`, if present, are not in the future; all with `[token] client_assertion_clock_skew_seconds` of leeway | `client_assertion_expired`, `client_assertion_lifetime_too_long`, `client_assertion_not_yet_valid` |
+| the `jti` has not been used by this client before | `client_assertion_replayed` |
+
+All of them are 401 `invalid_client` with `WWW-Authenticate: Basic realm="attenuo"`, as a wrong secret is. The answer never echoes the assertion. Until the signature has verified, a caller holding none of the client's keys learns nothing about the entry: an unknown client id, an entry without `jwks`, an unknown `kid`, a key of another algorithm and a bad signature are one answer, `client_authentication_failed` with the same `detail`, as an unknown id or a wrong secret is on the secret path (SR-110). The specific reason is in the server's log at debug level (`client assertion refused`, `reason` = `unknown_client`, `client_without_keys`, `unknown_kid`, `key_alg_mismatch` or `bad_signature`). The checks after the signature keep their own codes, because only a holder of the key can reach them and they say what to fix. The checks before the lookup (`typ`, `iss` and `sub`, `alg`, a `kid` that is not a string) do not depend on whether the client exists. The `aud` rule is strict on purpose: the token endpoint URL is not accepted, so an assertion made for one server cannot be replayed at another that shares a URL prefix or proxy (the audience-injection concern behind RFC 7523bis). The `jti` is recorded in the replay store (`used_credentials`, the store DPoP proofs and actor tokens use) until `exp` plus the skew, so it stays spent across a restart; it is spent when the client authenticates, even if the request is then refused for another reason, so send a fresh assertion with every request. Two refusals come before that and leave the assertion unspent, because the client is told to send the same request again: `429` `rate_limited` from `[limits] token_requests_per_minute`, and a `DPoP` header proof that is refused (`use_dpop_nonce` under `[token] dpop_nonce = "required"`, or `invalid_dpop_proof`). A full or unavailable replay store is 503, as for DPoP.
+
+The method shows in the server log and in the audit record's arguments: `agent_auth` at hop 0 and `actor_auth` at later hops are `client_secret`, `private_key_jwt`, `actor_token`, or `actor_token+client_secret` / `actor_token+private_key_jwt` with `[token] actor_auth = "either"` (and `none` for an unauthenticated later hop when `[token] require_actor_auth = false`).
 
 ## Public
 
 | Method and path | Auth | Purpose |
 | --- | --- | --- |
 | `GET /healthz` | none | Liveness. Never touches storage. |
-| `GET /readyz` | none | Readiness. Checks the audit store and the lease store. 200 `{"ready":true,"checks":{"audit":"ok","leases":"ok"}}` or 503 with `"error"` for the failing check and no error text. With `[audit.sink]` the body also has `"degraded"` and `checks.checkpoint_sink` (`"ok"` or `"degraded"`); a degraded sink is a 503 only with `fail_readiness = true`. With `[approvals.notify]` it also has `checks.approval_notifier` (`"ok"` or `"degraded"`), which sets `"degraded"` but never makes the answer a 503. |
+| `GET /readyz` | none | Readiness. Checks the audit store and the lease store, and whether the last audit append failed. 200 `{"ready":true,"checks":{"audit":"ok","audit_append":"ok","leases":"ok"}}` or 503 with `"error"` for the failing check and no error text. `checks.audit_append` is `"error"` from a failed audit append (a full disk, for example, while reads still work) until the next append succeeds, or for at most 30 s when no append is made after it; no probe is written. With `[audit.sink]` the body also has `"degraded"` and `checks.checkpoint_sink` (`"ok"` or `"degraded"`); a degraded sink is a 503 only with `fail_readiness = true`. With `[approvals.notify]` it also has `checks.approval_notifier` (`"ok"` or `"degraded"`), which sets `"degraded"` but never makes the answer a 503. |
 | `GET /.well-known/jwks.json` | none | Public keys for token verification, including retired keys. |
-| `GET /.well-known/authzen-configuration` | none | AuthZEN discovery (AuthZEN 1.0 section 9): `policy_decision_point`, `access_evaluation_endpoint` and `access_evaluations_endpoint`, and nothing else; no search endpoints, which are not served. Public metadata: no credential is needed and an `Authorization` header is ignored ([why](authzen.md#discovery)). The URLs are built from `[server] public_url`. Without it (loopback only) from `Host`, which must be `localhost`, `127.0.0.1` or `[::1]`; anything else is 400 `invalid_host`. |
+| `GET /.well-known/authzen-configuration` | none | AuthZEN discovery (AuthZEN 1.0 section 9): `policy_decision_point`, `access_evaluation_endpoint`, `access_evaluations_endpoint` and `search_action_endpoint`, and nothing else; no subject or resource search endpoints, which are not served, and no `capabilities` or `signed_metadata` ([why](authzen.md#discovery)). Public metadata: no credential is needed and an `Authorization` header is ignored ([why](authzen.md#discovery)). The URLs are built from `[server] public_url`. Without it (loopback only) from `Host`, which must be `localhost`, `127.0.0.1` or `[::1]`; anything else is 400 `invalid_host`. |
 
 ## Token
 
 | Method and path | Auth | Purpose |
 | --- | --- | --- |
-| `POST /token` | agent client credentials at hop 0; at later hops the parent token, plus the actor's client credentials or an `actor_token` | RFC 8693 token exchange, as a form or JSON. Hop 0 takes an OIDC ID token or an ID-JAG. Later hops take a parent delegation token and `authorization_details`. Optional `may_act` (agent ids) sets who may exchange the new token next. A `DPoP` header binds the new token to a key (`token_type` `DPoP`); `subject_token_dpop` is the parent key's sign-off, naming the new key and `actor`, when the parent is bound to another key. |
+| `POST /token` | agent client credentials (a secret or a [client assertion](#client-authentication)) at hop 0; at later hops the parent token, plus the actor's client credentials or an `actor_token` | RFC 8693 token exchange, as a form or JSON. Hop 0 takes an OIDC ID token or an ID-JAG. Later hops take a parent delegation token and `authorization_details`. Optional `may_act` (agent ids) sets who may exchange the new token next. A `DPoP` header binds the new token to a key (`token_type` `DPoP`); `subject_token_dpop` is the parent key's sign-off, naming the new key and `actor`, when the parent is bound to another key. |
 | `POST /token/renew` | bearer delegation token (and a DPoP proof if it is bound) | Extend the lease of the token's last hop. Returns `{lease, expires_at, expires_in}`. A refusal of a token that verified is audited (below). |
 
-A capability may carry run `limits` (`calls`, `sum: {arg, max}`, `calls_per: {arg, max}`, `distinct: {arg, max}`; [run limits](../design/server.md#run-limits)). `distinct` allows at most `max` different values of `arg`. `calls_per` and `distinct` may add `"derive": "host"` to count the host of a URL argument instead of the whole value (`{"arg": "url", "derive": "host", "max": 2}`). A value with no scheme is a bare host and is read as `http://` followed by the value, so `www.example.com/x` counts host `www.example.com` and `localhost:8080` counts `localhost`. A child must keep every limit of the parent capability that covers it, on the same argument and derivation, at most as large (`calls: m` also satisfies a parent's `calls_per` or `distinct` with `max >= m`); one it leaves out or asks larger is filled in or lowered (a `sum`, `calls_per` or `distinct` over another argument or derivation is refused as not covered), and its `calls` and `sum` are lowered further to what the parent hop has left. An unknown limit kind or derivation, or `derive` on a `sum`, is 400 `invalid_request`.
+A capability may carry run `limits` (`calls`, `sum: {arg, max}`, `calls_per: {arg, max}`, `distinct: {arg, max}`; [run limits](../design/server.md#run-limits)). `distinct` allows at most `max` different values of `arg`. `calls_per` and `distinct` may add `"derive": "host"` to count the host of a URL argument instead of the whole value (`{"arg": "url", "derive": "host", "max": 2}`). A value with no scheme is a bare host and is read as `http://` followed by the value, so `www.example.com/x` counts host `www.example.com` and `localhost:8080` counts `localhost`. A child must keep every limit of the parent capability that covers it, on the same argument and derivation, at most as large (`calls: m` also satisfies a parent's `calls_per` or `distinct` with `max >= m`); one it leaves out or asks larger is filled in or lowered (a `sum`, `calls_per` or `distinct` over another argument or derivation is refused as not covered), and its `calls` and `sum` are lowered further to what the parent hop has left. An unknown limit kind or derivation does not parse: 400 `invalid_request` (at `POST /token`, with `code` `malformed_request`). A limit that parses but is malformed (`derive` on a `sum`, an empty `arg`, a `max` over the cap) is 400 `invalid_grant` with `code` `invalid_capability`.
 
-A later-hop request authenticates its `actor` with `client_id` / `client_secret` (or HTTP Basic), or with `actor_token` and `actor_token_type` = `urn:ietf:params:oauth:token-type:jwt` (RFC 8693 §2.1): a workload-identity JWT, such as a SPIFFE JWT-SVID, from an `[[actor_trust]]` issuer. `[token] actor_auth` decides which are accepted. An actor token works for one exchange, and the child expires no later than it does. If the parent token carries `may_act`, the `actor` must be listed (`actor_not_permitted` otherwise). `may_act` on the request sets the new token's own list: absent means any authenticated agent may exchange the new token (it does not inherit the parent's list), and `[]` means none may.
+A later-hop request authenticates its `actor` with `client_id` / `client_secret` (or HTTP Basic), with a client assertion (`client_assertion_type` and `client_assertion`, [above](#client-authentication)), or with `actor_token` and `actor_token_type` = `urn:ietf:params:oauth:token-type:jwt` (RFC 8693 §2.1): a workload-identity JWT, such as a SPIFFE JWT-SVID, from an `[[actor_trust]]` issuer. `[token] actor_auth` decides which are accepted: `"secret"` means client credentials, a secret or an assertion according to what the agent's entry holds. An actor token works for one exchange, and the child expires no later than it does. If the parent token carries `may_act`, the `actor` must be listed (`actor_not_permitted` otherwise). `may_act` on the request sets the new token's own list: absent means any authenticated agent may exchange the new token (it does not inherit the parent's list), and `[]` means none may.
 
 **Refused exchanges are audited.** When the subject token verified (signature, issuer, audience, expiry, chain) and so did its DPoP proof, a refusal the request caused is a `deny` record against the parent's chain: server `attenuo`, tool `token.exchange`, kind `decision`, the parent's subject, agents, leases and `chain_id`. The 400 carries the record id in `X-Attenuo-Decision-Id` and as `decision_id` in the body:
 
 ```json
-{"error": "invalid_scope", "detail": "delegation chain is invalid: ...", "decision_id": "10ce6d75-b2e0-4aa7-a563-7b2fc5a8b223"}
+{"error": "invalid_scope", "code": "scope_exceeds_parent", "detail": "delegation chain is invalid: ...", "decision_id": "10ce6d75-b2e0-4aa7-a563-7b2fc5a8b223"}
 ```
 
-| Refusal | `error` / `error_description` | Audit `reason` |
-| --- | --- | --- |
-| asks for more than the parent holds | `invalid_scope` | `exchange_widening` |
-| chain deeper than `[issuer] max_depth` | `invalid_scope` | `exchange_too_deep` |
-| actor not in the parent's `may_act` | `invalid_request` / `actor_not_permitted` | `exchange_actor_not_permitted` |
-| authenticated agent or actor token is not `actor` | `invalid_request` / `actor_mismatch` | `exchange_actor_mismatch` |
-| `actor` already in the chain | `invalid_request` / `duplicate_actor` | `exchange_duplicate_actor` |
-| `actor` is `attenuo` | `invalid_request` / `reserved_agent` | `exchange_reserved_agent` |
-| actor token expires now | `invalid_request` / `actor_token_expired`, `no_lifetime_left` | `exchange_no_lifetime_left` |
-| parent already delegated to this actor, or actor token reused | `invalid_grant` / `replayed` | `exchange_replayed` |
-| a requested capability has an invalid name or limit | `invalid_grant` | `exchange_invalid_capability` |
-| parent lease revoked, expired or unknown | `invalid_grant` | `lease_revoked`, `lease_expired`, `lease_unknown` |
+| Refusal | `error` / `error_description` | `code` | Audit `reason` |
+| --- | --- | --- | --- |
+| asks for more than the parent holds | `invalid_scope` | `scope_exceeds_parent` | `exchange_widening` |
+| chain deeper than `[issuer] max_depth` | `invalid_scope` | `chain_too_deep` | `exchange_too_deep` |
+| actor not in the parent's `may_act` | `invalid_request` / `actor_not_permitted` | `actor_not_permitted` | `exchange_actor_not_permitted` |
+| authenticated agent or actor token is not `actor` | `invalid_request` / `actor_mismatch` | `actor_mismatch` | `exchange_actor_mismatch` |
+| `actor` already in the chain | `invalid_request` / `duplicate_actor` | `duplicate_actor` | `exchange_duplicate_actor` |
+| `actor` is `attenuo` | `invalid_request` / `reserved_agent` | `reserved_agent` | `exchange_reserved_agent` |
+| actor token expires now | `invalid_request` / `actor_token_expired`, `no_lifetime_left` | the same | `exchange_no_lifetime_left` |
+| parent already delegated to this actor, or actor token reused | `invalid_grant` / `replayed` | `replayed` | `exchange_replayed` |
+| a requested capability has an invalid name or limit | `invalid_grant` | `invalid_capability` | `exchange_invalid_capability` |
+| the request is over a size bound (1,024 capabilities, argument constraints or `one_of` values in all, 1,024 values in a `one_of`) | `invalid_scope` | `too_many_capabilities`, `too_many_constraints`, `too_many_one_of_values`, `one_of_too_long` | `exchange_invalid_capability` |
+| `actor` is empty (possible only without actor authentication) | `invalid_grant` | `invalid_agent` | `exchange_refused` |
+| parent lease revoked, expired or unknown | `invalid_grant` | `lease_revoked`, `lease_expired`, `lease_unknown` | the same |
 
-Not recorded, a server log line only: a malformed request, failed client or actor-token authentication, a subject token or DPoP proof that does not verify (so an anonymous caller cannot write to the log, SR-18), and server errors. A `requested_ttl_seconds` beyond the parent's expiry is not a refusal: the child is clamped to the parent. A refused exchange uses up nothing: the parent can still delegate once to that actor, an actor token can be presented again, and no run limit is charged; only its DPoP proof (its `jti`) is spent. It is counted in `decisions_total{decision="deny",reason}`.
+A parent whose lease is not live is answered with the lease reason as `code`, and `detail` names it too (`subject token cannot delegate: lease_revoked (...)`); there is no `error_description`. Not recorded, a server log line only: a malformed request, failed client or actor-token authentication, a subject token or DPoP proof that does not verify (so an anonymous caller cannot write to the log, SR-18), and server errors. A subject token that verified but has expired (or a hop of its chain has) is 400 `invalid_grant` with `code` `token_expired`; any other subject token that does not verify is 400 `invalid_grant` with `code` `invalid_grant`. A body that is not JSON or a well-formed form, a repeated form parameter, or a field that is missing or does not parse is 400 `invalid_request` with `code` `malformed_request` and no `error_description` (hop-0 intake sends the same code, and for a field also as `error_description`), and a form `scope` entry that is not `server:tool` is 400 `invalid_scope` with `code` `invalid_capability`. A request with no capability is 400 `invalid_request` with `code` `no_capabilities_requested`, and a `subject_token_type` other than the JWT URN (and not a hop-0 credential type) is 400 `invalid_request` with `code` `unsupported_token_type`. A `requested_ttl_seconds` beyond the parent's expiry is not a refusal: the child is clamped to the parent. A refused exchange uses up nothing: the parent can still delegate once to that actor, an actor token can be presented again, and no run limit is charged; only its DPoP proof (its `jti`) is spent. It is counted in `decisions_total{decision="deny",reason}`.
 
 **Refused renewals are audited.** When the token of a `POST /token/renew` verified (signature, issuer, audience, expiry, chain) and so did its DPoP proof, a refusal is a `deny` record against the token's chain: server `attenuo`, tool `lease.renew` (the tool of a successful renewal, so `audit export --tool lease.renew --decision deny` lists the refused ones), kind `decision`, and the arguments digest of `{lease, ancestor, dpop_bound}`. The 400 carries the id in `X-Attenuo-Decision-Id` and `decision_id`:
 
-| Refusal | `error` | Audit `reason` |
+| Refusal | `error` | `code` and audit `reason` |
 | --- | --- | --- |
 | the token's own lease, or an ancestor's, is revoked | `invalid_grant` | `lease_revoked` |
 | an ancestor lease has expired (stopped renewing) | `invalid_grant` | `lease_expired` |
 | the token's own lease, or an ancestor's, is unknown to the lease store | `invalid_grant` | `lease_unknown` |
+
+```json
+{"error": "invalid_grant", "code": "lease_revoked", "detail": "lease_revoked", "decision_id": "10ce6d75-b2e0-4aa7-a563-7b2fc5a8b223"}
+```
+
+Branch on `code`. `detail` is the bare reason for the token's own lease and `an ancestor lease is not live: <reason>` for an ancestor's; it is text for people and may change.
 
 The token's own lease having lapsed is not a refusal: renewal revives it. Not recorded, a server log line only: a missing token, a token or DPoP proof that does not verify (401, SR-18), and lease store errors (500).
 
@@ -83,12 +348,13 @@ grant_type=urn:ietf:params:oauth:grant-type:token-exchange
 
 ## Decision
 
-Both endpoints echo a request's `X-Request-ID` header on the response, whatever its status (AuthZEN 1.0 section 10.1.3). What of the AuthZEN specification is implemented, extended and left out, with the conformance fixtures that check it: [AuthZEN conformance](authzen.md).
+The three AuthZEN endpoints echo a request's `X-Request-ID` header on the response, whatever its status (AuthZEN 1.0 section 10.1.3). What of the AuthZEN specification is implemented, extended and left out, with the conformance fixtures that check it: [AuthZEN conformance](authzen.md).
 
 | Method and path | Auth | Purpose |
 | --- | --- | --- |
-| `POST /access/v1/evaluation` | bearer token, or a trusted PEP | AuthZEN evaluation. Same pipeline as the proxy, run limits included: an allowed evaluation is charged as a proxied call is, and its answer carries `context.budget` (`limited`, `calls_remaining`, `amount_remaining`, `destination_new`) when a limit matched, `context.charged` when it was charged, `context.limit` on `budget_exhausted`, `context.untrusted_args` (`[{arg, seq, kind}]`, as in the proxy's error data) when an argument matched an untrusted result of the run, and `context.usage` (`{calls, amount, destination_seen}`, plus `user_window` when it is not all zero, as in the proxy's error data) for a destructive tool or one with an `outbound` catalog input; an allowed evaluation is counted in the run's usage, and anything the PEP sends under `context.usage` is ignored. `context.diagnostics` is filled only for callers `[authzen] diagnostics` allows: by default a `[[peps]]` entry, which can authenticate next to a bearer token with `pep_id` and `pep_secret` in the body. |
-| `POST /access/v1/evaluations` | same | AuthZEN batch: top-level `subject`, `action`, `resource`, `context` are defaults and each entry of `evaluations` overrides them. Answers `{"evaluations": [{decision, context}, ...]}`, one per entry, each decided and audited like a single evaluation. At most `[authzen] max_batch` entries (default 64): more is 400 `batch_too_large`. Without `evaluations`, or with an empty one, the request is a single evaluation and is answered with a single `{decision, context}` (AuthZEN 1.0 section 7.1). `options.evaluations_semantic` (AuthZEN 1.0 section 7.1.2.1) is `execute_all` (default: every entry decided and answered), `deny_on_first_deny` (entries decided in order, stopping after the first deny; an entry that fails counts as a deny) or `permit_on_first_permit` (stopping after the first permit). A stopped batch answers only the entries it decided, so `evaluations` is shorter than the request; the entries after the stop are not decided, charged or audited. Any other value is 400 `invalid_request` before anything is decided. |
+| `POST /access/v1/evaluation` | bearer token, or a trusted PEP | AuthZEN evaluation. Same pipeline as the proxy, run limits included: an allowed evaluation is charged as a proxied call is, and its answer carries `context.budget` (`limited`, `calls_remaining`, `amount_remaining`, `destination_new`) when a limit matched, `context.charged` when it was charged, `context.limit` on `budget_exhausted`, `context.untrusted_args` (`[{arg, seq, kind}]`, as in the proxy's error data) when an argument matched an untrusted result of the run, and `context.usage` (`{calls, amount, destination_seen}`, plus `user_window` when it is not all zero, as in the proxy's error data) for a destructive tool or one with an `outbound` catalog input; an allowed evaluation is counted in the run's usage, and anything the PEP sends under `context.usage` is ignored. `context.diagnostics` is filled only for callers `[authzen] diagnostics` allows: by default a `[[peps]]` entry, which can authenticate next to a bearer token with `pep_id` and `pep_secret` in the body, or with a top-level `client_assertion_type` and `client_assertion` ([client authentication](#client-authentication)). |
+| `POST /access/v1/evaluations` | same | AuthZEN batch: top-level `subject`, `action`, `resource`, `context` are defaults and each entry of `evaluations` overrides them. Answers `{"evaluations": [{decision, context}, ...]}`, one per entry, each decided and audited like a single evaluation. At most `[authzen] max_batch` entries (default 64): more is 400 `batch_too_large`. Without `evaluations`, or with an empty one, the request is a single evaluation and is answered with a single `{decision, context}` (AuthZEN 1.0 section 7.1). `options.evaluations_semantic` (AuthZEN 1.0 section 7.1.2.1) is `execute_all` (default: every entry decided and answered), `deny_on_first_deny` (entries decided in order, stopping after the first deny; an entry that fails counts as a deny) or `permit_on_first_permit` (stopping after the first permit). A stopped batch answers only the entries it decided, so `evaluations` is shorter than the request; the entries after the stop are not decided, charged or audited. Any other value is 400 `invalid_request` before anything is decided. A PEP's client assertion goes at the top level and covers the whole batch (its `jti` is spent once per HTTP request); one inside an entry is that entry's `malformed_request`. |
+| `POST /access/v1/search/action` | same | AuthZEN action search (AuthZEN 1.0 section 8): `{subject, resource, context, page}` with no `action`; the resource is the MCP server, named by `resource.properties.server` or by a `resource.id` without `/`. Answers `{"page": {"next_token", "count"}, "results": [{"name": <tool>, "properties": {"server": <server>}}, ...]}`: the `[policy] catalog` tools of that server that the token's capabilities name, in name order, that the pipeline would allow now for this caller and context, each of which `POST /access/v1/evaluation` with the same subject, resource and context decides `true` while the run's state is unchanged. No reasons, policy ids or diagnostics. Nothing is written: no audit record, no charge to run limits or usage, no approval taken or requested, so an approval-gated tool is never a result; `context.approval_token` is 400 `approval_token_not_accepted`. A dead lease gives no results. One page evaluates at most `page.limit` candidates (default and maximum `[authzen] max_batch`; a larger `limit` is clamped, 0 is 400 `invalid_page`), so a page can hold fewer results, even none, while `next_token` is set; `next_token` is `""` after the last page. Send it back as `page.token` with the same `subject`, `resource` and `context` (`page.limit` may change); a token this route did not issue, or issued for another chain, server or `context`, is 400 `invalid_cursor`. A resource that names no server is 400 `invalid_search_resource`. With `[limits] authzen_search_requests_per_minute` set, a run's searches over it in its minute are 429 `rate_limited` with `Retry-After`, counted after authentication and before anything is evaluated; evaluations are not counted. [Why and what is left out](authzen.md#action-search). |
 
 ## MCP proxy
 
@@ -98,9 +364,11 @@ Both endpoints echo a request's `X-Request-ID` header on the response, whatever 
 | `GET /mcp/{server}` | bearer delegation token | The streamable HTTP listen stream, after the lease check; resumable with `Last-Event-ID`. List answers on it are filtered and answers to allowed calls labelled, like `POST` answers. Ended (and recorded as `stream.end`, at most once per chain and reason per 60 s) when the lease is revoked or the token expires. |
 | `DELETE /mcp/{server}` | bearer delegation token | Passthrough session close, after the lease check. |
 
-A denial is a JSON-RPC error with code `-32003`, carrying `reason` and `decision_id`. A call that a policy sends for approval (reason `approval_required`) gets `-32008` instead, with `reason`, `decision_id`, `call_hash` (SHA-256 of the RFC 8785 JSON of `{server, tool, arguments}`), `approval_id` and `expires_at`, and is not forwarded. Once the approval is granted, the identical call from the same hop is allowed once (see [Approvals](#approvals)); or the retry carries the grant's signed approval token in `params._meta["dev.attenuo/approval"]`, which the proxy removes before the upstream and which does not count as an argument (see [Approval tokens](#approval-tokens)). A token that does not verify, is for another call, hop, run or key, or names an approval that is no longer granted gets `-32003` with reason `approval_invalid`. `approval_id` is absent if the server could not open an approval: the store failed, or the run already has 32 approvals pending for hops whose lease is not revoked (AuthZEN diagnostics `too many pending approvals for this run`). When an argument of the call copies a value or span of an untrusted result of the run (output labelling phase 2), the `-32008` data, and a `-32003` policy denial's data, add `untrusted_args: [{arg, seq, kind}]`: the argument, the `seq` of the `tool_result` record it matched (absent for kind `unreadable`) and the kind (`leaf`, `entity`, `kgram`, or `unreadable` when the run's index could not be read or the call's arguments carry more than 8,000 fingerprints in all). A call over a run limit gets `-32003` with reason `budget_exhausted` and `data.limit: {hop, kind, arg, max, used}` (`arg` absent for `calls`, written `url#host` for a derived value; for `distinct`, `used` is how many values the limit has seen); `budget_error` means the counters could not be read or written, and `limit_arg_invalid` that the call lacks an argument a limit counts, or has a value it cannot count (a `sum` needs a non-negative integer, a `"derive": "host"` limit a URL of a special scheme or a bare host with a host and no backslash, whitespace or control character, and a `calls_per` or `distinct` list at most 256 values). No policy or approval passes these. For a call to a tool the catalog marks destructive or gives an `outbound` input, the `-32008` and `-32003` data also carry `usage: {calls, amount, destination_seen}`, the run's usage of the tool before this call as the policy saw it (`context.usage`): allowed calls of this server and tool by every hop of the run, the sum of the catalog's `amount` input over them, and whether the catalog's `destination` value, or a value of an `outbound` input, was seen in one of them. When some loaded policy reads a per-user window (run limits phase 3), `usage` also carries `user_window: {hour: {calls, amount}, day: {calls, amount}}`, the originating user's usage of the tool across all their runs in the current UTC hour and day; it is left out when all its figures are zero, which is also what a kind the server does not keep reads as. The decision record carries the same figures as `usage`, omitted for other tools; its `usage.user_window` names only the kinds the server keeps, each as `{start, calls, amount}` with `start` the window's start in Unix seconds UTC, and is absent when none is kept. If the answer to an allowed call cannot be recorded in the audit log, the agent gets `-32003` with reason `label_error` and the call's `decision_id` instead of the answer. A missing or bad token is HTTP 401 with `-32001` and `data.reason` set to `missing_token`, `invalid_token`, `token_expired`, `dpop_required`, `invalid_dpop_proof`, `use_dpop_nonce` or, for a lease that is no longer live, `lease_revoked`, `lease_expired` or `lease_unknown`. A request refused for its lease without a per-call decision (`initialize`, `tools/list`, `ping`, `resources/unsubscribe`, the other allowlisted methods, notifications, `GET` and `DELETE`) is also a `deny` record with that reason, the token's subject and chain, the proxied server, and `tool` set to the method (`http.POST` for a notification, `http.GET`, `http.DELETE`); its 401 carries the record's id in `X-Attenuo-Decision-Id` and `data.decision_id`. These records are bounded like listen-stream ends: the first refusal per delegation chain, tool and reason in `[proxy] record_window_seconds` (default 60 s) is recorded, and a retry within the window is still a 401 but writes no record, carries the first record's id (both are left out in the moment before a concurrent first record is written) and is counted in `audit_records_suppressed_total`. A refusal whose record could not be written (a failed audit append) names no decision id and opens no window, so the next one is recorded (SR-81). Refused exchanges and renewals, and `tools/call` denials, are recorded every time. A token that does not verify writes no record. An open stream (the `GET` listen stream, or a streamed answer) whose leases stop being live or whose token expires is ended within `[proxy] stream_recheck_seconds`: an SSE stream's last event is a JSON-RPC error with `id: null`, code `-32001`, `data.reason` (`lease_revoked`, `lease_expired`, `lease_unknown`, `token_expired`) and `data.decision_id`, the id of a `deny` record of tool `stream.end` with the session's hash tag. On the `GET` listen stream that record is written for the first such end per delegation chain and reason in `[proxy] record_window_seconds` (default 60 s); later ends in the window carry the same `decision_id` and are counted in `audit_records_suppressed_total` instead of recorded. A stream the client drops or the upstream ends writes no record; `GET` listen streams are counted by how they ended in `proxy_streams_ended_total`. An upstream the proxy cannot reach is HTTP 502 with `-32005` and `data.reason` `upstream_unreachable`; the upstream URL and transport error are only logged. An upstream that answers a `GET` with a success status but not `text/event-stream` is HTTP 502 with `-32005` and `data.reason` `upstream_not_event_stream` (MCP allows only an SSE stream or `405` there); `405` and error answers to a `GET` are relayed. Allowed responses carry `X-Attenuo-Decision-Id`.
+A message that an upstream matching member names without regard to case (Go's `encoding/json`) could read as another message is refused with `-32600` `invalid_request` and never forwarded (SR-133): an object anywhere in it with two member names that differ only in case (`path` and `Path`), or a member of the message or of its `params` that is a JSON-RPC or MCP name in another case (`Method`, `Name`). In a batch only that entry is refused; a notification is dropped. A single argument name in another case (`Path` alone) is valid JSON-RPC and is decided: it is denied with `-32003` `argument_case_mismatch`, and recorded, when it differs only in case from a name the decision reads for the tool (see the [catalog reference](config.md#policycatalogservertool)).
 
-Other refusals of the proxy:
+A denial is a JSON-RPC error with code `-32003`, carrying `reason` and `decision_id`. A call that a policy sends for approval (reason `approval_required`) gets `-32008` instead, with `reason`, `decision_id`, `call_hash` (SHA-256 of the RFC 8785 JSON of `{server, tool, arguments}`), `approval_id` and `expires_at`, and is not forwarded. Once the approval is granted, the identical call from the same hop is allowed once (see [Approvals](#approvals)); or the retry carries the grant's signed approval token in `params._meta["dev.attenuo/approval"]`, which the proxy removes before the upstream and which does not count as an argument (see [Approval tokens](#approval-tokens)). A token that does not verify, is for another call, hop, run or key, or names an approval that is no longer granted gets `-32003` with reason `approval_invalid`. `approval_id` is absent if the server could not open an approval: the store failed, or the run already has 32 approvals pending for hops whose lease is not revoked (AuthZEN diagnostics `too many pending approvals for this run`). When an argument of the call copies a value or span of an untrusted result of the run (output labelling phase 2), the `-32008` data, and the data of every `-32003` denial the decision pipeline reaches once the run's leases are found live (`capability_denied`, `policy_deny`, `tool_not_in_catalog`, `budget_exhausted`, `approval_invalid` and the other decided reasons, `audit_error` included), add `untrusted_args: [{arg, seq, kind}]`: the argument, the `seq` of the `tool_result` record it matched (absent for kind `unreadable`) and the kind (`leaf`, `entity`, `kgram`, or `unreadable` when the run's index could not be read or the call's arguments carry more than 8,000 fingerprints in all). A lease denial (`lease_revoked`, `lease_expired`, `lease_unknown`) never carries it: the arguments are not matched then. Nor do the denials the proxy makes without asking the pipeline: a name it refuses up front (`invalid_name`, `tool_not_listed`), `label_error` and `session_mismatch`. A call over a run limit gets `-32003` with reason `budget_exhausted` and `data.limit: {hop, kind, arg, max, used}` (`arg` absent for `calls`, written `url#host` for a derived value; for `distinct`, `used` is how many values the limit has seen); `budget_error` means the counters could not be read or written, and `limit_arg_invalid` that the call lacks an argument a limit counts, or has a value it cannot count (a `sum` needs a non-negative integer, a `"derive": "host"` limit a URL of a special scheme or a bare host with a host and no backslash, whitespace or control character, and a `calls_per` or `distinct` list at most 256 values). No policy or approval passes these. For a call to a tool the catalog marks destructive or gives an `outbound` input, the `-32008` and `-32003` data also carry `usage: {calls, amount, destination_seen}`, the run's usage of the tool before this call as the policy saw it (`context.usage`): allowed calls of this server and tool by every hop of the run, the sum of the catalog's `amount` input over them, and whether the catalog's `destination` value, or a value of an `outbound` input, was seen in one of them. When some loaded policy reads a per-user window (run limits phase 3), `usage` also carries `user_window: {hour: {calls, amount}, day: {calls, amount}}`, the originating user's usage of the tool across all their runs in the current UTC hour and day; it is left out when all its figures are zero, which is also what a kind the server does not keep reads as. The decision record carries the same figures as `usage`, omitted for other tools; its `usage.user_window` names only the kinds the server keeps, each as `{start, calls, amount}` with `start` the window's start in Unix seconds UTC, and is absent when none is kept. If the answer to an allowed call cannot be recorded in the audit log, the agent gets `-32003` with reason `label_error` and the call's `decision_id` instead of the answer. A missing or bad token is HTTP 401 with `-32001` and `data.reason` set to `missing_token`, `invalid_token`, `token_expired`, `dpop_required`, `invalid_dpop_proof`, `use_dpop_nonce` or, for a lease that is no longer live, `lease_revoked`, `lease_expired` or `lease_unknown`. A request refused for its lease without a per-call decision (`initialize`, `tools/list`, `ping`, `resources/unsubscribe`, the other allowlisted methods, notifications, `GET` and `DELETE`) is also a `deny` record with that reason, the token's subject and chain, the proxied server, and `tool` set to the method (`http.POST` for a notification, `http.GET`, `http.DELETE`); its 401 carries the record's id in `X-Attenuo-Decision-Id` and `data.decision_id`. These records are bounded like listen-stream ends: the first refusal per delegation chain, tool and reason in `[proxy] record_window_seconds` (default 60 s) is recorded, and a retry within the window is still a 401 but writes no record, carries the first record's id (both are left out in the moment before a concurrent first record is written) and is counted in `audit_records_suppressed_total`. A refusal whose record could not be written (a failed audit append) names no decision id and opens no window, so the next one is recorded (SR-81). Refused exchanges and renewals, and `tools/call` denials, are recorded every time. A token that does not verify writes no record. An open stream (the `GET` listen stream, or a streamed answer) whose leases stop being live or whose token expires is ended within `[proxy] stream_recheck_seconds`: an SSE stream's last event is a JSON-RPC error with `id: null`, code `-32001`, `data.reason` (`lease_revoked`, `lease_expired`, `lease_unknown`, `token_expired`) and `data.decision_id`, the id of a `deny` record of tool `stream.end` with the session's hash tag. On the `GET` listen stream that record is written for the first such end per delegation chain and reason in `[proxy] record_window_seconds` (default 60 s); later ends in the window carry the same `decision_id` and are counted in `audit_records_suppressed_total` instead of recorded. A stream the client drops or the upstream ends writes no record; `GET` listen streams are counted by how they ended in `proxy_streams_ended_total`. An upstream the proxy cannot reach (connection refused, or not connected within `[proxy] upstream_connect_timeout_seconds`, default 5) is HTTP 502 with `-32005` and `data.reason` `upstream_unreachable`; the upstream URL and transport error are only logged. Nothing was sent, so a retry is safe. An upstream that accepts the request but does not send its response headers, or the rest of a JSON body the proxy must read (to filter a list or record a result), within `[proxy] upstream_response_timeout_seconds` (default 30) of sending is HTTP 504 with `-32005` and `data.reason` `upstream_timeout`. It is a separate reason because the request did reach the upstream, which may have acted on it: retry a call with side effects only if it is idempotent. A stream (SSE, the `GET` listen stream) whose headers arrived in time is never cut by that deadline. An upstream that answers a `GET` with a success status but not `text/event-stream` is HTTP 502 with `-32005` and `data.reason` `upstream_not_event_stream` (MCP allows only an SSE stream or `405` there); `405` and error answers to a `GET` are relayed. Allowed responses carry `X-Attenuo-Decision-Id`.
+
+Other refusals of the proxy. Each also carries its stable code in `data.code` (listed under [Errors](#errors)); where the table says `data.reason` none, `data` holds only `code`: `unknown_server`, `session_unknown`, `invalid_request` and `parse_error`.
 
 | HTTP status | JSON-RPC code | `data.reason` | When |
 | --- | --- | --- | --- |
@@ -113,6 +381,32 @@ Other refusals of the proxy:
 | 502 | `-32005` | `upstream_body_too_large` | an upstream body the proxy buffers is over `[proxy] max_upstream_body_bytes` |
 | 503 | `-32006` | `session_registry_full` | no free session slot (`[proxy] max_sessions`), with `Retry-After: 30` |
 | 429 | `-32007` | `too_many_sessions` | the principal holds `[proxy] max_sessions_per_principal` live sessions, with `Retry-After: 30` |
+| 429 | `-32007` | `rate_limited` | the run (root lease) used up `[limits] mcp_requests_per_minute`, with `Retry-After` until its minute ends; counted after the token verified, never recorded |
+| 503 | `-32006` | `overloaded` | `[limits] max_in_flight` requests are already being handled, with `Retry-After: 1` |
+
+## Gateway external authorization
+
+Mounted only when `[[ext_authz]]` has an entry ([configuration](config.md#extauthz)); otherwise these paths are unknown. An external gateway (agentgateway's HTTP `extAuthz` mode, [guide](../guides/agentgateway.md)) sends the agent's request here and forwards it to the MCP server only on a 2xx answer. The decision is the proxy's own for `POST /mcp/{server}` ([design](../design/agentgateway-ext-authz.md)), with the gateway's position taken into account.
+
+| Method and path | Auth | Purpose |
+| --- | --- | --- |
+| `POST /ext-authz/v1/mcp/{server}` | `X-Attenuo-Gateway-Secret` of the `[[ext_authz]]` entry of `server`, then the agent's delegation token as forwarded | Decide the one JSON-RPC message in the body as the proxy would. 200 with no body when the proxy would forward it (with `X-Attenuo-Decision-Id` when a call was decided); otherwise the proxy's own answer. |
+| `GET /ext-authz/v1/mcp/{server}` | same | The listen stream: 200 when the token verifies and its lease is live, as the proxy checks before forwarding a `GET`. |
+| `DELETE /ext-authz/v1/mcp/{server}` | same | Session close: as `GET`. |
+
+Every request must carry `x-envoy-auth-partial-body: false`, which the gateway sets when it sends the whole body. `Mcp-Session-Id` is ignored, and the decided call has no session. Answers that differ from the proxy's:
+
+| HTTP status | JSON-RPC code | `data.code` | When |
+| --- | --- | --- | --- |
+| 403 | `-32003`, `-32008`, `-32602` | the proxy's | the proxy would have answered the message itself with this error inside a 200 (a denial, an approval request, invalid params); the body is the same JSON-RPC error |
+| 403 | `-32001` | `ext_authz_unauthenticated` | `X-Attenuo-Gateway-Secret` is missing, sent twice, or not the secret of this server's entry; checked first, nothing is decided or recorded |
+| 403 | `-32600` | `ext_authz_body_incomplete` | `x-envoy-auth-partial-body` is missing or not exactly `false` |
+| 401 | `-32001` | `ext_authz_dpop_url_unset` | the request has a `DPoP` header and the entry has no `dpop_url` |
+| 400 | `-32600` | `ext_authz_ambiguous_body` | an object has two members of one name or two whose names differ only in case, a member of the message or its `params` is a JSON-RPC or MCP name in another case (`Method`), or a number is not written as serde_json reads it (`1e3`, `1.50`, `0.10000000000000001`, an integer beyond 64 bits) |
+| 400 | `-32600` | `ext_authz_batch_unsupported` | the body is a JSON-RPC batch; nothing is decided |
+| 404 | `-32004` | `unknown_server` | no `[[ext_authz]]` entry is called `server` |
+
+A DPoP proof must name the entry's `dpop_url` and the forwarded method; it is used once, as at the proxy. The other refusals (no or bad token, a dead lease, `request_too_large`, `parse_error`, `rate_limited`) are the proxy's, with the same status and body. `HEAD` is answered as `GET`, as at `/mcp/{server}`. Other methods get 405 with no body. Two answers differ from `/mcp/{server}` because the route is not under `/mcp/`: over `[limits] max_in_flight` it is the 503 `temporarily_unavailable` body of the other routes, not `-32006` `overloaded`, and `[limits] request_timeout_seconds` bounds its handler. Both are non-2xx, so the gateway denies.
 
 ## Approvals
 
@@ -122,9 +416,9 @@ A call gated with `@obligation("approval")` gets an `approval_id` in its `-32008
 | --- | --- | --- |
 | `POST /approvals/{id}` | an OIDC ID token of the run's originating user (`Authorization: Bearer`) | Body `{"decision": "grant" \| "decline"}`. Answers the approval as below. |
 | `GET /approvals/{id}` | that user's ID token, or a delegation token of the same run whose leases are live (with a DPoP proof when bound) | The approval. Anyone else, including a hop whose lease was revoked or has expired, gets 404. |
-| `GET /admin/approvals?chain_id&state&limit` | admin | Approvals newest first, optionally of one run (`chain_id`, the first hop's lease) or in one state; `limit` default and maximum 500. `{"approvals": [...]}`. |
+| `GET /admin/approvals?chain_id&state&limit&cursor` | admin | Approvals newest first, optionally of one run (`chain_id`, the first hop's lease) and in one state; both filters apply before `limit`. `{"approvals": [...], "next_cursor": ...}`, paged as in [Paging](#paging): `limit` default 100, at most 500. Every approval is reachable. |
 | `GET /admin/approvals/{id}` | admin | One approval. |
-| `POST /admin/approvals/{id}` | admin | Body as above; decides as the operator (`by = "operator"`). Also on the console listener with `[admin_ui] allow_write = true`. |
+| `POST /admin/approvals/{id}` | admin, role `operator` or `admin` | Body as above; decides as the operator (`by = "operator"`, `approver.subject` the operator's subject). Also on the console listener with `[admin_ui] allow_write = true`. |
 
 The ID token is verified as at hop 0: signature from a `[[idps]]` issuer, expiry, and `aud`/`azp` equal to `[approvals] client_id` or, when that is unset, to the client id intake expects for the run's root agent. Its `sub` and `iss` must match the run's originating user. A token can decide once; reads do not use it up.
 
@@ -159,7 +453,7 @@ An approval:
 | Claim | Value |
 |---|---|
 | `iss`, `aud` | the issuer and audience of delegation tokens |
-| `sub`, `by` | the approver (`sub` of the user, or `urn:attenuo:admin`), and `user` or `operator` |
+| `sub`, `by` | the approver (`sub` of the user, or `urn:attenuo:admin` for `[admin] token` and `urn:attenuo:admin:<name>` for a named operator), and `user` or `operator` |
 | `chain_id`, `lease` | the run (its first hop's lease) and the lease of the hop that made the call |
 | `ch` | the call hash, as in the `-32008` data |
 | `iat`, `exp`, `jti` | when it was granted, the approval's `expires_at`, the approval id |
@@ -177,30 +471,71 @@ Every answer for one grant carries the same token. To use it, retry the call wit
 | 403 | `wrong_user` | the ID token belongs to someone other than the run's originating user |
 | 404 | `not_found` | unknown approval, or a delegation token of another run |
 | 409 | `approval_not_pending`, `approval_expired`, `lease_revoked` | already decided or used, past `expires_at`, or the lease it is bound to is no longer live |
+| 503 | `temporarily_unavailable` (`error_description` `replay_cache_full` or `replay_store_unavailable`) | the ID token's single use could not be recorded (too many in flight, or a database error); nothing was decided, retry |
 
 ## Admin
 
-All admin routes need `Authorization: Bearer <admin token>`. They answer 401 without it and 403 `admin_disabled` when no admin token is configured. Every admin answer, errors included, carries `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`.
+All admin routes need `Authorization: Bearer <admin token>`: the `[admin] token` or the token of an `[[admin.operators]]` entry ([config](config.md#admin), [ADR-0016](../decisions/0016-admin-operators.md)). They answer 401 without a bearer or with one that matches no credential (`missing_token`, `invalid_token`), 401 `admin_credential_expired` for an operator's token whose `expires_at` has passed (all three with `WWW-Authenticate: Bearer realm="attenuo-admin"`), 403 `admin_disabled` when no admin credential is configured, and 403 `admin_role_insufficient` when the credential's role is below the route's (`detail` names the role needed, never the token). Every admin answer, errors included, carries `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`.
+
+Each route needs at least one role; a role includes the ones below it. The table is `attenuo_server::operators::ROUTE_ROLES`, and a route missing from it needs `admin`.
+
+| Role | Routes |
+| --- | --- |
+| `viewer` | `GET /admin/whoami`, `GET /admin/leases/{lease_id}`, `GET /admin/leases/{lease_id}/tree`, every `GET /admin/audit...` route (`/admin/audit/checkpoint` included: it signs a checkpoint of the head when there is none, which records no new fact), `GET /admin/policies`, `GET /admin/policies/check`, `POST /admin/policies/evaluate` (a dry run that writes nothing), `GET /admin/approvals`, `GET /admin/approvals/{id}` |
+| `operator` | `POST /admin/leases/{lease_id}/revoke`, `POST /admin/leases/revoke` (its `?preview=true` dry run included), `POST /admin/approvals/{id}` |
+| `admin` | `POST /admin/budgets/refund`, `POST /admin/policies/reload`, `POST /admin/operators/reload`, `POST /admin/root-token` |
+
+`[admin] token` is the operator `admin` with role `admin`. The audit log records an admin action with `originating_subject` `urn:attenuo:admin` for `[admin] token`, as before operators existed, and `urn:attenuo:admin:<name>` for a named operator; an approval decided by an operator has that subject as `approver.subject` and as the approval token's `sub`.
+
+Where they are served: on the main listener by default; with `[admin] listen` set, on that listener only, and the main listener then answers every `/admin/...` path exactly as it answers an unknown path (404 with an empty body, whatever the method and bearer), so it does not reveal that an admin API exists. The admin listener serves these routes and nothing else (`/healthz` and `/readyz` stay on the main listener). Off a loopback `[server] listen` the server does not start with the admin routes on the main listener unless `[admin] serve_on_main_listener = true` ([config](config.md#admin)). The console listener (`[admin_ui]`) serves its own subset either way.
 
 | Method and path | Purpose |
 | --- | --- |
+| `GET /admin/whoami` | The credential that sent the request, `{"name": "<operator>", "role": "viewer" \| "operator" \| "admin", "expires_at": "<RFC 3339>" \| null}` (`expires_at` is the operator entry's, null when it has none); `[admin] token` is `{"name": "admin", "role": "admin", "expires_at": null}`. Reads nothing else and records nothing. Also on the console listener. |
 | `GET /admin/leases/{lease_id}` | Lease state. |
 | `POST /admin/leases/{lease_id}/revoke` | Revoke the lease and all descendants. Body `{"reason": "..."}` (optional). Answers `{lease_id, revoked, reason, audit_id}`: `revoked` counts the leases that changed, `audit_id` is the `admin.lease.revoke` record (null when it could not be written; the revocation stands). The SDKs return it: Python `revoke_lease(...).audit_id`, TypeScript `(await revokeLease(...)).auditId`. |
 | `POST /admin/leases/revoke?preview` | Revoke every lease of one originating user, one delegation chain or the chain that opened one MCP session, each with its descendants, in one transaction; `preview=true` is a dry run. See [Revoke by user or chain](#revoke-by-user-or-chain) and [Revoke by session](#revoke-by-session). |
 | `GET /admin/leases/{lease_id}/tree?max_nodes` | The lease, its descendants and its ancestors, and how many leases a revoke would change now. Read-only; see [Lease tree](#lease-tree). 404 for an unknown lease. |
-| `GET /admin/audit` | Audit entries in ascending `seq` order, paged with `from` and `limit` (default 100, at most 1000). Also returns `next` (when the page was full) and `head`, the newest `seq`. Filters and newest-first paging are below. |
+| `GET /admin/audit` | Audit entries, oldest first or with `order=desc` newest first, `{entries, next_cursor, head}` (`head` is the newest `seq`), paged as in [Paging](#paging): `limit` default 100, at most 1000. `from` and `to` select a `seq` range. Filters are below. |
 | `GET /admin/audit/entries/{seq}` | One entry with its context, `{entry, lease_states, covered_by_checkpoint, policy_reloaded_after}` (below). 404 when there is no entry at `seq`. |
 | `GET /admin/audit/records/{id}` | The same for the entry whose record id is `id`: the UUID that proxy denials and AuthZEN answers return as `decision_id`. 400 if `id` is not a UUID, 404 if no record has it. |
-| `GET /admin/audit/checkpoints?before&limit` | Stored checkpoints, newest first, `{checkpoints, prev}`; each is `{seq, head_hash, at, kid, signature}`. `prev` is the `before` of the next (older) page, null after the oldest. Read-only: it never signs, unlike `/admin/audit/checkpoint`. |
+| `GET /admin/audit/checkpoints?limit&cursor` | Stored checkpoints, newest first, `{checkpoints, next_cursor}`; each is `{seq, head_hash, at, kid, signature}`. Paged as in [Paging](#paging): `limit` default 100, at most 1000. Read-only: it never signs, unlike `/admin/audit/checkpoint`. |
 | `GET /admin/audit/verify` | Walk the whole hash chain, verify every checkpoint signature against the JWKS, and report `{entries, ok, first_bad_seq, checkpoints, last_signed_seq, unsigned_tail, bad_checkpoints}`. |
 | `GET /admin/audit/checkpoint` | The signed checkpoint of the head, `{seq, head_hash, at, kid, signature}` (signing it now if the head has none). For keeping outside the host. `hash` repeats `head_hash` for older clients. |
 | `GET /admin/audit/export?from&to` | Entries `from..=to` (default: the whole log) and the checkpoints in that range, streamed as `application/x-ndjson`: a `header` line, `entry` lines, then `checkpoint` lines. Verify offline with `attenuo audit verify --file`. `kind`, `chain_id`, `tool` and `decision` keep only the matching entries; the header then has a `filter` member naming them and the file cannot be verified. The SDKs take the same four: Python `audit_export(kind=, chain_id=, tool=, decision=)`, TypeScript `auditExport(from, to, { kind, chainId, tool, decision })`. 400 if `from` is 0 or `to < from`, for an unknown kind or decision, more than one kind, or an empty filter value. |
 | `POST /admin/policies/reload` | Re-read the policy file. On failure the old policy stays. |
+| `POST /admin/operators/reload` | Re-read `[[admin.operators]]`, and nothing else, from the config file the server was started with, and swap them in at once. See [Operators reload](#operators-reload). Also on the console listener with `[admin_ui] allow_write = true`. |
 | `GET /admin/policies` | The policy set in force: file path, its `sha256` and `loaded_at` (startup or last successful reload), `policy_ids`, validation `warnings`, and `policies: [{id, text}]`. |
 | `GET /admin/policies/check` | Lint the policy file as it is on disk now against the running schema, with line and column for each issue, and say whether it differs from the loaded one. Loads nothing, audits nothing. 409 `check_unavailable` without `policy.policies_path`. |
 | `POST /admin/policies/evaluate` | Dry run: what the loaded policies decide for one call, given a token or a chain, and optionally the run-limit state to assume (`budget`). No lease check, no charge, no audit record, no decision metric. |
 | `POST /admin/budgets/refund` | Body `{"decision_id": "<uuid>", "reason": "..."}`: give back to every run-limit counter what that decision charged, once, for an allowed call whose effect did not happen. Answers `{decision_id, refunded, reason, audit_id}` (`refunded` counts the token-limit counters credited; the run usage and the per-user windows the decision charged are returned too (each window to the window it was charged to, even one that has ended) but not counted, so a call that charged only usage answers 0; a `distinct` value is freed, and counted, only when no other unrefunded decision used it, SR-62) and appends an `admin.budget.refund` record. When there is nothing to refund, the audit log says why: 410 `charge_pruned` when the decision's record shows a run-limit charge whose charge-log entry was pruned, 404 `not_found` for a decision that charged nothing or an unknown id, 409 `already_refunded`; see [Budget refund](#budget-refund). Also on the console listener with `[admin_ui] allow_write = true`. |
-| `POST /admin/root-token` | Development root mint. Mounted only when `[dev] allow_root_mint = true`. |
+| `POST /admin/root-token` | Development root mint. Mounted only when `[dev] allow_root_mint = true`, which refuses to start when the admin API's listener (`[admin] listen`, else `[server] listen`) is not a loopback address. |
+
+### Console listener
+
+The console listener (`[admin_ui] enabled = true`, [config](config.md#adminui)) serves the console's own files besides the admin routes above that it mounts. They need no bearer: the page asks for the admin token and sends it with each API call. Each file answers with `Cache-Control: no-cache` and a SHA-256 `ETag`, and `If-None-Match` with 304. An unknown file is 404 `not_found`.
+
+| Method and path | Purpose |
+| --- | --- |
+| `GET /admin/ui/` | The console page. |
+| `GET /admin/ui/{file}` | A file of the console (script, style sheet, icon). |
+| `GET /` | Redirects (303) to `/admin/ui/`. |
+| `GET /admin/ui` | Redirects (303) to `/admin/ui/`. |
+| `GET /favicon.svg` | The favicon, the same file as `/admin/ui/favicon.svg`. |
+
+### Operators reload
+
+`POST /admin/operators/reload` (role `admin`, no body) re-reads the `[[admin.operators]]` array from the config file the server was started with (`--config` or `ATTENUO_CONFIG`), checks it with the startup rules ([config](config.md#adminoperators)) against the `[admin] token` in force, and puts it in force in one step. `[admin] token` (and `ATTENUO_ADMIN_TOKEN`) and the rest of the file are not reloaded, nor checked: only the operators are read, though the file must be TOML. Reloads run one at a time.
+
+It answers `{"added": [...], "removed": [...], "changed": [...], "audit_id": "<uuid>"}`: operator names, never a digest, `changed` meaning a different role, `token_sha256` or `expires_at`. The `admin.operators.reload` audit record names the caller as `originating_subject` and has `{path, added, removed, changed}` as its arguments (kept as their digest, as for every record). A refused reload is recorded as a `deny` whose `reason` is the refusal's code.
+
+- The caller's own entry may be removed or demoted: the request that does it completes, and the caller's next request is checked against the new list. Requests admitted before the swap complete as admitted.
+- 422 `operators_no_admin`: the new list would leave no credential with role `admin` that has not expired (there is no `[admin] token` and no such operator). Refused so that a typo cannot lock everyone out until a restart.
+- 422 `operators_invalid`: the file is not TOML, or an entry breaks a startup rule (a name, a duplicate, a digest, the `[admin] token` digest, an `expires_at` that does not parse, an unknown key or role). `detail` says which, and never quotes the file.
+- 409 `reload_unavailable`: the server was not started from a config file (a program that builds its config in code and calls `serve`).
+- 500 `config_unreadable`: the file cannot be read; the cause is in the server log only.
+
+On every refusal the operators in force are unchanged. An entry whose `expires_at` has already passed is accepted, with a warning naming it, and its token is refused.
 
 ### Budget refund
 
@@ -262,9 +597,9 @@ The SDKs wrap it: Python `AdminClient.revoke_by_selector(user=..., chain_id=...,
 
 #### Revoke by session
 
-When the proxy binds a new MCP session (the upstream assigns an `Mcp-Session-Id`, normally in its answer to `initialize`), the server records the session's SHA-256, the upstream server name and the chain id of the caller (`LeaseStore::record_session`; SQLite table `lease_sessions`). Only a request whose token and DPoP proof verified and whose leases are live can open a session, so nothing else can write a binding. The raw id is never stored; the session tag in audit records and logs is the first 12 hex characters of the same hash. A binding is write-once per session and server: the first chain is kept. It is deleted once its chain's root lease is revoked, or has been expired for longer than `[leases] session_retention_seconds` (default 86400), by a background pass every minute (see [config](config.md#leases)); a pruned session then resolves like one the server never saw.
+When the proxy binds a new MCP session (the upstream assigns an `Mcp-Session-Id`, normally in its answer to `initialize`), the server records the session's SHA-256, the upstream server name and the chain id of the caller (`RunState::record_session`; SQLite table `lease_sessions`). Only a request whose token and DPoP proof verified and whose leases are live can open a session, so nothing else can write a binding. The raw id is never stored; the session tag in audit records and logs is the first 12 hex characters of the same hash. A binding is write-once per session and server: the first chain is kept. It is deleted once its chain's root lease is revoked, or has been expired for longer than `[leases] session_retention_seconds` (default 86400), by a background pass every minute (see [config](config.md#leases)); a pruned session then resolves like one the server never saw.
 
-`{"session": "<id>"}` hashes the id, looks up the chains recorded for it (one per upstream the session was opened with, normally one) and then behaves as `chain_id` for each of them, preview included. The answer's `selector` is `{"session_tag": "...", "chain_ids": [...]}`, never the raw id. A session the server has no record of (a wrong id, or one opened before the server recorded sessions) resolves to `chain_ids: []` and matches nothing: a 200 with empty lists, as for an unknown `chain_id`. The proxy's next request on a revoked session's chain is refused (HTTP 401 `lease_revoked` for `initialize`, `ping`, `tools/list` and session `GET`s; a `-32003` denial for `tools/call`).
+`{"session": "<id>"}` hashes the id, looks up the chains recorded for it (one per upstream the session was opened with, normally one) and then behaves as `chain_id` for each of them, preview included. The answer's `selector` is `{"session_tag": "...", "chain_ids": [...]}`, never the raw id. A session the server has no record of (a wrong id, or one opened before the server recorded sessions) resolves to `chain_ids: []` and matches nothing: a 200 with empty lists, as for an unknown `chain_id`. The proxy's next request on a revoked session's chain is refused (HTTP 401 `lease_revoked` for `initialize`, `ping`, `tools/list` and session `GET`s; a `-32003` denial for `tools/call`). There is no selector for the session tag that audit records and logs show: it is a 48-bit prefix of the hash, so it can match more than one session. Revoke by the raw id, or by the `chain_id` of the record.
 
 ### Lease tree
 
@@ -276,6 +611,7 @@ When the proxy binds a new MCP session (the upstream assigns an `Mcp-Session-Id`
 - Per lease: the registry row (`parent`, `expires_at`, `revoked_at`, `revoke_reason`), `active` now, and from the audit record that issued it (`root_token` or `exchange`) the `agent` it was issued to, `issued_at` and `issued_seq`. These three are `null` when no issuance record is found.
 - Per lease, `chain_id` and `subject`: the chain id, which is the same as `root` for every lease of the tree and is what `POST /admin/leases/revoke` takes as `chain_id`; and the originating user's subject the server recorded when it issued the lease, which that route takes as `user`. `subject` is `null` for a lease registered before the server recorded subjects. The subjects of the whole tree are read with one store call. `subject` is the IdP's `sub`, so treat it as untrusted text.
 - Per lease, `budget`: the hop's run limits and what is left of them, `null` when the hop has no limits and nothing was charged under its lease. `{recorded, limits, usage}`: `recorded` says the server kept the hop's limits when it issued the token (a lease issued by an older server has counters but no `max`); `limits` has one entry per limit, `{cap, server, tool, kind, arg, max, used, remaining}` (`arg` is `null` for `calls` and `url#host` for a derived value; `used` is calls, the sum, for `distinct` the values seen, and for `calls_per` the most calls any one value has had, with `values` the number of values seen; `remaining` is `max - used`); `usage`, on a run's root lease, is the run's usage per destructive or outbound tool, `{tool, calls, amount, destinations}`. Value hashes are never shown. Calls are charged to every hop, so the smallest `remaining` along the chain is what a lease can still spend.
+- `user_windows`: the per-user windows ([run limits phase 3](../design/run-limits-phase3.md)) of the run's originating user, read at `root`, for the tools the run used. `{windows, truncated}`: `windows` has one entry per tool in the root lease's `budget.usage` and per window kind a loaded policy reads (`context.usage.user_window.<kind>`), ordered by tool and then `hour` before `day`, each `{tool, kind, start, calls, amount}`. `start` is the start of the window that holds the current time, RFC 3339 in UTC; `calls` and `amount` are what every run of that user (the same issuer and subject) was allowed in that window, this run and the others. The list is empty when the run has no run usage (none yet, or the run was revoked, which deletes run usage but never a window) or no policy reads a window. It holds at most 10000 entries, the tree's node cap; `truncated` is `true` when it was cut there. `user_windows` is `null` for a run whose root lease was issued before the server recorded the originating user's issuer (schema version 4): a window is keyed by issuer and subject, and the server never guesses an issuer. The answer shows neither the issuer nor the keyed digest the store files windows under; the user is the `subject` already on the nodes. Reading the tree charges nothing.
 
 ```json
 {
@@ -301,7 +637,10 @@ When the proxy binds a new MCP session (the upstream assigns an `Mcp-Session-Id`
      "budget": null}
   ],
   "would_revoke": 1,
-  "truncated": false
+  "truncated": false,
+  "user_windows": {"truncated": false, "windows": [
+    {"tool": "bank/send_money", "kind": "day", "start": "2026-10-23T00:00:00Z",
+     "calls": 3, "amount": 120}]}
 }
 ```
 
@@ -321,13 +660,14 @@ When the proxy binds a new MCP session (the upstream assigns an `Mcp-Session-Id`
 | `chain_id` | this `chain_id` (the lease id of the chain's first hop) |
 | `since`, `until` | `at` in `[since, until)`, both RFC 3339 times |
 
-Paging:
+Range and order:
 
-- `order=asc` (the default) with `from`: oldest first from `from`. The answer is `{entries, next, head}`; `next` is the `from` of the following page, null at the end. Without any of the new parameters the answer is exactly what it was before filters existed.
-- `order=desc` with `before`: newest first, entries with `seq < before` (default: from the head). The answer adds `prev`, the `before` of the following (older) page, null once seq 1 has been read; `next` is then the `from` for reading forward with `order=asc` from just above the page, null when the page reached the head. `before` with `order=asc`, or `from` with `order=desc`, is a 400.
-- A filtered page reads at most 50,000 seqs (`agent`, `lease`, `since` and `until` cannot use an index). It can therefore come back short, even empty, with `next` or `prev` set: keep following the link until it is null. Unfiltered pages are never cut short.
+- `from` and `to` (inclusive `seq`s, by default the whole log) select a range, as on `GET /admin/audit/export`. They are filters, not page links: send the same values with each cursor.
+- `order=asc` (the default) reads the range oldest first; `order=desc` newest first. A cursor works only with the `order` it was issued for.
+- Paging is as in [Paging](#paging). Oldest first, `next_cursor` is null once the page reached the head as it was when the page was read; to follow the log, ask again later with `from` just above the last `seq` seen (`attenuo audit tail --follow` does this).
+- A filtered page reads at most 50,000 seqs (`agent`, `lease`, `since` and `until` cannot use an index). It can therefore come back short, even empty, with `next_cursor` set: keep following it until it is null. Unfiltered pages are never cut short.
 
-An unknown `kind` or `decision`, a time that is not RFC 3339, an empty value or an unknown `order` is a 400 `invalid_request`. The renewal history of a lease, for example, is `kind=lease_renew&lease=<id>`.
+An unknown `kind` or `decision`, a time that is not RFC 3339, an empty value, an unknown `order`, `from` or `to` of 0, `to` below `from`, or the removed `before` is a 400 `invalid_request`; a bad cursor is 400 `invalid_cursor`. The renewal history of a lease, for example, is `kind=lease_renew&lease=<id>`.
 
 The single-entry routes (`/admin/audit/entries/{seq}`, `/admin/audit/records/{id}`) answer:
 
@@ -453,7 +793,7 @@ Every series is prefixed `attenuo_`. Label values come from fixed sets, so the n
 
 | Series | Type | Labels | Help |
 |---|---|---|---|
-| `decisions_total` | counter | `decision` (`allow`, `deny`), `reason` | Decision records by outcome and reason code: pipeline decisions (MCP proxy and AuthZEN) and the requests the proxy refuses and records before a decision. `reason` is one of `policy_allow`, `policy_deny`, `policy_error`, `approval_required`, `approval_invalid`, `capability_denied`, `tool_not_in_catalog`, `attribute_type_mismatch`, `input_type_mismatch`, `invalid_name`, `tool_not_listed`, `session_mismatch`, `budget_exhausted`, `budget_error`, `limit_arg_invalid`, `lease_revoked`, `lease_expired`, `lease_unknown`, `lease_error`, `audit_error`, and for a refused token exchange `exchange_widening`, `exchange_too_deep`, `exchange_actor_not_permitted`, `exchange_actor_mismatch`, `exchange_duplicate_actor`, `exchange_reserved_agent`, `exchange_no_lifetime_left`, `exchange_replayed`, `exchange_invalid_capability`, `exchange_refused`. A lease refusal of `initialize` or another undecided request, of an exchange's parent, or of a renewal, counts under its lease reason. Unauthenticated requests (bad token, DPoP) are not counted here. |
+| `decisions_total` | counter | `decision` (`allow`, `deny`), `reason` | Decision records by outcome and reason code: pipeline decisions (MCP proxy and AuthZEN) and the requests the proxy refuses and records before a decision. `reason` is one of `policy_allow`, `policy_deny`, `policy_error`, `approval_required`, `approval_invalid`, `capability_denied`, `tool_not_in_catalog`, `attribute_type_mismatch`, `input_type_mismatch`, `argument_case_mismatch`, `invalid_name`, `tool_not_listed`, `session_mismatch`, `budget_exhausted`, `budget_error`, `limit_arg_invalid`, `lease_revoked`, `lease_expired`, `lease_unknown`, `lease_error`, `audit_error`, and for a refused token exchange `exchange_widening`, `exchange_too_deep`, `exchange_actor_not_permitted`, `exchange_actor_mismatch`, `exchange_duplicate_actor`, `exchange_reserved_agent`, `exchange_no_lifetime_left`, `exchange_replayed`, `exchange_invalid_capability`, `exchange_refused`. A lease refusal of `initialize` or another undecided request, of an exchange's parent, or of a renewal, counts under its lease reason. Unauthenticated requests (bad token, DPoP) are not counted here. |
 | `tokens_issued_total` | counter | `kind` (`root`, `exchange`) | Delegation tokens issued. |
 | `leases_revoked_total` | counter | none | Leases moved to revoked, including cascaded descendants. |
 | `lease_sessions_pruned_total` | counter | none | Session bindings (revoke by session) deleted because their chain's root lease was revoked or expired longer ago than `[leases] session_retention_seconds`. |
@@ -462,6 +802,7 @@ Every series is prefixed `attenuo_`. Label values come from fixed sets, so the n
 | `leases_pruned_total` | counter | none | Leases deleted from the registry (with their recorded users and bindings) because every lease of their run was revoked or expired longer ago than `[leases] retention_seconds`. |
 | `run_state_pruned_total` | counter | `kind` (`counters`, `charges`, `approvals`, `user_window`) | Run state deleted by `[leases] run_state_retention_seconds` once the leases it belongs to were gone from the registry: run-limit and run-usage counters, charge-log entries (one per charged decision) and approvals; and, as `user_window`, per-user window rows (windows and their logged charges) deleted by `[leases] user_window_retention_seconds` once their window had ended. |
 | `audit_append_errors_total` | counter | none | Audit log appends that failed. |
+| `audit_append_shed_total` | counter | `cause` (`queue_full`, `timeout`) | Audit appends that failed instead of waiting for the writer: `[audit] append_queue_max` appends were already waiting, or no answer came within `[audit] append_timeout_seconds`. Each denied its decision with `audit_error`. |
 | `audit_checkpoints_total` | counter | none | Signed audit checkpoints written. |
 | `audit_checkpoint_last_timestamp_seconds` | gauge | none | Unix time this process wrote the newest signed audit checkpoint; 0 when none. |
 | `audit_sink_delivered_total` | counter | none | Signed checkpoints delivered off the host by `[audit.sink]`. |
@@ -480,6 +821,9 @@ Every series is prefixed `attenuo_`. Label values come from fixed sets, so the n
 | `audit_wal_presyncs_total` | counter | `file` (`wal`, `db`) | Syncs run off the request path: `wal` ahead of a signed checkpoint, `db` before a locked pass. |
 | `audit_wal_frames` | gauge | none | Frames in the WAL at the last checkpoint pass. |
 | `audit_wal_last_complete_timestamp_seconds` | gauge | none | Unix time the last complete WAL checkpoint round finished; 0 before the first. |
+| `requests_shed_total` | counter | none | Requests answered `503` `overloaded` because `[limits] max_in_flight` requests were already being handled. `/healthz` and `/readyz` are never shed. |
+| `requests_rate_limited_total` | counter | `limit` (`token`, `token_unauthenticated`, `mcp`, `authzen_search`), `cause` (`limit`, `table_full`) | Requests answered `429` by a `[limits]` rate limit: per agent, per peer address, per run, action searches per run; `table_full` when a new caller met `rate_limit_max_keys` callers inside their minute (for the per-peer limit, one that then authenticated no agent). |
+| `request_timeouts_total` | counter | `kind` (`body`, `handler`) | Requests past a `[limits]` deadline: the body did not arrive within `request_body_timeout_seconds`, or no answer within `request_timeout_seconds`. |
 | `http_requests_total` | counter | `route` (route template, for example `/mcp/{server}`), `status` | HTTP requests by route template and status. |
 | `authorize_duration_seconds` | histogram | none | Time to decide one tool call: leases, labels, run limits, run lock, approval, policy, charge and audit append. |
 | `audit_append_duration_seconds` | histogram | none | Time for one audit log append, including waiting for the store's lock. |

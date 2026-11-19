@@ -31,11 +31,23 @@ fn fmt_span(secs: u64) -> String {
 }
 
 /// `s` with its control characters escaped (`\u{1b}`) and everything else as it is, for text
-/// that a child or a caller chose and a terminal would otherwise act on (SR-59, SR-72).
-fn escape_controls(s: &str) -> String {
+/// that a child or a caller chose and a terminal would otherwise act on (SR-59, SR-72), and for
+/// what the server, or an upstream MCP server through the proxy, sends to be printed (SR-118).
+pub(crate) fn escape_controls(s: &str) -> String {
+    escape_controls_but(s, &[])
+}
+
+/// As [`escape_controls`], but line feeds and tabs are kept, for text that may run over several
+/// lines, such as a tool's output or description (SR-118). A carriage return is escaped: it
+/// would let a line overwrite itself.
+pub(crate) fn escape_controls_keep_lines(s: &str) -> String {
+    escape_controls_but(s, &['\n', '\t'])
+}
+
+fn escape_controls_but(s: &str, keep: &[char]) -> String {
     s.chars()
         .map(|c| {
-            if c.is_control() {
+            if c.is_control() && !keep.contains(&c) {
                 c.escape_default().collect()
             } else {
                 c.to_string()
@@ -54,6 +66,7 @@ fn fmt_constraint(arg: &str, c: &ArgConstraint) -> String {
             format!("{arg} in [{}]", items.join(", "))
         }
         ArgConstraint::Prefix(p) => format!("{arg} starts with {p:?}"),
+        ArgConstraint::PathPrefix(p) => format!("{arg} is a path under {p:?}"),
         ArgConstraint::Range { min, max } => match (min, max) {
             (Some(lo), Some(hi)) => format!("{lo} <= {arg} <= {hi}"),
             (Some(lo), None) => format!("{arg} >= {lo}"),
@@ -355,8 +368,33 @@ pub(crate) fn render_entry_view(v: &Value) -> String {
     out
 }
 
+/// The options a listing was given that its next page needs again (`--limit`, filters), as
+/// ` --name value` each, values quoted for a POSIX shell when they need it, for the hint that
+/// names the next page's command. Options without a value are left out.
+pub(crate) fn repeat_flags(flags: &[(&str, Option<String>)]) -> String {
+    let mut out = String::new();
+    for (name, value) in flags {
+        if let Some(v) = value {
+            out.push_str(&format!(" {name} {}", shell_word(v)));
+        }
+    }
+    out
+}
+
+/// `s` as one POSIX shell word: as it is when it has only safe characters, else in single
+/// quotes.
+fn shell_word(s: &str) -> String {
+    let safe = |c: char| c.is_ascii_alphanumeric() || "-_.:/@%+=,".contains(c);
+    if !s.is_empty() && s.chars().all(safe) {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
+}
+
 /// `audit checkpoints`: one line per stored checkpoint, newest first, and how to page on.
-pub(crate) fn render_checkpoints(v: &Value) -> String {
+/// `flags` are the options to repeat on the next page ([`repeat_flags`]).
+pub(crate) fn render_checkpoints(v: &Value, flags: &str) -> String {
     let cps = v["checkpoints"].as_array().cloned().unwrap_or_default();
     if cps.is_empty() {
         return "no checkpoints stored\n".to_string();
@@ -371,8 +409,10 @@ pub(crate) fn render_checkpoints(v: &Value) -> String {
             s(c, "head_hash")
         ));
     }
-    if let Some(prev) = v["prev"].as_u64() {
-        out.push_str(&format!("older: audit checkpoints --before {prev}\n"));
+    if let Some(next) = v["next_cursor"].as_str() {
+        out.push_str(&format!(
+            "older: audit checkpoints{flags} --cursor {next}\n"
+        ));
     }
     out
 }
@@ -455,13 +495,51 @@ pub(crate) fn fmt_budget(b: &Value) -> Vec<String> {
     out
 }
 
+/// The lines of a lease tree's `user_windows` (run limits phase 3): one per tool and window
+/// kind, `window <kind> <start> <tool>: <calls> calls, amount <amount>`, then a note when the
+/// list was cut short. `null` (a run issued before the server kept issuers) is one line saying
+/// so; an empty list is no line.
+fn fmt_user_windows(w: &Value) -> Vec<String> {
+    if w.is_null() {
+        return vec!["user windows not recorded (lease issued before schema version 4)".into()];
+    }
+    let mut out: Vec<String> = w["windows"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|e| {
+            format!(
+                "window {} {} {}: {} calls, amount {}",
+                s(e, "kind"),
+                s(e, "start"),
+                s(e, "tool").escape_debug(),
+                num(&e["calls"]),
+                num(&e["amount"])
+            )
+        })
+        .collect();
+    if w["truncated"] == true {
+        out.push(format!("user windows truncated: only {} listed", out.len()));
+    }
+    out
+}
+
 type Children<'a> = std::collections::BTreeMap<&'a str, Vec<&'a Value>>;
 
 /// The budget lines of tree node `n`, whose children are drawn below it at `deeper`; a `│`
-/// keeps the line down to its first child unbroken.
-fn tree_budget(out: &mut String, n: &Value, deeper: &str, children: &Children) {
+/// keeps the line down to its first child unbroken. The run's root node also gets the
+/// `user_windows` lines (`windows`, `None` for any other node).
+fn tree_budget(
+    out: &mut String,
+    n: &Value,
+    deeper: &str,
+    children: &Children,
+    windows: Option<&Value>,
+) {
     let has_kids = children.contains_key(s(n, "lease_id"));
-    for line in fmt_budget(&n["budget"]) {
+    let mut lines = fmt_budget(&n["budget"]);
+    lines.extend(windows.map(fmt_user_windows).unwrap_or_default());
+    for line in lines {
         out.push_str(&format!(
             "{deeper}{}{line}\n",
             if has_kids { "│    " } else { "     " }
@@ -471,8 +549,12 @@ fn tree_budget(out: &mut String, n: &Value, deeper: &str, children: &Children) {
 
 /// `lease tree`: the ancestors nearest first, then the lease and its descendants drawn as a
 /// tree, then what a revoke would change. Each lease with a `budget` has its limit and usage
-/// lines under it, indented to stay inside its branch.
+/// lines under it, indented to stay inside its branch, and the run's root lease (the last
+/// ancestor, or the first node when there is none) has the user's window lines after them.
 pub(crate) fn render_lease_tree(v: &Value) -> String {
+    let root = s(v, "root");
+    // A server older than `user_windows` sends no member: no lines, not "not recorded".
+    let windows = |n: &Value| v.get("user_windows").filter(|_| s(n, "lease_id") == root);
     let nodes = v["nodes"].as_array().cloned().unwrap_or_default();
     let mut out = String::new();
     let ancestors = v["ancestors"].as_array().cloned().unwrap_or_default();
@@ -485,7 +567,9 @@ pub(crate) fn render_lease_tree(v: &Value) -> String {
         ));
         for a in &ancestors {
             out.push_str(&format!("  {}\n", fmt_tree_node(a)));
-            for line in fmt_budget(&a["budget"]) {
+            let mut lines = fmt_budget(&a["budget"]);
+            lines.extend(windows(a).map(fmt_user_windows).unwrap_or_default());
+            for line in lines {
                 out.push_str(&format!("       {line}\n"));
             }
         }
@@ -506,13 +590,13 @@ pub(crate) fn render_lease_tree(v: &Value) -> String {
                 fmt_tree_node(k)
             ));
             let deeper = format!("{prefix}{}", if last { "   " } else { "│  " });
-            tree_budget(out, k, &deeper, children);
+            tree_budget(out, k, &deeper, children, None);
             draw(out, k, &deeper, children);
         }
     }
     if let Some(first) = nodes.first() {
         out.push_str(&format!("{}\n", fmt_tree_node(first)));
-        tree_budget(&mut out, first, "", &children);
+        tree_budget(&mut out, first, "", &children, windows(first));
         draw(&mut out, first, "", &children);
     }
     out.push_str(&format!(
@@ -598,8 +682,9 @@ pub(crate) fn render_selector_revocation(v: &Value) -> String {
     out
 }
 
-/// `approval list`: one line per approval, newest first.
-pub(crate) fn render_approvals(v: &Value) -> String {
+/// `approval list`: one line per approval, newest first. `flags` are the filters and
+/// `--limit` to repeat on the next page ([`repeat_flags`]).
+pub(crate) fn render_approvals(v: &Value, flags: &str) -> String {
     let list = v["approvals"].as_array().cloned().unwrap_or_default();
     if list.is_empty() {
         return "no approvals\n".to_string();
@@ -619,6 +704,11 @@ pub(crate) fn render_approvals(v: &Value) -> String {
             s(&a["call"], "tool"),
             s(a, "chain_id"),
             s(a, "expires_at"),
+        ));
+    }
+    if let Some(next) = v["next_cursor"].as_str() {
+        out.push_str(&format!(
+            "more: approval list{flags} --cursor {next}, or --all\n"
         ));
     }
     out
@@ -992,6 +1082,13 @@ user alice  (issuer https://idp.example)
             .with_constraint("r", ArgConstraint::OneOf(vec![json!("a"), json!("b")]));
         assert_eq!(fmt_capability(&c), "github:x {n == 1, r in [\"a\", \"b\"]}");
         assert_eq!(fmt_capabilities(&CapabilitySet::new()), "(none)");
+        let paths = Capability::new("fs", "read_file")
+            .with_constraint("path", ArgConstraint::path_prefix("/workspace/").unwrap())
+            .with_constraint("root", ArgConstraint::Prefix("/workspace/".into()));
+        assert_eq!(
+            fmt_capability(&paths),
+            "fs:read_file {path is a path under \"/workspace/\", root starts with \"/workspace/\"}"
+        );
         let range = |min, max| ArgConstraint::range(min, max).unwrap();
         let ranged = Capability::new("bank", "send_money")
             .with_constraint("amount", range(Some(0), Some(2000)))
@@ -1195,6 +1292,62 @@ would revoke 4 lease(s) if revoked now
     }
 
     #[test]
+    fn lease_tree_puts_user_windows_under_the_root() {
+        let mut root = node("R", None, "planner", false);
+        root["budget"] = json!({"recorded": true, "limits": [], "usage": [
+            {"tool": "bank/send_money", "calls": 1, "amount": 10, "destinations": 1}]});
+        let windows = json!({"truncated": false, "windows": [
+            {"tool": "bank/send_money", "kind": "hour", "start": "2026-11-14T09:00:00Z",
+             "calls": 2, "amount": 40},
+            {"tool": "bank/send_money", "kind": "day", "start": "2026-11-14T00:00:00Z",
+             "calls": 5, "amount": 130}]});
+        // Asked at the root: the root is the first node, its children below the lines.
+        let v = json!({
+            "root": "R", "ancestors": [], "would_revoke": 2, "truncated": false,
+            "nodes": [root.clone(), node("A", Some("R"), "coder", false)],
+            "user_windows": windows,
+        });
+        let expected = "\
+root lease (no ancestors)
+R  planner  active, expires 2026-10-23T10:00:00Z  issued #3
+│    usage bank/send_money: 1 calls, amount 10, 1 destinations
+│    window hour 2026-11-14T09:00:00Z bank/send_money: 2 calls, amount 40
+│    window day 2026-11-14T00:00:00Z bank/send_money: 5 calls, amount 130
+└─ A  coder  active, expires 2026-10-23T10:00:00Z  issued #3
+would revoke 2 lease(s) if revoked now
+";
+        assert_eq!(render_lease_tree(&v), expected);
+        // Asked below the root: the lines are under the root among the ancestors, not under
+        // the lease asked for.
+        let mut truncated = windows.clone();
+        truncated["truncated"] = json!(true);
+        let v = json!({
+            "root": "R", "ancestors": [root], "would_revoke": 1, "truncated": false,
+            "nodes": [node("A", Some("R"), "coder", false)],
+            "user_windows": truncated,
+        });
+        let expected = "\
+ancestors (nearest first, chain root R)
+  R  planner  active, expires 2026-10-23T10:00:00Z  issued #3
+       usage bank/send_money: 1 calls, amount 10, 1 destinations
+       window hour 2026-11-14T09:00:00Z bank/send_money: 2 calls, amount 40
+       window day 2026-11-14T00:00:00Z bank/send_money: 5 calls, amount 130
+       user windows truncated: only 2 listed
+A  coder  active, expires 2026-10-23T10:00:00Z  issued #3
+would revoke 1 lease(s) if revoked now
+";
+        assert_eq!(render_lease_tree(&v), expected);
+        // A run from before the server kept issuers, and an older server (no member).
+        let v = json!({"root": "R", "ancestors": [], "would_revoke": 1, "truncated": false,
+                       "nodes": [node("R", None, "planner", false)], "user_windows": null});
+        assert!(render_lease_tree(&v)
+            .contains("\n     user windows not recorded (lease issued before schema version 4)\n"));
+        let mut old = v.clone();
+        old.as_object_mut().unwrap().remove("user_windows");
+        assert!(!render_lease_tree(&old).contains("window"));
+    }
+
+    #[test]
     fn selector_revocation_lists_the_revoked_leases() {
         let v = json!({"selector": {"user": "alice"}, "preview": false,
                        "matched": ["L1"], "revoked": ["L1", "L2"], "matched_count": 1,
@@ -1277,7 +1430,7 @@ would revoke 4 lease(s) if revoked now
     #[test]
     fn empty_checkpoints_and_expired_evaluation() {
         assert_eq!(
-            render_checkpoints(&json!({"checkpoints": [], "prev": null})),
+            render_checkpoints(&json!({"checkpoints": [], "prev": null}), ""),
             "no checkpoints stored\n"
         );
         let text = render_evaluation(&json!({
@@ -1327,17 +1480,46 @@ would revoke 4 lease(s) if revoked now
     #[test]
     fn approval_list_has_one_line_each() {
         assert_eq!(
-            render_approvals(&json!({"approvals": []})),
+            render_approvals(&json!({"approvals": []}), ""),
             "no approvals\n"
         );
         let mut expired = approval();
         expired["state"] = json!("pending");
         expired["expired"] = json!(true);
-        let text = render_approvals(&json!({"approvals": [approval(), expired]}));
+        let text = render_approvals(&json!({"approvals": [approval(), expired]}), "");
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 2, "{text}");
         assert!(lines[0].starts_with("a-1  granted"), "{text}");
         assert!(lines[0].contains("github/delete_repo  run l1"), "{text}");
         assert!(lines[1].contains("pending (expired)"), "{text}");
+    }
+
+    #[test]
+    fn next_page_hints_repeat_the_limit_and_filters() {
+        let flags = repeat_flags(&[
+            ("--chain-id", Some("l1".into())),
+            ("--state", None),
+            ("--limit", Some("5".into())),
+        ]);
+        assert_eq!(flags, " --chain-id l1 --limit 5");
+        let page = json!({"approvals": [approval()], "next_cursor": "AQID"});
+        assert!(
+            render_approvals(&page, &flags)
+                .ends_with("more: approval list --chain-id l1 --limit 5 --cursor AQID, or --all\n"),
+            "{}",
+            render_approvals(&page, &flags)
+        );
+        let cps = json!({"checkpoints": [{"seq": 9, "at": "t", "kid": "k", "head_hash": "h"}],
+                         "next_cursor": "AQIC"});
+        let text = render_checkpoints(&cps, &repeat_flags(&[("--limit", Some("3".into()))]));
+        assert!(
+            text.ends_with("older: audit checkpoints --limit 3 --cursor AQIC\n"),
+            "{text}"
+        );
+        assert_eq!(
+            repeat_flags(&[("--x", Some("it's a b".into()))]),
+            r" --x 'it'\''s a b'"
+        );
+        assert_eq!(repeat_flags(&[("--x", Some(String::new()))]), " --x ''");
     }
 }

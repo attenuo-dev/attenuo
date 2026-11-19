@@ -22,25 +22,31 @@ The cost is one more hop on the path, and that you must close the other routes t
 
 A gateway such as Kong or Envoy authenticates a caller and routes the request. It can call an external authorizer on each request (Envoy's `ext_authz` is one such hook). What it does not do by itself is understand who the agent is working for, how many agents the authority has passed through, or what each of them was allowed to hand on. It sees one bearer and applies rules to it.
 
-attenuo is the part that answers those questions. It can sit behind a gateway as the policy decision point: it speaks the OpenID AuthZEN evaluation API at `POST /access/v1/evaluation`. Wiring a particular gateway to it would need an adapter that we have not written or tested. It also ships its own MCP proxy, for setups without a gateway. See [Using the AuthZEN endpoint](guides/integrating-mcp-clients.md#using-the-authzen-endpoint-from-a-non-mcp-pep).
+attenuo is the part that answers those questions. It can sit behind a gateway as the policy decision point: it speaks the OpenID AuthZEN evaluation API at `POST /access/v1/evaluation`. For agentgateway there is an adapter for its HTTP external-authorization mode, run once against agentgateway v1.7.0 on one machine, on loopback ([guide](guides/agentgateway.md#what-was-run)). Other gateways would need their own adapter, which we have not written. It also ships its own MCP proxy, for setups without a gateway. See [Using the AuthZEN endpoint](guides/integrating-mcp-clients.md#using-the-authzen-endpoint-from-a-non-mcp-pep).
 
 ## How is it different from Teleport or SPIRE?
 
 Those two answer "who or what is this workload, and may it reach this system?". Teleport is an identity-aware access layer for infrastructure and issues short-lived credentials to people and machines. SPIRE issues cryptographic identities (SVIDs) to workloads. Both identify the caller.
 
-attenuo answers a different question: "this caller is acting for Alice, through two other agents, with this much of Alice's authority, and may it make this call with these arguments right now?". The two layers fit together. SPIRE or similar can identify each agent: an exchange's `actor` is authenticated by default (`[token] require_actor_auth`), by a client secret or by an `actor_token` such as a JWT-SVID checked against a SPIFFE trust bundle ([ADR-0007](decisions/0007-actor-authentication.md)). Teleport's MCP Access does enforce per tool: roles list the tools a user or bot may call, by name, glob or regex. Its docs do not describe checks on a call's arguments or a narrowing chain across agents; its Delegated Identity for agents is in public beta. Details and sources are in the [comparison](comparison.md#product-notes) (checked 2026-10-24).
+attenuo answers a different question: "this caller is acting for Alice, through two other agents, with this much of Alice's authority, and may it make this call with these arguments right now?". The two layers fit together. SPIRE or similar can identify each agent: an exchange's `actor` is authenticated by default (`[token] require_actor_auth`), by a client secret, by a client assertion signed with the agent's own key (`private_key_jwt`, [ADR-0017](decisions/0017-private-key-jwt.md)), or by an `actor_token` such as a JWT-SVID checked against a SPIFFE trust bundle ([ADR-0007](decisions/0007-actor-authentication.md)). Teleport's MCP Access does enforce per tool: roles list the tools a user or bot may call, by name, glob or regex. Its docs do not describe checks on a call's arguments or a narrowing chain across agents; its Delegated Identity for agents is in public beta. Details and sources are in the [comparison](comparison.md#product-notes) (checked 2026-10-24).
 
 ## How is it different from OpenFGA, SpiceDB, Cerbos or OPA?
 
 Those are policy and authorization engines. You ask them a question and they answer. They are good at it, and attenuo uses one: Cedar, in-process, for the policy stage.
 
-What an engine does not give you is everything around the question. It does not mint the tokens that carry a delegation chain, check that each hop only narrowed the one above, hold leases, sit in the request path, or keep a hash-chained log of the answers. attenuo supplies those, and calls the policy engine for the "may this call pass" step. A relationship store like OpenFGA or SpiceDB could later feed facts into the policy (who owns which repo). That is on the [task board](tasks/board.md) as later work, not built. A comparison table is in [related work](research/related-work.md#positioning-table).
+What an engine does not give you is everything around the question. It does not mint the tokens that carry a delegation chain, check that each hop only narrowed the one above, hold leases, sit in the request path, or keep a hash-chained log of the answers. attenuo supplies those, and calls the policy engine for the "may this call pass" step. A relationship store like OpenFGA or SpiceDB could later feed facts into the policy (who owns which repo). That is planned in [ADR-0002](decisions/0002-cedar-for-policy.md) (a `RelationResolver` with a SpiceDB-backed implementation), not built. A comparison table is in [related work](research/related-work.md#positioning-table).
 
 ## How is it different from Microsoft Agent 365 or other agent governance products?
 
 Managed agent-governance products, from Microsoft (Entra Agent ID, Agent 365), Okta and Auth0, and others, give you agent identity, registries, policy and reporting inside a vendor's platform and tied to that vendor's identity system. As we understand them, they are hosted services.
 
-attenuo is self-hosted, open source (Apache-2.0) and neutral about the IdP: it takes OIDC ID tokens from Keycloak, Okta, Entra, Google and others. It enforces at the tool call, not only at sign-in. You can run both: let the vendor own agent identity and registration, and let attenuo be the monitor in front of the tools. Which of these products enforce per tool call, or revoke in flight, we could not confirm from their documentation (checked 2026-10-24); the [comparison](comparison.md#product-notes) has what each documents, with sources.
+attenuo is self-hosted, open source (Apache-2.0) and neutral about the IdP: it takes OIDC ID tokens from Keycloak, Okta, Entra, Google and others. It enforces at the tool call, not only at sign-in. You can run both: let the vendor own agent identity and registration, and let attenuo be the monitor in front of the tools. Which of these products enforce per tool call, or revoke in flight, we could not confirm from their documentation (checked 2026-10-24). Some products announced since do describe a check on each tool call and per-agent revocation, Aembit's MCP Identity Gateway among them. The [comparison](comparison.md#product-notes) has what each documents or announced, with sources.
+
+## Is attenuo the only system that does this?
+
+No. Narrowing delegation with a check on every tool call exists elsewhere. Research prototypes, AgentCap and AgentGate (same authors; we cannot tell from their abstract pages whether they are one paper) and DelegateGuard, narrow authority across hops and check calls outside the model, and DelegateGuard also cascades revocation. An IETF individual draft, `draft-niyikiza-oauth-attenuating-agent-tokens`, defines agent tokens that holders narrow offline, with argument constraints and a proof of possession per call, and Tenuo, an Apache-2.0 project, implements it as SDK and MCP middleware. Commercial gateways and vendor platforms cover parts of it too.
+
+What attenuo adds is a combination, built in the open: it is self-hosted and Apache-2.0, it uses standards (RFC 8693 exchange, ID-JAG or OIDC at hop 0, Cedar, AuthZEN), its chains cross identity providers and services, revoking a lease stops running agents on their next call, the decision log can be verified offline by anyone with the public keys, and its evaluation states what it does not show. Its delegation is online, at the server, where the draft's is offline: that costs a round trip per hop and buys revocation and a record of every delegation. See [related work](research/related-work.md#online-versus-offline-attenuation) and [standards](research/standards.md).
 
 ## Does it slow calls down?
 
@@ -66,7 +72,7 @@ Yes, in two ways, one of which exists today.
 
 `POST /access/v1/evaluation` is a plain AuthZEN endpoint. Any service that guards its own actions can send it the delegation token and a description of the action, and enforce the true or false that comes back. It uses the same lease check, capability check, Cedar policy and audit log as the MCP path. See [the AuthZEN section of the client guide](guides/integrating-mcp-clients.md#using-the-authzen-endpoint-from-a-non-mcp-pep).
 
-The proxy itself only speaks MCP over Streamable HTTP. Local STDIO MCP servers are not covered. There is no proxy for plain REST or gRPC APIs. If you want one, the AuthZEN endpoint is the building block.
+The proxy itself only speaks MCP over Streamable HTTP. A local STDIO MCP server can be put behind it with `attenuo stdio-bridge`, which runs the server as a child process and serves it over HTTP on loopback; the agent must then not be able to start the server itself, and messages from the server to the client are not passed on ([STDIO MCP servers](guides/stdio-servers.md)). There is no proxy for plain REST or gRPC APIs. If you want one, the AuthZEN endpoint is the building block.
 
 ## Is Cedar required?
 
@@ -78,7 +84,7 @@ You do not need to write much of it. Before Cedar runs, a capability check in pl
 
 Point `private_key_pem_path` at a new key, list the old one in `previous_key_paths`, and restart. Tokens signed with the old key keep verifying (they carry a `kid`, and the JWKS lists both keys) until you remove it. The steps are in [Deploying](guides/deploying.md#key-rotation).
 
-Rotating the signing key does not touch the audit log, which is not signed with it. Rotating the admin token and agent secrets also means editing the config and restarting.
+Rotating the signing key does not touch the audit log, which is not signed with it. Rotating `[admin] token`, agent secrets or agent client keys also means editing the config and restarting. A named operator's token can be replaced without a restart: edit its `[[admin.operators]]` entry and call `POST /admin/operators/reload` (`attenuo admin operator reload`).
 
 ## How is the audit log tamper-evident?
 
@@ -105,7 +111,7 @@ The holder renews its lease with `POST /token/renew`. See [ADR-0006](decisions/0
 
 ID-JAG is the Identity Assertion JWT Authorization Grant, an IETF OAuth draft (`draft-ietf-oauth-identity-assertion-authz-grant`). It is a JWT that an IdP issues to say: this client is allowed to act for this user toward this resource. It is the basis of Okta's Cross App Access and was folded into MCP as an enterprise authorization extension.
 
-attenuo accepts an ID-JAG, or a plain OIDC ID token, as the credential at hop 0 and builds the first token of a chain from it. It follows draft -04, and drafts change, so treat that part as the least stable. It has been tested only against assertions the server's own tests sign. See [Identity providers](guides/identity-providers.md#id-jag) and [the standards note](research/standards.md).
+attenuo accepts an ID-JAG, or a plain OIDC ID token, as the credential at hop 0 and builds the first token of a chain from it. It was written against draft -04 and checked on 2026-11-13 against the text of -06 (31 October 2026); [the standards note](research/standards.md#id-jag-conformance-against--06) lists what conforms and what does not (a valid ID-JAG without a root grant is `invalid_scope`, not `access_denied`, for example; the ID-JAG's `resource`, `scope` and `authorization_details` claims narrow the root grant only with the opt-in `[idps.id_jag_ceiling]`). Drafts still change, so treat that part as the least stable. It has been tested only against assertions the server's own tests sign. See [Identity providers](guides/identity-providers.md#id-jag) and [the standards note](research/standards.md).
 
 ## Does it stop prompt injection?
 
@@ -117,4 +123,4 @@ Without those, it cannot stop an agent from misusing something it is legitimatel
 
 ## Is it ready for production?
 
-No. It is pre-alpha. Formats will change before 1.0, there is one node and one SQLite file, admin authentication is a single static token, and the ten security review passes were done by the project itself with no outside audit (every finding is fixed or accepted except three open Info findings; see [Status](https://github.com/attenuo-dev/attenuo#status)). Use it to evaluate the model, in staging, or in a closed pilot where you accept those limits. [Deploying](guides/deploying.md) lists what to harden.
+No. It is pre-alpha. Formats will change before 1.0 ([what may change](reference/api-compatibility.md)), there is one node and one SQLite file, admin authentication is static bearer tokens (one per operator, with a role and an optional expiry, but no login), and the twenty security review passes were done by the project itself with no outside audit (every finding but three is fixed or accepted; SR-117, SR-126 and SR-135, Info, are open as design choices; see [Status](status.md)). Use it to evaluate the model, in staging, or in a closed pilot where you accept those limits. [Deploying](guides/deploying.md) lists what to harden.

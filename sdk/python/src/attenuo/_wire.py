@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any
+from typing import Any, TypeAlias
 from urllib.parse import quote
 
 import httpx
@@ -18,19 +19,26 @@ from .errors import (
     ApprovalRequired,
     AttenuoError,
     Denied,
+    RateLimited,
     RpcError,
     Unauthorized,
+    Unavailable,
 )
-from .token import Token, decode_token, parse_time
+from .token import Token, _b64url_decode, decode_token, parse_time
 
 TOKEN_EXCHANGE_GRANT = "urn:ietf:params:oauth:grant-type:token-exchange"
 TYPE_JWT = "urn:ietf:params:oauth:token-type:jwt"
 TYPE_ID_TOKEN = "urn:ietf:params:oauth:token-type:id_token"
+#: RFC 7523 §2.2 ``client_assertion_type`` of a ``private_key_jwt`` client assertion.
+CLIENT_ASSERTION_TYPE = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
 AUTHORIZATION_DETAILS_TYPE = "attenuo_capabilities"
 
 CODE_UNAUTHORIZED = -32001
 CODE_DENIED = -32003
 CODE_APPROVAL_REQUIRED = -32008
+CODE_UNAVAILABLE = -32006
+CODE_TOO_MANY = -32007
+RETRY_AFTER_HEADER = "retry-after"
 DECISION_ID_HEADER = "x-attenuo-decision-id"
 SESSION_HEADER = "mcp-session-id"
 MCP_ACCEPT = "application/json, text/event-stream"
@@ -125,9 +133,75 @@ class AuthzenDecision:
     approval_id: str | None = None
     call_hash: str | None = None
     expires_at: datetime | None = None
+    error: AuthzenEntryError | None = None
 
     def __bool__(self) -> bool:
         return self.decision
+
+
+@dataclass(frozen=True)
+class AuthzenEntryError:
+    """Why one entry of an AuthZEN batch failed (``context.error``): the HTTP ``status`` and
+    error ``code`` a single evaluation of it would have answered (``invalid_request``,
+    ``unknown_tool``, ...) and the server's ``message``. The entry counts as a deny; the rest
+    of the batch is decided as usual."""
+
+    status: int
+    code: str
+    message: str
+
+
+@dataclass(frozen=True)
+class AuthzenEvaluation:
+    """One call to decide in :meth:`~attenuo.Client.authzen_evaluate_batch`: the tool
+    ``server/tool`` with ``arguments``. A ``(server, tool)`` or ``(server, tool, arguments)``
+    tuple is taken too."""
+
+    server: str
+    tool: str
+    arguments: dict[str, Any] | None = None
+
+
+AuthzenEvaluationLike: TypeAlias = (
+    AuthzenEvaluation | tuple[str, str] | tuple[str, str, dict[str, Any] | None]
+)
+
+EVALUATIONS_SEMANTICS = ("execute_all", "deny_on_first_deny", "permit_on_first_permit")
+
+
+@dataclass(frozen=True)
+class AuthzenConfiguration:
+    """The AuthZEN discovery document (``GET /.well-known/authzen-configuration``, AuthZEN 1.0
+    section 9): the decision point's base URL and its two evaluation endpoints, as the server
+    publishes them (from ``[server] public_url``)."""
+
+    policy_decision_point: str
+    access_evaluation_endpoint: str
+    access_evaluations_endpoint: str
+    raw: dict[str, Any] = field(repr=False)
+    #: ``""`` when the server does not publish action search.
+    search_action_endpoint: str = ""
+
+
+@dataclass(frozen=True)
+class AuthzenAction:
+    """One result of an AuthZEN action search: the tool ``server/name`` that an evaluation
+    with the same token and arguments would allow now."""
+
+    name: str
+    server: str
+
+
+@dataclass(frozen=True)
+class AuthzenActionPage:
+    """One page of ``POST /access/v1/search/action``. ``next_token`` is the token of the next
+    page, ``None`` after the last (the server's ``""``). A page can hold fewer results than its
+    ``limit``, even none, while ``next_token`` is set: ``limit`` bounds how many catalogued
+    tools one page evaluates, not how many it returns."""
+
+    actions: list[AuthzenAction]
+    next_token: str | None
+    raw: dict[str, Any] = field(repr=False)
 
 
 @dataclass(frozen=True)
@@ -167,8 +241,20 @@ class Approval:
 
 
 def error_from_response(resp: httpx.Response) -> ApiError:
+    """The :class:`ApiError` (:class:`Unauthorized` for a 401) for a non-success answer.
+
+    ``decision_id`` is the body's ``decision_id`` when ``X-Attenuo-Decision-Id`` vouches for
+    it (see :func:`_proven_decision_id`). A JSON-RPC error body (the proxy's 401) gives its
+    ``data.reason`` and ``data``. The server's load refusals are :class:`Unavailable` (503
+    ``temporarily_unavailable``, or the proxy's ``-32006``) and :class:`RateLimited` (429
+    ``rate_limited``, or the proxy's ``-32007``); see :func:`_rpc_refusal` for the proxy's.
+    """
     text = resp.text
     error, detail, description = "http_error", text.strip(), None
+    code: str | None = None
+    claimed: Any = None
+    reason: str | None = None
+    data: dict[str, Any] | None = None
     try:
         body = json.loads(text)
     except ValueError:
@@ -177,12 +263,94 @@ def error_from_response(resp: httpx.Response) -> ApiError:
         error = body["error"]
         detail = str(body.get("detail", ""))
         description = body.get("error_description")
+        code = _opt_str(body.get("code"))
+        claimed = body.get("decision_id")
     elif isinstance(body, dict) and isinstance(body.get("error"), dict):
         # A JSON-RPC error body (the proxy's 401).
         error = str(body["error"].get("code", "rpc_error"))
         detail = str(body["error"].get("message", ""))
-    cls = Unauthorized if resp.status_code == 401 else ApiError
-    return cls(resp.status_code, error, detail, description)
+        raw_data = body["error"].get("data")
+        data = raw_data if isinstance(raw_data, dict) else {}
+        claimed = data.get("decision_id")
+        reason = _opt_str(data.get("reason")) or "unauthorized"
+        code = _opt_str(data.get("code")) or reason
+    decision_id = _proven_decision_id(resp, claimed)
+    refusal: ApiError | None = None
+    if data is not None:
+        refusal = _rpc_refusal(resp, body["error"].get("code"), detail, data)
+    elif isinstance(body, dict) and isinstance(body.get("error"), str):
+        refusal = _rest_refusal(resp, error, detail, description)
+    if refusal is not None:
+        return refusal
+    if resp.status_code == 401:
+        return Unauthorized(
+            resp.status_code,
+            error,
+            detail,
+            description,
+            decision_id,
+            reason=reason,
+            data=data,
+            code=code,
+        )
+    return ApiError(resp.status_code, error, detail, description, decision_id, code)
+
+
+def retry_after(resp: httpx.Response) -> int | None:
+    """``Retry-After`` in whole seconds, ``None`` when it is missing or not a plain
+    non-negative number (an HTTP-date is not read: the server sends seconds only)."""
+    value = resp.headers.get(RETRY_AFTER_HEADER)
+    if value is None:
+        return None
+    value = value.strip()
+    if not (value.isascii() and value.isdigit()):
+        return None
+    return int(value)
+
+
+def _rest_refusal(
+    resp: httpx.Response, error: str, detail: str, description: Any
+) -> ApiError | None:
+    """The server's own 503 ``temporarily_unavailable`` or 429 ``rate_limited`` answer of a REST
+    route as :class:`Unavailable` or :class:`RateLimited`, else ``None``."""
+    reason = description if isinstance(description, str) and description else error
+    if resp.status_code == 503 and error == "temporarily_unavailable":
+        return Unavailable(reason, retry_after(resp), detail)
+    if resp.status_code == 429 and error == "rate_limited":
+        return RateLimited(reason, retry_after(resp), detail)
+    return None
+
+
+def _rpc_refusal(
+    resp: httpx.Response, code: Any, message: str, data: dict[str, Any]
+) -> ApiError | None:
+    """The proxy's own 503 ``-32006`` or 429 ``-32007`` as :class:`Unavailable` or
+    :class:`RateLimited`, else ``None``. The proxy sets ``Retry-After`` on these and never
+    relays one from an upstream, so an answer without it is an upstream's own error."""
+    if RETRY_AFTER_HEADER not in resp.headers:
+        return None
+    reason = _opt_str(data.get("reason"))
+    if resp.status_code == 503 and code == CODE_UNAVAILABLE:
+        return Unavailable(reason or "temporarily_unavailable", retry_after(resp), message, data)
+    if resp.status_code == 429 and code == CODE_TOO_MANY:
+        return RateLimited(reason or "rate_limited", retry_after(resp), message, data)
+    return None
+
+
+RETRIED_REASONS = {503: "overloaded", 429: "rate_limited"}
+
+
+def retryable_refusal(resp: httpx.Response) -> Unavailable | RateLimited | None:
+    """The error of a refusal that the client's ``max_retries`` may retry: 503 ``overloaded``
+    or 429 ``rate_limited`` from the server's ``[limits]``, refused before any work. ``None``
+    for any other answer, ``request_timeout`` and every denial included. Reads the body."""
+    wanted = RETRIED_REASONS.get(resp.status_code)
+    if wanted is None:
+        return None
+    err = error_from_response(resp)
+    if isinstance(err, (Unavailable, RateLimited)) and err.reason == wanted:
+        return err
+    return None
 
 
 def json_body(resp: httpx.Response) -> Any:
@@ -205,11 +373,17 @@ def exchange_body(
     subject_token_type: str | None,
     actor_token: str | None = None,
     may_act: Iterable[str] | None = None,
+    client_assertion: str | None = None,
 ) -> dict[str, Any]:
     if actor_token is not None and not actor_token.strip():
         raise ValueError("actor_token is empty")
-    if client_id is not None and not client_secret:
-        raise ValueError("client_id and client_secret go together")
+    if client_assertion is not None and not client_assertion.strip():
+        raise ValueError("client_assertion is empty")
+    if client_assertion is not None and client_secret:
+        # RFC 6749 §2.3: one client authentication method per request.
+        raise ValueError("use client_secret or client_assertion, not both")
+    if client_id is not None and not client_secret and client_assertion is None:
+        raise ValueError("client_id goes with client_secret or client_assertion")
     if client_secret and client_id is None:
         # A hop n+1 exchange authenticates as its actor.
         client_id = actor
@@ -218,7 +392,9 @@ def exchange_body(
         # Agent credentials (a client secret or an actor token) alone do not make this hop 0:
         # the server also requires them, as the actor's, on a hop n+1 exchange. Hop 0 is an
         # IdP credential, which is not an attenuo delegation token.
-        authenticated = client_secret is not None or actor_token is not None
+        authenticated = (
+            client_secret is not None or actor_token is not None or client_assertion is not None
+        )
         intake = authenticated and not is_delegation_token(subject_token)
         subject_token_type = TYPE_ID_TOKEN if intake else TYPE_JWT
     body: dict[str, Any] = {
@@ -238,6 +414,12 @@ def exchange_body(
     if client_secret:
         body["client_id"] = client_id
         body["client_secret"] = client_secret
+    if client_assertion is not None:
+        # RFC 7523 §2.2 private_key_jwt; the server reads the client id from its `sub`.
+        if client_id is not None:
+            body["client_id"] = client_id
+        body["client_assertion_type"] = CLIENT_ASSERTION_TYPE
+        body["client_assertion"] = client_assertion.strip()
     if actor_token is not None:
         # RFC 8693 §2.1: a workload-identity JWT (e.g. a SPIFFE JWT-SVID) for the actor.
         body["actor_token"] = actor_token.strip()
@@ -245,6 +427,40 @@ def exchange_body(
     if may_act is not None:
         body["may_act"] = may_act_json(may_act)
     return body
+
+
+# The largest ``exp`` magnitude :func:`assertion_expiry` reads: the server's ``i64`` seconds.
+_EXP_LIMIT = 2**63 - 1
+
+
+def assertion_expiry(body: dict[str, Any]) -> int | None:
+    """The ``exp`` of the ``client_assertion`` in a ``POST /token`` ``body``, read without
+    verifying anything; ``None`` when the body has none or its ``exp`` cannot be read.
+
+    A load refusal (429 ``rate_limited``, 503 ``overloaded``) leaves the assertion unspent, so
+    the retry may send it again, but only before it expires: the client's retry does not wait
+    past this time (:func:`attenuo._retry.left_until`)."""
+    assertion = body.get("client_assertion")
+    if not isinstance(assertion, str):
+        return None
+    parts = assertion.split(".")
+    if len(parts) != 3:
+        return None
+    try:
+        claims = json.loads(_b64url_decode(parts[1]))
+    except (AttenuoError, ValueError, RecursionError):
+        # RecursionError: nesting deeper than the decoder recurses (SR-113).
+        return None
+    exp = claims.get("exp") if isinstance(claims, dict) else None
+    if isinstance(exp, bool):
+        return None
+    if isinstance(exp, int):
+        # One no float holds would make the retry's deadline raise OverflowError (SR-113);
+        # the server's `numeric_date` refuses it anyway.
+        return exp if -_EXP_LIMIT <= exp <= _EXP_LIMIT else None
+    if isinstance(exp, float) and math.isfinite(exp) and -_EXP_LIMIT <= exp <= _EXP_LIMIT:
+        return int(exp)
+    return None
 
 
 def may_act_json(may_act: Iterable[str]) -> dict[str, list[str]]:
@@ -292,6 +508,118 @@ def authzen_body(server: str, tool: str, arguments: dict[str, Any] | None) -> di
     }
 
 
+def authzen_batch_body(
+    evaluations: Iterable[AuthzenEvaluationLike], semantic: str | None
+) -> dict[str, Any]:
+    """The ``POST /access/v1/evaluations`` body: the subject as the top-level default (the
+    server fills it from the verified chain) and one ``action``/``resource``/``context`` entry
+    per call. ``ValueError`` for no call, since the server answers an empty batch as a single
+    evaluation, or for an unknown ``semantic``."""
+    entries = []
+    for ev in evaluations:
+        if isinstance(ev, tuple):
+            ev = AuthzenEvaluation(*ev)
+        if not isinstance(ev, AuthzenEvaluation):
+            raise TypeError(f"an evaluation is an AuthzenEvaluation or a tuple, got {ev!r}")
+        one = authzen_body(ev.server, ev.tool, ev.arguments)
+        del one["subject"]
+        entries.append(one)
+    if not entries:
+        raise ValueError("an AuthZEN batch needs at least one evaluation")
+    body: dict[str, Any] = {"subject": {"type": "agent", "id": ""}, "evaluations": entries}
+    if semantic is not None:
+        if semantic not in EVALUATIONS_SEMANTICS:
+            raise ValueError(
+                f"semantic must be one of {', '.join(EVALUATIONS_SEMANTICS)}, got {semantic!r}"
+            )
+        body["options"] = {"evaluations_semantic": semantic}
+    return body
+
+
+def authzen_batch_from_response(body: Any) -> list[AuthzenDecision]:
+    """The decisions of a batch answer, in request order. A batch stopped by its semantic
+    answers fewer entries than it asked."""
+    items = body.get("evaluations") if isinstance(body, dict) else None
+    if not isinstance(items, list):
+        raise AttenuoError(f"unexpected AuthZEN batch response: {str(body)[:200]}")
+    return [authzen_from_response(item if isinstance(item, dict) else {}) for item in items]
+
+
+def authzen_configuration_from_json(body: Any) -> AuthzenConfiguration:
+    if not isinstance(body, dict):
+        raise AttenuoError(f"unexpected AuthZEN configuration: {str(body)[:200]}")
+    return AuthzenConfiguration(
+        policy_decision_point=str(body.get("policy_decision_point", "")),
+        access_evaluation_endpoint=str(body.get("access_evaluation_endpoint", "")),
+        access_evaluations_endpoint=str(body.get("access_evaluations_endpoint", "")),
+        raw=body,
+        search_action_endpoint=str(body.get("search_action_endpoint", "")),
+    )
+
+
+def advance_cursor(cur: str | None, last: str | None) -> str | None:
+    """``cur`` to follow next, refusing a cursor that repeats the one just sent (which would
+    page forever)."""
+    if cur is not None and cur == last:
+        raise AttenuoError("paging did not advance (the server sent the same cursor again)")
+    return cur
+
+
+def authzen_search_action_body(
+    server: str,
+    arguments: dict[str, Any] | None,
+    page_token: str | None = None,
+    limit: int | None = None,
+) -> dict[str, Any]:
+    """The ``POST /access/v1/search/action`` body: the subject (filled in by the server from
+    the verified chain), the MCP ``server`` as the resource, the arguments every candidate is
+    decided with, and ``page`` when a token or limit is given."""
+    body: dict[str, Any] = {
+        "subject": {"type": "agent", "id": ""},
+        "resource": {"type": "mcp_server", "id": server},
+        "context": {"input": arguments or {}},
+    }
+    page: dict[str, Any] = {}
+    if page_token:
+        page["token"] = page_token
+    if limit is not None:
+        page["limit"] = limit
+    if page:
+        body["page"] = page
+    return body
+
+
+def authzen_search_action_from_response(body: Any) -> AuthzenActionPage:
+    items = body.get("results") if isinstance(body, dict) else None
+    if not isinstance(items, list):
+        raise AttenuoError(f"unexpected AuthZEN action search response: {str(body)[:200]}")
+    actions = []
+    for item in items:
+        if not isinstance(item, dict) or not isinstance(item.get("name"), str):
+            raise AttenuoError(f"unexpected AuthZEN action search result: {str(item)[:200]}")
+        props = item.get("properties")
+        server = props.get("server") if isinstance(props, dict) else None
+        actions.append(AuthzenAction(name=item["name"], server=str(server or "")))
+    page = body.get("page")
+    token = page.get("next_token") if isinstance(page, dict) else None
+    return AuthzenActionPage(
+        actions=actions,
+        next_token=token if isinstance(token, str) and token else None,
+        raw=body,
+    )
+
+
+def _entry_error(value: Any) -> AuthzenEntryError | None:
+    if not isinstance(value, dict):
+        return None
+    status = value.get("status")
+    return AuthzenEntryError(
+        status=status if isinstance(status, int) and not isinstance(status, bool) else 0,
+        code=str(value.get("code", "")),
+        message=str(value.get("message", "")),
+    )
+
+
 def authzen_from_response(body: Any) -> AuthzenDecision:
     ctx = body.get("context") or {}
     return AuthzenDecision(
@@ -303,6 +631,7 @@ def authzen_from_response(body: Any) -> AuthzenDecision:
         approval_id=_opt_str(ctx.get("approval_id")),
         call_hash=_opt_str(ctx.get("call_hash")),
         expires_at=_opt_time(ctx.get("expires_at")),
+        error=_entry_error(ctx.get("error")),
     )
 
 
@@ -362,20 +691,27 @@ def parse_rpc_body(text: str, sse: bool) -> dict[str, Any] | None:
     return None
 
 
-def _proxy_decision_id(resp: httpx.Response, data: dict[str, Any]) -> str | None:
-    """The decision id of a denial the proxy produced, else ``None`` (SR-32).
+def _proven_decision_id(resp: httpx.Response, claimed: Any) -> str | None:
+    """``claimed`` when it is one of the ids in ``resp``'s ``X-Attenuo-Decision-Id``, else
+    ``None`` (SR-32).
 
-    The proxy sets ``X-Attenuo-Decision-Id`` (a comma separated list, request order) on every
-    response that carries its decisions and forwards no such header from an upstream. An upstream
-    is untrusted and can put any ``-32003`` error in its own body, so a denial counts only when
-    ``data.decision_id`` is one of the ids in that header.
+    The server and the proxy set that header (a comma separated list, request order) on every
+    response that carries their decisions, and the proxy forwards no such header from an
+    upstream. An upstream is untrusted and can put any error, and any ``decision_id``, in its
+    own body, so an id counts only when the header names it too.
     """
-    claimed = data.get("decision_id")
     header = resp.headers.get(DECISION_ID_HEADER)
     if not isinstance(claimed, str) or not claimed or not header:
         return None
     ids = [part.strip() for part in header.split(",")]
     return claimed if claimed in ids else None
+
+
+def _proxy_decision_id(resp: httpx.Response, data: dict[str, Any]) -> str | None:
+    """The decision id of a denial the proxy produced, else ``None``: a ``-32003`` or
+    ``-32008`` counts as the proxy's only when ``data.decision_id`` is proven by the header
+    (:func:`_proven_decision_id`)."""
+    return _proven_decision_id(resp, data.get("decision_id"))
 
 
 def _opt_time(value: Any) -> datetime | None:
@@ -415,6 +751,37 @@ def approval_from_json(body: Any) -> Approval:
     )
 
 
+APPROVAL_DECISIONS = ("grant", "decline")
+
+
+def approval_decision_body(decision: str) -> dict[str, str]:
+    if decision not in APPROVAL_DECISIONS:
+        raise ValueError(f"decision must be 'grant' or 'decline', got {decision!r}")
+    return {"decision": decision}
+
+
+def id_token_headers(id_token: str) -> dict[str, str]:
+    """``Authorization: Bearer`` for the user's OIDC ID token. Never DPoP: the server verifies
+    the ID token as at hop 0, and a delegation token is refused there
+    (``agent_token_refused``)."""
+    token = id_token.strip() if isinstance(id_token, str) else ""
+    if not token:
+        raise ValueError("id_token must be the user's OIDC ID token")
+    return {"authorization": f"Bearer {token}"}
+
+
+def session_closed(resp: httpx.Response) -> bool:
+    """The answer to ``DELETE /mcp/{server}``: ``True`` when the upstream closed the session,
+    ``False`` when it does not let clients close sessions (405, as MCP allows). The proxy's own
+    refusals raise what a call would (:func:`rpc_result`)."""
+    if resp.is_success:
+        return True
+    if resp.status_code == 405:
+        return False
+    rpc_result(resp)
+    raise error_from_response(resp)
+
+
 def approval_ready(approval: Approval) -> bool:
     """True when the grant is usable, False while it is still pending; raises
     :class:`~attenuo.ApprovalNotGranted` when waiting longer cannot help."""
@@ -441,8 +808,11 @@ def rpc_result(
     :func:`_proxy_decision_id`) raise
     :class:`Denied`; a ``-32003`` without that proof is an upstream's own error and raises
     :class:`RpcError`. A ``-32008`` with the same proof raises :class:`ApprovalRequired`.
-    ``-32001`` or HTTP 401 raises :class:`Unauthorized`; any other JSON-RPC error raises
-    :class:`RpcError`.
+    ``-32001`` or HTTP 401 raises :class:`Unauthorized` with the error's ``data.reason`` as
+    ``reason`` and, when the header vouches for it, its ``data.decision_id``. HTTP 503 with
+    ``-32006`` raises :class:`Unavailable` and HTTP 429 with ``-32007`` :class:`RateLimited`,
+    when the answer carries ``Retry-After`` (:func:`_rpc_refusal`); any other JSON-RPC error
+    raises :class:`RpcError`.
     """
     decision_id = resp.headers.get(DECISION_ID_HEADER)
     if msg is _UNPARSED:
@@ -461,7 +831,7 @@ def rpc_result(
         if code == CODE_DENIED:
             proven = _proxy_decision_id(resp, data)
             if proven is not None:
-                raise Denied(str(data.get("reason", "unknown")), proven, message)
+                raise Denied(str(data.get("reason", "unknown")), proven, message, data)
         if code == CODE_APPROVAL_REQUIRED:
             proven = _proxy_decision_id(resp, data)
             if proven is not None:
@@ -473,9 +843,23 @@ def rpc_result(
                     _opt_time(data.get("expires_at")),
                     call_hash if isinstance(call_hash, str) else None,
                     message,
+                    data,
                 )
         if code == CODE_UNAUTHORIZED or resp.status_code == 401:
-            raise Unauthorized(401, "unauthorized", message)
+            raise Unauthorized(
+                401,
+                "unauthorized",
+                message,
+                decision_id=_proxy_decision_id(resp, data),
+                # Only the proxy answers with HTTP 401. A `-32001` inside a 200 answer can be an
+                # upstream's own error, so its `data.reason` is not taken as the server's word.
+                reason=(_opt_str(data.get("reason")) if resp.status_code == 401 else None)
+                or "unauthorized",
+                data=data,
+            )
+        refusal = _rpc_refusal(resp, code, message, data)
+        if refusal is not None:
+            raise refusal
         raise RpcError(int(code) if isinstance(code, int) else 0, message, raw_data)
     if not resp.is_success:
         raise error_from_response(resp)

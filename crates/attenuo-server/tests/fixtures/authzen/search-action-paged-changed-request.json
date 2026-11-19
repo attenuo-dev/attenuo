@@ -1,0 +1,174 @@
+{
+  "_note": "AuthZEN 1.0 section 8.2: a PDP should return an error when a page token is sent with a request that changed. The token of the first page is bound to digests of the chain, the server and the context it was issued for: sent with another context, another resource (MCP server) or no context at all it is 400 invalid_cursor, and detail names what differs without quoting the token or the request. page.limit is not bound, so the last step continues the same query with a larger page (and an explicit subject.id, the chain's current agent, which is the same subject): it evaluates delete_repo (approval-gated, never a result), pay and read_file, and ends.",
+  "token": {},
+  "steps": [
+    {
+      "path": "/access/v1/search/action",
+      "body": {
+        "subject": {
+          "type": "agent",
+          "id": ""
+        },
+        "resource": {
+          "type": "mcp_server",
+          "id": "github"
+        },
+        "context": {
+          "input": {
+            "repo": "alice/public-site"
+          }
+        },
+        "page": {
+          "limit": 1
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "page": {
+            "next_token": "<next_token>",
+            "count": 1
+          },
+          "results": [
+            {
+              "name": "create_issue",
+              "properties": {
+                "server": "github"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "path": "/access/v1/search/action",
+      "body": {
+        "subject": {
+          "type": "agent",
+          "id": ""
+        },
+        "resource": {
+          "type": "mcp_server",
+          "id": "github"
+        },
+        "context": {
+          "input": {
+            "repo": "alice/private"
+          }
+        },
+        "page": {
+          "limit": 1,
+          "token": "$next_token"
+        }
+      },
+      "expect": {
+        "status": 400,
+        "body": {
+          "error": "invalid_cursor",
+          "code": "invalid_cursor",
+          "detail": "`page.token` was issued for a search with another context; send it with the request it came from, or leave it out to start again from the first page"
+        }
+      }
+    },
+    {
+      "path": "/access/v1/search/action",
+      "body": {
+        "subject": {
+          "type": "agent",
+          "id": ""
+        },
+        "resource": {
+          "type": "mcp_server",
+          "id": "vault"
+        },
+        "context": {
+          "input": {
+            "repo": "alice/public-site"
+          }
+        },
+        "page": {
+          "limit": 1,
+          "token": "$next_token"
+        }
+      },
+      "expect": {
+        "status": 400,
+        "body": {
+          "error": "invalid_cursor",
+          "code": "invalid_cursor",
+          "detail": "`page.token` was issued for a search with another resource (MCP server); send it with the request it came from, or leave it out to start again from the first page"
+        }
+      }
+    },
+    {
+      "path": "/access/v1/search/action",
+      "body": {
+        "subject": {
+          "type": "agent",
+          "id": ""
+        },
+        "resource": {
+          "type": "mcp_server",
+          "id": "github"
+        },
+        "page": {
+          "limit": 1,
+          "token": "$next_token"
+        }
+      },
+      "expect": {
+        "status": 400,
+        "body": {
+          "error": "invalid_cursor",
+          "code": "invalid_cursor",
+          "detail": "`page.token` was issued for a search with another context; send it with the request it came from, or leave it out to start again from the first page"
+        }
+      }
+    },
+    {
+      "path": "/access/v1/search/action",
+      "body": {
+        "subject": {
+          "type": "agent",
+          "id": "planner"
+        },
+        "resource": {
+          "type": "mcp_server",
+          "id": "github"
+        },
+        "context": {
+          "input": {
+            "repo": "alice/public-site"
+          }
+        },
+        "page": {
+          "limit": 3,
+          "token": "$next_token"
+        }
+      },
+      "expect": {
+        "status": 200,
+        "body": {
+          "page": {
+            "next_token": "",
+            "count": 2
+          },
+          "results": [
+            {
+              "name": "pay",
+              "properties": {
+                "server": "github"
+              }
+            },
+            {
+              "name": "read_file",
+              "properties": {
+                "server": "github"
+              }
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

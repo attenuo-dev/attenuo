@@ -196,6 +196,10 @@ impl Harness {
             attribute_claims: vec![],
             jwks_ttl_seconds: 300,
             clock_skew_seconds: 0,
+            tenant: None,
+            id_jag_ceiling: None,
+            credentials: attenuo_server::config::DEFAULT_IDP_CREDENTIALS.to_vec(),
+            ca_pem_path: None,
             client_ids: [("planner".to_string(), CLIENT_AUD.to_string())].into(),
         }];
         tweak(&mut cfg);
@@ -372,6 +376,22 @@ impl Harness {
             .filter(|c| c.name == "delete_repo")
             .count()
     }
+}
+
+/// `[[idps]] credentials` is about hop 0 (SR-122): an entry that accepts ID-JAGs only still
+/// takes its users' ID tokens as approvals.
+#[tokio::test]
+async fn an_id_jag_only_entry_still_takes_approval_id_tokens_sr122() {
+    let h = Harness::start_with(|cfg| {
+        cfg.idps[0].credentials = vec![attenuo_server::config::IdpCredential::IdJag];
+    })
+    .await;
+    let token = h.root().await;
+    h.taint(&token).await;
+    let g = h.gated(&token, "alice/site").await;
+    let granted = h.grant_as_alice(&g.approval_id).await;
+    assert_eq!(granted["state"], "granted");
+    assert_eq!(granted["approver"]["method"], "id_token");
 }
 
 #[tokio::test]
@@ -728,6 +748,163 @@ async fn revoked_lease_kills_pending_and_granted_approvals() {
         .await;
     assert_eq!(status, StatusCode::CONFLICT, "{v}");
     assert_eq!(v["error"], "lease_revoked");
+}
+
+#[tokio::test]
+async fn a_named_operator_decides_and_is_recorded_a_viewer_cannot_adr0016() {
+    use attenuo_server::config::AdminOperator;
+    use attenuo_server::operators::{token_sha256_hex, AdminRole};
+    let h = Harness::start_with(|cfg| {
+        cfg.admin.operators = vec![
+            AdminOperator {
+                name: "bob".into(),
+                token_sha256: token_sha256_hex("bob-token"),
+                role: AdminRole::Operator,
+                expires_at: None,
+            },
+            AdminOperator {
+                name: "vera".into(),
+                token_sha256: token_sha256_hex("vera-token"),
+                role: AdminRole::Viewer,
+                expires_at: None,
+            },
+        ];
+    })
+    .await;
+    let token = h.root().await;
+    h.taint(&token).await;
+    let g = h.gated(&token, "alice/site").await;
+    let decide = |bearer: &'static str| {
+        h.client
+            .post(h.server.url(&format!("/admin/approvals/{}", g.approval_id)))
+            .bearer_auth(bearer)
+            .json(&json!({ "decision": "grant" }))
+            .send()
+    };
+    // A viewer may read the approval but not decide it.
+    let resp = h
+        .client
+        .get(h.server.url(&format!("/admin/approvals/{}", g.approval_id)))
+        .bearer_auth("vera-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = decide("vera-token").await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(v["error"], "admin_role_insufficient");
+    assert_eq!(v["code"], "admin_role_insufficient");
+    assert!(v["detail"].as_str().unwrap().contains("`operator`"), "{v}");
+    assert!(!v.to_string().contains("vera-token"), "{v}");
+    // The operator decides; the approval and its audit record name bob.
+    let resp = decide("bob-token").await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(v["approver"]["by"], "operator");
+    assert_eq!(v["approver"]["subject"], "urn:attenuo:admin:bob");
+    let records = h.records().await;
+    let grant = records
+        .iter()
+        .find(|r| r["kind"] == "approval_grant")
+        .unwrap();
+    assert_eq!(grant["approval"]["approver"], "urn:attenuo:admin:bob");
+    assert_eq!(grant["approval"]["by"], "operator");
+    assert!(allowed(&h.delete(&token, "alice/site").await));
+    h.verify_ok().await;
+}
+
+/// Pass 20: on a console listener without `allow_write`, a decision is answered 404 (#354) only
+/// after the admin bearer check: no bearer, or another bearer, is 401; with the bearer, a body
+/// that is not JSON is 415 and a decision is 404, for a pending approval and an unknown id
+/// alike. None of them decides, records or counts anything: the approval stays pending and
+/// the user can still grant it.
+#[tokio::test]
+async fn a_decision_on_a_read_only_console_is_404_after_the_bearer_and_changes_nothing() {
+    let h = Harness::start().await;
+    let token = h.root().await;
+    h.taint(&token).await;
+    let g = h.gated(&token, "alice/site").await;
+    assert!(!h.cfg.admin_ui.allow_write);
+    let ro = spawn_router(attenuo_server::admin_ui::router(h.state.clone(), &h.cfg))
+        .await
+        .unwrap();
+    let before = h.records().await.len();
+    let url = ro.url(&format!("/admin/approvals/{}", g.approval_id));
+    let unknown = ro.url("/admin/approvals/no-such-approval");
+    for decision in ["grant", "decline"] {
+        let body = json!({ "decision": decision });
+        for target in [&url, &unknown] {
+            let r = h.client.post(target).json(&body).send().await.unwrap();
+            assert_eq!(r.status(), StatusCode::UNAUTHORIZED, "no bearer, {target}");
+            let r = h
+                .client
+                .post(target)
+                .bearer_auth(&token)
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                r.status(),
+                StatusCode::UNAUTHORIZED,
+                "agent token, {target}"
+            );
+            let r = h
+                .client
+                .post(target)
+                .bearer_auth(ADMIN)
+                .body(body.to_string())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE, "{target}");
+            let r = h
+                .client
+                .post(target)
+                .bearer_auth(ADMIN)
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::NOT_FOUND, "{target}");
+        }
+    }
+    let shown: Value = h
+        .client
+        .get(url.as_str())
+        .bearer_auth(ADMIN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(shown["state"], "pending");
+    assert!(shown["approver"].is_null(), "{shown}");
+    assert_eq!(h.records().await.len(), before, "nothing was recorded");
+    assert_eq!(
+        metric(
+            &h,
+            "attenuo_approvals_decided_total{outcome=\"granted\",by=\"operator\"}"
+        ),
+        0
+    );
+    assert_eq!(
+        metric(
+            &h,
+            "attenuo_approvals_decided_total{outcome=\"declined\",by=\"operator\"}"
+        ),
+        0
+    );
+    // Still gated, with the same approval, and still the user's to decide.
+    assert_eq!(
+        h.gated(&token, "alice/site").await.approval_id,
+        g.approval_id
+    );
+    h.grant_as_alice(&g.approval_id).await;
+    assert!(allowed(&h.delete(&token, "alice/site").await));
+    h.verify_ok().await;
 }
 
 #[tokio::test]

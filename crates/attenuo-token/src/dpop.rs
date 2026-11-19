@@ -626,8 +626,17 @@ impl DpopKey {
     /// proof with a wrong claim.
     pub fn sign_claims(&self, claims: &Value) -> String {
         let header = json!({"typ": DPOP_PROOF_TYPE, "alg": self.alg(), "jwk": self.public_jwk});
-        let enc = |v: &Value| URL_SAFE_NO_PAD.encode(serde_json::to_vec(v).expect("JSON"));
-        let input = format!("{}.{}", enc(&header), enc(claims));
+        self.sign_jws(&header, claims)
+    }
+
+    /// Sign `claims` as a compact JWS with exactly this protected `header`. The caller sets
+    /// `alg` to [`DpopKey::alg`]; this key signs whatever the header says. Used for the
+    /// proofs above and for `private_key_jwt` client assertions
+    /// ([`crate::client_assertion`]), whose header carries a `kid` instead of the key.
+    pub fn sign_jws(&self, header: &Value, claims: &Value) -> String {
+        // Serializing a `Value` cannot fail.
+        let enc = |v: &Value| URL_SAFE_NO_PAD.encode(serde_json::to_vec(v).unwrap_or_default());
+        let input = format!("{}.{}", enc(header), enc(claims));
         let sig = match &self.secret {
             Secret::Ed25519 { pair, .. } => pair.sign(input.as_bytes()).as_ref().to_vec(),
             Secret::P256 { pair, .. } => pair

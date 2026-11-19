@@ -5,7 +5,7 @@
 
 - Date: 2026-10-23
 - Branch: `review/security-pass-3` (base: `f386c33` on main)
-- Related: [pass 1 and 2](security-review-2026-10-22.md), [RFC-0001](../spec/rfc-0001-attenuo.md), [threat model](../spec/threat-model.md), [task board](../tasks/board.md)
+- Related: [pass 1 and 2](security-review-2026-10-22.md), [RFC-0001](../spec/rfc-0001-attenuo.md), [threat model](../spec/threat-model.md), task board
 
 ## Scope and method
 

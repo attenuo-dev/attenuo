@@ -165,6 +165,12 @@ pub enum AuthError {
     /// good token or key (SR-47).
     #[error("temporarily unavailable: {0}")]
     Unavailable(String),
+    /// The caller is over a rate limit of the authorizer (the server's `[limits]
+    /// mcp_requests_per_minute`, per run). The number is how many seconds until it may retry.
+    /// The proxy answers `429` with `Retry-After` and JSON-RPC `-32007`, not `401`: the token
+    /// is good.
+    #[error("rate limited; retry in {0} s")]
+    RateLimited(u64),
 }
 
 /// Reason code of [`AuthError::MissingToken`].
@@ -177,6 +183,8 @@ pub const REASON_TOKEN_EXPIRED: &str = "token_expired";
 pub const REASON_DPOP_REQUIRED: &str = "dpop_required";
 /// Reason code of [`AuthError::InvalidDpopProof`].
 pub const REASON_INVALID_DPOP_PROOF: &str = "invalid_dpop_proof";
+/// Reason code of [`AuthError::RateLimited`].
+pub const REASON_RATE_LIMITED: &str = "rate_limited";
 /// Reason code of [`AuthError::UseDpopNonce`] (RFC 9449 §9).
 pub const REASON_USE_DPOP_NONCE: &str = "use_dpop_nonce";
 /// Reason code (JSON-RPC `data.reason`) for a call whose result was withheld because it could
@@ -201,6 +209,7 @@ impl AuthError {
             AuthError::InvalidDpopProof(_) => REASON_INVALID_DPOP_PROOF,
             AuthError::UseDpopNonce(_) => REASON_USE_DPOP_NONCE,
             AuthError::Unavailable(reason) => reason,
+            AuthError::RateLimited(_) => REASON_RATE_LIMITED,
         }
     }
 
@@ -236,6 +245,10 @@ pub struct RequestAuth<'a> {
     pub path: &'a str,
     /// The `Host` header, used to rebuild the request URL when no public URL is configured.
     pub host: Option<&'a str>,
+    /// The full URL the DPoP proof must name in `htu`, when it is not this server's own URL
+    /// for `path`: the gateway URL the agent called, from an `[[ext_authz]]` entry's
+    /// `dpop_url`. Always from configuration, never from the request. `None` everywhere else.
+    pub url: Option<&'a str>,
 }
 
 /// An authenticated caller.
@@ -308,6 +321,12 @@ pub trait Authorizer: Send + Sync {
     ) -> AuthDecision {
         let _ = ctx;
         self.authorize(chain, call, now).await
+    }
+
+    /// How user subjects are written into the proxy's log lines (`[logging]
+    /// redact_subjects`). The default writes them as they are.
+    fn subject_log(&self) -> &crate::SubjectLog {
+        &crate::subject_log::CLEAR
     }
 
     /// Is `(server, tool)` in the tool catalog behind this authorizer? Used by the proxy's

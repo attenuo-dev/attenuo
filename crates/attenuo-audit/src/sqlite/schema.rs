@@ -1,4 +1,8 @@
-//! The SQL schema of the audit log and the lease store, and the record id index.
+//! The SQL of schema version 1 of the audit log and the lease store, and the record id index.
+//!
+//! These statements are migration 1 (see `migrations.rs`). They keep `IF NOT EXISTS` because
+//! adopting a file from before schema versions runs them to add only what it lacks; a later
+//! change to the schema is a new migration there, never an edit here.
 
 use rusqlite::Connection;
 
@@ -64,18 +68,19 @@ CREATE TABLE IF NOT EXISTS lease_bindings (
     id      TEXT PRIMARY KEY,
     binding TEXT NOT NULL
 );
--- The originating user's subject of each lease (`LeaseStore::record_subject`), for revoking
--- every lease of one user. Created at open on stores that predate it; a lease registered
--- before then has no row and is not matched by a subject.
+-- The originating user's subject of each lease (`LeaseRegistry::record_subject`), for revoking
+-- every lease of one user. Added to a pre-versioning store when it is adopted; a lease
+-- registered before then has no row and is not matched by a subject.
 CREATE TABLE IF NOT EXISTS lease_subjects (
     id      TEXT PRIMARY KEY,
     subject TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS lease_subjects_subject_idx ON lease_subjects(subject);
 -- MCP sessions opened through the proxy and the chain that opened each
--- (`LeaseStore::record_session`), for revoking by session. `session` is the SHA-256 of the
--- `Mcp-Session-Id` in hex, never the id. Write-once per (session, server). Created at open on
--- stores that predate it; a session opened before then has no row and matches nothing.
+-- (`RunState::record_session`), for revoking by session. `session` is the SHA-256 of the
+-- `Mcp-Session-Id` in hex, never the id. Write-once per (session, server). Added to a
+-- pre-versioning store when it is adopted; a session opened before then has no row and
+-- matches nothing.
 CREATE TABLE IF NOT EXISTS lease_sessions (
     session  TEXT NOT NULL,
     server   TEXT NOT NULL,
@@ -147,14 +152,14 @@ CREATE TABLE IF NOT EXISTS budget_meta (
 );
 INSERT OR IGNORE INTO budget_meta (key, value) VALUES ('value_key', lower(hex(randomblob(32))));
 -- The limited capabilities of each hop as issued (JSON list of `HopLimit`), for the admin
--- console only: enforcement reads limits from the token. Created at open on older stores.
+-- console only: enforcement reads limits from the token.
 CREATE TABLE IF NOT EXISTS hop_limits (
     lease  TEXT PRIMARY KEY,
     limits TEXT NOT NULL
 );
 -- Output labelling phase 2 (ADR-0009): the span index of each run. `hash` is the HMAC-SHA-256
 -- of a result fingerprint under `span_key` (no content); `seq` is the audit seq of the result's
--- `tool_result` record. Created at open on stores that predate it.
+-- `tool_result` record.
 CREATE TABLE IF NOT EXISTS run_spans (
     chain_id TEXT    NOT NULL,
     hash     BLOB    NOT NULL,
@@ -166,7 +171,6 @@ INSERT OR IGNORE INTO budget_meta (key, value) VALUES ('span_key', lower(hex(ran
 -- Per-user windows (run limits phase 3). `user` is the hex HMAC-SHA-256, under `user_key`
 -- in budget_meta, of the RFC 8785 JSON of [issuer, subject]; never the subject itself.
 -- Pruned by the window's end (`[leases] user_window_retention_seconds`), never by leases.
--- Created at open on stores that predate it.
 CREATE TABLE IF NOT EXISTS user_windows (
     user         TEXT    NOT NULL,
     window_kind  TEXT    NOT NULL,
@@ -204,10 +208,11 @@ pub(super) const RECORD_ID_EXPR: &str =
 
 /// Create the index for looking an entry up by its record id (`GET /admin/audit/records/{id}`).
 ///
-/// Added after the table was first released, so it is created at open on databases that
-/// lack it. An expression index stores derived values in a separate b-tree; it never writes
-/// to the `audit` rows, so no hashed data changes. Once built it costs one b-tree insert per
-/// append; building it on a large existing log reads every row once.
+/// Added after the table was first created, so adopting a file from before schema versions
+/// builds it when it is missing (migration 1 runs this). An expression index stores derived
+/// values in a separate b-tree; it never writes to the `audit` rows, so no hashed data
+/// changes. Once built it costs one b-tree insert per append; building it on a large existing
+/// log reads every row once.
 pub(super) fn create_record_id_index(conn: &Connection) -> Result<(), AuditError> {
     conn.execute_batch(&format!(
         "CREATE INDEX IF NOT EXISTS audit_record_id_idx ON audit({RECORD_ID_EXPR})"

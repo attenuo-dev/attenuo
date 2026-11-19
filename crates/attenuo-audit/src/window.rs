@@ -8,7 +8,7 @@
 //! of reach of someone who holds the whole store and a list of guesses.
 //!
 //! Window charges are applied with the limits and run usage of the same decision, in the same
-//! transaction ([`LeaseStore::charge_windowed`](crate::LeaseStore::charge_windowed)), and
+//! transaction ([`RunLimits::charge_windowed`](crate::RunLimits::charge_windowed)), and
 //! logged under the decision id so an operator refund returns them, once, to the window each
 //! was charged to. A window counter saturates at [`WindowCharge::MAX`] and never refuses a
 //! call. Revoking a run does not touch windows: "revoke the run, start a new one" must not
@@ -101,7 +101,7 @@ pub(crate) fn plan_windows(
     Ok(out)
 }
 
-/// What one [`LeaseStore::prune_user_windows`](crate::LeaseStore::prune_user_windows) pass did.
+/// What one [`StoreRetention::prune_user_windows`](crate::StoreRetention::prune_user_windows) pass did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct WindowPrune {
     /// Window counters deleted.

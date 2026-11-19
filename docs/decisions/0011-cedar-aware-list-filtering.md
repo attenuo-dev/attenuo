@@ -1,6 +1,6 @@
 ---
-status: proposed
-date: 2026-10-25
+status: accepted
+date: 2026-11-12
 decision-makers: [7Mudit]
 consulted: []
 informed: []
@@ -30,7 +30,7 @@ The proxy filters list results by capability shape only, so an agent is shown to
 
 ## Decision Outcome
 
-Proposed (built on `feat/cedar-list-filter`, see Confirmation): "Hide only when the policy denies for every possible input", behind `[proxy] list_filter = "policy"` with `"capabilities"` (today's behaviour) as the default, because it is the only option that is sound and keeps approval-gated tools. It needs cedar-policy's experimental `partial-eval` feature in `attenuo-policy`; Cedar's type-aware `tpe` cannot be used, since it takes the context only fully known or fully unknown and would lose the chain and user facts that make the screen useful. The first slice covers `tools/list` only, wherever the answer arrives, with the tests listed in [design section 4](../design/cedar-aware-list-filtering.md#4-chosen-design-proposed). If the experimental feature is not acceptable, the fallback is the catalog stage alone, which needs no Cedar change (design open question 1).
+Chosen (built on `feat/cedar-list-filter`, see Confirmation): "Hide only when the policy denies for every possible input", behind `[proxy] list_filter = "policy"` with `"capabilities"` (today's behaviour) as the default, because it is the only option that is sound and keeps approval-gated tools. It needs cedar-policy's experimental `partial-eval` feature in `attenuo-policy`; Cedar's type-aware `tpe` cannot be used, since it takes the context only fully known or fully unknown and would lose the chain and user facts that make the screen useful. The first slice covers `tools/list` only, wherever the answer arrives, with the tests listed in [design section 4](../design/cedar-aware-list-filtering.md#4-chosen-design-proposed). If the experimental feature is not acceptable, the fallback is the catalog stage alone, which needs no Cedar change (design open question 1).
 
 ### Consequences
 
@@ -44,7 +44,7 @@ Proposed (built on `feat/cedar-list-filter`, see Confirmation): "Hide only when 
 
 ### Confirmation
 
-Built on branch `feat/cedar-list-filter` (2026-11-05) and merged to `main` as an opt-in setting (`[proxy] list_filter = "policy"`; the default is unchanged). The status stays proposed until the maintainer accepts it.
+Built on branch `feat/cedar-list-filter` (2026-11-05) and merged to `main` as an opt-in setting (`[proxy] list_filter = "policy"`; the default is unchanged). The maintainer accepted it on 2026-11-12; the setting stays opt-in.
 
 - **Bench** (`cargo bench -p attenuo-policy --bench list_screen`, next to `policy_stage`; [bench note](../design/bench/2026-11-05-vm-list-screen.md)). cedar-policy 4.14.0's `partial-eval` expresses the screen: `is_authorized_partial` with `originating_user` and `chain` concrete and the call-time members unknown. For the starter policy and a 200-tool catalog (133 hidden, 67 kept): **4.9 ms per uncached list at 1 hop, 5.5 to 5.9 ms at 3 hops** (about 25 us per tool, 9 us of it partial evaluation, against 6 us for a concrete one); with an approval obligation, 5.0 and 5.7 to 6.1 ms; **a memoised list 80 to 91 us**. End to end through the server, a 200-tool `tools/list` takes 5 to 8 ms longer on a chain's first list and 0.4 to 0.8 ms longer on a repeated one, against 1.8 to 2.0 ms with `"capabilities"`. The estimate above (2 to 5 ms warm, about 25 ms first) was pessimistic: the screen builds the chain's entities once per list. `policy_stage` with the feature on is unchanged within 0.7 us.
 - **Tests.** `crates/attenuo-policy/tests/list_screen.rs`: the soundness proptest `every_hidden_tool_is_denied_for_generated_calls` (512 cases; every hidden tool is denied by `authorize_labelled` for generated arguments, taint, argument labels, approvals, budgets, usage, time and session id, under the starter policy with extra call-time rules and the injection suite's five suite policies with their approval add-ons; it caught a deliberately broken `session_id` handling), `the_soundness_suites_hide_and_keep_tools`, `policy_screen_hides_tools_no_permit_can_allow`, `policy_screen_hides_sensitive_tools_for_users_without_mfa`, `policy_screen_hides_every_tool_for_chains_deeper_than_the_policy_allows`, `policy_screen_keeps_approval_gated_tools`, `policy_screen_keeps_tools_whose_permit_depends_on_input`, `policy_screen_keeps_tools_whose_permit_depends_on_time`, `policy_screen_keeps_tools_allowed_only_without_a_session_id`, `policy_screen_hides_uncatalogued_tools_only_under_unknown_tools_deny`, `a_reload_bumps_the_generation_and_empties_the_memo`, `imported_narrowing_is_part_of_the_memo_key`. `crates/attenuo-server/tests/list_screen.rs`: `hidden_tools_are_still_decided_when_called` (same `policy_deny` and audit record as with `"capabilities"`), `approval_gated_tools_stay_listed`, `a_policy_reload_changes_the_hidden_set`, `policy_mode_hides_tools_no_call_could_use_and_writes_no_record` (JSON and SSE), `the_default_mode_lists_what_the_capabilities_allow`. `crates/attenuo-proxy/tests/list_screen.rs`: JSON, SSE, batch and listen-stream answers, screening after the capability filter, `list_filter_defaults_to_capabilities_and_never_screens`. Config: `list_filter_defaults_to_capabilities_and_refuses_unknown_values`. The existing list-filter tests pass unchanged.
@@ -75,6 +75,5 @@ Built on branch `feat/cedar-list-filter` (2026-11-05) and merged to `main` as an
 
 ## More Information
 
-- Board: the two "consider Cedar-aware list filtering" items in [docs/tasks/board.md](../tasks/board.md) point here.
 - Related: [ADR-0005](0005-policy-decision-point.md) (capabilities first, then Cedar), [ADR-0009](0009-output-labelling.md) (approval obligations, run taint), [ADR-0010](0010-run-limits.md) (run usage and budgets in context), [server pipeline, list filtering](../design/server.md#list-filtering).
 - Cedar experimental features: [cedar-policy RFCs](https://github.com/cedar-policy/rfcs/blob/main/README.md#experimental-features).

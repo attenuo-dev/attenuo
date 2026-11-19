@@ -20,7 +20,7 @@ from typing import Any, TypeGuard
 import httpx
 
 from . import _wire as w
-from .errors import AttenuoError, Denied, RpcError
+from .errors import AttenuoError, Denied, RpcError, TransportTimeout
 
 #: The default bound on one SSE event (or a plain JSON answer) of a streamed call: 16 MiB, the
 #: proxy's ``[proxy] max_upstream_body_bytes`` default.
@@ -66,9 +66,13 @@ class Deadline:
         self.seconds = seconds
         self.end = None if seconds is None else time.monotonic() + seconds
 
+    def left(self) -> float | None:
+        """Seconds until the deadline (``None`` without one)."""
+        return None if self.end is None else self.end - time.monotonic()
+
     def check(self) -> None:
         if self.end is not None and time.monotonic() >= self.end:
-            raise AttenuoError(f"stream deadline of {self.seconds:g}s elapsed")
+            raise TransportTimeout(f"stream deadline of {self.seconds:g}s elapsed")
 
 
 @dataclass(frozen=True)
@@ -260,7 +264,7 @@ def stream_end_error(msg: dict[str, Any]) -> Denied | RpcError | None:
     message = str(err.get("message", ""))
     data = err.get("data")
     if _is_stream_end(data):
-        return Denied(data["reason"], data.get("decision_id"), message)
+        return Denied(data["reason"], data.get("decision_id"), message, data)
     return RpcError(w.CODE_UNAUTHORIZED, message, data)
 
 

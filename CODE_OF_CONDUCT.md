@@ -59,9 +59,8 @@ representative at an online or offline event.
 ## Enforcement
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
-reported to the community leaders responsible for enforcement at
-`conduct@<domain>` (placeholder until the project domain is set; until then,
-contact the maintainers listed in [MAINTAINERS.md](MAINTAINERS.md) directly).
+reported to the community leaders responsible for enforcement, privately, at
+<attenuo.dev@gmail.com>. The maintainers are listed in [MAINTAINERS.md](MAINTAINERS.md).
 All complaints will be reviewed and investigated promptly and fairly.
 
 All community leaders are obligated to respect the privacy and security of the

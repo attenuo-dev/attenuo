@@ -124,7 +124,7 @@ step 0 'attenuo token root --subject alice --agent planner --may-act coder'
 PLANNER="$(field token)"; PLANNER_LEASE="$(field lease)"
 
 say "2. The planner looks at the issues it was asked to plan for: allowed"
-step 0 'ATTENUO_TOKEN="$PLANNER" attenuo call --server github --tool list_issues --arg repo=acme/api'
+step 0 'ATTENUO_TOKEN="$PLANNER" attenuo call --upstream github --tool list_issues --arg repo=acme/api'
 expect ALLOWED
 
 say "3. Refused exchange: the coder asks for get_file_contents on any repository"
@@ -152,23 +152,23 @@ expect "is not permitted to act on this token (may_act)"
 expect "decision "
 
 say "7. The coder reads the file it was asked to fix: allowed"
-step 0 'ATTENUO_TOKEN="$CODER" attenuo call --server github --tool get_file_contents --arg repo=acme/api --arg path=src/lib.rs'
+step 0 'ATTENUO_TOKEN="$CODER" attenuo call --upstream github --tool get_file_contents --arg repo=acme/api --arg path=src/lib.rs'
 expect ALLOWED
 
 say "8. The coder pushes its fix straight to main: denied by policy"
 note "create_or_update_file on acme/api is in the coder's token; the policy wants an agent/* branch."
-step 2 'ATTENUO_TOKEN="$CODER" attenuo call --server github --tool create_or_update_file --arg repo=acme/api --arg path=src/lib.rs --arg branch=main --arg content="fn fixed() {}"'
+step 2 'ATTENUO_TOKEN="$CODER" attenuo call --upstream github --tool create_or_update_file --arg repo=acme/api --arg path=src/lib.rs --arg branch=main --arg content="fn fixed() {}"'
 expect policy_deny
 WRITE_DECISION="$(field decision)"
 
 say "9. The coder tries to open an issue: denied, the planner never delegated create_issue"
-step 2 'ATTENUO_TOKEN="$CODER" attenuo call --server github --tool create_issue --arg repo=acme/api --arg title="fix pushed"'
+step 2 'ATTENUO_TOKEN="$CODER" attenuo call --upstream github --tool create_issue --arg repo=acme/api --arg title="fix pushed"'
 expect capability_denied
 
 say "10. The coder reads from a second repository under acme/api: denied by the run limit"
 note "acme/api-client is inside the coder's repo prefix and the policy allows the read, but the"
 note "distinct limit allows one repository per run and acme/api was the first."
-step 2 'ATTENUO_TOKEN="$CODER" attenuo call --server github --tool get_file_contents --arg repo=acme/api-client --arg path=README.md'
+step 2 'ATTENUO_TOKEN="$CODER" attenuo call --upstream github --tool get_file_contents --arg repo=acme/api-client --arg path=README.md'
 expect budget_exhausted
 
 say "11. The operator looks at the chain before acting"
@@ -181,7 +181,7 @@ step 0 'attenuo lease revoke --chain-id "$PLANNER_LEASE" --reason "planner run w
 expect "revoked 2 lease(s)"
 
 say "13. The coder's next call, even the one that worked before, is denied"
-step 2 'ATTENUO_TOKEN="$CODER" attenuo call --server github --tool get_file_contents --arg repo=acme/api --arg path=src/lib.rs'
+step 2 'ATTENUO_TOKEN="$CODER" attenuo call --upstream github --tool get_file_contents --arg repo=acme/api --arg path=src/lib.rs'
 expect lease_revoked
 
 say "14. The audit log records every decision, and its hash chain checks out"

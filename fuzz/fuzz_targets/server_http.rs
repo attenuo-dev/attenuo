@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 
 use arbitrary::{Result, Unstructured};
-use attenuo_audit::LeaseStore;
+use attenuo_audit::LeaseRegistry;
 use attenuo_core::limits::MAX_COUNTED_VALUES;
 use attenuo_core::{AgentId, ArgLimit, Capability, CapabilitySet, Derive, Limits, OriginatingUser};
 use attenuo_fuzz::{edge_number, edge_string, json_value};

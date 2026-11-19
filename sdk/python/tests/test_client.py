@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import inspect
 import json
 from collections.abc import Callable
@@ -11,13 +12,21 @@ import httpx
 import pytest
 
 from attenuo import (
+    AdminClient,
     ApiError,
     ArgLimit,
+    AsyncAdminClient,
     AsyncClient,
     AttenuoError,
+    AuthzenAction,
+    AuthzenActionPage,
+    AuthzenConfiguration,
+    AuthzenEntryError,
+    AuthzenEvaluation,
     Capability,
     Client,
     Denied,
+    DpopKey,
     Prefix,
     RpcError,
     Token,
@@ -214,6 +223,33 @@ async def test_exchange_with_actor_token_and_may_act(make: Any) -> None:
         await call(client, "exchange", parent, "coder", "github:read_file", actor_token=" ")
     with pytest.raises(TypeError):
         await call(client, "exchange", parent, "coder", "github:read_file", may_act="reviewer")
+
+
+async def test_exchange_with_a_client_assertion(make: Any) -> None:
+    s = Signer()
+    parent = s.mint(("planner",))
+    child = s.mint(("planner", "coder"))
+    client, rec = make(lambda r: httpx.Response(200, json=token_response(child)))
+    await call(client, "exchange", parent, "coder", "github:read_file", client_assertion=" a.b.c\n")
+    body = rec.body()
+    assert body["client_assertion"] == "a.b.c"
+    assert body["client_assertion_type"] == (
+        "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+    )
+    assert "client_id" not in body and "client_secret" not in body
+    assert body["subject_token_type"] == "urn:ietf:params:oauth:token-type:jwt"
+    # Hop 0: an IdP credential with an assertion, client_id allowed alongside.
+    await call(
+        client, "exchange", "ID.TOKEN.JWT", "planner", "github:*",
+        client_id="planner", client_assertion="a.b.c",
+    )  # fmt: skip
+    body = rec.body()
+    assert body["subject_token_type"] == "urn:ietf:params:oauth:token-type:id_token"
+    assert body["client_id"] == "planner"
+    # One method per request (RFC 6749 §2.3), and never an empty assertion.
+    for bad in ({"client_secret": "cs", "client_assertion": "a.b.c"}, {"client_assertion": " "}):
+        with pytest.raises(ValueError):
+            await call(client, "exchange", parent, "coder", "github:read_file", **bad)
 
 
 async def test_exchange_errors(make: Any) -> None:
@@ -525,3 +561,350 @@ def test_context_managers() -> None:
 async def test_async_context_manager() -> None:
     async with AsyncClient(BASE, transport=httpx.MockTransport(lambda r: httpx.Response(200))) as c:
         assert c.server_url == BASE
+
+
+# --- K-5: AuthZEN batch and discovery, MCP session close -------------------------------------
+
+
+async def test_authzen_evaluate_batch_wire_format_and_answers(make: Any) -> None:
+    answer = {
+        "evaluations": [
+            {"decision": True, "context": {"reason": "policy_allow", "decision_id": "d1"}},
+            {"decision": False, "context": {"reason": "capability_denied", "decision_id": "d2"}},
+            {
+                "decision": False,
+                "context": {
+                    "error": {"status": 400, "code": "invalid_request", "message": "bad entry"}
+                },
+            },
+        ]
+    }
+    client, rec = make(lambda r: httpx.Response(200, json=answer))
+    out = await call(
+        client,
+        "authzen_evaluate_batch",
+        "TOK",
+        [
+            AuthzenEvaluation("github", "read_file", {"repo": "a/b"}),
+            ("github", "create_issue"),
+            ("github", "delete_repo", {"repo": "a/b"}),
+        ],
+        semantic="deny_on_first_deny",
+    )
+    assert (rec.last.method, rec.last.url.path) == ("POST", "/access/v1/evaluations")
+    assert rec.last.headers["authorization"] == "Bearer TOK"
+    assert rec.body() == {
+        "subject": {"type": "agent", "id": ""},
+        "evaluations": [
+            {
+                "action": {"name": "read_file", "properties": {"server": "github"}},
+                "resource": {"type": "tool", "id": "github/read_file"},
+                "context": {"input": {"repo": "a/b"}},
+            },
+            {
+                "action": {"name": "create_issue", "properties": {"server": "github"}},
+                "resource": {"type": "tool", "id": "github/create_issue"},
+                "context": {"input": {}},
+            },
+            {
+                "action": {"name": "delete_repo", "properties": {"server": "github"}},
+                "resource": {"type": "tool", "id": "github/delete_repo"},
+                "context": {"input": {"repo": "a/b"}},
+            },
+        ],
+        "options": {"evaluations_semantic": "deny_on_first_deny"},
+    }
+    assert [(d.decision, d.reason, d.decision_id) for d in out] == [
+        (True, "policy_allow", "d1"),
+        (False, "capability_denied", "d2"),
+        (False, "", None),
+    ]
+    assert out[0].error is None
+    assert out[2].error == AuthzenEntryError(400, "invalid_request", "bad entry")
+
+    # No semantic: no `options`; a stopped batch answers fewer entries.
+    client, rec = make(
+        lambda r: httpx.Response(200, json={"evaluations": answer["evaluations"][:1]})
+    )
+    out = await call(client, "authzen_evaluate_batch", "TOK", [("github", "a"), ("github", "b")])
+    assert "options" not in rec.body() and len(out) == 1
+
+
+async def test_authzen_evaluate_batch_refusals(make: Any) -> None:
+    client, rec = make(lambda r: httpx.Response(500))
+    with pytest.raises(ValueError, match="at least one"):
+        await call(client, "authzen_evaluate_batch", "TOK", [])
+    with pytest.raises(ValueError, match="semantic"):
+        await call(client, "authzen_evaluate_batch", "TOK", [("s", "t")], semantic="first")
+    with pytest.raises(TypeError):
+        await call(client, "authzen_evaluate_batch", "TOK", ["s/t"])
+    assert rec.requests == []
+
+    too_many = {"error": "batch_too_large", "detail": "65 evaluations exceed [authzen] max_batch"}
+    client, _ = make(lambda r: httpx.Response(400, json=too_many))
+    with pytest.raises(ApiError) as e:
+        await call(client, "authzen_evaluate_batch", "TOK", [("s", "t")])
+    assert (e.value.status, e.value.error) == (400, "batch_too_large")
+
+    expired = {
+        "error": "invalid_token",
+        "detail": "expired",
+        "error_description": "expired",
+    }
+    client, _ = make(lambda r: httpx.Response(401, json=expired))
+    with pytest.raises(Unauthorized) as u:
+        await call(client, "authzen_evaluate_batch", "TOK", [("s", "t")])
+    assert u.value.description == "expired"
+
+    client, _ = make(lambda r: httpx.Response(200, json={"decision": True}))
+    with pytest.raises(AttenuoError, match="batch response"):
+        await call(client, "authzen_evaluate_batch", "TOK", [("s", "t")])
+
+
+async def test_authzen_evaluate_batch_signs_with_dpop(make: Any) -> None:
+    key = DpopKey.generate()
+    client, rec = make(lambda r: httpx.Response(200, json={"evaluations": []}), dpop_key=key)
+    assert await call(client, "authzen_evaluate_batch", "TOK", [("s", "t")]) == []
+    assert rec.last.headers["authorization"] == "DPoP TOK"
+    claims = json.loads(base64.urlsafe_b64decode(rec.last.headers["dpop"].split(".")[1] + "=="))
+    assert (claims["htm"], claims["htu"]) == ("POST", f"{BASE}/access/v1/evaluations")
+
+
+async def test_authzen_configuration(make: Any) -> None:
+    doc = {
+        "policy_decision_point": "https://pdp.example",
+        "access_evaluation_endpoint": "https://pdp.example/access/v1/evaluation",
+        "access_evaluations_endpoint": "https://pdp.example/access/v1/evaluations",
+    }
+    client, rec = make(lambda r: httpx.Response(200, json=doc))
+    cfg = await call(client, "authzen_configuration")
+    assert (rec.last.method, rec.last.url.path) == ("GET", "/.well-known/authzen-configuration")
+    assert "authorization" not in rec.last.headers
+    assert isinstance(cfg, AuthzenConfiguration)
+    assert cfg.policy_decision_point == "https://pdp.example"
+    assert cfg.access_evaluation_endpoint.endswith("/access/v1/evaluation")
+    assert cfg.access_evaluations_endpoint.endswith("/access/v1/evaluations")
+    assert cfg.search_action_endpoint == ""
+    assert cfg.raw == doc
+    with_search = {**doc, "search_action_endpoint": "https://pdp.example/access/v1/search/action"}
+    client, _ = make(lambda r: httpx.Response(200, json=with_search))
+    cfg = await call(client, "authzen_configuration")
+    assert cfg.search_action_endpoint == with_search["search_action_endpoint"]
+
+    bad_host = {"error": "invalid_host", "detail": "Host must be localhost"}
+    client, _ = make(lambda r: httpx.Response(400, json=bad_host))
+    with pytest.raises(ApiError) as e:
+        await call(client, "authzen_configuration")
+    assert e.value.error == "invalid_host"
+
+
+async def test_authzen_search_action_wire_format_and_paging(make: Any) -> None:
+    pages = [
+        {
+            "page": {"next_token": "T1", "count": 1},
+            "results": [{"name": "read_file", "properties": {"server": "github"}}],
+        },
+        {"page": {"next_token": "T2", "count": 0}, "results": []},
+        {
+            "page": {"next_token": "", "count": 1},
+            "results": [{"name": "search", "properties": {"server": "github"}}],
+        },
+    ]
+
+    def handler(r: httpx.Request) -> httpx.Response:
+        token = json.loads(r.content).get("page", {}).get("token")
+        return httpx.Response(200, json=pages[{None: 0, "T1": 1, "T2": 2}[token]])
+
+    client, rec = make(handler)
+    page = await call(client, "authzen_search_action", "TOK", "github", {"repo": "a/b"}, limit=2)
+    assert (rec.last.method, rec.last.url.path) == ("POST", "/access/v1/search/action")
+    assert rec.last.headers["authorization"] == "Bearer TOK"
+    assert rec.body() == {
+        "subject": {"type": "agent", "id": ""},
+        "resource": {"type": "mcp_server", "id": "github"},
+        "context": {"input": {"repo": "a/b"}},
+        "page": {"limit": 2},
+    }
+    assert isinstance(page, AuthzenActionPage)
+    assert page.actions == [AuthzenAction("read_file", "github")]
+    assert page.next_token == "T1" and page.raw == pages[0]
+
+    page = await call(client, "authzen_search_action", "TOK", "github", page_token="T2")
+    assert rec.body() == {
+        "subject": {"type": "agent", "id": ""},
+        "resource": {"type": "mcp_server", "id": "github"},
+        "context": {"input": {}},
+        "page": {"token": "T2"},
+    }
+    assert page.actions == [AuthzenAction("search", "github")]
+    assert page.next_token is None, "the server's empty token is the last page"
+
+    # The iterator follows next_token through an empty page to the last one.
+    it = client.authzen_search_action_iter("TOK", "github", limit=2)
+    names = [a.name async for a in it] if hasattr(it, "__aiter__") else [a.name for a in it]
+    assert names == ["read_file", "search"]
+    assert [json.loads(r.content).get("page") for r in rec.requests[-3:]] == [
+        {"limit": 2},
+        {"token": "T1", "limit": 2},
+        {"token": "T2", "limit": 2},
+    ]
+
+
+async def test_authzen_search_action_refusals(make: Any) -> None:
+    stuck = {"page": {"next_token": "T", "count": 0}, "results": []}
+    client, _ = make(lambda r: httpx.Response(200, json=stuck))
+    it = client.authzen_search_action_iter("TOK", "github")
+    with pytest.raises(AttenuoError, match="did not advance"):
+        if inspect.isasyncgen(it):
+            async for _ in it:
+                pass
+        else:
+            for _ in it:
+                pass
+
+    bad = {"error": "invalid_request", "code": "invalid_search_resource", "detail": "one tool"}
+    client, _ = make(lambda r: httpx.Response(400, json=bad))
+    with pytest.raises(ApiError) as e:
+        await call(client, "authzen_search_action", "TOK", "github/read_file")
+    assert (e.value.status, e.value.code) == (400, "invalid_search_resource")
+
+    expired = {"error": "invalid_token", "detail": "expired", "error_description": "expired"}
+    client, _ = make(lambda r: httpx.Response(401, json=expired))
+    with pytest.raises(Unauthorized):
+        await call(client, "authzen_search_action", "TOK", "github")
+
+    odd: dict[str, Any]
+    for odd in ({"decision": True}, {"results": [{"properties": {}}]}):
+        client, _ = make(lambda r, odd=odd: httpx.Response(200, json=odd))
+        with pytest.raises(AttenuoError, match="action search"):
+            await call(client, "authzen_search_action", "TOK", "github")
+
+    client, _ = make(lambda r: httpx.Response(200, json=stuck))
+    with pytest.raises(ValueError, match="no token"):
+        await call(client, "authzen_search_action", None, "github")
+
+
+async def test_authzen_search_action_signs_with_dpop(make: Any) -> None:
+    key = DpopKey.generate()
+    empty = {"page": {"next_token": "", "count": 0}, "results": []}
+    client, rec = make(lambda r: httpx.Response(200, json=empty), dpop_key=key)
+    page = await call(client, "authzen_search_action", "TOK", "github")
+    assert page.actions == [] and page.next_token is None
+    assert rec.last.headers["authorization"] == "DPoP TOK"
+    claims = json.loads(base64.urlsafe_b64decode(rec.last.headers["dpop"].split(".")[1] + "=="))
+    assert (claims["htm"], claims["htu"]) == ("POST", f"{BASE}/access/v1/search/action")
+
+
+async def test_close_session(make: Any) -> None:
+    client, rec = make(lambda r: httpx.Response(204))
+    assert await call(client, "close_session", "TOK", "github", "s-1") is True
+    assert (rec.last.method, rec.last.url.path) == ("DELETE", "/mcp/github")
+    assert rec.last.headers["mcp-session-id"] == "s-1"
+    assert rec.last.headers["authorization"] == "Bearer TOK"
+
+    client, _ = make(lambda r: httpx.Response(405))
+    assert await call(client, "close_session", "TOK", "github", "s-1") is False
+
+    client, _ = make(lambda r: rpc_err(-32600, "unknown session", status=404))
+    with pytest.raises(RpcError) as e:
+        await call(client, "close_session", "TOK", "github", "s-1")
+    assert e.value.code == -32600
+
+    data = {"reason": "session_mismatch", "decision_id": "dec-9"}
+    client, _ = make(
+        lambda r: rpc_err(-32003, "denied", data, 403, {"x-attenuo-decision-id": "dec-9"})
+    )
+    with pytest.raises(Denied) as d:
+        await call(client, "close_session", "TOK", "github", "s-1")
+    assert (d.value.reason, d.value.decision_id) == ("session_mismatch", "dec-9")
+
+    client, _ = make(lambda r: rpc_err(-32001, "revoked", {"reason": "lease_revoked"}, 401))
+    with pytest.raises(Unauthorized) as u:
+        await call(client, "close_session", "TOK", "github", "s-1")
+    assert u.value.reason == "lease_revoked"
+
+    client, _ = make(lambda r: httpx.Response(502, text="bad gateway"))
+    with pytest.raises(ApiError) as a:
+        await call(client, "close_session", "TOK", "github", "s-1")
+    assert a.value.status == 502
+
+    with pytest.raises(ValueError):
+        await call(client, "close_session", "TOK", "github", "")
+    with pytest.raises(ValueError):
+        await call(client, "close_session", "TOK", "..", "s-1")
+
+
+async def test_close_session_signs_a_delete_with_dpop(make: Any) -> None:
+    client, rec = make(lambda r: httpx.Response(200), dpop_key=DpopKey.generate())
+    assert await call(client, "close_session", "TOK", "github", "s-1") is True
+    claims = json.loads(base64.urlsafe_b64decode(rec.last.headers["dpop"].split(".")[1] + "=="))
+    assert (claims["htm"], claims["htu"]) == ("DELETE", f"{BASE}/mcp/github")
+
+
+@pytest.mark.parametrize("cls", [Client, AsyncClient, AdminClient, AsyncAdminClient])
+def test_no_client_follows_redirects_sr112(cls: Any) -> None:
+    """No client follows a redirect (SR-112), whatever it was constructed with."""
+    admin = cls in (AdminClient, AsyncAdminClient)
+    client = cls("http://ob.test", "t") if admin else cls("http://ob.test")
+    assert client._http.follow_redirects is False
+
+
+@pytest.fixture
+def redirecting() -> Any:
+    """A server answering every request ``307`` to a second one, which records what it gets.
+    Yields the first one's URL, the ``Location`` and the list of requests the second got."""
+    import http.server
+    import threading
+
+    seen: list[bytes] = []
+
+    class Collect(http.server.BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            seen.append(self.rfile.read(int(self.headers.get("content-length", 0))))
+            self.send_response(400)
+            self.end_headers()
+
+        def log_message(self, *args: Any) -> None:
+            pass
+
+    other = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Collect)
+    location = f"http://127.0.0.1:{other.server_address[1]}/collect"
+
+    class Redirect(http.server.BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            self.rfile.read(int(self.headers.get("content-length", 0)))
+            self.send_response(307)
+            self.send_header("location", location)
+            self.send_header("content-length", "0")
+            self.end_headers()
+
+        def log_message(self, *args: Any) -> None:
+            pass
+
+    front = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Redirect)
+    for srv in (other, front):
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+    yield f"http://127.0.0.1:{front.server_address[1]}", location, seen
+    for srv in (other, front):
+        srv.shutdown()
+        srv.server_close()
+
+
+@pytest.mark.parametrize("cls", [Client, AsyncClient])
+async def test_a_redirect_is_an_error_naming_its_location_sr112(cls: Any, redirecting: Any) -> None:
+    """A ``307`` from the server URL raises ``ApiError`` ``redirect_not_followed`` naming the
+    ``Location``, and the other origin gets nothing, client secret included (SR-112)."""
+    url, location, seen = redirecting
+    client = cls(url)
+    with pytest.raises(ApiError) as e:
+        out = client.exchange(
+            "a.b.c", "coder", "github:read_file", client_id="coder", client_secret="sr112-secret"
+        )
+        if inspect.isawaitable(out):
+            await out
+    assert e.value.status == 307
+    assert e.value.code == "redirect_not_followed"
+    assert f"Location {location}" in str(e.value)
+    assert "does not follow redirects" in str(e.value)
+    assert "sr112-secret" not in str(e.value)
+    assert seen == []

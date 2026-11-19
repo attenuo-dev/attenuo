@@ -1,7 +1,12 @@
-# ADR-0003: Apache License 2.0
+---
+status: accepted
+date: 2026-10-22
+decision-makers: [7Mudit]
+consulted: []
+informed: []
+---
 
-- Status: accepted
-- Date: 2026-10-22
+# ADR-0003. Apache License 2.0
 
 ## Context
 

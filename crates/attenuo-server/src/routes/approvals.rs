@@ -7,8 +7,8 @@
 //! |---|---|---|
 //! | `POST /approvals/{id}` | an ID token of the run's originating user, from a trusted `[[idps]]` | grant or decline (`by = "user"`) |
 //! | `GET /approvals/{id}` | that user's ID token, or a delegation token of the same run with live leases | the exact call, labels (and matched arguments, `untrusted_args`), state and expiry |
-//! | `POST /admin/approvals/{id}` | admin bearer | grant or decline as an operator (`by = "operator"`) |
-//! | `GET /admin/approvals/{id}`, `GET /admin/approvals?chain_id=` | admin bearer | one approval; the newest approvals of a run (console, CLI) |
+//! | `POST /admin/approvals/{id}` | admin credential, role `operator` or `admin` | grant or decline as an operator (`by = "operator"`, approver the operator's subject) |
+//! | `GET /admin/approvals/{id}`, `GET /admin/approvals?chain_id=&state=&cursor=` | admin bearer | one approval; approvals newest first, paged with a cursor (console, CLI) |
 //!
 //! The ID token is checked as hop-0 intake checks it (signature, `iss`, `aud`/`azp` bound to
 //! the run's root agent's client id or to `[approvals] client_id`, expiry), its `sub` and
@@ -36,26 +36,32 @@
 
 use std::sync::Arc;
 
-use attenuo_audit::{Approval, ApprovalMethod, ApprovalState, Approver, AuditError, LeaseStore};
+use attenuo_audit::{
+    Approval, ApprovalMethod, ApprovalState, ApprovalStore, Approver, AuditError, LeaseRegistry,
+};
 use attenuo_core::{
     ApprovalInfo, Decision, DecisionRecord, LeaseId, RecordKind, ToolCall,
     REASON_APPROVAL_DECLINED, REASON_APPROVAL_GRANTED,
 };
-use axum::body::Bytes;
-use axum::extract::{Path, Query, State};
+use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
-use axum::Json;
+use axum::{Extension, Json};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
-use super::{bearer_of, parse_json, ADMIN_SUBJECT};
+use super::extract::{Body, Path, Query};
+use super::page;
+use super::{bearer_of, parse_json};
 use crate::error::{ApiError, REASON_MISSING_TOKEN};
+use crate::operators::AdminIdentity;
 use crate::state::AppState;
 
-/// Most approvals `GET /admin/approvals` returns.
+/// Most approvals one `GET /admin/approvals` page returns; a larger `limit` is a 400.
 pub const MAX_LIST: usize = 500;
+/// Page size of `GET /admin/approvals` without `limit`.
+pub const DEFAULT_LIST: usize = 100;
 
 /// Body of a decision: `{"decision": "grant" | "decline"}`.
 #[derive(Debug, Deserialize)]
@@ -85,7 +91,9 @@ pub struct ListQuery {
     pub chain_id: Option<String>,
     /// Only approvals in this state (`pending`, `granted`, `declined`, `consumed`).
     pub state: Option<String>,
-    /// At most this many (default and maximum [`MAX_LIST`]).
+    /// The `next_cursor` of the previous page ([`super::page`]).
+    pub cursor: Option<String>,
+    /// Page size (default [`DEFAULT_LIST`], at most [`MAX_LIST`]).
     pub limit: Option<usize>,
 }
 
@@ -240,7 +248,7 @@ fn decide(
         approval = %a.id,
         outcome = if grant { "grant" } else { "decline" },
         by = approver.method.by(),
-        approver = ?approver.subject,
+        approver = ?state.pipeline.subject_log().show(&approver.subject),
         tool = ?a.tool,
         "approval decided"
     );
@@ -308,7 +316,7 @@ async fn verify_user(
 /// `decline`; 401 `unauthorized` when no bearer token is sent, and 401 `invalid_token` when the ID
 /// token does not verify; 403 `agent_token_refused` for a delegation token and 403 `wrong_user` for
 /// another user's ID token; 400 `invalid_grant` (`replayed`) for an ID token already used, and 503
-/// when the replay cache is full; 404 `not_found` for an unknown approval; 409
+/// when its use cannot be recorded (`replay_cache_full`, `replay_store_unavailable`); 404 `not_found` for an unknown approval; 409
 /// `approval_not_pending`, `approval_expired` or `lease_revoked` when it cannot be decided; 500
 /// `server_error` when the store fails or the decision cannot be audited (the decision is then
 /// dropped).
@@ -316,7 +324,7 @@ pub async fn user_decide(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     headers: HeaderMap,
-    body: Bytes,
+    Body(body): Body,
 ) -> Result<Json<Value>, ApiError> {
     let body: DecideBody = parse_json(&body)?;
     let grant = body.grant()?;
@@ -406,7 +414,9 @@ pub async fn user_get(
 }
 
 /// `POST /admin/approvals/{id}` with `{"decision": "grant" | "decline"}`: an operator decides
-/// (`by = "operator"`, approver `urn:attenuo:admin`).
+/// (`by = "operator"`, method `admin_token`, approver the operator's subject:
+/// `urn:attenuo:admin` for `[admin] token`, `urn:attenuo:admin:<name>` for a named operator,
+/// [`AdminIdentity::subject`]).
 ///
 /// # Errors
 ///
@@ -416,8 +426,9 @@ pub async fn user_get(
 /// store fails or the decision cannot be audited (the decision is then dropped).
 pub async fn admin_decide(
     State(state): State<Arc<AppState>>,
+    Extension(who): Extension<AdminIdentity>,
     Path(id): Path<String>,
-    body: Bytes,
+    Body(body): Body,
 ) -> Result<Json<Value>, ApiError> {
     let body: DecideBody = parse_json(&body)?;
     let grant = body.grant()?;
@@ -425,7 +436,7 @@ pub async fn admin_decide(
     state
         .blocking(move |s| {
             let approver = Approver {
-                subject: ADMIN_SUBJECT.to_string(),
+                subject: who.subject(),
                 method: ApprovalMethod::AdminToken,
             };
             let a = decide(s, &id, grant, approver, now)?;
@@ -449,12 +460,18 @@ pub async fn admin_get(
         .await
 }
 
-/// `GET /admin/approvals?chain_id=&state=&limit=`: the newest approvals, of one run when
-/// `chain_id` is given.
+/// `GET /admin/approvals?chain_id=&state=&cursor=&limit=`: approvals newest first, of one run
+/// when `chain_id` is given and in one state when `state` is, as `{approvals, next_cursor}`.
+/// Paging is the one style of [`super::page`]; the cursor's position is the store's approval
+/// position, so every approval is reachable however many there are, and approvals created
+/// while a client pages sort above the first page instead of shifting the rest. Both filters
+/// are applied by the store before the limit; send the same ones with each cursor.
 ///
 /// # Errors
 ///
-/// 400 `invalid_request` for an unknown `state`, and 500 `server_error` when the store fails.
+/// 400 `invalid_request` for an unknown `state` or a `limit` of 0 or above [`MAX_LIST`], 400
+/// `invalid_cursor` for a cursor that is malformed or of another route, and 500 `server_error`
+/// when the store fails.
 pub async fn admin_list(
     State(state): State<Arc<AppState>>,
     Query(q): Query<ListQuery>,
@@ -466,22 +483,24 @@ pub async fn admin_list(
                 .map_err(|_| ApiError::bad_request("invalid_request", "unknown state"))?,
         ),
     };
-    let limit = q.limit.unwrap_or(MAX_LIST).clamp(1, MAX_LIST);
+    let limit = page::limit(q.limit, DEFAULT_LIST, MAX_LIST)?;
+    let dir = page::Direction::Descending;
+    let before = page::decode(q.cursor.as_deref(), page::List::Approvals, dir)?;
     let now = state.now();
     state
         .blocking(move |s| {
             let chain = q.chain_id.filter(|c| !c.is_empty()).map(LeaseId::new);
-            // A state filter is applied after the store's limit; ask for the most it gives.
-            let fetch = if want.is_some() { MAX_LIST } else { limit };
-            let approvals: Vec<Value> = s
+            // One more than the page, to tell whether anything follows it.
+            let mut listed = s
                 .leases
-                .approvals(chain.as_ref(), fetch)?
-                .iter()
-                .filter(|a| want.is_none_or(|w| a.state == w))
-                .take(limit)
-                .map(|a| approval_json(a, now))
-                .collect();
-            Ok(Json(json!({ "approvals": approvals })))
+                .approvals(chain.as_ref(), want, before, limit + 1)?;
+            let next = (listed.len() > limit).then(|| listed[limit - 1].0);
+            listed.truncate(limit);
+            let approvals: Vec<Value> = listed.iter().map(|(_, a)| approval_json(a, now)).collect();
+            Ok(Json(json!({
+                "approvals": approvals,
+                "next_cursor": next.map(|p| page::encode(page::List::Approvals, dir, p)),
+            })))
         })
         .await
 }

@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::*;
 use attenuo_audit::{
-    AuditEntry, AuditError, Durability, MemoryAudit, MemoryLeaseStore, SqliteAudit,
+    AuditEntry, AuditError, Durability, LeaseRegistry, MemoryAudit, MemoryLeaseStore, SqliteAudit,
     SqliteLeaseStore, VerifyReport,
 };
 use attenuo_audit::{AuditSink, LeaseStore};
@@ -15,7 +15,7 @@ use attenuo_policy::PolicyEngineBuilder;
 use attenuo_policy::{BudgetContext, UsageContext};
 use serde_json::json;
 use serde_json::Value;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use time::Duration;
 use time::OffsetDateTime;
 
@@ -81,7 +81,7 @@ fn pipeline(leases: Arc<dyn LeaseStore>, audit: Arc<dyn AuditSink>) -> Pipeline 
         .with_track_usage(attenuo_policy::TrackUsage::Always)
         .build()
         .unwrap();
-    Pipeline::new(Arc::new(RwLock::new(engine)), leases, audit)
+    Pipeline::new(Arc::new(SharedPolicy::new(engine)), leases, audit)
 }
 
 fn send(amount: Value) -> ToolCall {
@@ -428,7 +428,7 @@ fn stated_counters_give_the_view_a_store_holding_them_gives() {
 
     for amount in [5, 20] {
         let call = send(json!(amount));
-        let stored = p.budget_view(&c, &call);
+        let stored = p.budget_view(&p.policy_snapshot(), &c, &call);
         let stated = StatedBudget {
             calls_remaining: Some(2),
             amount_remaining: Some(10),
@@ -456,10 +456,15 @@ fn stated_counters_give_the_view_a_store_holding_them_gives() {
             ..StatedBudget::default()
         };
         assert_eq!(stated.unmatched(&stored.charges), None);
-        let from_stated = p.budget_view_from(&c, &call, CounterSource::Stated(&stated));
+        let from_stated = p.budget_view_from(
+            &p.policy_snapshot(),
+            &c,
+            &call,
+            CounterSource::Stated(&stated),
+        );
         assert_eq!(from_stated, stored, "amount {amount}");
     }
-    let over = p.budget_view(&c, &send(json!(20)));
+    let over = p.budget_view(&p.policy_snapshot(), &c, &send(json!(20)));
     assert_eq!(over.hit.as_ref().map(|h| h.kind), Some(LimitKind::Sum));
     assert_eq!(
         over.context.refusal.as_ref().map(|r| r.reason.as_str()),
@@ -480,14 +485,19 @@ fn stated_counters_never_read_the_store() {
     let p = pipeline(leases, Arc::new(MemoryAudit::new()));
     let c = chain(Limits::default().with_calls(5), now);
     let call = send(json!(1));
-    let stored = p.budget_view(&c, &call);
+    let stored = p.budget_view(&p.policy_snapshot(), &c, &call);
     assert_eq!(
         stored.context.refusal.map(|r| r.reason),
         Some(REASON_BUDGET_ERROR.to_string())
     );
 
     let fresh = StatedBudget::default();
-    let v = p.budget_view_from(&c, &call, CounterSource::Stated(&fresh));
+    let v = p.budget_view_from(
+        &p.policy_snapshot(),
+        &c,
+        &call,
+        CounterSource::Stated(&fresh),
+    );
     assert_eq!(v.context.refusal, None);
     assert_eq!(v.context.calls_remaining, 5);
     assert_eq!(v.usage, Some(UsageContext::default()));
@@ -496,7 +506,12 @@ fn stated_counters_never_read_the_store() {
         calls_remaining: Some(0),
         ..StatedBudget::default()
     };
-    let v = p.budget_view_from(&c, &call, CounterSource::Stated(&spent));
+    let v = p.budget_view_from(
+        &p.policy_snapshot(),
+        &c,
+        &call,
+        CounterSource::Stated(&spent),
+    );
     let refusal = v.context.refusal.unwrap();
     assert_eq!(refusal.reason, REASON_BUDGET_EXHAUSTED);
     assert_eq!(
@@ -524,7 +539,12 @@ fn stated_entries_must_name_a_matching_limit_and_unlimited_figures_pass_through(
         }],
         ..StatedBudget::default()
     };
-    let v = p.budget_view_from(&c, &send(json!(1)), CounterSource::Stated(&stated));
+    let v = p.budget_view_from(
+        &p.policy_snapshot(),
+        &c,
+        &send(json!(1)),
+        CounterSource::Stated(&stated),
+    );
     assert_eq!(
         stated.unmatched(&v.charges).as_deref(),
         Some(
@@ -550,4 +570,97 @@ fn stated_entries_must_name_a_matching_limit_and_unlimited_figures_pass_through(
         ..StatedBudget::default()
     };
     assert_eq!(off.unlimited_context(), BudgetContext::default());
+}
+
+/// A stuck audit writer (audit A-3; here a thread holds the log's connection, as a write stuck
+/// on a hung disk would) fails the decision closed with `audit_error` within the append
+/// timeout, instead of blocking the caller for as long as the disk hangs. Once the writer is
+/// free, decisions are allowed again.
+#[test]
+fn a_stuck_audit_writer_denies_within_the_append_timeout() {
+    let now = OffsetDateTime::now_utc();
+    let leases = Arc::new(SqliteLeaseStore::open_in_memory().unwrap());
+    leases
+        .register(&LeaseId::new("l1"), None, now + Duration::hours(1))
+        .unwrap();
+    let audit = Arc::new(
+        SqliteAudit::open_in_memory()
+            .unwrap()
+            .with_append_limits(16, std::time::Duration::from_millis(200)),
+    );
+    let p = pipeline(leases, audit.clone());
+    let c = chain(Limits::default(), now);
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder = {
+        let audit = audit.clone();
+        std::thread::spawn(move || {
+            audit
+                .with_connection(|_| {
+                    held_tx.send(()).unwrap();
+                    let _ = release_rx.recv();
+                    Ok(())
+                })
+                .unwrap();
+        })
+    };
+    held_rx.recv().unwrap();
+    let started = std::time::Instant::now();
+    let d = p.decide(&c, &send(json!(1)), now);
+    assert_eq!(d.reason, REASON_AUDIT_ERROR);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(audit.append_stats().timeouts, 1);
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+    assert!(p.decide(&c, &send(json!(1)), now).is_allow());
+    assert!(audit.verify_chain().unwrap().ok);
+}
+
+/// (SR-133's remainder) The argument a `sum`, `distinct` or `calls_per` limit counts, sent in
+/// another case, is refused for its name and charges nothing. Without it at all, every limit
+/// refuses as `limit_arg_invalid` (a missing argument is never "nothing to count").
+#[test]
+fn a_limited_argument_in_another_case_is_refused_and_not_charged() {
+    let now = OffsetDateTime::now_utc();
+    for (limits, arg) in [
+        (Limits::default().with_sum("amount", 50), "amount"),
+        (Limits::default().with_distinct("to", 1), "to"),
+        (Limits::default().with_calls_per("to", 1), "to"),
+    ] {
+        let leases = Arc::new(MemoryLeaseStore::new());
+        leases
+            .register(&LeaseId::new("l1"), None, now + Duration::hours(1))
+            .unwrap();
+        let audit = Arc::new(MemoryAudit::new());
+        let p = pipeline(leases, audit.clone());
+        let c = chain(limits.clone(), now);
+        let mut args = json!({"to": "emma", "amount": 40});
+        let v = args.as_object_mut().unwrap().remove(arg).unwrap();
+        let without = ToolCall::new("bank", "send", args.clone());
+        assert_eq!(
+            p.decide(&c, &without, now).reason,
+            REASON_LIMIT_ARG_INVALID,
+            "{limits:?}"
+        );
+        args[arg.to_uppercase()] = v;
+        let d = p.decide(&c, &ToolCall::new("bank", "send", args), now);
+        assert_eq!(
+            d.reason,
+            attenuo_policy::REASON_ARGUMENT_CASE_MISMATCH,
+            "{limits:?}"
+        );
+        let records = audit.snapshot().unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            records[1].record.reason,
+            attenuo_policy::REASON_ARGUMENT_CASE_MISMATCH
+        );
+        assert!(records[1].record.budget.is_none(), "nothing charged");
+        // The limit is untouched: the exact name is charged from zero.
+        assert!(p.decide(&c, &send(json!(40)), now).is_allow(), "{limits:?}");
+    }
 }

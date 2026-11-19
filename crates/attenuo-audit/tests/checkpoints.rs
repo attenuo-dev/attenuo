@@ -510,3 +510,50 @@ fn signing_payload_is_canonical_json_sr20() {
     );
     assert_eq!(cp.signing_payload(), serde_json::to_vec(&fields).unwrap());
 }
+
+/// A-1: a signed verify of a file log while appends (and the automatic checkpoints they
+/// write) land: every verify reports the log intact as of its start, never a break or a
+/// checkpoint past the walked entries, and every append commits meanwhile.
+#[test]
+fn verify_during_appends_reports_its_snapshot_and_never_a_false_break() {
+    let issuer = issuer();
+    let keys = keys(&issuer);
+    let dir = tempfile::tempdir().unwrap();
+    let log = Arc::new(
+        SqliteAudit::open(dir.path().join("audit.db"))
+            .unwrap()
+            .with_checkpointing(issuer.detached_signer(), 7),
+    );
+    for i in 0..3000 {
+        log.append(record(i)).unwrap();
+    }
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let appenders: Vec<_> = (0..2)
+        .map(|t| {
+            let (log, done) = (Arc::clone(&log), Arc::clone(&done));
+            std::thread::spawn(move || {
+                let mut n = 0usize;
+                while !done.load(Ordering::Acquire) {
+                    log.append(record(10_000 + t * 100_000 + n)).unwrap();
+                    n += 1;
+                }
+                n
+            })
+        })
+        .collect();
+    let mut last = 0;
+    for _ in 0..5 {
+        let before = log.head().unwrap().unwrap().seq;
+        let report = log.verify_chain_signed(&keys).unwrap();
+        assert_eq!(report.first_bad_seq, None, "{report:?}");
+        assert!(report.bad_checkpoints.is_empty(), "{report:?}");
+        assert!(report.entries >= before && report.entries >= last);
+        last = report.entries;
+    }
+    done.store(true, Ordering::Release);
+    let appended: usize = appenders.into_iter().map(|a| a.join().unwrap()).sum();
+    assert!(appended > 0, "appends went on during the verifies");
+    let report = log.verify_chain_signed(&keys).unwrap();
+    assert_eq!(report.entries, 3000 + appended as u64);
+    assert!(report.chain().ok && report.bad_checkpoints.is_empty());
+}

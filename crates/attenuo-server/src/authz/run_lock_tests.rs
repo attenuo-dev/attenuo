@@ -3,7 +3,8 @@
 //! same figures and all pass a rule that should stop the second.
 
 use super::*;
-use attenuo_audit::{Approval, ChargeOutcome, LeaseStore, RunLabel};
+use attenuo_audit::{Approval, ChargeOutcome, RunLabel};
+use attenuo_audit::{ApprovalStore, LeaseRegistry, RunLimits, RunState, StoreRetention};
 use attenuo_audit::{
     Approver, AuditError, CounterSummary, HopLimit, LeaseStatus, MemoryAudit, MemoryLeaseStore,
     SpanHit,
@@ -15,7 +16,7 @@ use attenuo_core::{Charge, DelegationChain, LeaseId, LimitKind, ToolCall, Window
 use attenuo_policy::{ArgType, PolicyEngineBuilder, ToolAttrs, ToolCatalog};
 use serde_json::json;
 use std::collections::BTreeSet;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::sync::{Barrier, Condvar};
 use time::Duration;
 use time::OffsetDateTime;
@@ -34,7 +35,7 @@ struct Rendezvous {
     no_windows: std::sync::atomic::AtomicBool,
 }
 
-impl LeaseStore for Rendezvous {
+impl LeaseRegistry for Rendezvous {
     fn register(
         &self,
         l: &LeaseId,
@@ -43,27 +44,65 @@ impl LeaseStore for Rendezvous {
     ) -> Result<(), AuditError> {
         self.inner.register(l, p, e)
     }
+
     fn revoke(&self, l: &LeaseId, r: &str, n: OffsetDateTime) -> Result<u64, AuditError> {
         self.inner.revoke(l, r, n)
     }
+
     fn renew(&self, l: &LeaseId, e: OffsetDateTime, n: OffsetDateTime) -> Result<(), AuditError> {
         self.inner.renew(l, e, n)
     }
+
     fn is_active(&self, l: &LeaseId, n: OffsetDateTime) -> Result<bool, AuditError> {
         self.inner.is_active(l, n)
     }
+
     fn bind(&self, l: &LeaseId, b: &str) -> Result<(), AuditError> {
         self.inner.bind(l, b)
     }
+
     fn binding(&self, l: &LeaseId) -> Result<Option<String>, AuditError> {
         self.inner.binding(l)
     }
+
     fn record_subject(&self, l: &LeaseId, s: &str) -> Result<(), AuditError> {
         self.inner.record_subject(l, s)
     }
+
     fn subject(&self, l: &LeaseId) -> Result<Option<String>, AuditError> {
         self.inner.subject(l)
     }
+
+    fn record_originating_user(&self, l: &LeaseId, i: &str, s: &str) -> Result<(), AuditError> {
+        self.inner.record_originating_user(l, i, s)
+    }
+
+    fn originating_user(&self, l: &LeaseId) -> Result<Option<(String, String)>, AuditError> {
+        self.inner.originating_user(l)
+    }
+
+    fn preview_selected(
+        &self,
+        s: &attenuo_audit::LeaseSelector,
+    ) -> Result<attenuo_audit::SelectorRevocation, AuditError> {
+        self.inner.preview_selected(s)
+    }
+
+    fn revoke_selected(
+        &self,
+        s: &attenuo_audit::LeaseSelector,
+        r: &str,
+        n: OffsetDateTime,
+    ) -> Result<attenuo_audit::SelectorRevocation, AuditError> {
+        self.inner.revoke_selected(s, r, n)
+    }
+
+    fn check_all(&self, l: &[&LeaseId], n: OffsetDateTime) -> Result<LeaseStatus, AuditError> {
+        self.inner.check_all(l, n)
+    }
+}
+
+impl RunState for Rendezvous {
     fn record_session(
         &self,
         s: &str,
@@ -73,71 +112,47 @@ impl LeaseStore for Rendezvous {
     ) -> Result<bool, AuditError> {
         self.inner.record_session(s, v, c, n)
     }
+
     fn sessions(&self, s: &str) -> Result<Vec<attenuo_audit::SessionBinding>, AuditError> {
         self.inner.sessions(s)
     }
-    fn prune_sessions(
-        &self,
-        n: OffsetDateTime,
-        r: time::Duration,
-        m: usize,
-    ) -> Result<attenuo_audit::SessionPrune, AuditError> {
-        self.inner.prune_sessions(n, r, m)
-    }
-    fn prune_leases(
-        &self,
-        n: OffsetDateTime,
-        r: time::Duration,
-        m: usize,
-    ) -> Result<attenuo_audit::LeasePrune, AuditError> {
-        self.inner.prune_leases(n, r, m)
-    }
-    fn prune_run_state(
-        &self,
-        n: OffsetDateTime,
-        r: time::Duration,
-        m: usize,
-    ) -> Result<attenuo_audit::RunStatePrune, AuditError> {
-        self.inner.prune_run_state(n, r, m)
-    }
-    fn preview_selected(
-        &self,
-        s: &attenuo_audit::LeaseSelector,
-    ) -> Result<attenuo_audit::SelectorRevocation, AuditError> {
-        self.inner.preview_selected(s)
-    }
-    fn revoke_selected(
-        &self,
-        s: &attenuo_audit::LeaseSelector,
-        r: &str,
-        n: OffsetDateTime,
-    ) -> Result<attenuo_audit::SelectorRevocation, AuditError> {
-        self.inner.revoke_selected(s, r, n)
-    }
-    fn check_all(&self, l: &[&LeaseId], n: OffsetDateTime) -> Result<LeaseStatus, AuditError> {
-        self.inner.check_all(l, n)
-    }
+
     fn add_label(&self, c: &LeaseId, l: &RunLabel) -> Result<(), AuditError> {
         self.inner.add_label(c, l)
     }
+
     fn labels(&self, c: &LeaseId) -> Result<Vec<RunLabel>, AuditError> {
         self.inner.labels(c)
     }
+
     fn add_spans(&self, c: &LeaseId, s: u64, f: &[Fingerprint]) -> Result<(), AuditError> {
         self.inner.add_spans(c, s, f)
     }
+
     fn find_spans(&self, c: &LeaseId, f: &[Fingerprint]) -> Result<Vec<SpanHit>, AuditError> {
         self.inner.find_spans(c, f)
     }
+}
+
+impl ApprovalStore for Rendezvous {
     fn create_approval(&self, a: &Approval) -> Result<(Approval, bool), AuditError> {
         self.inner.create_approval(a)
     }
+
     fn approval(&self, id: &str) -> Result<Option<Approval>, AuditError> {
         self.inner.approval(id)
     }
-    fn approvals(&self, c: Option<&LeaseId>, n: usize) -> Result<Vec<Approval>, AuditError> {
-        self.inner.approvals(c, n)
+
+    fn approvals(
+        &self,
+        c: Option<&LeaseId>,
+        s: Option<attenuo_audit::ApprovalState>,
+        b: Option<u64>,
+        n: usize,
+    ) -> Result<Vec<(u64, Approval)>, AuditError> {
+        self.inner.approvals(c, s, b, n)
     }
+
     fn decide_approval(
         &self,
         id: &str,
@@ -147,6 +162,7 @@ impl LeaseStore for Rendezvous {
     ) -> Result<Approval, AuditError> {
         self.inner.decide_approval(id, g, a, n)
     }
+
     fn take_approval(
         &self,
         c: &LeaseId,
@@ -157,6 +173,7 @@ impl LeaseStore for Rendezvous {
     ) -> Result<Option<Approval>, AuditError> {
         self.inner.take_approval(c, l, h, d, n)
     }
+
     fn take_approval_by_id(
         &self,
         id: &str,
@@ -168,12 +185,17 @@ impl LeaseStore for Rendezvous {
     ) -> Result<Option<Approval>, AuditError> {
         self.inner.take_approval_by_id(id, c, l, h, d, n)
     }
+
     fn restore_approval(&self, id: &str, d: &str) -> Result<(), AuditError> {
         self.inner.restore_approval(id, d)
     }
+
     fn remove_approval(&self, id: &str) -> Result<(), AuditError> {
         self.inner.remove_approval(id)
     }
+}
+
+impl RunLimits for Rendezvous {
     fn budget_used(&self, c: &[Charge]) -> Result<Vec<u64>, AuditError> {
         if self.stale.load(std::sync::atomic::Ordering::SeqCst) {
             return Ok(vec![0; c.len()]);
@@ -188,6 +210,7 @@ impl LeaseStore for Rendezvous {
         drop(readers);
         self.inner.budget_used(c)
     }
+
     fn charge(
         &self,
         d: &str,
@@ -196,9 +219,11 @@ impl LeaseStore for Rendezvous {
     ) -> Result<ChargeOutcome, AuditError> {
         self.inner.charge(d, c, at)
     }
+
     fn refund(&self, d: &str, at: OffsetDateTime) -> Result<u64, AuditError> {
         self.inner.refund(d, at)
     }
+
     fn window_used(&self, w: &[WindowCharge]) -> Result<Vec<u64>, AuditError> {
         if self.no_windows.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(AuditError::Storage("windows lost".into()));
@@ -215,6 +240,7 @@ impl LeaseStore for Rendezvous {
         drop(readers);
         self.inner.window_used(w)
     }
+
     fn charge_windowed(
         &self,
         d: &str,
@@ -228,14 +254,46 @@ impl LeaseStore for Rendezvous {
         }
         self.inner.charge_windowed(d, c, w, at, defer)
     }
+
     fn record_hop_limits(&self, l: &LeaseId, h: &[HopLimit]) -> Result<(), AuditError> {
         self.inner.record_hop_limits(l, h)
     }
+
     fn hop_limits(&self, l: &LeaseId) -> Result<Option<Vec<HopLimit>>, AuditError> {
         self.inner.hop_limits(l)
     }
+
     fn budget_summary(&self, l: &LeaseId) -> Result<Vec<CounterSummary>, AuditError> {
         self.inner.budget_summary(l)
+    }
+}
+
+impl StoreRetention for Rendezvous {
+    fn prune_sessions(
+        &self,
+        n: OffsetDateTime,
+        r: time::Duration,
+        m: usize,
+    ) -> Result<attenuo_audit::SessionPrune, AuditError> {
+        self.inner.prune_sessions(n, r, m)
+    }
+
+    fn prune_leases(
+        &self,
+        n: OffsetDateTime,
+        r: time::Duration,
+        m: usize,
+    ) -> Result<attenuo_audit::LeasePrune, AuditError> {
+        self.inner.prune_leases(n, r, m)
+    }
+
+    fn prune_run_state(
+        &self,
+        n: OffsetDateTime,
+        r: time::Duration,
+        m: usize,
+    ) -> Result<attenuo_audit::RunStatePrune, AuditError> {
+        self.inner.prune_run_state(n, r, m)
     }
 }
 
@@ -288,7 +346,7 @@ fn runs_with(
         .build()
         .unwrap();
     let pipeline = Pipeline::new(
-        Arc::new(RwLock::new(engine)),
+        Arc::new(SharedPolicy::new(engine)),
         leases,
         Arc::new(MemoryAudit::new()),
     );

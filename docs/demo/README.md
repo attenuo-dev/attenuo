@@ -1,6 +1,6 @@
 # Demo recordings
 
-Terminal recordings of the two end-to-end demos. Both use a fake GitHub MCP server on loopback, with no model and no real GitHub. The credentials on screen are the fixture values from the demo configs.
+Terminal recordings of two of the end-to-end demos, the GitHub leak demo and the multi-hop demo (the [IdP exchange demo](https://github.com/attenuo-dev/attenuo/blob/main/examples/idp-exchange-demo/README.md) has no recording). Both use a fake GitHub MCP server on loopback, with no model and no real GitHub. The credentials on screen are the fixture values from the demo configs.
 
 ## GitHub leak demo
 
@@ -33,7 +33,7 @@ asciinema play docs/demo/multi-hop-demo.cast
 | `multi-hop-demo.cast` | 16.5 KB | 0.26 s | real time |
 | `multi-hop-demo.gif` | 2.5 MB | 89.0 s | retimed |
 
-The `.cast` files are the recordings as made. Each demo finishes in well under a second, so use `asciinema play --speed 0.01 FILE` to read one as it plays, or `cat` the demo's own [leak transcript](../../examples/github-leak-demo/transcript.md).
+The `.cast` files are the recordings as made. Each demo finishes in well under a second, so use `asciinema play --speed 0.01 FILE` to read one as it plays, or `cat` the demo's own [leak transcript](https://github.com/attenuo-dev/attenuo/blob/main/examples/github-leak-demo/transcript.md).
 
 The GIFs have the same output in the same order, but the pauses are added. [`retime.py`](retime.py) waits 2.5 s before each section heading and 2 s before each command, and shows a command and its output in one frame. Don't read the GIF's length as the demo's run time.
 

@@ -167,16 +167,17 @@ impl Harness {
         cfg.issuer.audience = "attenuo-test".into();
         cfg.admin.token = Some(ADMIN.into());
         cfg.dev.allow_root_mint = true;
-        cfg.agents = vec![AgentConfig {
-            id: "reviewer".into(),
-            secret_sha256: sha256_hex("reviewer-secret"),
-        }];
+        cfg.agents = vec![AgentConfig::with_secret_sha256(
+            "reviewer",
+            sha256_hex("reviewer-secret"),
+        )];
         cfg.actor_trust = vec![
             ActorTrustConfig {
                 issuer: None,
                 jwks_url: None,
                 spiffe_trust_domain: Some(TRUST_DOMAIN.into()),
                 spiffe_bundle_url: Some(keys.server.url("/bundle")),
+                ca_pem_path: None,
                 audience: ACTOR_AUD.into(),
                 subject_to_agent: SubjectToAgent::Map(BTreeMap::from([
                     (CODER_ID.to_string(), "coder".to_string()),
@@ -194,6 +195,7 @@ impl Harness {
                 jwks_url: Some(keys.server.url("/jwks")),
                 spiffe_trust_domain: None,
                 spiffe_bundle_url: None,
+                ca_pem_path: None,
                 audience: ACTOR_AUD.into(),
                 subject_to_agent: SubjectToAgent::Sub,
                 allowed_algs: DEFAULT_IDP_ALGS.iter().map(|s| s.to_string()).collect(),
@@ -544,8 +546,8 @@ async fn actor_auth_actor_token_refuses_client_secrets() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(code(&v), ("invalid_request", "client_auth_not_accepted"));
     let (status, v) = h.exchange(&root, "coder", json!({})).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(code(&v), ("invalid_request", "actor_token_required"));
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(code(&v), ("invalid_client", "actor_token_required"));
     let (status, v) = h
         .with_actor_token(&root, "coder", &h.keys.svid(CODER_ID))
         .await;
@@ -706,4 +708,126 @@ async fn an_actor_token_mapped_to_the_reserved_agent_id_is_refused_sr45() {
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
     assert_eq!(code(&v), ("invalid_request", "reserved_agent"), "{v}");
+}
+
+/// `actor_auth = "either"` with a `private_key_jwt` client assertion and an actor token sent
+/// together: both are checked and must name the same agent, as with a client secret.
+#[tokio::test]
+async fn either_mode_checks_an_assertion_and_an_actor_token_together() {
+    let key = attenuo_token::DpopKey::generate().unwrap();
+    let jwks = json!({ "keys": [key.public_jwk()] }).to_string();
+    let h = Harness::start(|cfg| {
+        cfg.agents
+            .push(AgentConfig::with_jwks("coder", jwks.clone()));
+        cfg.agents
+            .push(AgentConfig::with_jwks("wl:reviewer", jwks.clone()));
+    })
+    .await;
+    let assertion = |client: &str| {
+        attenuo_token::client_assertion::sign(
+            &key,
+            None,
+            client,
+            "https://attenuo.test",
+            attenuo_token::client_assertion::DEFAULT_LIFETIME,
+            OffsetDateTime::now_utc(),
+        )
+    };
+    let fields = |svid: String, a: String| {
+        json!({"actor_token": svid, "actor_token_type": JWT,
+               "client_assertion_type": attenuo_token::client_assertion::CLIENT_ASSERTION_TYPE,
+               "client_assertion": a})
+    };
+    let root = h.root_token().await;
+    let (status, v) = h
+        .exchange(
+            &root,
+            "coder",
+            fields(h.keys.svid(CODER_ID), assertion("coder")),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    // The assertion names another agent than the actor token.
+    let root = h.root_token().await;
+    let (status, v) = h
+        .exchange(
+            &root,
+            "coder",
+            fields(h.keys.svid(CODER_ID), assertion("wl:reviewer")),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(code(&v), ("invalid_request", "actor_mismatch"));
+    // A bad assertion fails the request even with a good actor token.
+    let root = h.root_token().await;
+    let (status, v) = h
+        .exchange(
+            &root,
+            "coder",
+            fields(h.keys.svid(CODER_ID), "not.a.jwt".into()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{v}");
+    assert_eq!(code(&v), ("invalid_client", "client_assertion_malformed"));
+}
+
+/// An exchange that sends no credential at all is 401 `invalid_client` in every
+/// `[token] actor_auth` mode (RFC 6749 §5.2), with a `WWW-Authenticate` challenge, and the
+/// whole answer is the same for an `actor` that is a configured agent and one that is not
+/// (SR-110).
+#[tokio::test]
+async fn exchange_without_any_credential_is_invalid_client_in_every_mode() {
+    for (mode, expected) in [
+        (ActorAuth::Either, "client_auth_missing"),
+        (ActorAuth::Secret, "client_auth_missing"),
+        (ActorAuth::ActorToken, "actor_token_required"),
+    ] {
+        let h = Harness::start(|cfg| cfg.token.actor_auth = mode).await;
+        let root = h.root_token().await;
+        let mut answers = Vec::new();
+        for (actor, client_id) in [
+            ("reviewer", None),
+            ("nobody", None),
+            ("reviewer", Some("reviewer")),
+            ("nobody", Some("nobody")),
+        ] {
+            let mut body = json!({
+                "grant_type": EXCHANGE,
+                "subject_token": root,
+                "subject_token_type": JWT,
+                "actor": actor,
+                "authorization_details": [{"type": "attenuo_capabilities",
+                    "capabilities": [{"server": "github", "tool": "read_file"}]}],
+            });
+            if let Some(id) = client_id {
+                body["client_id"] = json!(id);
+            }
+            let resp = h
+                .client
+                .post(h.server.url("/token"))
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            let status = resp.status();
+            let challenge = resp
+                .headers()
+                .get("www-authenticate")
+                .map(|v| v.to_str().unwrap().to_owned());
+            let v: Value = resp.json().await.unwrap();
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{mode:?} {actor}: {v}");
+            assert_eq!(code(&v), ("invalid_client", expected), "{mode:?} {actor}");
+            assert_eq!(v["code"], expected, "{mode:?} {actor}");
+            assert!(challenge.is_some(), "{mode:?} {actor}: no WWW-Authenticate");
+            answers.push((status, challenge, v));
+        }
+        assert_eq!(
+            answers[0], answers[1],
+            "{mode:?}: known and unknown actor differ"
+        );
+        assert_eq!(
+            answers[2], answers[3],
+            "{mode:?}: known and unknown client_id differ"
+        );
+    }
 }

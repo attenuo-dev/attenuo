@@ -5,7 +5,7 @@
 
 - Date: 2026-10-23
 - Branch: `review/security-pass-4` (base: `0ff8177` on main)
-- Related: [pass 1 and 2](security-review-2026-10-22.md), [pass 3](security-review-2026-10-23.md), [RFC-0001](../spec/rfc-0001-attenuo.md), [threat model](../spec/threat-model.md), [task board](../tasks/board.md)
+- Related: [pass 1 and 2](security-review-2026-10-22.md), [pass 3](security-review-2026-10-23.md), [RFC-0001](../spec/rfc-0001-attenuo.md), [threat model](../spec/threat-model.md), task board
 
 ## Scope and method
 
@@ -22,7 +22,7 @@ Everything that merged after pass 3, and the pass 3 fixes themselves:
 
 The attacker was taken as each of: (a) the holder of a valid child token, (b) a compromised sub-agent with its own credentials, (c) a thief holding a copied bound token but not its key, (d) a network position between client and server, (e) an upstream MCP server, (f) a power failure. Every finding fixed here has a regression test that fails on the base commit and passes on this branch (run against a copy of the base sources). Findings are numbered from SR-40.
 
-Not changed on this branch: `crates/onbehalf-policy/src/*` and `crates/onbehalf-audit/src/*`, which another branch was editing at the time (entity caching, the WAL checkpoint thread). Findings there are Open with the file and function to change, and are listed on the [task board](../tasks/board.md).
+Not changed on this branch: `crates/onbehalf-policy/src/*` and `crates/onbehalf-audit/src/*`, which another branch was editing at the time (entity caching, the WAL checkpoint thread). Findings there are Open with the file and function to change, and are listed on the task board.
 
 ## Summary
 

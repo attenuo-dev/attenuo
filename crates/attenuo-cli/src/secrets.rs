@@ -156,11 +156,31 @@ pub(crate) fn resolve_token(
     file: Option<&Path>,
     input: &mut Stdin,
 ) -> Result<String> {
+    resolve_named_token(
+        "delegation token",
+        "a delegation token",
+        flag,
+        literal,
+        file,
+        input,
+    )
+}
+
+/// As [`resolve_token`], for a token called `what` in messages, `a_what` with its article
+/// (`token exchange` at hop 0 reads an IdP credential from the same places).
+pub(crate) fn resolve_named_token(
+    what: &str,
+    a_what: &str,
+    flag: &str,
+    literal: Option<String>,
+    file: Option<&Path>,
+    input: &mut Stdin,
+) -> Result<String> {
     let stdin = literal.as_deref() == Some("-");
     let literal = literal.filter(|_| !stdin);
-    resolve("delegation token", literal, stdin, file, TOKEN_ENV, input)?.ok_or_else(|| {
+    resolve(what, literal, stdin, file, TOKEN_ENV, input)?.ok_or_else(|| {
         anyhow::anyhow!(
-            "a delegation token is required: set {TOKEN_ENV}, or pass {flag}-file <PATH> or \
+            "{a_what} is required: set {TOKEN_ENV}, or pass {flag}-file <PATH> or \
              `{flag} -` to read it from stdin"
         )
     })

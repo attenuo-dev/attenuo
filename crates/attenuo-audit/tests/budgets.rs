@@ -8,7 +8,9 @@ mod common;
 
 use std::sync::{Arc, Barrier};
 
-use attenuo_audit::{AuditError, ChargeOutcome, LeaseStore, MemoryLeaseStore, SqliteLeaseStore};
+use attenuo_audit::{
+    AuditError, ChargeOutcome, LeaseStore, MemoryLeaseStore, RunLimits, SqliteLeaseStore,
+};
 use attenuo_core::limits::{usage_charges, MAX_LIMIT};
 use attenuo_core::{Charge, LeaseId, LimitKind, ToolCall};
 use common::t0;

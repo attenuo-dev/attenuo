@@ -22,6 +22,7 @@ from attenuo import (
     DpopKey,
     RpcError,
     StreamEvent,
+    TransportTimeout,
     Unauthorized,
 )
 from attenuo._sse import SseParser
@@ -527,6 +528,8 @@ async def test_stream_of_keep_alives_ends_at_the_deadline_sr82(kind: str) -> Non
     seen, err = await run_stream(kind, handler, deadline=0.2)
     elapsed = time.monotonic() - start
     assert isinstance(err, AttenuoError)
+    # A timeout, distinguishable from an answer of the server (K-12).
+    assert isinstance(err, TransportTimeout) and err.__cause__ is None
     assert "stream deadline of 0.2s elapsed" in str(err)
     assert [ev.method for ev in seen] == ["notifications/progress"]
     assert 0.2 <= elapsed < 0.8

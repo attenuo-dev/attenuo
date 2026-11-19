@@ -20,6 +20,7 @@ import {
   writeFileSync,
   createWriteStream,
 } from "node:fs";
+import { createServer as createHttpServer, type Server as HttpServer } from "node:http";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -37,7 +38,9 @@ import {
   mcpUrl,
   AttenuoClient,
   prefix,
+  RateLimitedError,
   RefreshError,
+  RpcError,
   type Token,
   TokenRefresher,
   UnauthorizedError,
@@ -46,6 +49,7 @@ import {
   verifyExport,
   withLimits,
 } from "../src/index.js";
+import { retryHooks } from "../src/retry.js";
 
 // [[agents]] secrets in the demo config: an exchange authenticates as its actor.
 const CODER_SECRET = "demo-coder-secret";
@@ -85,6 +89,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
  * Start the fake upstream and the server with the demo config, plus `tokenSection` (a `[token]`
  * table) when given and `fakeArgs` for the upstream; resolves once both answer. `policyExtra` is
  * appended to the demo policy, and each `edits` key of the config is replaced by its value.
+ * `{work}` in the config stands for the stack's own directory.
  */
 async function startStack(
   tokenSection = "",
@@ -117,7 +122,7 @@ async function startStack(
     if (!config.includes(from)) throw new Error(`not in the demo config: ${from}`);
     config = config.replace(from, to);
   }
-  writeFileSync(join(work, "config.toml"), config);
+  writeFileSync(join(work, "config.toml"), config.replaceAll("{work}", work));
 
   const fakeOut = join(work, "fake-mcp.out");
   const fakeLog = join(work, "fake-mcp.log");
@@ -160,6 +165,46 @@ async function startStack(
     await sleep(100);
   }
   return { url, work, procs };
+}
+
+/** Wait until the server at `url` answers `/healthz`, or throw with its log. */
+async function waitHealthy(url: string, work: string, proc: ChildProcess): Promise<void> {
+  const deadline = Date.now() + 20_000;
+  for (;;) {
+    try {
+      if ((await fetch(`${url}/healthz`, { signal: AbortSignal.timeout(1000) })).ok) return;
+    } catch {
+      /* not up yet */
+    }
+    if (proc.exitCode !== null || Date.now() > deadline) {
+      throw new Error(`server did not start:\n${readFileSync(join(work, "server.log"), "utf8")}`);
+    }
+    await sleep(100);
+  }
+}
+
+/**
+ * Stop the stack's server and start it again on the same port and config. A server with an
+ * ephemeral issuer key or a `:memory:` audit store forgets its tokens; one with files keeps them
+ * and forgets only what lives in the process, such as the rate limits' minutes.
+ */
+async function restartServer(stack: { url: string; work: string; procs: ChildProcess[] }) {
+  const old = stack.procs[1]!;
+  const exited = new Promise((r) => old.once("exit", r));
+  old.kill("SIGTERM");
+  await exited;
+  const log = createWriteStream(join(stack.work, "server.log"), { flags: "a" });
+  await new Promise((r) => log.once("open", r));
+  const proc = spawn(
+    join(stack.work, "attenuo-server"),
+    ["--config", join(stack.work, "config.toml")],
+    {
+      stdio: ["ignore", log, log],
+      env: { ...process.env, RUST_LOG: "warn" },
+    },
+  );
+  stack.procs[1] = proc;
+  await waitHealthy(stack.url, stack.work, proc);
 }
 
 async function stopStack(procs: ChildProcess[], work: string): Promise<void> {
@@ -250,6 +295,7 @@ describe.skipIf(!enabled)("GitHub leak scenario against the real server", () => 
     expect(policyDenied).toBeInstanceOf(DeniedError);
     const pd = policyDenied as DeniedError;
     expect(pd.reason).toBe("policy_deny");
+    expect(pd.stableCode).toBe("policy_deny");
     expect(pd.decisionId).toBeTruthy();
 
     // 8. Exfiltration through create_issue: never delegated.
@@ -287,10 +333,13 @@ describe.skipIf(!enabled)("GitHub leak scenario against the real server", () => 
     expect(lease.lease).toBe(coder.lease);
     expect(lease.expiresIn).toBeGreaterThan(0);
 
-    // 11. A bad bearer is a 401, not a denial.
-    await expect(
-      ob.callTool("not.a.token", "github", "read_file", { repo: "alice/public-docs" }),
-    ).rejects.toBeInstanceOf(UnauthorizedError);
+    // 11. A bad bearer is a 401, not a denial, and says why.
+    const badBearer = (await ob
+      .callTool("not.a.token", "github", "read_file", { repo: "alice/public-docs" })
+      .catch((e: unknown) => e)) as UnauthorizedError;
+    expect(badBearer).toBeInstanceOf(UnauthorizedError);
+    expect(badBearer.reason).toBe("invalid_token");
+    expect(badBearer.decisionId).toBeUndefined(); // a token that does not verify writes no record
 
     // 12. Revoke the root lease: the cascade takes the coder and the tester with it.
     const revoked = await admin.revokeLease(root.lease, "agent session compromised");
@@ -304,7 +353,17 @@ describe.skipIf(!enabled)("GitHub leak scenario against the real server", () => 
     await expect(
       ob.callTool(tester, "github", "read_file", { repo: "alice/public-docs" }),
     ).rejects.toBeInstanceOf(DeniedError);
-    await expect(ob.renew(coder)).rejects.toBeInstanceOf(ApiError); // a revoked lease is final
+    // A request without a per-call decision is a 401 that names the reason and its record.
+    const listing = (await ob
+      .listTools(tester, "github")
+      .catch((e: unknown) => e)) as UnauthorizedError;
+    expect(listing).toBeInstanceOf(UnauthorizedError);
+    expect(listing.reason).toBe("lease_revoked");
+    expect(listing.decisionId).toBeTruthy();
+    const renewal = (await ob.renew(coder).catch((e: unknown) => e)) as ApiError; // final
+    expect(renewal).toBeInstanceOf(ApiError);
+    expect([renewal.status, renewal.error]).toEqual([400, "invalid_grant"]);
+    expect(renewal.decisionId).toBeTruthy();
 
     // 13. The audit log has every decision, and its hash chain verifies.
     const report = await admin.auditVerify();
@@ -315,6 +374,10 @@ describe.skipIf(!enabled)("GitHub leak scenario against the real server", () => 
     expect(byId.get(pd.decisionId)?.record.reason).toBe("policy_deny");
     expect(byId.get(capDenied.decisionId)?.record.reason).toBe("capability_denied");
     expect(byId.get(after.decisionId)?.record.reason).toBe("lease_revoked");
+    const listed = byId.get(listing.decisionId!)?.record;
+    expect([listed?.tool, listed?.reason]).toEqual(["tools/list", "lease_revoked"]);
+    const renewRecord = byId.get(renewal.decisionId!)?.record;
+    expect([renewRecord?.tool, renewRecord?.reason]).toEqual(["lease.renew", "lease_revoked"]);
     expect((await admin.auditCheckpoint()).seq).toBeGreaterThanOrEqual(report.entries);
 
     // 14. Only the intended reads (one for the coder, one for the tester) reached upstream.
@@ -378,14 +441,29 @@ describe.skipIf(!enabled)("GitHub leak scenario against the real server", () => 
     const noProof = await thief
       .callTool(coder, "github", "read_file", { repo: "alice/public-docs" })
       .catch((e: unknown) => e);
+    // Every route says why the same way: `reason`, for the proxy as for REST routes.
     expect(noProof).toBeInstanceOf(UnauthorizedError);
-    await expect(thief.renew(coder)).rejects.toMatchObject({ status: 401, error: "dpop_required" });
+    expect((noProof as UnauthorizedError).reason).toBe("dpop_required");
+    await expect(thief.listTools(coder, "github")).rejects.toMatchObject({
+      reason: "dpop_required",
+    });
+    await expect(thief.renew(coder)).rejects.toMatchObject({
+      status: 401,
+      error: "dpop_required",
+      reason: "dpop_required",
+    });
     await expect(
       thief.exchange(coder, "tester", "github:read_file", { clientSecret: TESTER_SECRET }),
-    ).rejects.toMatchObject({ status: 401, error: "dpop_required" });
+    ).rejects.toMatchObject({ status: 401, error: "dpop_required", reason: "dpop_required" });
     // Another key does not help either.
     const other = new AttenuoClient(url, { dpopKey: await DpopKey.generate() });
-    await expect(other.renew(coder)).rejects.toMatchObject({ error: "invalid_dpop_proof" });
+    await expect(other.renew(coder)).rejects.toMatchObject({
+      error: "invalid_dpop_proof",
+      reason: "invalid_dpop_proof",
+    });
+    await expect(
+      other.callTool(coder, "github", "read_file", { repo: "alice/public-docs" }),
+    ).rejects.toMatchObject({ reason: "invalid_dpop_proof" });
 
     // The audit log records the bound use.
     const entries = await admin.auditTail(50);
@@ -585,6 +663,7 @@ describe.skipIf(!enabled)("streamed tools/call against the real server", () => {
     expect(Date.now() - started).toBeLessThan(10_000); // one re-check interval (1 s), with slack
     expect(cut).toBeInstanceOf(DeniedError);
     expect((cut as DeniedError).reason).toBe("lease_revoked");
+    expect((cut as DeniedError).stableCode).toBe("lease_revoked");
     const end = (await admin.auditRecord((cut as DeniedError).decisionId!)).entry;
     expect([end.record.tool, end.record.decision, end.record.reason]).toEqual([
       "stream.end",
@@ -637,6 +716,9 @@ describe.skipIf(!enabled)("DPoP server nonces against the real server", () => {
       clientSecret: CODER_SECRET,
     });
     expect(coder.dpopJkt).toBe(key.thumbprint);
+    // Action search signs its own URL and picks up the nonce like evaluation.
+    const found = await ob.authzenSearchAction(coder, "github", { repo: "alice/public-x" });
+    expect(found.actions.map((a) => a.name)).toEqual(["read_file"]);
 
     // Through the fetch an MCP client library would use.
     const f = mcpFetch(() => coder, { dpopKey: key });
@@ -890,9 +972,14 @@ describe.skipIf(!enabled)("filtered export and revocation by selector", () => {
     for (let i = 0; i < 2; i++) {
       expect((await ob.callTool(coder, "github", "read_file", read)).decisionId).toBeTruthy();
     }
-    await expect(ob.callTool(coder, "github", "read_file", read)).rejects.toMatchObject({
-      reason: "budget_exhausted",
-    });
+    const over = (await ob
+      .callTool(coder, "github", "read_file", read)
+      .catch((e: unknown) => e)) as DeniedError;
+    expect(over).toBeInstanceOf(DeniedError);
+    expect(over.reason).toBe("budget_exhausted");
+    // The refusal names the limit, as the dry run did.
+    expect(over.limit).toEqual({ hop: 1, kind: "calls", used: 2, max: 2 });
+    expect(over.data.limit).toEqual(over.limit);
     await admin.revokeLease(root.lease);
   });
 });
@@ -1024,5 +1111,432 @@ describe.skipIf(!enabled)("decimal catalog input against the real server", () =>
     });
     expect([dryBad.decision, dryBad.reason]).toEqual(["deny", "input_type_mismatch"]);
     await admin.revokeLease(root.lease);
+  });
+});
+
+describe.skipIf(!enabled)(
+  "refund, AuthZEN batch and discovery, user decision, session close (K-5)",
+  () => {
+    const ISSUER = "https://idp.example";
+    let procs: ChildProcess[] = [];
+    let work = "";
+    let url = "";
+    let jwksServer: HttpServer | undefined;
+    let idpKey: CryptoKey;
+
+    const b64u = (d: Uint8Array | string) => Buffer.from(d).toString("base64url");
+    async function idToken(sub: string, jti: string): Promise<string> {
+      const now = Math.floor(Date.now() / 1000);
+      const head = { alg: "EdDSA", typ: "JWT", kid: "idp-1" };
+      const claims = { iss: ISSUER, sub, aud: "demo-approval-page", iat: now, exp: now + 300, jti };
+      const signing = `${b64u(JSON.stringify(head))}.${b64u(JSON.stringify(claims))}`;
+      const sig = await crypto.subtle.sign("Ed25519", idpKey, new TextEncoder().encode(signing));
+      return `${signing}.${b64u(new Uint8Array(sig))}`;
+    }
+
+    beforeAll(async () => {
+      // A stand-in OIDC issuer: an Ed25519 key, its JWKS on a local port, trusted by `[[idps]]`.
+      const pair = (await crypto.subtle.generateKey("Ed25519", true, [
+        "sign",
+        "verify",
+      ])) as CryptoKeyPair;
+      idpKey = pair.privateKey;
+      const raw = new Uint8Array(await crypto.subtle.exportKey("raw", pair.publicKey));
+      const jwks = JSON.stringify({
+        keys: [{ kty: "OKP", crv: "Ed25519", kid: "idp-1", x: b64u(raw) }],
+      });
+      const srv = createHttpServer((_req, res) => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(jwks);
+      });
+      jwksServer = srv;
+      const port = await new Promise<number>((ok) =>
+        srv.listen(0, "127.0.0.1", () => ok((srv.address() as { port: number }).port)),
+      );
+      const idps = `[[idps]]\nissuer = "${ISSUER}"\njwks_url = "http://127.0.0.1:${port}/jwks"\n\n`;
+      ({ url, work, procs } = await startStack(idps));
+    });
+
+    afterAll(async () => {
+      await stopStack(procs, work);
+      jwksServer?.close();
+    });
+
+    it("closes an MCP session, and refuses another run's or an unknown one", async () => {
+      const admin = new AdminClient(url, ADMIN_TOKEN);
+      const ob = new AttenuoClient(url);
+      const root = await admin.mintRootDev("alice", ISSUER, "assistant", {
+        capabilities: ["github:*"],
+      });
+      const coder = await ob.exchange(root, "coder", ["github:read_file"], {
+        clientSecret: CODER_SECRET,
+      });
+      const sid = await ob.initialize(coder, "github");
+      expect(sid, "the fake upstream assigns a session id").toBeTruthy();
+      const other = await admin.mintRootDev("alice", ISSUER, "assistant", {
+        capabilities: ["github:*"],
+      });
+      const mismatch = await ob.closeSession(other, "github", sid!).catch((e: unknown) => e);
+      expect(mismatch).toBeInstanceOf(DeniedError);
+      expect((mismatch as DeniedError).reason).toBe("session_mismatch");
+      expect(await ob.closeSession(coder, "github", sid!)).toBe(true);
+      const unknown = await ob.closeSession(coder, "github", "no-such-session").catch((e) => e);
+      expect(unknown).toBeInstanceOf(RpcError);
+      expect((unknown as RpcError).code).toBe(-32600);
+      expect((unknown as RpcError).stableCode).toBe("session_unknown");
+      await admin.revokeLease(root.lease);
+      await admin.revokeLease(other.lease);
+    });
+
+    it("refunds a charged decision once", async () => {
+      const admin = new AdminClient(url, ADMIN_TOKEN);
+      const ob = new AttenuoClient(url);
+      const root = await admin.mintRootDev("alice", ISSUER, "assistant", {
+        capabilities: ["github:*"],
+      });
+      const coder = await ob.exchange(
+        root,
+        "coder",
+        [withLimits(capability("github", "read_file"), { calls: 1 })],
+        { clientSecret: CODER_SECRET },
+      );
+      const read = { repo: "alice/public-docs", path: "README.md" };
+      const first = await ob.callTool(coder, "github", "read_file", read);
+      expect(first.decisionId).toBeTruthy();
+      await expect(ob.callTool(coder, "github", "read_file", read)).rejects.toMatchObject({
+        reason: "budget_exhausted",
+      });
+      const refund = await admin.refundBudget(first.decisionId!, "upstream failed");
+      expect(refund.decisionId).toBe(first.decisionId);
+      expect(refund.refunded).toBeGreaterThanOrEqual(1);
+      expect(refund.reason).toBe("upstream failed");
+      expect(refund.auditId).toBeTruthy();
+      expect((await ob.callTool(coder, "github", "read_file", read)).decisionId).toBeTruthy();
+      await expect(admin.refundBudget(first.decisionId!)).rejects.toMatchObject({
+        status: 409,
+        error: "already_refunded",
+        decisionId: undefined,
+      });
+      await expect(
+        admin.refundBudget("00000000-0000-4000-8000-000000000000"),
+      ).rejects.toMatchObject({ status: 404, error: "not_found" });
+      await admin.revokeLease(root.lease);
+    });
+
+    it("decides a batch in order, stops on the first deny, and serves discovery", async () => {
+      const admin = new AdminClient(url, ADMIN_TOKEN);
+      const ob = new AttenuoClient(url);
+      const root = await admin.mintRootDev("alice", ISSUER, "assistant", {
+        capabilities: ["github:*"],
+      });
+      const coder = await ob.exchange(root, "coder", ["github:read_file"], {
+        clientSecret: CODER_SECRET,
+      });
+      const read = { repo: "alice/public-docs", path: "README.md" };
+      const issue = { repo: "alice/public-docs", title: "t" };
+      const [allow, deny] = await ob.authzenEvaluateBatch(coder, [
+        { server: "github", tool: "read_file", args: read },
+        ["github", "create_issue", issue],
+      ]);
+      expect(allow!.decision).toBe(true);
+      expect(allow!.decisionId).toBeTruthy();
+      expect([deny!.decision, deny!.reason]).toEqual([false, "capability_denied"]);
+      const stopped = await ob.authzenEvaluateBatch(
+        coder,
+        [
+          ["github", "create_issue", issue],
+          ["github", "read_file", read],
+        ],
+        { semantic: "deny_on_first_deny" },
+      );
+      expect(stopped.map((d) => d.decision)).toEqual([false]);
+      await expect(
+        ob.authzenEvaluateBatch("not-a-token", [["github", "read_file", read]]),
+      ).rejects.toBeInstanceOf(UnauthorizedError);
+
+      expect(await ob.authzenConfiguration()).toMatchObject({
+        policyDecisionPoint: url,
+        accessEvaluationEndpoint: `${url}/access/v1/evaluation`,
+        accessEvaluationsEndpoint: `${url}/access/v1/evaluations`,
+      });
+      await admin.revokeLease(root.lease);
+    });
+
+    it("searches actions as evaluation would decide them, page by page", async () => {
+      const admin = new AdminClient(url, ADMIN_TOKEN);
+      const ob = new AttenuoClient(url);
+      const root = await admin.mintRootDev("alice", ISSUER, "assistant", {
+        capabilities: ["github:*"],
+      });
+      const coder = await ob.exchange(root, "coder", ["github:read_file"], {
+        clientSecret: CODER_SECRET,
+      });
+      const pub = { repo: "alice/public-docs", path: "README.md" };
+      const priv = { repo: "alice/private-salaries", path: "pay.csv" };
+      const collect = async (token: typeof root, args: Record<string, unknown>, limit?: number) => {
+        const out = [];
+        for await (const a of ob.authzenSearchActionIter(token, "github", args, { limit })) {
+          out.push(a);
+        }
+        return out;
+      };
+
+      const page = await ob.authzenSearchAction(coder, "github", pub);
+      expect(page.actions).toEqual([{ name: "read_file", server: "github" }]);
+      expect(page.nextToken).toBeUndefined();
+      expect((await ob.authzenEvaluate(coder, "github", "read_file", pub)).decision).toBe(true);
+      // The policy forbids the private repo, so nothing is a result for these arguments.
+      expect((await ob.authzenSearchAction(coder, "github", priv)).actions).toEqual([]);
+
+      // One candidate per page: the catalog is create_issue, delete_repo, read_file. The first
+      // page is approval-gated create_issue, never a result, so it is empty with a token.
+      const first = await ob.authzenSearchAction(root, "github", pub, { limit: 1 });
+      expect(first.actions).toEqual([]);
+      expect(first.nextToken).toBeTruthy();
+      const paged = await collect(root, pub, 1);
+      expect(paged).toEqual(await collect(root, pub));
+      expect(paged).toContainEqual({ name: "read_file", server: "github" });
+      expect(paged).not.toContainEqual({ name: "create_issue", server: "github" });
+      for (const a of paged) {
+        expect((await ob.authzenEvaluate(root, "github", a.name, pub)).decision).toBe(true);
+      }
+
+      await expect(ob.authzenSearchAction("not-a-token", "github", pub)).rejects.toBeInstanceOf(
+        UnauthorizedError,
+      );
+      await expect(ob.authzenSearchAction(coder, "github/read_file", pub)).rejects.toMatchObject({
+        status: 400,
+        code: "invalid_search_resource",
+      });
+      await expect(
+        ob.authzenSearchAction(coder, "github", pub, { pageToken: "not-a-token" }),
+      ).rejects.toMatchObject({ code: "invalid_cursor" });
+      expect((await ob.authzenConfiguration()).searchActionEndpoint).toBe(
+        `${url}/access/v1/search/action`,
+      );
+
+      await admin.revokeLease(root.lease);
+      expect((await ob.authzenSearchAction(coder, "github", pub)).actions).toEqual([]);
+    });
+
+    it("lets the user decide with their ID token, and nobody else", async () => {
+      const admin = new AdminClient(url, ADMIN_TOKEN);
+      const ob = new AttenuoClient(url);
+      const root = await admin.mintRootDev("alice", ISSUER, "assistant", {
+        capabilities: ["github:*"],
+      });
+      const issue = { repo: "alice/public-docs", title: "from the user" };
+      const held = (await ob
+        .callTool(root, "github", "create_issue", issue)
+        .catch((e) => e)) as ApprovalRequiredError;
+      expect(held).toBeInstanceOf(ApprovalRequiredError);
+      const id = held.approvalId!;
+
+      await expect(ob.grantApproval(id, root.jwt)).rejects.toMatchObject({
+        status: 403,
+        error: "agent_token_refused",
+      });
+      await expect(ob.grantApproval(id, await idToken("mallory", "j-0"))).rejects.toMatchObject({
+        status: 403,
+        error: "wrong_user",
+      });
+      const token = await idToken("alice", "j-1");
+      const granted = await ob.grantApproval(id, token);
+      expect(granted).toMatchObject({ state: "granted", usable: true });
+      expect(granted.approver?.by).toBe("user");
+      const done = await ob.callTool(root, "github", "create_issue", issue, {
+        approvalToken: granted.approvalToken!,
+      });
+      expect(done.decisionId).toBeTruthy();
+
+      const second = (await ob
+        .callTool(root, "github", "create_issue", { ...issue, title: "again" })
+        .catch((e) => e)) as ApprovalRequiredError;
+      expect(second.approvalId).toBeTruthy();
+      await expect(ob.declineApproval(second.approvalId!, token)).rejects.toMatchObject({
+        status: 400,
+        error: "invalid_grant",
+      });
+      const declined = await ob.declineApproval(second.approvalId!, await idToken("alice", "j-2"));
+      expect(declined.state).toBe("declined");
+      await admin.revokeLease(root.lease);
+    });
+  },
+);
+
+// ---- private_key_jwt client assertions and the retries that send them again ---------------
+//
+// The server leaves a client assertion unused when it refuses the request with `use_dpop_nonce`
+// or `429 rate_limited` (SR-108, SR-111), because the client is told to send the same request
+// again. These tests check that the SDK's retries then succeed against the real server, and that
+// the load retry does not send an assertion that will have expired.
+
+/** An `[[agents]]` entry for `signer` that authenticates with `key`'s client assertions. */
+function signerAgent(key: DpopKey): string {
+  return `[[agents]]\nid = "signer"\njwks = '${JSON.stringify({ keys: [key.publicJwk] })}'\n\n`;
+}
+
+interface Sent {
+  assertion?: string;
+  status: number;
+  error?: string;
+}
+
+/** The global `fetch`, keeping each `POST /token` and its answer. */
+function recordingFetch() {
+  const sent: Sent[] = [];
+  const f = async (input: string, init?: RequestInit): Promise<Response> => {
+    const res = await fetch(input, init);
+    if (new URL(input).pathname === "/token") {
+      const body = JSON.parse(String(init?.body)) as { client_assertion?: string };
+      const answer = (await res.clone().json()) as { error?: string };
+      sent.push({ assertion: body.client_assertion, status: res.status, error: answer.error });
+    }
+    return res;
+  };
+  return { fetch: f, sent };
+}
+
+describe.skipIf(!enabled)("a client assertion across the nonce retry", () => {
+  let stack = { url: "", work: "", procs: [] as ChildProcess[] };
+  let clientKey: DpopKey;
+
+  beforeAll(async () => {
+    clientKey = await DpopKey.generate();
+    stack = await startStack(`[token]\ndpop_nonce = "required"\n\n${signerAgent(clientKey)}`);
+  });
+
+  afterAll(async () => {
+    await stopStack(stack.procs, stack.work);
+  });
+
+  it("is sent again with a proof that carries the nonce, and accepted", async () => {
+    // A fresh client's first exchange is refused `use_dpop_nonce`; the retry sends the same
+    // assertion with the nonce, and the server accepts it. The next exchange has the nonce
+    // already: one request.
+    const { url } = stack;
+    const key = await DpopKey.generate();
+    const admin = new AdminClient(url, ADMIN_TOKEN);
+    const root = () =>
+      admin.mintRootDev("alice", "https://idp.example", "assistant", {
+        capabilities: ["github:*"],
+        dpopKey: key,
+      });
+    const [firstRoot, laterRoot] = [await root(), await root()];
+    const rec = recordingFetch();
+    const ob = new AttenuoClient(url, { dpopKey: key, fetch: rec.fetch });
+
+    let assertion = await clientKey.clientAssertion("signer", url);
+    let child = await ob.exchange(firstRoot, "signer", ["github:read_file"], {
+      clientAssertion: assertion,
+    });
+    expect(child.dpopJkt).toBe(key.thumbprint);
+    expect(child.chain.hops.at(-1)?.agent).toBe("signer");
+    expect(rec.sent).toEqual([
+      { assertion, status: 401, error: "use_dpop_nonce" },
+      { assertion, status: 200, error: undefined },
+    ]);
+
+    rec.sent.length = 0;
+    assertion = await clientKey.clientAssertion("signer", url);
+    child = await ob.exchange(laterRoot, "signer", ["github:read_file"], {
+      clientAssertion: assertion,
+    });
+    expect(rec.sent).toEqual([{ assertion, status: 200, error: undefined }]);
+    // The bound child works through the proxy.
+    const res = await ob.callTool(child, "github", "read_file", { repo: "alice/public-docs" });
+    expect(res.decisionId).toBeTruthy();
+  });
+});
+
+describe.skipIf(!enabled)("a client assertion across the load retry", () => {
+  // `token_requests_per_minute = 1`, and an issuer key and audit store (leases, spent
+  // credentials) in files: a restart keeps the tokens and every spent assertion and forgets only
+  // the rate limit's minute, so the tests restart the server in place of waiting it out.
+  let stack = { url: "", work: "", procs: [] as ChildProcess[] };
+  let clientKey: DpopKey;
+  const original = { ...retryHooks };
+
+  beforeAll(async () => {
+    clientKey = await DpopKey.generate();
+    stack = await startStack(
+      `[limits]\ntoken_requests_per_minute = 1\n\n${signerAgent(clientKey)}`,
+      [],
+      {
+        edits: {
+          'sqlite_path = ":memory:"': 'sqlite_path = "{work}/audit.sqlite"',
+          "[issuer]\n": '[issuer]\nprivate_key_pem_path = "{work}/issuer.pem"\n',
+        },
+      },
+    );
+  });
+
+  afterAll(async () => {
+    Object.assign(retryHooks, original);
+    await stopStack(stack.procs, stack.work);
+  });
+
+  it("sends the same assertion while it lasts, and throws when it would expire", async () => {
+    const { url } = stack;
+    const admin = new AdminClient(url, ADMIN_TOKEN);
+    const roots: Token[] = [];
+    for (let i = 0; i < 3; i++) {
+      roots.push(
+        await admin.mintRootDev("alice", "https://idp.example", "assistant", {
+          capabilities: ["github:*"],
+        }),
+      );
+    }
+    const waits: number[] = [];
+    retryHooks.random = () => 0;
+    retryHooks.sleep = async (ms) => {
+      waits.push(ms);
+      await restartServer(stack);
+    };
+    const rec = recordingFetch();
+    const ob = new AttenuoClient(url, {
+      fetch: rec.fetch,
+      maxRetries: 1,
+      maxRetryDelayMs: 120_000,
+    });
+    const caps = ["github:read_file"];
+    await ob.exchange(roots[0]!, "signer", caps, {
+      clientAssertion: await clientKey.clientAssertion("signer", url),
+    });
+    expect(waits).toEqual([]);
+
+    // Over the limit: 429 with `Retry-After` until the minute ends. The assertion lasts longer,
+    // so the client waits (here: the restart) and sends it again, and it is accepted.
+    rec.sent.length = 0;
+    const lasting = await clientKey.clientAssertion("signer", url, { lifetime: 300 });
+    const child = await ob.exchange(roots[1]!, "signer", caps, { clientAssertion: lasting });
+    expect(child.chain.hops.at(-1)?.agent).toBe("signer");
+    expect(waits).toHaveLength(1);
+    expect(waits[0]).toBeGreaterThanOrEqual(1000);
+    expect(waits[0]).toBeLessThanOrEqual(60_000);
+    expect(rec.sent).toEqual([
+      { assertion: lasting, status: 429, error: "rate_limited" },
+      { assertion: lasting, status: 200, error: undefined },
+    ]);
+
+    // Over the limit again, with an assertion that would expire before the minute ends: not
+    // sent again; the refusal is thrown at once.
+    rec.sent.length = 0;
+    const short = await clientKey.clientAssertion("signer", url, { lifetime: 5 });
+    const err = await ob.exchange(roots[2]!, "signer", caps, { clientAssertion: short }).then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(RateLimitedError);
+    expect((err as RateLimitedError).retryAfter).toBeGreaterThan(5);
+    expect(waits).toHaveLength(1);
+    expect(rec.sent).toEqual([{ assertion: short, status: 429, error: "rate_limited" }]);
+
+    // What the caller does: wait out `retryAfter` (here: the restart), mint, call again.
+    await restartServer(stack);
+    await ob.exchange(roots[2]!, "signer", caps, {
+      clientAssertion: await clientKey.clientAssertion("signer", url),
+    });
+    expect(rec.sent.map((x) => x.status)).toEqual([429, 200]);
   });
 });

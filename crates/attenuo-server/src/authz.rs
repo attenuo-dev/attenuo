@@ -4,13 +4,13 @@
 //! [`ServerAuthorizer`]) and the AuthZEN endpoint call it, so they cannot disagree:
 //!
 //! 1. **Leases.** Every lease in the chain must be known, unrevoked and unexpired
-//!    (`LeaseStore::check_all`). Otherwise: deny with `lease_revoked`, `lease_expired` or
+//!    (`LeaseRegistry::check_all`). Otherwise: deny with `lease_revoked`, `lease_expired` or
 //!    `lease_unknown` (checked in that order), or `lease_error` if the store fails.
-//! 2. **Labels and budgets.** The taint state of the delegation run (`LeaseStore::labels`
+//! 2. **Labels and budgets.** The taint state of the delegation run (`RunState::labels`
 //!    for the chain id, ADR-0009); a store that cannot be read counts as tainted. And the
 //!    run limits (ADR-0010): every limited capability, in every hop, that matches the call
 //!    ([`attenuo_core::limits::charges_for`]) and what its counters hold
-//!    (`LeaseStore::budget_used`), as `context.budget` and as the limit check of step 4.
+//!    (`RunLimits::budget_used`), as `context.budget` and as the limit check of step 4.
 //!    Unreadable counters deny a limited call with `budget_error`; an argument a limit
 //!    cannot count denies it with `limit_arg_invalid`. In the same read, for a tool the
 //!    catalog marks destructive, and only when the engine tracks usage
@@ -24,19 +24,19 @@
 //!    policy reads `context.args_contain_untrusted` or `context.untrusted_args`
 //!    ([`PolicyEngine::reads_arg_taint`]) and otherwise for a call to a destructive tool,
 //!    every argument not pinned by an `equals` or `one_of` constraint is fingerprinted and
-//!    looked up in the run's span index (`LeaseStore::find_spans`), once per distinct
+//!    looked up in the run's span index (`RunState::find_spans`), once per distinct
 //!    fingerprint and with at most [`attenuo_audit::MAX_SEQS_PER_PROBE`] results each; the
 //!    hits are `context.untrusted_args` and the record's `labels.untrusted_args`. An
 //!    unreadable index, or arguments that carry more than [`MAX_ARG_PROBES`] fingerprints in
 //!    all (then nothing is looked up), makes every unpinned argument untrusted (SR-91).
 //! 3. **Approval.** A granted, unexpired approval for this call (same run, same calling hop's
 //!    lease, same call hash) is taken from the lease store and marked consumed
-//!    (`LeaseStore::take_approval`); Cedar then sees `context.approval.present` and `by`.
+//!    (`ApprovalStore::take_approval`); Cedar then sees `context.approval.present` and `by`.
 //!    When the call presents a signed approval token ([`CallContext::approval_token`]), that
 //!    token decides instead: its signature, `typ` and `exp` must verify under the issuer key,
 //!    its `chain_id`, `lease`, `ch` and `cnf.jkt` must be the call's run, the calling hop's
 //!    lease, the call hash and the hop's key binding, and the approval it names (`jti`) is
-//!    taken by id (`LeaseStore::take_approval_by_id`). A token that fails any of this, or
+//!    taken by id (`ApprovalStore::take_approval_by_id`). A token that fails any of this, or
 //!    names an approval that is consumed, declined, expired or bound to a dead lease, denies
 //!    the call with `approval_invalid` before the policy runs.
 //! 4. **Policy.** `PolicyEngine::authorize_labelled`: the capability stage (including the
@@ -46,7 +46,7 @@
 //!    `context.usage`. A deny through
 //!    `@obligation("approval")` forbids only is `approval_required`.
 //! 5. **Charge.** For an allowed call that matched limits, every counter is re-checked and
-//!    charged in one store transaction (`LeaseStore::charge`), so concurrent calls cannot
+//!    charged in one store transaction (`RunLimits::charge`), so concurrent calls cannot
 //!    overspend: if one spent first, the decision becomes `budget_exhausted`; if the store
 //!    fails, `budget_error`. The run-usage counters of a destructive call are charged in the
 //!    same transaction; usage never refuses, and a failed charge of usage alone leaves the
@@ -60,7 +60,7 @@
 //!    `audit_error`: an action that cannot be recorded does not happen. An approval taken in
 //!    step 3 is given back when the call is not allowed or its record cannot be written, so
 //!    it is spent exactly when an allowed decision that names it is in the log. A charge made
-//!    in step 5 is refunded the same way when the append fails (`LeaseStore::refund`).
+//!    in step 5 is refunded the same way when the append fails (`RunLimits::refund`).
 //! 7. **Pending approval.** For `approval_required`, a pending approval is stored (or the
 //!    pending one for the same call reused) and an `approval_request` record appended; the
 //!    caller gets its id and expiry ([`PipelineDecision::approval`]).
@@ -82,6 +82,7 @@ mod authorizer;
 mod budgets;
 mod labels;
 mod pipeline;
+mod shared_policy;
 mod usage;
 mod windows;
 
@@ -97,6 +98,7 @@ pub use pipeline::{
     REASON_LABEL_ERROR, REASON_LEASE_ERROR, REASON_LEASE_EXPIRED, REASON_LEASE_REVOKED,
     REASON_LEASE_UNKNOWN,
 };
+pub use shared_policy::SharedPolicy;
 pub use usage::{result_digest, usage_json, UNREADABLE_USAGE};
 pub use windows::UNREADABLE_WINDOW;
 

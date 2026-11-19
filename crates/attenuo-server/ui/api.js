@@ -9,7 +9,12 @@
 import { h, replace } from './dom.js';
 
 let token = null;
+// `GET /admin/whoami` of the token: {name, role, expires_at}. The server enforces roles (ADR-0016); the
+// console only uses this to name the operator and to disable buttons the role cannot use.
+let identity = null;
 let onUnauthorized = () => {};
+
+const ROLE_RANK = { viewer: 0, operator: 1, admin: 2 };
 
 /** Install the callback that shows the login screen after a 401. */
 export function setUnauthorizedHandler(fn) {
@@ -26,9 +31,41 @@ export function hasToken() {
 
 export function forgetToken() {
   token = null;
+  identity = null;
 }
 
-/** An error answer from the admin API: status, the API's `error` code and its message. */
+export function setIdentity(who) {
+  identity = who && typeof who.name === 'string' && typeof who.role === 'string' ? who : null;
+}
+
+export function getIdentity() {
+  return identity;
+}
+
+/** Whether the logged-in operator's role reaches `min` (`viewer`, `operator` or `admin`). */
+export function roleAllows(min) {
+  if (identity === null) return true;
+  return (ROLE_RANK[identity.role] ?? -1) >= ROLE_RANK[min];
+}
+
+/**
+ * Disable `btn` for good when the operator's role is below `min`, and say why in its title.
+ * Returns `btn`, so it wraps an h('button', ...) call. A disabled button only saves a 403:
+ * the server checks the role on every request.
+ */
+export function needsRole(btn, min) {
+  if (btn && !roleAllows(min)) {
+    btn.disabled = true;
+    btn.dataset.role = min;
+    btn.title = `Needs the ${min} role; you are ${identity.role}.`;
+  }
+  return btn;
+}
+
+/**
+ * An error answer from the admin API: status, the API's stable `code` (its `error` for a server
+ * that sends no `code`) and its human-readable message.
+ */
 export class ApiError extends Error {
   constructor(status, code, message) {
     super(message);
@@ -49,8 +86,10 @@ async function errorFrom(resp) {
   try {
     const body = await resp.json();
     if (body && typeof body === 'object') {
-      code = body.error || code;
-      message = body.error_description || body.message || body.detail || message;
+      // `code` is the stable machine code; `detail` is text for people. `error_description`
+      // is a deprecated copy of the code, read only from a server that sends neither.
+      code = body.code || body.error_description || body.error || code;
+      message = body.detail || body.message || body.error_description || message;
     }
   } catch {
     // Not JSON: keep the status text.

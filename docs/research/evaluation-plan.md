@@ -4,10 +4,11 @@
 > Note (2026-10-23): this project was renamed from `onbehalf` to `attenuo`. This historical document keeps the old name.
 
 - Status: draft plan. First slice run: a synthetic, LLM-free replay of injected tool calls, [injection suite](../evaluation/injection-suite.md) (2026-10-23)
+- Later results: AgentDojo ([plan](agentdojo-plan-2026-11-05.md), [planner-written grants](../evaluation/agentdojo-planner-grants.md), [a local open-weight model](../evaluation/agentdojo-local-model.md))
 - Date: 2026-10-22
 - Related: [RFC-0001](../spec/rfc-0001-attenuo.md), [threat model](../spec/threat-model.md), [incidents](incidents-2025-2026.md), [related work](related-work.md), [performance notes](../design/performance.md)
 
-This document describes how to measure whether onbehalf does what the RFC claims, in a form that can be written up as a workshop paper or as the evaluation chapter of a Master's thesis. It is a plan, not a result. Numbers quoted from other papers are as those papers report them. The only part run so far is the [injection suite](../evaluation/injection-suite.md). It replays hand-written injected call sequences through arms A0, A1 and A2 with no model in the loop, and it does not follow the split discipline of section 4.4.
+This document describes how to measure whether onbehalf does what the RFC claims, in a form that can be written up as a workshop paper or a longer technical report. It is a plan, not a result. Numbers quoted from other papers are as those papers report them. The only part run so far is the [injection suite](../evaluation/injection-suite.md). It replays hand-written injected call sequences through arms A0, A1 and A2 with no model in the loop, and it does not follow the split discipline of section 4.4.
 
 The RFC states four properties (P1 to P4). The threat model says what onbehalf does not do: it does not detect prompt injection, it assumes the agent is compromised and bounds the damage. The evaluation therefore asks a bounded question. If an agent is successfully injected, how often does attenuated delegation plus per-call policy stop the harmful tool call, how much legitimate work does it break, and what does it cost?
 
@@ -21,7 +22,7 @@ The RFC states four properties (P1 to P4). The threat model says what onbehalf d
 
 **RQ4 (secondary). Audit usefulness.** For each blocked or allowed call in a benchmark run, does the hash-chained log contain enough to reconstruct which agent, acting for which user, made the call and which policy decided it? This is checked mechanically (field completeness, chain verification, replay) and is a sanity check, not a headline result.
 
-RQ1 and RQ3 are the core of a thesis chapter. RQ2 is a short, self-contained measurement. RQ4 is a paragraph.
+RQ1 and RQ3 are the core of the write-up. RQ2 is a short, self-contained measurement. RQ4 is a paragraph.
 
 ## 2. Benchmarks and the threat model they exercise
 
@@ -220,7 +221,7 @@ Day 0 is the start of the work; weeks are counted from there.
 | 9 | InjecAgent and in-scope ASB subsets; MCP-SafetyBench and MCPTox runs; coverage table for MCPSecBench. | RQ1 results, second family |
 | 10 | Overhead experiments (section 6) on dedicated hardware. | RQ2 results |
 | 11 | Adaptive attack check; audit completeness check (RQ4); analysis scripts rerun from raw logs. | Remaining results |
-| 12 | Write-up: figures, tables, threats to validity, deviations list. Release harness, policies and logs. | Workshop paper draft or thesis chapter draft |
+| 12 | Write-up: figures, tables, threats to validity, deviations list. Release harness, policies and logs. | Workshop paper draft or report draft |
 | 13 | Buffer for reruns after fixes, and internal review. | Submission-ready draft |
 
 The slip risk is the AgentDojo adapter and the LLM budget. If weeks 3 to 6 run over, cut the ASB and MCPTox runs first and keep AgentDojo, InjecAgent and RQ3, which together carry the argument.

@@ -53,14 +53,28 @@ BACKOFF_CAP = 30.0
 _Clock = Callable[[], float]
 
 
+_LEASE_GONE = ("lease_revoked", "lease_unknown")
+
+
 def _terminal(kind: str, exc: Exception) -> RefreshError | None:
-    """A permanent failure as a RefreshError, or None when retrying can help."""
+    """A permanent failure as a RefreshError, or None when retrying can help.
+
+    Reads the server's stable code (``stable_code``) first. An older server sent ``code``
+    ``invalid_grant`` for a refused renewal and the lease reason only in ``detail``, so ``detail``
+    is the fallback when the code names no reason."""
     if isinstance(exc, ApiError):
-        detail = f"{exc.error} {exc.detail}"
+        code = exc.stable_code
+        legacy = f"{exc.error} {exc.detail}"
         if isinstance(exc, Unauthorized):
-            reason = "token_expired" if "token_expired" in detail else "refused"
+            expired = code == "token_expired" or "token_expired" in legacy
+            reason = "token_expired" if expired else "refused"
         elif kind == "renew" and exc.status == 400 and exc.error == "invalid_grant":
-            gone = "lease_revoked" in detail or "lease_unknown" in detail
+            if code in _LEASE_GONE:
+                gone = True
+            elif code == "lease_expired":
+                gone = False
+            else:
+                gone = any(r in legacy for r in _LEASE_GONE)
             reason = "lease_revoked" if gone else "lease_lost"
         elif 400 <= exc.status < 500 and exc.status not in (408, 429):
             reason = "refused"

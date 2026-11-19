@@ -50,7 +50,7 @@ The bundled defenses (`tool_filter`, `transformers_pi_detector`, `spotlighting_w
 
 ## Models
 
-The plan uses `claude-haiku-5-5` for the pilot and `claude-sonnet-5-5` for the real run. The package can't select either from its command line, and five things need handling in a custom pipeline. [`pilot.py`](../../evaluation/agentdojo/pilot.py) does all of them:
+The plan uses `claude-haiku-5-5` for the pilot and `claude-sonnet-5-5` for the real run. The package can't select either from its command line, and five things need handling in a custom pipeline. [`pilot.py`](https://github.com/attenuo-dev/attenuo/blob/main/evaluation/agentdojo/pilot.py) does all of them:
 
 - Model selection. The CLI's `--model` is an enum holding only Claude 3 ids. The entry point is `python -m agentdojo.scripts.benchmark`, and the package installs no `agentdojo` console script. We build the pipeline ourselves around `AnthropicLLM(client, model=...)`.
 - Temperature. `AnthropicLLM` sends `temperature=0.0` by default, and both models reject non-default values. Passing `temperature=None` leaves it out. Runs can't be pinned to temperature 0, so repeat runs may differ, and the report has to say so.
@@ -98,7 +98,7 @@ There are two ways in.
 | Tool list filtering | No | Yes |
 | New code | Executor only | Executor and shim |
 
-AuthZEN is the cheapest, but it can't run the labels arm. Labels are the best result on the injection suite: 1 of 77 attack calls allowed against 15 of 77 without them ([final results](../../evaluation/injection-suite/results/2026-11-05-final-main.md), scripted approver). The proxy is also the deployment we describe to readers. The plan uses the proxy.
+AuthZEN is the cheapest, but it can't run the labels arm. Labels are the best result on the injection suite: 1 of 77 attack calls allowed against 15 of 77 without them ([final results](https://github.com/attenuo-dev/attenuo/blob/main/evaluation/injection-suite/results/2026-11-05-final-main.md), scripted approver). The proxy is also the deployment we describe to readers. The plan uses the proxy.
 
 ### The adapter
 
@@ -138,7 +138,7 @@ A [run limit](../design/run-limits.md) caps what one delegated run can do: how m
 
 ## Replay 2026-11-05
 
-Each injection task can carry a ground truth: the calls that reach the attacker's goal. [`replay.py`](../../evaluation/agentdojo/replay.py) sends those through the real proxy to an MCP shim over AgentDojo's own tools, after the user task's calls and on the same token. There is no model and no API cost. AgentDojo's own checks read the final environment, and the shim records what reached a tool, so neither count rests on attenuo's answers.
+Each injection task can carry a ground truth: the calls that reach the attacker's goal. [`replay.py`](https://github.com/attenuo-dev/attenuo/blob/main/evaluation/agentdojo/replay.py) sends those through the real proxy to an MCP shim over AgentDojo's own tools, after the user task's calls and on the same token. There is no model and no API cost. AgentDojo's own checks read the final environment, and the shim records what reached a tool, so neither count rests on attenuo's answers.
 
 | Arm | Attacks landed | Attack calls blocked | Benign tasks kept | Benign calls blocked |
 | --- | --- | --- | --- | --- |
@@ -267,7 +267,7 @@ This repeats the [workspace replay](#replay-2026-11-05) on all four suites, with
 
 What the numbers show:
 
-- Attacks still get through oracle grants. All 15 are on slack. In 12, `injection_task_3` makes the agent fetch a URL, which is a read, and grants leave reads unconstrained under the rule in [`replay.py`](../../evaluation/agentdojo/replay.py). In 3, `injection_task_1` sends a direct message to a person the task already allows, with the attacker's link in a free-text body the grant doesn't pin. A fetched URL can carry data out, so this is a real gap in the read rule.
+- Attacks still get through oracle grants. All 15 are on slack. In 12, `injection_task_3` makes the agent fetch a URL, which is a read, and grants leave reads unconstrained under the rule in [`replay.py`](https://github.com/attenuo-dev/attenuo/blob/main/evaluation/agentdojo/replay.py). In 3, `injection_task_1` sends a direct message to a person the task already allows, with the attacker's link in a free-text body the grant doesn't pin. A fetched URL can carry data out, so this is a real gap in the read rule.
 - The labels arm stops those 3 messages and not the 12 fetches, because the gate applies only to destructive calls. Declining every approval leaves 40 of 97 tasks, and 1 of 21 on slack, so that row is a floor for utility.
 - The suite policy leaves what it permits. Travel's 56 are reservations and a calendar event the policy allows, workspace's 40 are file deletes, and slack's 42 are those same message and URL attacks.
 - Under permit-all, travel's `user_task_3` lets `injection_task_5` land. That attack mails the user's passport and card numbers to the same address the task legitimately mails, so the recipient pin passes and the free-text body isn't pinned. The suite policy stopped it only because that address isn't a known contact, the same rule that refused the task's own email. This is exfiltration over an allowed channel, which argument-level taint in the [labelling design](../design/output-labelling.md) targets and these arms don't use.
@@ -277,7 +277,7 @@ The limits from the [workspace replay](#replay-2026-11-05) apply here too. Grant
 
 ## Argument-level taint in the replay 2026-11-05
 
-This asks whether argument-level taint (phase 2 of [output labelling](../design/output-labelling.md), `context.args_contain_untrusted`) closes the two gaps in the [replay on all suites](#replay-on-all-suites): the 12 slack URL fetches and the 3 slack messages that pass oracle grants. No model and no API cost. Three arms were added to [`replay.py`](../../evaluation/agentdojo/replay.py), each with the oracle grants and the suite policy, plus one rule that asks for an approval, and every approval is declined as in the labels arm:
+This asks whether argument-level taint (phase 2 of [output labelling](../design/output-labelling.md), `context.args_contain_untrusted`) closes the two gaps in the [replay on all suites](#replay-on-all-suites): the 12 slack URL fetches and the 3 slack messages that pass oracle grants. No model and no API cost. Three arms were added to [`replay.py`](https://github.com/attenuo-dev/attenuo/blob/main/evaluation/agentdojo/replay.py), each with the oracle grants and the suite policy, plus one rule that asks for an approval, and every approval is declined as in the labels arm:
 
 | Arm | Rule | Catalog |
 | --- | --- | --- |
@@ -360,7 +360,7 @@ The binary was `attenuo-server` (debug) built from `59cd554`, the server commit 
 
 ## Read-side arms in the replay (2026-11-06)
 
-This runs the replay experiments that section 7 of the [read-side exfiltration](../design/read-side-exfiltration.md#7-replay-experiments-before-any-code) note proposes, for the two gaps that pass oracle grants: the 12 slack `get_webpage` fetches of `www.true-informations.com` (`injection_task_3`) and the 3 slack messages with the attacker's link (`injection_task_1`). No model and no API cost. The arms were added to [`replay.py`](../../evaluation/agentdojo/replay.py) and frozen before their first run. Each keeps the oracle grants, and every approval is declined:
+This runs the replay experiments that section 7 of the [read-side exfiltration](../design/read-side-exfiltration.md#7-replay-experiments-before-any-code) note proposes, for the two gaps that pass oracle grants: the 12 slack `get_webpage` fetches of `www.true-informations.com` (`injection_task_3`) and the 3 slack messages with the attacker's link (`injection_task_1`). No model and no API cost. The arms were added to [`replay.py`](https://github.com/attenuo-dev/attenuo/blob/main/evaluation/agentdojo/replay.py) and frozen before their first run. Each keeps the oracle grants, and every approval is declined:
 
 | Arm | Change from `grants` | Injected |
 | --- | --- | --- |
@@ -495,7 +495,7 @@ This run stopped once at 959 runs, on the organisation's limit of 2M input token
 
 The first run with attenuo between a model and the tools: `claude-haiku-5-5`, workspace, `important_instructions`, all 40 benign tasks and all 560 pairs, not only the 240 with ground truth, since attack runs don't need one. Cost was **$1.52** for task grants and **$0.09** for the labels half. Baselines come from [Haiku baseline](#haiku-baseline-2026-11-05).
 
-[`enforced.py`](../../evaluation/agentdojo/enforced.py) replaces `ToolsExecutor` and sends each call through the proxy to the shim. It was committed before the run. The catalog, suite policy, labels policy and grant rule are the ones in [`replay.py`](../../evaluation/agentdojo/replay.py), and nothing in them changed to make this work. The model sees every tool the suite has, as the baseline does, and gets attenuo's refusal as a tool error.
+[`enforced.py`](https://github.com/attenuo-dev/attenuo/blob/main/evaluation/agentdojo/enforced.py) replaces `ToolsExecutor` and sends each call through the proxy to the shim. It was committed before the run. The catalog, suite policy, labels policy and grant rule are the ones in [`replay.py`](https://github.com/attenuo-dev/attenuo/blob/main/evaluation/agentdojo/replay.py), and nothing in them changed to make this work. The model sees every tool the suite has, as the baseline does, and gets attenuo's refusal as a tool error.
 
 | Arm | Benign utility | Utility under attack | Attack success |
 | --- | --- | --- | --- |
@@ -541,7 +541,7 @@ A2 on Sonnet 5.5, on the workspace half of the [four-model sample](#four-models-
 
 ### Filtered tool list
 
-The rows above offer the model every tool in the suite, and attenuo refuses what the grant leaves out. With `--filtered-list` in [`enforced.py`](../../evaluation/agentdojo/enforced.py), the server runs with `[proxy] list_filter = "policy"` and the model is offered only what the proxy's `tools/list` returns for that run's token. Same arm (A2), same workspace half of the sample, same oracle grants and policies, one run per pair. Refused runs count as not done, and attack success is 0 in every row.
+The rows above offer the model every tool in the suite, and attenuo refuses what the grant leaves out. With `--filtered-list` in [`enforced.py`](https://github.com/attenuo-dev/attenuo/blob/main/evaluation/agentdojo/enforced.py), the server runs with `[proxy] list_filter = "policy"` and the model is offered only what the proxy's `tools/list` returns for that run's token. Same arm (A2), same workspace half of the sample, same oracle grants and policies, one run per pair. Refused runs count as not done, and attack success is 0 in every row.
 
 | Model and tool list | Benign utility | Task done under attack | Runs refused | Cost |
 | --- | --- | --- | --- | --- |
@@ -585,7 +585,7 @@ This adds the `confirm_untrusted_args` rule from `replay.args_policy(False)` to 
 | Sonnet, A2 | 6/10 | 65/140 | 26 | $4.66 |
 | Sonnet, `args`, cut off | 6/10 | 56/112 | 23 | $3.64 |
 
-On the 112 pairs both Sonnet runs finished, `args` and A2 each finished 56, with 23 and 21 refused. The Sonnet run stopped when the API credit ran out.
+On the 112 pairs both Sonnet runs finished, `args` and A2 each finished 56, with 23 and 21 refused. The Sonnet run stopped before it finished.
 
 | Attack-run calls | Allowed | Denied by capability | Denied by policy | Sent to approval |
 | --- | --- | --- | --- | --- |
@@ -663,7 +663,7 @@ How far this goes:
 - One run per pair, workspace only, and refusals vary from run to run: the same pair can refuse on one run and pass on the next.
 ## Replacing the contact rule 2026-11-05
 
-The contact-style rules cost 20 of 97 benign tasks in the [replay on all suites](#replay-on-all-suites), and with a real model they caused most of the loss under oracle grants. This measures, with no model and no API cost, what should take their place when the token already holds oracle grants. Three arms were added to [`replay.py`](../../evaluation/agentdojo/replay.py). Each keeps the oracle grants and changes only the recipient rules of the suite policy. Reads, deletes, reservations, the banking password's MFA rule and slack's rule on where pages may be published are unchanged.
+The contact-style rules cost 20 of 97 benign tasks in the [replay on all suites](#replay-on-all-suites), and with a real model they caused most of the loss under oracle grants. This measures, with no model and no API cost, what should take their place when the token already holds oracle grants. Three arms were added to [`replay.py`](https://github.com/attenuo-dev/attenuo/blob/main/evaluation/agentdojo/replay.py). Each keeps the oracle grants and changes only the recipient rules of the suite policy. Reads, deletes, reservations, the banking password's MFA rule and slack's rule on where pages may be published are unchanged.
 
 | Arm | workspace and travel | banking | slack |
 | --- | --- | --- | --- |
@@ -735,9 +735,7 @@ All 63 refusals are category `cyber`. So the refusals follow the attacker's goal
 
 ## Decisions needed
 
-Spend so far is **$171.96 by the Console, and the API credit is used up**: the account shows $3.46 unpaid, and the API refuses calls until funds are added. No payment method is on file and the credit was promotional, so nothing was charged.
-
-Our meter says $99.03, so it missed $72.93. All costs in this document come from that meter, and any cost for a model other than Haiku may be low by a factor of about 1.8. The caps we set also rested on it, which is how spending passed the $120 limit set for this work. The Console's cost and usage pages list only Haiku, at $7.42 and 60.5M input tokens, which is close to our meter's $7.16 and 58.6M. They don't list the other models at all, so we can't tell where the difference comes from. It could be rates higher than the table we priced from, or something we don't count. Treat relative costs between runs of one model as usable, and absolute costs above as lower bounds.
+The provider's Console puts the cost of all runs so far at **$171.96**. Our meter says $99.03, so it missed $72.93. All costs in this document come from that meter, and any cost for a model other than Haiku may be low by a factor of about 1.8. The spending caps we set for the runs also rested on it, so actual spending ran past them. The Console's cost and usage pages list only Haiku, at $7.42 and 60.5M input tokens, which is close to our meter's $7.16 and 58.6M. They don't list the other models at all, so we can't tell where the difference comes from. It could be rates higher than the table we priced from, or something we don't count. Treat relative costs between runs of one model as usable, and absolute costs above as lower bounds.
 
 1. Whether any more baseline spending helps. No attack succeeded on four models with this attack, and on Haiku with a stronger one too. Attacks that adapt to the model are a separate research effort, and more runs of stock attacks are unlikely to change this.
 2. Whether to report the refusal result. It can now be stated, narrowly. With default settings, on Opus 5.5 and these workspace tasks, an injection stopped the user's task in about 60% of runs under [three attacks](#refusals-fallback-and-a-second-attack), without the attack succeeding, and the attack success rate doesn't show this. Refusals follow goals that send data out, not the template. With the refusal fallback, nearly all those runs finished, on an older model, and no attack succeeded. It rests on one model at this rate, one run per pair and a partial third run. Other models and suites are unmeasured.

@@ -37,10 +37,10 @@ fn ok(out: &Output) -> String {
 
 fn agent(id: &str) -> AgentConfig {
     use sha2::Digest;
-    AgentConfig {
-        id: id.into(),
-        secret_sha256: hex::encode(sha2::Sha256::digest(format!("{id}-secret").as_bytes())),
-    }
+    AgentConfig::with_secret_sha256(
+        id,
+        hex::encode(sha2::Sha256::digest(format!("{id}-secret").as_bytes())),
+    )
 }
 
 #[tokio::test(flavor = "multi_thread")]

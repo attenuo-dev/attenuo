@@ -4,6 +4,7 @@ import {
   argLimit,
   capability,
   DeniedError,
+  DpopKey,
   AttenuoClient,
   AttenuoError,
   prefix,
@@ -168,6 +169,34 @@ describe("exchange", () => {
     await expect(
       ob.exchange(rootJwt, "coder", "github:read_file", { actorToken: " " }),
     ).rejects.toThrow(TypeError);
+  });
+
+  it("sends a client assertion instead of a secret", async () => {
+    const { fetch, calls } = mockFetch(() => jsonResponse(tokenResponse(coderJwt)));
+    const ob = new AttenuoClient(URL_, { fetch });
+    await ob.exchange(rootJwt, "coder", "github:read_file", { clientAssertion: " a.b.c\n" });
+    const body = calls[0]!.body as Record<string, unknown>;
+    expect(body).toMatchObject({
+      subject_token_type: "urn:ietf:params:oauth:token-type:jwt",
+      client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+      client_assertion: "a.b.c",
+    });
+    expect(body).not.toHaveProperty("client_id");
+    expect(body).not.toHaveProperty("client_secret");
+    // Hop 0, with a client id next to the assertion.
+    await ob.exchange("idtoken", "planner", "github:*", {
+      clientId: "planner",
+      clientAssertion: "a.b.c",
+    });
+    expect(calls[1]!.body).toMatchObject({
+      subject_token_type: "urn:ietf:params:oauth:token-type:id_token",
+      client_id: "planner",
+    });
+    for (const bad of [{ clientSecret: "s", clientAssertion: "a.b.c" }, { clientAssertion: " " }]) {
+      await expect(ob.exchange(rootJwt, "coder", "github:read_file", bad)).rejects.toThrow(
+        TypeError,
+      );
+    }
   });
 
   it("requires clientId and clientSecret together", async () => {
@@ -547,5 +576,324 @@ describe("transport options", () => {
         init?.signal?.addEventListener("abort", () => rej(init.signal!.reason));
       })) as typeof globalThis.fetch;
     await expect(new AttenuoClient(URL_, { fetch: slow, timeoutMs: 20 }).jwks()).rejects.toThrow();
+  });
+});
+
+describe("authzenEvaluateBatch (K-5)", () => {
+  const answer = {
+    evaluations: [
+      { decision: true, context: { reason: "policy_allow", decision_id: "d1" } },
+      { decision: false, context: { reason: "capability_denied", decision_id: "d2" } },
+      {
+        decision: false,
+        context: { error: { status: 400, code: "invalid_request", message: "bad entry" } },
+      },
+    ],
+  };
+
+  it("posts one entry per call under the subject default, and reads every answer", async () => {
+    const { fetch, calls } = mockFetch(() => jsonResponse(answer));
+    const out = await new AttenuoClient(URL_, { fetch }).authzenEvaluateBatch(
+      "TOK",
+      [
+        { server: "github", tool: "read_file", args: { repo: "a/b" } },
+        ["github", "create_issue"],
+        ["github", "delete_repo", { repo: "a/b" }],
+      ],
+      { semantic: "deny_on_first_deny" },
+    );
+    expect(calls[0]!.method).toBe("POST");
+    expect(calls[0]!.url.pathname).toBe("/access/v1/evaluations");
+    expect(calls[0]!.headers.get("authorization")).toBe("Bearer TOK");
+    expect(calls[0]!.body).toEqual({
+      subject: { type: "agent", id: "" },
+      evaluations: [
+        {
+          action: { name: "read_file", properties: { server: "github" } },
+          resource: { type: "tool", id: "github/read_file" },
+          context: { input: { repo: "a/b" } },
+        },
+        {
+          action: { name: "create_issue", properties: { server: "github" } },
+          resource: { type: "tool", id: "github/create_issue" },
+          context: { input: {} },
+        },
+        {
+          action: { name: "delete_repo", properties: { server: "github" } },
+          resource: { type: "tool", id: "github/delete_repo" },
+          context: { input: { repo: "a/b" } },
+        },
+      ],
+      options: { evaluations_semantic: "deny_on_first_deny" },
+    });
+    expect(out.map((d) => [d.decision, d.reason, d.decisionId])).toEqual([
+      [true, "policy_allow", "d1"],
+      [false, "capability_denied", "d2"],
+      [false, "", undefined],
+    ]);
+    expect(out[0]!.error).toBeUndefined();
+    expect(out[2]!.error).toEqual({ status: 400, code: "invalid_request", message: "bad entry" });
+  });
+
+  it("sends no options without a semantic, and returns a stopped batch as it came", async () => {
+    const { fetch, calls } = mockFetch(() =>
+      jsonResponse({ evaluations: answer.evaluations.slice(0, 1) }),
+    );
+    const out = await new AttenuoClient(URL_, { fetch }).authzenEvaluateBatch("TOK", [
+      ["g", "a"],
+      ["g", "b"],
+    ]);
+    expect(calls[0]!.body).not.toHaveProperty("options");
+    expect(out).toHaveLength(1);
+  });
+
+  it("refuses an empty batch, a bad entry and an unknown semantic before sending", async () => {
+    const { fetch, calls } = mockFetch(() => jsonResponse({}, 500));
+    const ob = new AttenuoClient(URL_, { fetch });
+    await expect(ob.authzenEvaluateBatch("TOK", [])).rejects.toThrow(/at least one/);
+    await expect(
+      ob.authzenEvaluateBatch("TOK", [["s", "t"]], { semantic: "first" as never }),
+    ).rejects.toThrow(/semantic/);
+    await expect(ob.authzenEvaluateBatch("TOK", ["s/t" as never])).rejects.toBeInstanceOf(
+      TypeError,
+    );
+    expect(calls).toHaveLength(0);
+  });
+
+  it("maps the server's refusals through the error contract", async () => {
+    const tooMany = { error: "batch_too_large", detail: "65 evaluations exceed max_batch" };
+    const { fetch } = mockFetch(() => jsonResponse(tooMany, 400));
+    const err = await new AttenuoClient(URL_, { fetch })
+      .authzenEvaluateBatch("TOK", [["s", "t"]])
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect(err).toMatchObject({ status: 400, error: "batch_too_large" });
+
+    const expired = { error: "invalid_token", detail: "expired", error_description: "expired" };
+    const { fetch: f401 } = mockFetch(() => jsonResponse(expired, 401));
+    const e401 = await new AttenuoClient(URL_, { fetch: f401 })
+      .authzenEvaluateBatch("TOK", [["s", "t"]])
+      .catch((e: unknown) => e);
+    expect(e401).toBeInstanceOf(UnauthorizedError);
+    expect(e401).toMatchObject({ description: "expired" });
+
+    const { fetch: fSingle } = mockFetch(() => jsonResponse({ decision: true }));
+    await expect(
+      new AttenuoClient(URL_, { fetch: fSingle }).authzenEvaluateBatch("TOK", [["s", "t"]]),
+    ).rejects.toThrow(/batch response/);
+  });
+
+  it("signs the batch with DPoP when the client has a key", async () => {
+    const { fetch, calls } = mockFetch(() => jsonResponse({ evaluations: [] }));
+    const ob = new AttenuoClient(URL_, { fetch, dpopKey: await DpopKey.generate() });
+    expect(await ob.authzenEvaluateBatch("TOK", [["s", "t"]])).toEqual([]);
+    expect(calls[0]!.headers.get("authorization")).toBe("DPoP TOK");
+    const claims = JSON.parse(
+      Buffer.from(calls[0]!.headers.get("dpop")!.split(".")[1]!, "base64url").toString(),
+    );
+    expect([claims.htm, claims.htu]).toEqual(["POST", `${URL_}/access/v1/evaluations`]);
+  });
+});
+
+describe("authzenConfiguration (K-5)", () => {
+  it("reads the discovery document without a credential", async () => {
+    const doc = {
+      policy_decision_point: "https://pdp.example",
+      access_evaluation_endpoint: "https://pdp.example/access/v1/evaluation",
+      access_evaluations_endpoint: "https://pdp.example/access/v1/evaluations",
+    };
+    const { fetch, calls } = mockFetch(() => jsonResponse(doc));
+    const cfg = await new AttenuoClient(URL_, { fetch, token: "TOK" }).authzenConfiguration();
+    expect(calls[0]!.method).toBe("GET");
+    expect(calls[0]!.url.pathname).toBe("/.well-known/authzen-configuration");
+    expect(calls[0]!.headers.has("authorization")).toBe(false);
+    expect(cfg).toEqual({
+      policyDecisionPoint: "https://pdp.example",
+      accessEvaluationEndpoint: "https://pdp.example/access/v1/evaluation",
+      accessEvaluationsEndpoint: "https://pdp.example/access/v1/evaluations",
+      searchActionEndpoint: "",
+      raw: doc,
+    });
+    const withSearch = {
+      ...doc,
+      search_action_endpoint: "https://pdp.example/access/v1/search/action",
+    };
+    const { fetch: f2 } = mockFetch(() => jsonResponse(withSearch));
+    const cfg2 = await new AttenuoClient(URL_, { fetch: f2 }).authzenConfiguration();
+    expect(cfg2.searchActionEndpoint).toBe(withSearch.search_action_endpoint);
+  });
+
+  it("throws the server's refusal as an ApiError", async () => {
+    const { fetch } = mockFetch(() =>
+      jsonResponse({ error: "invalid_host", detail: "Host must be localhost" }, 400),
+    );
+    await expect(new AttenuoClient(URL_, { fetch }).authzenConfiguration()).rejects.toMatchObject({
+      status: 400,
+      error: "invalid_host",
+    });
+  });
+});
+
+describe("authzenSearchAction", () => {
+  const pages: Record<string, unknown> = {
+    first: {
+      page: { next_token: "T1", count: 1 },
+      results: [{ name: "read_file", properties: { server: "github" } }],
+    },
+    T1: { page: { next_token: "T2", count: 0 }, results: [] },
+    T2: {
+      page: { next_token: "", count: 1 },
+      results: [{ name: "search", properties: { server: "github" } }],
+    },
+  };
+  const paged = () =>
+    mockFetch((req) => {
+      const token = (req.body as { page?: { token?: string } }).page?.token;
+      return jsonResponse(pages[token ?? "first"]);
+    });
+
+  it("posts the search body with page and reads one page", async () => {
+    const { fetch, calls } = paged();
+    const ob = new AttenuoClient(URL_, { fetch });
+    const page = await ob.authzenSearchAction("TOK", "github", { repo: "a/b" }, { limit: 2 });
+    expect(calls[0]!.method).toBe("POST");
+    expect(calls[0]!.url.pathname).toBe("/access/v1/search/action");
+    expect(calls[0]!.headers.get("authorization")).toBe("Bearer TOK");
+    expect(calls[0]!.body).toEqual({
+      subject: { type: "agent", id: "" },
+      resource: { type: "mcp_server", id: "github" },
+      context: { input: { repo: "a/b" } },
+      page: { limit: 2 },
+    });
+    expect(page).toEqual({
+      actions: [{ name: "read_file", server: "github" }],
+      nextToken: "T1",
+      raw: pages.first,
+    });
+
+    const last = await ob.authzenSearchAction("TOK", "github", undefined, { pageToken: "T2" });
+    expect(calls[1]!.body).toEqual({
+      subject: { type: "agent", id: "" },
+      resource: { type: "mcp_server", id: "github" },
+      context: { input: {} },
+      page: { token: "T2" },
+    });
+    expect(last.actions).toEqual([{ name: "search", server: "github" }]);
+    expect(last.nextToken).toBeUndefined();
+  });
+
+  it("iterates every page, through an empty one, to the last", async () => {
+    const { fetch, calls } = paged();
+    const ob = new AttenuoClient(URL_, { fetch });
+    const names: string[] = [];
+    for await (const a of ob.authzenSearchActionIter("TOK", "github", undefined, { limit: 2 })) {
+      names.push(a.name);
+    }
+    expect(names).toEqual(["read_file", "search"]);
+    expect(calls.map((c) => (c.body as { page?: unknown }).page)).toEqual([
+      { limit: 2 },
+      { limit: 2, token: "T1" },
+      { limit: 2, token: "T2" },
+    ]);
+  });
+
+  it("refuses a token that does not advance, and maps refusals", async () => {
+    const stuck = { page: { next_token: "T", count: 0 }, results: [] };
+    const { fetch } = mockFetch(() => jsonResponse(stuck));
+    const it_ = new AttenuoClient(URL_, { fetch }).authzenSearchActionIter("TOK", "github");
+    await expect(
+      (async () => {
+        for await (const _ of it_) void _;
+      })(),
+    ).rejects.toThrow(/did not advance/);
+
+    const bad = { error: "invalid_request", code: "invalid_search_resource", detail: "one tool" };
+    const { fetch: f400 } = mockFetch(() => jsonResponse(bad, 400));
+    const e400 = await new AttenuoClient(URL_, { fetch: f400 })
+      .authzenSearchAction("TOK", "github/read_file")
+      .catch((e: unknown) => e);
+    expect(e400).toBeInstanceOf(ApiError);
+    expect(e400).toMatchObject({ status: 400, code: "invalid_search_resource" });
+
+    const expired = { error: "invalid_token", detail: "expired", error_description: "expired" };
+    const { fetch: f401 } = mockFetch(() => jsonResponse(expired, 401));
+    await expect(
+      new AttenuoClient(URL_, { fetch: f401 }).authzenSearchAction("TOK", "github"),
+    ).rejects.toBeInstanceOf(UnauthorizedError);
+
+    for (const odd of [{ decision: true }, { results: [{ properties: {} }] }]) {
+      const { fetch: fOdd } = mockFetch(() => jsonResponse(odd));
+      await expect(
+        new AttenuoClient(URL_, { fetch: fOdd }).authzenSearchAction("TOK", "github"),
+      ).rejects.toThrow(/action search/);
+    }
+  });
+
+  it("signs the search URL with DPoP when the client has a key", async () => {
+    const empty = { page: { next_token: "", count: 0 }, results: [] };
+    const { fetch, calls } = mockFetch(() => jsonResponse(empty));
+    const ob = new AttenuoClient(URL_, { fetch, dpopKey: await DpopKey.generate() });
+    const page = await ob.authzenSearchAction("TOK", "github");
+    expect(page.actions).toEqual([]);
+    expect(page.nextToken).toBeUndefined();
+    expect(calls[0]!.headers.get("authorization")).toBe("DPoP TOK");
+    const claims = JSON.parse(
+      Buffer.from(calls[0]!.headers.get("dpop")!.split(".")[1]!, "base64url").toString(),
+    );
+    expect([claims.htm, claims.htu]).toEqual(["POST", `${URL_}/access/v1/search/action`]);
+  });
+});
+
+describe("closeSession (K-5)", () => {
+  it("sends DELETE with the session id, and reads 2xx and 405", async () => {
+    const { fetch, calls } = mockFetch(() => new Response(null, { status: 204 }));
+    expect(await new AttenuoClient(URL_, { fetch }).closeSession("TOK", "github", "s-1")).toBe(
+      true,
+    );
+    expect(calls[0]!.method).toBe("DELETE");
+    expect(calls[0]!.url.pathname).toBe("/mcp/github");
+    expect(calls[0]!.headers.get("mcp-session-id")).toBe("s-1");
+    expect(calls[0]!.headers.get("authorization")).toBe("Bearer TOK");
+
+    const { fetch: f405 } = mockFetch(() => new Response("", { status: 405 }));
+    expect(
+      await new AttenuoClient(URL_, { fetch: f405 }).closeSession("TOK", "github", "s-1"),
+    ).toBe(false);
+  });
+
+  it("throws the proxy's refusals as a call would", async () => {
+    const run = (res: () => Response) =>
+      new AttenuoClient(URL_, { fetch: mockFetch(res).fetch })
+        .closeSession("TOK", "github", "s-1")
+        .catch((e: unknown) => e);
+    const unknown = await run(() => rpcErr(-32600, "unknown session", undefined, 404));
+    expect(unknown).toBeInstanceOf(RpcError);
+    expect(unknown).toMatchObject({ code: -32600 });
+    const mismatch = await run(() =>
+      rpcErr(-32003, "denied", { reason: "session_mismatch", decision_id: "dec-9" }, 403, {
+        "x-attenuo-decision-id": "dec-9",
+      }),
+    );
+    expect(mismatch).toBeInstanceOf(DeniedError);
+    expect(mismatch).toMatchObject({ reason: "session_mismatch", decisionId: "dec-9" });
+    const revoked = await run(() => rpcErr(-32001, "revoked", { reason: "lease_revoked" }, 401));
+    expect(revoked).toBeInstanceOf(UnauthorizedError);
+    expect(revoked).toMatchObject({ reason: "lease_revoked" });
+    const gateway = await run(() => new Response("bad gateway", { status: 502 }));
+    expect(gateway).toBeInstanceOf(ApiError);
+    expect(gateway).toMatchObject({ status: 502 });
+  });
+
+  it("refuses an empty session id or a dot server, and signs a DELETE with DPoP", async () => {
+    const { fetch, calls } = mockFetch(() => new Response(null, { status: 200 }));
+    const ob = new AttenuoClient(URL_, { fetch, dpopKey: await DpopKey.generate() });
+    await expect(ob.closeSession("TOK", "github", "")).rejects.toBeInstanceOf(TypeError);
+    await expect(ob.closeSession("TOK", "..", "s-1")).rejects.toBeInstanceOf(TypeError);
+    expect(calls).toHaveLength(0);
+    expect(await ob.closeSession("TOK", "github", "s-1")).toBe(true);
+    const claims = JSON.parse(
+      Buffer.from(calls[0]!.headers.get("dpop")!.split(".")[1]!, "base64url").toString(),
+    );
+    expect([claims.htm, claims.htu]).toEqual(["DELETE", `${URL_}/mcp/github`]);
   });
 });

@@ -461,6 +461,18 @@ mod tests {
     }
 
     #[test]
+    fn a_path_prefix_uri_constraint_hides_dot_segments_and_full_uris() {
+        let c = CapabilitySet::from_iter([Capability::new("github", "resources/read")
+            .with_constraint("uri", ArgConstraint::path_prefix("/public").unwrap())]);
+        assert!(could_permit_resource(&c, "github", "/public/a"));
+        assert!(!could_permit_resource(&c, "github", "/public/../secret/a"));
+        assert!(!could_permit_resource(&c, "github", "/public-secret/a"));
+        // A URI with `//` is not a plain path: `path_prefix` admits none, so it is for path
+        // arguments, and a URI is constrained with `prefix`.
+        assert!(!could_permit_resource(&c, "github", "file:///public/a"));
+    }
+
+    #[test]
     fn prompts_are_matched_on_the_name_constraint() {
         let c = res_caps();
         assert!(could_permit_prompt(&c, "github", "deploy"));
