@@ -23,6 +23,16 @@ cargo run -q -p attenuo-cli -- policy lint examples/github-leak-demo/policy.ceda
 
 See [writing-policies](../../docs/guides/writing-policies.md#testing-policies).
 
+### Run it without Rust
+
+```sh
+examples/github-leak-demo/run-docker.sh
+```
+
+It needs only Docker with the compose plugin. The script pulls the release image `ghcr.io/attenuo-dev/attenuo:0.1.0` and the stock `python:3.12-slim` image, starts `compose.image.yml`, and plays the steps below with the CLI inside the server's container. It exits non-zero if a step comes out differently and stops the containers at the end. The release image holds no fake server, so the upstream here is `fake_github_mcp.py`, a Python script with the same three tools that echoes each call. The audit log has nine entries, as in `run.sh`; the token inspection of step 3 is left out.
+
+`KEEP=1` leaves the containers running and prints how to reach them, `ATTENUO_HOST_PORT=8081` moves the published port when 8080 is taken, and `ATTENUO_IMAGE=attenuo:dev` runs an image you built. The config is `config.docker.toml`, the one the next section describes; that section builds both images from the checkout instead. CI runs this script against the published image (job `docker-quickstart`), which is also how it was tested: the pull from GitHub's registry was not run on a developer machine.
+
 ### Run it in Docker
 
 `docker-compose.yml` at the repository root runs the same pair in containers: the server from the release image (`attenuo:dev`, which has no fake server and no `curl`) and the fake GitHub server from the `demo` build target (`attenuo:demo`).
@@ -70,6 +80,7 @@ At the end the script prints what the fake GitHub server received: one `tools/ca
 - `policy.cedar`: two permits, `read_file` and `create_issue` only when `repo like "alice/public-*"`; a forbid with `@obligation("approval")` that holds every `create_issue` until a person approves it (the Python, TypeScript and Claude Agent SDK examples use it); and two guard-rail forbids (sensitive tools without MFA, chains deeper than three).
 - `policy_test.yaml`: eleven cases for that policy, run by `attenuo policy test`.
 - `config.docker.toml`: the same, for `docker-compose.yml` at the repository root (run by `scripts/compose-smoke.sh`). It binds `0.0.0.0` inside the container, so the admin API gets a listener of its own (`[admin] listen = "0.0.0.0:9102"`, not published by compose), and, since that listener is not loopback either, it sets the demo-only `[dev] allow_root_mint_off_loopback`, without which the dev mint refuses to start. Never copy that line into a deployment.
+- `compose.image.yml`, `run-docker.sh`, `fake_github_mcp.py`: the demo from the published image, with a Python fake upstream ([Run it without Rust](#run-it-without-rust)).
 - `run.sh`, `transcript.md`.
 
 The fake server is `crates/attenuo-proxy/examples/fake_mcp.rs`: the proxy crate's `FakeMcpServer` test double with `read_file`, `create_issue` and `delete_repo`, which echoes calls instead of doing anything.

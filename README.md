@@ -24,7 +24,18 @@ cd attenuo
 examples/github-leak-demo/run.sh
 ```
 
-The first run compiles the workspace: about a minute and a half on a 4-core machine, nearly all of it compiling (plus crate downloads if your cargo cache is empty). After that the script takes about a second ([measured](docs/design/bench/2026-10-24-vm-demo-cold-timing.md)). It starts attenuo and the fake server on free ports, plays nine steps with the `attenuo` CLI, and exits non-zero if any step comes out differently. In short:
+No Rust toolchain? With Docker, the same scenario runs from the published image and compiles nothing:
+
+<!-- check: skip needs Docker and the network; CI job docker-quickstart runs it -->
+```sh
+git clone https://github.com/attenuo-dev/attenuo.git
+cd attenuo
+examples/github-leak-demo/run-docker.sh
+```
+
+It pulls `ghcr.io/attenuo-dev/attenuo:0.1.0` and the stock Python image, which runs a small fake GitHub server ([details](examples/github-leak-demo/README.md#run-it-without-rust)).
+
+With the Rust toolchain, the first run compiles the workspace: about a minute and a half on a 4-core machine, nearly all of it compiling (plus crate downloads if your cargo cache is empty). After that the script takes about a second ([measured](docs/design/bench/2026-10-24-vm-demo-cold-timing.md)). It starts attenuo and the fake server on free ports, plays nine steps with the `attenuo` CLI, and exits non-zero if any step comes out differently. In short:
 
 - Alice's assistant gets a broad `github:*` token and hands its `coder` sub-agent `github:read_file` only.
 - `coder` reads `alice/public-docs`: allowed.
