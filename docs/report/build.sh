@@ -60,7 +60,8 @@ table {
 tr { break-inside: avoid; }
 thead { display: table-header-group; }
 img { break-inside: avoid; }
-caption { caption-side: bottom; font-size: 0.95em; padding-top: 0.4em; text-align: left; }
+p:has(> img) { break-after: avoid; }
+caption { caption-side: top; font-size: 0.95em; padding-bottom: 0.4em; break-after: avoid; text-align: left; }
 th, td { padding: 0.18em 0.5em; border-bottom: 1px solid #ccc; vertical-align: top; }
 thead th { border-bottom: 1.5px solid #444; }
 img { display: block; max-width: 100%; height: auto; margin: 0.9em auto 0.3em; }
