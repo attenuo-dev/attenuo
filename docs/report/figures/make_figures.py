@@ -6,6 +6,7 @@
 No dependencies. The numbers in figures 3 and 4 are copied from the report's
 tables (sections 5.1 and 5.2); change them there and here together.
 """
+
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -40,7 +41,19 @@ def box(x, y, w, h, title, sub=None, fill="#ffffff", stroke=INK, bold=True):
     return t
 
 
-def arrow(x1, y1, x2, y2, label=None, lx=None, ly=None, colour=INK, marker="a", dash=False, anchor="middle"):
+def arrow(
+    x1,
+    y1,
+    x2,
+    y2,
+    label=None,
+    lx=None,
+    ly=None,
+    colour=INK,
+    marker="a",
+    dash=False,
+    anchor="middle",
+):
     d = ' stroke-dasharray="5 4"' if dash else ""
     t = f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" stroke="{colour}" stroke-width="1.3" marker-end="url(#{marker})"{d}/>\n'
     if label:
@@ -57,9 +70,23 @@ def fig_call_path():
     b += box(20, 230, 130, 46, "Sub-agent", "agent, hop 1")
     b += f'<rect x="300" y="20" width="290" height="290" rx="8" fill="{LIGHT}" stroke="{INK}" stroke-width="1.3"/>\n'
     b += f'<text x="445" y="42" font-size="13" font-weight="600" text-anchor="middle" fill="{INK}">attenuo (token server and MCP proxy)</text>\n'
-    b += box(320, 56, 250, 40, "Token exchange (RFC 8693)", "child must be narrower than parent", bold=False)
+    b += box(
+        320,
+        56,
+        250,
+        40,
+        "Token exchange (RFC 8693)",
+        "child must be narrower than parent",
+        bold=False,
+    )
     b += f'<text x="445" y="120" font-size="11" text-anchor="middle" fill="{GREY}">checks on every tool call, in order</text>\n'
-    stages = ["1  token and every hop's lease", "2  capabilities and run limits", "3  Cedar policy over the arguments", "4  approval, if the policy asks", "5  append decision to the audit log"]
+    stages = [
+        "1  token and every hop's lease",
+        "2  capabilities and run limits",
+        "3  Cedar policy over the arguments",
+        "4  approval, if the policy asks",
+        "5  append decision to the audit log",
+    ]
     for i, s in enumerate(stages):
         y = 128 + i * 34
         b += f'<rect x="320" y="{y}" width="250" height="27" rx="4" fill="#ffffff" stroke="{ACCENT}" stroke-width="1.2"/>\n'
@@ -67,16 +94,32 @@ def fig_call_path():
     b += box(700, 150, 120, 50, "MCP server", "the tool")
     b += arrow(85, 76, 85, 128, "ID token", lx=92, ly=106, anchor="start")
     b += arrow(85, 176, 85, 228, "child token", lx=92, ly=206, anchor="start")
-    for (x1, y1, x2, y2, letter) in [(150, 140, 318, 68, "A"), (150, 166, 318, 86, "B"), (150, 253, 318, 142, "C")]:
+    for x1, y1, x2, y2, letter in [
+        (150, 140, 318, 68, "A"),
+        (150, 166, 318, 86, "B"),
+        (150, 253, 318, 142, "C"),
+    ]:
         b += arrow(x1, y1, x2, y2)
         mx, my = (x1 + x2) / 2, (y1 + y2) / 2
         b += f'<circle cx="{mx}" cy="{my}" r="9" fill="#ffffff" stroke="{INK}" stroke-width="1.1"/>\n'
         b += f'<text x="{mx}" y="{my + 4}" font-size="11" font-weight="600" text-anchor="middle" fill="{INK}">{letter}</text>\n'
     b += arrow(590, 175, 698, 175, "allowed calls only", ly=167)
     b += arrow(590, 262, 640, 262, None, colour=WARN, marker="r")
-    for k, line in enumerate(["denied: an error with a reason", "and a decision id; the server", "never sees the call"]):
+    for k, line in enumerate(
+        [
+            "denied: an error with a reason",
+            "and a decision id; the server",
+            "never sees the call",
+        ]
+    ):
         b += f'<text x="648" y="{258 + k * 14}" font-size="10.5" fill="{WARN}">{line}</text>\n'
-    for k, line in enumerate(["A   the user's ID token is exchanged for a root token", "B   the root token is exchanged for a narrower child token", "C   the sub-agent calls a tool with the child token"]):
+    for k, line in enumerate(
+        [
+            "A   the user's ID token is exchanged for a root token",
+            "B   the root token is exchanged for a narrower child token",
+            "C   the sub-agent calls a tool with the child token",
+        ]
+    ):
         b += f'<text x="20" y="{336 + k * 16}" font-size="11" fill="{INK}">{line}</text>\n'
     return svg(840, 380, b)
 
@@ -84,9 +127,34 @@ def fig_call_path():
 def fig_narrowing():
     b = ""
     rows = [
-        (20, 760, "User's grant to the orchestrator (hop 0)", ["github / *", "repo: any", "calls: no limit", "expires 10:30"]),
-        (90, 620, "Orchestrator's grant to the coder (hop 1)", ["github / read_file", "repo: prefix alice/public-", "calls: at most 20", "expires 10:15"]),
-        (120, 560, "Coder's grant to a helper (hop 2)", ["github / read_file", "repo = alice/public-site", "calls: at most 5", "expires 10:05"]),
+        (
+            20,
+            760,
+            "User's grant to the orchestrator (hop 0)",
+            ["github / *", "repo: any", "calls: no limit", "expires 10:30"],
+        ),
+        (
+            90,
+            620,
+            "Orchestrator's grant to the coder (hop 1)",
+            [
+                "github / read_file",
+                "repo: prefix alice/public-",
+                "calls: at most 20",
+                "expires 10:15",
+            ],
+        ),
+        (
+            120,
+            560,
+            "Coder's grant to a helper (hop 2)",
+            [
+                "github / read_file",
+                "repo = alice/public-site",
+                "calls: at most 5",
+                "expires 10:05",
+            ],
+        ),
     ]
     y = 20
     for x, w, title, cells in rows:
@@ -100,7 +168,16 @@ def fig_narrowing():
         y += 92
     for i in range(2):
         yy = 82 + i * 92
-        b += arrow(400, yy, 400, yy + 28, "exchange: accepted only if narrower", lx=412, ly=yy + 19, anchor="start")
+        b += arrow(
+            400,
+            yy,
+            400,
+            yy + 28,
+            "exchange: accepted only if narrower",
+            lx=412,
+            ly=yy + 19,
+            anchor="start",
+        )
     return svg(800, 276, b)
 
 
@@ -143,7 +220,12 @@ def fig_agentdojo():
         ("workspace", [(28, 554), (2, 554)]),
         ("all four suites", [(207, 936), (25, 936)]),
     ]
-    return bars("attack cases scored as landed", groups, [("model alone", GREY), ("model behind attenuo", ACCENT)], 100)
+    return bars(
+        "attack cases scored as landed",
+        groups,
+        [("model alone", GREY), ("model behind attenuo", ACCENT)],
+        100,
+    )
 
 
 def fig_suite():
@@ -155,7 +237,12 @@ def fig_suite():
         ("attenuo|(base)", [(7, 38)]),
         ("attenuo +|output labels", [(1, 38)]),
     ]
-    return bars("attack calls allowed (test split)", groups, [("attack calls that got through, of 38", ACCENT)], 100)
+    return bars(
+        "attack calls allowed (test split)",
+        groups,
+        [("attack calls that got through, of 38", ACCENT)],
+        100,
+    )
 
 
 if __name__ == "__main__":
