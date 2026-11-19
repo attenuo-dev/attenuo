@@ -1,0 +1,57 @@
+# The GitHub leak demo from the published image: no Rust toolchain and nothing built from source.
+# run-docker.sh starts this file and plays the demo; README.md ("Run it without Rust") explains it.
+#
+#   examples/github-leak-demo/run-docker.sh
+#
+# Two containers: attenuo-server from the release image on GitHub's registry, and a fake GitHub
+# MCP server (fake_github_mcp.py, Python standard library only) in the stock Python image. The
+# release image holds no fake server, which is why the upstream is a script here.
+#
+# docker-compose.yml at the repository root is the same demo with both images built from the
+# checkout. This file shares its config (config.docker.toml) and policy, so the notes in that
+# file about the admin listener (9102, not published) and the development root mint apply here.
+#
+# ATTENUO_IMAGE picks another image, for example one you built yourself:
+#   ATTENUO_IMAGE=attenuo:dev examples/github-leak-demo/run-docker.sh
+
+services:
+  attenuo:
+    image: ${ATTENUO_IMAGE:-ghcr.io/attenuo-dev/attenuo:0.1.0}
+    command: ["--config", "/etc/attenuo/config.toml"]
+    environment:
+      ATTENUO_ADMIN_TOKEN: ${ATTENUO_ADMIN_TOKEN:?set ATTENUO_ADMIN_TOKEN, e.g. $(openssl rand -hex 32)}
+    ports:
+      # Agent-facing listener only, on the host's loopback. Set ATTENUO_HOST_PORT if 8080 is taken.
+      - "127.0.0.1:${ATTENUO_HOST_PORT:-8080}:8080"
+    volumes:
+      - ./config.docker.toml:/etc/attenuo/config.toml:ro
+      - ./policy.cedar:/etc/attenuo/policy.cedar:ro
+    healthcheck:
+      test: ["CMD", "attenuo", "--server", "http://127.0.0.1:8080", "health", "--timeout", "3"]
+      interval: 10s
+      timeout: 5s
+      start_period: 5s
+      start_interval: 1s
+      retries: 3
+    depends_on:
+      fake-mcp:
+        condition: service_started
+    stop_grace_period: 15s # the server drains for up to 10s after SIGTERM
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+
+  # Named fake-mcp because config.docker.toml reaches the upstream at http://fake-mcp:3001/mcp.
+  fake-mcp:
+    image: python:3.12-slim
+    command: ["python3", "/srv/fake_github_mcp.py", "--host", "0.0.0.0", "--port", "3001"]
+    user: "65534:65534"
+    volumes:
+      - ./fake_github_mcp.py:/srv/fake_github_mcp.py:ro
+    expose:
+      - "3001"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true

@@ -8,6 +8,10 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 
 ## [Unreleased]
 
+### Added
+
+- The GitHub leak demo runs without a Rust toolchain: `examples/github-leak-demo/run-docker.sh` pulls the published image `ghcr.io/attenuo-dev/attenuo:0.1.0` and plays the scenario against a fake GitHub MCP server written in Python (`fake_github_mcp.py`, `compose.image.yml`). The README shows it next to the source run, and the CI job `docker-quickstart` runs it against the published image.
+
 ### Documentation
 
 - The STDIO servers guide has a walkthrough against a real server, `@modelcontextprotocol/server-filesystem` 2.4.0, with the config, policy and the output of one allowed and three denied calls. The `stdio-bridge` example command is no longer marked untested.

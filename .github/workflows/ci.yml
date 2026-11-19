@@ -56,6 +56,7 @@ jobs:
       rust: ${{ github.event_name != 'pull_request' || steps.filter.outputs.rust == 'true' }}
       fuzz: ${{ github.event_name != 'pull_request' || steps.filter.outputs.fuzz == 'true' }}
       docker: ${{ github.event_name != 'pull_request' || steps.filter.outputs.docker == 'true' }}
+      quickstart: ${{ github.event_name != 'pull_request' || steps.filter.outputs.quickstart == 'true' }}
       guide: ${{ github.event_name != 'pull_request' || steps.filter.outputs.guide == 'true' }}
       lean: ${{ github.event_name != 'pull_request' || steps.filter.outputs.lean == 'true' }}
     steps:
@@ -81,6 +82,10 @@ jobs:
             # The image and compose files, the compose demo's config and its test.
             docker:
               - "{Dockerfile,.dockerignore,docker-compose.yml,examples/github-leak-demo/config.docker.toml,scripts/compose-smoke.sh,.github/workflows/ci.yml}"
+            # The demo from the published image: its compose file, script, fake upstream, and
+            # the config and policy it mounts.
+            quickstart:
+              - "{examples/github-leak-demo/compose.image.yml,examples/github-leak-demo/run-docker.sh,examples/github-leak-demo/fake_github_mcp.py,examples/github-leak-demo/config.docker.toml,examples/github-leak-demo/policy.cedar,.github/workflows/ci.yml}"
             # The getting-started guide and the README are documentation, which `rust` leaves
             # out, but their commands are checked by running them (the `getting-started` job).
             guide:
@@ -289,6 +294,20 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: bash scripts/compose-smoke.sh
 
+  # The leak demo from the published release image (examples/github-leak-demo/run-docker.sh):
+  # what a newcomer without a Rust toolchain runs. Nothing is built; the image is pulled from
+  # ghcr.io. The image is a fixed release while the config and policy come from the checkout, so
+  # this also fails when a change to config.docker.toml stops the released server from starting.
+  docker-quickstart:
+    name: docker quickstart (published image)
+    needs: changes
+    if: needs.changes.outputs.quickstart == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: bash examples/github-leak-demo/run-docker.sh
+
   # The admin console in headless Chromium: every page in both themes, with zero console
   # errors and CSP violations allowed (scripts/console-smoke.sh, tests/console/).
   console-browser:
@@ -467,7 +486,7 @@ jobs:
   ci-ok:
     name: ci-ok
     if: always()
-    needs: [changes, fmt, clippy, test, msrv, deny, audit, demo, getting-started, compose, console-browser, policy-tests, fuzz-check, fuzz-build, lean, docs]
+    needs: [changes, fmt, clippy, test, msrv, deny, audit, demo, getting-started, compose, docker-quickstart, console-browser, policy-tests, fuzz-check, fuzz-build, lean, docs]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
