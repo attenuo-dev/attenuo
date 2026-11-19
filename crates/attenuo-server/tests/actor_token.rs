@@ -313,6 +313,16 @@ async fn spiffe_jwt_svid_authenticates_the_actor() {
         )
         .unwrap();
     assert_eq!(child.claims.act.sub, "coder");
+    // `act.iss` is the namespace of the agent id, this server, not the SPIFFE trust domain
+    // that vouched for the workload (OAuth Actor Profile -01 §3.4: not the credential issuer).
+    assert_eq!(
+        child.claims.act.iss.as_deref(),
+        Some("https://attenuo.test")
+    );
+    assert_eq!(
+        child.claims.act.act.as_ref().and_then(|a| a.iss.as_deref()),
+        Some("https://attenuo.test")
+    );
 
     // The issuance is audited under the authenticated agent.
     let entries = h.audit().await;

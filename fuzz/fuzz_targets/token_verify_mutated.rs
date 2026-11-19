@@ -267,10 +267,7 @@ fuzz_target!(|input: Input| {
                     Some(v.claims.exp),
                     v.chain.hops.last().map(|h| h.expires_at.unix_timestamp())
                 );
-                assert_eq!(
-                    attenuo_token::ActClaim::from_chain(&v.chain).as_ref(),
-                    Some(&v.claims.act)
-                );
+                assert!(v.claims.act.matches_chain(&v.chain, &v.claims.iss));
                 assert_eq!(v.claims.ou_sig_v, attenuo_token::OU_SIG_VERSION);
                 if let Some(cnf) = &v.claims.cnf {
                     assert!(cnf.is_well_formed());

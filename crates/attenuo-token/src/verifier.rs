@@ -4,7 +4,7 @@ use attenuo_core::DelegationChain;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use time::OffsetDateTime;
 
-use crate::claims::{ou_sig_message, ActClaim, Claims, OU_SIG_VERSION, TOKEN_TYPE};
+use crate::claims::{ou_sig_message, Claims, OU_SIG_VERSION, TOKEN_TYPE};
 use crate::error::TokenError;
 use crate::keys::PublicKey;
 
@@ -214,7 +214,7 @@ impl Verifier {
                 "`sub` does not match the chain's originating user".into(),
             ));
         }
-        if ActClaim::from_chain(&claims.chain).as_ref() != Some(&claims.act) {
+        if !claims.act.matches_chain(&claims.chain, &claims.iss) {
             return Err(TokenError::Malformed(
                 "`act` does not match the chain's hops".into(),
             ));

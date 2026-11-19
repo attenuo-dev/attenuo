@@ -124,7 +124,8 @@ A delegation token is a compact JWS, EdDSA (Ed25519), with header `typ` = `atten
   "iss": "https://attenuo.example.com",
   "aud": "https://attenuo.example.com/proxy",
   "sub": "user:alice",
-  "act": { "sub": "agent:coder", "act": { "sub": "agent:planner" } },
+  "act": { "sub": "agent:coder", "iss": "https://attenuo.example.com",
+           "act": { "sub": "agent:planner", "iss": "https://attenuo.example.com" } },
   "jti": "0f8c1d52-9b0e-4a8e-bb43-5d61f3a1c7e0",
   "iat": 1761167100,
   "exp": 1761168900,
@@ -137,7 +138,7 @@ A delegation token is a compact JWS, EdDSA (Ed25519), with header `typ` = `atten
 }
 ```
 
-- `sub` is the originating user. `act` is the RFC 8693 §4.1 actor chain: outermost is the agent currently acting, innermost the root agent (no `act`). Both are derived from `chain` so generic consumers can read who acts for whom without parsing it; the verifier MUST reject a token in which they disagree with `chain`.
+- `sub` is the originating user. `act` is the RFC 8693 §4.1 actor chain: outermost is the agent currently acting, innermost the root agent (no `act`). Both are derived from `chain` so generic consumers can read who acts for whom without parsing it; the verifier MUST reject a token in which they disagree with `chain`. Every level of `act` carries `iss`, the namespace of its `sub`, as the OAuth Actor Profile asks (draft-mcguinness-oauth-actor-profile-01 §3.4, an individual Internet-Draft, not a standard): agent ids are assigned by the token service's `[[agents]]`, so it is always the token's own `iss`, whether the agent authenticated with a client secret or an actor token. Tokens issued before `act.iss` existed have it at no level; a verifier MUST accept `iss` equal to the token's `iss` at every level or at none, and MUST reject anything else.
 - `exp` always equals the last hop's `expires_at`. Leases are not a top-level claim; each hop carries its own inside `chain`.
 - `ou_sig` is made once at root issuance and copied unchanged through every exchange, together with `ou_sig_v` and `ou_kid`, so the user block is verifiable independently of the outer signature, under the key that made it (which may be a retired key after a rotation).
 - `ou_kid` is the key id of `ou_sig`, a sibling claim rather than part of an `{sig, kid}` object, so `ou_sig` stays a plain string. It is not covered by `ou_sig` itself (the outer signature covers it) and has been required since `ou_sig` version 2: the root mint sets it to the signing key's `kid` (the same value as the JWT header `kid`, base64url of the first 16 bytes of SHA-256 over the key's SPKI DER), and every exchange copies it from the parent. The verifier MUST check `ou_sig` under that one key and MUST NOT try the other trusted keys: an `ou_kid` that is missing, empty or names no trusted key fails verification. No accepted token lacks it, and a fallback would let a token pick a path costing one Ed25519 check per trusted key.
@@ -196,7 +197,7 @@ When both are sent, both are checked. An agent id MUST NOT appear more than once
 1. EdDSA signature and algorithm;
 2. header and claim `typ` equal `attenuo+jwt`;
 3. `iss`, then 4. `aud`, then 5. `exp > now`;
-6. `sub` equals `chain.originating_user.subject`, and `act` equals the actor chain rebuilt from `chain.hops`;
+6. `sub` equals `chain.originating_user.subject`, and `act` equals the actor chain rebuilt from `chain.hops` (with `iss` = the token's `iss` at every level, or at none);
 7. `exp` equals the last hop's `expires_at`;
 8. `ou_sig_v` equals 3, then `ou_sig` (construction above, RFC 8785 canonical JSON) under the trusted key named by `ou_kid` (that key only; no `ou_kid`, or one naming no trusted key, fails);
 9. `chain.validate_at(now, max_depth)`: non-empty subject, at least one hop, depth, per-hop expiry, expiry monotonicity, attenuation.

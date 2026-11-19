@@ -14,7 +14,7 @@ use attenuo_token::{
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
-use serde_json::json;
+use serde_json::{json, Value};
 use time::macros::datetime;
 use time::{Duration, OffsetDateTime};
 
@@ -164,10 +164,15 @@ fn act_nesting_for_three_hops_matches_rfc8693() {
     assert_eq!(grandparent.sub, "agent:planner");
     assert!(grandparent.act.is_none());
     assert_eq!(act.depth(), 3);
+    // Every level names the namespace of its `sub`, the token service itself (OAuth Actor
+    // Profile, draft-mcguinness-oauth-actor-profile-01 §3.4).
     assert_eq!(
         decode_payload(&h2.token)["act"],
-        json!({"sub": "agent:reviewer", "act": {"sub": "agent:coder", "act": {"sub": "agent:planner"}}})
+        json!({"sub": "agent:reviewer", "iss": ISS,
+               "act": {"sub": "agent:coder", "iss": ISS,
+                       "act": {"sub": "agent:planner", "iss": ISS}}})
     );
+    assert_eq!(act.iss.as_deref(), Some(ISS));
     // the user block signature travels unchanged
     assert_eq!(
         decode_payload(&h2.token)["ou_sig"],
@@ -630,6 +635,64 @@ fn inconsistent_sub_or_act_is_rejected() {
     ));
 }
 
+/// `act.iss` is the token's own `iss` at every level, or absent at every level (a token issued
+/// before it was added). Anything else does not match the chain.
+#[test]
+fn act_iss_is_the_issuer_or_absent_everywhere() {
+    let issuer = issuer();
+    let r = root(&issuer);
+    let child = issuer
+        .exchange(
+            &r.token,
+            AgentId::new("agent:coder"),
+            caps([Capability::new("github", "read_file")]),
+            None,
+            t0(),
+        )
+        .unwrap();
+    let verify = |payload: &Value| {
+        issuer
+            .verifier()
+            .verify(&resign_with_issuer_key(&issuer, payload), t0())
+    };
+    let base = decode_payload(&child.token);
+    assert!(verify(&base).is_ok());
+
+    // The older form, without `iss` anywhere, still verifies.
+    let mut old = base.clone();
+    old["act"].as_object_mut().unwrap().remove("iss");
+    old["act"]["act"].as_object_mut().unwrap().remove("iss");
+    let v = verify(&old).unwrap();
+    assert_eq!(v.claims.act.iss, None);
+    // A parent in the older form can still be exchanged; the child has `iss` everywhere.
+    let old_parent = resign_with_issuer_key(&issuer, &old);
+    let grandchild = issuer
+        .exchange(
+            &old_parent,
+            AgentId::new("agent:reviewer"),
+            caps([Capability::new("github", "read_file")]),
+            None,
+            t0(),
+        )
+        .unwrap();
+    assert_eq!(
+        decode_payload(&grandchild.token)["act"]["act"]["act"]["iss"],
+        ISS
+    );
+
+    // Another namespace, or `iss` on some levels only: refused.
+    let mut foreign = base.clone();
+    foreign["act"]["iss"] = json!("https://other.example");
+    let mut mixed = base.clone();
+    mixed["act"]["act"].as_object_mut().unwrap().remove("iss");
+    for bad in [foreign, mixed] {
+        assert!(
+            matches!(verify(&bad), Err(TokenError::Malformed(_))),
+            "{bad}"
+        );
+    }
+}
+
 #[test]
 fn wrong_header_typ_is_rejected() {
     let issuer = issuer();
@@ -930,6 +993,9 @@ fn ou_sig_is_bound_to_the_issuer() {
     assert!(b.verifier().verify(&from_b.token, t0()).is_ok());
     let mut payload = decode_payload(&from_b.token);
     payload["iss"] = json!(ISS);
+    // `act.iss` too, so that only `ou_sig` can tell (a mismatched `act.iss` alone is refused as
+    // malformed, `act_iss_is_the_issuer_or_absent_everywhere`).
+    payload["act"]["iss"] = json!(ISS);
     let relabelled = resign_with_issuer_key(&a, &payload);
     assert!(matches!(
         a.verifier().verify(&relabelled, t0()),
