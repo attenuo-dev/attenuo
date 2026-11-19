@@ -40,7 +40,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 # Pinned by digest (multi-arch index, SR-30). Refresh: Dependabot (docker ecosystem), or
 # `docker buildx imagetools inspect debian:bookworm-slim` and paste the top-level Digest.
-FROM debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3 AS base
+FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc AS base
 # No packages are installed: TLS uses rustls with its own built-in roots (webpki-roots), not the
 # system store, and the health check is the CLI's own.
 RUN groupadd --system --gid 10001 attenuo \
