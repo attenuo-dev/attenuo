@@ -33,7 +33,7 @@ attenuo is a self-hosted server and MCP proxy written in Rust, with Python and T
 
 Narrowing delegation with a check on every tool call is not new in itself: research prototypes and an IETF individual draft do the same job in other ways. Section 7 says which, and how attenuo differs.
 
-attenuo is pre-alpha. Release 0.1.0 is prepared but not tagged, and nothing has run in production (`docs/release/0.1.0.md`).
+attenuo is pre-alpha. Release 0.1.0 is the first tagged release (2026-11-19), and nothing has run in production (`docs/release/0.1.0.md`).
 
 **How to read this report.** Sections 2 and 3 give the threat model and the design. Section 5 is the evaluation and starts with a one-table summary. Section 6 lists the limits and section 7 the related work. The appendices hold detail that most readers will not need on a first reading: design details (A), the further AgentDojo runs (B), the re-check of the injection suite (C) and the security review pass by pass (D). Every result names its source.
 
@@ -384,7 +384,7 @@ Table: Table 11. Attack calls allowed (without an approval, in approval arms) an
 
 *Figure 4. Attack calls allowed on the test split, by arm.* The first five bars are the first five rows of Table 11, and the last is the output-labels row, in which a scripted approver declined the gated attack calls.
 
-Table 11 is the final run, on release binaries at version 0.1.0 (untagged) built from `main` 85cb28f; the results file records repository HEAD `f17882d`, the next commit, which changes no crate. The Wilson intervals treat each call as an independent trial. Calls in one case share a grant and a task, so the true uncertainty is wider.
+Table 11 is the final run, on release binaries at version 0.1.0 (before the tag) built from `main` 85cb28f; the results file records repository HEAD `f17882d`, the next commit, which changes no crate. The Wilson intervals treat each call as an independent trial. Calls in one case share a grant and a task, so the true uncertainty is wider.
 
 **Where calls were refused.** Under `attenuo` on dev, the 62 refused attack calls split as 43 at the capability check, 16 by policy and 3 by leases. The lease denials happen only because a case scripted a user revocation, so they stand for a person who noticed something. On test, 31 refusals split as 4 at the name check (look-alike names), 12 capability, 7 policy, 2 refused delegations, 4 scripted leases and 2 by the declared-type check (see Appendix C).
 
@@ -512,7 +512,7 @@ None of these is an independent evaluation. The two gaps that still land are a r
 
 # Availability
 
-The source is Apache-2.0 and is to be published at <https://github.com/attenuo-dev/attenuo> when 0.1.0 is tagged and the repository is made public [verify: not public at the time of writing]. Design, decisions, suite and benchmark outputs are in `docs/spec/`, `docs/decisions/`, `evaluation/injection-suite/`, `evaluation/agentdojo/results/` and `docs/design/bench/`. Corrections, independent runs and attempts to break attenuo are welcome.
+The source is Apache-2.0 and is published at <https://github.com/attenuo-dev/attenuo>; release 0.1.0 is tagged `v0.1.0`. Design, decisions, suite and benchmark outputs are in `docs/spec/`, `docs/decisions/`, `evaluation/injection-suite/`, `evaluation/agentdojo/results/` and `docs/design/bench/`. Corrections, independent runs and attempts to break attenuo are welcome.
 
 # References {.unnumbered}
 

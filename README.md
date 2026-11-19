@@ -92,7 +92,7 @@ All measured on a shared 4-core development container, so read them as indicativ
 
 ## Status
 
-attenuo is pre-alpha and has not been used in production. Release 0.1.0 is prepared but not tagged ([draft notes](docs/release/0.1.0.md)). The full account is in [docs/status.md](docs/status.md).
+attenuo is pre-alpha and has not been used in production. Release 0.1.0, the first, was tagged on 2026-11-19 ([release notes](docs/release/0.1.0.md)). The full account is in [docs/status.md](docs/status.md).
 
 - **Tests and fuzzing.** Unit, property and integration tests in Rust and in both SDKs, the SDKs against a real server, and 22 fuzz targets with no open crash.
 - **Proof.** A Lean model of the covering rule proves that delegation never widens authority in the model. The Rust code is not verified against it; a differential test finds the two in agreement on 31,500 generated cases.
