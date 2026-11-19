@@ -556,7 +556,10 @@ export const Outro: React.FC = () => {
           </div>
         </Rise>
         <Rise at={40} style={{ marginTop: 50 }}>
-          <div style={{ fontSize: sq ? 34 : 40, color: C.fg }}>Open source soon.</div>
+          <div style={{ fontSize: sq ? 34 : 40, color: C.fg }}>Open source now.</div>
+        </Rise>
+        <Rise at={46} style={{ marginTop: 14 }}>
+          <div style={{ fontFamily: mono, fontSize: sq ? 30 : 34, color: C.accent }}>github.com/attenuo-dev/attenuo</div>
         </Rise>
         <Rise at={52} style={{ marginTop: 18 }}>
           <div style={{ fontFamily: mono, fontSize: sq ? 28 : 32, color: C.muted }}>
