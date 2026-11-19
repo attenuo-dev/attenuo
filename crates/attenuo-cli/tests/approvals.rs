@@ -93,7 +93,13 @@ async fn operator_lists_shows_grants_and_declines_approvals() {
         let mut c = attenuo();
         c.env("ATTENUO_TOKEN", &token)
             .args([
-                "--server", &url, "call", "--server", "github", "--tool", tool,
+                "--server",
+                &url,
+                "call",
+                "--upstream",
+                "github",
+                "--tool",
+                tool,
             ])
             .arg("--arg")
             .arg(format!("repo={repo}"));
@@ -258,5 +264,35 @@ async fn operator_lists_shows_grants_and_declines_approvals() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+
+    // Two approvals in the run: a page of one names the next page's command with the filters
+    // and `--limit` it was given, and that command lists the other one.
+    let mut c = admin();
+    c.args(["approval", "list", "--chain-id", &chain_id, "--limit", "1"]);
+    let text = ok(&run(c).await);
+    assert!(text.starts_with(&other), "{text}");
+    let next = text
+        .lines()
+        .find_map(|l| l.strip_prefix("more: approval list "))
+        .and_then(|l| l.strip_suffix(", or --all"))
+        .unwrap_or_else(|| panic!("no next-page hint: {text}"));
+    let prefix = format!("--chain-id {chain_id} --limit 1 --cursor ");
+    let cursor = next
+        .strip_prefix(&prefix)
+        .unwrap_or_else(|| panic!("hint drops the filters or --limit: {text}"));
+    let mut c = admin();
+    c.args([
+        "approval",
+        "list",
+        "--chain-id",
+        &chain_id,
+        "--limit",
+        "1",
+        "--cursor",
+        cursor,
+    ]);
+    let text = ok(&run(c).await);
+    assert!(text.starts_with(&approval_id), "{text}");
+    assert!(!text.contains("more:"), "{text}");
     drop(upstream_task);
 }

@@ -41,6 +41,7 @@ pub mod clock;
 pub mod decision;
 pub mod digest;
 pub mod error;
+pub mod error_codes;
 pub mod fingerprint;
 pub mod jcs;
 pub mod jsonrpc;
@@ -49,7 +50,11 @@ pub mod names;
 pub mod windows;
 
 pub use call::ToolCall;
-pub use capability::{as_long, ArgConstraint, Capability, CapabilitySet, RangeError};
+pub use capability::{
+    as_long, ArgConstraint, Capability, CapabilitySet, ConstraintError, PathError, RangeError,
+    LOOKALIKE_SEPARATORS, MAX_CAPABILITIES, MAX_CONSTRAINTS, MAX_ONE_OF_VALUES,
+    MAX_ONE_OF_VALUES_TOTAL,
+};
 pub use chain::{AgentId, DelegationChain, Hop, LeaseId, OriginatingUser};
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use decision::{
@@ -58,7 +63,7 @@ pub use decision::{
     UntrustedArg, UntrustedKind, REASON_APPROVAL_DECLINED, REASON_APPROVAL_GRANTED,
     REASON_APPROVAL_INVALID, REASON_APPROVAL_REQUESTED, REASON_TOOL_RESULT,
 };
-pub use error::{AttenuationError, ChainError};
+pub use error::{AttenuationError, ChainError, SizeError};
 pub use limits::{ArgLimit, Charge, Derive, LimitKind, Limits};
 pub use names::{NameError, NameKind};
 pub use windows::{WindowCharge, WindowKind, WindowMeasure};

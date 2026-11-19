@@ -73,25 +73,25 @@ describe("AdminClient", () => {
 
   it("pages the audit log", async () => {
     const { fetch, calls } = mockFetch(() =>
-      jsonResponse({ entries: [entry(5), entry(6)], next: 7 }),
+      jsonResponse({ entries: [entry(5), entry(6)], next_cursor: "c7" }),
     );
     const page = await new AdminClient(URL_, "adm", { fetch }).audit(5, 2);
-    expect(page.next).toBe(7);
+    expect(page.nextCursor).toBe("c7");
     expect(page.entries.map((e) => e.seq)).toEqual([5, 6]);
     expect(page.entries[0]!.record.id).toBe("dec-5");
     expect(calls[0]!.url.searchParams.get("from")).toBe("5");
     expect(calls[0]!.url.searchParams.get("limit")).toBe("2");
   });
 
-  it("tails the log from the head of GET /admin/audit, following next", async () => {
+  it("tails the log from the head of GET /admin/audit, following next_cursor", async () => {
     const { fetch, calls } = mockFetch((s) => {
       expect(s.url.pathname).not.toBe("/admin/audit/checkpoint");
-      const from = Number(s.url.searchParams.get("from"));
       if (s.url.searchParams.get("limit") === "1")
-        return jsonResponse({ entries: [entry(1)], next: 2, head: 10 });
-      return from === 8
-        ? jsonResponse({ entries: [entry(8), entry(9)], next: 10, head: 10 })
-        : jsonResponse({ entries: [entry(10)], next: null, head: 10 });
+        return jsonResponse({ entries: [entry(1)], next_cursor: "x", head: 10 });
+      expect(s.url.searchParams.get("from")).toBe("8");
+      return s.url.searchParams.get("cursor") === null
+        ? jsonResponse({ entries: [entry(8), entry(9)], next_cursor: "c10", head: 10 })
+        : jsonResponse({ entries: [entry(10)], next_cursor: null, head: 10 });
     });
     const tail = await new AdminClient(URL_, "adm", { fetch }).auditTail(3);
     expect(tail.map((e) => e.seq)).toEqual([8, 9, 10]);
@@ -103,9 +103,9 @@ describe("AdminClient", () => {
   });
 
   it("reads the head, 0 when absent", async () => {
-    const a = mockFetch(() => jsonResponse({ entries: [], next: null, head: 12 }));
+    const a = mockFetch(() => jsonResponse({ entries: [], next_cursor: null, head: 12 }));
     expect(await new AdminClient(URL_, "adm", { fetch: a.fetch }).auditHead()).toBe(12);
-    const b = mockFetch(() => jsonResponse({ entries: [], next: null }));
+    const b = mockFetch(() => jsonResponse({ entries: [] }));
     expect(await new AdminClient(URL_, "adm", { fetch: b.fetch }).auditHead()).toBe(0);
   });
 
@@ -346,6 +346,25 @@ describe("AdminClient", () => {
     ).rejects.toBeInstanceOf(ApiError);
   });
 
+  it("reloads operators and surfaces a 422 as ApiError", async () => {
+    const ok = mockFetch(() =>
+      jsonResponse({ added: ["frank"], removed: ["vera"], changed: ["bob"], audit_id: "x" }),
+    );
+    expect(await new AdminClient(URL_, "adm", { fetch: ok.fetch }).operatorsReload()).toEqual({
+      added: ["frank"],
+      removed: ["vera"],
+      changed: ["bob"],
+    });
+    expect(ok.calls[0]!.url.pathname).toBe("/admin/operators/reload");
+    expect(ok.calls[0]!.method).toBe("POST");
+    const bad = mockFetch(() =>
+      jsonResponse({ error: "operators_no_admin", code: "operators_no_admin", detail: "x" }, 422),
+    );
+    await expect(
+      new AdminClient(URL_, "adm", { fetch: bad.fetch }).operatorsReload(),
+    ).rejects.toBeInstanceOf(ApiError);
+  });
+
   it("mints a dev root token", async () => {
     const { fetch, calls } = mockFetch(() => jsonResponse(tokenResponse(rootJwt, "lease-0")));
     const admin = new AdminClient(URL_, "adm", { fetch });
@@ -403,17 +422,34 @@ describe("AdminClient", () => {
 });
 
 describe("AdminClient console endpoints", () => {
+  it("whoami names the token's operator and role", async () => {
+    const { fetch, calls } = mockFetch(() => jsonResponse({ name: "alice", role: "operator" }));
+    const admin = new AdminClient(URL_, "adm", { fetch });
+    expect(await admin.whoami()).toStrictEqual({ name: "alice", role: "operator" });
+    expect(calls[0]!.url.pathname).toBe("/admin/whoami");
+    expect(calls[0]!.method).toBe("GET");
+    const exp = mockFetch(() =>
+      jsonResponse({ name: "temp", role: "viewer", expires_at: "2026-12-31T23:59:59Z" }),
+    );
+    expect(await new AdminClient(URL_, "adm", { fetch: exp.fetch }).whoami()).toStrictEqual({
+      name: "temp",
+      role: "viewer",
+      expiresAt: "2026-12-31T23:59:59Z",
+    });
+  });
+
   const deny = (seq: number) => ({ seq, record: { ...entry(seq).record, decision: "deny" } });
 
-  it("filters newest first and follows prev across a short page", async () => {
+  it("filters newest first and follows next_cursor across a short page", async () => {
     const { fetch, calls } = mockFetch((s) =>
-      s.url.searchParams.has("before")
-        ? jsonResponse({ entries: [deny(4), deny(2)], next: 10, prev: null, head: 12 })
-        : jsonResponse({ entries: [deny(9)], next: null, prev: 9, head: 12 }),
+      s.url.searchParams.has("cursor")
+        ? jsonResponse({ entries: [deny(4), deny(2)], next_cursor: null, head: 12 })
+        : jsonResponse({ entries: [deny(9)], next_cursor: "d9", head: 12 }),
     );
     const admin = new AdminClient(URL_, "adm", { fetch });
     const query = {
       order: "desc",
+      to: 11,
       limit: 3,
       decision: "deny",
       kind: ["decision", "exchange"],
@@ -421,10 +457,11 @@ describe("AdminClient console endpoints", () => {
       since: new Date("2026-10-23T09:00:00Z"),
     } as const;
     const page = await admin.auditQuery(query);
-    expect([page.next, page.prev, page.head]).toEqual([undefined, 9, 12]);
+    expect([page.nextCursor, page.head]).toEqual(["d9", 12]);
     expect(Object.fromEntries(calls[0]!.url.searchParams)).toEqual({
       order: "desc",
       limit: "3",
+      to: "11",
       decision: "deny",
       kind: "decision,exchange",
       lease: "l 1",
@@ -433,14 +470,18 @@ describe("AdminClient console endpoints", () => {
     const seqs = [];
     for await (const e of admin.auditIter(query)) seqs.push(e.seq);
     expect(seqs).toEqual([9, 4, 2]);
-    expect(calls[2]!.url.searchParams.get("before")).toBe("9");
+    // The cursor goes with the same filters and range.
+    expect(calls[2]!.url.searchParams.get("cursor")).toBe("d9");
+    expect(calls[2]!.url.searchParams.get("to")).toBe("11");
+    expect(calls[2]!.url.searchParams.get("decision")).toBe("deny");
   });
 
-  it("iterates oldest first by next, and refuses a cursor that does not move", async () => {
-    const asc = mockFetch((s) => {
-      const from = Number(s.url.searchParams.get("from") ?? "1");
-      return jsonResponse({ entries: [entry(from)], next: from >= 5 ? null : from + 4, head: 5 });
-    });
+  it("iterates oldest first by next_cursor, and refuses a cursor that does not move", async () => {
+    const asc = mockFetch((s) =>
+      s.url.searchParams.get("cursor") === "a5"
+        ? jsonResponse({ entries: [entry(5)], next_cursor: null, head: 5 })
+        : jsonResponse({ entries: [entry(1)], next_cursor: "a5", head: 5 }),
+    );
     const seqs = [];
     for await (const e of new AdminClient(URL_, "adm", { fetch: asc.fetch }).auditIter({
       chainId: "c1",
@@ -452,12 +493,11 @@ describe("AdminClient console endpoints", () => {
       limit: "1000",
       chain_id: "c1",
     });
-    const stuck = mockFetch(() => jsonResponse({ entries: [], prev: 5, head: 9 }));
+    const stuck = mockFetch(() => jsonResponse({ entries: [], next_cursor: "same", head: 9 }));
     await expect(
       (async () => {
         for await (const _ of new AdminClient(URL_, "adm", { fetch: stuck.fetch }).auditIter({
           order: "desc",
-          before: 5,
         }))
           void _;
       })(),
@@ -515,16 +555,23 @@ describe("AdminClient console endpoints", () => {
       { seq: 20, head_hash: "a" },
       { seq: 10, head_hash: "b" },
     ];
-    const { fetch, calls } = mockFetch(() => jsonResponse({ checkpoints: cps, prev: 10 }));
+    const { fetch, calls } = mockFetch((s) =>
+      s.url.searchParams.get("cursor") === "k10"
+        ? jsonResponse({ checkpoints: [{ seq: 5, head_hash: "c" }], next_cursor: null })
+        : jsonResponse({ checkpoints: cps, next_cursor: "k10" }),
+    );
     const admin = new AdminClient(URL_, "adm", { fetch });
-    expect(await admin.auditCheckpoints({ before: 30, limit: 2 })).toEqual({
+    expect(await admin.auditCheckpoints({ cursor: "k30", limit: 2 })).toEqual({
       checkpoints: cps,
-      prev: 10,
+      nextCursor: "k10",
     });
     expect(calls[0]!.url.pathname).toBe("/admin/audit/checkpoints");
-    expect(Object.fromEntries(calls[0]!.url.searchParams)).toEqual({ before: "30", limit: "2" });
+    expect(Object.fromEntries(calls[0]!.url.searchParams)).toEqual({ cursor: "k30", limit: "2" });
     await admin.auditCheckpoints();
     expect(calls[1]!.url.search).toBe("");
+    const seqs = [];
+    for await (const c of admin.auditCheckpointsIter({ limit: 2 })) seqs.push(c.seq);
+    expect(seqs).toEqual([20, 10, 5]);
   });
 
   it("reads a lease tree", async () => {
@@ -589,6 +636,34 @@ describe("AdminClient console endpoints", () => {
       remaining: 1,
       values: undefined,
     });
+    // An older server sends no `user_windows`.
+    expect(tree.userWindows).toBeUndefined();
+  });
+
+  it("types the user windows of a lease tree", async () => {
+    const windows = {
+      truncated: true,
+      windows: [
+        { tool: "bank/pay", kind: "hour", start: "2026-11-14T09:00:00Z", calls: 2, amount: 40 },
+        { tool: "bank/pay", kind: "day", start: "2026-11-14T00:00:00Z", calls: 5, amount: 130 },
+      ],
+    };
+    let userWindows: unknown = windows;
+    const { fetch } = mockFetch(() =>
+      jsonResponse({
+        root: "r",
+        ancestors: [],
+        nodes: [],
+        would_revoke: 0,
+        truncated: false,
+        user_windows: userWindows,
+      }),
+    );
+    const admin = new AdminClient(URL_, "adm", { fetch });
+    expect((await admin.leaseTree("r")).userWindows).toEqual(windows);
+    // A run from before the server kept issuers.
+    userWindows = null;
+    expect((await admin.leaseTree("r")).userWindows).toBeUndefined();
   });
 
   it("reads the policy set and the on-disk check", async () => {
@@ -910,13 +985,19 @@ const approvalBody = (state = "pending", extra: Record<string, unknown> = {}) =>
 
 describe("AdminClient approvals", () => {
   it("lists approvals with filters and reads one", async () => {
-    const { fetch, calls } = mockFetch((s) =>
-      s.url.pathname === "/admin/approvals"
-        ? jsonResponse({ approvals: [approvalBody()] })
-        : jsonResponse(approvalBody()),
-    );
+    const { fetch, calls } = mockFetch((s) => {
+      if (s.url.pathname !== "/admin/approvals") return jsonResponse(approvalBody());
+      return s.url.searchParams.get("cursor") === "p2"
+        ? jsonResponse({
+            approvals: [approvalBody("pending", { approval_id: "a0" })],
+            next_cursor: null,
+          })
+        : jsonResponse({ approvals: [approvalBody()], next_cursor: "p2" });
+    });
     const admin = new AdminClient(URL_, "adm", { fetch });
-    const list = await admin.approvals({ chainId: "c1", state: "pending", limit: 10 });
+    const page = await admin.approvals({ chainId: "c1", state: "pending", limit: 10 });
+    expect(page.nextCursor).toBe("p2");
+    const list = page.approvals;
     expect(calls[0]!.method).toBe("GET");
     expect(calls[0]!.url.pathname).toBe("/admin/approvals");
     expect(Object.fromEntries(calls[0]!.url.searchParams)).toEqual({
@@ -937,6 +1018,18 @@ describe("AdminClient approvals", () => {
     expect(calls[2]!.url.pathname).toBe("/admin/approvals/..%2Fa1");
     expect(a.state).toBe("pending");
     expect(a.chainId).toBe("c1");
+
+    // Every page, with the same filters on each.
+    const ids = [];
+    for await (const x of admin.approvalsIter({ chainId: "c1", state: "pending", limit: 1 }))
+      ids.push(x.approvalId);
+    expect(ids).toEqual(["a1", "a0"]);
+    expect(Object.fromEntries(calls.at(-1)!.url.searchParams)).toEqual({
+      chain_id: "c1",
+      state: "pending",
+      limit: "1",
+      cursor: "p2",
+    });
   });
 
   it("grants and declines as the operator", async () => {
@@ -973,5 +1066,56 @@ describe("AdminClient approvals", () => {
       error: "approval_not_pending",
     });
     await expect(admin.approval("nope")).rejects.toBeInstanceOf(ApiError);
+  });
+});
+
+describe("refundBudget (K-5)", () => {
+  it("posts the decision id and reason, and reads the answer", async () => {
+    const { fetch, calls } = mockFetch(() =>
+      jsonResponse({ decision_id: "d-1", refunded: 2, reason: "upstream failed", audit_id: "r-9" }),
+    );
+    const admin = new AdminClient(URL_, "adm", { fetch });
+    const res = await admin.refundBudget("d-1", "upstream failed");
+    expect(calls[0]!.method).toBe("POST");
+    expect(calls[0]!.url.pathname).toBe("/admin/budgets/refund");
+    expect(calls[0]!.headers.get("authorization")).toBe("Bearer adm");
+    expect(calls[0]!.body).toEqual({ decision_id: "d-1", reason: "upstream failed" });
+    expect(res).toEqual({
+      decisionId: "d-1",
+      refunded: 2,
+      reason: "upstream failed",
+      auditId: "r-9",
+    });
+  });
+
+  it("leaves the reason to the server, and reads a missing audit id", async () => {
+    const { fetch, calls } = mockFetch(() =>
+      jsonResponse({
+        decision_id: "d-1",
+        refunded: 0,
+        reason: "refunded by admin",
+        audit_id: null,
+      }),
+    );
+    const res = await new AdminClient(URL_, "adm", { fetch }).refundBudget("d-1");
+    expect(calls[0]!.body).toEqual({ decision_id: "d-1" });
+    expect(res).toMatchObject({ refunded: 0, reason: "refunded by admin", auditId: undefined });
+    await expect(new AdminClient(URL_, "adm", { fetch }).refundBudget(" ")).rejects.toThrow(
+      /decisionId/,
+    );
+    expect(calls).toHaveLength(1);
+  });
+
+  it.each([
+    [409, "already_refunded"],
+    [410, "charge_pruned"],
+    [404, "not_found"],
+  ])("throws %i %s as an ApiError without a decision id", async (status, error) => {
+    const { fetch } = mockFetch(() => jsonResponse({ error, detail: "refused" }, status));
+    const err = await new AdminClient(URL_, "adm", { fetch })
+      .refundBudget("d-1")
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect(err).toMatchObject({ status, error, decisionId: undefined });
   });
 });

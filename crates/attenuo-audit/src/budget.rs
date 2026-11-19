@@ -8,10 +8,10 @@
 //! The key lives in the same store, so the hash keeps addresses off the counter rows, not out
 //! of reach of someone who holds the whole store and a list of guesses.
 //!
-//! [`LeaseStore::charge`](crate::LeaseStore::charge) checks every charge of a call and either
+//! [`RunLimits::charge`](crate::RunLimits::charge) checks every charge of a call and either
 //! applies all of them or none, in one transaction (an `IMMEDIATE` one in SQLite), so two
 //! concurrent calls against a budget of one cannot both pass. Every charge is also logged under
-//! the decision id that made it, so [`LeaseStore::refund`](crate::LeaseStore::refund) can
+//! the decision id that made it, so [`RunLimits::refund`](crate::RunLimits::refund) can
 //! return exactly what one decision charged, at most once. Counters are keyed by lease id and
 //! never joined with the lease table: revoking or expiring a lease does not stop its counters,
 //! or its ancestors', from being read.
@@ -36,7 +36,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::AuditError;
 
-/// What [`LeaseStore::charge`](crate::LeaseStore::charge) did.
+/// What [`RunLimits::charge`](crate::RunLimits::charge) did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChargeOutcome {
     /// Every charge was applied. `used_after[i]` is what the counter of `charges[i]` holds now
@@ -67,7 +67,7 @@ pub(crate) struct CounterKey {
 
 /// One limited capability of a hop, as the server recorded it when it issued the hop's token,
 /// so the admin console can show a lease's limits next to its counters
-/// ([`LeaseStore::record_hop_limits`](crate::LeaseStore::record_hop_limits)). The token
+/// ([`RunLimits::record_hop_limits`](crate::RunLimits::record_hop_limits)). The token
 /// stays the authority; this copy is for display only.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HopLimit {
@@ -83,7 +83,7 @@ pub struct HopLimit {
 }
 
 /// What one counter (or one group of per-value counters) under a lease holds
-/// ([`LeaseStore::budget_summary`](crate::LeaseStore::budget_summary)). Value hashes are not
+/// ([`RunLimits::budget_summary`](crate::RunLimits::budget_summary)). Value hashes are not
 /// exposed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CounterSummary {

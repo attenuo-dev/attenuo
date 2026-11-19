@@ -9,18 +9,19 @@ mod common;
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use attenuo_policy::{ArgType, ToolAttrs};
-use attenuo_proxy::testing::{spawn_router, FakeMcpServer, Spawned};
+use attenuo_proxy::testing::{FakeMcpServer, Spawned};
 use attenuo_proxy::UpstreamConfig;
 use attenuo_server::config::{DpopMode, DpopNonceMode};
-use attenuo_server::Config;
+use attenuo_server::{AppState, Config};
 use attenuo_token::DpopKey;
 use reqwest::{RequestBuilder, StatusCode};
 use serde_json::{json, Value};
 use time::OffsetDateTime;
 
-use common::agent_configs;
+use common::{agent_configs, Running};
 
 const ADMIN: &str = "dpop-test-admin";
 const AGENTS: &[&str] = &["planner", "coder", "reviewer"];
@@ -34,12 +35,15 @@ fn secret(id: &str) -> String {
 struct Server {
     upstream: FakeMcpServer,
     _upstream_task: Spawned,
-    server: Spawned,
+    server: Running,
+    state: Arc<AppState>,
     client: reqwest::Client,
 }
 
 /// A server with `[token] dpop = mode`. Servers started on the same `dir` share the issuer key
-/// and the SQLite file, so a token minted by one is accepted by the others.
+/// and the SQLite file, so a token minted by one is accepted by the others. Only one runs on a
+/// `dir` at a time (the single-writer fence on the SQLite file): [`Server::stop`] the previous
+/// one first.
 async fn start(dir: &Path, mode: DpopMode) -> Server {
     start_with(dir, mode, DpopNonceMode::Off).await
 }
@@ -75,11 +79,12 @@ async fn start_with(dir: &Path, mode: DpopMode, nonce: DpopNonceMode) -> Server 
     cfg.token.dpop = mode;
     cfg.token.dpop_nonce = nonce;
     cfg.agents = agent_configs(AGENTS, secret);
-    let (router, _state) = attenuo_server::build(&cfg).unwrap();
+    let (router, state) = attenuo_server::build(&cfg).unwrap();
     Server {
         upstream,
         _upstream_task: upstream_task,
-        server: spawn_router(router).await.unwrap(),
+        server: Running::start(cfg, state.clone(), router).await,
+        state,
         client: reqwest::Client::new(),
     }
 }
@@ -94,6 +99,13 @@ fn proof(key: &DpopKey, url: &str, token: Option<&str>) -> String {
 }
 
 impl Server {
+    /// Stop this server as `serve` does after a signal; once this returns it has let go of
+    /// the SQLite file, so the next server on the same `dir` can start ([`Running::stop`]).
+    async fn stop(self) {
+        let Self { server, state, .. } = self;
+        server.stop(state).await;
+    }
+
     fn url(&self, path: &str) -> String {
         self.server.url(path)
     }
@@ -543,13 +555,15 @@ async fn child_of_bound_parent_must_be_bound_sr24() {
 
 #[tokio::test]
 async fn required_mode_refuses_unbound_exchanges_sr24() {
-    // Three servers over one issuer key and one lease store, differing only in `[token] dpop`.
+    // Three servers over one issuer key and one lease store, differing only in `[token] dpop`,
+    // one after the other (one server per SQLite file).
     let dir = tempfile::tempdir().unwrap();
     let optional = start(dir.path(), DpopMode::Optional).await;
-    let required = start(dir.path(), DpopMode::Required).await;
-    let off = start(dir.path(), DpopMode::Off).await;
     let key = DpopKey::generate().unwrap();
     let unbound = optional.root_token(None).await;
+    let bound = optional.root_token(Some(&key)).await;
+    optional.stop().await;
+    let required = start(dir.path(), DpopMode::Required).await;
 
     // `required`: no unbound issuance, no unbound token accepted.
     assert_eq!(refusal(required.root(None).await).await.1, "dpop_required");
@@ -570,12 +584,13 @@ async fn required_mode_refuses_unbound_exchanges_sr24() {
     )
     .await;
     required.root_token(Some(&key)).await;
+    required.stop().await;
 
     // `off`: proofs are ignored at issuance, but a bound token still needs one.
+    let off = start(dir.path(), DpopMode::Off).await;
     let resp = off.root(Some(&key)).await;
     let v: Value = resp.json().await.unwrap();
     assert_eq!(v["token_type"], "Bearer");
-    let bound = optional.root_token(Some(&key)).await;
     let resp = off.call(&bound, None).send().await.unwrap();
     assert_eq!(refusal(resp).await.1, "dpop_required");
     let mcp = off.url("/mcp/github");
@@ -697,12 +712,14 @@ async fn server_nonce_required_through_the_proxy() {
     assert_eq!(refusal(resp).await.1, "dpop_required");
 
     // A server with the same issuer key accepts the nonce (no shared storage needed); one
-    // with nonces off neither sends nor checks them.
+    // with nonces off neither sends nor checks them. They run on the same file, so in turn.
+    s.stop().await;
     let twin = start_with(dir.path(), DpopMode::Optional, DpopNonceMode::Required).await;
     let twin_mcp = twin.url("/mcp/github");
     let p = key.proof_with_nonce("POST", &twin_mcp, Some(&token), Some(&nonce), now());
     let resp = twin.call(&token, Some(p)).send().await.unwrap();
     assert!(allowed(&resp.json().await.unwrap()));
+    twin.stop().await;
     let off = start(dir.path(), DpopMode::Optional).await;
     let off_mcp = off.url("/mcp/github");
     let resp = off
@@ -712,4 +729,50 @@ async fn server_nonce_required_through_the_proxy() {
         .unwrap();
     assert!(nonce_of(&resp).is_none());
     assert!(allowed(&resp.json().await.unwrap()));
+}
+
+/// AuthZEN action search authenticates a bound token exactly as evaluation does: the bare
+/// token is `dpop_required`, a proof made for the evaluation URL is `invalid_dpop_proof`, and a
+/// proof for the search URL itself is accepted.
+#[tokio::test]
+async fn action_search_needs_a_proof_for_its_own_url() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = start(dir.path(), DpopMode::Optional).await;
+    let key = DpopKey::generate().unwrap();
+    let token = s.root_token(Some(&key)).await;
+    let search_url = s.url("/access/v1/search/action");
+    let search = |p: Option<String>| {
+        let req = s.client.post(&search_url).bearer_auth(&token).json(&json!({
+            "subject": {"type": "agent", "id": ""},
+            "resource": {"type": "mcp_server", "id": "github"},
+            "context": {"input": {"repo": "acme/api"}},
+        }));
+        match p {
+            Some(p) => req.header("DPoP", p),
+            None => req,
+        }
+    };
+    let (status, code, challenge) = refusal(search(None).send().await.unwrap()).await;
+    assert_eq!(
+        (status, code.as_str()),
+        (StatusCode::UNAUTHORIZED, "dpop_required")
+    );
+    assert!(challenge.starts_with("DPoP "), "{challenge}");
+    let elsewhere = proof(&key, &s.url("/access/v1/evaluation"), Some(&token));
+    let (status, code, _) = refusal(search(Some(elsewhere)).send().await.unwrap()).await;
+    assert_eq!(
+        (status, code.as_str()),
+        (StatusCode::UNAUTHORIZED, "invalid_dpop_proof")
+    );
+    let resp = search(Some(proof(&key, &search_url, Some(&token))))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(
+        v["results"],
+        json!([{"name": "read_file", "properties": {"server": "github"}}]),
+        "{v}"
+    );
 }

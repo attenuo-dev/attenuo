@@ -213,7 +213,7 @@ export function streamEndError(msg: Json): DeniedError | RpcError | undefined {
     const id = d.decision_id;
     const idOk = !("decision_id" in d) || (typeof id === "string" && UUID.test(id));
     if (typeof reason === "string" && STREAM_END_REASONS.has(reason) && idOk) {
-      return new DeniedError(reason, id as string | undefined, message);
+      return new DeniedError(reason, id as string | undefined, message, d);
     }
   }
   return new RpcError(w.CODE_UNAUTHORIZED, message, data);

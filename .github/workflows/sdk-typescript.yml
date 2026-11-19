@@ -5,11 +5,17 @@ on:
     paths:
       - "sdk/typescript/**"
       - "examples/typescript-agent/**"
+      # test/readme.test.ts: the README's SDK section, run against the example config.
+      - "README.md"
+      - "config/example.toml"
       - ".github/workflows/sdk-typescript.yml"
   pull_request:
     paths:
       - "sdk/typescript/**"
       - "examples/typescript-agent/**"
+      # test/readme.test.ts: the README's SDK section, run against the example config.
+      - "README.md"
+      - "config/example.toml"
       - ".github/workflows/sdk-typescript.yml"
 
 permissions:

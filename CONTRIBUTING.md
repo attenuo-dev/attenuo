@@ -29,7 +29,17 @@ cargo deny check          # cargo install cargo-deny
 cargo audit               # cargo install cargo-audit (optional locally; CI runs it)
 ```
 
-`scripts/dev.sh` runs fmt, clippy, the tests and the two scripted demos (the GitHub leak demo and the multi-hop delegation demo) in one go (`scripts/dev.sh policy docs links deny` runs the other CI steps). The `justfile` has the same targets if you use [just](https://github.com/casey/just): `just dev`, `just ci`, `just demo`, `just policy`. `scripts/gen-admin-token.sh` prints a random admin token for a local server config. The MSRV (`rust-version` in `Cargo.toml`) is checked in CI only.
+`scripts/dev.sh` runs fmt, clippy, the tests and the three scripted demos (the GitHub leak demo, the multi-hop delegation demo and the IdP exchange demo) in one go (`scripts/dev.sh policy docs links deny` runs the other CI steps). The `justfile` has the same targets if you use [just](https://github.com/casey/just): `just dev`, `just ci`, `just demo`, `just policy`. `scripts/gen-admin-token.sh` prints a random admin token for a local server config.
+
+`scripts/check-getting-started.sh` (`scripts/dev.sh guide`, `just guide`, and the `getting-started` CI job) runs every `sh` block of [the getting-started guide](docs/guides/getting-started.md) in order, in one shell with a scratch `HOME` and free ports, and fails when a command fails or its output differs from the `text` or `json` block that follows it (times, UUIDs and key ids are masked). It reads the commands from the guide, so when you change a command or an output there, run it. A few blocks carry an HTML comment on the line before the fence (`<!-- check: build -->`, `<!-- check: background -->`, `<!-- check: exit 2 -->`, `<!-- check: skip REASON -->` for a block that needs Docker, the network or a long build) that says how to run them; the header of `scripts/check-doc-commands.sh`, which does the work, explains each. It takes a few seconds after the build. The same check runs the README's "Run the server yourself" and "Command line" sections: `scripts/check-doc-commands.sh README.md` (`scripts/dev.sh readme`, `just readme`, the same CI job), which prints every skipped block with its reason. When you change a command or an output in the README, run it.
+
+The SDK READMEs' snippets are tested as code: `sdk/python/tests/test_readme_snippets.py` compiles and type-checks (mypy) every `python` block of `sdk/python/README.md` and of the README's Python SDK section, and `sdk/typescript/test/readme.test.ts` type-checks every `ts` block of `sdk/typescript/README.md` and of the README's TypeScript SDK section against the built SDK types (`npm run build` first). Both run with the SDK's unit tests (`pytest`, `npm test`); with `ATTENUO_INTEGRATION=1` they also run the self-contained snippets, the quick starts among them, against a server on `config/example.toml` with the dev root mint on. `scripts/dev.sh snippets` (`just snippets`) runs both type checks.
+
+The three reference pages are checked against the code by tests that fail with the item and the page to fix. `docs/reference/config.md` must have a heading for every config section and a table row for every key, and no other, and a default a row states plainly must be the server's (`crates/attenuo-server/tests/reference_config.rs`). `docs/reference/cli.md` must have a section for every `attenuo` subcommand and write every flag in its command's section, and every flag it writes must exist there (`reference_doc` in `crates/attenuo-cli/src/`). `docs/reference/http-api.md` must list every route the server mounts, and no other (`crates/attenuo-server/tests/reference_http_api.rs`), and its error-code table is generated from the code (`error_codes.rs`). When you add or rename a config key, a subcommand, a flag or a route, run `cargo test -p attenuo-server --test reference_config --test reference_http_api --test error_codes` and `cargo test -p attenuo-cli reference_doc`.
+
+The MSRV (`rust-version` in `Cargo.toml`) is checked in CI only.
+
+`scripts/check-lean.sh` (`scripts/dev.sh lean`, `just lean`, the `lean` CI job) builds the Lean model and proof of the covering rule in `proofs/lean/` and fails on `sorry` or a non-standard axiom. It needs Lean, installed with elan ([proofs/lean/README.md](proofs/lean/README.md#running-it)); `scripts/dev.sh lean` skips it when Lean is missing. `scripts/check-lean-differential.sh` (run by the same three after it) runs the model, as a program, against the Rust code on the cases `crates/attenuo-core/tests/lean_differential.rs` writes, and fails on any case where their answers differ. If you change `covers`, `implies`, `permits`, `attenuate` or a constraint kind in `crates/attenuo-core/src/capability.rs`, change the model to match and run both.
 
 ### Property tests
 
@@ -44,11 +54,11 @@ A bad value of either variable fails the test with a message naming it. Failure 
 
 Fuzz targets for the parsers and checks an attacker can reach live in `fuzz/` (cargo-fuzz, nightly, outside the workspace). CI only builds them and runs their seeds; run one for a few minutes when you change a parser, a token or proof check, capability coverage, the proxy's JSON-RPC or SSE handling, or audit verification: `cargo +nightly fuzz run <target> -- -max_total_time=120`. See [fuzz/README.md](fuzz/README.md) and [docs/design/fuzzing.md](docs/design/fuzzing.md).
 
-If you change the admin console (`crates/attenuo-server/ui/`), run `scripts/console-smoke.sh`. It builds and starts the server with the leak demo's config and an `[admin_ui]` listener, fills the log through the CLI, and opens every console page in headless Chromium in the dark and the light theme with Playwright. It fails on any console error, page error, failed request or CSP violation, on text below 4.5:1 contrast, and when the lease page's revoke preview differs from `attenuo lease tree`. It needs Node 20 or later: run `npm ci` and `npx playwright install --with-deps chromium` in `tests/console/` once (Playwright is pinned to 1.56.1 there). Set `CONSOLE_SMOKE_SHOTS=DIR` to keep the screenshots, one per page and theme. It takes about 10 seconds after the build.
+If you change the admin console (`crates/attenuo-server/ui/`), run `scripts/console-smoke.sh`. It builds and starts the server with the leak demo's config and an `[admin_ui]` listener, fills the log through the CLI, and opens every console page in headless Chromium in the dark and the light theme with Playwright. It fails on any console error, page error, failed request or CSP violation, on text below 4.5:1 contrast, and when the lease page's revoke preview differs from `attenuo lease tree`. It also configures four `[[admin.operators]]` (a viewer, an operator, an operator with a future `expires_at` and an expired viewer) and logs in as each in a fresh page (`tests/console/roles.test.cjs`): the header names the operator, role and expiry, the buttons a role cannot use (revoke, grant and decline, policy reload) are disabled, and an expired token gets the expired message at login. It needs Node 20 or later: run `npm ci` and `npx playwright install --with-deps chromium` in `tests/console/` once (Playwright is pinned to 1.56.1 there). Set `CONSOLE_SMOKE_SHOTS=DIR` to keep the screenshots, one per page and theme. It takes about 10 seconds after the build.
 
 The Python SDK tests (`cd sdk/python && pytest -rf`, and `ATTENUO_INTEGRATION=1 pytest -rf -m integration` for the real-server tests) are run with `-rf` so that the name of a failing test is in the summary; see [sdk/python/README.md](sdk/python/README.md).
 
-`rustfmt.toml` and `clippy.toml` in the repo root carry the project settings, so `cargo fmt` and `cargo clippy` pick them up without flags. `rust-toolchain.toml` selects the stable channel. It is not pinned to an exact release, so a new stable clippy can flag code that passed before; CI uses the same channel.
+`rustfmt.toml` and `clippy.toml` in the repo root carry the project settings, so `cargo fmt` and `cargo clippy` pick them up without flags. `rust-toolchain.toml` pins the exact stable release CI, the release builds and the Dockerfile use (1.99.1), with `rustfmt` and `clippy`; rustup installs it on first use in the repository. A new stable is adopted in its own pull request that bumps `channel` there, refreshes the digest of the Dockerfile's `rust:1-bookworm` base image so that it ships that release (the Dockerfile's header says how), and fixes what the new clippy and rustdoc find. Nightly-only work names its toolchain (`cargo +nightly fuzz ...`), which overrides the file; so does the MSRV check (`cargo +1.89 check`).
 
 ## Previewing the documentation site
 
@@ -58,11 +68,11 @@ The pages in `docs/` are published as an [mdBook](https://rust-lang.github.io/md
 cargo install mdbook --locked --version 0.4.52   # the version CI uses
 mdbook serve --open                              # http://localhost:3000, rebuilds on save
 mdbook build                                     # one-off build into book/ (ignored by git)
-python3 scripts/check-links.py                   # relative links and anchors
+python3 scripts/check-links.py                   # relative links, anchors, links out of the book
 python3 scripts/check-public-hygiene.py          # no machine paths, personal notes, old name or placeholders
 ```
 
-Keep the pages readable on GitHub and in Obsidian as well. Link to other pages with relative `.md` paths. Link to files outside `docs/` (for example `config/example.toml`) with a full GitHub URL, because the book only contains `docs/`. To link to a folder's `README.md`, link the folder (`../spec/`), since the book renders it as `index.html`. Mermaid diagrams render on the site through a script that loads mermaid from a CDN, so they need network access when you preview.
+Keep the pages readable on GitHub and in Obsidian as well. Link to other pages with relative `.md` paths. Link to files outside `docs/` (for example `config/example.toml`) with a full GitHub URL (`https://github.com/attenuo-dev/attenuo/blob/main/<path>`, or `tree/main/` for a folder), because the book only contains `docs/`; `scripts/check-links.py` refuses a relative link out of `docs/` from a page listed in `docs/SUMMARY.md` (its tests: `python3 -m pytest scripts/test_check_links.py`). Pages not in the book may keep relative links. To link to a folder's `README.md`, link the folder (`../spec/`), since the book renders it as `index.html`. Mermaid diagrams render on the site through a script that loads mermaid from a CDN, so they need network access when you preview.
 
 ## Branches
 
@@ -133,18 +143,38 @@ A change is done when all of the following hold:
 3. Public items have doc comments; new configuration or CLI flags are documented.
 4. `CHANGELOG.md` has an entry under `Unreleased` if the change is visible to users (new feature, behaviour change, fix, security fix).
 5. An ADR or RFC exists for any design decision the change embodies, and its status is updated if the change implements it.
-6. The task is moved on `docs/tasks/board.md` and, if you keep one, a line is added to today's file in `docs/log/`.
+6. Reference docs (`docs/reference/`) and any design note, ADR or guide that described the old behaviour say what is true after the change; a note's open questions and a guide's limits lose what the change closed. The durable record of a change is its `CHANGELOG.md` entry and its pull request description, so say there what changed and why.
 7. Commits are signed off and in conventional form; the PR has at least one maintainer approval.
 
 ## Releases
 
-Maintainers only. Versions follow [SemVer 2.0](https://semver.org/). Pre-1.0, a minor bump may break; every breaking change is marked in the changelog.
+Maintainers only. Versions follow [SemVer 2.0](https://semver.org/). Pre-1.0, a minor bump may break; every breaking change is marked in the changelog. What counts as breaking for each surface (routes, error codes, token claims, audit constructions, config keys, metrics, SDKs) and how it is deprecated first is in [API compatibility](docs/reference/api-compatibility.md); a change to the wire format is additive unless it follows those rules.
 
 1. Make sure `main` is green and `CHANGELOG.md`'s `Unreleased` section is complete. `git cliff --unreleased` gives a draft to compare against. `scripts/release-check.sh` runs every local check a release needs, including the crates, PyPI and npm dry runs; the 0.1.0 steps are in [docs/release/0.1.0.md](docs/release/0.1.0.md).
-2. Open a `chore(release): vX.Y.Z` PR that bumps `workspace.package.version` in `Cargo.toml` and the SDK versions with it (`sdk/python/pyproject.toml`, `sdk/typescript/package.json` and its lockfile; `scripts/release-check.sh` fails when they differ), moves `Unreleased` to a dated `[X.Y.Z]` heading with a compare link, and adds a fresh empty `Unreleased`.
+2. Open a `chore(release): vX.Y.Z` PR that sets the new version in every place the `versions` step of `scripts/release-check.sh` compares, and that step fails when any of them differs from the workspace version:
+   - `Cargo.toml`: `[workspace.package] version`, and the `version` of each `attenuo-*` entry under `[workspace.dependencies]` (`attenuo-core`, `attenuo-token`, `attenuo-policy`, `attenuo-audit`, `attenuo-proxy`);
+   - `sdk/python/pyproject.toml`: `[project] version`;
+   - `sdk/typescript/package.json`: `version`;
+   - `sdk/typescript/package-lock.json`: the top-level `version` (run `npm install --package-lock-only` in `sdk/typescript` so the lockfile's `packages[""]` entry matches too);
+   - `CHANGELOG.md`: move `Unreleased` to a `## [X.Y.Z] - YYYY-MM-DD` heading (the step looks for exactly that form) with a compare link, and add a fresh empty `Unreleased`.
+
+   Also update `Cargo.lock` (`cargo update --workspace`): the step does not compare it, but the later steps build with `--locked` and fail on a stale lockfile.
 3. Merge, then tag the merge commit `vX.Y.Z` (annotated, signed if you have a key) and push the tag. `.github/workflows/release.yml` builds `attenuo` and `attenuo-server` for Linux (musl, x86_64 and aarch64) and macOS (arm64, x86_64), pushes a signed multi-arch image to GHCR (cosign keyless, SBOM attached), and opens a **draft** GitHub release with the archives, `SHA256SUMS` and the git-cliff changelog section. Review the draft and publish it by hand. It needs only the automatic `GITHUB_TOKEN`; set the GHCR package to public after the first push.
-4. For the first public release, work through the [launch checklist](docs/launch-checklist.md).
-5. Crate publishing to crates.io is manual until the public API settles; the plan is to adopt release-plz once it does.
+4. Crate publishing to crates.io is manual until the public API settles; the plan is to adopt release-plz once it does.
+
+### Release tooling
+
+The Python package that PyPI receives is built only with the tools in `sdk/python/release-requirements.txt`: `build`, `twine` and the build backend `hatchling` with their dependencies, each pinned to a version and its sha256 hashes. `.github/workflows/release-packages.yml` installs the file with `pip install --require-hashes --only-binary :all:` into a fresh venv and runs `python -m build --no-isolation`, so nothing is resolved from the index at release time (SR-83). The file is compiled from `sdk/python/release-requirements.in` for Python 3.12 on Linux, the workflow's interpreter and runner. The hashes cover every wheel and sdist PyPI has for each pinned version; the set of packages is the one Linux needs (Windows-only dependencies of `twine` are left out).
+
+Dependabot (the `pip` entry for `/sdk/python` in `.github/dependabot.yml`) checks weekly and opens a PR that recompiles the file when a pinned tool has a newer release. To do it by hand, or after changing the `.in` file or the `[build-system] requires` in `pyproject.toml`, run in `sdk/python` with Python 3.12:
+
+```sh
+python3.12 -m venv /tmp/piptools && /tmp/piptools/bin/pip install pip-tools
+/tmp/piptools/bin/pip-compile --upgrade --generate-hashes --allow-unsafe --strip-extras \
+  --no-emit-index-url --output-file=release-requirements.txt release-requirements.in
+```
+
+Then check it the way the workflow uses it: in a fresh Python 3.12 venv, `pip install --require-hashes --only-binary :all: -r release-requirements.txt`, then `python -m build --no-isolation --outdir dist .` and `twine check --strict dist/*`. A Dependabot PR's header line must still say "with Python 3.12"; if it names another version, recompile by hand. The npm jobs need no file of their own: `package-lock.json` pins every package by integrity hash, and both jobs run `npm ci --ignore-scripts`, so no dependency's install script runs in the job that holds the publish token; a dependency that gains one shows up as a lockfile change in review.
 
 ## AI-assisted contributions
 

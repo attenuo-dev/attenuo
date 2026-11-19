@@ -6,7 +6,7 @@
 //! | `subject_token_type` | Credential | `aud` must be |
 //! |---|---|---|
 //! | `urn:ietf:params:oauth:token-type:id_token` | OIDC ID token | `[[idps]] audience` |
-//! | `urn:ietf:params:oauth:token-type:id-jag` | ID-JAG (draft-ietf-oauth-identity-assertion-authz-grant-04), header `typ` = `oauth-id-jag+jwt` | `[issuer] issuer` |
+//! | `urn:ietf:params:oauth:token-type:id-jag` | ID-JAG (draft-ietf-oauth-identity-assertion-authz-grant, checked against -06), header `typ` = `oauth-id-jag+jwt` (or `application/oauth-id-jag+jwt`) | `[issuer] issuer` |
 //!
 //! An ID-JAG may also be presented as the draft describes it, with
 //! `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer` and `assertion=<ID-JAG>`.
@@ -17,16 +17,26 @@
 //! # Verification ([`IdpRegistry::verify`])
 //!
 //! 1. Header and payload decode; the header `typ` is checked: an ID-JAG must say
-//!    `oauth-id-jag+jwt`; an ID token must not carry any other explicit `…+jwt` type
-//!    (RFC 8725 §3.11), so an access token or an ID-JAG cannot be replayed as an ID token.
+//!    `oauth-id-jag+jwt` (case-insensitive, with or without `application/`, RFC 7515
+//!    §4.1.9); an ID token must not carry any other explicit `…+jwt` type (RFC 8725 §3.11),
+//!    so an access token or an ID-JAG cannot be replayed as an ID token.
 //! 2. The unverified `iss` selects the `[[idps]]` entry; unknown issuers are rejected before
-//!    any network call.
+//!    any network call. At hop 0, a credential of a kind the entry's `credentials` does not
+//!    list is refused at the same step (`credential_type_not_accepted`, SR-122), so before any
+//!    network call too, and before the credential could be used up.
 //! 3. `alg` must be in that IdP's `allowed_algs` (asymmetric only).
 //! 4. The key is looked up by `kid` in the IdP's cached JWKS ([`jwks::JwksCache`]), refetching
 //!    once on an unknown `kid`.
 //! 5. Signature, then `iss` (exact), `aud` (string or array containing the expected value),
 //!    `exp` (required), `iat` (required, not in the future), `nbf` (optional), all with
 //!    `clock_skew_seconds` of leeway, then `sub` (required, non-empty).
+//! 6. For an ID-JAG only: `aud` must be a string or a one-element array, and with
+//!    `[[idps]] tenant` set, `tenant` must equal it (draft -06 §4.4.1).
+//!
+//! The intake handler then reads the ID-JAG's own claims ([`claims::map_id_jag`]: `client_id`
+//! and `jti` required, `cnf.jkt` if bound) and, for a bound ID-JAG, requires a DPoP proof by
+//! that key on the request (`credential_pop_required`, `credential_pop_mismatch`; draft -04
+//! §9.8.1.2, -06 §4.4.1).
 //!
 //! `nonce` is ignored: it binds an ID token to the browser session that requested it, and the
 //! agent presenting the token here is not that session. Replay is bounded instead by requiring
@@ -43,6 +53,7 @@
 //! verifier's message (issuer, audience, `kid`, client ids) is logged at debug level and never
 //! returned (SR-17).
 
+pub(crate) mod ceiling;
 pub(crate) mod claims;
 pub(crate) mod intake;
 pub(crate) mod jwks;
@@ -57,7 +68,7 @@ use jsonwebtoken::{Algorithm, Validation};
 use serde_json::{Map, Value};
 use time::OffsetDateTime;
 
-use crate::config::IdpConfig;
+use crate::config::{IdpConfig, IdpCredential};
 use crate::error::ApiError;
 use jwks::{JwksCache, JwksError};
 
@@ -88,6 +99,14 @@ impl CredentialKind {
             CredentialKind::IdJag => "id-jag",
         }
     }
+
+    /// The `[[idps]] credentials` name of this kind.
+    fn config(self) -> IdpCredential {
+        match self {
+            CredentialKind::IdToken => IdpCredential::IdToken,
+            CredentialKind::IdJag => IdpCredential::IdJag,
+        }
+    }
 }
 
 /// A rejected user credential.
@@ -101,6 +120,8 @@ pub enum IntakeError {
     TypMismatch(Option<String>),
     #[error("issuer `{0}` is not a trusted [[idps]] entry")]
     UntrustedIssuer(String),
+    #[error("the [[idps]] entry of `{issuer}` does not accept {kind} credentials (credentials)")]
+    KindNotAccepted { issuer: String, kind: &'static str },
     #[error("token has no kid and the issuer has several keys")]
     MissingKid,
     #[error("no key with this kid at the issuer")]
@@ -119,6 +140,12 @@ pub enum IntakeError {
     CredentialAudienceMismatch(String),
     #[error("ID-JAG client_id `{assertion}` does not match the authenticated client `{client}`")]
     ClientIdMismatch { assertion: String, client: String },
+    #[error("ID-JAG tenant {0:?} is not the [[idps]] tenant")]
+    TenantMismatch(Option<String>),
+    #[error("proof of possession required: {0}")]
+    PopRequired(String),
+    #[error("the DPoP proof's key is not the key the ID-JAG is bound to (cnf.jkt)")]
+    PopMismatch,
     #[error("cannot fetch the issuer's keys: {0}")]
     JwksUnavailable(String),
 }
@@ -131,6 +158,7 @@ impl IntakeError {
             IntakeError::UnsupportedAlg(_) => "unsupported_alg",
             IntakeError::TypMismatch(_) => "typ_mismatch",
             IntakeError::UntrustedIssuer(_) => "untrusted_issuer",
+            IntakeError::KindNotAccepted { .. } => "credential_type_not_accepted",
             IntakeError::MissingKid => "missing_kid",
             IntakeError::UnknownKid => "unknown_kid",
             IntakeError::BadSignature(_) => "bad_signature",
@@ -140,6 +168,9 @@ impl IntakeError {
             IntakeError::MissingClaim(_) => "missing_claim",
             IntakeError::CredentialAudienceMismatch(_) => "credential_audience_mismatch",
             IntakeError::ClientIdMismatch { .. } => "client_id_mismatch",
+            IntakeError::TenantMismatch(_) => "tenant_mismatch",
+            IntakeError::PopRequired(_) => "credential_pop_required",
+            IntakeError::PopMismatch => "credential_pop_mismatch",
             IntakeError::JwksUnavailable(_) => "jwks_unavailable",
         }
     }
@@ -231,6 +262,8 @@ struct TrustedIdp {
     config: IdpConfig,
     algs: Vec<Algorithm>,
     jwks: JwksCache,
+    /// `[idps.id_jag_ceiling]`, checked.
+    ceiling: Option<ceiling::IdJagCeiling>,
 }
 
 /// The configured `[[idps]]`, each with its key cache.
@@ -243,10 +276,9 @@ pub struct IdpRegistry {
 impl IdpRegistry {
     /// Validate the `[[idps]]` entries and build their key caches.
     pub fn from_config(idps: &[IdpConfig], our_issuer: &str) -> anyhow::Result<Self> {
-        let client = reqwest::Client::builder()
-            .timeout(FETCH_TIMEOUT)
-            .redirect(reqwest::redirect::Policy::limited(3))
-            .build()?;
+        // One client for every entry without `ca_pem_path`; an entry with one gets its own,
+        // so its extra roots are trusted for its fetches and no other.
+        let shared = jwks::fetch_client(FETCH_TIMEOUT, &[])?;
         let mut out = Vec::with_capacity(idps.len());
         for cfg in idps {
             if cfg.issuer.is_empty() {
@@ -274,14 +306,53 @@ impl IdpRegistry {
                 .map(|a| parse_asymmetric_alg(a))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| anyhow::anyhow!("[[idps]] `{}`: {e}", cfg.issuer))?;
+            // An empty tenant would look set and could match no real ID-JAG (or one with an
+            // empty `tenant` claim): a mistake in the file, so refuse it at startup.
+            if cfg.tenant.as_deref().is_some_and(|t| t.trim().is_empty()) {
+                anyhow::bail!(
+                    "[[idps]] `{}`: tenant is empty; remove the line or name a tenant",
+                    cfg.issuer
+                );
+            }
+            let ceiling = cfg
+                .id_jag_ceiling
+                .as_ref()
+                .map(ceiling::IdJagCeiling::from_config)
+                .transpose()
+                .map_err(|e| anyhow::anyhow!("[[idps]] `{}`: {e}", cfg.issuer))?;
+            // A name that is not a kind was refused by the parser; an empty list would refuse
+            // every credential of this issuer, which is a mistake in the file (SR-122).
+            if cfg.credentials.is_empty() {
+                anyhow::bail!(
+                    "[[idps]] `{}`: credentials is empty; list \"id_token\", \"id-jag\" or both, \
+                     or remove the line to accept both",
+                    cfg.issuer
+                );
+            }
+            if let Some(warning) = ceiling_bypass_warning(cfg) {
+                tracing::warn!("{warning}");
+            }
             if cfg.jwks_ttl_seconds == 0 {
                 anyhow::bail!(
                     "[[idps]] `{}`: jwks_ttl_seconds must be positive",
                     cfg.issuer
                 );
             }
+            // S-8: the key source is https (or http on loopback). Without jwks_url the keys
+            // are found by discovery at the issuer, so the issuer is the URL checked.
+            let (key, source) = match &cfg.jwks_url {
+                Some(u) => ("jwks_url", u.as_str()),
+                None => (
+                    "issuer (used for discovery, no jwks_url)",
+                    cfg.issuer.as_str(),
+                ),
+            };
+            jwks::check_fetch_url(source)
+                .map_err(|e| anyhow::anyhow!("[[idps]] `{}`: {key} {source:?}: {e}", cfg.issuer))?;
+            let client = jwks::entry_client(&shared, cfg.ca_pem_path.as_deref(), FETCH_TIMEOUT)
+                .map_err(|e| anyhow::anyhow!("[[idps]] `{}`: {e}", cfg.issuer))?;
             let jwks = JwksCache::new(
-                client.clone(),
+                client,
                 cfg.issuer.clone(),
                 cfg.jwks_url.clone(),
                 Duration::from_secs(cfg.jwks_ttl_seconds),
@@ -291,6 +362,7 @@ impl IdpRegistry {
                 config: cfg.clone(),
                 algs,
                 jwks,
+                ceiling,
             });
         }
         Ok(Self {
@@ -301,6 +373,15 @@ impl IdpRegistry {
 
     pub fn is_empty(&self) -> bool {
         self.idps.is_empty()
+    }
+
+    /// The `[idps.id_jag_ceiling]` of the IdP `issuer`, when it has one.
+    pub(crate) fn id_jag_ceiling(&self, issuer: &str) -> Option<&ceiling::IdJagCeiling> {
+        self.idps
+            .iter()
+            .find(|i| i.config.issuer == issuer)?
+            .ceiling
+            .as_ref()
     }
 
     /// The `aud` an ID token must name when presented by `agent` at the IdP `issuer`: the
@@ -319,7 +400,7 @@ impl IdpRegistry {
         agent: &str,
         now: OffsetDateTime,
     ) -> Result<VerifiedAssertion, IntakeError> {
-        self.verify_for(token, kind, ClientId::Agent(agent), now)
+        self.verify_for(token, kind, ClientId::Agent(agent), Purpose::Intake, now)
             .await
     }
 
@@ -337,8 +418,14 @@ impl IdpRegistry {
             Some(c) => ClientId::Fixed(c),
             None => ClientId::Agent(agent),
         };
-        self.verify_for(token, CredentialKind::IdToken, client, now)
-            .await
+        self.verify_for(
+            token,
+            CredentialKind::IdToken,
+            client,
+            Purpose::Approval,
+            now,
+        )
+        .await
     }
 
     async fn verify_for(
@@ -346,13 +433,14 @@ impl IdpRegistry {
         token: &str,
         kind: CredentialKind,
         client: ClientId<'_>,
+        purpose: Purpose,
         now: OffsetDateTime,
     ) -> Result<VerifiedAssertion, IntakeError> {
         let (header, payload) = peek(token)?;
 
         let typ = header.get("typ").and_then(Value::as_str);
         let typ_ok = match kind {
-            CredentialKind::IdJag => typ.is_some_and(|t| t.eq_ignore_ascii_case(ID_JAG_TYP)),
+            CredentialKind::IdJag => typ.is_some_and(|t| typ_is(t, ID_JAG_TYP)),
             CredentialKind::IdToken => {
                 !typ.is_some_and(|t| t.to_ascii_lowercase().ends_with("+jwt"))
             }
@@ -370,6 +458,16 @@ impl IdpRegistry {
             .iter()
             .find(|i| i.config.issuer == iss)
             .ok_or_else(|| IntakeError::UntrustedIssuer(iss.to_owned()))?;
+        // SR-122: at hop 0, the entry names the credentials it accepts. Refused at the step
+        // that refuses an unknown issuer, before any key fetch, so a refusal costs the same
+        // for both and nothing about this credential has been checked or recorded. Approval ID
+        // tokens are not hop-0 credentials and are not affected.
+        if purpose == Purpose::Intake && !idp.config.credentials.contains(&kind.config()) {
+            return Err(IntakeError::KindNotAccepted {
+                issuer: idp.config.issuer.clone(),
+                kind: kind.as_str(),
+            });
+        }
 
         let alg_name = header.get("alg").and_then(Value::as_str).unwrap_or("");
         let alg = Algorithm::from_str(alg_name)
@@ -413,6 +511,9 @@ impl IdpRegistry {
             now,
             idp.config.clock_skew_seconds,
         )?;
+        if kind == CredentialKind::IdJag {
+            check_id_jag(&claims, &idp.config, expected_aud)?;
+        }
         // `check_claims` required a numeric `exp`; read it the same way (a JSON float is a
         // valid NumericDate, and `as_i64` alone would turn it into 0).
         let expires_at = numeric_date(&claims, "exp").unwrap_or(0);
@@ -426,6 +527,59 @@ impl IdpRegistry {
             clock_skew_seconds: idp.config.clock_skew_seconds,
         })
     }
+}
+
+/// The ID-JAG checks beyond [`check_claims`] (draft -06 §4.4.1):
+///
+/// - `aud` names this server and nothing else: a string, or an array with exactly one element
+///   ("If the aud claim is an array, it MUST contain exactly one element", also in -04). An
+///   ID-JAG for several authorization servers could be redeemed at each of them.
+/// - With `[[idps]] tenant` set (a multi-tenant issuer), the `tenant` claim must be present and
+///   equal to it, so that `iss` and `tenant` together name the tenant whose users the
+///   `[[root_grants]]` cover (-06 §4.4.1, §6.1).
+fn check_id_jag(
+    claims: &Map<String, Value>,
+    cfg: &IdpConfig,
+    audience: &str,
+) -> Result<(), IntakeError> {
+    if let Some(Value::Array(list)) = claims.get("aud") {
+        if list.len() != 1 {
+            return Err(IntakeError::AudienceMismatch(audience.to_owned()));
+        }
+    }
+    if let Some(expected) = &cfg.tenant {
+        let tenant = claims.get("tenant");
+        match tenant.and_then(Value::as_str) {
+            Some(t) if t == expected => {}
+            Some(t) => return Err(IntakeError::TenantMismatch(Some(t.to_owned()))),
+            None if tenant.is_none() => return Err(IntakeError::MissingClaim("tenant")),
+            None => return Err(IntakeError::TenantMismatch(None)),
+        }
+    }
+    Ok(())
+}
+
+/// What a credential is verified for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Purpose {
+    /// Hop-0 intake: `[[idps]] credentials` applies.
+    Intake,
+    /// An approval's ID token (ADR-0009): `credentials` does not apply.
+    Approval,
+}
+
+/// The start-up warning for an entry whose `[idps.id_jag_ceiling]` an agent can step around:
+/// the entry also accepts ID tokens, which the ceiling never narrows (SR-122). `None` when the
+/// entry has no ceiling or accepts no ID tokens.
+fn ceiling_bypass_warning(cfg: &IdpConfig) -> Option<String> {
+    (cfg.id_jag_ceiling.is_some() && cfg.credentials.contains(&IdpCredential::IdToken)).then(|| {
+        format!(
+            "[[idps]] `{}`: [idps.id_jag_ceiling] does not apply to ID tokens, and this entry \
+             accepts them: an agent that can present this issuer's ID tokens gets its root grant \
+             without the ceiling. Set credentials = [\"id-jag\"] to accept ID-JAGs only (SR-122)",
+            cfg.issuer
+        )
+    })
 }
 
 /// Which client an ID token must have been issued to.
@@ -477,6 +631,19 @@ fn parse_asymmetric_alg(name: &str) -> Result<Algorithm, String> {
     }
 }
 
+/// Does the JWT header `typ` value `typ` name the media type `expected` (given without its
+/// `application/` prefix)? RFC 7515 §4.1.9: the comparison is case-insensitive, and a value
+/// with no `/` is read as if `application/` were prepended, so `oauth-id-jag+jwt` and
+/// `application/oauth-id-jag+jwt` are the same type.
+pub(crate) fn typ_is(typ: &str, expected: &str) -> bool {
+    const PREFIX: &str = "application/";
+    let bare = match typ.get(..PREFIX.len()) {
+        Some(p) if p.eq_ignore_ascii_case(PREFIX) => &typ[PREFIX.len()..],
+        _ => typ,
+    };
+    bare.eq_ignore_ascii_case(expected)
+}
+
 type JsonObject = Map<String, Value>;
 
 /// Decode header and payload without verifying anything.
@@ -520,10 +687,10 @@ pub(crate) fn numeric_date(claims: &Map<String, Value>, name: &str) -> Option<i6
 /// `f` rounded down to a whole number of seconds, if that fits in an `i64`.
 fn float_seconds(f: f64) -> Option<i64> {
     // -2^63 is exact as an f64; i64::MAX is not (it rounds up to 2^63), so the upper bound is
-    // exclusive.
+    // exclusive. NaN and the infinities are outside the range too.
     const LIMIT: f64 = 9_223_372_036_854_775_808.0;
     let s = f.floor();
-    if !s.is_finite() || s < -LIMIT || s >= LIMIT {
+    if !(-LIMIT..LIMIT).contains(&s) {
         return None;
     }
     // In range and whole, so the cast is exact.
@@ -579,10 +746,37 @@ fn check_claims(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::IdJagCeilingConfig;
     use serde_json::json;
 
     fn claims(v: Value) -> Map<String, Value> {
         v.as_object().unwrap().clone()
+    }
+
+    #[test]
+    fn typ_media_type_comparison_rfc7515() {
+        for t in [
+            "oauth-id-jag+jwt",
+            "OAUTH-ID-JAG+JWT",
+            "application/oauth-id-jag+jwt",
+            "Application/OAuth-ID-JAG+JWT",
+        ] {
+            assert!(typ_is(t, ID_JAG_TYP), "{t}");
+        }
+        for t in [
+            "",
+            "JWT",
+            "at+jwt",
+            "application/",
+            "text/oauth-id-jag+jwt",
+            "application/application/oauth-id-jag+jwt",
+            "oauth-id-jag+jwt ",
+            "applicatio\u{20ac}x",
+        ] {
+            assert!(!typ_is(t, ID_JAG_TYP), "{t}");
+        }
+        // The actor-token check uses the same comparison.
+        assert!(typ_is("application/attenuo+jwt", attenuo_token::TOKEN_TYPE));
     }
 
     #[test]
@@ -694,7 +888,11 @@ mod tests {
             attribute_claims: vec![],
             jwks_ttl_seconds: 300,
             clock_skew_seconds: 60,
+            tenant: None,
+            ca_pem_path: None,
             client_ids: Default::default(),
+            id_jag_ceiling: None,
+            credentials: crate::config::DEFAULT_IDP_CREDENTIALS.to_vec(),
         };
         assert!(IdpRegistry::from_config(std::slice::from_ref(&cfg), "me").is_err());
         let good = IdpConfig {
@@ -702,6 +900,180 @@ mod tests {
             ..cfg
         };
         assert!(IdpRegistry::from_config(&[good.clone(), good], "me").is_err());
+    }
+
+    #[test]
+    fn an_empty_tenant_is_refused_in_config() {
+        let idp = |tenant: Option<&str>| IdpConfig {
+            issuer: "https://idp.example".into(),
+            audience: "a".into(),
+            jwks_url: None,
+            allowed_algs: vec!["RS256".into()],
+            attribute_claims: vec![],
+            jwks_ttl_seconds: 300,
+            clock_skew_seconds: 60,
+            tenant: tenant.map(str::to_owned),
+            ca_pem_path: None,
+            client_ids: Default::default(),
+            id_jag_ceiling: None,
+            credentials: crate::config::DEFAULT_IDP_CREDENTIALS.to_vec(),
+        };
+        for ok in [None, Some("acme")] {
+            IdpRegistry::from_config(&[idp(ok)], "me").unwrap();
+        }
+        for bad in ["", "  "] {
+            let err = IdpRegistry::from_config(&[idp(Some(bad))], "me")
+                .err()
+                .expect("an empty tenant must be refused")
+                .to_string();
+            assert!(err.contains("tenant is empty"), "{err}");
+        }
+    }
+
+    /// A bad `[idps.id_jag_ceiling]` refuses to start, naming the entry.
+    #[test]
+    fn a_bad_id_jag_ceiling_is_refused_in_config() {
+        let idp = |ceiling: &str| IdpConfig {
+            issuer: "https://idp.example".into(),
+            audience: String::new(),
+            jwks_url: None,
+            allowed_algs: vec!["RS256".into()],
+            attribute_claims: vec![],
+            jwks_ttl_seconds: 300,
+            clock_skew_seconds: 60,
+            tenant: None,
+            ca_pem_path: None,
+            client_ids: Default::default(),
+            id_jag_ceiling: Some(toml::from_str(ceiling).unwrap()),
+            credentials: crate::config::DEFAULT_IDP_CREDENTIALS.to_vec(),
+        };
+        let reg =
+            IdpRegistry::from_config(&[idp(r#"scopes = { "s" = ["github:*"] }"#)], "me").unwrap();
+        assert!(reg.id_jag_ceiling("https://idp.example").is_some());
+        assert!(reg.id_jag_ceiling("https://other.example").is_none());
+        let err = IdpRegistry::from_config(&[idp(r#"resources = { "r" = [] }"#)], "me")
+            .err()
+            .expect("a resource mapped to no server must be refused")
+            .to_string();
+        assert!(
+            err.contains("https://idp.example") && err.contains("maps to no server"),
+            "{err}"
+        );
+    }
+
+    /// SR-122: `credentials` defaults to both kinds; an empty list or an unknown name refuses to
+    /// start; a ceiling on an entry that accepts ID tokens is warned about, not refused.
+    #[test]
+    fn credentials_are_checked_at_start_sr122() {
+        let parse = |extra: &str| {
+            toml::from_str::<IdpConfig>(&format!("issuer = \"https://idp.example\"\n{extra}"))
+        };
+        let default = parse("").unwrap();
+        assert_eq!(
+            default.credentials,
+            [IdpCredential::IdToken, IdpCredential::IdJag]
+        );
+        assert_eq!(
+            parse(r#"credentials = ["id-jag"]"#).unwrap().credentials,
+            [IdpCredential::IdJag]
+        );
+        assert_eq!(
+            parse(r#"credentials = ["id_token"]"#).unwrap().credentials,
+            [IdpCredential::IdToken]
+        );
+        for bad in [
+            r#"credentials = ["id_jag"]"#,
+            r#"credentials = ["id-token"]"#,
+            r#"credentials = ["ID-JAG"]"#,
+            r#"credentials = "id-jag""#,
+        ] {
+            let err = parse(bad).expect_err(bad).to_string();
+            assert!(err.contains("credentials"), "{bad}: {err}");
+        }
+        IdpRegistry::from_config(std::slice::from_ref(&default), "me").unwrap();
+        let empty = IdpConfig {
+            credentials: vec![],
+            ..default.clone()
+        };
+        let err = IdpRegistry::from_config(&[empty], "me")
+            .err()
+            .expect("an empty credentials list must be refused")
+            .to_string();
+        assert!(
+            err.contains("https://idp.example") && err.contains("credentials is empty"),
+            "{err}"
+        );
+
+        // The warning: only with a ceiling, and only while ID tokens are accepted.
+        let ceiling: IdJagCeilingConfig =
+            toml::from_str(r#"scopes = { "s" = ["github:*"] }"#).unwrap();
+        let with = |credentials: &[IdpCredential], ceiling: Option<IdJagCeilingConfig>| IdpConfig {
+            credentials: credentials.to_vec(),
+            id_jag_ceiling: ceiling,
+            ..default.clone()
+        };
+        let both = [IdpCredential::IdToken, IdpCredential::IdJag];
+        let warning = ceiling_bypass_warning(&with(&both, Some(ceiling.clone())))
+            .expect("a ceiling with ID tokens accepted is warned about");
+        assert!(
+            warning.contains("https://idp.example")
+                && warning.contains("does not apply to ID tokens")
+                && warning.contains(r#"credentials = ["id-jag"]"#),
+            "{warning}"
+        );
+        assert!(
+            ceiling_bypass_warning(&with(&[IdpCredential::IdToken], Some(ceiling.clone())))
+                .is_some()
+        );
+        assert_eq!(
+            ceiling_bypass_warning(&with(&[IdpCredential::IdJag], Some(ceiling.clone()))),
+            None
+        );
+        assert_eq!(ceiling_bypass_warning(&with(&both, None)), None);
+        // A warning, not a refusal: such an entry starts, as it did before the key existed.
+        IdpRegistry::from_config(&[with(&both, Some(ceiling))], "me").unwrap();
+    }
+
+    /// S-8: the JWKS (or, without `jwks_url`, the issuer used for discovery) is https, or plain
+    /// http on a loopback host.
+    #[test]
+    fn key_sources_must_be_https_or_loopback_http_s8() {
+        let idp = |issuer: &str, jwks_url: Option<&str>| IdpConfig {
+            issuer: issuer.into(),
+            audience: String::new(),
+            jwks_url: jwks_url.map(str::to_owned),
+            allowed_algs: vec!["RS256".into()],
+            attribute_claims: vec![],
+            jwks_ttl_seconds: 300,
+            clock_skew_seconds: 60,
+            tenant: None,
+            ca_pem_path: None,
+            client_ids: Default::default(),
+            id_jag_ceiling: None,
+            credentials: crate::config::DEFAULT_IDP_CREDENTIALS.to_vec(),
+        };
+        for ok in [
+            idp("https://idp.example", None),
+            idp("https://idp.example", Some("https://keys.idp.example/jwks")),
+            idp("http://127.0.0.1:9000", None),
+            idp("https://idp.example", Some("http://localhost:9000/jwks")),
+        ] {
+            IdpRegistry::from_config(std::slice::from_ref(&ok), "me").unwrap();
+        }
+        for (bad, named) in [
+            (idp("http://idp.example", None), "issuer"),
+            (
+                idp("https://idp.example", Some("http://idp.example/jwks")),
+                "jwks_url",
+            ),
+            (idp("idp", None), "issuer"),
+        ] {
+            let err = IdpRegistry::from_config(std::slice::from_ref(&bad), "me")
+                .err()
+                .expect("must refuse")
+                .to_string();
+            assert!(err.contains(named), "{err}");
+        }
     }
 
     #[test]

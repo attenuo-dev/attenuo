@@ -1,15 +1,14 @@
-//! Opening a connection: durability, the switch to WAL mode, the per-file write gate and
-//! the checks an existing audit table must pass.
+//! Opening a connection: durability, the switch to WAL mode and the per-file write gate. The
+//! schema is brought up to date by `migrations.rs`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, Weak};
 use std::time::Duration;
 
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 
 use crate::error::AuditError;
-use crate::log::ENTRY_HASH_VERSION;
 
 /// How long a connection waits for another connection's write lock before giving up with
 /// `SQLITE_BUSY`. Within one process the stores' [`WriteGate`] serializes writers on one file,
@@ -140,6 +139,10 @@ pub(super) struct Ticket {
     /// (next ticket to hand out, ticket now served).
     state: Mutex<(u64, u64)>,
     turn: Condvar,
+    /// Tests and measurements: how many turns were taken, that is how many writes ran on the
+    /// file, by every store on it.
+    #[cfg(any(test, feature = "testing"))]
+    pub(super) taken: std::sync::atomic::AtomicU64,
 }
 
 /// Holds a [`Ticket`] until dropped (also when unwinding), which serves the next ticket.
@@ -181,6 +184,8 @@ impl WriteGate {
     /// ignored.
     pub(super) fn hold(&self) -> Option<TicketGuard<'_>> {
         self.0.as_ref().map(|t| {
+            #[cfg(any(test, feature = "testing"))]
+            t.taken.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let mut s = t.state.lock().unwrap_or_else(PoisonError::into_inner);
             let mine = s.0;
             s.0 += 1;
@@ -190,6 +195,15 @@ impl WriteGate {
             TicketGuard(t)
         })
     }
+
+    /// Tests and measurements: how many turns this gate has handed out (every write on the
+    /// file, by every store on it); 0 for a store with no gate.
+    #[cfg(any(test, feature = "testing"))]
+    pub(super) fn turns(&self) -> u64 {
+        self.0
+            .as_ref()
+            .map_or(0, |t| t.taken.load(std::sync::atomic::Ordering::Relaxed))
+    }
 }
 
 /// The `synchronous` level of `conn` if it is below `FULL` and there is a file to sync.
@@ -197,72 +211,6 @@ pub(super) fn relaxed_sync_of(conn: &Connection) -> Result<Option<i64>, AuditErr
     let file_backed = conn.path().is_some_and(|p| !p.is_empty());
     let level: i64 = conn.query_row("PRAGMA synchronous", [], |r| r.get(0))?;
     Ok((file_backed && level < SYNC_FULL).then_some(level))
-}
-
-/// Refuse a log created before records had `kind` and `chain_id` (this morning's v2 shape,
-/// never released): its rows lack the columns and its hashes do not cover the fields.
-pub(super) fn check_record_fields(conn: &Connection) -> Result<(), AuditError> {
-    let cols: Vec<String> = conn
-        .prepare("SELECT name FROM pragma_table_info('audit')")?
-        .query_map([], |r| r.get(0))?
-        .collect::<Result<_, _>>()?;
-    if !cols.is_empty() && !cols.iter().any(|c| c == "kind") {
-        return Err(AuditError::Storage(
-            "this audit log was written before records had `kind` and `chain_id` (a pre-release \
-             build) and cannot be read by this version; move the file aside and start a new log"
-                .into(),
-        ));
-    }
-    Ok(())
-}
-
-/// Refuse a log whose entries were hashed with another construction than
-/// [`ENTRY_HASH_VERSION`], and record the construction of a new one.
-pub(super) fn check_hash_version(conn: &Connection) -> Result<(), AuditError> {
-    let stored: Option<String> = conn
-        .query_row(
-            "SELECT value FROM audit_meta WHERE key = 'entry_hash'",
-            [],
-            |r| r.get(0),
-        )
-        .optional()?;
-    match stored {
-        Some(v) if v == ENTRY_HASH_VERSION => Ok(()),
-        Some(v) => Err(AuditError::Storage(format!(
-            "this audit log was written with entry hash `{v}`; this version reads only \
-             `{ENTRY_HASH_VERSION}`"
-        ))),
-        None => {
-            let has_entries: bool =
-                conn.query_row("SELECT EXISTS (SELECT 1 FROM audit)", [], |r| r.get(0))?;
-            if has_entries {
-                return Err(AuditError::Storage(format!(
-                    "this audit log was written by an earlier attenuo (entry hash v1, before \
-                     RFC 8785 canonical JSON) and cannot be verified or extended by this \
-                     version, which hashes `{ENTRY_HASH_VERSION}`; move the file aside and \
-                     start a new log"
-                )));
-            }
-            conn.execute(
-                "INSERT OR IGNORE INTO audit_meta (key, value) VALUES ('entry_hash', ?1)",
-                [ENTRY_HASH_VERSION],
-            )?;
-            // Another process may have created the log meanwhile; whoever won must agree.
-            let v: String = conn.query_row(
-                "SELECT value FROM audit_meta WHERE key = 'entry_hash'",
-                [],
-                |r| r.get(0),
-            )?;
-            if v == ENTRY_HASH_VERSION {
-                Ok(())
-            } else {
-                Err(AuditError::Storage(format!(
-                    "this audit log uses entry hash `{v}`; this version reads only \
-                     `{ENTRY_HASH_VERSION}`"
-                )))
-            }
-        }
-    }
 }
 
 impl std::fmt::Display for Durability {
@@ -278,6 +226,7 @@ pub(super) fn open_connection(
     path: &Path,
     durability: Durability,
 ) -> Result<Connection, AuditError> {
+    create_owner_only(path)?;
     let conn = Connection::open(path)?;
     conn.busy_timeout(BUSY_TIMEOUT)?;
     conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE);
@@ -292,6 +241,41 @@ pub(super) fn open_connection(
     }
     conn.pragma_update(None, "synchronous", durability.pragma())?;
     Ok(conn)
+}
+
+/// Create the database file `0600` on Unix when it does not exist yet, before SQLite opens
+/// it: SQLite would create it `0644` (less the umask), readable by every local user, and the
+/// log holds user subjects, tool arguments and decisions. SQLite gives the `-wal` and `-shm`
+/// files it creates the database file's mode, so they are owner-only too. An existing file is
+/// left as it is: an operator who made it group-readable (for a backup user, say) keeps that
+/// (SR-103). A `:memory:` or `file:` URI name is not a file path and is skipped.
+fn create_owner_only(path: &Path) -> Result<(), AuditError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let name = path.as_os_str();
+        if name == ":memory:" || name.as_encoded_bytes().starts_with(b"file:") {
+            return Ok(());
+        }
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+        {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => {
+                return Err(AuditError::Storage(format!(
+                    "cannot create the database file {}: {e}",
+                    path.display()
+                )))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 /// `PRAGMA journal_mode=WAL`, answering the mode in force. SQLite does not call the busy

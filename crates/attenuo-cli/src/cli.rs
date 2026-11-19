@@ -10,14 +10,21 @@ pub(crate) const DEFAULT_SERVER: &str = "http://127.0.0.1:8080";
 /// attenuo: mint, exchange and inspect delegation tokens, call tools through the proxy and
 /// administer a running attenuo server.
 ///
-/// `--server` here is the attenuo server's base URL and goes before the subcommand. The
-/// `--server` of `call` and `tools` names the MCP upstream (for example `github`).
+/// `--server` here is the attenuo server's base URL and goes before the subcommand. The MCP
+/// upstream a subcommand talks to (`call`, `tools`, `authzen eval`, `policy evaluate`,
+/// `audit tail`) is `--upstream` (for example `github`).
 #[derive(Debug, Parser)]
 #[command(name = "attenuo", version, about, long_about)]
 pub(crate) struct Cli {
     /// Base URL of the attenuo server.
     #[arg(long, visible_alias = "url", env = "ATTENUO_SERVER", default_value = DEFAULT_SERVER)]
     pub server: String,
+
+    /// Base URL of the server's admin API, for a server with `[admin] listen`. Every request
+    /// to `/admin/*` goes here; every other request (tokens, AuthZEN, the proxy, `health`,
+    /// the JWKS) still goes to `--server`. Unset or empty, `/admin/*` goes to `--server` too.
+    #[arg(long, global = true, env = "ATTENUO_ADMIN_SERVER", value_name = "URL")]
+    pub admin_server: Option<String>,
 
     /// Bearer token for `/admin/*` (token root, lease, audit, policy). Without this flag,
     /// `--admin-token-stdin` or `--admin-token-file`, the `ATTENUO_ADMIN_TOKEN` environment
@@ -46,6 +53,91 @@ pub(crate) struct Cli {
 
     #[command(subcommand)]
     pub command: Command,
+}
+
+/// Warning printed when a subcommand is given its deprecated `--server` (audit K-13).
+pub(crate) fn server_flag_warning(cmd: &str) -> String {
+    format!(
+        "warning: `{cmd} --server` is deprecated, use `--upstream`; `--server` before the \
+         subcommand is the attenuo server URL"
+    )
+}
+
+/// Move a deprecated `--server` value into `upstream`, and say so in `warnings`.
+fn adopt(
+    upstream: &mut Option<String>,
+    old: &mut Option<String>,
+    cmd: &str,
+    warnings: &mut Vec<String>,
+) {
+    if let Some(v) = old.take() {
+        *upstream = Some(v);
+        warnings.push(server_flag_warning(cmd));
+    }
+}
+
+/// The upstream name of `call`, `tools` and `policy evaluate`, after
+/// [`Cli::resolve_deprecated`] (clap makes one of the two flags required).
+macro_rules! upstream_accessor {
+    ($($t:ty),*) => {$(
+        impl $t {
+            /// The MCP upstream name, from `--upstream` or the deprecated `--server`.
+            pub(crate) fn upstream(&self) -> &str {
+                self.upstream
+                    .as_deref()
+                    .or(self.server_deprecated.as_deref())
+                    .unwrap_or_default()
+            }
+        }
+    )*};
+}
+upstream_accessor!(CallArgs, ToolsArgs, EvaluateArgs);
+
+impl Cli {
+    /// Apply the deprecated `--server` spelling of a subcommand's `--upstream`, which clap
+    /// keeps apart so that its use can be warned about. Returns one warning line per use, for
+    /// stderr.
+    pub(crate) fn resolve_deprecated(&mut self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        match &mut self.command {
+            Command::Call(a) => adopt(
+                &mut a.upstream,
+                &mut a.server_deprecated,
+                "call",
+                &mut warnings,
+            ),
+            Command::Tools(a) => adopt(
+                &mut a.upstream,
+                &mut a.server_deprecated,
+                "tools",
+                &mut warnings,
+            ),
+            Command::Policy(PolicyCmd::Evaluate(a)) => adopt(
+                &mut a.upstream,
+                &mut a.server_deprecated,
+                "policy evaluate",
+                &mut warnings,
+            ),
+            Command::Audit(AuditCmd::Tail { filter, .. }) => adopt(
+                &mut filter.upstream,
+                &mut filter.server_deprecated,
+                "audit tail",
+                &mut warnings,
+            ),
+            Command::Authzen(AuthzenCmd::Eval {
+                upstream,
+                server_deprecated,
+                ..
+            }) => {
+                if let Some(v) = server_deprecated.take() {
+                    *upstream = v;
+                    warnings.push(server_flag_warning("authzen eval"));
+                }
+            }
+            _ => {}
+        }
+        warnings
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -78,6 +170,177 @@ pub(crate) enum Command {
     /// Generate keys.
     #[command(subcommand)]
     Key(KeyCmd),
+    /// Admin operators: make their credentials offline, and reload them on the server
+    /// (ADR-0016).
+    #[command(subcommand)]
+    Admin(AdminCmd),
+    /// Check that the server is up (`GET /healthz`), or ready with `--ready` (`GET /readyz`).
+    /// Exits 0 when it is and 1 when it is not or cannot be reached, never 2, so it can be a
+    /// container `HEALTHCHECK` (Docker reserves exit status 2 there). Needs no token.
+    Health(HealthArgs),
+    /// Run a local STDIO MCP server as a child process and serve it as a Streamable HTTP MCP
+    /// endpoint at `http://<listen>/mcp`, so it can be an `[[upstreams]]` entry of the
+    /// attenuo proxy. The bridge has no authentication of its own: anyone who can reach it
+    /// bypasses attenuo, so it binds loopback only unless `--allow-non-loopback` is given.
+    /// Runs until SIGINT or SIGTERM (exit 0) or until the child exits (exit 1); the child is
+    /// stopped with it.
+    StdioBridge(StdioBridgeArgs),
+}
+
+/// `attenuo stdio-bridge`.
+#[derive(Debug, Args)]
+pub(crate) struct StdioBridgeArgs {
+    /// The address to serve on, an IP address and a port (`127.0.0.1:3001`; port 0 picks a
+    /// free one). The URL is printed on stdout once bound: `listening on http://ADDR/mcp`.
+    #[arg(long, value_name = "ADDR")]
+    pub listen: std::net::SocketAddr,
+    /// Accept a `--listen` address that is not loopback. The bridge does not authenticate
+    /// its callers: anyone who reaches it calls the STDIO server without attenuo.
+    #[arg(long)]
+    pub allow_non_loopback: bool,
+    /// How long a request waits for the STDIO server's answer, in seconds, before it gets a
+    /// JSON-RPC error with HTTP 504. Keep it below the proxy's
+    /// `upstream_response_timeout_seconds` (120 by default).
+    #[arg(long, value_name = "SECS", default_value_t = 90, value_parser = clap::value_parser!(u64).range(1..=3600))]
+    pub timeout: u64,
+    /// Largest HTTP request body accepted, in bytes; a larger one gets HTTP 413.
+    #[arg(long, value_name = "BYTES", default_value_t = 4 * 1024 * 1024, value_parser = clap::value_parser!(u64).range(1..=(1 << 30)))]
+    pub max_request_bytes: u64,
+    /// Longest line read from the STDIO server's stdout, in bytes; a longer one is dropped
+    /// (and the request it answered times out).
+    #[arg(long, value_name = "BYTES", default_value_t = 16 * 1024 * 1024, value_parser = clap::value_parser!(u64).range(1..=(1 << 30)))]
+    pub max_line_bytes: u64,
+    /// Print one line to stderr for each message of the STDIO server the bridge drops
+    /// (notifications, its own requests, answers nobody waits for).
+    #[arg(long)]
+    pub verbose: bool,
+    /// The STDIO server's command and its arguments, after `--`. It inherits the bridge's
+    /// environment, without any variable whose name starts with `ATTENUO_` (attenuo's own
+    /// secrets and configuration overrides).
+    #[arg(required = true, last = true, num_args = 1.., value_name = "COMMAND", value_parser = clap::value_parser!(std::ffi::OsString))]
+    pub command: Vec<std::ffi::OsString>,
+}
+
+/// `attenuo health`.
+#[derive(Debug, Args)]
+pub(crate) struct HealthArgs {
+    /// Ask `/readyz` (audit log and lease store answer, last audit append succeeded) instead of
+    /// `/healthz` (the process answers HTTP).
+    #[arg(long)]
+    pub ready: bool,
+    /// Give up after this many seconds, connect and answer together.
+    #[arg(long, value_name = "SECS", default_value_t = 5, value_parser = clap::value_parser!(u64).range(1..=300))]
+    pub timeout: u64,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum AdminCmd {
+    /// Named admin operators (`[[admin.operators]]`).
+    #[command(subcommand)]
+    Operator(OperatorCmd),
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum OperatorCmd {
+    /// Generate a token for a new operator: 32 random bytes, base64url. Prints the token once
+    /// on stdout, then the `[[admin.operators]]` entry to add to the server's config, which
+    /// holds only the token's SHA-256. Writes nothing to disk and sends nothing to a server;
+    /// the server picks the entry up on `attenuo admin operator reload` or a restart.
+    New {
+        /// The operator's name, `[a-z0-9_-]{1,64}` and not `admin`; recorded in the audit
+        /// log as `urn:attenuo:admin:<name>`.
+        #[arg(long)]
+        name: String,
+        /// What the operator may do: `viewer` (reads), `operator` (also revoke leases and
+        /// decide approvals) or `admin` (everything).
+        #[arg(long)]
+        role: OperatorRole,
+        /// The token stops working this long from now: a whole number and a unit, `s`, `m`,
+        /// `h` or `d` (`90d`, `12h`). Written into the entry as `expires_at`.
+        #[arg(long, value_name = "DURATION", value_parser = parse_expires_in, conflicts_with = "expires_at")]
+        expires_in: Option<time::Duration>,
+        /// The token stops working at this RFC 3339 time with an offset
+        /// (`2026-12-31T23:59:59Z`), which must be in the future.
+        #[arg(long, value_name = "RFC3339", value_parser = parse_expires_at)]
+        expires_at: Option<time::OffsetDateTime>,
+    },
+    /// Print the `token_sha256` of a token read from the first line of standard input, for
+    /// a token made some other way.
+    Hash,
+    /// Ask the server to re-read `[[admin.operators]]` from its config file and put them in
+    /// force without a restart (`POST /admin/operators/reload`, role `admin`). Prints the
+    /// operators added, removed and changed. `[admin] token` is not reloaded. On a refusal
+    /// (a list that does not parse or breaks a rule, or one that would leave no `admin`) the
+    /// operators in force are unchanged.
+    Reload,
+}
+
+/// Longest `--expires-in`: ten years.
+const MAX_EXPIRES_IN_DAYS: i64 = 3650;
+
+/// `--expires-in`: a whole number of `s`, `m`, `h` or `d`, at least one second and at most
+/// [`MAX_EXPIRES_IN_DAYS`] days.
+pub(crate) fn parse_expires_in(s: &str) -> Result<time::Duration, String> {
+    let bad = || {
+        format!("`{s}` is not a duration: write a whole number and a unit, s, m, h or d (like 90d)")
+    };
+    let unit = s.chars().last().ok_or_else(bad)?;
+    let digits = &s[..s.len() - unit.len_utf8()];
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(bad());
+    }
+    let n: i64 = digits.parse().map_err(|_| bad())?;
+    let seconds_per = match unit {
+        's' => 1,
+        'm' => 60,
+        'h' => 3600,
+        'd' => 86_400,
+        _ => return Err(bad()),
+    };
+    let secs = n.checked_mul(seconds_per).ok_or_else(bad)?;
+    if secs < 1 {
+        return Err(format!("`{s}`: the duration must be at least 1s"));
+    }
+    if secs > MAX_EXPIRES_IN_DAYS * 86_400 {
+        return Err(format!(
+            "`{s}`: the duration must be at most {MAX_EXPIRES_IN_DAYS}d"
+        ));
+    }
+    Ok(time::Duration::seconds(secs))
+}
+
+/// `--expires-at`: an RFC 3339 time with an offset, in the future.
+fn parse_expires_at(s: &str) -> Result<time::OffsetDateTime, String> {
+    use time::format_description::well_known::Rfc3339;
+    let t = time::OffsetDateTime::parse(s, &Rfc3339).map_err(|_| {
+        format!("`{s}` is not an RFC 3339 time with an offset (like 2026-12-31T23:59:59Z)")
+    })?;
+    if t <= time::OffsetDateTime::now_utc() {
+        return Err(format!("`{s}` is in the past"));
+    }
+    Ok(t)
+}
+
+/// The role of an admin operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum OperatorRole {
+    /// Read-only admin routes.
+    Viewer,
+    /// A viewer that may also revoke leases and decide approvals.
+    Operator,
+    /// Every admin route.
+    Admin,
+}
+
+impl OperatorRole {
+    /// The config spelling.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            OperatorRole::Viewer => "viewer",
+            OperatorRole::Operator => "operator",
+            OperatorRole::Admin => "admin",
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -85,10 +348,26 @@ pub(crate) enum KeyCmd {
     /// Generate a key. `--dpop <PATH>` writes a new Ed25519 DPoP key (RFC 9449) as a private
     /// JWK, readable only by you, and prints its thumbprint (the `cnf.jkt` of tokens bound to
     /// it). Use it with `--dpop-key`; the Python and TypeScript SDKs take the same file.
+    /// `--client <PATH>` writes a new Ed25519 client key for `private_key_jwt` (RFC 7523) the
+    /// same way, and prints the `jwks` line with its public half to add to the agent's
+    /// `[[agents]]` (or the PEP's `[[peps]]`) entry. Use it with `token exchange --client-key`.
+    #[command(group(clap::ArgGroup::new("kind").required(true).args(["dpop", "client"])))]
     Gen {
         /// Where to write the DPoP key. An existing file is never overwritten.
-        #[arg(long, value_name = "PATH", required = true)]
-        dpop: std::path::PathBuf,
+        #[arg(long, value_name = "PATH")]
+        dpop: Option<std::path::PathBuf>,
+        /// Where to write the client key. An existing file is never overwritten.
+        #[arg(long, value_name = "PATH")]
+        client: Option<std::path::PathBuf>,
+        /// The client key's `kid` (default: its RFC 7638 thumbprint). Give each key of an
+        /// agent its own `kid`, so a new key can be added next to the old one.
+        #[arg(
+            long,
+            requires = "client",
+            conflicts_with = "dpop",
+            value_parser = NonEmptyStringValueParser::new()
+        )]
+        kid: Option<String>,
     },
 }
 
@@ -229,17 +508,54 @@ fn split_agents(values: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// What `token exchange` sends as its subject token: the `subject_token_type` of the request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+pub(crate) enum SubjectTokenType {
+    /// An attenuo token: an exchange from hop n to hop n+1.
+    #[default]
+    Jwt,
+    /// An OIDC ID token from an `[[idps]]` issuer: hop 0, which mints a root token.
+    IdToken,
+    /// An ID-JAG from an `[[idps]]` issuer: hop 0, which mints a root token.
+    IdJag,
+}
+
+impl SubjectTokenType {
+    /// The RFC 8693 token type URN the request carries.
+    pub(crate) fn urn(self) -> &'static str {
+        match self {
+            Self::Jwt => "urn:ietf:params:oauth:token-type:jwt",
+            Self::IdToken => "urn:ietf:params:oauth:token-type:id_token",
+            Self::IdJag => "urn:ietf:params:oauth:token-type:id-jag",
+        }
+    }
+
+    /// Is the subject token an IdP credential (hop 0) rather than an attenuo token?
+    pub(crate) fn is_hop0(self) -> bool {
+        self != Self::Jwt
+    }
+}
+
 #[derive(Debug, Args)]
 pub(crate) struct ExchangeArgs {
-    /// The parent token, or `-` to read it from the first line of stdin. Without this flag or
+    /// The parent token (or, with `--subject-token-type id-token | id-jag`, the IdP
+    /// credential), or `-` to read it from the first line of stdin. Without this flag or
     /// `--subject-token-file`, the `ATTENUO_TOKEN` environment variable is used. Prefer those:
     /// an argument is visible to other local users in `ps`.
     #[arg(long, conflicts_with = "subject_token_file")]
     pub subject_token: Option<String>,
-    /// Read the parent token from the first line of this file.
+    /// Read the parent token (or the IdP credential) from the first line of this file.
     #[arg(long, value_name = "PATH")]
     pub subject_token_file: Option<std::path::PathBuf>,
-    /// The sub-agent that will hold the new token. The request authenticates as this agent.
+    /// What the subject token is. `jwt`: an attenuo token, exchanged from hop n to hop n+1.
+    /// `id-token` (an OIDC ID token) or `id-jag` (an ID-JAG): a user credential from an
+    /// `[[idps]]` issuer, exchanged at hop 0 for a root token held by `--actor`, within the
+    /// server's `[[root_grants]]`. Sent as `subject_token_type`
+    /// (`urn:ietf:params:oauth:token-type:jwt`, `...:id_token`, `...:id-jag`).
+    #[arg(long, value_enum, value_name = "TYPE", default_value_t = SubjectTokenType::Jwt)]
+    pub subject_token_type: SubjectTokenType,
+    /// The sub-agent that will hold the new token (at hop 0, the agent presenting the user's
+    /// credential). The request authenticates as this agent.
     #[arg(long)]
     pub actor: String,
     /// Client id to authenticate with (an `[[agents]]` entry). Defaults to `--actor`; the server
@@ -247,17 +563,30 @@ pub(crate) struct ExchangeArgs {
     #[arg(long)]
     pub client_id: Option<String>,
     /// The agent's client secret. Required by servers with `[token] require_actor_auth`
-    /// (the default). Without this flag, `--client-secret-stdin` or `--client-secret-file`,
+    /// (the default), unless the agent authenticates with `--client-key` or `--actor-token`.
+    /// Without this flag, `--client-secret-stdin`, `--client-secret-file` or `--client-key`,
     /// the `ATTENUO_CLIENT_SECRET` environment variable is used. Prefer those: an argument is
     /// visible to other local users in `ps`.
-    #[arg(long, conflicts_with_all = ["client_secret_stdin", "client_secret_file"])]
+    #[arg(long, conflicts_with_all = ["client_secret_stdin", "client_secret_file", "client_key"])]
     pub client_secret: Option<String>,
     /// Read the client secret from the first line of standard input.
-    #[arg(long, conflicts_with = "client_secret_file")]
+    #[arg(long, conflicts_with_all = ["client_secret_file", "client_key"])]
     pub client_secret_stdin: bool,
     /// Read the client secret from the first line of this file.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", conflicts_with = "client_key")]
     pub client_secret_file: Option<std::path::PathBuf>,
+    /// Authenticate with `private_key_jwt` (RFC 7523) instead of a secret: sign a client
+    /// assertion with this key, a private JWK (Ed25519 or P-256) such as `attenuo key gen
+    /// --client` writes; its `kid`, if the file has one, goes in the header. The assertion
+    /// names the client id, has a fresh `jti` and lives one minute. `ATTENUO_CLIENT_SECRET` is
+    /// then ignored.
+    #[arg(long, value_name = "PATH")]
+    pub client_key: Option<std::path::PathBuf>,
+    /// The `aud` of the client assertion: the server's `[issuer] issuer`. Default: the `iss`
+    /// of the subject token, which this server issued. Required at hop 0, where the subject
+    /// token is the IdP's.
+    #[arg(long, value_name = "ISSUER", requires = "client_key")]
+    pub client_assertion_audience: Option<String>,
     /// RFC 8693 actor token authenticating `--actor`: a workload-identity JWT (for example a
     /// SPIFFE JWT-SVID) from an `[[actor_trust]]` issuer, or `-` to read it from stdin. Sent as
     /// `actor_token` with `actor_token_type` `urn:ietf:params:oauth:token-type:jwt`. Each
@@ -283,26 +612,31 @@ pub(crate) struct ExchangeArgs {
     /// Capability `server:tool`, or a full capability as a JSON object (with `constraints` and
     /// run `limits`). Repeatable; plain `server:tool` values may also be comma-separated. Must
     /// be covered by the parent's capabilities; limits are inherited from the parent and
-    /// clamped to what it has left.
+    /// clamped to what it has left. At hop 0, must be covered by the `[[root_grants]]` entry,
+    /// and a limited capability of the entry cannot be split across two requested
+    /// capabilities (`limit_split_at_root`): ask for one with a `one_of` constraint instead.
     #[arg(long = "cap", required = true)]
     pub caps: Vec<String>,
-    /// Requested lifetime in seconds (clamped to the parent's expiry).
+    /// Requested lifetime in seconds (clamped to the parent's expiry; at hop 0, to the
+    /// credential's).
     #[arg(long)]
     pub ttl_seconds: Option<u64>,
     /// Bind the new token to this DPoP key (a private JWK from `attenuo key gen --dpop`): a
     /// proof by it goes in the `DPoP` header. When the parent token is bound to the same key,
-    /// the proof also covers the parent. Required for a bound parent.
+    /// the proof also covers the parent. Required for a bound parent, and at hop 0 for an
+    /// ID-JAG with a `cnf` key, which must be this key.
     #[arg(long, value_name = "PATH")]
     pub dpop_key: Option<std::path::PathBuf>,
     /// The parent token's DPoP key, when it differs from `--dpop-key`: its proof goes in the
     /// body as `subject_token_dpop`, the parent holder's consent to binding the new token to
     /// `--dpop-key` for `--actor`. Only when one party holds both keys; otherwise the parent
     /// makes the consent with `attenuo token sign-off` and you pass it with
-    /// `--subject-token-dpop-file`.
+    /// `--subject-token-dpop-file`. Not at hop 0.
     #[arg(long, value_name = "PATH", conflicts_with = "subject_token_dpop_file")]
     pub subject_dpop_key: Option<std::path::PathBuf>,
     /// The parent holder's consent (`subject_token_dpop`) made with `attenuo token sign-off`
     /// for this exchange's `--dpop-key` and `--actor`, read from the first line of this file.
+    /// Not at hop 0.
     #[arg(long, value_name = "PATH")]
     pub subject_token_dpop_file: Option<std::path::PathBuf>,
     /// Print only this value, for scripts.
@@ -311,6 +645,35 @@ pub(crate) struct ExchangeArgs {
 }
 
 impl ExchangeArgs {
+    /// Refuse the flags that mean nothing at hop 0 (`--subject-token-type id-token | id-jag`),
+    /// where there is no parent token: the server would ignore a parent's sign-off, and the
+    /// client assertion's audience cannot be read from an IdP credential.
+    pub(crate) fn check_hop0(&self) -> anyhow::Result<()> {
+        if !self.subject_token_type.is_hop0() {
+            return Ok(());
+        }
+        let ty = self
+            .subject_token_type
+            .to_possible_value()
+            .map(|v| v.get_name().to_owned())
+            .unwrap_or_default();
+        if self.subject_dpop_key.is_some() || self.subject_token_dpop_file.is_some() {
+            anyhow::bail!(
+                "--subject-dpop-key and --subject-token-dpop-file sign off on an exchange of a \
+                 bound parent token; at hop 0 (--subject-token-type {ty}) there is none. Use \
+                 --dpop-key to bind the root token"
+            );
+        }
+        if self.client_key.is_some() && self.client_assertion_audience.is_none() {
+            anyhow::bail!(
+                "--client-key at hop 0 (--subject-token-type {ty}) needs \
+                 --client-assertion-audience <the server's [issuer] issuer>: the subject token \
+                 is the IdP's, so its `iss` is not the server's"
+            );
+        }
+        Ok(())
+    }
+
     /// The actor token from `--actor-token` (`-` reads `stdin`) or `--actor-token-file`,
     /// trimmed; `None` when neither is given.
     pub(crate) fn actor_token(&self, stdin: impl std::io::Read) -> anyhow::Result<Option<String>> {
@@ -403,8 +766,20 @@ pub(crate) struct CallArgs {
     #[command(flatten)]
     pub token: TokenSource,
     /// MCP upstream name, as mounted at `/mcp/<name>`.
-    #[arg(long, alias = "upstream")]
-    pub server: String,
+    #[arg(
+        long,
+        value_name = "NAME",
+        required_unless_present = "server_deprecated"
+    )]
+    pub upstream: Option<String>,
+    /// Deprecated spelling of `--upstream`.
+    #[arg(
+        long = "server",
+        value_name = "NAME",
+        hide = true,
+        conflicts_with = "upstream"
+    )]
+    pub server_deprecated: Option<String>,
     /// Tool name.
     #[arg(long)]
     pub tool: String,
@@ -417,9 +792,21 @@ pub(crate) struct CallArgs {
 pub(crate) struct ToolsArgs {
     #[command(flatten)]
     pub token: TokenSource,
-    /// MCP upstream name.
-    #[arg(long, alias = "upstream")]
-    pub server: String,
+    /// MCP upstream name, as mounted at `/mcp/<name>`.
+    #[arg(
+        long,
+        value_name = "NAME",
+        required_unless_present = "server_deprecated"
+    )]
+    pub upstream: Option<String>,
+    /// Deprecated spelling of `--upstream`.
+    #[arg(
+        long = "server",
+        value_name = "NAME",
+        hide = true,
+        conflicts_with = "upstream"
+    )]
+    pub server_deprecated: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -502,7 +889,7 @@ fn parse_reason(s: &str) -> Result<String, String> {
 /// grants with an ID token at `POST /approvals/{id}` instead.
 #[derive(Debug, Subcommand)]
 pub(crate) enum ApprovalCmd {
-    /// The newest approvals, newest first.
+    /// Approvals, newest first, one page at a time (`--all` for every page).
     List {
         /// Only the approvals of this delegation run (its first hop's lease).
         #[arg(long)]
@@ -510,9 +897,15 @@ pub(crate) enum ApprovalCmd {
         /// Only approvals in this state.
         #[arg(long, value_parser = ["pending", "granted", "declined", "consumed"])]
         state: Option<String>,
-        /// At most this many (server maximum 500).
+        /// Page size (server default 100, at most 500).
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..=500))]
         limit: Option<u64>,
+        /// Start at this page: the `next_cursor` of an earlier listing with the same filters.
+        #[arg(long, conflicts_with = "all")]
+        cursor: Option<String>,
+        /// Follow `next_cursor` and list every matching approval.
+        #[arg(long)]
+        all: bool,
     },
     /// Show one approval: the exact call, the run's labels, state and expiry.
     Show { id: String },
@@ -590,11 +983,11 @@ pub(crate) enum AuditCmd {
     },
     /// List stored checkpoints, newest first. Read-only: never signs a new one.
     Checkpoints {
-        /// Only checkpoints with a seq below this (the next page of an earlier listing).
-        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
-        before: Option<u64>,
+        /// The next (older) page: the `next_cursor` of an earlier listing.
+        #[arg(long)]
+        cursor: Option<String>,
         /// Page size (server default 100, at most 1000).
-        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..=1000))]
         limit: Option<u64>,
     },
     /// Walk the whole hash chain and verify the signed checkpoints. Exits 2 if the chain is
@@ -704,10 +1097,19 @@ pub(crate) struct AuditFilter {
     /// A lease anywhere in the record's chain.
     #[arg(long, value_parser = NonEmptyStringValueParser::new())]
     pub lease: Option<String>,
-    /// The MCP upstream the call went to (not the attenuo server URL, which is the global
-    /// `--server` before the subcommand).
-    #[arg(long, value_parser = NonEmptyStringValueParser::new())]
-    pub server: Option<String>,
+    /// The MCP upstream the call went to (the record's `server`; not the attenuo server URL,
+    /// which is the global `--server` before the subcommand).
+    #[arg(long, value_name = "NAME", value_parser = NonEmptyStringValueParser::new())]
+    pub upstream: Option<String>,
+    /// Deprecated spelling of `--upstream`.
+    #[arg(
+        long = "server",
+        value_name = "NAME",
+        hide = true,
+        conflicts_with = "upstream",
+        value_parser = NonEmptyStringValueParser::new()
+    )]
+    pub server_deprecated: Option<String>,
     /// The tool. attenuo's own records use `token.root`, `token.exchange`, `lease.renew` and
     /// `admin.*`: `--tool token.exchange --decision deny` lists refused exchanges, `--tool
     /// lease.renew --decision deny` refused renewals.
@@ -745,7 +1147,7 @@ impl AuditFilter {
             ("subject", &self.subject),
             ("agent", &self.agent),
             ("lease", &self.lease),
-            ("server", &self.server),
+            ("server", &self.upstream),
             ("tool", &self.tool),
             ("chain_id", &self.chain_id),
             ("since", &self.since),
@@ -872,8 +1274,20 @@ pub(crate) struct EvaluateArgs {
     #[arg(long, value_name = "PATH")]
     pub chain_file: Option<std::path::PathBuf>,
     /// MCP upstream name.
-    #[arg(long, alias = "upstream")]
-    pub server: String,
+    #[arg(
+        long,
+        value_name = "NAME",
+        required_unless_present = "server_deprecated"
+    )]
+    pub upstream: Option<String>,
+    /// Deprecated spelling of `--upstream`.
+    #[arg(
+        long = "server",
+        value_name = "NAME",
+        hide = true,
+        conflicts_with = "upstream"
+    )]
+    pub server_deprecated: Option<String>,
     /// Tool name.
     #[arg(long)]
     pub tool: String,
@@ -889,15 +1303,46 @@ pub(crate) enum AuthzenCmd {
         /// The delegation token, sent as the bearer.
         #[command(flatten)]
         token: TokenSource,
-        /// MCP server name.
-        #[arg(long, default_value = "github")]
-        server: String,
+        /// MCP upstream name.
+        #[arg(long, value_name = "NAME", default_value = "github")]
+        upstream: String,
+        /// Deprecated spelling of `--upstream`.
+        #[arg(
+            long = "server",
+            value_name = "NAME",
+            hide = true,
+            conflicts_with = "upstream"
+        )]
+        server_deprecated: Option<String>,
         /// Tool name.
         #[arg(long)]
         tool: String,
         /// Tool argument `key=value` (`key:=json`). Repeatable.
         #[arg(long = "arg", value_parser = parse_kv)]
         args: Vec<(String, Value)>,
+    },
+    /// List the catalogued tools of an upstream that the token's chain may call with these
+    /// arguments (AuthZEN action search), without calling or auditing anything.
+    Search {
+        /// The delegation token, sent as the bearer.
+        #[command(flatten)]
+        token: TokenSource,
+        /// MCP upstream name.
+        #[arg(long, value_name = "NAME", default_value = "github")]
+        upstream: String,
+        /// Argument `key=value` (`key:=json`) every candidate is decided with. Repeatable.
+        #[arg(long = "arg", value_parser = parse_kv)]
+        args: Vec<(String, Value)>,
+        /// How many catalogued tools one page evaluates (the server clamps it to its
+        /// `[authzen] max_batch`).
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
+        limit: Option<u64>,
+        /// Ask for the page after this one: the `next_token` a previous search printed.
+        #[arg(long, value_name = "TOKEN", conflicts_with = "all")]
+        page_token: Option<String>,
+        /// Follow `next_token` and print every page's results.
+        #[arg(long)]
+        all: bool,
     },
 }
 
@@ -927,6 +1372,16 @@ pub(crate) fn parse_caps(raw: &[String]) -> anyhow::Result<Vec<Value>> {
         }
     }
     Ok(out)
+}
+
+/// Warnings about capabilities as [`parse_caps`] returns them: a `prefix` constraint on an
+/// argument that looks like a file path, where `path_prefix` is meant
+/// ([`attenuo_core::Capability::path_prefix_warnings`]). The request is sent anyway.
+pub(crate) fn cap_warnings(caps: &[Value]) -> Vec<String> {
+    caps.iter()
+        .filter_map(|v| serde_json::from_value::<attenuo_core::Capability>(v.clone()).ok())
+        .flat_map(|c| c.path_prefix_warnings())
+        .collect()
 }
 
 /// Parse `key=value` (a string) or `key:=json` (any JSON value).
@@ -992,7 +1447,7 @@ mod tests {
             "call",
             "--token",
             "T",
-            "--server",
+            "--upstream",
             "github",
             "--tool",
             "read_file",
@@ -1007,12 +1462,117 @@ mod tests {
         let Command::Call(c) = cli.command else {
             panic!("not call")
         };
-        assert_eq!(
-            (c.server.as_str(), c.tool.as_str()),
-            ("github", "read_file")
-        );
+        assert_eq!((c.upstream(), c.tool.as_str()), ("github", "read_file"));
         assert_eq!(c.args.len(), 2);
         assert_eq!(c.args[1].1, json!(2));
+    }
+
+    /// K-13: a subcommand's MCP upstream is `--upstream`; its old `--server` spelling still
+    /// works, is hidden from help and is warned about once, and the two cannot be combined.
+    #[test]
+    fn subcommand_server_is_a_deprecated_upstream() {
+        let cases: [(&[&str], &str); 5] = [
+            (&["call", "--tool", "t"], "call"),
+            (&["tools"], "tools"),
+            (&["authzen", "eval", "--tool", "t"], "authzen eval"),
+            (
+                &["policy", "evaluate", "--tool", "t", "--token", "x"],
+                "policy evaluate",
+            ),
+            (&["audit", "tail"], "audit tail"),
+        ];
+        let upstream_of = |cli: &Cli| -> Option<String> {
+            match &cli.command {
+                Command::Call(a) => Some(a.upstream().to_string()),
+                Command::Tools(a) => Some(a.upstream().to_string()),
+                Command::Policy(PolicyCmd::Evaluate(a)) => Some(a.upstream().to_string()),
+                Command::Audit(AuditCmd::Tail { filter, .. }) => filter.upstream.clone(),
+                Command::Authzen(AuthzenCmd::Eval { upstream, .. }) => Some(upstream.clone()),
+                _ => panic!("unexpected command"),
+            }
+        };
+        for (args, name) in cases {
+            let with = |flag: &str| {
+                let mut a = vec!["--server", "http://ob:9"];
+                a.extend_from_slice(args);
+                a.extend_from_slice(&[flag, "gh"]);
+                parse(&a)
+            };
+            let mut cli = with("--upstream").unwrap();
+            assert!(cli.resolve_deprecated().is_empty(), "{name}");
+            assert_eq!(upstream_of(&cli).as_deref(), Some("gh"), "{name}");
+            assert_eq!(cli.server, "http://ob:9", "{name}");
+
+            let mut cli = with("--server").unwrap();
+            assert_eq!(
+                cli.resolve_deprecated(),
+                vec![server_flag_warning(name)],
+                "{name}"
+            );
+            assert_eq!(upstream_of(&cli).as_deref(), Some("gh"), "{name}");
+            assert_eq!(cli.server, "http://ob:9", "{name}");
+            // Resolved once: a second pass has nothing left to warn about.
+            assert!(cli.resolve_deprecated().is_empty(), "{name}");
+
+            let mut both: Vec<&str> = args.to_vec();
+            both.extend_from_slice(&["--upstream", "a", "--server", "b"]);
+            assert!(parse(&both).is_err(), "{name}: both flags must conflict");
+        }
+        assert!(server_flag_warning("call").starts_with("warning: `call --server` is deprecated"));
+        assert!(!server_flag_warning("call").contains('\n'));
+        // `call` and `tools` still need one of the two.
+        assert!(parse(&["call", "--tool", "t"]).is_err());
+        assert!(parse(&["tools"]).is_err());
+
+        // Hidden from help; `--upstream` is shown.
+        use clap::CommandFactory;
+        let mut cmd = Cli::command();
+        for path in [
+            &["call"][..],
+            &["tools"],
+            &["authzen", "eval"],
+            &["policy", "evaluate"],
+            &["audit", "tail"],
+        ] {
+            let mut sub = &mut cmd;
+            for p in path {
+                sub = sub.find_subcommand_mut(p).unwrap();
+            }
+            let help = sub.render_long_help().to_string();
+            assert!(help.contains("--upstream"), "{path:?}: {help}");
+            assert!(!help.contains("--server <"), "{path:?}: {help}");
+        }
+    }
+
+    #[test]
+    fn authzen_search_flags() {
+        let cli = parse(&["authzen", "search", "--arg", "repo=a/b", "--limit", "5"]).unwrap();
+        match cli.command {
+            Command::Authzen(AuthzenCmd::Search {
+                upstream,
+                args,
+                limit,
+                page_token,
+                all,
+                ..
+            }) => {
+                assert_eq!(upstream, "github");
+                assert_eq!(args, vec![("repo".to_string(), json!("a/b"))]);
+                assert_eq!((limit, page_token, all), (Some(5), None, false));
+            }
+            _ => panic!("not authzen search"),
+        }
+        assert!(parse(&["authzen", "search", "--limit", "0"]).is_err());
+        assert!(parse(&["authzen", "search", "--all", "--page-token", "t"]).is_err());
+        assert!(parse(&[
+            "authzen",
+            "search",
+            "--page-token",
+            "t",
+            "--token-file",
+            "/t"
+        ])
+        .is_ok());
     }
 
     #[test]
@@ -1054,6 +1614,96 @@ mod tests {
         };
         assert_eq!(e.client_secret.as_deref(), Some("s3cret"));
         assert!(parse(&["token", "exchange", "--subject-token", "J", "--actor", "c"]).is_err());
+    }
+
+    /// `--subject-token-type` picks the URN; `jwt` (an exchange from hop n) is the default.
+    #[test]
+    fn exchange_subject_token_type_sets_the_urn() {
+        let ex = |extra: &[&str]| {
+            let mut a = vec!["token", "exchange", "--actor", "planner", "--cap", "g:t"];
+            a.extend_from_slice(extra);
+            match parse(&a).map(|c| c.command) {
+                Ok(Command::Token(TokenCmd::Exchange(e))) => Ok(e),
+                Ok(_) => panic!("not exchange"),
+                Err(e) => Err(e),
+            }
+        };
+        let e = ex(&[]).unwrap();
+        assert_eq!(e.subject_token_type, SubjectTokenType::Jwt);
+        assert_eq!(
+            e.subject_token_type.urn(),
+            "urn:ietf:params:oauth:token-type:jwt"
+        );
+        assert!(!e.subject_token_type.is_hop0());
+        for (flag, urn) in [
+            ("jwt", "urn:ietf:params:oauth:token-type:jwt"),
+            ("id-token", "urn:ietf:params:oauth:token-type:id_token"),
+            ("id-jag", "urn:ietf:params:oauth:token-type:id-jag"),
+        ] {
+            let e = ex(&["--subject-token-type", flag]).unwrap();
+            assert_eq!(e.subject_token_type.urn(), urn);
+            assert_eq!(e.subject_token_type.is_hop0(), flag != "jwt");
+            e.check_hop0().unwrap();
+        }
+        for bad in ["id_token", "jag", ""] {
+            assert!(ex(&["--subject-token-type", bad]).is_err(), "{bad:?}");
+        }
+        // The subject token's sources, the agent's authentication and the rest of the request
+        // are the same flags as for an exchange from hop n.
+        let e = ex(&[
+            "--subject-token-type",
+            "id-token",
+            "--subject-token-file",
+            "/run/id",
+            "--client-secret-stdin",
+            "--no-delegation",
+            "--ttl-seconds",
+            "60",
+            "--dpop-key",
+            "/k",
+        ])
+        .unwrap();
+        e.check_hop0().unwrap();
+        assert!(e.subject_token_file.is_some() && e.client_secret_stdin && e.no_delegation);
+    }
+
+    /// At hop 0 there is no parent token: the parent's sign-off flags are refused (the server
+    /// would ignore them), and a client assertion needs its audience given, since the IdP
+    /// credential's `iss` is not the server's.
+    #[test]
+    fn hop0_refuses_what_only_an_exchange_from_hop_n_uses() {
+        let ex = |extra: &[&str]| {
+            let mut a = vec!["token", "exchange", "--actor", "planner", "--cap", "g:t"];
+            a.extend_from_slice(extra);
+            let Command::Token(TokenCmd::Exchange(e)) = parse(&a).unwrap().command else {
+                panic!("not exchange")
+            };
+            e
+        };
+        for ty in ["id-token", "id-jag"] {
+            for extra in [
+                ["--subject-token-dpop-file", "/s"].as_slice(),
+                ["--dpop-key", "/k", "--subject-dpop-key", "/p"].as_slice(),
+                ["--client-key", "/c"].as_slice(),
+            ] {
+                let mut a = vec!["--subject-token-type", ty];
+                a.extend_from_slice(extra);
+                let err = ex(&a).check_hop0().unwrap_err().to_string();
+                assert!(err.contains(ty), "{err}");
+                // The same flags at hop n are fine (the server checks them).
+                ex(extra).check_hop0().unwrap();
+            }
+            ex(&[
+                "--subject-token-type",
+                ty,
+                "--client-key",
+                "/c",
+                "--client-assertion-audience",
+                "https://attenuo.example",
+            ])
+            .check_hop0()
+            .unwrap();
+        }
     }
 
     #[test]
@@ -1126,10 +1776,51 @@ mod tests {
             ["--client-secret", "s", "--client-secret-stdin"].as_slice(),
             ["--client-secret", "s", "--client-secret-file", "/x"].as_slice(),
             ["--client-secret-stdin", "--client-secret-file", "/x"].as_slice(),
+            ["--client-key", "/k", "--client-secret", "s"].as_slice(),
+            ["--client-key", "/k", "--client-secret-stdin"].as_slice(),
+            ["--client-key", "/k", "--client-secret-file", "/x"].as_slice(),
+            ["--client-assertion-audience", "https://a"].as_slice(),
         ] {
             let mut a = both.to_vec();
             a.extend_from_slice(extra);
             assert!(parse(&a).is_err(), "{extra:?}");
+        }
+        let mut a = both.to_vec();
+        a.extend_from_slice(&[
+            "--client-key",
+            "/k",
+            "--client-assertion-audience",
+            "https://a",
+        ]);
+        let Command::Token(TokenCmd::Exchange(e)) = parse(&a).unwrap().command else {
+            panic!()
+        };
+        assert_eq!(e.client_key.as_deref(), Some(std::path::Path::new("/k")));
+        assert_eq!(e.client_assertion_audience.as_deref(), Some("https://a"));
+    }
+
+    /// `key gen` makes exactly one kind of key; `--kid` is for client keys.
+    #[test]
+    fn key_gen_takes_dpop_or_client() {
+        let Command::Key(KeyCmd::Gen { client, kid, dpop }) =
+            parse(&["key", "gen", "--client", "/c", "--kid", "k1"])
+                .unwrap()
+                .command
+        else {
+            panic!()
+        };
+        assert_eq!(
+            (client.is_some(), kid.as_deref(), dpop),
+            (true, Some("k1"), None)
+        );
+        assert!(parse(&["key", "gen", "--dpop", "/d"]).is_ok());
+        for bad in [
+            &["key", "gen"][..],
+            &["key", "gen", "--dpop", "/d", "--client", "/c"],
+            &["key", "gen", "--dpop", "/d", "--kid", "k1"],
+            &["key", "gen", "--client", "/c", "--kid", ""],
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?}");
         }
     }
 
@@ -1139,7 +1830,7 @@ mod tests {
     #[test]
     fn delegation_tokens_from_stdin_or_a_file() {
         let call = |extra: &[&str]| {
-            let mut a = vec!["call", "--server", "github", "--tool", "t"];
+            let mut a = vec!["call", "--upstream", "github", "--tool", "t"];
             a.extend_from_slice(extra);
             parse(&a).map(|c| match c.command {
                 Command::Call(c) => c.token,
@@ -1154,7 +1845,7 @@ mod tests {
         assert!(t.token.is_none() && t.token_file.is_none());
         assert!(call(&["--token", "x", "--token-file", "/run/t"]).is_err());
         for cmd in [
-            ["tools", "--server", "github", "--token-file", "/t"].as_slice(),
+            ["tools", "--upstream", "github", "--token-file", "/t"].as_slice(),
             ["authzen", "eval", "--tool", "t", "--token-file", "/t"].as_slice(),
         ] {
             assert!(parse(cmd).is_ok(), "{cmd:?}");
@@ -1331,6 +2022,33 @@ mod tests {
         assert_eq!(caps[0], json!({"server": "github", "tool": "read_file"}));
         assert_eq!(caps[1]["constraints"]["repo"]["op"], "prefix");
         assert!(parse_caps(&["nocolon".into()]).is_err());
+        // A repository prefix is not taken for a file path.
+        assert!(cap_warnings(&caps).is_empty());
+        // `path_prefix` passes through; a malformed one is refused before the request, and a
+        // `prefix` on a path argument gets a warning.
+        let paths = parse_caps(&[
+            r#"{"server":"fs","tool":"read_file","constraints":{"path":{"op":"path_prefix","value":"/workspace/"}}}"#.into(),
+            r#"{"server":"fs","tool":"write_file","constraints":{"path":{"op":"prefix","value":"/workspace/"}}}"#.into(),
+        ])
+        .unwrap();
+        assert_eq!(paths[0]["constraints"]["path"]["op"], "path_prefix");
+        assert_eq!(paths[0]["constraints"]["path"]["value"], "/workspace/");
+        let warnings = cap_warnings(&paths);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].starts_with("fs:write_file argument \"path\""),
+            "{warnings:?}"
+        );
+        assert!(warnings[0].contains("use `path_prefix`"), "{warnings:?}");
+        let bad = parse_caps(&[
+            r#"{"server":"fs","tool":"read_file","constraints":{"path":{"op":"path_prefix","value":"/workspace/../etc"}}}"#.into(),
+        ])
+        .unwrap_err();
+        assert!(
+            bad.to_string()
+                .contains("a path_prefix constraint's path holds a `.` or `..` segment"),
+            "{bad}"
+        );
         assert!(parse_caps(&["github:".into()]).is_err());
         assert!(parse_caps(&[r#"{"server":1}"#.into()]).is_err());
         // A `range` constraint passes through; a malformed one is refused before the request.
@@ -1387,6 +2105,7 @@ mod tests {
         let cli = parse(&["audit", "tail", "-n", "5", "-f", "--json"]).unwrap();
         assert!(cli.json);
         assert_eq!(cli.server, DEFAULT_SERVER);
+        assert_eq!(cli.admin_server, None);
         let Command::Audit(AuditCmd::Tail { lines, follow, .. }) = cli.command else {
             panic!("not tail")
         };
@@ -1412,6 +2131,7 @@ mod tests {
         assert_eq!(state.as_deref(), Some("pending"));
         assert!(parse(&["approval", "list", "--state", "maybe"]).is_err());
         assert!(parse(&["approval", "list", "--limit", "0"]).is_err());
+        assert!(parse(&["approval", "list", "--cursor", "c", "--all"]).is_err());
         assert!(parse(&["approval", "show", "A"]).is_ok());
         assert!(parse(&["approval", "grant", "A"]).is_ok());
         assert!(parse(&["approval", "decline", "A"]).is_ok());
@@ -1530,7 +2250,7 @@ mod tests {
             "coder",
             "--lease",
             "L 1",
-            "--server",
+            "--upstream",
             "github",
             "--tool",
             "read_file",
@@ -1568,17 +2288,22 @@ mod tests {
         assert_eq!(before, Some(40));
         assert!(tail(&["--before", "0"]).is_err());
         assert!(tail(&["--before", "40", "--follow"]).is_err());
-        // The upstream `--server` filter lives after the subcommand; the global one before it.
+        // The upstream filter is `--upstream` after the subcommand; `--server` before it is the
+        // attenuo server URL.
         let cli = parse(&[
             "--server",
             "http://ob:9",
             "audit",
             "tail",
-            "--server",
+            "--upstream",
             "github",
         ])
         .unwrap();
         assert_eq!(cli.server, "http://ob:9");
+        let Command::Audit(AuditCmd::Tail { filter, .. }) = cli.command else {
+            panic!("not tail")
+        };
+        assert_eq!(filter.query(), "&server=github");
     }
 
     #[test]
@@ -1605,17 +2330,18 @@ mod tests {
             let mut a = vec!["audit", "checkpoints"];
             a.extend_from_slice(extra);
             parse(&a).map(|c| match c.command {
-                Command::Audit(AuditCmd::Checkpoints { before, limit }) => (before, limit),
+                Command::Audit(AuditCmd::Checkpoints { cursor, limit }) => (cursor, limit),
                 _ => panic!("not checkpoints"),
             })
         };
         assert_eq!(cps(&[]).unwrap(), (None, None));
         assert_eq!(
-            cps(&["--before", "9", "--limit", "3"]).unwrap(),
-            (Some(9), Some(3))
+            cps(&["--cursor", "AQIC", "--limit", "3"]).unwrap(),
+            (Some("AQIC".to_string()), Some(3))
         );
-        assert!(cps(&["--before", "0"]).is_err());
+        assert!(cps(&["--before", "9"]).is_err(), "removed: use --cursor");
         assert!(cps(&["--limit", "0"]).is_err());
+        assert!(cps(&["--limit", "1001"]).is_err());
     }
 
     #[test]
@@ -1720,7 +2446,7 @@ mod tests {
             let mut a = vec![
                 "policy",
                 "evaluate",
-                "--server",
+                "--upstream",
                 "github",
                 "--tool",
                 "read_file",
@@ -1733,7 +2459,7 @@ mod tests {
         };
         let e = eval(&["--token", "-", "--arg", "repo=a/b", "--arg", "n:=1"]).unwrap();
         assert_eq!(e.token.as_deref(), Some("-"));
-        assert_eq!((e.server.as_str(), e.args.len()), ("github", 2));
+        assert_eq!((e.upstream(), e.args.len()), ("github", 2));
         let e = eval(&["--chain-file", "c.json"]).unwrap();
         assert!(e.chain_file.is_some() && e.token.is_none());
         assert!(eval(&["--token-file", "/t"]).unwrap().token_file.is_some());
@@ -1744,5 +2470,74 @@ mod tests {
             parse(&["policy", "evaluate", "--tool", "t"]).is_err(),
             "--server required"
         );
+    }
+
+    #[test]
+    fn operator_new_takes_one_expiry() {
+        let new = |extra: &[&str]| {
+            let mut a = vec![
+                "admin", "operator", "new", "--name", "a", "--role", "viewer",
+            ];
+            a.extend_from_slice(extra);
+            parse(&a).map(|c| match c.command {
+                Command::Admin(AdminCmd::Operator(OperatorCmd::New {
+                    expires_in,
+                    expires_at,
+                    ..
+                })) => (expires_in, expires_at),
+                _ => panic!("not operator new"),
+            })
+        };
+        assert_eq!(new(&[]).unwrap(), (None, None));
+        assert_eq!(
+            new(&["--expires-in", "90d"]).unwrap().0,
+            Some(time::Duration::days(90))
+        );
+        let at = new(&["--expires-at", "2999-01-01T00:00:00+02:00"])
+            .unwrap()
+            .1
+            .unwrap();
+        assert_eq!(at.offset().whole_hours(), 2);
+        assert!(new(&["--expires-in", "1h", "--expires-at", "2999-01-01T00:00:00Z"]).is_err());
+        assert!(
+            new(&["--expires-at", "2020-01-01T00:00:00Z"]).is_err(),
+            "past"
+        );
+        assert!(
+            new(&["--expires-at", "2999-01-01T00:00:00"]).is_err(),
+            "no offset"
+        );
+        assert!(parse(&["admin", "operator", "reload"]).is_ok());
+    }
+
+    #[test]
+    fn expires_in_is_a_number_and_a_unit() {
+        for (s, secs) in [
+            ("1s", 1),
+            ("30m", 1800),
+            ("12h", 43_200),
+            ("90d", 7_776_000),
+            ("3650d", 315_360_000),
+        ] {
+            assert_eq!(parse_expires_in(s).unwrap().whole_seconds(), secs, "{s}");
+        }
+        for bad in [
+            "",
+            "d",
+            "0s",
+            "1",
+            "1w",
+            "1.5h",
+            "-1d",
+            "+1d",
+            " 1d",
+            "1 d",
+            "1D",
+            "3651d",
+            "99999999999999999999d",
+            "1dé",
+        ] {
+            assert!(parse_expires_in(bad).is_err(), "{bad:?}");
+        }
     }
 }

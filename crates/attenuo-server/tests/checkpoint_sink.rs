@@ -188,7 +188,7 @@ async fn webhook_sink_ships_each_checkpoint_with_retries_sr21() {
     assert_eq!(
         body,
         json!({"ready": true, "degraded": false,
-               "checks": {"audit": "ok", "leases": "ok", "checkpoint_sink": "ok"}})
+               "checks": {"audit": "ok", "audit_append": "ok", "leases": "ok", "checkpoint_sink": "ok"}})
     );
     let metrics = h.state.metrics.render();
     assert!(
@@ -252,7 +252,7 @@ async fn a_failing_sink_degrades_readyz_and_counts_drops_sr21() {
     assert_eq!(
         body,
         json!({"ready": false, "degraded": true,
-               "checks": {"audit": "ok", "leases": "ok", "checkpoint_sink": "degraded"}})
+               "checks": {"audit": "ok", "audit_append": "ok", "leases": "ok", "checkpoint_sink": "degraded"}})
     );
 }
 
@@ -307,16 +307,33 @@ async fn s3_sink_puts_sigv4_signed_objects_sr21() {
     );
     let payload_hash = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&body));
     assert_eq!(headers["x-amz-content-sha256"], payload_hash.as_str());
+    // The checksum an Object Lock bucket with a retention period requires: the algorithm and
+    // the standard base64 of the body's SHA-256.
+    {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD
+            .encode(<sha2::Sha256 as sha2::Digest>::digest(&body));
+        assert_eq!(headers["x-amz-checksum-sha256"], b64.as_str());
+        assert_eq!(headers["x-amz-sdk-checksum-algorithm"], "SHA256");
+    }
     // Recompute the signature from what arrived: the server signed exactly these headers.
     let h_ = |n: &str| headers[n].to_str().unwrap().to_string();
     let signed = vec![
         ("content-type".to_string(), h_("content-type")),
         ("host".to_string(), h_("host")),
         (
+            "x-amz-checksum-sha256".to_string(),
+            h_("x-amz-checksum-sha256"),
+        ),
+        (
             "x-amz-content-sha256".to_string(),
             h_("x-amz-content-sha256"),
         ),
         ("x-amz-date".to_string(), h_("x-amz-date")),
+        (
+            "x-amz-sdk-checksum-algorithm".to_string(),
+            h_("x-amz-sdk-checksum-algorithm"),
+        ),
     ];
     let creds = attenuo_server::sink::S3Credentials {
         access_key_id: "AKIDTEST".into(),
@@ -336,7 +353,7 @@ async fn s3_sink_puts_sigv4_signed_objects_sr21() {
     });
     assert_eq!(h_("authorization"), expected);
     assert!(expected.starts_with("AWS4-HMAC-SHA256 Credential=AKIDTEST/"));
-    assert!(expected.contains("/eu-west-1/s3/aws4_request, SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date, "));
+    assert!(expected.contains("/eu-west-1/s3/aws4_request, SignedHeaders=content-type;host;x-amz-checksum-sha256;x-amz-content-sha256;x-amz-date;x-amz-sdk-checksum-algorithm, "));
 }
 
 #[test]

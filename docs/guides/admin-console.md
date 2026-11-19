@@ -19,7 +19,7 @@ Restart the server. The log says `admin console listening at /admin/ui/`, and `h
 
 The server refuses to start when `listen` is not a loopback address, unless you also set `allow_public = true`, and then `[admin] token` must pass the strength check a public listener needs. Keep it on loopback. All keys are in [the configuration reference](../reference/config.md#adminui).
 
-The listener needs `[admin] token` set. Without one, every admin route answers 403 and the login screen says the admin API is disabled.
+The listener needs an admin credential: `[admin] token` or an `[[admin.operators]]` entry. Without one, every admin route answers 403 and the login screen says the admin API is disabled.
 
 ## Reach it from your laptop
 
@@ -33,7 +33,7 @@ Then open `http://127.0.0.1:9101/` on your laptop. The page and the API it calls
 
 ## Log in
 
-The login screen asks for the admin token (the value of `[admin] token`). The console checks it with a one-entry read of the audit log and keeps it only if the server accepts it.
+The login screen asks for an admin token: the value of `[admin] token`, or an operator's token from `attenuo admin operator new` ([admin operators](deploying.md#admin-operators)). The console checks it with `GET /admin/whoami` and keeps it only if the server accepts it. The header then shows the operator's name and role (`alice · operator`; `admin · admin` for `[admin] token`), followed by `expires <date>` when the token has an `expires_at` (an expired token is refused at login with "That token has expired."), and the buttons the role cannot use are disabled: revoking and deciding approvals need `operator`, reloading the policy needs `admin`. The server checks the role on every request either way; a disabled button only saves a refused request.
 
 The token stays in the memory of that browser tab. It is not written to `localStorage`, `sessionStorage`, a cookie or the URL. It is forgotten when you:
 
@@ -54,7 +54,7 @@ The log, newest first, 100 entries a page: seq, local time (hover for UTC), kind
 - **Older**, **Newer**, **Newest** page through the log. A filtered page can come back shorter than 100 entries; the server stops reading after 50,000 entries per request, and the console keeps asking until it has a page or reaches the end.
 - **Follow** checks every 2 seconds whether the log grew and adds new entries at the top. It reads the head only; it never signs a checkpoint.
 - A chain id narrows the view to that chain. A lease id opens its lease tree. A seq opens the decision.
-- **Export this range** downloads the entries between the oldest and newest seq on screen, unfiltered, with the checkpoints in that range, as `attenuo-audit-{from}-{to}.ndjson`. Check it offline with `attenuo audit verify --file`.
+- **Export this range** downloads the entries between the oldest and newest seq on screen, unfiltered, with the checkpoints in that range, as `attenuo-audit-{from}-{to}.ndjson`. Check it offline with `attenuo audit verify --file`. That check refuses entries newer than the last checkpoint in the file (exit 2), so press **Sign head now** on the Verify page before exporting, or pass `--allow-unsigned-tail` to accept them as covered by the hash chain only.
 
 ### Decision
 
@@ -75,6 +75,8 @@ What it cannot show: the tool arguments and the capabilities each hop held. The 
 `#/lease/<id>` shows the leases the lease was delegated from (root first), and the lease with everything delegated from it as an indented tree: lease id, agent, expiry, state (with revocation reason and time), and the seq of the record that issued it. **renewals** lists the renewals of one lease. **Revoke…** opens a confirmation (below).
 
 **Run limits** lists the limits each hop of the chain was issued with, root first down to this lease: the capability, the kind (`calls`, `sum`, `calls_per`, `distinct`), the argument (`url#host` when a limit counts URL hosts), what is used now, the maximum and what is left. For `calls_per` the used figure is the most calls any one value has had, with the number of values seen. Every call is charged to every hop it passes through, so the smallest figure left along the chain is what this lease can still spend. On a run's root lease, **Run usage** shows the run's calls, amount and number of destinations per destructive tool (`context.usage`). Each node of the tree also shows its limits on one line as `kind used/max`. The figures are what the counters hold when the page loads; reload for fresh ones. A hop issued by a server older than this console has counters but no recorded maximum, shown as "not recorded".
+
+**User windows** shows the per-user windows ([run limits phase 3](../design/run-limits-phase3.md)) of the run's originating user for the tools this run used: the tool, the window kind (`hour` or `day`), the window's start in UTC, and the calls and amount that every run of that user (the same issuer and subject) was allowed in the current window, as policies read them in `context.usage.user_window`. Only kinds a loaded policy reads are listed. The panel is absent when there is nothing to show (no window policy, or no run usage yet). A run issued before the server kept the user's issuer says "Not recorded"; the server does not guess an issuer for it. The panel is read only: nothing on the console resets or changes a window, and a refund is an admin API action.
 
 ### Approvals
 
@@ -113,7 +115,7 @@ One action writes even when `allow_write` is off, because it changes no lease, p
 ## Security model
 
 - **Separate listener.** The main listener also serves `/mcp/{server}`, where an upstream MCP server chooses the response type. If the console shared that origin, a hostile upstream could answer with HTML and run script next to the admin token. The console's own listener serves only the console files and the admin API. The files are compiled into the server: the page, its stylesheet and scripts, and the brand favicon (`assets/brand/favicon.svg`, served as `image/svg+xml` under `/admin/ui/` and at `/favicon.svg`, with the same headers as the other files).
-- **Same token as the CLI.** The console has no accounts or sessions of its own. Anyone with the admin token can do with `curl` everything the console can.
+- **Same token as the CLI.** The console has no accounts or sessions of its own. Anyone with an admin token can do with `curl` everything the console can with it, and no more: the role is checked by the server.
 - **No dev mint.** `POST /admin/root-token` is never mounted on the console listener, whatever `[dev] allow_root_mint` says.
 - **Strict page policy.** Every response carries a Content-Security-Policy that allows only the console's own scripts, styles and requests, no inline script, no framing and no form posts, and turns on Trusted Types. The console builds every element as text; it never turns a string into HTML. A test in the server scans the embedded files for HTML-parsing calls, `eval`, `javascript:` URLs, inline handlers and inline scripts or styles, and fails the build if one appears. So a tool name such as `<img src=x onerror=alert(1)>` in the log shows up as those characters.
 - **No cross-site requests.** No CORS header is ever sent, so another site's page cannot read admin answers. Every `POST` must say `Content-Type: application/json`, which a cross-site form cannot send without a CORS preflight the listener never grants.
@@ -122,8 +124,8 @@ One action writes even when `allow_write` is off, because it changes no lease, p
 
 ## Limits
 
-- One shared admin token, no per-user accounts or roles, and no record of which person used the console. Admin actions are audited as `urn:attenuo:admin`.
+- Operators log in with bearer tokens, not with an identity provider; there are no sessions, no expiry and no second factor. Admin actions are audited as the operator (`urn:attenuo:admin:<name>`), or as `urn:attenuo:admin` for the shared `[admin] token`. Reads are not audited.
 - The decision view shows lease states and policy text as they are now, not as they were when the decision was made.
-- The lease page shows run-limit counters as they are now. Refunding a charge is not a console action; use `POST /admin/budgets/refund` on the admin API.
+- The lease page shows run-limit counters and the user's windows as they are now. Refunding a charge is not a console action; use `POST /admin/budgets/refund` on the admin API.
 - Readiness (`/readyz`) is served on the main listener only; the Verify page says so instead of showing it.
 - The console is tested in current Chromium. Other browsers are untested.

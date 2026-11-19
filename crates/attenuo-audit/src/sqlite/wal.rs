@@ -54,7 +54,7 @@ thread_local! {
 /// background checkpointer holding SQLite's checkpoint lock most of the time under load,
 /// would nearly always return busy and copy nothing).
 pub(super) fn note_wal_pages(
-    _: &rusqlite::hooks::Wal,
+    _: &mut rusqlite::hooks::Wal,
     pages: std::ffi::c_int,
 ) -> rusqlite::Result<()> {
     WAL_PAGES.with(|p| p.set(pages));

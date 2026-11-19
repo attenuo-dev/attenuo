@@ -28,7 +28,7 @@ Nothing was built or run. Behaviour that only a running server shows (timings, t
 
 ## Summary
 
-| Document | Claims checked (about) | Mismatches | Fixed in docs | Open for the lead |
+| Document | Claims checked (about) | Mismatches | Fixed in docs | Open for the maintainer |
 | --- | --- | --- | --- | --- |
 | `reference/config.md` | 75 | 14 | 13 | 1 |
 | `config/example.toml` | 60 | 3 | 3 | 0 |

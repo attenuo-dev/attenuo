@@ -56,7 +56,37 @@ pub fn is_passthrough_method(method: &str) -> bool {
     PASSTHROUGH_METHODS.contains(&method) || method.starts_with("notifications/")
 }
 
-/// Build a JSON-RPC error response.
+/// Build one of the proxy's own JSON-RPC errors: `data.code` is `code`, the stable code of
+/// the answer (an entry of [`attenuo_core::error_codes::ERROR_CODES`] with this `number`,
+/// checked in debug builds), next to the members of `data`. Where `data` has a `reason`, it is
+/// the same string as `code`. An upstream's own errors are relayed unchanged and never get a
+/// `data.code`.
+pub fn attenuo_error(
+    id: Value,
+    number: i64,
+    code: &str,
+    message: impl Into<String>,
+    data: Option<Value>,
+) -> Value {
+    debug_assert!(
+        attenuo_core::error_codes::is_jsonrpc(code, number),
+        "code `{code}` with JSON-RPC number {number} is not in ERROR_CODES"
+    );
+    let mut data = match data {
+        Some(Value::Object(m)) => Value::Object(m),
+        _ => json!({}),
+    };
+    debug_assert!(
+        data.get("reason").is_none_or(|r| r == code),
+        "data.reason {:?} differs from code `{code}`",
+        data.get("reason")
+    );
+    data["code"] = Value::String(code.to_string());
+    error_response(id, number, message, Some(data))
+}
+
+/// Build a JSON-RPC error response as it is, without a `data.code` (for an upstream's or a
+/// test upstream's error). The proxy's own errors use [`attenuo_error`].
 pub fn error_response(
     id: Value,
     code: i64,
@@ -93,9 +123,10 @@ pub fn denied_response_with(
     if let Some(u) = untrusted_args {
         data["untrusted_args"] = u.clone();
     }
-    error_response(
+    attenuo_error(
         id,
         CODE_DENIED,
+        reason,
         format!("attenuo: denied: {reason}"),
         Some(data),
     )
@@ -134,7 +165,13 @@ pub fn approval_required_response(
         ),
         None => "attenuo: approval required".to_string(),
     };
-    error_response(id, CODE_APPROVAL_REQUIRED, message, Some(data))
+    attenuo_error(
+        id,
+        CODE_APPROVAL_REQUIRED,
+        crate::auth::REASON_APPROVAL_REQUIRED,
+        message,
+        Some(data),
+    )
 }
 
 /// Add the run's usage of a destructive tool (run-limits design section 3.5) to the `data` of
@@ -168,9 +205,144 @@ pub fn is_request(msg: &Value) -> bool {
     matches!(msg.get("id"), Some(v) if !v.is_null())
 }
 
+/// Member names of a JSON-RPC message that the proxy reads.
+const ENVELOPE_MEMBERS: &[&str] = &["jsonrpc", "id", "method", "params", "result", "error"];
+/// Member names of `params` that the proxy reads.
+const PARAMS_MEMBERS: &[&str] = &["name", "arguments", "uri", "_meta"];
+
+/// A member name with case folded: two names with one key are one member to a decoder that
+/// matches names without regard to case. Go's `encoding/json` joins two names that are equal
+/// rune by rune under Unicode simple case folding (`ſ` with `s`, the Kelvin sign with `k`,
+/// `ẞ` with `ß`); lower, upper, then lower case gives each such pair one key (SR-137: upper
+/// then lower case alone gave `ẞ` and `ß` two keys). `ß` and `ss` also give one key, which
+/// can only refuse more.
+fn fold_name(name: &str) -> String {
+    name.to_lowercase().to_uppercase().to_lowercase()
+}
+
+/// Why `msg` can be read as another message by a decoder that matches member names without
+/// regard to case (Go's `encoding/json`, which takes the last of the names that match a field
+/// and also matches a name that differs from the field's only in case) (SR-133): an object
+/// anywhere in it with two member names that differ only in case, or, in the message or its
+/// `params`, a member name that is one the proxy reads ([`ENVELOPE_MEMBERS`],
+/// [`PARAMS_MEMBERS`]) in another case, such as `Method`. `None` when there is none.
+pub(crate) fn member_case_conflict(msg: &Value) -> Option<&'static str> {
+    fn variant_of(obj: &serde_json::Map<String, Value>, names: &[&str]) -> bool {
+        obj.keys()
+            .any(|k| !names.contains(&k.as_str()) && names.iter().any(|n| fold_name(k) == *n))
+    }
+    fn folded_twice(v: &Value) -> bool {
+        match v {
+            Value::Object(obj) => {
+                let mut seen = std::collections::HashSet::with_capacity(obj.len());
+                obj.keys().any(|k| !seen.insert(fold_name(k))) || obj.values().any(folded_twice)
+            }
+            Value::Array(items) => items.iter().any(folded_twice),
+            _ => false,
+        }
+    }
+    if let Some(obj) = msg.as_object() {
+        if variant_of(obj, ENVELOPE_MEMBERS) {
+            return Some("a member name of the message differs from a JSON-RPC name only in case");
+        }
+        if let Some(params) = obj.get("params").and_then(Value::as_object) {
+            if variant_of(params, PARAMS_MEMBERS) {
+                return Some("a member name of params differs from an MCP name only in case");
+            }
+        }
+    }
+    folded_twice(msg).then_some("two member names of an object differ only in case")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn member_names_that_differ_only_in_case_are_found_sr133() {
+        for ok in [
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                   "params": {"name": "read_file", "arguments": {"path": "/a", "mode": "r"}}}),
+            json!({"jsonrpc": "2.0", "id": 1, "result": {"tools": [{"name": "a"}, {"name": "b"}]}}),
+            // An argument named like a member the proxy reads is only an argument.
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                   "params": {"name": "x", "arguments": {"Method": "a", "NAME": "b"}}}),
+        ] {
+            assert_eq!(member_case_conflict(&ok), None, "{ok}");
+        }
+        for bad in [
+            json!({"jsonrpc": "2.0", "id": 1, "method": "ping", "Method": "tools/call"}),
+            json!({"jsonrpc": "2.0", "id": 1, "METHOD": "tools/call", "params": {"name": "x"}}),
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                   "params": {"name": "read_file", "Name": "delete_repo"}}),
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                   "params": {"Name": "delete_repo", "arguments": {}}}),
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                   "params": {"name": "x", "arguments": {"path": "/a", "Path": "/b"}}}),
+            // Go folds the long s to `s` and the Kelvin sign to `k`.
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                   "params": {"name": "x", "arguments": {"ask": "a", "a\u{17f}k": "b"}}}),
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                   "params": {"name": "x", "arguments": {"key": "a", "\u{212a}ey": "b"}}}),
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                   "params": {"name": "x", "arguments": {"l": [{"a": 1, "A": 2}]}}}),
+            // A JSON-RPC or MCP name with a rune Go folds onto an ASCII letter (pass 20).
+            json!({"j\u{17f}onrpc": "2.0", "id": 1, "method": "tools/call", "params": {}}),
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                   "params": {"name": "x", "argument\u{17f}": {"path": "/etc/passwd"}}}),
+            // Go joins `ß` and the capital sharp s (SR-137).
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                   "params": {"name": "x", "arguments": {"stra\u{df}e": "a", "stra\u{1e9e}e": "b"}}}),
+        ] {
+            assert!(member_case_conflict(&bad).is_some(), "{bad}");
+        }
+    }
+
+    /// K-8: the proxy's own errors carry `data.code`, equal to `data.reason` where that is
+    /// present; one without data gets `data: {"code": ...}`.
+    #[test]
+    fn attenuo_errors_carry_the_stable_code() {
+        let v = denied_response(json!(7), "policy_deny", Uuid::nil());
+        assert_eq!(v["error"]["data"]["code"], "policy_deny");
+        assert_eq!(v["error"]["data"]["reason"], "policy_deny");
+        let v = attenuo_error(
+            Value::Null,
+            CODE_UNKNOWN_SERVER,
+            "unknown_server",
+            "attenuo: unknown server `x`",
+            None,
+        );
+        assert_eq!(
+            v,
+            json!({"jsonrpc": "2.0", "id": null, "error": {"code": CODE_UNKNOWN_SERVER,
+                   "message": "attenuo: unknown server `x`", "data": {"code": "unknown_server"}}})
+        );
+        let v = approval_required_response(json!(1), Uuid::nil(), "h", None, None);
+        assert_eq!(v["error"]["data"]["code"], "approval_required");
+        // An upstream's error built as it is gets no code.
+        let v = error_response(json!(1), -32000, "upstream", None);
+        assert!(v["error"].get("data").is_none());
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "is not in ERROR_CODES")]
+    fn an_unlisted_code_panics_in_debug_builds() {
+        attenuo_error(Value::Null, CODE_DENIED, "no_such_code", "x", None);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "differs from code")]
+    fn a_reason_other_than_the_code_panics_in_debug_builds() {
+        attenuo_error(
+            Value::Null,
+            CODE_DENIED,
+            "policy_deny",
+            "x",
+            Some(json!({"reason": "capability_denied"})),
+        );
+    }
 
     #[test]
     fn denied_response_shape() {

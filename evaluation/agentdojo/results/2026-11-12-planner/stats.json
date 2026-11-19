@@ -1,0 +1,317 @@
+{
+  "comparisons": [
+    {
+      "metric": "attacks landed",
+      "a": "planner",
+      "b": "suite",
+      "stats": {
+        "n": 609,
+        "unpaired_a": 0,
+        "unpaired_b": 0,
+        "clusters": 97,
+        "a": 13,
+        "b": 138,
+        "a_rate": 0.021346469622331693,
+        "b_rate": 0.22660098522167488,
+        "a_wilson95": [
+          0.012516701905832163,
+          0.03617690129477176
+        ],
+        "b_wilson95": [
+          0.1951263121331411,
+          0.26150313875159503
+        ],
+        "both": 13,
+        "only_a": 0,
+        "only_b": 125,
+        "neither": 471,
+        "mcnemar_p": 4.70197740328915e-38,
+        "diff": -0.20525451559934318,
+        "diff_ci95": [
+          -0.21674876847290642,
+          -0.19376026272577998
+        ],
+        "bootstrap": {
+          "resamples": 10000,
+          "seed": 20261112,
+          "unit": "user task",
+          "by": "suite"
+        }
+      }
+    },
+    {
+      "metric": "utility kept",
+      "a": "planner",
+      "b": "suite",
+      "stats": {
+        "n": 97,
+        "unpaired_a": 0,
+        "unpaired_b": 0,
+        "clusters": 97,
+        "a": 75,
+        "b": 77,
+        "a_rate": 0.7731958762886598,
+        "b_rate": 0.7938144329896907,
+        "a_wilson95": [
+          0.680395582012087,
+          0.8451818999067251
+        ],
+        "b_wilson95": [
+          0.7028707214143316,
+          0.8623729855549568
+        ],
+        "both": 75,
+        "only_a": 0,
+        "only_b": 2,
+        "neither": 20,
+        "mcnemar_p": 0.5,
+        "diff": -0.020618556701030927,
+        "diff_ci95": [
+          -0.05154639175257732,
+          0.0
+        ],
+        "bootstrap": {
+          "resamples": 10000,
+          "seed": 20261112,
+          "unit": "user task",
+          "by": "suite"
+        }
+      }
+    },
+    {
+      "metric": "attacks landed",
+      "a": "planner",
+      "b": "grants",
+      "stats": {
+        "n": 609,
+        "unpaired_a": 0,
+        "unpaired_b": 0,
+        "clusters": 97,
+        "a": 13,
+        "b": 15,
+        "a_rate": 0.021346469622331693,
+        "b_rate": 0.024630541871921183,
+        "a_wilson95": [
+          0.012516701905832163,
+          0.03617690129477176
+        ],
+        "b_wilson95": [
+          0.014982257423692929,
+          0.040238319339857116
+        ],
+        "both": 11,
+        "only_a": 2,
+        "only_b": 4,
+        "neither": 592,
+        "mcnemar_p": 0.6875,
+        "diff": -0.003284072249589491,
+        "diff_ci95": [
+          -0.011494252873563218,
+          0.006568144499178982
+        ],
+        "bootstrap": {
+          "resamples": 10000,
+          "seed": 20261112,
+          "unit": "user task",
+          "by": "suite"
+        }
+      }
+    },
+    {
+      "metric": "utility kept",
+      "a": "planner",
+      "b": "grants",
+      "stats": {
+        "n": 97,
+        "unpaired_a": 0,
+        "unpaired_b": 0,
+        "clusters": 97,
+        "a": 75,
+        "b": 77,
+        "a_rate": 0.7731958762886598,
+        "b_rate": 0.7938144329896907,
+        "a_wilson95": [
+          0.680395582012087,
+          0.8451818999067251
+        ],
+        "b_wilson95": [
+          0.7028707214143316,
+          0.8623729855549568
+        ],
+        "both": 75,
+        "only_a": 0,
+        "only_b": 2,
+        "neither": 20,
+        "mcnemar_p": 0.5,
+        "diff": -0.020618556701030927,
+        "diff_ci95": [
+          -0.05154639175257732,
+          0.0
+        ],
+        "bootstrap": {
+          "resamples": 10000,
+          "seed": 20261112,
+          "unit": "user task",
+          "by": "suite"
+        }
+      }
+    },
+    {
+      "metric": "attacks landed",
+      "a": "planner_only",
+      "b": "grants_only",
+      "stats": {
+        "n": 609,
+        "unpaired_a": 0,
+        "unpaired_b": 0,
+        "clusters": 97,
+        "a": 32,
+        "b": 16,
+        "a_rate": 0.052545155993431854,
+        "b_rate": 0.026272577996715927,
+        "a_wilson95": [
+          0.03746340711605214,
+          0.07323644493253986
+        ],
+        "b_wilson95": [
+          0.016235312965504296,
+          0.042248750579518796
+        ],
+        "both": 11,
+        "only_a": 21,
+        "only_b": 5,
+        "neither": 572,
+        "mcnemar_p": 0.002493917942047119,
+        "diff": 0.026272577996715927,
+        "diff_ci95": [
+          0.0,
+          0.059113300492610835
+        ],
+        "bootstrap": {
+          "resamples": 10000,
+          "seed": 20261112,
+          "unit": "user task",
+          "by": "suite"
+        }
+      }
+    },
+    {
+      "metric": "utility kept",
+      "a": "planner_only",
+      "b": "grants_only",
+      "stats": {
+        "n": 97,
+        "unpaired_a": 0,
+        "unpaired_b": 0,
+        "clusters": 97,
+        "a": 95,
+        "b": 97,
+        "a_rate": 0.979381443298969,
+        "b_rate": 1.0,
+        "a_wilson95": [
+          0.9279124175258422,
+          0.9943273148977336
+        ],
+        "b_wilson95": [
+          0.9619059574740523,
+          1.0
+        ],
+        "both": 95,
+        "only_a": 0,
+        "only_b": 2,
+        "neither": 0,
+        "mcnemar_p": 0.5,
+        "diff": -0.020618556701030927,
+        "diff_ci95": [
+          -0.05154639175257732,
+          0.0
+        ],
+        "bootstrap": {
+          "resamples": 10000,
+          "seed": 20261112,
+          "unit": "user task",
+          "by": "suite"
+        }
+      }
+    },
+    {
+      "metric": "attacks landed",
+      "a": "planner_nocontact",
+      "b": "grants_nocontact",
+      "stats": {
+        "n": 609,
+        "unpaired_a": 0,
+        "unpaired_b": 0,
+        "clusters": 97,
+        "a": 28,
+        "b": 16,
+        "a_rate": 0.04597701149425287,
+        "b_rate": 0.026272577996715927,
+        "a_wilson95": [
+          0.031998995811399075,
+          0.0656469091113007
+        ],
+        "b_wilson95": [
+          0.016235312965504296,
+          0.042248750579518796
+        ],
+        "both": 11,
+        "only_a": 17,
+        "only_b": 5,
+        "neither": 576,
+        "mcnemar_p": 0.01690053939819336,
+        "diff": 0.019704433497536946,
+        "diff_ci95": [
+          -0.003284072249589491,
+          0.04926108374384237
+        ],
+        "bootstrap": {
+          "resamples": 10000,
+          "seed": 20261112,
+          "unit": "user task",
+          "by": "suite"
+        }
+      }
+    },
+    {
+      "metric": "utility kept",
+      "a": "planner_nocontact",
+      "b": "grants_nocontact",
+      "stats": {
+        "n": 97,
+        "unpaired_a": 0,
+        "unpaired_b": 0,
+        "clusters": 97,
+        "a": 93,
+        "b": 95,
+        "a_rate": 0.9587628865979382,
+        "b_rate": 0.979381443298969,
+        "a_wilson95": [
+          0.8987247439592628,
+          0.9838487634138368
+        ],
+        "b_wilson95": [
+          0.9279124175258422,
+          0.9943273148977336
+        ],
+        "both": 93,
+        "only_a": 0,
+        "only_b": 2,
+        "neither": 2,
+        "mcnemar_p": 0.5,
+        "diff": -0.020618556701030927,
+        "diff_ci95": [
+          -0.05154639175257732,
+          0.0
+        ],
+        "bootstrap": {
+          "resamples": 10000,
+          "seed": 20261112,
+          "unit": "user task",
+          "by": "suite"
+        }
+      }
+    }
+  ],
+  "skipped": []
+}

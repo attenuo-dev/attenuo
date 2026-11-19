@@ -17,11 +17,13 @@
  * answers `use_dpop_nonce`.
  */
 
-import { AttenuoError } from "./errors.js";
+import { AttenuoError, TransportError } from "./errors.js";
 import { b64urlDecode } from "./token.js";
 
 /** `typ` of a DPoP proof. */
 export const PROOF_TYPE = "dpop+jwt";
+/** `typ` of the client assertions `DpopKey.clientAssertion` makes. */
+export const CLIENT_ASSERTION_TYP = "client-authentication+jwt";
 /** Sign-off claim naming the new token's key thumbprint. */
 export const SIGN_OFF_CHILD_JKT = "child_jkt";
 /** Sign-off claim naming the new token's agent. */
@@ -96,6 +98,8 @@ export class DpopKey {
     readonly publicJwk: Readonly<Record<string, string>>,
     /** RFC 7638 thumbprint: the `cnf.jkt` of tokens bound to this key. */
     readonly thumbprint: string,
+    /** The `kid` of the JWK the key was imported from, if it had one. */
+    readonly kid?: string,
   ) {}
 
   /** Import a private JWK. Throws `AttenuoError` for a public key or a key that does not match. */
@@ -118,7 +122,8 @@ export class DpopKey {
     } catch (e) {
       throw new AttenuoError(`DPoP key: invalid ${pub.crv} key: ${(e as Error).message}`);
     }
-    return new DpopKey(key, d, ed ? "EdDSA" : "ES256", pub, await jwkThumbprint(pub));
+    const kid = typeof jwk.kid === "string" && jwk.kid !== "" ? jwk.kid : undefined;
+    return new DpopKey(key, d, ed ? "EdDSA" : "ES256", pub, await jwkThumbprint(pub), kid);
   }
 
   /** A fresh Ed25519 key. Keep `privateJwk()` somewhere safe to reuse it. */
@@ -193,9 +198,41 @@ export class DpopKey {
     });
   }
 
+  /**
+   * A `private_key_jwt` client assertion (RFC 7523 §2.2) signed by this key, for an agent or PEP
+   * whose server entry lists the public key in `jwks`: `iss` = `sub` = `clientId`, `aud` =
+   * `audience` (the server's `[issuer] issuer`, the `iss` of the tokens it mints), a fresh `jti`,
+   * and `exp` `lifetime` seconds (default 60) ahead. `kid` defaults to the imported JWK's `kid`.
+   * Each assertion authenticates one request: pass it as `clientAssertion`.
+   */
+  async clientAssertion(
+    clientId: string,
+    audience: string,
+    opts: { kid?: string; lifetime?: number; iat?: number } = {},
+  ): Promise<string> {
+    const iat = opts.iat ?? Math.floor(Date.now() / 1000);
+    const header: Record<string, unknown> = { alg: this.alg, typ: CLIENT_ASSERTION_TYP };
+    const kid = opts.kid ?? this.kid;
+    if (kid !== undefined) header.kid = kid;
+    return this.signJws(header, {
+      iss: clientId,
+      sub: clientId,
+      aud: audience,
+      jti: crypto.randomUUID(),
+      iat,
+      exp: iat + Math.trunc(opts.lifetime ?? 60),
+    });
+  }
+
   /** Sign arbitrary proof claims under a DPoP header (for tests and special cases). */
   async sign(claims: Record<string, unknown>): Promise<string> {
-    const header = { typ: PROOF_TYPE, alg: this.alg, jwk: this.publicJwk };
+    return this.signJws({ typ: PROOF_TYPE, alg: this.alg, jwk: this.publicJwk }, claims);
+  }
+
+  private async signJws(
+    header: Record<string, unknown>,
+    claims: Record<string, unknown>,
+  ): Promise<string> {
     const signing = `${b64urlEncode(JSON.stringify(header))}.${b64urlEncode(JSON.stringify(claims))}`;
     const data = new TextEncoder().encode(signing);
     // ES256 in WebCrypto already produces the JWS form (r || s, 64 bytes).
@@ -240,13 +277,18 @@ export async function presented(
  * already reached it, so now and then the retry meets the close and fails. `send` must make the
  * same request with the same headers each time, so the same DPoP proof: if the server did get
  * the first copy, its `jti` is used and the second is refused as a replay, never acted on twice.
- * An abort (a `DOMException`) is not resent.
+ * The client's own requests throw that `TypeError` wrapped in a `TransportError`, which is resent
+ * the same way. An abort or a timeout (a `DOMException`, or a `TransportError` around one) is not
+ * resent.
  */
 export async function resendOnce(send: () => Promise<Response>): Promise<Response> {
   try {
     return await send();
   } catch (e) {
-    if (!(e instanceof TypeError)) throw e;
+    // The SDK's own requests wrap the `TypeError` in a `TransportError` (its `cause`).
+    const network =
+      e instanceof TypeError || (e instanceof TransportError && e.cause instanceof TypeError);
+    if (!network) throw e;
     return send();
   }
 }

@@ -1,5 +1,5 @@
-"""Operator API: revoke leases, read and verify the audit log, reload policy, decide
-approvals, mint dev roots.
+"""Operator API: revoke leases, refund a decision's budget charge, read and verify the audit
+log, reload policy, decide approvals, mint dev roots.
 
 Every route needs the static admin bearer (``[admin] token`` in the server config). Keep that
 token out of agents: it can revoke anything and read every decision.
@@ -17,9 +17,12 @@ from typing import Any, Literal
 import httpx
 
 from . import _wire as w
+from ._http import AsyncHttpClient, HttpClient
 from .capability import CapabilityLike, capabilities_to_json
 from .dpop import DpopKey, NonceCache
-from .errors import AttenuoError
+from .errors import AttenuoError, budget_limit_from_json
+from .errors import BudgetLimit as BudgetLimit
+from .errors import LimitKind as LimitKind
 from .token import Token
 
 _MAX_PAGE = 1000
@@ -33,6 +36,21 @@ class RevokeResult:
 
     lease_id: str
     revoked: int
+    reason: str
+    audit_id: str | None = None
+
+
+@dataclass(frozen=True)
+class BudgetRefund:
+    """The answer of :meth:`AdminClient.refund_budget` (``POST /admin/budgets/refund``).
+
+    ``refunded`` counts the token-limit counters credited. The run usage and per-user windows
+    the decision charged are given back too but not counted, so a decision that charged only
+    usage answers 0. ``audit_id`` is the id of the ``admin.budget.refund`` record, ``None``
+    when the server could not write it (the refund stands)."""
+
+    decision_id: str
+    refunded: int
     reason: str
     audit_id: str | None = None
 
@@ -125,9 +143,31 @@ class VerifyReport:
 
 
 @dataclass(frozen=True)
+class AdminIdentity:
+    """Who the admin token is (``GET /admin/whoami``, ADR-0016): the operator's ``name``
+    (``admin`` for the server's ``[admin] token``), ``role``: ``viewer``, ``operator`` or
+    ``admin``, and ``expires_at``, the RFC 3339 time the token stops working (``None`` when it
+    does not expire)."""
+
+    name: str
+    role: str
+    expires_at: str | None = None
+
+
+@dataclass(frozen=True)
 class PolicyReload:
     policy_ids: list[str]
     warnings: list[str]
+
+
+@dataclass(frozen=True)
+class OperatorsReload:
+    """What ``POST /admin/operators/reload`` changed, by operator name (never a digest):
+    operators ``added``, ``removed`` and ``changed`` (role, token or expiry)."""
+
+    added: list[str]
+    removed: list[str]
+    changed: list[str]
 
 
 @dataclass(frozen=True)
@@ -157,13 +197,13 @@ class AuditFilter:
 class AuditPage:
     """One page of :meth:`AdminClient.audit_query`.
 
-    ``next`` is the ``from`` of the following page read oldest first, ``prev`` the ``before``
-    of the following page read newest first; each is ``None`` at its end. A filtered page can
-    be short, even empty, with a link still set: use :meth:`AdminClient.audit_iter`."""
+    ``next_cursor`` fetches the following page in the same ``order`` (pass it back as
+    ``cursor`` with the same filter and range); ``None`` once the range has been read. It is
+    opaque. A filtered page can be short, even empty, with ``next_cursor`` still set: use
+    :meth:`AdminClient.audit_iter`, which follows it."""
 
     entries: list[AuditEntry]
-    next: int | None
-    prev: int | None
+    next_cursor: str | None
     head: int
 
 
@@ -199,10 +239,20 @@ class AuditEntryDetail:
 
 @dataclass(frozen=True)
 class CheckpointPage:
-    """Stored checkpoints, newest first; ``prev`` is the ``before`` of the next (older) page."""
+    """Stored checkpoints, newest first; ``next_cursor`` fetches the next (older) page, ``None``
+    after the oldest."""
 
     checkpoints: list[dict[str, Any]]
-    prev: int | None
+    next_cursor: str | None
+
+
+@dataclass(frozen=True)
+class ApprovalPage:
+    """One page of :meth:`AdminClient.approvals`, newest first; ``next_cursor`` fetches the
+    next (older) page with the same filters, ``None`` after the last."""
+
+    approvals: list[w.Approval]
+    next_cursor: str | None
 
 
 @dataclass(frozen=True)
@@ -225,18 +275,45 @@ class LeaseNode:
 
 
 @dataclass(frozen=True)
+class LeaseUserWindow:
+    """One per-user window of a run's originating user (run limits phase 3): the window of
+    ``kind`` (``hour`` or ``day``) holding now, starting at ``start`` (RFC 3339, UTC), and what
+    every run of the user was allowed in it for ``tool`` (``"<server>/<tool>"``)."""
+
+    tool: str
+    kind: str
+    start: str
+    calls: int
+    amount: int
+
+
+@dataclass(frozen=True)
+class LeaseUserWindows:
+    """The ``user_windows`` of a :class:`LeaseTree`: a window per tool the run used and kind a
+    loaded policy reads, ordered by tool then kind; ``truncated`` when the server's cap cut
+    the list short."""
+
+    windows: list[LeaseUserWindow]
+    truncated: bool
+
+
+@dataclass(frozen=True)
 class LeaseTree:
     """What a revoke of the lease would reach, changing nothing.
 
     ``nodes`` is the lease then its descendants, breadth-first, cut short when ``truncated``.
     ``ancestors`` runs nearest first to ``root``, the chain's first hop. ``would_revoke`` is the
-    count a revoke sent now would return (whole subtree, ignoring ``max_nodes``)."""
+    count a revoke sent now would return (whole subtree, ignoring ``max_nodes``).
+    ``user_windows`` is the run's originating user's per-user windows, read at ``root``;
+    ``None`` when the root lease was issued before the server kept the user's issuer, or the
+    server is older than the member."""
 
     root: str
     ancestors: list[LeaseNode]
     nodes: list[LeaseNode]
     would_revoke: int
     truncated: bool
+    user_windows: LeaseUserWindows | None = None
 
 
 @dataclass(frozen=True)
@@ -268,35 +345,6 @@ class PolicyCheck:
     warning_count: int
     issues: list[dict[str, Any]]
     policy_ids: list[str]
-
-
-LimitKind = Literal["calls", "sum", "calls_per", "distinct"]
-
-
-@dataclass(frozen=True)
-class BudgetLimit:
-    """One run-limit counter: ``hop`` (position in the chain, root 0), ``kind``, ``arg`` (the
-    counted argument as the limit names it, ``arg#host`` for a derived one; ``None`` for
-    ``calls``), ``used`` (calls or summed amount; for ``calls_per`` the calls with this value;
-    for ``distinct`` how many values the limit has seen) and ``max``.
-
-    The ``limit`` of a ``budget_exhausted`` dry run has this shape, and so does an entry of
-    :attr:`StatedBudget.limits`, where ``max`` is optional (when given it must equal the
-    limit's). A refusal's ``limit`` can be stated back as it came."""
-
-    hop: int
-    kind: LimitKind
-    used: int
-    arg: str | None = None
-    max: int | None = None
-
-    def to_json(self) -> dict[str, Any]:
-        out: dict[str, Any] = {"hop": self.hop, "kind": self.kind, "used": self.used}
-        if self.arg is not None:
-            out["arg"] = self.arg
-        if self.max is not None:
-            out["max"] = self.max
-        return out
 
 
 @dataclass(frozen=True)
@@ -590,14 +638,17 @@ def _audit_params(
     flt: AuditFilter | None,
     order: str,
     from_seq: int | None,
-    before: int | None,
+    to_seq: int | None,
+    cursor: str | None,
     limit: int,
 ) -> dict[str, Any]:
     params: dict[str, Any] = {"order": order, "limit": limit}
     if from_seq is not None:
         params["from"] = from_seq
-    if before is not None:
-        params["before"] = before
+    if to_seq is not None:
+        params["to"] = to_seq
+    if cursor is not None:
+        params["cursor"] = cursor
     if flt is None:
         return params
     for name in ("decision", "reason", "subject", "agent", "lease", "server", "tool", "chain_id"):
@@ -614,15 +665,15 @@ def _audit_params(
 
 
 def _audit_page(page: Any) -> AuditPage:
-    return AuditPage(_entries(page), page.get("next"), page.get("prev"), _head(page))
+    return AuditPage(_entries(page), _next_cursor(page), _head(page))
 
 
-def _cursor(page: AuditPage, order: str, last: int | None) -> int | None:
-    """The link to follow after ``page``: ``prev`` newest first, ``next`` oldest first."""
-    cur = page.prev if order == "desc" else page.next
-    if cur is not None and cur == last:
-        raise AttenuoError(f"audit paging did not advance (cursor {cur})")
-    return cur
+def _next_cursor(page: Any) -> str | None:
+    cur = page.get("next_cursor") if isinstance(page, dict) else None
+    return cur if isinstance(cur, str) else None
+
+
+_advance = w.advance_cursor
 
 
 def _entry_detail(b: Any) -> AuditEntryDetail:
@@ -646,17 +697,17 @@ def _entry_detail(b: Any) -> AuditEntryDetail:
     )
 
 
-def _checkpoint_params(before: int | None, limit: int | None) -> dict[str, Any]:
+def _checkpoint_params(cursor: str | None, limit: int | None) -> dict[str, Any]:
     params: dict[str, Any] = {}
-    if before is not None:
-        params["before"] = before
+    if cursor is not None:
+        params["cursor"] = cursor
     if limit is not None:
         params["limit"] = limit
     return params
 
 
 def _checkpoint_page(b: Any) -> CheckpointPage:
-    return CheckpointPage(list(b.get("checkpoints") or []), b.get("prev"))
+    return CheckpointPage(list(b.get("checkpoints") or []), _next_cursor(b))
 
 
 def _lease_node(n: Any) -> LeaseNode:
@@ -674,6 +725,20 @@ def _lease_node(n: Any) -> LeaseNode:
     )
 
 
+def _user_windows(v: Any) -> LeaseUserWindows | None:
+    if not isinstance(v, dict):
+        return None
+    return LeaseUserWindows(
+        windows=[
+            LeaseUserWindow(
+                str(e["tool"]), str(e["kind"]), str(e["start"]), int(e["calls"]), int(e["amount"])
+            )
+            for e in v.get("windows") or []
+        ],
+        truncated=v.get("truncated") is True,
+    )
+
+
 def _lease_tree(b: Any) -> LeaseTree:
     return LeaseTree(
         root=str(b["root"]),
@@ -681,6 +746,24 @@ def _lease_tree(b: Any) -> LeaseTree:
         nodes=[_lease_node(n) for n in b.get("nodes") or []],
         would_revoke=int(b.get("would_revoke", 0)),
         truncated=b.get("truncated") is True,
+        user_windows=_user_windows(b.get("user_windows")),
+    )
+
+
+def _admin_identity(b: Any) -> AdminIdentity:
+    expires_at = b.get("expires_at")
+    return AdminIdentity(
+        name=str(b["name"]),
+        role=str(b["role"]),
+        expires_at=None if expires_at is None else str(expires_at),
+    )
+
+
+def _operators_reload(b: Any) -> OperatorsReload:
+    return OperatorsReload(
+        added=list(b.get("added") or []),
+        removed=list(b.get("removed") or []),
+        changed=list(b.get("changed") or []),
     )
 
 
@@ -744,19 +827,6 @@ def _int(v: Any) -> int:
     return v if isinstance(v, int) and not isinstance(v, bool) else 0
 
 
-def _budget_limit(v: Any) -> BudgetLimit | None:
-    if not isinstance(v, dict):
-        return None
-    arg, mx = v.get("arg"), v.get("max")
-    return BudgetLimit(
-        hop=_int(v.get("hop")),
-        kind=str(v.get("kind", "")),  # type: ignore[arg-type]
-        used=_int(v.get("used")),
-        arg=None if arg is None else str(arg),
-        max=mx if isinstance(mx, int) and not isinstance(mx, bool) else None,
-    )
-
-
 def _evaluation_budget(v: Any) -> EvaluationBudget | None:
     if not isinstance(v, dict):
         return None
@@ -804,7 +874,7 @@ def _policy_evaluation(b: Any) -> PolicyEvaluation:
         chain_source=str(b.get("chain_source", "")),
         token_expired=b.get("token_expired") is True,
         budget=_evaluation_budget(b.get("budget")),
-        limit=_budget_limit(b.get("limit")),
+        limit=budget_limit_from_json(b.get("limit")),
         labels=_evaluation_labels(b.get("session")),
         usage=_evaluation_usage(b.get("usage")),
         approval_by=str(approval.get("by", "")) if present else None,
@@ -821,8 +891,12 @@ def _revoke_result(b: Any) -> RevokeResult:
     )
 
 
-def _approval_params(chain_id: str | None, state: str | None, limit: int | None) -> dict[str, Any]:
+def _approval_params(
+    chain_id: str | None, state: str | None, limit: int | None, cursor: str | None
+) -> dict[str, Any]:
     params: dict[str, Any] = {}
+    if cursor is not None:
+        params["cursor"] = cursor
     if chain_id:
         params["chain_id"] = chain_id
     if state:
@@ -832,9 +906,31 @@ def _approval_params(chain_id: str | None, state: str | None, limit: int | None)
     return params
 
 
-def _approvals(b: Any) -> list[w.Approval]:
+def _approvals(b: Any) -> ApprovalPage:
     items = b.get("approvals") if isinstance(b, dict) else None
-    return [w.approval_from_json(a) for a in items or []]
+    return ApprovalPage([w.approval_from_json(a) for a in items or []], _next_cursor(b))
+
+
+def _refund_body(decision_id: str, reason: str | None) -> dict[str, Any]:
+    if not isinstance(decision_id, str) or not decision_id.strip():
+        raise ValueError("decision_id must be the id of an allowed decision")
+    body: dict[str, Any] = {"decision_id": decision_id.strip()}
+    if reason is not None:
+        body["reason"] = reason
+    return body
+
+
+def _budget_refund(b: Any) -> BudgetRefund:
+    if not isinstance(b, dict):
+        raise AttenuoError(f"unexpected refund response: {str(b)[:200]}")
+    audit_id = b.get("audit_id")
+    refunded = b.get("refunded")
+    return BudgetRefund(
+        decision_id=str(b.get("decision_id", "")),
+        refunded=refunded if isinstance(refunded, int) and not isinstance(refunded, bool) else 0,
+        reason=str(b.get("reason", "")),
+        audit_id=None if audit_id is None else str(audit_id),
+    )
 
 
 def _approval_path(approval_id: str) -> str:
@@ -853,7 +949,7 @@ class AdminClient:
         transport: httpx.BaseTransport | None = None,
     ) -> None:
         self.server_url = w.normalize_base(server_url)
-        self._http = httpx.Client(
+        self._http = HttpClient(
             base_url=self.server_url,
             timeout=timeout,
             transport=transport,
@@ -907,6 +1003,19 @@ class AdminClient:
         resp = self._http.post("/admin/leases/revoke", json=body, params=params)
         return _selector_revocation(w.json_body(resp))
 
+    def refund_budget(self, decision_id: str, reason: str | None = None) -> BudgetRefund:
+        """``POST /admin/budgets/refund``: give back what the allowed decision ``decision_id``
+        charged to its run's limits, once, for a call whose effect did not happen. The server
+        writes an ``admin.budget.refund`` record (``reason`` defaults to ``refunded by
+        admin``).
+
+        A refund that cannot be made is an :class:`~attenuo.ApiError`: 409
+        ``already_refunded``, 410 ``charge_pruned`` (the charge is older than the server
+        keeps), 404 ``not_found`` (an unknown id, or a decision that charged nothing). Its
+        ``detail`` says which, from the decision's audit record."""
+        body = _refund_body(decision_id, reason)
+        return _budget_refund(w.json_body(self._http.post("/admin/budgets/refund", json=body)))
+
     def lease_status(self, lease_id: str) -> LeaseStatus:
         b = w.json_body(self._http.get(f"/admin/leases/{w.path_segment(lease_id, 'lease_id')}"))
         return LeaseStatus(
@@ -918,12 +1027,17 @@ class AdminClient:
             b.get("revoke_reason"),
         )
 
-    def audit(self, from_seq: int = 1, limit: int = 100) -> tuple[list[AuditEntry], int | None]:
-        """One page of entries from ``from_seq``, and the ``from`` for the next page (or None)."""
-        page = w.json_body(
-            self._http.get("/admin/audit", params={"from": from_seq, "limit": limit})
-        )
-        return _entries(page), page.get("next")
+    def audit(
+        self, from_seq: int = 1, limit: int = 100, *, cursor: str | None = None
+    ) -> tuple[list[AuditEntry], str | None]:
+        """One page of entries from ``from_seq`` oldest first, and the ``next_cursor`` for the
+        next page (``None`` at the head). Pass it back as ``cursor`` with the same
+        ``from_seq``."""
+        params: dict[str, Any] = {"from": from_seq, "limit": limit}
+        if cursor is not None:
+            params["cursor"] = cursor
+        page = w.json_body(self._http.get("/admin/audit", params=params))
+        return _entries(page), _next_cursor(page)
 
     def audit_head(self) -> int:
         """The newest audit ``seq`` (0 for an empty log). Reads ``head`` from
@@ -935,12 +1049,13 @@ class AdminClient:
         head = self.audit_head()
         start = max(1, head + 1 - n)
         out: list[AuditEntry] = []
+        cursor: str | None = None
         while True:
-            page, nxt = self.audit(start, _MAX_PAGE)
+            page, nxt = self.audit(start, _MAX_PAGE, cursor=cursor)
             out.extend(page)
-            if nxt is None:
+            cursor = _advance(nxt, cursor)
+            if cursor is None:
                 return out
-            start = nxt
 
     def audit_checkpoint(self) -> dict[str, Any]:
         """The signed checkpoint of the log head (``seq``, ``head_hash``, ``hash``, ``at``,
@@ -988,6 +1103,12 @@ class AdminClient:
         b = w.json_body(self._http.post("/admin/policies/reload", json={}))
         return PolicyReload(list(b.get("policy_ids") or []), list(b.get("warnings") or []))
 
+    def operators_reload(self) -> OperatorsReload:
+        """Re-read ``[[admin.operators]]`` from the server's config file and put them in force
+        (role ``admin``). A list that does not parse, breaks a rule or would leave no ``admin``
+        raises ``ApiError`` (422) and the operators in force stay as they were."""
+        return _operators_reload(w.json_body(self._http.post("/admin/operators/reload", json={})))
+
     def lease_tree(self, lease_id: str, max_nodes: int | None = None) -> LeaseTree:
         """The lease, its descendants and ancestors, and how many leases a revoke would change
         now. A dry run of :meth:`revoke_lease`: nothing changes, nothing is audited."""
@@ -1001,15 +1122,18 @@ class AdminClient:
         *,
         order: str = "asc",
         from_seq: int | None = None,
-        before: int | None = None,
+        to_seq: int | None = None,
+        cursor: str | None = None,
         limit: int = 100,
     ) -> AuditPage:
         """One filtered page of ``GET /admin/audit``.
 
-        ``order="asc"`` reads oldest first from ``from_seq``; ``order="desc"`` reads newest
-        first, entries with ``seq < before`` (default: from the head). A filtered page can come
-        back short or empty with a link still set; :meth:`audit_iter` follows the links."""
-        params = _audit_params(filter, order, from_seq, before, limit)
+        ``from_seq`` and ``to_seq`` (inclusive) select a range, by default the whole log;
+        ``order="asc"`` reads it oldest first, ``order="desc"`` newest first. ``cursor`` is the
+        ``next_cursor`` of the previous page, sent with the same filter, range and order. A
+        filtered page can come back short or empty with ``next_cursor`` still set;
+        :meth:`audit_iter` follows it."""
+        params = _audit_params(filter, order, from_seq, to_seq, cursor, limit)
         return _audit_page(w.json_body(self._http.get("/admin/audit", params=params)))
 
     def audit_iter(
@@ -1018,24 +1142,21 @@ class AdminClient:
         *,
         order: str = "asc",
         from_seq: int | None = None,
-        before: int | None = None,
+        to_seq: int | None = None,
         limit: int = _MAX_PAGE,
     ) -> Iterator[AuditEntry]:
-        """Every matching entry, in ``order``, following ``next`` (asc) or ``prev`` (desc)
-        until it is null. Pages lazily: stop iterating to stop reading."""
+        """Every matching entry of the range, in ``order``, following ``next_cursor`` until it
+        is null. Pages lazily: stop iterating to stop reading. Entries appended meanwhile do
+        not shift the ones not read yet."""
+        cursor: str | None = None
         while True:
             page = self.audit_query(
-                filter, order=order, from_seq=from_seq, before=before, limit=limit
+                filter, order=order, from_seq=from_seq, to_seq=to_seq, cursor=cursor, limit=limit
             )
             yield from page.entries
-            last = before if order == "desc" else from_seq
-            cur = _cursor(page, order, last)
-            if cur is None:
+            cursor = _advance(page.next_cursor, cursor)
+            if cursor is None:
                 return
-            if order == "desc":
-                before = cur
-            else:
-                from_seq = cur
 
     def audit_entry(self, seq: int) -> AuditEntryDetail:
         """The entry at ``seq`` with its context. ``ApiError`` (404) when there is none."""
@@ -1048,14 +1169,30 @@ class AdminClient:
         return _entry_detail(w.json_body(self._http.get(path)))
 
     def audit_checkpoints(
-        self, before: int | None = None, limit: int | None = None
+        self, cursor: str | None = None, limit: int | None = None
     ) -> CheckpointPage:
-        """Stored checkpoints with ``seq < before``, newest first. Read-only: unlike
+        """Stored checkpoints, newest first; ``cursor`` is the ``next_cursor`` of the previous
+        page (server default page 100, at most 1000). Read-only: unlike
         :meth:`audit_checkpoint` it never signs."""
-        params = _checkpoint_params(before, limit)
+        params = _checkpoint_params(cursor, limit)
         return _checkpoint_page(
             w.json_body(self._http.get("/admin/audit/checkpoints", params=params))
         )
+
+    def audit_checkpoints_iter(self, limit: int | None = None) -> Iterator[dict[str, Any]]:
+        """Every stored checkpoint, newest first, following ``next_cursor``."""
+        cursor: str | None = None
+        while True:
+            page = self.audit_checkpoints(cursor, limit)
+            yield from page.checkpoints
+            cursor = _advance(page.next_cursor, cursor)
+            if cursor is None:
+                return
+
+    def whoami(self) -> AdminIdentity:
+        """The name, role and expiry of the admin token this client sends
+        (``GET /admin/whoami``)."""
+        return _admin_identity(w.json_body(self._http.get("/admin/whoami")))
 
     def policies(self) -> PolicySet:
         """The policy set in force: file, digest, load time, ids, warnings and texts."""
@@ -1108,12 +1245,32 @@ class AdminClient:
         *,
         state: str | None = None,
         limit: int | None = None,
-    ) -> list[w.Approval]:
-        """The newest approvals, newest first: of one delegation run with ``chain_id``, in one
-        ``state`` (``pending``, ``granted``, ``declined``, ``consumed``), at most ``limit``
-        (server default and maximum 500). An unknown state is an ``ApiError`` (400)."""
-        params = _approval_params(chain_id, state, limit)
+        cursor: str | None = None,
+    ) -> ApprovalPage:
+        """One page of approvals, newest first: of one delegation run with ``chain_id``, in
+        one ``state`` (``pending``, ``granted``, ``declined``, ``consumed``), at most ``limit``
+        (server default 100, maximum 500). ``cursor`` is the ``next_cursor`` of the previous
+        page, sent with the same filters; :meth:`approvals_iter` follows it. An unknown state
+        is an ``ApiError`` (400)."""
+        params = _approval_params(chain_id, state, limit, cursor)
         return _approvals(w.json_body(self._http.get("/admin/approvals", params=params)))
+
+    def approvals_iter(
+        self,
+        chain_id: str | None = None,
+        *,
+        state: str | None = None,
+        limit: int | None = None,
+    ) -> Iterator[w.Approval]:
+        """Every matching approval, newest first, following ``next_cursor``. Approvals created
+        meanwhile sort above the first page and do not shift the rest."""
+        cursor: str | None = None
+        while True:
+            page = self.approvals(chain_id, state=state, limit=limit, cursor=cursor)
+            yield from page.approvals
+            cursor = _advance(page.next_cursor, cursor)
+            if cursor is None:
+                return
 
     def approval(self, approval_id: str) -> w.Approval:
         """One approval: the exact call, the run's labels, state, approver and expiry.
@@ -1177,7 +1334,7 @@ class AsyncAdminClient:
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self.server_url = w.normalize_base(server_url)
-        self._http = httpx.AsyncClient(
+        self._http = AsyncHttpClient(
             base_url=self.server_url,
             timeout=timeout,
             transport=transport,
@@ -1221,6 +1378,11 @@ class AsyncAdminClient:
         resp = await self._http.post("/admin/leases/revoke", json=body, params=params)
         return _selector_revocation(w.json_body(resp))
 
+    async def refund_budget(self, decision_id: str, reason: str | None = None) -> BudgetRefund:
+        body = _refund_body(decision_id, reason)
+        resp = await self._http.post("/admin/budgets/refund", json=body)
+        return _budget_refund(w.json_body(resp))
+
     async def lease_status(self, lease_id: str) -> LeaseStatus:
         b = w.json_body(
             await self._http.get(f"/admin/leases/{w.path_segment(lease_id, 'lease_id')}")
@@ -1235,12 +1397,13 @@ class AsyncAdminClient:
         )
 
     async def audit(
-        self, from_seq: int = 1, limit: int = 100
-    ) -> tuple[list[AuditEntry], int | None]:
-        page = w.json_body(
-            await self._http.get("/admin/audit", params={"from": from_seq, "limit": limit})
-        )
-        return _entries(page), page.get("next")
+        self, from_seq: int = 1, limit: int = 100, *, cursor: str | None = None
+    ) -> tuple[list[AuditEntry], str | None]:
+        params: dict[str, Any] = {"from": from_seq, "limit": limit}
+        if cursor is not None:
+            params["cursor"] = cursor
+        page = w.json_body(await self._http.get("/admin/audit", params=params))
+        return _entries(page), _next_cursor(page)
 
     async def audit_head(self) -> int:
         return _head(
@@ -1251,12 +1414,13 @@ class AsyncAdminClient:
         head = await self.audit_head()
         start = max(1, head + 1 - n)
         out: list[AuditEntry] = []
+        cursor: str | None = None
         while True:
-            page, nxt = await self.audit(start, _MAX_PAGE)
+            page, nxt = await self.audit(start, _MAX_PAGE, cursor=cursor)
             out.extend(page)
-            if nxt is None:
+            cursor = _advance(nxt, cursor)
+            if cursor is None:
                 return out
-            start = nxt
 
     async def audit_checkpoint(self) -> dict[str, Any]:
         body = w.json_body(await self._http.get("/admin/audit/checkpoint"))
@@ -1288,6 +1452,10 @@ class AsyncAdminClient:
         b = w.json_body(await self._http.post("/admin/policies/reload", json={}))
         return PolicyReload(list(b.get("policy_ids") or []), list(b.get("warnings") or []))
 
+    async def operators_reload(self) -> OperatorsReload:
+        b = w.json_body(await self._http.post("/admin/operators/reload", json={}))
+        return _operators_reload(b)
+
     async def lease_tree(self, lease_id: str, max_nodes: int | None = None) -> LeaseTree:
         params = {} if max_nodes is None else {"max_nodes": max_nodes}
         path = f"/admin/leases/{w.path_segment(lease_id, 'lease_id')}/tree"
@@ -1299,10 +1467,11 @@ class AsyncAdminClient:
         *,
         order: str = "asc",
         from_seq: int | None = None,
-        before: int | None = None,
+        to_seq: int | None = None,
+        cursor: str | None = None,
         limit: int = 100,
     ) -> AuditPage:
-        params = _audit_params(filter, order, from_seq, before, limit)
+        params = _audit_params(filter, order, from_seq, to_seq, cursor, limit)
         return _audit_page(w.json_body(await self._http.get("/admin/audit", params=params)))
 
     async def audit_iter(
@@ -1311,23 +1480,19 @@ class AsyncAdminClient:
         *,
         order: str = "asc",
         from_seq: int | None = None,
-        before: int | None = None,
+        to_seq: int | None = None,
         limit: int = _MAX_PAGE,
     ) -> AsyncIterator[AuditEntry]:
+        cursor: str | None = None
         while True:
             page = await self.audit_query(
-                filter, order=order, from_seq=from_seq, before=before, limit=limit
+                filter, order=order, from_seq=from_seq, to_seq=to_seq, cursor=cursor, limit=limit
             )
             for entry in page.entries:
                 yield entry
-            last = before if order == "desc" else from_seq
-            cur = _cursor(page, order, last)
-            if cur is None:
+            cursor = _advance(page.next_cursor, cursor)
+            if cursor is None:
                 return
-            if order == "desc":
-                before = cur
-            else:
-                from_seq = cur
 
     async def audit_entry(self, seq: int) -> AuditEntryDetail:
         return _entry_detail(w.json_body(await self._http.get(f"/admin/audit/entries/{int(seq)}")))
@@ -1337,12 +1502,27 @@ class AsyncAdminClient:
         return _entry_detail(w.json_body(await self._http.get(path)))
 
     async def audit_checkpoints(
-        self, before: int | None = None, limit: int | None = None
+        self, cursor: str | None = None, limit: int | None = None
     ) -> CheckpointPage:
-        params = _checkpoint_params(before, limit)
+        params = _checkpoint_params(cursor, limit)
         return _checkpoint_page(
             w.json_body(await self._http.get("/admin/audit/checkpoints", params=params))
         )
+
+    async def audit_checkpoints_iter(
+        self, limit: int | None = None
+    ) -> AsyncIterator[dict[str, Any]]:
+        cursor: str | None = None
+        while True:
+            page = await self.audit_checkpoints(cursor, limit)
+            for cp in page.checkpoints:
+                yield cp
+            cursor = _advance(page.next_cursor, cursor)
+            if cursor is None:
+                return
+
+    async def whoami(self) -> AdminIdentity:
+        return _admin_identity(w.json_body(await self._http.get("/admin/whoami")))
 
     async def policies(self) -> PolicySet:
         return _policy_set(w.json_body(await self._http.get("/admin/policies")))
@@ -1376,9 +1556,26 @@ class AsyncAdminClient:
         *,
         state: str | None = None,
         limit: int | None = None,
-    ) -> list[w.Approval]:
-        params = _approval_params(chain_id, state, limit)
+        cursor: str | None = None,
+    ) -> ApprovalPage:
+        params = _approval_params(chain_id, state, limit, cursor)
         return _approvals(w.json_body(await self._http.get("/admin/approvals", params=params)))
+
+    async def approvals_iter(
+        self,
+        chain_id: str | None = None,
+        *,
+        state: str | None = None,
+        limit: int | None = None,
+    ) -> AsyncIterator[w.Approval]:
+        cursor: str | None = None
+        while True:
+            page = await self.approvals(chain_id, state=state, limit=limit, cursor=cursor)
+            for a in page.approvals:
+                yield a
+            cursor = _advance(page.next_cursor, cursor)
+            if cursor is None:
+                return
 
     async def approval(self, approval_id: str) -> w.Approval:
         return w.approval_from_json(w.json_body(await self._http.get(_approval_path(approval_id))))

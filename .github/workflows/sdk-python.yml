@@ -5,11 +5,17 @@ on:
     paths:
       - "sdk/python/**"
       - "examples/python-agent/**"
+      # tests/test_readme_snippets.py: the README's SDK section, run against the example config.
+      - "README.md"
+      - "config/example.toml"
       - ".github/workflows/sdk-python.yml"
   pull_request:
     paths:
       - "sdk/python/**"
       - "examples/python-agent/**"
+      # tests/test_readme_snippets.py: the README's SDK section, run against the example config.
+      - "README.md"
+      - "config/example.toml"
       - ".github/workflows/sdk-python.yml"
 
 permissions:

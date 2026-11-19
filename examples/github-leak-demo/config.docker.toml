@@ -46,6 +46,14 @@ url = "http://fake-mcp:3001/mcp"
 
 # No [admin] token in this file: the server listens on all interfaces inside the container,
 # so it refuses to start with a placeholder. docker-compose.yml passes ATTENUO_ADMIN_TOKEN.
+[admin]
+# Off loopback the admin API (/admin/*) needs a listener of its own (S-1). Port 9102 is not
+# published to the host: admin commands run inside the container,
+#   docker compose exec attenuo attenuo --server http://127.0.0.1:9102 lease show <id>
+# and the main port (8080, published on the host's 127.0.0.1) answers /admin/* with 404.
+# It binds 0.0.0.0 so another container on the compose network can reach it too; a deployment
+# binds it to an address only operators reach (docs/guides/deploying.md).
+listen = "0.0.0.0:9102"
 
 # Alice's assistant holds a broad token, like the over-privileged PAT in the real incident.
 [[root_grants]]
@@ -71,3 +79,7 @@ secret_sha256 = "4d4d01d5f4743384d7e17f557918cd0e2f81d9a46a4fcb3c8d2c851e8d08bbd
 # Real deployments leave this off and mint root tokens from an OIDC ID token or ID-JAG.
 [dev]
 allow_root_mint = true
+# The unverified mint is refused when the admin API's listener ([admin] listen) is not
+# loopback. Here it binds 0.0.0.0 inside the container's own network namespace and is not
+# published, so the demo opts in. Never copy this line into a deployment.
+allow_root_mint_off_loopback = true

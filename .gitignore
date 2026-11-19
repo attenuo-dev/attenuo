@@ -27,3 +27,6 @@ dist-py/
 
 # Owner-facing reading guides exported from the project workspace; never part of the repository.
 docs/guide/flight-guide-*
+
+# Lean build output of the covering-rule proof (proofs/lean). lake-manifest.json is tracked.
+/proofs/lean/.lake/

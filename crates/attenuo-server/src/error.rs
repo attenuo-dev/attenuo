@@ -1,11 +1,21 @@
-//! JSON error responses: `{"error": "<code>", "detail": "<human-readable text>"}`, plus a
-//! stable machine-readable sub-code in `error_description` where one is defined (IdP intake at
-//! `POST /token`, see `crate::idp::IntakeError`).
+//! JSON error responses: `{"error": "<error>", "code": "<code>", "detail": "<human-readable
+//! text>"}`, plus `error_description` where one is set.
+//!
+//! `code` is the stable machine-readable code of the answer: its sub-code when it has one
+//! (sent also as `error_description`, except for a reason set with [`ApiError::with_code`]),
+//! else `error`. Every code, with its HTTP status, its JSON-RPC number and
+//! whether it is also a deny `reason`, is in one table, [`ERROR_CODES`] (from
+//! `attenuo_core::error_codes`, so that the proxy and the CLI read the same table). `detail` is
+//! text for people and may change in any release; `error_description` keeps the sub-code it
+//! carried before `code` existed and is deprecated as a machine field (RFC 6749 §5.2 means it
+//! for people).
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::json;
+
+pub use attenuo_core::error_codes::{ErrorCode, ERROR_CODES};
 
 /// 401 reason: no credential was sent.
 pub const REASON_MISSING_TOKEN: &str = attenuo_proxy::auth::REASON_MISSING_TOKEN;
@@ -31,21 +41,54 @@ pub const INTERNAL_DETAIL: &str = "internal error; the details are in the server
 pub struct ApiError {
     /// HTTP status of the response.
     pub status: StatusCode,
-    /// Machine-readable code, sent as `error` in the body.
+    /// OAuth-style error, sent as `error` in the body. The stable code of the answer is
+    /// [`Self::stable_code`].
     pub code: String,
     /// Human-readable explanation, sent as `detail`. [`Self::internal`] sends
     /// [`INTERNAL_DETAIL`] here and keeps the cause in the log.
     pub detail: String,
-    /// Stable sub-code, sent as `error_description` (RFC 6749 §5.2) when set.
+    /// Stable sub-code: the answer's `code` when set, and also sent as `error_description`
+    /// (RFC 6749 §5.2) unless [`Self::code_only`].
     pub description: Option<&'static str>,
+    /// The sub-code is sent as `code` only, with no `error_description`: the specific reason
+    /// of a refusal that never had an `error_description` (a refused renewal's
+    /// `lease_revoked`, say), set by [`Self::with_code`] so that `error`, `detail` and the
+    /// absence of `error_description` stay as they were.
+    pub code_only: bool,
     /// The id of the `deny` audit record this refusal wrote, when it wrote one (a refused
     /// token exchange whose subject token verified, or a refused renewal whose token
     /// verified). Sent as `decision_id` in the body and in
     /// the `X-Attenuo-Decision-Id` header.
     pub decision_id: Option<uuid::Uuid>,
+    /// Seconds the client should wait before it retries, sent as `Retry-After` when set (a
+    /// shed request, a timed-out handler, a rate limit; see [`crate::config::LimitsSection`]).
+    pub retry_after: Option<u64>,
 }
 
 impl ApiError {
+    /// The answer's stable code, sent as `code`: the sub-code when there is one
+    /// ([`Self::with_description`], [`Self::with_code`]), `error` otherwise. Always an entry of
+    /// [`ERROR_CODES`] (checked in debug builds).
+    pub fn stable_code(&self) -> &str {
+        self.description.unwrap_or(&self.code)
+    }
+
+    /// In a debug build, panic unless [`ERROR_CODES`] lists [`Self::stable_code`] with this
+    /// status and `error`: a code that is not in the table is a bug the tests should catch.
+    pub(crate) fn debug_check(&self) {
+        debug_assert!(
+            attenuo_core::error_codes::is_rest(
+                self.stable_code(),
+                self.status.as_u16(),
+                &self.code
+            ),
+            "code `{}` with status {} and error `{}` is not in ERROR_CODES",
+            self.stable_code(),
+            self.status.as_u16(),
+            self.code
+        );
+    }
+
     /// An error with no `error_description` and no decision id.
     pub fn new(status: StatusCode, code: impl Into<String>, detail: impl Into<String>) -> Self {
         Self {
@@ -53,13 +96,32 @@ impl ApiError {
             code: code.into(),
             detail: detail.into(),
             description: None,
+            code_only: false,
             decision_id: None,
+            retry_after: None,
         }
+    }
+
+    /// Ask the client to wait `seconds` (at least 1) before it retries (`Retry-After`).
+    pub fn with_retry_after(mut self, seconds: u64) -> Self {
+        self.retry_after = Some(seconds.max(1));
+        self
     }
 
     /// Attach a stable `error_description` sub-code.
     pub fn with_description(mut self, description: &'static str) -> Self {
         self.description = Some(description);
+        self.code_only = false;
+        self
+    }
+
+    /// Send `code` as the answer's `code` instead of `error`, without adding an
+    /// `error_description`: for a refusal whose specific reason used to reach the client only in
+    /// `detail` or in the message text, and whose `error`, `detail` and other fields stay as they
+    /// were for clients that read them.
+    pub fn with_code(mut self, code: &'static str) -> Self {
+        self.description = Some(code);
+        self.code_only = true;
         self
     }
 
@@ -121,8 +183,10 @@ impl IntoResponse for ApiError {
         } else {
             tracing::debug!(status = %self.status, code = ?self.code, detail = ?self.detail, "request rejected");
         }
-        let mut body = json!({ "error": self.code, "detail": self.detail });
-        if let Some(d) = self.description {
+        self.debug_check();
+        let code = self.stable_code();
+        let mut body = json!({ "error": self.code, "code": code, "detail": self.detail });
+        if let Some(d) = self.description.filter(|_| !self.code_only) {
             body["error_description"] = d.into();
         }
         if let Some(id) = self.decision_id {
@@ -142,6 +206,10 @@ impl IntoResponse for ApiError {
             axum::http::header::CACHE_CONTROL,
             axum::http::HeaderValue::from_static("no-store"),
         );
+        if let Some(secs) = self.retry_after {
+            resp.headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, secs.into());
+        }
         if self.status == StatusCode::UNAUTHORIZED && self.code == "invalid_client" {
             // RFC 6749 §5.2: a 401 for client authentication names the scheme.
             resp.headers_mut().insert(
@@ -240,7 +308,11 @@ impl From<attenuo_audit::AuditError> for ApiError {
             | E::Export(_)
             | E::NoCheckpointSigner
             | E::Jwks(_)
-            | E::BindingConflict(_)) => ApiError::internal(e),
+            | E::BindingConflict(_)
+            | E::Fenced { .. }
+            | E::NetworkFilesystem { .. }
+            | E::Overloaded(_)
+            | E::SchemaTooNew { .. }) => ApiError::internal(e),
         }
     }
 }
@@ -248,8 +320,9 @@ impl From<attenuo_audit::AuditError> for ApiError {
 /// Map a token error to an OAuth-style error code and status.
 ///
 /// Attenuation and depth violations are `invalid_scope` (the request asked for more than the
-/// parent holds); every other verification failure of the subject token is `invalid_grant`;
-/// key problems are server errors.
+/// parent holds); every other verification failure of the subject token is `invalid_grant`,
+/// with `code` `token_expired` when the token verified but has expired (or a hop of its chain
+/// has); key problems are server errors.
 impl From<attenuo_token::TokenError> for ApiError {
     fn from(e: attenuo_token::TokenError) -> Self {
         use attenuo_core::ChainError;
@@ -260,6 +333,7 @@ impl From<attenuo_token::TokenError> for ApiError {
                     .with_description("duplicate_actor")
             }
             TokenError::Chain(ChainError::AttenuationViolated { .. })
+            | TokenError::Chain(ChainError::TooLarge { .. })
             | TokenError::Chain(ChainError::TooDeep { .. }) => "invalid_scope",
             TokenError::ActorNotPermitted(_) => {
                 return ApiError::bad_request("invalid_request", e.to_string())
@@ -273,10 +347,115 @@ impl From<attenuo_token::TokenError> for ApiError {
             TokenError::BindingRequired => {
                 return crate::dpop::DpopFailure::Required(e.to_string()).into()
             }
+            // A subject token that verified but has expired: the same code as an expired
+            // bearer (`token_expired`), so a client can tell "renew or re-exchange" from "give
+            // up" without reading `detail`.
+            _ if is_expiry(&e) => {
+                return ApiError::bad_request("invalid_grant", e.to_string())
+                    .with_code(REASON_TOKEN_EXPIRED)
+            }
             _ => "invalid_grant",
         };
         ApiError::bad_request(code, e.to_string())
     }
+}
+
+/// `code` of a mint refused because a requested capability is not one a call can have (a
+/// server or tool name that breaks the naming rules, a malformed limit, or a shorthand that is
+/// not `server:tool`).
+pub const INVALID_CAPABILITY: &str = "invalid_capability";
+/// `code` of a mint refused because the agent id it names is empty.
+pub const INVALID_AGENT: &str = "invalid_agent";
+/// `code` of a root-token mint refused because the user's subject is empty.
+pub const INVALID_SUBJECT: &str = "invalid_subject";
+/// `code` of a mint refused because the requested lifetime gives no representable expiry.
+pub const TTL_OUT_OF_RANGE: &str = "ttl_out_of_range";
+/// `code` of an exchange that asks for more than the subject token holds.
+pub const SCOPE_EXCEEDS_PARENT: &str = "scope_exceeds_parent";
+/// `code` of an exchange whose chain would be deeper than `[issuer] max_depth`.
+pub const CHAIN_TOO_DEEP: &str = "chain_too_deep";
+/// `code` of a hop-0 request in which two capabilities fall under the same limited capability
+/// of the root grant or of the ID-JAG ceiling: it covers the calls of both (SR-121, SR-128).
+pub const LIMIT_SPLIT_AT_ROOT: &str = "limit_split_at_root";
+/// `code` of a hop-0 request with a capability under one or more limited capabilities of the root
+/// grant or of the ID-JAG ceiling whose limits one capability cannot carry together: the same
+/// kind of limit on different arguments (SR-128).
+pub const LIMIT_CONFLICT_AT_ROOT: &str = "limit_conflict_at_root";
+
+/// `code` of a request for more capabilities than one token may hold
+/// ([`attenuo_core::MAX_CAPABILITIES`], SR-123).
+pub const TOO_MANY_CAPABILITIES: &str = "too_many_capabilities";
+/// `code` of a request with a `one_of` longer than [`attenuo_core::MAX_ONE_OF_VALUES`] (SR-123).
+pub const ONE_OF_TOO_LONG: &str = "one_of_too_long";
+/// `code` of a request with more argument constraints, over all its capabilities, than
+/// [`attenuo_core::MAX_CONSTRAINTS`] (SR-123).
+pub const TOO_MANY_CONSTRAINTS: &str = "too_many_constraints";
+/// `code` of a request with more `one_of` values, over all its capabilities, than
+/// [`attenuo_core::MAX_ONE_OF_VALUES_TOTAL`] (SR-123).
+pub const TOO_MANY_ONE_OF_VALUES: &str = "too_many_one_of_values";
+
+/// The `code` of a request refused for its size.
+pub(crate) fn size_code(e: &attenuo_core::SizeError) -> &'static str {
+    match e {
+        attenuo_core::SizeError::TooManyCapabilities { .. } => TOO_MANY_CAPABILITIES,
+        attenuo_core::SizeError::OneOfTooLong { .. } => ONE_OF_TOO_LONG,
+        attenuo_core::SizeError::TooManyConstraints { .. } => TOO_MANY_CONSTRAINTS,
+        attenuo_core::SizeError::TooManyOneOfValues { .. } => TOO_MANY_ONE_OF_VALUES,
+    }
+}
+
+/// The `detail` of a [`LIMIT_SPLIT_AT_ROOT`] refusal: names the two capabilities as requested
+/// and `of`, where their limits come from, never the limits themselves (SR-124).
+pub(crate) fn limit_split_detail(first: &str, second: &str, of: &str) -> String {
+    format!(
+        "requested capabilities `{first}` and `{second}` fall under the same limited \
+         capability of {of}, and a limit there bounds one capability of the root token, not \
+         each of several: ask for one capability covering both (a `one_of` or wider \
+         constraint) instead"
+    )
+}
+
+/// The `detail` of a [`LIMIT_CONFLICT_AT_ROOT`] refusal: names the capability as requested
+/// and `of`, where the limits come from, never the limits themselves (SR-124).
+pub(crate) fn limit_conflict_detail(requested: &str, of: &str) -> String {
+    format!(
+        "requested capability `{requested}` is under one or more limited capabilities of {of}, \
+         and a root token capability must carry the limits of each of them, but their limits \
+         (or the request's own and theirs) set one kind of limit on different arguments, which \
+         one capability cannot carry together: ask for a capability fewer of them cover, \
+         without a limit of its own on another argument"
+    )
+}
+
+/// The answer to a token the server was asked to mint (an exchange's child, a root token) and
+/// could not. As [`From<TokenError>`](attenuo_token::TokenError), with the request's own fault
+/// named in `code` (by [`ApiError::with_code`]: status, `error` and `detail` are those of the
+/// `From` mapping, with no `error_description`): a widening is `scope_exceeds_parent`, a chain
+/// too deep `chain_too_deep` (both `invalid_scope`), and an invalid capability, an empty agent
+/// or subject, or a lifetime out of range `invalid_capability`, `invalid_agent`,
+/// `invalid_subject` or `ttl_out_of_range` (`invalid_grant`).
+///
+/// Only for errors of minting: a subject token whose own chain breaks these rules fails
+/// verification, and [`From<TokenError>`](attenuo_token::TokenError) answers it as a grant that
+/// does not verify.
+pub fn mint_refusal(e: attenuo_token::TokenError) -> ApiError {
+    use attenuo_core::ChainError as C;
+    use attenuo_token::TokenError;
+    let code = match &e {
+        TokenError::Chain(C::TooLarge { source, .. })
+        | TokenError::Chain(C::AttenuationViolated {
+            source: attenuo_core::AttenuationError::TooLarge(source),
+            ..
+        }) => size_code(source),
+        TokenError::Chain(C::AttenuationViolated { .. }) => SCOPE_EXCEEDS_PARENT,
+        TokenError::Chain(C::TooDeep { .. }) => CHAIN_TOO_DEEP,
+        TokenError::Chain(C::InvalidName { .. } | C::InvalidLimit { .. }) => INVALID_CAPABILITY,
+        TokenError::Chain(C::EmptyAgentId { .. }) => INVALID_AGENT,
+        TokenError::Chain(C::EmptySubject) => INVALID_SUBJECT,
+        TokenError::Chain(C::TtlOutOfRange) => TTL_OUT_OF_RANGE,
+        _ => return ApiError::from(e),
+    };
+    ApiError::from(e).with_code(code)
 }
 
 #[cfg(test)]
@@ -300,6 +479,209 @@ mod tests {
             !text.contains("/var/lib") && !text.contains("disk I/O"),
             "{text}"
         );
+    }
+
+    async fn body_of(e: ApiError) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(e.into_response().into_body(), 4096)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// K-8: every body carries `code`, the sub-code when there is one and `error` otherwise,
+    /// and keeps `error`, `detail` and `error_description` as they were.
+    #[tokio::test]
+    async fn every_body_carries_the_stable_code() {
+        let b = body_of(ApiError::bad_request(
+            "invalid_request",
+            "missing field `action`",
+        ))
+        .await;
+        assert_eq!(
+            b,
+            json!({"error": "invalid_request", "code": "invalid_request",
+                   "detail": "missing field `action`"})
+        );
+        let b = body_of(ApiError::unauthorized(REASON_TOKEN_EXPIRED, "expired")).await;
+        assert_eq!(
+            b,
+            json!({"error": "unauthorized", "code": "token_expired", "detail": "token_expired",
+                   "error_description": "token_expired"})
+        );
+        let b = body_of(
+            ApiError::bad_request("invalid_grant", "x").with_description("audience_mismatch"),
+        )
+        .await;
+        assert_eq!(b["error"], "invalid_grant");
+        assert_eq!(b["code"], "audience_mismatch");
+        assert_eq!(b["error_description"], "audience_mismatch");
+        let b = body_of(ApiError::internal("disk on fire")).await;
+        assert_eq!(b["code"], "server_error");
+        assert_eq!(b["detail"], INTERNAL_DETAIL);
+    }
+
+    /// `with_code` changes `code` only: `error`, `detail` and the absence of
+    /// `error_description` stay as they were, so a client that reads them sees no change.
+    #[tokio::test]
+    async fn with_code_sets_only_the_code() {
+        let b = body_of(
+            ApiError::bad_request("invalid_grant", "lease_revoked").with_code("lease_revoked"),
+        )
+        .await;
+        assert_eq!(
+            b,
+            json!({"error": "invalid_grant", "code": "lease_revoked", "detail": "lease_revoked"})
+        );
+        // `with_description` sends a sub-code in both fields again.
+        let b = body_of(
+            ApiError::bad_request("invalid_grant", "x")
+                .with_code("lease_revoked")
+                .with_description("replayed"),
+        )
+        .await;
+        assert_eq!(
+            (&b["code"], &b["error_description"]),
+            (&json!("replayed"), &json!("replayed"))
+        );
+    }
+
+    /// A subject token that verified but expired (itself, or a hop of its chain) answers
+    /// `token_expired`; any other verification failure stays `invalid_grant`. `error` and
+    /// `detail` are as before.
+    #[test]
+    fn an_expired_subject_token_answers_token_expired() {
+        use attenuo_token::TokenError;
+        let e = ApiError::from(TokenError::Expired);
+        assert_eq!(
+            (e.status, e.code.as_str(), e.stable_code()),
+            (StatusCode::BAD_REQUEST, "invalid_grant", "token_expired")
+        );
+        assert_eq!(e.detail, TokenError::Expired.to_string());
+        assert!(e.code_only, "no error_description");
+        e.debug_check();
+        let hop = TokenError::Chain(attenuo_core::ChainError::HopExpired {
+            index: 1,
+            expires_at: "1970-01-01T00:00:00Z".into(),
+        });
+        assert_eq!(ApiError::from(hop).stable_code(), "token_expired");
+        let e = ApiError::from(TokenError::InvalidSignature);
+        assert_eq!(e.stable_code(), "invalid_grant");
+        e.debug_check();
+    }
+
+    /// A refused mint names the request's fault in `code` and keeps status, `error` and
+    /// `detail` of the plain mapping, with no `error_description`; anything else maps as
+    /// before.
+    #[test]
+    fn a_refused_mint_names_its_reason_in_code() {
+        use attenuo_core::{AttenuationError, ChainError as C, NameError, NameKind};
+        use attenuo_token::TokenError as T;
+        type Case = (fn() -> T, &'static str, &'static str);
+        let cases: [Case; 7] = [
+            (
+                || {
+                    T::Chain(C::AttenuationViolated {
+                        index: 1,
+                        parent: 0,
+                        source: AttenuationError::Empty,
+                    })
+                },
+                "invalid_scope",
+                SCOPE_EXCEEDS_PARENT,
+            ),
+            (
+                || T::Chain(C::TooDeep { depth: 9, max: 8 }),
+                "invalid_scope",
+                CHAIN_TOO_DEEP,
+            ),
+            (
+                || {
+                    T::Chain(C::InvalidName {
+                        index: 1,
+                        source: NameError::Empty {
+                            kind: NameKind::Server,
+                        },
+                    })
+                },
+                "invalid_grant",
+                INVALID_CAPABILITY,
+            ),
+            (
+                || {
+                    T::Chain(C::InvalidLimit {
+                        index: 1,
+                        source: attenuo_core::limits::LimitError {
+                            capability: "github:x".into(),
+                            kind: attenuo_core::LimitKind::Calls,
+                            detail: "x".into(),
+                        },
+                    })
+                },
+                "invalid_grant",
+                INVALID_CAPABILITY,
+            ),
+            (
+                || T::Chain(C::EmptyAgentId { index: 1 }),
+                "invalid_grant",
+                INVALID_AGENT,
+            ),
+            (
+                || T::Chain(C::EmptySubject),
+                "invalid_grant",
+                INVALID_SUBJECT,
+            ),
+            (
+                || T::Chain(C::TtlOutOfRange),
+                "invalid_grant",
+                TTL_OUT_OF_RANGE,
+            ),
+        ];
+        for (make, error, code) in cases {
+            let plain = ApiError::from(make());
+            let got = mint_refusal(make());
+            assert_eq!(
+                (got.status, got.code.as_str(), got.stable_code()),
+                (StatusCode::BAD_REQUEST, error, code),
+                "{}",
+                got.detail
+            );
+            assert_eq!(got, plain.with_code(code));
+            got.debug_check();
+        }
+        // Not one of these: exactly as `From`.
+        for make in [
+            || T::ActorNotPermitted("x".into()),
+            || T::Expired,
+            || T::InvalidSignature,
+            || T::Chain(C::NoHops),
+            || T::Key("x".into()),
+        ] {
+            assert_eq!(mint_refusal(make()), ApiError::from(make()));
+        }
+    }
+
+    /// Debug builds refuse to send a code the table does not list, or lists with another
+    /// status or `error`, so a route test that reaches one fails.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "is not in ERROR_CODES")]
+    fn an_unlisted_code_panics_in_debug_builds() {
+        ApiError::bad_request("no_such_code", "x").debug_check();
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "is not in ERROR_CODES")]
+    fn a_listed_code_with_another_status_panics_in_debug_builds() {
+        ApiError::new(StatusCode::CONFLICT, "not_found", "x").debug_check();
+    }
+
+    /// Every `AuditError` and the token errors map to codes of the table.
+    #[test]
+    fn mapped_errors_are_in_the_table() {
+        for e in one_of_each_audit_error() {
+            ApiError::from(e).debug_check();
+        }
     }
 
     /// One value of every `AuditError` variant.
@@ -339,6 +721,19 @@ mod tests {
                 chain_id: "l1".into(),
                 max: 32,
             },
+            E::Fenced {
+                lock: "/var/lib/attenuo/audit.sqlite.lock".into(),
+                holder: Some(42),
+            },
+            E::Overloaded("the audit writer's queue is full"),
+            E::SchemaTooNew {
+                found: 2,
+                supported: 1,
+            },
+            E::NetworkFilesystem {
+                dir: "/mnt/nfs/attenuo".into(),
+                fs: "nfs",
+            },
         ]
     }
 
@@ -373,6 +768,12 @@ mod tests {
                 E::UnknownCharge(_) => (16, false),
                 E::ChargeRefunded(_) => (17, false),
                 E::TooManyPendingApprovals { .. } => (18, false),
+                E::Fenced { .. } => (19, true),
+                E::Overloaded(_) => (20, true),
+                // Only at start-up, which it stops.
+                E::SchemaTooNew { .. } => (21, true),
+                // Only at start-up, which it stops.
+                E::NetworkFilesystem { .. } => (22, true),
             }
         }
         let all = one_of_each_audit_error();

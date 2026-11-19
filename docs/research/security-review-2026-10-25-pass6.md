@@ -2,7 +2,7 @@
 
 - Date: 2026-10-25
 - Branch: `fix/security-pass-6` (base: `9536ec6` on main)
-- Related: [pass 1 and 2](security-review-2026-10-22.md), [pass 3](security-review-2026-10-23.md), [pass 4](security-review-2026-10-23-pass4.md), [pass 5](security-review-2026-10-24-pass5.md), [threat model](../spec/threat-model.md), [task board](../tasks/board.md)
+- Related: [pass 1 and 2](security-review-2026-10-22.md), [pass 3](security-review-2026-10-23.md), [pass 4](security-review-2026-10-23-pass4.md), [pass 5](security-review-2026-10-24-pass5.md), [threat model](../spec/threat-model.md), task board
 
 ## Scope and method
 
@@ -37,7 +37,7 @@ Every finding fixed here has a regression test that failed on the base commit an
 | SR-70 | policy: starter `default.cedar` `acme/` guards | Medium | Fixed |
 | SR-71 | core: `range` implication against `equals` and `one_of` | Low | Fixed |
 | SR-72 | CLI: constraint names and dry-run diagnostics | Low | Fixed |
-| SR-73 | core: `prefix` constraints and URL parsers | Info | Accepted |
+| SR-73 | core: `prefix` constraints and URL parsers | Info | Accepted; `path_prefix` added later for paths |
 | SR-74 | proxy: `stream.end` record window | Info | Accepted |
 | SR-75 | server: AuthZEN `X-Request-ID` and batch checks before authentication | Info | Accepted |
 | SR-76 | server: admin dry run with a stated budget | Info | Accepted |
@@ -82,6 +82,7 @@ The two Medium findings:
 - **Component.** `attenuo-core` `ArgConstraint::Prefix`.
 - **Attack.** A capability `{repo: {op: prefix, value: "acme/"}}` admits `acme/..\evil\api`, which a WHATWG parser resolves outside `acme/` (SR-70).
 - **Reason accepted.** A prefix is a plain string prefix, and the writing-policies guide already says it accepts `acme/a/../b` and to prefer `equals` or `one_of` for a whole repository name. What the tool makes of the string is not something a token constraint can know. The guide's paragraph on `like` now names the backslash, and the starter policy refuses it whatever the token says. Threat-model row added.
+- **Status (2026-11-12).** `prefix` is unchanged. A new constraint kind, `path_prefix`, compares a path by `/` segment and refuses a value with a `.` or `..` segment, `//`, a backslash, a control character or `%2e`, `%2f` or `%5c`, so `path_prefix: acme` refuses `acme/..\evil\api` and `path_prefix: /workspace/` refuses `/workspace/../etc/passwd` ([`prefix` or `path_prefix`](../concepts/capabilities-and-attenuation.md#prefixes-of-strings-and-of-paths)). `attenuo policy lint --config`, the server at startup and `token root`/`token exchange` warn about a `prefix` on a path-like argument. Tests: `capability::tests::path_prefix_*` and `prefix_keeps_admitting_what_path_prefix_refuses`, the `path_implication_is_sound` property, and `path_prefix_denies_a_dot_dot_escape_that_prefix_lets_through` in `attenuo-proxy`.
 
 ### SR-74: the `stream.end` window is per chain and reason, not per stream (Info, accepted)
 

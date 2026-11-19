@@ -78,6 +78,69 @@ pub enum AuditError {
         /// The cap, [`crate::MAX_PENDING_APPROVALS_PER_RUN`].
         max: usize,
     },
+    /// Another holder has the database's single-writer fence
+    /// ([`WriterFence`](crate::WriterFence)): another server process runs on this file.
+    ///
+    /// The pid is the one the lock file records: the last attenuo server that took the fence.
+    /// Any process that can open the file can lock it without writing it, so the holder may
+    /// be another program; the message says so rather than name a pid as the holder (SR-103).
+    #[error(
+        "{} is locked by another process: one server process per database file; stop the \
+         other instance first (in Kubernetes, use `strategy: Recreate`). {}",
+        lock.display(),
+        holder.map_or_else(
+            || "The lock file records no pid; find the holder with `fuser` or `lsof`.".to_string(),
+            |p| format!(
+                "The lock file records pid {p}, the last attenuo server that took it; if that \
+                 process is gone, another program holds the lock (find it with `fuser` or `lsof`)."
+            )
+        )
+    )]
+    Fenced {
+        /// The lock file, `<sqlite_path>.lock`.
+        lock: std::path::PathBuf,
+        /// The process id the lock file records, when it is readable: the last attenuo
+        /// server that took the fence, not necessarily the current holder.
+        holder: Option<u32>,
+    },
+    /// An append was shed instead of waiting without bound: the writer's queue was full, or
+    /// the writer did not take the record within the append timeout (a hung disk, say). The
+    /// record was not written and never will be, so the caller may undo what the decision
+    /// charged; the decision fails closed.
+    #[error("audit append shed: {0}")]
+    Overloaded(&'static str),
+    /// The database file's schema version (`PRAGMA user_version`) is newer than this build
+    /// knows: a newer attenuo wrote it. Nothing was read or written. Run the newer binary, or
+    /// restore the backup taken before the upgrade; there is no downgrade.
+    #[error(
+        "the database has schema version {found}, written by a newer attenuo; this build reads \
+         schema versions up to {supported}. Run the newer binary, or restore the backup taken \
+         before upgrading: there is no downgrade"
+    )]
+    SchemaTooNew {
+        /// The file's `user_version`.
+        found: u32,
+        /// [`SCHEMA_VERSION`](crate::SCHEMA_VERSION), the newest this build knows.
+        supported: u32,
+    },
+    /// The database's directory is on a network filesystem
+    /// ([`Filesystem::Network`](crate::Filesystem::Network)), where SQLite's WAL mode and the
+    /// single-writer fence's lock are not reliable. The server refuses to start on it unless
+    /// `[audit] allow_network_filesystem` is set.
+    #[error(
+        "{} is on a network filesystem ({fs}): SQLite in WAL mode needs every process on one \
+         host, and file locks there may not keep a second writer out, so the audit log and \
+         lease registry could be corrupted. Put sqlite_path on a local disk or a volume one \
+         host mounts (a ReadWriteOnce volume), or set `[audit] allow_network_filesystem = \
+         true` if only one host ever mounts this filesystem and its locking works.",
+        dir.display()
+    )]
+    NetworkFilesystem {
+        /// The directory that holds the database, after symbolic links are resolved.
+        dir: std::path::PathBuf,
+        /// The filesystem's usual name (`"nfs"`, `"cifs"`, `"9p"`, ...).
+        fs: &'static str,
+    },
 }
 
 impl<T> From<std::sync::PoisonError<T>> for AuditError {

@@ -65,14 +65,27 @@ export interface RefresherOptions {
 
 type Kind = "renew" | "exchange";
 
+const LEASE_GONE = ["lease_revoked", "lease_unknown"];
+
+/**
+ * A permanent failure as a RefreshError, or undefined when retrying can help. Reads the server's
+ * stable code (`stableCode`) first. An older server sent `code` `invalid_grant` for a refused
+ * renewal and the lease reason only in `detail`, so `detail` is the fallback when the code names
+ * no reason.
+ */
 function terminal(kind: Kind, e: unknown): RefreshError | undefined {
   if (!(e instanceof ApiError)) return undefined;
-  const detail = `${e.error} ${e.detail}`;
+  const code = e.stableCode;
+  const legacy = `${e.error} ${e.detail}`;
   let reason: string;
   if (e instanceof UnauthorizedError) {
-    reason = detail.includes("token_expired") ? "token_expired" : "refused";
+    const expired = code === "token_expired" || legacy.includes("token_expired");
+    reason = expired ? "token_expired" : "refused";
   } else if (kind === "renew" && e.status === 400 && e.error === "invalid_grant") {
-    const gone = detail.includes("lease_revoked") || detail.includes("lease_unknown");
+    let gone: boolean;
+    if (LEASE_GONE.includes(code)) gone = true;
+    else if (code === "lease_expired") gone = false;
+    else gone = LEASE_GONE.some((r) => legacy.includes(r));
     reason = gone ? "lease_revoked" : "lease_lost";
   } else if (e.status >= 400 && e.status < 500 && e.status !== 408 && e.status !== 429) {
     reason = "refused";

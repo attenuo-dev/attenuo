@@ -12,7 +12,6 @@ use attenuo_core::{DelegationChain, ToolCall};
 use attenuo_policy::authzen::{self, EvaluationRequest};
 use attenuo_policy::{ArgLabels, CallLabels, SessionLabels};
 use attenuo_token::{TokenError, VerifiedToken, Verifier};
-use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
@@ -23,6 +22,7 @@ use sha2::Digest;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
+use super::extract::Body;
 use super::parse_json;
 use crate::authz::{CounterSource, StatedBudget, StatedLimit, MAX_STATED_LIMITS};
 use crate::error::ApiError;
@@ -36,7 +36,7 @@ pub const CHAIN_SOURCE_TOKEN: &str = "token";
 pub const CHAIN_SOURCE_ADMIN: &str = "admin_supplied";
 
 fn lock_poisoned() -> ApiError {
-    ApiError::internal("policy engine lock poisoned")
+    ApiError::internal("loaded policy info lock poisoned")
 }
 
 /// `GET /admin/policies`: the policy set in force.
@@ -48,20 +48,14 @@ fn lock_poisoned() -> ApiError {
 ///
 /// # Errors
 ///
-/// 500 `server_error` when a policy lock is poisoned (a reload panicked).
+/// 500 `server_error` when the loaded-policy info lock is poisoned (a reload panicked).
 pub async fn get_policies(State(state): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
-    // Engine first, then the loaded-policy info: the order reload takes them in, so the pair
-    // always describes the same policy set.
-    let engine = state
-        .pipeline
-        .policy()
-        .read()
-        .map_err(|_| lock_poisoned())?;
-    let loaded = state
-        .loaded_policies
-        .read()
-        .map_err(|_| lock_poisoned())?
-        .clone();
+    // The snapshot is taken while the loaded-policy info is held for reading, and a reload
+    // swaps the engine while holding it for writing, so the pair describes one policy set.
+    let (engine, loaded) = {
+        let loaded = state.loaded_policies.read().map_err(|_| lock_poisoned())?;
+        (state.pipeline.policy_snapshot(), loaded.clone())
+    };
     let policies: Vec<Value> = engine
         .policy_texts()
         .into_iter()
@@ -90,7 +84,8 @@ pub async fn get_policies(State(state): State<Arc<AppState>>) -> Result<Json<Val
 /// # Errors
 ///
 /// 409 when no `policy.policies_path` is configured, and 500 `server_error` when the file cannot be
-/// read or a policy lock is poisoned. A file that does not lint is not an error but `ok: false`.
+/// read or the loaded policy info lock is poisoned. A file that does not lint is not an error
+/// but `ok: false`.
 pub async fn check_policies(State(state): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
     let path = state.policies_path.as_ref().ok_or_else(|| {
         ApiError::new(
@@ -104,11 +99,7 @@ pub async fn check_policies(State(state): State<Arc<AppState>>) -> Result<Json<V
         .map_err(|e| ApiError::internal(format!("reading {}: {e}", path.display())))?;
     let digest = hex::encode(sha2::Sha256::digest(text.as_bytes()));
     let report = {
-        let engine = state
-            .pipeline
-            .policy()
-            .read()
-            .map_err(|_| lock_poisoned())?;
+        let engine = state.pipeline.policy_snapshot();
         attenuo_policy::lint_with_options(
             &text,
             engine.schema_text(),
@@ -179,11 +170,10 @@ pub async fn check_policies(State(state): State<Arc<AppState>>) -> Result<Json<V
 /// 400 `invalid_request` for a body that is not a JSON object or an AuthZEN request, a non-string
 /// `token`, a malformed `session`, `approval`, `usage` or `budget` block, or a `budget` that does
 /// not match the call's limits; 400 `invalid_token` for a token that does not verify (other than by
-/// expiring); 400 `invalid_chain` for a body chain that fails `validate_at`; 500 `server_error`
-/// when a policy lock is poisoned.
+/// expiring); 400 `invalid_chain` for a body chain that fails `validate_at`.
 pub async fn evaluate_policies(
     State(state): State<Arc<AppState>>,
-    body: Bytes,
+    Body(body): Body,
 ) -> Result<Json<Value>, ApiError> {
     let now = state.now();
     let mut raw: Value = parse_json(&body)?;
@@ -246,6 +236,9 @@ pub async fn evaluate_policies(
         }
     };
 
+    // One policy set for every stage of the dry run, as for a decision.
+    let engine = state.pipeline.policy_snapshot();
+    let engine = engine.as_ref();
     // Output labels (ADR-0009): as given, or else the run's current taint state and, on a
     // tainted run, the arguments that match its span index now (for every call when a policy
     // reads argument taint, else for a destructive call; `Pipeline::arg_taint`).
@@ -253,7 +246,7 @@ pub async fn evaluate_policies(
         Some((s, args)) => (s, args, "request"),
         None => {
             let s = state.pipeline.run_labels(&chain).session;
-            let args = state.pipeline.arg_taint(&chain, &call, &s).context;
+            let args = state.pipeline.arg_taint(engine, &chain, &call, &s).context;
             (s, args, "store")
         }
     };
@@ -261,17 +254,18 @@ pub async fn evaluate_policies(
     // Read, never charged.
     let (budget, budget_source) = match &stated {
         None => {
-            let mut view = state.pipeline.budget_view(&chain, &call);
+            let mut view = state.pipeline.budget_view(engine, &chain, &call);
             // Per-user windows (run limits phase 3) are read with the run's usage.
             state
                 .pipeline
-                .add_user_windows(&mut view, &chain, &call, now);
+                .add_user_windows(engine, &mut view, &chain, &call, now);
             (view, "store")
         }
         Some(s) => {
-            let mut view = state
-                .pipeline
-                .budget_view_from(&chain, &call, CounterSource::Stated(s));
+            let mut view =
+                state
+                    .pipeline
+                    .budget_view_from(engine, &chain, &call, CounterSource::Stated(s));
             let arg_invalid = view
                 .context
                 .refusal
@@ -296,12 +290,7 @@ pub async fn evaluate_policies(
         Some(u) => (u, "request"),
         None if stated.is_some() => (budget.usage.unwrap_or_default(), "request"),
         None => {
-            // A poisoned engine lock counts as tracking, as the pipeline treats it.
-            let tracked = state
-                .pipeline
-                .policy()
-                .read()
-                .map_or(true, |e| e.tracks_usage());
+            let tracked = engine.tracks_usage();
             let source = if tracked { "store" } else { "untracked" };
             (budget.usage.unwrap_or_default(), source)
         }
@@ -313,7 +302,9 @@ pub async fn evaluate_policies(
         budget: budget.context.clone(),
         usage,
     };
-    let o = state.pipeline.evaluate_policy(&chain, &call, &labels, now);
+    let o = state
+        .pipeline
+        .evaluate_policy(engine, &chain, &call, &labels, now);
     let mut out = json!({
         "decision": o.decision,
         "reason": o.reason,

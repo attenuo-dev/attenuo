@@ -1,6 +1,6 @@
 # Cedar-aware list filtering: design
 
-- Status: proposed; the first slice (section 4) is merged to `main` as an opt-in setting (built on `feat/cedar-list-filter`, 2026-11-05), measured in [bench/2026-11-05-vm-list-screen.md](bench/2026-11-05-vm-list-screen.md) and described in [server pipeline, list filtering](server.md#list-filtering). The decision is [ADR-0011](../decisions/0011-cedar-aware-list-filtering.md) (proposed); the maintainer decides.
+- Status: accepted with ADR-0011, 2026-11-12; the first slice (section 4) is merged to `main` as an opt-in setting (#158, 2026-11-06), measured in [bench/2026-11-05-vm-list-screen.md](bench/2026-11-05-vm-list-screen.md) and described in [server pipeline, list filtering](server.md#list-filtering). The decision is [ADR-0011](../decisions/0011-cedar-aware-list-filtering.md).
 - Date: 2026-10-25. Base: `main` at 76cff3a.
 - Related: [server pipeline, list filtering](server.md#list-filtering), [decision pipeline](server.md#the-decision-pipeline), [capabilities](../concepts/capabilities-and-attenuation.md), [ADR-0005](../decisions/0005-policy-decision-point.md), [ADR-0009](../decisions/0009-output-labelling.md), [ADR-0010](../decisions/0010-run-limits.md), [listen-stream filter bench](bench/2026-10-24-vm-listen-stream-filter.md).
 
@@ -14,7 +14,7 @@ The proxy filters `tools/list`, `resources/list`, `resources/templates/list` and
 - a tool the catalog does not hold, under `[policy] unknown_tools = "deny"` (`tool_not_in_catalog`, stage 1b);
 - a tool whose hard run limit is spent (`budget_exhausted`).
 
-The agent wastes calls on them, and the model reads descriptions of tools it cannot use. The board carries "consider Cedar-aware list filtering" twice ([board](../tasks/board.md)). The difficulty is that a `tools/call` decision depends on things that do not exist at list time: the arguments (`context.input`), the run's taint (`context.session`, `args_contain_untrusted`), a taken approval (`context.approval`), run usage and budgets (`context.budget`, `context.usage`), and the clock (`now_unix`). What is known at list time is the principal and its chain (`originating_user`, `chain`), the action and the tool's catalog attributes.
+The agent wastes calls on them, and the model reads descriptions of tools it cannot use. The project's task list carried "consider Cedar-aware list filtering" twice when this note was written. The difficulty is that a `tools/call` decision depends on things that do not exist at list time: the arguments (`context.input`), the run's taint (`context.session`, `args_contain_untrusted`), a taken approval (`context.approval`), run usage and budgets (`context.budget`, `context.usage`), and the clock (`now_unix`). What is known at list time is the principal and its chain (`originating_user`, `chain`), the action and the tool's catalog attributes.
 
 Nothing here may change a `tools/call` decision. Every call is still decided by the full pipeline. Hiding an entry is a usability property, not a security one: an agent that calls a hidden tool by name is decided as today.
 

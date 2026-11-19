@@ -1,9 +1,11 @@
 name: CI
 
 # Where each check runs (docs/research/ci-minutes-2026-11-05.md has the numbers):
-# - every pull request: everything below except the macOS tests and the fuzz build; a pull
-#   request that only touches documentation (see the `changes` job) runs only the link check.
-# - every push to main: the same, plus the fuzz build.
+# - every pull request: everything below except the macOS tests, the nightly fuzz build and
+#   the docker compose demo (those two run on a pull request that changes their files); a pull
+#   request that only touches documentation (see the `changes` job) runs only the link check,
+#   and the getting-started check when it changes that guide.
+# - every push to main: the same, plus the nightly fuzz build and the docker compose demo.
 # - weekly (Monday) and on manual dispatch: everything, including the macOS tests.
 # macOS minutes are billed at 10x on a private repository and the hosted macOS arm64 pool often
 # cannot start the job within 15 minutes, so macOS is weekly, not per push.
@@ -53,6 +55,9 @@ jobs:
     outputs:
       rust: ${{ github.event_name != 'pull_request' || steps.filter.outputs.rust == 'true' }}
       fuzz: ${{ github.event_name != 'pull_request' || steps.filter.outputs.fuzz == 'true' }}
+      docker: ${{ github.event_name != 'pull_request' || steps.filter.outputs.docker == 'true' }}
+      guide: ${{ github.event_name != 'pull_request' || steps.filter.outputs.guide == 'true' }}
+      lean: ${{ github.event_name != 'pull_request' || steps.filter.outputs.lean == 'true' }}
     steps:
       - id: filter
         if: github.event_name == 'pull_request'
@@ -73,6 +78,17 @@ jobs:
             # are one brace pattern: a file matches when it is under fuzz/ or is this file.
             fuzz:
               - "{fuzz/**,.github/workflows/ci.yml}"
+            # The image and compose files, the compose demo's config and its test.
+            docker:
+              - "{Dockerfile,.dockerignore,docker-compose.yml,examples/github-leak-demo/config.docker.toml,scripts/compose-smoke.sh,.github/workflows/ci.yml}"
+            # The getting-started guide and the README are documentation, which `rust` leaves
+            # out, but their commands are checked by running them (the `getting-started` job).
+            guide:
+              - "{docs/guides/getting-started.md,README.md,scripts/check-getting-started.sh,scripts/check-doc-commands.sh}"
+            # The Lean proof of the covering rule, its checks, and the Rust code and test the
+            # differential check runs against it.
+            lean:
+              - "{proofs/lean/**,scripts/check-lean.sh,scripts/check-lean-differential.sh,crates/attenuo-core/**,Cargo.lock,.github/workflows/ci.yml}"
 
   fmt:
     name: rustfmt
@@ -104,7 +120,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
-  # The test, demo, policy-tests and console-browser jobs build the same debug dependencies with
+  # The test, demo, getting-started, policy-tests and console-browser jobs build the same debug dependencies with
   # the same flags, so they share one cache (`shared-key: debug`), written by this job on main.
   test:
     name: test (ubuntu-latest, stable)
@@ -176,7 +192,9 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo check --workspace --all-targets --locked
+      # `+<version>`: rust-toolchain.toml pins the release CI otherwise uses, and it takes
+      # precedence over the toolchain the step above made the default.
+      - run: cargo +${{ steps.msrv.outputs.version }} check --workspace --all-targets --locked
 
   deny:
     name: cargo deny
@@ -204,7 +222,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
         with:
           tool: cargo-audit@0.22.2
       - run: cargo audit --file Cargo.lock
@@ -228,9 +246,48 @@ jobs:
       # the binaries built above and fails on any step, audit count or upstream count that differs.
       - name: Multi-hop delegation demo
         run: bash examples/multi-hop-demo/run.sh
+      # Hop 0 from an ID token: a mock OIDC IdP (the server's mock_idp example), POST /token with
+      # the dev mint off, one exchange, one allowed and one denied call. Same checks as above.
+      - name: IdP exchange demo
+        run: bash examples/idp-exchange-demo/run.sh
       # The admin console listener against the real binary: page and CSP, admin token, no dev mint.
       - name: Admin console smoke test
         run: bash scripts/admin-ui-smoke.sh
+
+  # Runs every command of docs/guides/getting-started.md in order, as a reader would, against
+  # the debug binaries its step 1 builds, and checks the outputs the guide shows
+  # (scripts/check-getting-started.sh); then the same for the README's server, curl and CLI
+  # sections (scripts/check-doc-commands.sh README.md). On every pull request that can change
+  # Rust, and on one that changes only the guide, the README or the scripts.
+  getting-started:
+    name: getting-started guide and README
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.guide == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: debug
+          save-if: false
+      - run: bash scripts/check-getting-started.sh
+      - run: bash scripts/check-doc-commands.sh README.md
+
+  # Builds the release and demo images and plays the leak demo through docker-compose.yml
+  # (scripts/compose-smoke.sh): release image contents, `attenuo health` as the HEALTHCHECK, the
+  # admin listener unpublished. A release build of the workspace, so on pull requests only when
+  # the Docker files change; always on main, weekly and on dispatch.
+  compose:
+    name: docker compose demo
+    needs: changes
+    if: needs.changes.outputs.docker == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: bash scripts/compose-smoke.sh
 
   # The admin console in headless Chromium: every page in both themes, with zero console
   # errors and CSP violations allowed (scripts/console-smoke.sh, tests/console/).
@@ -238,7 +295,10 @@ jobs:
     name: admin console in a browser
     needs: changes
     if: needs.changes.outputs.rust == 'true'
-    runs-on: ubuntu-latest
+    # Pinned: the Playwright version in tests/console/package.json has no Chromium build for
+    # the image ubuntu-latest now points at ("does not support chromium on ubuntu26.04-x64").
+    # Move back to ubuntu-latest together with a Playwright bump.
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -288,11 +348,31 @@ jobs:
       - name: attenuo policy test (config/policies)
         run: cargo run --locked -q -p attenuo-cli -- policy test --fail-on-unexercised config/policies/*_test.yaml
 
+  # Compiles every fuzz target and example on stable with `--cfg fuzzing` (as cargo-fuzz sets
+  # it), against fuzz/Cargo.lock with `--locked`, on every pull request that can change Rust. A
+  # library change that breaks a fuzz target, or leaves the fuzz crate's lockfile stale, fails
+  # here; the nightly build below runs on fewer events and cargo-fuzz has no `--locked`.
+  fuzz-check:
+    name: fuzz targets compile (stable)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      RUSTFLAGS: --cfg fuzzing -D warnings
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: fuzz
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: cargo check --manifest-path fuzz/Cargo.toml --bins --examples --locked
+
   # Builds the cargo-fuzz targets (nightly, outside the workspace) and runs each over its seed
-  # corpus once, so a target that stops compiling or a seed that crashes fails CI. Long fuzzing
-  # runs are manual; see docs/design/fuzzing.md. Runs on main, weekly, on dispatch, and on a
-  # pull request that changes fuzz/ or this workflow; a library change that breaks a fuzz target
-  # shows up on the main push after the merge.
+  # corpus once, so a seed that crashes fails CI. Long fuzzing runs are manual; see
+  # docs/design/fuzzing.md. Runs on main, weekly, on dispatch, and on a pull request that changes
+  # fuzz/ or this workflow; `fuzz-check` above catches a target that stops compiling sooner.
   fuzz-build:
     name: fuzz targets build
     needs: changes
@@ -320,6 +400,40 @@ jobs:
           for t in $(cargo +nightly fuzz list); do
             cargo +nightly fuzz run "$t" -- -runs=0
           done
+
+  # Builds the Lean model of the covering rule (proofs/lean) and checks that it has no `sorry`
+  # and only Lean's standard axioms, then runs the model against the Rust code on the cases of
+  # crates/attenuo-core/tests/lean_differential.rs. elan is the v4.2.4 release binary, checked
+  # against its sha256 (the installer script at a pinned commit still fetched whichever elan
+  # release was latest, unchecked: SR-114); elan then installs the toolchain
+  # proofs/lean/lean-toolchain names. Core Lean only, no Mathlib.
+  lean:
+    name: Lean proof of the covering rule
+    needs: changes
+    if: needs.changes.outputs.lean == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install elan
+        env:
+          ELAN_VERSION: "4.2.4"
+          ELAN_SHA256: "42b94d4244e8353142c456ec0e4ca6528fd898a6c604d4059f494e706e431f63"
+        run: |
+          set -euo pipefail
+          url="https://github.com/leanprover/elan/releases/download/v${ELAN_VERSION}/elan-x86_64-unknown-linux-gnu.tar.gz"
+          curl --proto '=https' --tlsv1.2 -sSfL -o "$RUNNER_TEMP/elan.tar.gz" "$url"
+          echo "${ELAN_SHA256}  $RUNNER_TEMP/elan.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/elan.tar.gz" -C "$RUNNER_TEMP"
+          "$RUNNER_TEMP/elan-init" -y --default-toolchain none --no-modify-path
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+      - run: bash scripts/check-lean.sh
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: debug
+          save-if: false
+      - run: bash scripts/check-lean-differential.sh
 
   # The Markdown link check runs on every pull request, documentation-only ones included;
   # rustdoc runs when Rust can have changed.
@@ -353,7 +467,7 @@ jobs:
   ci-ok:
     name: ci-ok
     if: always()
-    needs: [changes, fmt, clippy, test, msrv, deny, audit, demo, console-browser, policy-tests, fuzz-build, docs]
+    needs: [changes, fmt, clippy, test, msrv, deny, audit, demo, getting-started, compose, console-browser, policy-tests, fuzz-check, fuzz-build, lean, docs]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

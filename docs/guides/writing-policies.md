@@ -67,6 +67,8 @@ It does three jobs:
 2. **Schema generation.** Each catalog entry becomes a declared action, `Action::"<server>/<tool>"`, and each `inputs` entry a typed, optional attribute of `context.input`. Policies are validated against this schema at load time, so a typo in an argument name or a comparison of a string to a number fails the load instead of misbehaving on a call. A policy that names `Action::"github/x"` validates only if the catalog has a tool `x` under `github`. Argument types are `string`, `long`, `bool`, `decimal`, or `{ set = "string" }`. A `decimal` argument is Cedar's `decimal` type, for amounts with a fraction: `inputs = { amount = "decimal" }` and `context.input.amount.lessThan(decimal("100.0"))`. Cedar has no `<` on decimals, so use `lessThan`, `lessThanOrEqual`, `greaterThan` and `greaterThanOrEqual`.
 3. **Argument types on every call.** Evaluation itself is schema-free, so the types are also checked on each call, before Cedar: a present, non-null argument of another type than declared (a number where `repo` is a `string`, a single string where a set is declared, `2.5` for a `long`) is denied with reason `input_type_mismatch`, whether or not a policy reads it. Integral numbers, `5.0` included, count as `long`, as Cedar sees them. For a `decimal`, any number with at most 4 fractional digits counts, whole or not (`100` is `decimal("100.0")`); `12.34567`, a number beyond Cedar's range and a numeric string are refused. Nothing is coerced or rounded, except by the JSON parse itself: a number with more digits than a double holds (more than 15 significant digits) is the nearest double, which is also what the upstream is sent. Arguments the catalog declares no type for are not checked and reach Cedar as sent, and so do all arguments of a tool evaluated under `unknown_tools = "sensitive"` or `"allow"`. Before this check a mistyped argument that a policy read ended as `policy_error`, and one that no policy read went to the upstream.
 
+Write argument names exactly as the tool declares them, in the catalog, in capability constraints and limits, and in policies. Every check reads an argument by its exact name, while an MCP server written in Go with `encoding/json` matches names without regard to case: it reads `Path` as its `path`. So a call whose argument name differs only in case from a name the decision reads for that tool (in its catalog entry, in a constraint or limit of a capability that covers it, or under `context.input` or in a `context.untrusted_args` test of any loaded policy) is denied before the capability stage with reason `argument_case_mismatch`; the exact name passes. A name nothing reads is not checked, since attenuo has no schema of the tool, so declare in `inputs` the arguments your policies and limits are about.
+
 Server names (the `[[upstreams]]` names and the catalog's server keys) and tool names may not contain `/`, so `"<server>/<tool>"` always splits one way. The one exception is on the tool side: the proxy authorizes MCP methods other than `tools/call` under their method name (`resources/read`, `prompts/get`), so those catalog entries are `[policy.catalog.github."resources/read"]` and their action is `Action::"github/resources/read"`. A `tools/call` can never carry a `/` in its tool name, so a tool cannot pose as one of these methods. The server refuses to start with a catalog entry that breaks these rules.
 
 ### User attributes
@@ -78,7 +80,7 @@ The schema declares four optional attributes of `context.originating_user.attrib
 user_attributes = { groups = "set<string>", department = "string" }
 ```
 
-Types are `string`, `long`, `bool` and `set<T>` (for example `set<string>`); `decimal` is for catalog inputs only. The declarations are merged over the built-in four, so you can also re-type one of them. Then guard every use, since attributes are optional:
+Types are `string`, `long`, `bool` and `set<T>` (for example `set<string>`); `decimal` is for catalog inputs only. The declarations are merged over the built-in four, so you can also re-type one of them. Then guard every use, since attributes are optional (this example also needs a `[policy.catalog.github.create_deployment]` entry):
 
 ```cedar
 @id("platform_engineers_may_deploy")
@@ -108,7 +110,7 @@ The request data does not change: attenuo fills only the default attributes. Dec
 
 ## Patterns
 
-All of these assume the catalog above.
+All of these assume the catalog above. The banking examples use the `send_money` entry shown with them, and `merge_only_release_bot` below needs a `github.merge_pull_request` entry; without them `attenuo policy lint --config` reports the action as unrecognized.
 
 ### Read-only agents
 
@@ -182,7 +184,7 @@ when {
 
 A pattern in policy and a `prefix` constraint in the token's capability do different jobs:
 
-- A capability constraint (`{ op: prefix, value: "acme/" }`, `equals`, `one_of`) is checked before Cedar, travels with the token, and can only be narrowed by each delegation (`acme/` to `acme/api`). Use it for "this agent, for this task, may only touch these repositories": it is per token, and a policy cannot widen it. `prefix` is a plain string prefix with the same blind spots as `*` (it accepts `acme/` and `acme/a/../b`), so for a whole repository name prefer `equals` or `one_of`.
+- A capability constraint (`{ op: prefix, value: "acme/" }`, `equals`, `one_of`) is checked before Cedar, travels with the token, and can only be narrowed by each delegation (`acme/` to `acme/api`). Use it for "this agent, for this task, may only touch these repositories": it is per token, and a policy cannot widen it. `prefix` is a plain string prefix with the same blind spots as `*` (it accepts `acme/` and `acme/a/../b`), so for a whole repository name prefer `equals` or `one_of`. For a file path use `path_prefix`, which compares by `/` segment and refuses `..`, `//`, `\` and percent-encoded separators ([`prefix` or `path_prefix`](../concepts/capabilities-and-attenuation.md#prefixes-of-strings-and-of-paths)).
 - A policy pattern applies to every token the server sees and can say what a prefix cannot (no second `/`, not empty). Use it for the organisation-wide rule, the shape every value must have whatever a token says.
 
 The two compose: the token narrows to `prefix: acme/`, the policy rejects the malformed names inside it. The "capability stage" cases in [`config/policies/default_test.yaml`](https://github.com/attenuo-dev/attenuo/blob/main/config/policies/default_test.yaml) show both together.
@@ -226,7 +228,7 @@ Set `[approvals] client_id` to a client the agent does not control, such as your
 
 The grant also returns a signed approval token (`approval_token`, `typ: attenuo-approval+jwt`). An agent may send it with the retry in `params._meta["dev.attenuo/approval"]` (the SDK helpers do); the server then uses exactly the approval the token names, after checking that it is for this call, this hop, this run and, for a DPoP-bound agent, this key. Policy sees the same `context.approval`. A token that fails those checks, or whose approval was already used or declined, denies the call with `approval_invalid` whatever the policy says. Because the token is signed with the issuer key, an external PEP can check it offline; see [Approval tokens](../reference/http-api.md#approval-tokens).
 
-[`config/policies/output-labels.cedar`](../../config/policies/output-labels.cedar) has this rule, the mail rule from the design and the rule of the next section, with tests in `output-labels_test.yaml` next to it.
+[`config/policies/output-labels.cedar`](https://github.com/attenuo-dev/attenuo/blob/main/config/policies/output-labels.cedar) has this rule, the mail rule from the design and the rule of the next section, with tests in `output-labels_test.yaml` next to it.
 
 ### Asking only when an argument copies untrusted output
 
@@ -263,7 +265,7 @@ when {
 };
 ```
 
-`calls_remaining` and `amount_remaining` are what is left before this call, the smallest over every matching limit. `destination_new` is false once the call's `calls_per` or `distinct` value has been used in an earlier allowed call. [`config/policies/run-limits.cedar`](../../config/policies/run-limits.cedar) has this rule and a repeat-payee rule, with tests in `run-limits_test.yaml`.
+`calls_remaining` and `amount_remaining` are what is left before this call, the smallest over every matching limit. `destination_new` is false once the call's `calls_per` or `distinct` value has been used in an earlier allowed call. [`config/policies/run-limits.cedar`](https://github.com/attenuo-dev/attenuo/blob/main/config/policies/run-limits.cedar) has this rule and a repeat-payee rule, with tests in `run-limits_test.yaml`.
 
 ### Limits over run usage
 
@@ -294,7 +296,7 @@ when {
 };
 ```
 
-The gated call gets `-32008` with `usage` in its data; once the user or an operator grants it, the identical retry is allowed and counted, so the next payment asks again. Only allowed calls are counted, and an approval never raises a token's own limits. The figures are what the run had before this call, so `calls >= 1` means "not the first". An `amount` value that is not a non-negative integer adds nothing; a list-valued `destination` counts each element. A rule over `destination_seen` asks only for a repeat to the same payee or recipient, however many others the run has paid. With `destination = "url#host"` in the catalog, `destination_seen` compares the hosts of a URL input, so a rule can ask when a run fetches from a site it has not used before. Usage ends with the run: revoking its root lease deletes it. [`config/policies/run-usage.cedar`](../../config/policies/run-usage.cedar) has these rules, a per-recipient mail rule and a per-site fetch rule, with tests in `run-usage_test.yaml`.
+The gated call gets `-32008` with `usage` in its data; once the user or an operator grants it, the identical retry is allowed and counted, so the next payment asks again. Only allowed calls are counted, and an approval never raises a token's own limits. The figures are what the run had before this call, so `calls >= 1` means "not the first". An `amount` value that is not a non-negative integer adds nothing; a list-valued `destination` counts each element. A rule over `destination_seen` asks only for a repeat to the same payee or recipient, however many others the run has paid. With `destination = "url#host"` in the catalog, `destination_seen` compares the hosts of a URL input, so a rule can ask when a run fetches from a site it has not used before. Usage ends with the run: revoking its root lease deletes it. [`config/policies/run-usage.cedar`](https://github.com/attenuo-dev/attenuo/blob/main/config/policies/run-usage.cedar) has these rules, a per-recipient mail rule and a per-site fetch rule, with tests in `run-usage_test.yaml`.
 
 ### Limits per user across runs
 
@@ -312,7 +314,7 @@ when {
 };
 ```
 
-The server keeps a window only for the kinds a loaded policy reads (the rule above keeps `day`, not `hour`); a kind it does not keep reads as zero. Starting a new run, or revoking one, does not reset a window. An injected agent that spends the window blocks the user's other runs until the window ends, so prefer the asking form, and use a plain `forbid` for a regulated cap that no approver may pass. If the window cannot be read, the policy sees the largest `Long` for both figures, so a count rule refuses or asks and an amount rule overflows and denies. Windows are exact only on one server process: see [deploying](deploying.md). [`config/policies/user-windows.cedar`](../../config/policies/user-windows.cedar) has an asking daily cap and a hard hourly count, with tests in `user-windows_test.yaml`.
+The server keeps a window only for the kinds a loaded policy reads (the rule above keeps `day`, not `hour`); a kind it does not keep reads as zero. Starting a new run, or revoking one, does not reset a window. An injected agent that spends the window blocks the user's other runs until the window ends, so prefer the asking form, and use a plain `forbid` for a regulated cap that no approver may pass. If the window cannot be read, the policy sees the largest `Long` for both figures, so a count rule refuses or asks and an amount rule overflows and denies. Windows are exact only on one server process: see [deploying](deploying.md). [`config/policies/user-windows.cedar`](https://github.com/attenuo-dev/attenuo/blob/main/config/policies/user-windows.cedar) has an asking daily cap and a hard hourly count, with tests in `user-windows_test.yaml`.
 
 ### Outbound arguments
 
@@ -349,7 +351,7 @@ forbid (principal, action, resource)
 when { context.untrusted_outbound == true && !context.approval.present };
 ```
 
-A matched search phrase or other argument that is not outbound leaves it `false`. When the span index cannot be read, or the call carries more than 8,000 fingerprints, every unpinned argument with a fingerprint counts as matched (`unreadable`), so an outbound one sets `context.untrusted_outbound` too. Both rules run under the usual approval flow (`-32008`, then the approved retry). The first rule leaves a run's first fetch free and depends on order: if the attacker's host is the first one fetched, it is not new. A tool with both `destination` and `outbound` keeps `destination` as it was and counts the outbound values next to it, and `destination_seen` is true when any of them was seen. The examples are in [`config/policies/run-usage.cedar`](../../config/policies/run-usage.cedar) and [`config/policies/output-labels.cedar`](../../config/policies/output-labels.cedar). The background is in the [read-side exfiltration design](../design/read-side-exfiltration.md).
+A matched search phrase or other argument that is not outbound leaves it `false`. When the span index cannot be read, or the call carries more than 8,000 fingerprints, every unpinned argument with a fingerprint counts as matched (`unreadable`), so an outbound one sets `context.untrusted_outbound` too. Both rules run under the usual approval flow (`-32008`, then the approved retry). The first rule leaves a run's first fetch free and depends on order: if the attacker's host is the first one fetched, it is not new. A tool with both `destination` and `outbound` keeps `destination` as it was and counts the outbound values next to it, and `destination_seen` is true when any of them was seen. The examples are in [`config/policies/run-usage.cedar`](https://github.com/attenuo-dev/attenuo/blob/main/config/policies/run-usage.cedar) and [`config/policies/output-labels.cedar`](https://github.com/attenuo-dev/attenuo/blob/main/config/policies/output-labels.cedar). The background is in the [read-side exfiltration design](../design/read-side-exfiltration.md).
 
 ### Chain depth
 
@@ -376,7 +378,7 @@ forbid(principal in Agent::"untrusted-summarizer", action, resource)
 when { !resource.readonly };
 ```
 
-**Warning: agent identity is only as strong as actor authentication.** The agent ids in a chain are whatever the token exchange recorded. With `[token] require_actor_auth = true` (the default) an exchange must authenticate as its `actor`, with that agent's `[[agents]]` client secret or with an `actor_token` from an `[[actor_trust]]` issuer (`[token] actor_auth`). With a secret, an id in the chain means "someone holding that agent's secret"; with an actor token, "a workload the identity system vouched for", which is only as strong as that system and its `subject_to_agent` mapping. An operator who turns the setting off makes the `actor` an assertion again. Treat agent-keyed rules as defence in depth. Put the real boundary in things the holder cannot change: the capabilities in the token (attenuation only narrows), attributes of the originating user, and chain depth.
+**Warning: agent identity is only as strong as actor authentication.** The agent ids in a chain are whatever the token exchange recorded. With `[token] require_actor_auth = true` (the default) an exchange must authenticate as its `actor`, with that agent's `[[agents]]` client secret or client key (`private_key_jwt`), or with an `actor_token` from an `[[actor_trust]]` issuer (`[token] actor_auth`). With a secret or a client key, an id in the chain means "someone holding that agent's secret or private key"; with an actor token, "a workload the identity system vouched for", which is only as strong as that system and its `subject_to_agent` mapping. An operator who turns the setting off makes the `actor` an assertion again. Treat agent-keyed rules as defence in depth. Put the real boundary in things the holder cannot change: the capabilities in the token (attenuation only narrows), attributes of the originating user, and chain depth.
 
 ### Migrating from bare actions
 
@@ -412,7 +414,8 @@ cases:
       arguments: { repo: alice/public-docs, path: README.md }
     expect: allow                   # or deny
     reason: policy_allow            # optional: policy_allow | policy_deny | approval_required |
-                                    # capability_denied | input_type_mismatch | policy_error
+                                    # capability_denied | input_type_mismatch | policy_error |
+                                    # argument_case_mismatch
     policy_ids: [read_file_public_repos_only]   # optional; the policies that decided it, as a set
 ```
 
@@ -459,14 +462,19 @@ The harness builds a real `DelegationChain` and calls the same `PolicyEngine::au
 attenuo policy test policy_test.yaml [more.yaml ...] [--fail-on-unexercised] [--schema-file F] [--watch] [--json]
 ```
 
-```
+For example, with a policy `loose_read` that permits every `read_file` appended to the demo's `policy.cedar`, and the four-agent case taken out of its `policy_test.yaml` (the first lines of the run):
+
+```text
 examples/github-leak-demo/policy_test.yaml
-  ✓ coder may read a public repo  (allow: policy_allow [read_file_public_repos_only])
+  ✗ coder may read a public repo  (allow: policy_allow [loose_read, read_file_public_repos_only])
+      expected policy_ids [read_file_public_repos_only], got [loose_read, read_file_public_repos_only]
   ✗ the injected read of a private repo is denied  (allow: policy_allow [loose_read])
       expected deny, got allow (policy_allow)
+      expected reason policy_deny, got policy_allow
+  ...
 
-8 passed, 1 failed (9 cases in 1 file)
-1 of 5 policies not exercised:
+7 passed, 3 failed (10 cases in 1 file)
+1 of 6 policies not exercised:
   examples/github-leak-demo/policy.cedar:37  forbid_deep_chains
 ```
 
@@ -525,7 +533,7 @@ The same runner is available as a library, `attenuo_policy::testing`, for tests 
 attenuo policy lint policy.cedar --config server.toml [--schema] [--json]
 ```
 
-Parses the file, flags bare (not server-scoped) actions, and validates it against the schema generated from the catalog in `--config`, printing each problem as `file:line:col: error[stage]: message`. Exit `0` clean, `2` errors. `--schema` also prints the schema it validated against, which is the quickest way to see which actions and argument names are declared. Without `--config` the tools are declared from the policy's own `<server>/<tool>` action names, so a correct policy passes; `context.input` and the user attributes are not declared, so "impossible policy" warnings are dropped for policies that read them, and a `note:` says that `resource.readonly`, `resource.sensitive` and input types were not checked, and bare or malformed action names are listed as not declared. Pass `--config` for the full check.
+Parses the file, flags bare (not server-scoped) actions, and validates it against the schema generated from the catalog in `--config`, printing each problem as `file:line:col: error[stage]: message`. Exit `0` clean, `2` errors. `--schema` also prints the schema it validated against, which is the quickest way to see which actions and argument names are declared. Without `--config` the tools are declared from the policy's own `<server>/<tool>` action names, so a correct policy passes; `context.input` and the user attributes are not declared, so "impossible policy" warnings are dropped for policies that read them, and a `note:` says that `resource.readonly`, `resource.sensitive` and input types were not checked, and bare or malformed action names are listed as not declared. Pass `--config` for the full check of the policy. It does not run the server's start-up checks on the configuration, so a configuration that passes can still refuse to start ([CLI reference](../reference/cli.md#policy-lint-policy)).
 
 ### In CI
 
@@ -561,6 +569,6 @@ Pin the install to a tag or `--rev` once releases exist, so a CLI change cannot 
 - A capability denial, to prove the chain is narrower than the policy.
 - The boundary of numeric limits (`depth > 3`: three agents pass, four do not).
 
-[`config/policies/default_test.yaml`](../../config/policies/default_test.yaml) does each of these for the starter policy set, `default.cedar`.
+[`config/policies/default_test.yaml`](https://github.com/attenuo-dev/attenuo/blob/main/config/policies/default_test.yaml) does each of these for the starter policy set, `default.cedar`.
 
 A `forbid` that never appears in a passing test is a `forbid` you have not shown works. The unexercised list at the end of every run names the ones no case reached at all.

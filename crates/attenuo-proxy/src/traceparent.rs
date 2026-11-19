@@ -18,6 +18,15 @@ use axum::http::HeaderMap;
 /// subscriber routes this target to the exporter only, and every other target to the log only.
 pub const OTEL_TARGET: &str = "attenuo::otel";
 
+/// A count or sequence number as an exported span attribute. `tracing` hands a `u64` field to
+/// the OpenTelemetry layer as a debug string, so an attribute recorded from a `u64` or `usize`
+/// reached a collector as `"42"`; recorded as an `i64` it is an OTLP integer, which is what
+/// `http.response.status_code` is in the semantic conventions and what a backend compares.
+/// Saturates at `i64::MAX`, which no sequence number or chain depth reaches.
+pub fn otel_int(v: u64) -> i64 {
+    i64::try_from(v).unwrap_or(i64::MAX)
+}
+
 /// The W3C Trace Context request header.
 pub const TRACEPARENT_HEADER: &str = "traceparent";
 

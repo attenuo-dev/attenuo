@@ -6,7 +6,10 @@
  * the URL and the header; the rest is the MCP client's normal setup.
  *
  *     cd examples/typescript-agent && npm install
- *     ATTENUO_SERVER=http://127.0.0.1:8080 ATTENUO_ADMIN_TOKEN=demo-admin-token npm run mcp
+ *     ATTENUO_SERVER=http://127.0.0.1:18080 ATTENUO_ADMIN_TOKEN=demo-admin-token npm run mcp
+ *
+ * against the server and fake upstream started as in `agent.ts`'s header (the GitHub-leak demo's
+ * config, which listens on 127.0.0.1:18080).
  *
  * Tested with @modelcontextprotocol/sdk 1.32.1 against the fake GitHub MCP server of the demo
  * (`npm run mcp` here; the integration test runs it too).

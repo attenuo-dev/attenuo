@@ -9,6 +9,7 @@
 import { h, replace } from './dom.js';
 import {
   api, setToken, forgetToken, hasToken, setUnauthorizedHandler, clearStatus, showError,
+  setIdentity, getIdentity,
 } from './api.js';
 import { approvalsView, approvalView } from './view-approvals.js';
 import { auditView } from './view-audit.js';
@@ -22,6 +23,7 @@ const IDLE_MS = 15 * 60 * 1000;
 const main = document.getElementById('main');
 const nav = document.getElementById('nav');
 const lockBtn = document.getElementById('lock');
+const whoEl = document.getElementById('whoami');
 const themeBtn = document.getElementById('theme-toggle');
 
 let cleanup = null;
@@ -79,6 +81,8 @@ function lock(message) {
   idleTimer = null;
   nav.hidden = true;
   lockBtn.hidden = true;
+  whoEl.hidden = true;
+  whoEl.textContent = '';
   clearStatus();
   showLogin(message);
 }
@@ -134,25 +138,26 @@ function showLogin(message) {
     message ? h('p', { class: 'callout' }, message) : null,
     form,
     h('p', { class: 'note' },
-      'The token is the server’s [admin] token. It stays in this tab’s memory only: ',
+      'The token is the server’s [admin] token or an operator’s token ([[admin.operators]]). ',
+      'It stays in this tab’s memory only: ',
       'reloading, Lock, or 15 minutes without activity forget it.'));
   replace(main, card);
   input.focus();
 }
 
-/** Check a token with a one-entry audit read; keep it only if the server accepts it. */
+/** Check a token with `GET /admin/whoami`; keep it, and who it is, only if the server accepts it. */
 async function tryLogin(candidate, errorEl) {
   if (!candidate) return false;
   setToken(candidate);
   try {
-    await api('/admin/audit?limit=1', { loginCheck: true, quiet: [401, 403] });
+    setIdentity(await api('/admin/whoami', { loginCheck: true, quiet: [401, 403] }));
     return true;
   } catch (e) {
     forgetToken();
     errorEl.textContent = e.status === 401
-      ? 'That token was refused.'
+      ? (e.code === 'admin_credential_expired' ? 'That token has expired.' : 'That token was refused.')
       : e.status === 403
-        ? 'The server has no [admin] token configured, so the admin API is disabled.'
+        ? 'The server has no admin credential configured ([admin] token or [[admin.operators]]), so the admin API is disabled.'
         : `Could not log in: ${e.message}`;
     errorEl.hidden = false;
     return false;
@@ -162,6 +167,17 @@ async function tryLogin(candidate, errorEl) {
 function enterConsole() {
   nav.hidden = false;
   lockBtn.hidden = false;
+  const who = getIdentity();
+  if (who) {
+    // `expires_at` is RFC 3339 or null (ADR-0016): show its date, and the full time on hover.
+    const expires = typeof who.expires_at === 'string' ? who.expires_at : null;
+    whoEl.textContent = expires
+      ? `${who.name} · ${who.role} · expires ${expires.slice(0, 10)}`
+      : `${who.name} · ${who.role}`;
+    whoEl.title = `Logged in as the operator ${who.name}, role ${who.role}`
+      + (expires ? `; the token expires at ${expires}` : '');
+    whoEl.hidden = false;
+  }
   clearStatus();
   resetIdle();
   if (!location.hash || location.hash === '#' || location.hash === '#/') {

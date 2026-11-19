@@ -869,6 +869,7 @@ async fn revoking_root_lease_cascades_to_child() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let err: Value = resp.json().await.unwrap();
     assert!(err["detail"].as_str().unwrap().contains("lease_revoked"));
+    assert_eq!(err["code"], "lease_revoked", "{err}");
 
     // Unknown leases are 404, not a silent success.
     let resp = h
@@ -974,10 +975,10 @@ const PEP_SECRET: &str = "pep-secret-for-tests";
 async fn unsigned_authzen_chains_need_a_pep_and_an_issued_chain() {
     let h = Harness::start_tweaked(false, |cfg| {
         cfg.authzen.allow_unsigned_chain = true;
-        cfg.peps = vec![attenuo_server::config::PepConfig {
-            id: "gateway".into(),
-            secret_sha256: sha256_hex(PEP_SECRET),
-        }];
+        cfg.peps = vec![attenuo_server::config::PepConfig::with_secret_sha256(
+            "gateway",
+            sha256_hex(PEP_SECRET),
+        )];
     })
     .await;
     let root = h.mint_root("alice", "planner", &["github:*"]).await;
@@ -1103,6 +1104,129 @@ async fn unsigned_authzen_chains_need_a_pep_and_an_issued_chain() {
         )
         .await;
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// Action search takes the same unsigned-chain path as evaluation: with `allow_unsigned_chain`,
+/// a `[[peps]]` entry may search for a chain this server issued, and answers come from that
+/// chain's capabilities. A PEP without its credentials, or a chain the server did not issue, is
+/// refused as at evaluation, and no search (accepted or refused) writes an audit record.
+#[tokio::test]
+async fn unsigned_authzen_chains_can_search_actions_from_a_pep() {
+    let h = Harness::start_tweaked(false, |cfg| {
+        cfg.authzen.allow_unsigned_chain = true;
+        cfg.peps = vec![attenuo_server::config::PepConfig::with_secret_sha256(
+            "gateway",
+            sha256_hex(PEP_SECRET),
+        )];
+    })
+    .await;
+    let root = h.mint_root("alice", "planner", &["github:*"]).await;
+    let child = h
+        .exchange(&root.token, "coder", &["github:read_file"])
+        .await;
+    let chain = h
+        .state
+        .verifier
+        .verify(&child.token, time::OffsetDateTime::now_utc())
+        .unwrap()
+        .chain;
+    let call =
+        attenuo_core::ToolCall::new("github", "read_file", json!({"repo": "alice/public-site"}));
+    let search_body = |chain: &attenuo_core::DelegationChain, secret: Option<&str>| {
+        let mut body = serde_json::to_value(authzen::to_request(chain, &call)).unwrap();
+        let obj = body.as_object_mut().unwrap();
+        obj.remove("action");
+        obj.insert(
+            "resource".into(),
+            json!({"type": "mcp_server", "id": "github"}),
+        );
+        if let Some(s) = secret {
+            obj.insert("pep_id".into(), json!("gateway"));
+            obj.insert("pep_secret".into(), json!(s));
+        }
+        body
+    };
+    let search = |body: Value| {
+        h.client
+            .post(h.url("/access/v1/search/action"))
+            .json(&body)
+            .send()
+    };
+    let before = h.audit_entries().await.len();
+
+    // Accepted: the issued child chain, from an authenticated PEP (body credentials).
+    let resp = search(search_body(&chain, Some(PEP_SECRET))).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let b: Value = resp.json().await.unwrap();
+    assert_eq!(
+        b["results"],
+        json!([{"name": "read_file", "properties": {"server": "github"}}]),
+        "{b}"
+    );
+    assert_eq!(b["page"], json!({"next_token": "", "count": 1}), "{b}");
+    // And with HTTP Basic: the root chain holds `github:*`, so more of the catalog is a result.
+    let root_chain = attenuo_core::DelegationChain {
+        originating_user: chain.originating_user.clone(),
+        hops: chain.hops[..1].to_vec(),
+    };
+    let resp = h
+        .client
+        .post(h.url("/access/v1/search/action"))
+        .basic_auth("gateway", Some(PEP_SECRET))
+        .json(&search_body(&root_chain, None))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let b: Value = resp.json().await.unwrap();
+    let names: Vec<&str> = b["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"read_file"), "{b}");
+
+    // Refused: no PEP credentials, a wrong secret, and wrong Basic credentials.
+    for (name, body) in [
+        ("no credentials", search_body(&chain, None)),
+        ("wrong secret", search_body(&chain, Some("wrong"))),
+    ] {
+        let resp = search(body).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{name}");
+        assert_eq!(
+            resp.json::<Value>().await.unwrap()["error"],
+            "invalid_client",
+            "{name}"
+        );
+    }
+    let resp = h
+        .client
+        .post(h.url("/access/v1/search/action"))
+        .basic_auth("gateway", Some("wrong"))
+        .json(&search_body(&chain, None))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Refused: chains this server did not issue, built from real lease ids.
+    let mut other_user = chain.clone();
+    other_user.originating_user.subject = "bob".into();
+    let mut wider = chain.clone();
+    wider.hops[1].capabilities = root_chain.hops[0].capabilities.clone();
+    for (name, forged) in [("other user", &other_user), ("wider child", &wider)] {
+        let resp = search(search_body(forged, Some(PEP_SECRET))).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{name}");
+        let err: Value = resp.json().await.unwrap();
+        assert_eq!(err["error"], "chain_not_issued", "{name}: {err}");
+    }
+
+    assert_eq!(
+        h.audit_entries().await.len(),
+        before,
+        "a search, accepted or refused, writes no audit record"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1314,7 +1438,7 @@ async fn jwks_verifies_issued_tokens_and_health_is_ok() {
 // Scenario 7: lease renewal and expiry.
 // ---------------------------------------------------------------------------------------------
 
-use attenuo_audit::LeaseStore;
+use attenuo_audit::LeaseRegistry;
 use attenuo_core::LeaseId;
 use time::{Duration, OffsetDateTime};
 
@@ -1504,6 +1628,7 @@ async fn expired_parent_blocks_child_renewal_and_calls() {
     let err: Value = resp.json().await.unwrap();
     assert_eq!(err["error"], "invalid_grant");
     assert!(err["detail"].as_str().unwrap().contains("lease_expired"));
+    assert_eq!(err["code"], "lease_expired", "{err}");
 
     let denied = h
         .call(&child.token, "read_file", json!({"repo": "alice/public-x"}))
@@ -1573,6 +1698,7 @@ async fn refused_renewal_record(h: &Harness, token: &str, reason: &str) -> Value
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["error"], "invalid_grant", "{body}");
     assert!(body["detail"].as_str().unwrap().contains(reason), "{body}");
+    assert_eq!(body["code"], reason, "{body}");
     assert_eq!(body["decision_id"], id, "{body}");
     let entries = h.audit_entries().await;
     assert_eq!(entries.len(), before + 1, "exactly one record");
@@ -3171,3 +3297,1088 @@ when { context.originating_user.attributes has status
         "{entries:?}"
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// Stable codes: a refusal names its specific reason in `code`, not only in `detail`.
+// ---------------------------------------------------------------------------------------------
+
+/// The generic classes a `code` may fall back to. A refusal that answers one of these as its
+/// `code` must be on [`GENERIC_REFUSALS`].
+const GENERIC_CODES: &[&str] = &[
+    "invalid_grant",
+    "invalid_request",
+    "invalid_scope",
+    "invalid_client",
+    "unauthorized",
+    "forbidden",
+    "server_error",
+];
+
+/// The refusals driven below whose `code` is a generic class on purpose, with why no more
+/// specific reason exists. Every entry must be driven (so the list cannot rot), and nothing
+/// else may answer a generic class.
+const GENERIC_REFUSALS: &[(&str, &str)] = &[
+    (
+        "token: subject token that does not verify",
+        "the subject token is not one of ours (signature, issuer, audience, type, shape): one \
+         class, as `invalid_token` is for a bearer; an expired one answers `token_expired`",
+    ),
+    (
+        "admin: query parameter that does not parse",
+        "a malformed parameter: `detail` names it and the type it needs",
+    ),
+    (
+        "authzen: body that is not an object",
+        "a malformed request body: no reason beyond the class",
+    ),
+    (
+        "authzen batch: entry that is not an object",
+        "a malformed batch entry: no reason beyond the class",
+    ),
+    (
+        "proxy: JSON that is not a JSON-RPC message",
+        "a malformed JSON-RPC message (JSON-RPC's own `invalid_request` class)",
+    ),
+];
+
+/// Is `s` a machine-style token (`^[a-z][a-z0-9_]+$`)?
+fn is_machine_token(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() >= 2
+        && b[0].is_ascii_lowercase()
+        && b.iter()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'_')
+}
+
+/// Checks each refusal's stable code and records which allowlisted generic ones were seen.
+#[derive(Default)]
+struct CodeAudit {
+    generic_seen: std::collections::BTreeSet<&'static str>,
+}
+
+impl CodeAudit {
+    /// `code` must be in `ERROR_CODES`, equal `want` when given, and not be a generic class
+    /// unless `path` is on [`GENERIC_REFUSALS`]. And a `code` that only repeats `error` while
+    /// `detail` is a single machine-style token naming something else is the bug this guards
+    /// against: the specific reason left in `detail`.
+    fn check(
+        &mut self,
+        path: &'static str,
+        code: &str,
+        error: Option<&str>,
+        detail: &str,
+        want: Option<&str>,
+    ) {
+        assert!(
+            attenuo_core::error_codes::lookup(code).is_some(),
+            "{path}: code `{code}` is not in ERROR_CODES"
+        );
+        if let Some(w) = want {
+            assert_eq!(code, w, "{path}");
+        }
+        if error == Some(code) && is_machine_token(detail) {
+            assert_eq!(
+                detail, code,
+                "{path}: `code` is the generic `error` while `detail` names the reason `{detail}`"
+            );
+        }
+        if GENERIC_CODES.contains(&code) {
+            assert!(
+                GENERIC_REFUSALS.iter().any(|(p, _)| *p == path),
+                "{path}: `code` is the generic class `{code}` (detail {detail:?}); give it its \
+                 specific code, or add it to GENERIC_REFUSALS with the reason none exists"
+            );
+            self.generic_seen.insert(path);
+        }
+    }
+
+    /// A REST error body.
+    async fn rest(
+        &mut self,
+        path: &'static str,
+        resp: reqwest::Response,
+        status: StatusCode,
+        want: Option<&str>,
+    ) -> Value {
+        assert_eq!(resp.status(), status, "{path}");
+        let b: Value = resp.json().await.unwrap();
+        self.check(
+            path,
+            b["code"].as_str().unwrap_or_default(),
+            b["error"].as_str(),
+            b["detail"].as_str().unwrap_or_default(),
+            want,
+        );
+        b
+    }
+
+    /// A JSON-RPC error of the proxy: its `data.code`.
+    fn rpc(&mut self, path: &'static str, body: &Value, want: Option<&str>) {
+        let e = &body["error"];
+        self.check(
+            path,
+            e["data"]["code"].as_str().unwrap_or_default(),
+            None,
+            e["message"].as_str().unwrap_or_default(),
+            want,
+        );
+    }
+}
+
+/// Drive the known refusal paths of `/token`, `/token/renew`, `/admin/*`, AuthZEN and the proxy
+/// and check each one's `code` ([`CodeAudit::check`]), and that the specific reasons fixed in
+/// the stable-code sweep keep `error`, `detail` and the absence of `error_description` as they
+/// were.
+#[tokio::test]
+async fn every_refusal_names_its_specific_reason_in_code() {
+    let h = Harness::start().await;
+    let mut a = CodeAudit::default();
+    let read = ["github:read_file"];
+
+    // --- /token/renew ---
+    // The token's own lease revoked: `detail` was always the reason; `code` is it now too.
+    let root = h.mint_root("alice", "planner", &["github:*"]).await;
+    let own = h.exchange(&root.token, "coder", &read).await;
+    h.admin_post(&format!("/admin/leases/{}/revoke", own.lease), json!({}))
+        .await;
+    let b = a
+        .rest(
+            "renew: own lease revoked",
+            h.renew_raw(Some(&own.token)).await,
+            StatusCode::BAD_REQUEST,
+            Some("lease_revoked"),
+        )
+        .await;
+    assert_eq!(b["error"], "invalid_grant");
+    assert_eq!(b["detail"], "lease_revoked");
+    assert!(b.get("error_description").is_none(), "{b}");
+    // An ancestor revoked.
+    let root2 = h.mint_root("bob", "planner", &["github:*"]).await;
+    let child2 = h.exchange(&root2.token, "coder", &read).await;
+    h.admin_post(&format!("/admin/leases/{}/revoke", root2.lease), json!({}))
+        .await;
+    let b = a
+        .rest(
+            "renew: ancestor lease revoked",
+            h.renew_raw(Some(&child2.token)).await,
+            StatusCode::BAD_REQUEST,
+            Some("lease_revoked"),
+        )
+        .await;
+    assert_eq!(b["error"], "invalid_grant");
+    assert_eq!(b["detail"], "an ancestor lease is not live: lease_revoked");
+    assert!(b.get("error_description").is_none(), "{b}");
+    // An ancestor expired.
+    let root3 = h.mint_root("carol", "planner", &["github:*"]).await;
+    let child3 = h.exchange(&root3.token, "coder", &read).await;
+    h.set_lease_expiry(
+        &root3.lease,
+        OffsetDateTime::now_utc() - Duration::seconds(1),
+    );
+    a.rest(
+        "renew: ancestor lease expired",
+        h.renew_raw(Some(&child3.token)).await,
+        StatusCode::BAD_REQUEST,
+        Some("lease_expired"),
+    )
+    .await;
+    a.rest(
+        "renew: no bearer",
+        h.renew_raw(None).await,
+        StatusCode::UNAUTHORIZED,
+        Some("missing_token"),
+    )
+    .await;
+    a.rest(
+        "renew: bearer that is not a token",
+        h.renew_raw(Some("not.a.jwt")).await,
+        StatusCode::UNAUTHORIZED,
+        Some("invalid_token"),
+    )
+    .await;
+
+    // --- POST /token (exchange) ---
+    let b = a
+        .rest(
+            "token: parent lease revoked",
+            h.exchange_raw(&child2.token, "x", &read).await,
+            StatusCode::BAD_REQUEST,
+            Some("lease_revoked"),
+        )
+        .await;
+    assert_eq!(b["error"], "invalid_grant");
+    assert!(
+        b["detail"]
+            .as_str()
+            .unwrap()
+            .starts_with("subject token cannot delegate: lease_revoked"),
+        "{b}"
+    );
+    assert!(b.get("error_description").is_none(), "{b}");
+    assert!(b["decision_id"].is_string(), "still audited: {b}");
+    a.rest(
+        "token: parent's ancestor lease expired",
+        h.exchange_raw(&child3.token, "x", &read).await,
+        StatusCode::BAD_REQUEST,
+        Some("lease_expired"),
+    )
+    .await;
+    let live = h.mint_root("dave", "planner", &["github:*"]).await;
+    let b = a
+        .rest(
+            "token: no capability requested",
+            h.exchange_raw(&live.token, "coder", &[]).await,
+            StatusCode::BAD_REQUEST,
+            Some("no_capabilities_requested"),
+        )
+        .await;
+    assert_eq!(b["error"], "invalid_request");
+    assert!(b.get("error_description").is_none(), "{b}");
+    let post_token = |body: Value| h.client.post(h.url("/token")).json(&body).send();
+    let exchange_body = |grant: &str, ty: &str| {
+        json!({"grant_type": grant, "subject_token": live.token, "subject_token_type": ty,
+               "actor": "coder", "client_id": "coder", "client_secret": agent_secret("coder"),
+               "authorization_details": [{"type": "attenuo_capabilities",
+                   "capabilities": [{"server": "github", "tool": "read_file"}]}]})
+    };
+    const EXCHANGE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
+    const JWT: &str = "urn:ietf:params:oauth:token-type:jwt";
+    let b = a
+        .rest(
+            "token: unsupported subject_token_type",
+            post_token(exchange_body(EXCHANGE, "urn:example:saml"))
+                .await
+                .unwrap(),
+            StatusCode::BAD_REQUEST,
+            Some("unsupported_token_type"),
+        )
+        .await;
+    assert_eq!(b["error"], "invalid_request");
+    a.rest(
+        "token: unsupported grant_type",
+        post_token(exchange_body("password", JWT)).await.unwrap(),
+        StatusCode::BAD_REQUEST,
+        Some("unsupported_grant_type"),
+    )
+    .await;
+    let mut no_actor = exchange_body(EXCHANGE, JWT);
+    no_actor.as_object_mut().unwrap().remove("actor");
+    let b = a
+        .rest(
+            "token: body without `actor`",
+            post_token(no_actor).await.unwrap(),
+            StatusCode::BAD_REQUEST,
+            Some("malformed_request"),
+        )
+        .await;
+    assert_eq!(b["error"], "invalid_request");
+    assert_eq!(b["detail"], "missing field `actor`");
+    assert!(b.get("error_description").is_none(), "{b}");
+    a.rest(
+        "token: body that is not JSON",
+        h.client
+            .post(h.url("/token"))
+            .header("content-type", "application/json")
+            .body("{")
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::BAD_REQUEST,
+        Some("malformed_request"),
+    )
+    .await;
+    let post_form = |body: String| {
+        h.client
+            .post(h.url("/token"))
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(body)
+            .send()
+    };
+    a.rest(
+        "token: form parameter repeated",
+        post_form("actor=a&actor=b".into()).await.unwrap(),
+        StatusCode::BAD_REQUEST,
+        Some("malformed_request"),
+    )
+    .await;
+    let b = a
+        .rest(
+            "token: form scope entry that is not server:tool",
+            post_form(format!(
+                "grant_type={EXCHANGE}&subject_token={}&subject_token_type={JWT}&actor=coder\
+                 &scope=github",
+                live.token
+            ))
+            .await
+            .unwrap(),
+            StatusCode::BAD_REQUEST,
+            Some("invalid_capability"),
+        )
+        .await;
+    assert_eq!(b["error"], "invalid_scope");
+    assert!(b.get("error_description").is_none(), "{b}");
+    let mut forged = exchange_body(EXCHANGE, JWT);
+    forged["subject_token"] = json!("eyJhbGciOiJFUzI1NiJ9.e30.c2ln");
+    a.rest(
+        "token: subject token that does not verify",
+        post_token(forged).await.unwrap(),
+        StatusCode::BAD_REQUEST,
+        Some("invalid_grant"),
+    )
+    .await;
+    a.rest(
+        "token: wrong client secret",
+        h.exchange_as(&live.token, "coder", &read, Some(("coder", "wrong")))
+            .await,
+        StatusCode::UNAUTHORIZED,
+        None,
+    )
+    .await;
+    let narrow = h.exchange(&live.token, "coder", &read).await;
+    let b = a
+        .rest(
+            "token: request wider than the parent",
+            h.exchange_raw(&narrow.token, "reviewer", &["github:delete_repo"])
+                .await,
+            StatusCode::BAD_REQUEST,
+            Some("scope_exceeds_parent"),
+        )
+        .await;
+    assert_eq!(b["error"], "invalid_scope");
+    assert!(b.get("error_description").is_none(), "{b}");
+    assert!(b["decision_id"].is_string(), "still audited: {b}");
+    let any = h.mint_root("fay", "planner", &["*:*"]).await;
+    let b = a
+        .rest(
+            "token: capability with an invalid name",
+            h.exchange_raw(&any.token, "coder", &["evil/github:x"])
+                .await,
+            StatusCode::BAD_REQUEST,
+            Some("invalid_capability"),
+        )
+        .await;
+    assert_eq!(b["error"], "invalid_grant");
+    assert!(b["decision_id"].is_string(), "still audited: {b}");
+    // A limit that parses but is malformed is the same refusal.
+    let mut bad_limit = exchange_body(EXCHANGE, JWT);
+    bad_limit["subject_token"] = json!(any.token);
+    bad_limit["authorization_details"][0]["capabilities"] = json!([{"server": "github",
+        "tool": "x", "limits": {"sum": {"arg": "n", "max": 1, "derive": "host"}}}]);
+    let b = a
+        .rest(
+            "token: capability with a malformed limit",
+            post_token(bad_limit).await.unwrap(),
+            StatusCode::BAD_REQUEST,
+            Some("invalid_capability"),
+        )
+        .await;
+    assert_eq!(b["error"], "invalid_grant");
+    // An unknown limit kind does not parse: the request is malformed.
+    let mut unknown_limit = exchange_body(EXCHANGE, JWT);
+    unknown_limit["authorization_details"][0]["capabilities"] =
+        json!([{"server": "github", "tool": "read_file", "limits": {"often": 1}}]);
+    a.rest(
+        "token: capability with an unknown limit kind",
+        post_token(unknown_limit).await.unwrap(),
+        StatusCode::BAD_REQUEST,
+        Some("malformed_request"),
+    )
+    .await;
+    a.rest(
+        "token: actor already in the chain",
+        h.exchange_raw(&narrow.token, "coder", &read).await,
+        StatusCode::BAD_REQUEST,
+        Some("duplicate_actor"),
+    )
+    .await;
+
+    // --- /admin/* ---
+    let b = a
+        .rest(
+            "admin: root token without capabilities",
+            h.admin_post(
+                "/admin/root-token",
+                json!({"subject": "erin", "issuer": "https://idp.example", "agent": "planner"}),
+            )
+            .await,
+            StatusCode::BAD_REQUEST,
+            Some("no_capabilities_requested"),
+        )
+        .await;
+    assert_eq!(b["error"], "invalid_request");
+    assert_eq!(b["detail"], "capabilities are required");
+    let root_token = |subject: &str, agent: &str, caps: Value, ttl: Option<u64>| {
+        let mut body = json!({"subject": subject, "issuer": "https://idp.example",
+                              "agent": agent, "capabilities": caps});
+        if let Some(t) = ttl {
+            body["ttl_seconds"] = json!(t);
+        }
+        h.admin_post("/admin/root-token", body)
+    };
+    for (path, resp, error, code) in [
+        (
+            "admin: root token with a lifetime out of range",
+            root_token("erin", "planner", json!(["github:*"]), Some(u64::MAX)).await,
+            "invalid_grant",
+            "ttl_out_of_range",
+        ),
+        (
+            "admin: root token for an empty agent",
+            root_token("erin", "", json!(["github:*"]), None).await,
+            "invalid_grant",
+            "invalid_agent",
+        ),
+        (
+            "admin: root token for an empty subject",
+            root_token("", "planner", json!(["github:*"]), None).await,
+            "invalid_grant",
+            "invalid_subject",
+        ),
+        (
+            "admin: root token with an invalid capability name",
+            root_token("erin", "planner", json!(["evil/github:x"]), None).await,
+            "invalid_grant",
+            "invalid_capability",
+        ),
+        (
+            "admin: root token capability that is not server:tool",
+            root_token("erin", "planner", json!(["github"]), None).await,
+            "invalid_scope",
+            "invalid_capability",
+        ),
+    ] {
+        let b = a
+            .rest(path, resp, StatusCode::BAD_REQUEST, Some(code))
+            .await;
+        assert_eq!(b["error"], error, "{path}");
+        assert!(b.get("error_description").is_none(), "{path}: {b}");
+    }
+    a.rest(
+        "admin: root token for a reserved subject",
+        h.admin_post(
+            "/admin/root-token",
+            json!({"subject": "urn:attenuo:x", "issuer": "https://idp.example", "agent": "planner",
+                   "capabilities": ["github:*"]}),
+        )
+        .await,
+        StatusCode::BAD_REQUEST,
+        Some("reserved_subject"),
+    )
+    .await;
+    a.rest(
+        "admin: no bearer",
+        h.client.get(h.url("/admin/leases/x")).send().await.unwrap(),
+        StatusCode::UNAUTHORIZED,
+        Some("missing_token"),
+    )
+    .await;
+    a.rest(
+        "admin: wrong bearer",
+        h.client
+            .get(h.url("/admin/leases/x"))
+            .bearer_auth("wrong")
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::UNAUTHORIZED,
+        Some("invalid_token"),
+    )
+    .await;
+    a.rest(
+        "admin: unknown lease",
+        h.admin_post("/admin/leases/nope/revoke", json!({})).await,
+        StatusCode::NOT_FOUND,
+        Some("not_found"),
+    )
+    .await;
+    a.rest(
+        "admin: query parameter that does not parse",
+        h.client
+            .get(h.url("/admin/audit?from=abc"))
+            .bearer_auth(ADMIN)
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::BAD_REQUEST,
+        Some("invalid_request"),
+    )
+    .await;
+
+    a.rest(
+        "admin: operators reload without a config file",
+        h.admin_post("/admin/operators/reload", json!({})).await,
+        StatusCode::CONFLICT,
+        Some("reload_unavailable"),
+    )
+    .await;
+    // Named operators (one expired) and a config file to reload them from.
+    let ops_dir = tempfile::tempdir().unwrap();
+    let ops_path = ops_dir.path().join("attenuo.toml");
+    let op_entry = |name: &str, token: &str, role: &str, expires: &str| {
+        format!(
+            "[[admin.operators]]\nname = \"{name}\"\ntoken_sha256 = \"{}\"\nrole = \
+             \"{role}\"\n{expires}",
+            sha256_hex(token)
+        )
+    };
+    let ops_path_cfg = ops_path.clone();
+    let h2 = Harness::start_tweaked(false, move |cfg| {
+        cfg.admin.token = None;
+        cfg.admin.operators = attenuo_server::operators::operators_from_toml(
+            &(op_entry("ada", "ada-token", "admin", "")
+                + &op_entry(
+                    "old",
+                    "old-token",
+                    "viewer",
+                    "expires_at = \"2020-01-01T00:00:00Z\"\n",
+                )),
+        )
+        .unwrap();
+        cfg.source_path = Some(ops_path_cfg);
+    })
+    .await;
+    let reload_as = |token: &'static str| {
+        h2.client
+            .post(h2.url("/admin/operators/reload"))
+            .bearer_auth(token)
+            .send()
+    };
+    a.rest(
+        "admin: expired operator credential",
+        h2.client
+            .get(h2.url("/admin/whoami"))
+            .bearer_auth("old-token")
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::UNAUTHORIZED,
+        Some("admin_credential_expired"),
+    )
+    .await;
+    a.rest(
+        "admin: operators reload of a config file that cannot be read",
+        reload_as("ada-token").await.unwrap(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Some("config_unreadable"),
+    )
+    .await;
+    std::fs::write(&ops_path, "[[admin.operators]\n").unwrap();
+    a.rest(
+        "admin: operators reload of a file that is not TOML",
+        reload_as("ada-token").await.unwrap(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Some("operators_invalid"),
+    )
+    .await;
+    std::fs::write(&ops_path, op_entry("ada", "ada-token", "viewer", "")).unwrap();
+    a.rest(
+        "admin: operators reload that leaves no admin",
+        reload_as("ada-token").await.unwrap(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Some("operators_no_admin"),
+    )
+    .await;
+
+    // --- AuthZEN ---
+    a.rest(
+        "authzen: no bearer",
+        h.authzen(None, authzen_body("read_file", json!({"repo": "alice/x"})))
+            .await,
+        StatusCode::UNAUTHORIZED,
+        Some("missing_token"),
+    )
+    .await;
+    a.rest(
+        "authzen: body that is not an object",
+        h.authzen(Some(&live.token), json!([1])).await,
+        StatusCode::BAD_REQUEST,
+        Some("invalid_request"),
+    )
+    .await;
+    let batch: Value = post_batch(&h, &live.token, &json!({"evaluations": [7]}))
+        .await
+        .json()
+        .await
+        .unwrap();
+    let e = &batch["evaluations"][0]["context"]["error"];
+    a.check(
+        "authzen batch: entry that is not an object",
+        e["code"].as_str().unwrap_or_default(),
+        None,
+        e["message"].as_str().unwrap_or_default(),
+        Some("invalid_request"),
+    );
+
+    // --- the proxy ---
+    let denied = h
+        .call(&narrow.token, "delete_repo", json!({"repo": "alice/x"}))
+        .await;
+    a.rpc(
+        "proxy: call outside the capabilities",
+        &denied,
+        Some("capability_denied"),
+    );
+    let resp = h
+        .client
+        .post(h.url("/mcp/github"))
+        .bearer_auth(&own.token)
+        .header("accept", "application/json, text/event-stream")
+        .json(&json!({"jsonrpc": "2.0", "id": 1, "method": "ping"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    a.rpc(
+        "proxy: revoked lease",
+        &resp.json().await.unwrap(),
+        Some("lease_revoked"),
+    );
+    let resp = h
+        .client
+        .post(h.url("/mcp/github"))
+        .header("accept", "application/json, text/event-stream")
+        .json(&json!({"jsonrpc": "2.0", "id": 1, "method": "ping"}))
+        .send()
+        .await
+        .unwrap();
+    a.rpc(
+        "proxy: no bearer",
+        &resp.json().await.unwrap(),
+        Some("missing_token"),
+    );
+    let resp = h
+        .client
+        .post(h.url("/mcp/github"))
+        .bearer_auth(&live.token)
+        .header("accept", "application/json, text/event-stream")
+        .header("content-type", "application/json")
+        .body("{not json")
+        .send()
+        .await
+        .unwrap();
+    a.rpc(
+        "proxy: body that is not JSON",
+        &resp.json().await.unwrap(),
+        Some("parse_error"),
+    );
+    let resp = h
+        .client
+        .post(h.url("/mcp/github"))
+        .bearer_auth(&live.token)
+        .header("accept", "application/json, text/event-stream")
+        .json(&json!(42))
+        .send()
+        .await
+        .unwrap();
+    a.rpc(
+        "proxy: JSON that is not a JSON-RPC message",
+        &resp.json().await.unwrap(),
+        Some("invalid_request"),
+    );
+
+    // --- last: an expired subject token (the clock moves past every token here) ---
+    h.clock
+        .advance(std::time::Duration::from_secs(400 * 24 * 3600));
+    let b = a
+        .rest(
+            "token: subject token expired",
+            h.exchange_raw(&live.token, "coder", &read).await,
+            StatusCode::BAD_REQUEST,
+            Some("token_expired"),
+        )
+        .await;
+    assert_eq!(b["error"], "invalid_grant");
+    assert!(b.get("error_description").is_none(), "{b}");
+
+    // Every allowlisted generic refusal was driven.
+    for (path, _) in GENERIC_REFUSALS {
+        assert!(
+            a.generic_seen.contains(path),
+            "GENERIC_REFUSALS lists `{path}`, which no longer answers a generic code (or is \
+             not driven): remove it"
+        );
+    }
+}
+
+/// The paths that need another configuration: a `[[root_grants]]` ceiling at
+/// `/admin/root-token`, a PEP's unsigned AuthZEN chain that does not validate, and an exchange
+/// too deep for a small `[issuer] max_depth` or naming an empty `actor` (with
+/// `require_actor_auth = false`).
+#[tokio::test]
+async fn grant_and_body_chain_refusals_name_their_reason_in_code() {
+    let h = Harness::start_tweaked(false, |cfg| {
+        cfg.root_grants = vec![attenuo_server::config::RootGrant {
+            subject: None,
+            issuer: "https://idp.example".into(),
+            agent: "planner".into(),
+            capabilities: vec![attenuo_server::config::CapSpec::Short(
+                "github:read_file".into(),
+            )],
+            attributes: BTreeMap::new(),
+            may_act: None,
+        }];
+        cfg.authzen.allow_unsigned_chain = true;
+        cfg.peps = vec![attenuo_server::config::PepConfig::with_secret_sha256(
+            "gateway",
+            sha256_hex(PEP_SECRET),
+        )];
+    })
+    .await;
+    let mut a = CodeAudit::default();
+    let b = a
+        .rest(
+            "admin: root token wider than its grant",
+            h.admin_post(
+                "/admin/root-token",
+                json!({"subject": "alice", "issuer": "https://idp.example", "agent": "planner",
+                       "capabilities": ["github:*"]}),
+            )
+            .await,
+            StatusCode::BAD_REQUEST,
+            Some("scope_exceeds_grant"),
+        )
+        .await;
+    assert_eq!(b["error"], "invalid_scope");
+    assert!(b.get("error_description").is_none(), "{b}");
+
+    // A genuine chain, sent once its hop has expired: it no longer validates.
+    let root = h.mint_root("alice", "planner", &["github:read_file"]).await;
+    let chain = h
+        .state
+        .verifier
+        .verify(&root.token, time::OffsetDateTime::now_utc())
+        .unwrap()
+        .chain;
+    let call =
+        attenuo_core::ToolCall::new("github", "read_file", json!({"repo": "alice/public-site"}));
+    let mut body = serde_json::to_value(authzen::to_request(&chain, &call)).unwrap();
+    body["pep_id"] = json!("gateway");
+    body["pep_secret"] = json!(PEP_SECRET);
+    h.clock
+        .advance(std::time::Duration::from_secs(400 * 24 * 3600));
+    let b = a
+        .rest(
+            "authzen: PEP body chain that does not validate",
+            h.authzen(None, body).await,
+            StatusCode::BAD_REQUEST,
+            Some("invalid_chain"),
+        )
+        .await;
+    assert_eq!(b["error"], "invalid_request");
+    assert!(b.get("error_description").is_none(), "{b}");
+
+    // A chain deeper than `[issuer] max_depth`, and an empty `actor` (which only an exchange
+    // without actor authentication can name).
+    let h = Harness::start_tweaked(false, |cfg| {
+        cfg.issuer.max_depth = 2;
+        cfg.token.require_actor_auth = false;
+    })
+    .await;
+    let root = h.mint_root("alice", "planner", &["github:*"]).await;
+    let b = a
+        .rest(
+            "token: empty actor",
+            h.exchange_as(&root.token, "", &["github:read_file"], None)
+                .await,
+            StatusCode::BAD_REQUEST,
+            Some("invalid_agent"),
+        )
+        .await;
+    assert_eq!(b["error"], "invalid_grant");
+    assert!(b["decision_id"].is_string(), "still audited: {b}");
+    let child = h
+        .exchange(&root.token, "coder", &["github:read_file"])
+        .await;
+    let b = a
+        .rest(
+            "token: chain deeper than max_depth",
+            h.exchange_raw(&child.token, "reviewer", &["github:read_file"])
+                .await,
+            StatusCode::BAD_REQUEST,
+            Some("chain_too_deep"),
+        )
+        .await;
+    assert_eq!(b["error"], "invalid_scope");
+    assert!(b.get("error_description").is_none(), "{b}");
+    assert!(b["decision_id"].is_string(), "still audited: {b}");
+}
+
+/// A refusal as the client sees it: status, every header but `date` and `content-length`, and
+/// the whole JSON body, with a decision id (body and `X-Attenuo-Decision-Id`) replaced by
+/// `<decision_id>` once checked to be the same in both.
+async fn refusal_as_sent(resp: reqwest::Response) -> Value {
+    let status = resp.status().as_u16();
+    let mut headers = serde_json::Map::new();
+    for (k, v) in resp.headers() {
+        if k == "date" || k == "content-length" {
+            continue;
+        }
+        headers.insert(k.as_str().into(), json!(v.to_str().unwrap()));
+    }
+    let mut body: Value = resp.json().await.unwrap();
+    if let Some(id) = body.get("decision_id").cloned() {
+        assert_eq!(
+            headers.get("x-attenuo-decision-id"),
+            Some(&id),
+            "the header names the body's decision"
+        );
+        body["decision_id"] = json!("<decision_id>");
+        headers.insert("x-attenuo-decision-id".into(), json!("<decision_id>"));
+    }
+    json!({"status": status, "headers": headers, "body": body})
+}
+
+/// Every refusal whose class or code was chosen from message text, or whose code was the
+/// generic class, as sent before the change that chose them from typed errors: status, headers
+/// and the whole body. Only `code` may change, and only where the expectation below says so.
+#[tokio::test]
+async fn refusal_bodies_are_pinned() {
+    let h = Harness::start_tweaked(false, |cfg| cfg.issuer.max_depth = 3).await;
+    let open = Harness::start_tweaked(false, |cfg| cfg.token.require_actor_auth = false).await;
+    let root = h.mint_root("alice", "planner", &["github:*"]).await;
+    let any = h.mint_root("bob", "planner", &["*:*"]).await;
+    const EXCHANGE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
+    const JWT: &str = "urn:ietf:params:oauth:token-type:jwt";
+    let json_body = |grant: &str, ty: &str| {
+        json!({"grant_type": grant, "subject_token": root.token, "subject_token_type": ty,
+               "actor": "coder", "client_id": "coder", "client_secret": agent_secret("coder"),
+               "authorization_details": [{"type": "attenuo_capabilities",
+                   "capabilities": [{"server": "github", "tool": "read_file"}]}]})
+    };
+    let post_json = |body: Value| h.client.post(h.url("/token")).json(&body).send();
+    let post_raw = |ct: &'static str, body: String| {
+        h.client
+            .post(h.url("/token"))
+            .header("content-type", ct)
+            .body(body)
+            .send()
+    };
+    const FORM: &str = "application/x-www-form-urlencoded";
+    let form = |extra: &str| {
+        format!(
+            "grant_type={EXCHANGE}&subject_token={}&subject_token_type={JWT}&actor=coder\
+             &client_id=coder&client_secret={}{extra}",
+            root.token,
+            agent_secret("coder")
+        )
+    };
+
+    let mut seen = Vec::new();
+    let mut pin = |name: &str, got: Value| seen.push((name.to_string(), got));
+
+    pin(
+        "token: unsupported grant_type",
+        refusal_as_sent(post_json(json_body("password", JWT)).await.unwrap()).await,
+    );
+    pin(
+        "token: unsupported subject_token_type",
+        refusal_as_sent(
+            post_json(json_body(EXCHANGE, "urn:example:saml"))
+                .await
+                .unwrap(),
+        )
+        .await,
+    );
+    let mut no_actor = json_body(EXCHANGE, JWT);
+    no_actor.as_object_mut().unwrap().remove("actor");
+    pin(
+        "token: body without actor",
+        refusal_as_sent(post_json(no_actor).await.unwrap()).await,
+    );
+    let mut bad_ttl = json_body(EXCHANGE, JWT);
+    bad_ttl["requested_ttl_seconds"] = json!("soon");
+    pin(
+        "token: ill-typed requested_ttl_seconds",
+        refusal_as_sent(post_json(bad_ttl).await.unwrap()).await,
+    );
+    // A field whose text names another refusal: decided by type, not by the words.
+    let mut lookalike = json_body(EXCHANGE, JWT);
+    lookalike["requested_ttl_seconds"] = json!("unsupported grant_type");
+    pin(
+        "token: field whose error text quotes a refusal",
+        refusal_as_sent(post_json(lookalike).await.unwrap()).await,
+    );
+    pin(
+        "token: body that is not JSON",
+        refusal_as_sent(post_raw("application/json", "{".into()).await.unwrap()).await,
+    );
+    pin(
+        "token: form parameter repeated",
+        refusal_as_sent(post_raw(FORM, form("&actor=coder")).await.unwrap()).await,
+    );
+    pin(
+        "token: form authorization_details not JSON",
+        refusal_as_sent(
+            post_raw(FORM, form("&authorization_details=nope"))
+                .await
+                .unwrap(),
+        )
+        .await,
+    );
+    pin(
+        "token: form requested_ttl_seconds not a number",
+        refusal_as_sent(
+            post_raw(FORM, form("&requested_ttl_seconds=soon"))
+                .await
+                .unwrap(),
+        )
+        .await,
+    );
+    pin(
+        "token: form may_act not JSON",
+        refusal_as_sent(post_raw(FORM, form("&may_act=%5Bnope")).await.unwrap()).await,
+    );
+    pin(
+        "token: form scope and authorization_details",
+        refusal_as_sent(
+            post_raw(
+                FORM,
+                form("&scope=github:read_file&authorization_details=%5B%5D"),
+            )
+            .await
+            .unwrap(),
+        )
+        .await,
+    );
+    pin(
+        "token: form scope entry that is not server:tool",
+        refusal_as_sent(post_raw(FORM, form("&scope=github")).await.unwrap()).await,
+    );
+
+    // Minting refusals once the subject token verified (audited).
+    let child = h
+        .exchange(&root.token, "coder", &["github:read_file"])
+        .await;
+    pin(
+        "token: delegation replayed",
+        refusal_as_sent(
+            h.exchange_raw(&root.token, "coder", &["github:read_file"])
+                .await,
+        )
+        .await,
+    );
+    pin(
+        "token: request wider than the parent",
+        refusal_as_sent(
+            h.exchange_raw(&child.token, "reviewer", &["github:delete_repo"])
+                .await,
+        )
+        .await,
+    );
+    let grandchild = h
+        .exchange(&child.token, "reviewer", &["github:read_file"])
+        .await;
+    pin(
+        "token: chain deeper than max_depth",
+        refusal_as_sent(
+            h.exchange_raw(&grandchild.token, "x", &["github:read_file"])
+                .await,
+        )
+        .await,
+    );
+    pin(
+        "token: capability with an invalid name",
+        refusal_as_sent(
+            h.exchange_raw(&any.token, "coder", &["evil/github:x"])
+                .await,
+        )
+        .await,
+    );
+    let open_root = open.mint_root("carol", "planner", &["github:*"]).await;
+    pin(
+        "token: empty actor",
+        refusal_as_sent(
+            open.exchange_as(&open_root.token, "", &["github:read_file"], None)
+                .await,
+        )
+        .await,
+    );
+
+    // The same minting refusals at `POST /admin/root-token`.
+    let root_token = |body: Value| h.admin_post("/admin/root-token", body);
+    pin(
+        "admin: root token with a lifetime out of range",
+        refusal_as_sent(
+            root_token(json!({"subject": "dan", "issuer": "https://idp.example",
+                              "agent": "planner", "capabilities": ["github:*"],
+                              "ttl_seconds": u64::MAX}))
+            .await,
+        )
+        .await,
+    );
+    pin(
+        "admin: root token for an empty agent",
+        refusal_as_sent(
+            root_token(json!({"subject": "dan", "issuer": "https://idp.example",
+                              "agent": "", "capabilities": ["github:*"]}))
+            .await,
+        )
+        .await,
+    );
+    pin(
+        "admin: root token for an empty subject",
+        refusal_as_sent(
+            root_token(json!({"subject": "", "issuer": "https://idp.example",
+                              "agent": "planner", "capabilities": ["github:*"]}))
+            .await,
+        )
+        .await,
+    );
+    pin(
+        "admin: root token with an invalid capability name",
+        refusal_as_sent(
+            root_token(json!({"subject": "dan", "issuer": "https://idp.example",
+                              "agent": "planner", "capabilities": ["evil/github:x"]}))
+            .await,
+        )
+        .await,
+    );
+    pin(
+        "admin: root token capability that is not server:tool",
+        refusal_as_sent(
+            root_token(json!({"subject": "dan", "issuer": "https://idp.example",
+                              "agent": "planner", "capabilities": ["github"]}))
+            .await,
+        )
+        .await,
+    );
+
+    let got = Value::Array(
+        seen.into_iter()
+            .map(|(n, v)| json!({"name": n, "sent": v}))
+            .collect(),
+    );
+    let want: Value = serde_json::from_str(PINNED_REFUSALS).unwrap();
+    if got != want {
+        panic!(
+            "refusals differ from the pinned ones; as sent now:\n{}",
+            serde_json::to_string_pretty(&got).unwrap()
+        );
+    }
+}
+
+/// What [`refusal_bodies_are_pinned`] expects, in its order.
+const PINNED_REFUSALS: &str = r#"[
+  {"name": "token: unsupported grant_type", "sent": {"status": 400, "headers": {"content-type": "application/json", "cache-control": "no-store"}, "body": {"error": "unsupported_grant_type", "code": "unsupported_grant_type", "detail": "unsupported grant_type `password`"}}},
+  {"name": "token: unsupported subject_token_type", "sent": {"status": 400, "headers": {"content-type": "application/json", "cache-control": "no-store"}, "body": {"error": "invalid_request", "code": "unsupported_token_type", "detail": "unsupported subject_token_type `urn:example:saml`"}}},
+  {"name": "token: body without actor", "sent": {"status": 400, "headers": {"content-type": "application/json", "cache-control": "no-store"}, "body": {"error": "invalid_request", "code": "malformed_request", "detail": "missing field `actor`"}}},
+  {"name": "token: ill-typed requested_ttl_seconds", "sent": {"status": 400, "headers": {"content-type": "application/json", "cache-control": "no-store"}, "body": {"error": "invalid_request", "code": "malformed_request", "detail": "invalid type: string \"soon\", expected u64"}}},
+  {"name": "token: field whose error text quotes a refusal", "sent": {"status": 400, "headers": {"content-type": "application/json", "cache-control": "no-store"}, "body": {"error": "invalid_request", "code": "malformed_request", "detail": "invalid type: string \"unsupported grant_type\", expected u64"}}},
+  {"name": "token: body that is not JSON", "sent": {"status": 400, "headers": {"content-type": "application/json", "cache-control": "no-store"}, "body": {"error": "invalid_request", "code": "malformed_request", "detail": "EOF while parsing an object at line 1 column 1"}}},
+  {"name": "token: form parameter repeated", "sent": {"status": 400, "headers": {"content-type": "application/json", "cache-control": "no-store"}, "body": {"error": "invalid_request", "code": "malformed_request", "detail": "parameter `actor` repeated"}}},
+  {"name": "token: form authorization_details not JSON", "sent": {"status": 400, "headers": {"content-type": "application/json", "cache-control": "no-store"}, "body": {"error": "invalid_request", "code": "malformed_request", "detail": "authorization_details is not JSON: expected ident at line 1 column 2"}}},
+  {"name": "token: form requested_ttl_seconds not a number", "sent": {"status": 400, "headers": {"content-type": "application/json", "cache-control": "no-store"}, "body": {"error": "invalid_request", "code": "malformed_request", "detail": "requested_ttl_seconds: invalid digit found in string"}}},
+  {"name": "token: form may_act not JSON", "sent": {"status": 400, "headers": {"content-type": "application/json", "cache-control": "no-store"}, "body": {"error": "invalid_request", "code": "malformed_request", "detail": "may_act is not JSON: expected ident at line 1 column 3"}}},
+  {"name": "token: form scope and authorization_details", "sent": {"status": 400, "headers": {"content-type": "application/json", "cache-control": "no-store"}, "body": {"error": "invalid_request", "code": "malformed_request", "detail": "use either scope or authorization_details, not both"}}},
+  {"name": "token: form scope entry that is not server:tool", "sent": {"status": 400, "headers": {"content-type": "application/json", "cache-control": "no-store"}, "body": {"error": "invalid_scope", "code": "invalid_capability", "detail": "capability `github` must look like `server:tool`"}}},
+  {"name": "token: delegation replayed", "sent": {"status": 400, "headers": {"content-type": "application/json", "x-attenuo-decision-id": "<decision_id>", "cache-control": "no-store"}, "body": {"error": "invalid_grant", "code": "replayed", "detail": "this credential was already used; present a fresh one", "error_description": "replayed", "decision_id": "<decision_id>"}}},
+  {"name": "token: request wider than the parent", "sent": {"status": 400, "headers": {"content-type": "application/json", "x-attenuo-decision-id": "<decision_id>", "cache-control": "no-store"}, "body": {"error": "invalid_scope", "code": "scope_exceeds_parent", "detail": "delegation chain is invalid: hop 2 widens capabilities relative to hop 1: requested capability `github:delete_repo` is not covered by the parent capability set", "decision_id": "<decision_id>"}}},
+  {"name": "token: chain deeper than max_depth", "sent": {"status": 400, "headers": {"content-type": "application/json", "x-attenuo-decision-id": "<decision_id>", "cache-control": "no-store"}, "body": {"error": "invalid_scope", "code": "chain_too_deep", "detail": "delegation chain is invalid: chain depth 4 exceeds the maximum of 3", "decision_id": "<decision_id>"}}},
+  {"name": "token: capability with an invalid name", "sent": {"status": 400, "headers": {"content-type": "application/json", "x-attenuo-decision-id": "<decision_id>", "cache-control": "no-store"}, "body": {"error": "invalid_grant", "code": "invalid_capability", "detail": "delegation chain is invalid: hop 1 has an invalid capability: server name \"evil/github\" contains '/', which is not allowed", "decision_id": "<decision_id>"}}},
+  {"name": "token: empty actor", "sent": {"status": 400, "headers": {"content-type": "application/json", "x-attenuo-decision-id": "<decision_id>", "cache-control": "no-store"}, "body": {"error": "invalid_grant", "code": "invalid_agent", "detail": "delegation chain is invalid: hop 1 has an empty agent id", "decision_id": "<decision_id>"}}},
+  {"name": "admin: root token with a lifetime out of range", "sent": {"status": 400, "headers": {"content-type": "application/json", "cache-control": "no-store", "x-content-type-options": "nosniff"}, "body": {"error": "invalid_grant", "code": "ttl_out_of_range", "detail": "delegation chain is invalid: requested lifetime is out of range"}}},
+  {"name": "admin: root token for an empty agent", "sent": {"status": 400, "headers": {"content-type": "application/json", "cache-control": "no-store", "x-content-type-options": "nosniff"}, "body": {"error": "invalid_grant", "code": "invalid_agent", "detail": "delegation chain is invalid: hop 0 has an empty agent id"}}},
+  {"name": "admin: root token for an empty subject", "sent": {"status": 400, "headers": {"content-type": "application/json", "cache-control": "no-store", "x-content-type-options": "nosniff"}, "body": {"error": "invalid_grant", "code": "invalid_subject", "detail": "delegation chain is invalid: originating user subject is empty"}}},
+  {"name": "admin: root token with an invalid capability name", "sent": {"status": 400, "headers": {"content-type": "application/json", "cache-control": "no-store", "x-content-type-options": "nosniff"}, "body": {"error": "invalid_grant", "code": "invalid_capability", "detail": "delegation chain is invalid: hop 0 has an invalid capability: server name \"evil/github\" contains '/', which is not allowed"}}},
+  {"name": "admin: root token capability that is not server:tool", "sent": {"status": 400, "headers": {"content-type": "application/json", "cache-control": "no-store", "x-content-type-options": "nosniff"}, "body": {"error": "invalid_scope", "code": "invalid_capability", "detail": "capability `github` must look like `server:tool`"}}}
+]"#;

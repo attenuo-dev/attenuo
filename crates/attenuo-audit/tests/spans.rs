@@ -6,8 +6,8 @@
 mod common;
 
 use attenuo_audit::{
-    AuditError, LeaseStore, MemoryLeaseStore, SpanHit, SqliteLeaseStore, MAX_SEQS_PER_PROBE,
-    MAX_SPANS_PER_RUN,
+    AuditError, LeaseStore, MemoryLeaseStore, RunState, SpanHit, SqliteLeaseStore,
+    MAX_SEQS_PER_PROBE, MAX_SPANS_PER_RUN,
 };
 use attenuo_core::fingerprint::{fingerprints, Fingerprint, FingerprintKind};
 use attenuo_core::LeaseId;

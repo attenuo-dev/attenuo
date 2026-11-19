@@ -17,7 +17,7 @@ Status updated 2026-10-23 by [pass 4](security-review-2026-10-23-pass4.md) (`rev
 
 - Date: 2026-10-22
 - Branch: `review/security-pass-1` (base: `7411c9b`, all crates merged)
-- Related: [RFC-0001](../spec/rfc-0001-attenuo.md), [threat model](../spec/threat-model.md), [task board](../tasks/board.md)
+- Related: [RFC-0001](../spec/rfc-0001-attenuo.md), [threat model](../spec/threat-model.md), task board
 
 ## Scope and method
 

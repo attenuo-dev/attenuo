@@ -34,10 +34,10 @@ fn base_config() -> Config {
         "github",
         "http://127.0.0.1:9/internal-only-path",
     )];
-    cfg.peps = vec![AgentConfig {
-        id: "gateway".into(),
-        secret_sha256: hex::encode(Sha256::digest(PEP_SECRET.as_bytes())),
-    }];
+    cfg.peps = vec![AgentConfig::with_secret_sha256(
+        "gateway",
+        hex::encode(Sha256::digest(PEP_SECRET.as_bytes())),
+    )];
     cfg
 }
 
@@ -257,16 +257,33 @@ thread_local! {
     static CAPTURE: std::cell::RefCell<Option<Vec<u8>>> = const { std::cell::RefCell::new(None) };
 }
 
-/// Writes to the calling thread's capture buffer, and discards output when none is active.
+/// Lines written on threads without a capture buffer of their own (the blocking pool a route
+/// handler runs on), while a test that needs them has turned this on. Tests running at the same
+/// time may write here too, so a test filters what it reads by a marker of its own.
+static SHARED_CAPTURE: std::sync::Mutex<Option<Vec<u8>>> = std::sync::Mutex::new(None);
+
+/// Writes to the calling thread's capture buffer, else to [`SHARED_CAPTURE`] when that is on,
+/// and discards output otherwise.
 struct ThreadCapture;
 
 impl std::io::Write for ThreadCapture {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        CAPTURE.with(|c| {
-            if let Some(v) = c.borrow_mut().as_mut() {
+        let mine = CAPTURE.with(|c| match c.borrow_mut().as_mut() {
+            Some(v) => {
+                v.extend_from_slice(buf);
+                true
+            }
+            None => false,
+        });
+        if !mine {
+            if let Some(v) = SHARED_CAPTURE
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .as_mut()
+            {
                 v.extend_from_slice(buf);
             }
-        });
+        }
         Ok(buf.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
@@ -318,6 +335,38 @@ fn a_newline_in_a_tool_name_stays_on_one_log_line() {
     assert_eq!(text.lines().count(), 1, "{text}");
     assert!(text.contains(r#"tool="read_file\nFORGED"#), "{text}");
     assert!(text.contains(r#"subject="alice\nFORGED"#), "{text}");
+}
+
+/// SR-115: the `AuthZEN action search` log line wrote the request's `server` with `Display`,
+/// so a newline in `resource.properties.server` forged a second log line, as SR-18 did for the
+/// decision line. It is Debug-formatted now.
+#[tokio::test]
+async fn a_newline_in_an_action_search_server_stays_on_one_log_line_sr115() {
+    install_capture();
+    let server = start(&base_config()).await;
+    let (token, _) = root_token(&server).await;
+    *SHARED_CAPTURE.lock().unwrap() = Some(Vec::new());
+    let resp = reqwest::Client::new()
+        .post(server.url("/access/v1/search/action"))
+        .bearer_auth(&token)
+        .json(&json!({
+            "subject": {"type": "agent", "id": ""},
+            "resource": {"type": "mcp_server", "id": "x",
+                         "properties": {"server": "gh\nFORGED-SR115 level=INFO decision"}},
+        }))
+        .send()
+        .await
+        .unwrap();
+    let captured = SHARED_CAPTURE.lock().unwrap().take().unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let text = String::from_utf8(captured).unwrap();
+    let marked: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("FORGED-SR115"))
+        .collect();
+    assert_eq!(marked.len(), 1, "{text}");
+    assert!(marked[0].contains("AuthZEN action search"), "{text}");
+    assert!(marked[0].contains(r#"server="gh\nFORGED-SR115"#), "{text}");
 }
 
 /// SR-90: tower-http's default request span recorded the full URI, query string included, so
@@ -389,6 +438,10 @@ async fn request_spans_carry_the_route_template_not_the_uri() {
 fn public_url_is_required_off_loopback() {
     let mut cfg = base_config();
     cfg.server.listen = "0.0.0.0:8080".parse().unwrap();
+    // The dev root mint is refused off loopback (S-3), and the admin API on the main listener
+    // (S-1), which is not what this test is about.
+    cfg.dev.allow_root_mint = false;
+    cfg.admin.listen = Some("127.0.0.1:9102".parse().unwrap());
     let err = attenuo_server::build(&cfg).err().expect("must refuse");
     assert!(err.to_string().contains("public_url"), "{err}");
     cfg.server.public_url = Some("https://attenuo.example.com".into());
@@ -403,6 +456,54 @@ fn public_url_is_required_off_loopback() {
         cfg.server.public_url = Some(bad.into());
         assert!(attenuo_server::build(&cfg).is_err(), "{bad}");
     }
+}
+
+/// S-9: off loopback, an `http://` `public_url` with a host that is not loopback stops the
+/// server unless `allow_insecure_http`; an https URL (TLS at a reverse proxy) needs nothing.
+#[test]
+fn plain_http_public_url_off_loopback_is_refused_at_startup_s9() {
+    let mut cfg = base_config();
+    cfg.server.listen = "0.0.0.0:8080".parse().unwrap();
+    cfg.dev.allow_root_mint = false;
+    cfg.admin.listen = Some("127.0.0.1:9102".parse().unwrap());
+    cfg.server.public_url = Some("http://attenuo.example.com".into());
+    let err = attenuo_server::build(&cfg).err().expect("must refuse");
+    assert!(err.to_string().contains("allow_insecure_http"), "{err}");
+    cfg.server.allow_insecure_http = true;
+    let _ = attenuo_server::build(&cfg).unwrap();
+    cfg.server.allow_insecure_http = false;
+    cfg.server.public_url = Some("https://attenuo.example.com".into());
+    let _ = attenuo_server::build(&cfg).unwrap();
+    // A container that binds 0.0.0.0 but is reached on the host's loopback.
+    cfg.server.public_url = Some("http://127.0.0.1:8080".into());
+    let _ = attenuo_server::build(&cfg).unwrap();
+}
+
+/// S-3: the dev root mint stops the server off loopback unless the demo-only opt-in is set.
+/// What counts is the listener the admin API is on: the main one here (S-1 opt-in), a
+/// loopback `[admin] listen` at the end.
+#[test]
+fn dev_root_mint_off_loopback_is_refused_at_startup_s3() {
+    let mut cfg = base_config();
+    cfg.server.listen = "0.0.0.0:8080".parse().unwrap();
+    cfg.server.public_url = Some("https://attenuo.example.com".into());
+    cfg.admin.serve_on_main_listener = true;
+    assert!(cfg.dev.allow_root_mint, "base_config turns the mint on");
+    let err = attenuo_server::build(&cfg).err().expect("must refuse");
+    assert!(err.to_string().contains("allow_root_mint"), "{err}");
+    cfg.dev.allow_root_mint_off_loopback = true;
+    let _ = attenuo_server::build(&cfg).unwrap();
+    cfg.dev.allow_root_mint_off_loopback = false;
+    // On an admin listener of its own the mint is judged by that listener's address.
+    cfg.admin.serve_on_main_listener = false;
+    cfg.admin.listen = Some("0.0.0.0:9102".parse().unwrap());
+    let err = attenuo_server::build(&cfg).err().expect("must refuse");
+    assert!(err.to_string().contains("allow_root_mint"), "{err}");
+    cfg.admin.listen = Some("127.0.0.1:9102".parse().unwrap());
+    let _ = attenuo_server::build(&cfg).unwrap();
+    cfg.admin.listen = None;
+    cfg.server.listen = "127.0.0.1:8080".parse().unwrap();
+    let _ = attenuo_server::build(&cfg).unwrap();
 }
 
 async fn discovery(server: &Spawned, host: Option<&str>) -> reqwest::Response {
@@ -481,10 +582,7 @@ fn the_server_name_attenuo_is_reserved() {
 /// root grants may not use it as an agent id either.
 #[test]
 fn the_agent_id_attenuo_is_reserved() {
-    let agent = |id: &str| AgentConfig {
-        id: id.into(),
-        secret_sha256: hex::encode(Sha256::digest(b"s")),
-    };
+    let agent = |id: &str| AgentConfig::with_secret_sha256(id, hex::encode(Sha256::digest(b"s")));
     let mut cfg = Config::default();
     cfg.agents = vec![agent("attenuo")];
     assert!(cfg
@@ -504,7 +602,9 @@ fn the_agent_id_attenuo_is_reserved() {
         attributes: Default::default(),
         may_act: None,
     }];
-    assert!(cfg.check_server_names().is_err());
+    let err = cfg.check_server_names().unwrap_err().to_string();
+    assert!(err.contains("reserved"), "{err}");
+    assert!(err.starts_with("[[root_grants]] entry 0 "), "{err}");
     // A root-grant capability or catalog entry on the server `attenuo` is refused too.
     let mut cfg = Config::default();
     cfg.root_grants = vec![RootGrant {
@@ -515,7 +615,9 @@ fn the_agent_id_attenuo_is_reserved() {
         attributes: Default::default(),
         may_act: None,
     }];
-    assert!(cfg.check_server_names().is_err());
+    let err = cfg.check_server_names().unwrap_err().to_string();
+    assert!(err.contains("reserved"), "{err}");
+    assert!(err.starts_with("[[root_grants]] entry 0 "), "{err}");
     let cfg = Config::from_toml("[policy.catalog.attenuo.\"token.exchange\"]\n").unwrap();
     let err = cfg.check_server_names().unwrap_err().to_string();
     assert!(err.contains("reserved"), "{err}");
@@ -653,5 +755,135 @@ fn release_workflow_actions_are_pinned_to_commits() {
     assert!(
         !text.contains("Swatinem/rust-cache"),
         "the release build must not restore a shared cargo cache"
+    );
+}
+
+/// Every `[[root_grants]]` refusal at start names the entry the way the limits one does (its
+/// index from 0, issuer, agent and subject), then gives the reason it gave before: a reserved
+/// agent id, a capability that does not parse, an invalid tool name and a reserved server
+/// name. The SR-123 size bound is checked in `tests/run_limits.rs`.
+#[test]
+fn root_grant_refusals_name_the_entry() {
+    let grant = |agent: &str, subject: Option<&str>, cap: &str| RootGrant {
+        subject: subject.map(Into::into),
+        issuer: "https://idp.example".into(),
+        agent: agent.into(),
+        capabilities: vec![CapSpec::Short(cap.into())],
+        attributes: Default::default(),
+        may_act: None,
+    };
+    for (agent, cap, reason) in [
+        (
+            "attenuo",
+            "github:*",
+            "agent id `attenuo` is reserved for the server's own records",
+        ),
+        (
+            "planner",
+            "github",
+            "capability `github` must look like `server:tool`",
+        ),
+        ("planner", "github:a//b", "which is not allowed"),
+        (
+            "planner",
+            "attenuo:admin.lease.revoke",
+            "server name `attenuo` is reserved for the server's own audit records",
+        ),
+    ] {
+        let mut cfg = Config::default();
+        cfg.root_grants = vec![
+            grant("planner", None, "github:*"),
+            grant(agent, Some("alice"), cap),
+        ];
+        let err = cfg.check_server_names().unwrap_err().to_string();
+        let entry = format!(
+            "[[root_grants]] entry 1 (issuer \"https://idp.example\", agent \"{agent}\", \
+             subject \"alice\"): "
+        );
+        assert!(err.starts_with(&entry), "{err}");
+        assert!(err.contains(reason), "{err}");
+    }
+}
+
+/// A `[[root_grants]]` capability whose limits no token may carry refuses to start, naming the
+/// entry, the capability and the reason; it used to start and then fail every mint under the
+/// grant with `invalid_capability` (the `[[root_grants]]` follow-up of SR-125). A grant with
+/// well-formed limits still starts and mints.
+#[tokio::test]
+async fn root_grant_limits_no_token_may_carry_refuse_to_start() {
+    let grant = |subject: Option<&str>, limits: Value| RootGrant {
+        subject: subject.map(Into::into),
+        issuer: "https://idp.example".into(),
+        agent: "planner".into(),
+        capabilities: vec![CapSpec::Full(
+            serde_json::from_value(json!({"server": "github", "tool": "*", "limits": limits}))
+                .unwrap(),
+        )],
+        attributes: Default::default(),
+        may_act: None,
+    };
+    for (limits, reason) in [
+        (json!({"sum": {"arg": "", "max": 1}}), "`arg` is empty"),
+        (
+            json!({"sum": {"arg": "n", "max": 1, "derive": "host"}}),
+            "takes no `derive`",
+        ),
+    ] {
+        let mut cfg = base_config();
+        cfg.root_grants = vec![
+            grant(None, json!({"calls": 5})),
+            grant(Some("alice"), limits),
+        ];
+        let err = attenuo_server::build(&cfg)
+            .err()
+            .expect("must refuse")
+            .to_string();
+        assert!(
+            err.starts_with(
+                "[[root_grants]] entry 1 (issuer \"https://idp.example\", agent \"planner\", \
+                 subject \"alice\"): limit `sum` of capability `github:* limits="
+            ),
+            "{err}"
+        );
+        assert!(err.contains(reason), "{err}");
+        assert!(
+            err.ends_with("no token may carry it, so every mint under this grant would fail"),
+            "{err}"
+        );
+    }
+    // SR-130: under `[logging] redact_subjects` the refusal does not write the subject out;
+    // the index still names the entry.
+    let mut cfg = base_config();
+    cfg.logging.redact_subjects = true;
+    cfg.root_grants = vec![
+        grant(None, json!({"calls": 5})),
+        grant(
+            Some("alice@example.com"),
+            json!({"sum": {"arg": "", "max": 1}}),
+        ),
+    ];
+    let err = attenuo_server::build(&cfg)
+        .err()
+        .expect("must refuse")
+        .to_string();
+    assert!(
+        err.starts_with(
+            "[[root_grants]] entry 1 (issuer \"https://idp.example\", agent \"planner\", \
+             a subject (not shown: [logging] redact_subjects)): limit `sum`"
+        ),
+        "{err}"
+    );
+    assert!(!err.contains("alice"), "{err}");
+
+    // Well-formed limits start, and a mint under the grant succeeds.
+    let mut cfg = base_config();
+    cfg.root_grants = vec![grant(
+        None,
+        json!({"calls": 5, "sum": {"arg": "n", "max": 9}}),
+    )];
+    let server = start(&cfg).await;
+    assert_eq!(
+        mint_root(&server, "alice", "planner").await.status(),
+        StatusCode::OK
     );
 }

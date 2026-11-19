@@ -364,7 +364,7 @@ fn delegation_token_from_stdin_a_file_or_the_environment() {
             "--server",
             url,
             "call",
-            "--server",
+            "--upstream",
             "github",
             "--tool",
             "read_file",

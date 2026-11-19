@@ -36,6 +36,7 @@
         },
         "body": {
           "error": "unauthorized",
+          "code": "missing_token",
           "detail": "<any>",
           "error_description": "missing_token"
         }

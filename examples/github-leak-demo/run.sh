@@ -122,21 +122,21 @@ say "3. What the coder's token says"
 step 0 'attenuo token inspect "$CODER" --verify'
 
 say "4. The coder reads a public repo as intended: allowed"
-step 0 'ATTENUO_TOKEN="$CODER" attenuo call --server github --tool read_file --arg repo=alice/public-docs --arg path=README.md'
+step 0 'ATTENUO_TOKEN="$CODER" attenuo call --upstream github --tool read_file --arg repo=alice/public-docs --arg path=README.md'
 
 say "5. A malicious issue tells the coder to read alice/private-salaries: denied by policy"
 note "read_file is in the token, but the policy only lets it touch alice/public-*."
-step 2 'ATTENUO_TOKEN="$CODER" attenuo call --server github --tool read_file --arg repo=alice/private-salaries --arg path=2025.csv'
+step 2 'ATTENUO_TOKEN="$CODER" attenuo call --upstream github --tool read_file --arg repo=alice/private-salaries --arg path=2025.csv'
 
 say "6. The injection tries to copy the data out through create_issue: denied, never delegated"
-step 2 'ATTENUO_TOKEN="$CODER" attenuo call --server github --tool create_issue --arg repo=alice/public-docs --arg title=leak'
+step 2 'ATTENUO_TOKEN="$CODER" attenuo call --upstream github --tool create_issue --arg repo=alice/public-docs --arg title=leak'
 
 say "7. Alice sees the session going wrong and revokes the assistant's lease"
 step 0 'attenuo lease revoke "$ROOT_LEASE" --reason "agent session compromised"'
 step 0 'attenuo lease show "$CODER_LEASE"'
 
 say "8. The coder's next call, even the legitimate one, is denied: the revocation cascaded"
-step 2 'ATTENUO_TOKEN="$CODER" attenuo call --server github --tool read_file --arg repo=alice/public-docs --arg path=README.md'
+step 2 'ATTENUO_TOKEN="$CODER" attenuo call --upstream github --tool read_file --arg repo=alice/public-docs --arg path=README.md'
 
 say "9. The audit log records every decision, and its hash chain checks out"
 step 0 'attenuo audit tail -n 10'

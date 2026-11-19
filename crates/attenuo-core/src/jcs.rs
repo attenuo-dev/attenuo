@@ -204,6 +204,70 @@ pub fn value_eq(a: &Value, b: &Value) -> bool {
     }
 }
 
+/// The canonical encoding of a JSON value: the bytes [`to_vec`] gives for it, written
+/// straight from the value. Two values are [`value_eq`] exactly when their keys are equal, so
+/// a set of keys answers "is this value one of those?" in one lookup instead of one
+/// [`value_eq`] per member (SR-123).
+///
+/// Why the two equalities agree: numbers are written as [`value_eq`] compares them (the same
+/// decimal string for both); strings, `null` and booleans are written injectively, so two
+/// are written alike exactly when they are equal; an array is written element by element in
+/// order, delimited, so two are written alike exactly when they have the same length and
+/// pairwise equal elements; an object's members are written sorted by name, and a
+/// `serde_json` map holds each name once, so two objects are written alike exactly when they
+/// have the same names and equal values under each, which is [`value_eq`]'s test. The kinds
+/// start with different bytes (`n`, `t`/`f`, `"`, `[`, `{`, a digit or `-`), so values of two
+/// kinds are never written alike, as [`value_eq`] never finds them equal.
+pub fn value_key(value: &Value) -> Vec<u8> {
+    let mut out = Vec::with_capacity(16);
+    write_value(&mut out, value);
+    out
+}
+
+/// Append [`value_key`] of `value` to `out`.
+pub(crate) fn write_value(out: &mut Vec<u8>, value: &Value) {
+    use std::io::Write as _;
+    match value {
+        Value::Null => out.extend_from_slice(b"null"),
+        Value::Bool(true) => out.extend_from_slice(b"true"),
+        Value::Bool(false) => out.extend_from_slice(b"false"),
+        Value::Number(n) => {
+            if let Some(u) = n.as_u64() {
+                write!(out, "{u}").expect("writing to a Vec does not fail");
+            } else if let Some(i) = n.as_i64() {
+                write!(out, "{i}").expect("writing to a Vec does not fail");
+            } else {
+                out.extend_from_slice(number_key(n).as_bytes());
+            }
+        }
+        Value::String(s) => write_str(out, s),
+        Value::Array(items) => {
+            out.push(b'[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(b',');
+                }
+                write_value(out, item);
+            }
+            out.push(b']');
+        }
+        Value::Object(map) => {
+            let mut members: Vec<(&String, &Value)> = map.iter().collect();
+            members.sort_by(|a, b| utf16_cmp(a.0, b.0));
+            out.push(b'{');
+            for (i, (k, v)) in members.into_iter().enumerate() {
+                if i > 0 {
+                    out.push(b',');
+                }
+                write_str(out, k);
+                out.push(b':');
+                write_value(out, v);
+            }
+            out.push(b'}');
+        }
+    }
+}
+
 /// What a number is written as. A `serde_json::Number` always has one.
 fn number_key(n: &serde_json::Number) -> String {
     if let Some(u) = n.as_u64() {

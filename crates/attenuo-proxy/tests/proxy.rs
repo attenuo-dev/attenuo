@@ -306,6 +306,65 @@ async fn batch_with_one_allowed_and_one_denied() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// S-7 / SR-73: a `path_prefix` capability refuses a `..` escape at the capability stage, while
+/// a `prefix` capability on the same string lets it through to the upstream (pinned: `prefix`
+/// stays a string comparison).
+#[tokio::test]
+async fn path_prefix_denies_a_dot_dot_escape_that_prefix_lets_through() -> anyhow::Result<()> {
+    let with = |c: ArgConstraint| {
+        test_chain(
+            "user:alice",
+            "agent:coder",
+            [Capability::new(SERVER, "read_file").with_constraint("path", c)],
+        )
+    };
+    let h = Harness::start(
+        &["read_file"],
+        false,
+        vec![
+            ("path", with(ArgConstraint::path_prefix("/workspace/")?)),
+            ("string", with(ArgConstraint::Prefix("/workspace/".into()))),
+        ],
+    )
+    .await?;
+    let escape = json!({"path": "/workspace/../etc/passwd"});
+
+    let denied = h
+        .rpc(Some("path"), &tools_call(1, "read_file", escape.clone()))
+        .await?;
+    let body: Value = denied.json().await?;
+    assert_eq!(body["error"]["code"], CODE_DENIED, "{body}");
+    assert_eq!(body["error"]["data"]["reason"], "capability_denied");
+    assert!(h.upstream.recorded_calls().is_empty());
+
+    let inside = h
+        .rpc(
+            Some("path"),
+            &tools_call(2, "read_file", json!({"path": "/workspace/src/main.rs"})),
+        )
+        .await?;
+    let body: Value = inside.json().await?;
+    assert!(body.get("error").is_none(), "{body}");
+
+    let through = h
+        .rpc(Some("string"), &tools_call(3, "read_file", escape))
+        .await?;
+    let body: Value = through.json().await?;
+    assert!(body.get("error").is_none(), "{body}");
+    let calls = h.upstream.recorded_calls();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].arguments["path"], "/workspace/src/main.rs");
+    assert_eq!(calls[1].arguments["path"], "/workspace/../etc/passwd");
+    let reasons: Vec<String> = h
+        .authorizer
+        .decisions()
+        .into_iter()
+        .map(|d| d.reason)
+        .collect();
+    assert_eq!(reasons[0], "capability_denied", "{reasons:?}");
+    Ok(())
+}
+
 #[tokio::test]
 async fn github_leak_scenario_repo_prefix_constraint() -> anyhow::Result<()> {
     let chain = test_chain(
@@ -505,6 +564,8 @@ async fn unknown_server_is_404_and_bad_json_is_400() -> anyhow::Result<()> {
     assert_eq!(resp.status(), 404);
     let body: Value = resp.json().await?;
     assert_eq!(body["error"]["code"], CODE_UNKNOWN_SERVER);
+    // K-8: the stable code is in `data.code`.
+    assert_eq!(body["error"]["data"], json!({"code": "unknown_server"}));
 
     let resp = h
         .client
@@ -515,6 +576,8 @@ async fn unknown_server_is_404_and_bad_json_is_400() -> anyhow::Result<()> {
         .send()
         .await?;
     assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await?;
+    assert_eq!(body["error"]["data"]["code"], "parse_error");
 
     // tools/call without a name is rejected locally with invalid params
     let resp = h
@@ -525,6 +588,7 @@ async fn unknown_server_is_404_and_bad_json_is_400() -> anyhow::Result<()> {
         .await?;
     let body: Value = resp.json().await?;
     assert_eq!(body["error"]["code"], -32602);
+    assert_eq!(body["error"]["data"]["code"], "invalid_params");
     assert!(h.upstream.recorded_calls().is_empty());
     Ok(())
 }

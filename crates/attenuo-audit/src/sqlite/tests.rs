@@ -9,9 +9,9 @@ use crate::budget::ChargeOutcome;
 use crate::checkpoint::Checkpoint;
 use crate::error::AuditError;
 use crate::export::RecordFilter;
-use crate::lease::LeaseStore;
 use crate::log::{AuditSink, ENTRY_HASH_VERSION};
 use crate::query::{EntryFilter, Order};
+use crate::store::{LeaseRegistry, RunLimits, RunState};
 
 use super::connection::{
     open_connection, with_full_sync, Durability, Ticket, WriteGate, SYNC_FULL, SYNC_NORMAL,
@@ -863,9 +863,15 @@ fn the_record_id_index_is_added_to_an_existing_log_without_touching_rows() {
         for i in 0..5 {
             log.append(record(i)).unwrap();
         }
-        // Make the file look like one written before the index existed.
-        log.with_connection(|c| Ok(c.execute_batch("DROP INDEX audit_record_id_idx")?))
-            .unwrap();
+        // Make the file look like one written before the index existed (and so before
+        // schema versions, before the replay table of version 3 and the subject issuer of 4).
+        log.with_connection(|c| {
+            Ok(c.execute_batch(
+                "DROP INDEX audit_record_id_idx; DROP TABLE used_credentials; \
+                 ALTER TABLE lease_subjects DROP COLUMN issuer; PRAGMA user_version = 0;",
+            )?)
+        })
+        .unwrap();
         assert!(!index_exists(&log));
         let id = log.entry_at(4).unwrap().unwrap().record.id.to_string();
         (dump(&log), id)
@@ -878,8 +884,10 @@ fn the_record_id_index_is_added_to_an_existing_log_without_touching_rows() {
     // A row whose JSON was damaged while the index did not exist.
     log.with_connection(|c| {
         c.execute_batch(
-            "DROP INDEX audit_record_id_idx; \
-             UPDATE audit SET record_json = '{not json' WHERE seq = 2;",
+            "DROP INDEX audit_record_id_idx; DROP TABLE used_credentials; \
+             ALTER TABLE lease_subjects DROP COLUMN issuer; \
+             UPDATE audit SET record_json = '{not json' WHERE seq = 2; \
+             PRAGMA user_version = 0;",
         )?;
         Ok(())
     })
@@ -1000,4 +1008,335 @@ fn nears_checkpoint_fires_once_per_checkpoint() {
     assert_eq!(fired, [5, 15]);
     assert!(!nears_checkpoint(968, 968, 1000, 0));
     assert!(!nears_checkpoint(968, 968, 0, 32));
+}
+
+/// The writer stuck (here: the test holds the connection, as a write stuck on a hung disk
+/// would): every append fails within the append timeout instead of blocking, the ones the
+/// writer had not taken are never written, and once the writer is free the chain goes on
+/// from what it did commit, unforked.
+#[test]
+fn a_stuck_writer_times_appends_out_and_never_writes_withdrawn_ones() {
+    let log = Arc::new(
+        SqliteAudit::open_in_memory()
+            .unwrap()
+            .with_append_limits(64, Duration::from_millis(200)),
+    );
+    let held = log.inner.conn.lock().unwrap();
+    let started = std::time::Instant::now();
+    let appenders: Vec<_> = (1..=8)
+        .map(|i| {
+            let log = Arc::clone(&log);
+            std::thread::spawn(move || (i, log.append(record(i))))
+        })
+        .collect();
+    let results: Vec<_> = appenders.into_iter().map(|t| t.join().unwrap()).collect();
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "appends waited {:?}",
+        started.elapsed()
+    );
+    let mut taken = Vec::new();
+    for (i, r) in &results {
+        match r {
+            Err(AuditError::Overloaded(why)) if why.contains("did not take") => {}
+            Err(AuditError::Overloaded(why)) if why.contains("did not commit") => taken.push(*i),
+            other => panic!("append {i}: expected a timeout, got {other:?}"),
+        }
+    }
+    assert_eq!(log.append_stats().timeouts, 8);
+    assert_eq!(log.append_stats().queue_full, 0);
+    drop(held);
+    // The writer commits the batch it had taken (before or after this append, which may
+    // commit inline) and drops the withdrawn jobs.
+    let last = log.append(record(100)).unwrap();
+    let want = taken.len() as u64 + 1;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while log.head().unwrap().map_or(0, |h| h.seq) < want {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the writer never caught up"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let entries = log.range(1, 100).unwrap();
+    let mut written: Vec<i64> = entries
+        .iter()
+        .map(|e| e.record.at.unix_timestamp() - datetime!(2026-10-23 12:00 UTC).unix_timestamp())
+        .collect();
+    written.sort_unstable();
+    taken.push(100);
+    taken.sort_unstable();
+    assert_eq!(
+        written, taken,
+        "only the records the writer had taken, and the new one"
+    );
+    assert!(last.seq <= want);
+    assert!(log.verify_chain().unwrap().ok);
+}
+
+/// A writer that does not drain fills its bounded queue, and further appends fail at once
+/// (`queue_full`) rather than waiting.
+#[test]
+fn a_full_writer_queue_sheds_appends_at_once() {
+    let log = Arc::new(
+        SqliteAudit::open_in_memory()
+            .unwrap()
+            .with_append_limits(1, Duration::from_millis(300)),
+    );
+    let held = log.inner.conn.lock().unwrap();
+    let appenders: Vec<_> = (1..=32)
+        .map(|i| {
+            let log = Arc::clone(&log);
+            std::thread::spawn(move || log.append(record(i)))
+        })
+        .collect();
+    for t in appenders {
+        assert!(matches!(t.join().unwrap(), Err(AuditError::Overloaded(_))));
+    }
+    let stats = log.append_stats();
+    assert_eq!(stats.queue_full + stats.timeouts, 32);
+    // At most the batch the writer took and one queued job can wait; the rest are refused.
+    assert!(stats.queue_full >= 1, "{stats:?}");
+    drop(held);
+    // Withdrawn jobs hold their queue slots until the writer drains them, which it does as
+    // soon as it is free: appends succeed again shortly after.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match log.append(record(100)) {
+            Ok(_) => break,
+            Err(AuditError::Overloaded(_)) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(e) => panic!("the writer did not recover: {e}"),
+        }
+    }
+    assert!(log.verify_chain().unwrap().ok);
+}
+
+/// Under the default limits a busy writer still group-commits every append, in order.
+#[test]
+fn bounded_queue_keeps_group_commit_and_order() {
+    let log = Arc::new(SqliteAudit::open_in_memory().unwrap());
+    let appenders: Vec<_> = (0..16)
+        .map(|t| {
+            let log = Arc::clone(&log);
+            std::thread::spawn(move || {
+                (0..50)
+                    .map(|i| log.append(record(t * 1000 + i)).unwrap().seq)
+                    .collect::<Vec<_>>()
+            })
+        })
+        .collect();
+    for t in appenders {
+        let seqs = t.join().unwrap();
+        // One thread's appends get increasing sequence numbers.
+        assert!(seqs.windows(2).all(|w| w[0] < w[1]), "{seqs:?}");
+    }
+    assert_eq!(log.head().unwrap().unwrap().seq, 800);
+    assert_eq!(log.append_stats(), super::log::AppendStats::default());
+    assert!(log.verify_chain().unwrap().ok);
+}
+
+/// A-1: on a file in WAL mode, queries run on their own read-only connection, so a long read
+/// (here simulated by holding the reader's lock, as a verify walking a page does) never holds
+/// up an append, and an append is visible to the next read.
+#[test]
+fn a_read_in_progress_does_not_hold_up_appends() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = Arc::new(SqliteAudit::open(dir.path().join("audit.db")).unwrap());
+    log.append(record(0)).unwrap();
+    let reading = log
+        .reader
+        .as_ref()
+        .expect("a file in WAL mode has a reader")
+        .lock();
+    let (done, appended) = mpsc::channel();
+    let writer = {
+        let log = Arc::clone(&log);
+        std::thread::spawn(move || {
+            for i in 1..=20 {
+                log.append(record(i)).unwrap();
+            }
+            done.send(()).unwrap();
+        })
+    };
+    appended
+        .recv_timeout(Duration::from_secs(10))
+        .expect("appends commit while a read holds the reader connection");
+    // Queries wait for the reader, not for the writer.
+    let (asked, answered) = mpsc::channel();
+    let counting = {
+        let log = Arc::clone(&log);
+        std::thread::spawn(move || asked.send(log.len().unwrap()).unwrap())
+    };
+    assert!(answered.recv_timeout(Duration::from_millis(100)).is_err());
+    drop(reading);
+    assert_eq!(answered.recv_timeout(Duration::from_secs(10)).unwrap(), 21);
+    writer.join().unwrap();
+    counting.join().unwrap();
+    assert!(log.verify_chain().unwrap().ok);
+    // The reader cannot write.
+    let refused = log
+        .reader
+        .as_ref()
+        .unwrap()
+        .lock()
+        .unwrap()
+        .execute("DELETE FROM audit", []);
+    assert!(refused.is_err(), "the reader connection is read-only");
+    assert_eq!(log.len().unwrap(), 21);
+}
+
+/// An in-memory store has no second connection: its reads share the writer's.
+#[test]
+fn an_in_memory_store_reads_on_the_writer_connection() {
+    let log = SqliteAudit::open_in_memory().unwrap();
+    assert!(log.reader.is_none());
+    log.append(record(0)).unwrap();
+    assert_eq!(log.len().unwrap(), 1);
+    assert!(log.verify_chain().unwrap().ok);
+}
+
+/// A verify walks the log as it was when it began, page by page: entries appended after its
+/// snapshot are not walked, whatever page the walk is on when they land.
+#[test]
+fn a_paged_verify_stops_at_its_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = SqliteAudit::open(dir.path().join("audit.db")).unwrap();
+    // More than two pages.
+    let n = 2500;
+    std::thread::scope(|s| {
+        for t in 0..4 {
+            let log = &log;
+            s.spawn(move || {
+                for i in (t..n).step_by(4) {
+                    log.append(record(i)).unwrap();
+                }
+            });
+        }
+    });
+    let (upper, _) = log.verify_snapshot().unwrap();
+    assert_eq!(upper, n);
+    let mut walk = log.entries_through(upper);
+    let first = walk.next().unwrap().unwrap();
+    assert_eq!(first.seq, 1);
+    // Appends land while the walk is in its first page.
+    for i in 0..50 {
+        log.append(record(n + i)).unwrap();
+    }
+    let seqs: Vec<u64> = std::iter::once(Ok(first))
+        .chain(walk)
+        .map(|e| e.unwrap().seq)
+        .collect();
+    assert_eq!(seqs, (1..=2500).collect::<Vec<u64>>());
+    let report = log.verify_chain().unwrap();
+    assert!(report.ok);
+    assert_eq!(report.entries, 2550);
+}
+
+/// A row that does not decode is reported at its seq by the paged walk too, and the walk
+/// goes on past it.
+#[test]
+fn a_paged_verify_reports_a_corrupt_row_at_its_seq() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = SqliteAudit::open(dir.path().join("audit.db")).unwrap();
+    for i in 0..1500 {
+        log.append(record(i)).unwrap();
+    }
+    log.with_connection(|c| {
+        c.execute("UPDATE audit SET decision = 'deny' WHERE seq = 1200", [])?;
+        Ok(())
+    })
+    .unwrap();
+    let report = log.verify_chain().unwrap();
+    assert!(!report.ok);
+    assert_eq!(report.first_bad_seq, Some(1200));
+}
+
+/// SR-102: once the writer has taken a record, its caller waits for the true outcome, even
+/// past the append timeout. Before the fix the caller gave up with `Overloaded` (and the
+/// pipeline refunded the charge and gave the approval back) while the writer still committed
+/// the record afterwards, so the log held an `allow` for a call that was denied.
+#[test]
+fn a_taken_append_is_waited_for_past_the_timeout_sr102() {
+    use super::log::TakeGate;
+    let gate = Arc::new(TakeGate::default());
+    let timeout = Duration::from_millis(20);
+    let log = Arc::new(
+        SqliteAudit::open_in_memory()
+            .unwrap()
+            .with_append_limits(8, timeout)
+            .with_take_gate(Arc::clone(&gate)),
+    );
+    log.never_inline();
+    let (tx, rx) = mpsc::channel();
+    let appender = {
+        let log = Arc::clone(&log);
+        std::thread::spawn(move || tx.send(log.append(record(1))).unwrap())
+    };
+    // The writer holds the record and has not committed it; the caller's deadline runs now.
+    gate.wait_taken();
+    let early = rx.recv_timeout(timeout * 10);
+    // Let the writer go before any assertion, so a failure does not hang the drop.
+    gate.release();
+    match early {
+        Err(mpsc::RecvTimeoutError::Timeout) => {}
+        Ok(answer) => {
+            appender.join().unwrap();
+            let head = log.head().unwrap().map(|h| h.seq);
+            panic!(
+                "the caller gave up on a record the writer had taken ({answer:?}); \
+                 the log head is now {head:?}"
+            )
+        }
+        Err(e) => panic!("{e}"),
+    }
+    let entry = rx.recv().unwrap().expect("the caller learns the commit");
+    appender.join().unwrap();
+    assert_eq!(entry.seq, 1);
+    assert_eq!(log.head().unwrap().map(|h| h.seq), Some(1));
+    assert_eq!(log.append_stats().timeouts, 0);
+    assert!(log.verify_chain().unwrap().ok);
+}
+
+/// SR-103: a database file the stores create is the owner's alone, and so are the `-wal`
+/// and `-shm` files SQLite creates next to it (it gives them the database file's mode). The
+/// lease store, on the same file, opens it the same way.
+#[cfg(unix)]
+#[test]
+fn new_database_files_are_owner_only_sr103() {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("audit.sqlite");
+    let log = SqliteAudit::open(&db).unwrap();
+    let leases = SqliteLeaseStore::open(&db).unwrap();
+    log.append(record(1)).unwrap();
+    for suffix in ["", "-wal", "-shm"] {
+        let p = PathBuf::from(format!("{}{suffix}", db.display()));
+        assert_eq!(mode(&p), 0o600, "{}", p.display());
+    }
+    drop((log, leases));
+}
+
+/// SR-103: an existing database file keeps the mode an operator gave it (here group-readable,
+/// for a backup user), and SQLite gives its `-wal` and `-shm` files the same.
+#[cfg(unix)]
+#[test]
+fn an_existing_database_keeps_its_mode_sr103() {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("audit.sqlite");
+    drop(SqliteAudit::open(&db).unwrap());
+    for suffix in ["-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
+    }
+    std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o640)).unwrap();
+    let log = SqliteAudit::open(&db).unwrap();
+    log.append(record(1)).unwrap();
+    for suffix in ["", "-wal", "-shm"] {
+        let p = PathBuf::from(format!("{}{suffix}", db.display()));
+        assert_eq!(mode(&p), 0o640, "{}", p.display());
+    }
 }

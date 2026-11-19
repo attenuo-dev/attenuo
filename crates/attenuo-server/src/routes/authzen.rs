@@ -15,7 +15,7 @@
 //!   (HTTP Basic, or `pep_id` and `pep_secret` in the body; 401 `invalid_client` otherwise), and
 //!   `subject.properties.chain` is then checked structurally (`validate_at`) and hop by hop
 //!   against what this server issued: each hop's lease must carry a binding equal to the digest
-//!   of the chain up to that hop (`LeaseStore::bind`). A chain that does not match (a forged
+//!   of the chain up to that hop (`LeaseRegistry::bind`). A chain that does not match (a forged
 //!   user, widened attributes, a lease reused on another hop) is refused with 403
 //!   `chain_not_issued` *before* any audit record is written, so it cannot put records in a
 //!   victim's name. Lease ids alone are not secret (they are in every token), which is why they
@@ -39,7 +39,7 @@
 
 use std::sync::Arc;
 
-use attenuo_audit::LeaseStore;
+use attenuo_audit::LeaseRegistry;
 use attenuo_core::DelegationChain;
 use attenuo_policy::authzen::{self, EvaluationRequest, EvaluationResponse};
 use axum::body::Bytes;
@@ -49,13 +49,17 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::{json, Value};
 
+use super::extract::Body;
 use super::parse_json;
-use crate::clientauth::{self, ClientKind};
+use crate::clientauth;
 use crate::error::{ApiError, REASON_INVALID_TOKEN, REASON_MISSING_TOKEN};
 use crate::state::AppState;
 
 /// Error code when a body chain does not match what this server issued.
 pub const CHAIN_NOT_ISSUED: &str = "chain_not_issued";
+/// `code` of a PEP's unsigned body chain that does not validate (an expired hop, a widening,
+/// too deep): sent with `error` `invalid_request`.
+pub const INVALID_CHAIN: &str = "invalid_chain";
 
 // The `Err` is a full response, built once per refused request; boxing it buys nothing.
 /// `POST /access/v1/evaluation`: decide one AuthZEN request through the pipeline (see the
@@ -73,7 +77,7 @@ pub const CHAIN_NOT_ISSUED: &str = "chain_not_issued";
 pub async fn evaluation(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    body: Bytes,
+    Body(body): Body,
 ) -> Result<Json<EvaluationResponse>, Response> {
     // Token checks, lease lookups and the audit append all touch SQLite; keep them off the
     // async workers.
@@ -107,7 +111,7 @@ pub async fn evaluation(
 pub async fn evaluations(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    body: Bytes,
+    Body(body): Body,
 ) -> Result<Json<Value>, Response> {
     state
         .blocking(move |s| evaluate_batch(s, &headers, &body))
@@ -142,7 +146,8 @@ fn evaluate_batch(state: &AppState, headers: &HeaderMap, body: &Bytes) -> Result
         // as a single Access Evaluation request, and so does its answer.
         obj.remove("options");
         let bearer = bearer_auth(state, headers, "/access/v1/evaluations")?;
-        let r = evaluate_value(state, headers, bearer.as_ref(), raw)?;
+        let pep = pep_assertion(state, headers, &mut raw)?;
+        let r = evaluate_value(state, headers, bearer.as_ref(), pep.as_deref(), raw)?;
         return serde_json::to_value(r).map_err(ApiError::internal);
     }
     // Refuse before any evaluation runs, so an oversized batch writes nothing to the audit log.
@@ -159,6 +164,12 @@ fn evaluate_batch(state: &AppState, headers: &HeaderMap, body: &Bytes) -> Result
     let semantic = Semantic::from_options(obj.get("options"))?;
     obj.remove("options");
     let bearer = bearer_auth(state, headers, "/access/v1/evaluations")?;
+    // A PEP's client assertion authenticates the whole request once, like the bearer: its
+    // `jti` can be used only once, so the entries cannot each check it.
+    let pep = pep_assertion(state, headers, &mut raw)?;
+    let Some(obj) = raw.as_object_mut() else {
+        return Err(ApiError::internal("request body is no longer an object"));
+    };
 
     let mut results = Vec::with_capacity(items.len());
     for item in items {
@@ -177,8 +188,13 @@ fn evaluate_batch(state: &AppState, headers: &HeaderMap, body: &Bytes) -> Result
         for (k, v) in item {
             merged.insert(k, v);
         }
-        let decision = match evaluate_value(state, headers, bearer.as_ref(), Value::Object(merged))
-        {
+        let decision = match evaluate_value(
+            state,
+            headers,
+            bearer.as_ref(),
+            pep.as_deref(),
+            Value::Object(merged),
+        ) {
             Ok(r) => {
                 let decision = r.decision;
                 results.push(serde_json::to_value(r).map_err(ApiError::internal)?);
@@ -197,6 +213,258 @@ fn evaluate_batch(state: &AppState, headers: &HeaderMap, body: &Bytes) -> Result
         }
     }
     Ok(json!({ "evaluations": results }))
+}
+
+/// The path of the Action Search API (AuthZEN 1.0 section 8, default path of section 10.1).
+pub const SEARCH_ACTION_PATH: &str = "/access/v1/search/action";
+
+/// `POST /access/v1/search/action`: the AuthZEN Action Search API. Which actions (tools) the
+/// subject may perform on the resource (an MCP server), in the request's context.
+///
+/// - **Who may call.** Exactly who may call `POST /access/v1/evaluation`, authenticated the same
+///   way, by the same code: the agent's delegation token, or a `[[peps]]` entry with an
+///   unsigned chain under `[authzen] allow_unsigned_chain`.
+/// - **Resource.** The MCP server: `resource.properties.server`, else `resource.id`, which must
+///   then hold no `/` (a `<server>/<tool>` id names one tool, not a server). `resource.type`
+///   is not checked, as for evaluation. An `action` in the request is ignored (section 8 leaves
+///   it out of this request).
+/// - **Candidates.** The `[policy] catalog` tools of that server that the chain's capabilities
+///   could permit (the proxy's `tools/list` filter), in name order. A tool the catalog does not
+///   list is never a result, also under `unknown_tools = "allow"`; a catalogued tool outside the
+///   capabilities is not a candidate, so paging does not count the catalog (SR-116).
+/// - **Results.** The candidates for which the pipeline would allow the call
+///   ([`Pipeline::would_allow`](crate::authz::Pipeline::would_allow)): each result, sent back
+///   as the `action` of `POST /access/v1/evaluation` with the same subject, resource and
+///   context, is decided `true` while the run's state is unchanged. Each result is `{"name":
+///   <tool>, "properties": {"server": <server>}}`. No reason, policy id or diagnostic is
+///   returned, so a caller learns no more than evaluating each candidate one at a time would
+///   tell it.
+/// - **No side effects.** No audit record, no charge to run limits or usage, no approval taken
+///   or requested: a search acts on nothing, as the admin dry run and the list screen do not.
+///   An approval-gated tool is not a result. `context.approval_token` is refused (400
+///   `approval_token_not_accepted`): an approval token is spent by the one decision it names.
+/// - **Rate limit.** `[limits] authzen_search_requests_per_minute` (off by default) counts
+///   searches per run, the chain's root lease, once the caller has authenticated and before
+///   any candidate is evaluated, in a table apart from `mcp_requests_per_minute`. Over it the
+///   answer is 429 `rate_limited` with `Retry-After`, and nothing is evaluated (SR-117).
+/// - **Paging** (section 8.2). At most `[authzen] max_batch` candidates are evaluated per
+///   request, the bound of a batch. `page.limit` (1 or more; above `max_batch` it is clamped)
+///   is how many candidates one page evaluates, so a page holds at most that many results and
+///   may hold fewer, even none, while more remain. `page.next_token` is the token of the next
+///   page, or `""` after the last; `page.count` is the number of results in this answer.
+///   `page.token` sends it back, with the same `subject`, `resource` and `context`: the token
+///   is an opaque position bound to digests of the chain, the server and the `context` it was
+///   issued for ([`super::page::SearchBinding`]), and one sent with a request whose chain,
+///   server or `context` differs is 400 `invalid_cursor`. `page.limit` may change between
+///   pages, and a policy or catalog reload between pages is not detected (8.2 allows repeats
+///   or skips then).
+///
+/// # Errors
+///
+/// 400 `invalid_request` for a body that is not a JSON object or whose `subject` or `resource`
+/// is malformed (as for evaluation); 400 `invalid_page` for a `page` that is not an object, a
+/// `page.token` that is not a string or a `page.limit` that is not a positive integer; 400
+/// `invalid_cursor` for a `page.token` this route did not issue or issued for another chain,
+/// server or `context`; 400 `invalid_search_resource`
+/// when the resource names no server; 400 `approval_token_not_accepted`; 429 `rate_limited`
+/// over `[limits] authzen_search_requests_per_minute`; and the 401 and 403 of
+/// authentication, as for evaluation.
+// The `Err` is a full response, built once per refused request; boxing it buys nothing.
+#[allow(clippy::result_large_err)]
+pub async fn search_action(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Body(body): Body,
+) -> Result<Json<Value>, Response> {
+    state
+        .blocking(move |s| search_actions(s, &headers, &body))
+        .await
+        .map(Json)
+        .map_err(|e| with_challenge(e.into_response()))
+}
+
+/// The `page` of a search request: where to start in the candidate list (a token not yet
+/// checked against the request, or none for the first page) and how many candidates to
+/// evaluate.
+struct SearchPage {
+    token: Option<super::page::SearchCursor>,
+    limit: usize,
+}
+
+impl SearchPage {
+    fn from_request(page: Option<&Value>, max: usize) -> Result<Self, ApiError> {
+        let refuse = |detail: &str| {
+            ApiError::bad_request("invalid_request", detail).with_code("invalid_page")
+        };
+        let page = match page {
+            None | Some(Value::Null) => {
+                return Ok(Self {
+                    token: None,
+                    limit: max,
+                })
+            }
+            Some(Value::Object(p)) => p,
+            Some(_) => return Err(refuse("`page` must be an object")),
+        };
+        let limit = match page.get("limit") {
+            None | Some(Value::Null) => max,
+            Some(v) => match v.as_u64() {
+                Some(0) | None => {
+                    return Err(refuse("`page.limit` must be an integer of at least 1"))
+                }
+                Some(n) => usize::try_from(n).unwrap_or(usize::MAX).min(max),
+            },
+        };
+        let token = match page.get("token") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(t)) => Some(t.as_str()),
+            Some(_) => return Err(refuse("`page.token` must be a string")),
+        };
+        // AuthZEN's end-of-results token is the empty string; a client that sends it back is
+        // asking for the first page again, which is what leaving it out does.
+        let token = token.filter(|t| !t.is_empty());
+        // Its shape is checked now, before authentication, as the other members of `page`;
+        // whether it belongs to this request once the chain is known (`start`).
+        let token = super::page::decode_search("page.token", token)?;
+        Ok(Self { token, limit })
+    }
+
+    /// The index of the first candidate of this page: 0 without a token, else the token's
+    /// position once it is checked to have been issued for `binding`.
+    fn start(&self, binding: &super::page::SearchBinding) -> Result<usize, ApiError> {
+        match &self.token {
+            None => Ok(0),
+            Some(t) => Ok(usize::try_from(t.position_for(binding)?).unwrap_or(usize::MAX)),
+        }
+    }
+}
+
+/// The MCP server an action search's `resource` names.
+fn search_server(resource: Option<&Value>) -> Result<String, ApiError> {
+    let refuse = |detail: &str| {
+        ApiError::bad_request("invalid_request", detail).with_code("invalid_search_resource")
+    };
+    let Some(resource) = resource.and_then(Value::as_object) else {
+        // Missing or not an object: the request is malformed, as at evaluation.
+        return Err(ApiError::bad_request(
+            "invalid_request",
+            "`resource` is required and must be an object",
+        ));
+    };
+    let from_props = resource
+        .get("properties")
+        .and_then(|p| p.get("server"))
+        .and_then(Value::as_str);
+    let server = match from_props {
+        Some(s) => s,
+        None => match resource.get("id").and_then(Value::as_str) {
+            Some(id) if id.contains('/') => {
+                return Err(refuse(
+                    "`resource.id` names one tool (`<server>/<tool>`); name the server in \
+                     `resource.properties.server` or as the whole `resource.id`",
+                ))
+            }
+            Some(id) => id,
+            None => return Err(refuse("`resource` names no MCP server")),
+        },
+    };
+    if server.is_empty() {
+        return Err(refuse("`resource` names no MCP server"));
+    }
+    Ok(server.to_string())
+}
+
+fn search_actions(state: &AppState, headers: &HeaderMap, body: &Bytes) -> Result<Value, ApiError> {
+    let mut raw: Value = parse_json(body)?;
+    let Some(obj) = raw.as_object_mut() else {
+        return Err(ApiError::bad_request(
+            "invalid_request",
+            "expected a JSON object",
+        ));
+    };
+    let page = SearchPage::from_request(obj.get("page"), state.authzen_max_batch)?;
+    obj.remove("page");
+    let server = search_server(obj.get("resource"))?;
+    // The request has no `action`: each candidate becomes one. Until then the call names the
+    // server only.
+    obj.insert(
+        "action".into(),
+        json!({ "name": "", "properties": { "server": server } }),
+    );
+    let bearer = bearer_auth(state, headers, SEARCH_ACTION_PATH)?;
+    let pep = pep_assertion(state, headers, &mut raw)?;
+    let a = admit(state, headers, bearer.as_ref(), pep.as_deref(), raw)?;
+    // `[limits] authzen_search_requests_per_minute`, per run (the root lease of the bearer's
+    // chain, or of a PEP's issued unsigned chain): only once the caller has authenticated, so
+    // a caller without the credentials cannot use up a run's searches, and before any
+    // candidate is evaluated. A search writes no audit record, so this is what bounds how fast
+    // a run can try arguments (SR-117).
+    if let Some(run) = attenuo_core::chain_id_of(&a.chain) {
+        state.limits.admit_search(&run)?;
+    }
+    if a.req
+        .context
+        .as_ref()
+        .and_then(|c| c.get("approval_token"))
+        .is_some_and(|t| !t.is_null())
+    {
+        return Err(ApiError::bad_request(
+            "invalid_request",
+            "context.approval_token is not accepted by action search: an approval token is \
+             spent by the one decision it names; send it to POST /access/v1/evaluation",
+        )
+        .with_code("approval_token_not_accepted"));
+    }
+    // AuthZEN 1.0 section 8.2: a token sent with another query is refused. The binding is
+    // recomputed from this request, so a token only ever continues the query it came from.
+    let binding = super::page::SearchBinding::new(&a.chain, &server, a.req.context.as_ref());
+    let page_start = page.start(&binding)?;
+
+    let engine = state.pipeline.policy_snapshot();
+    // Only the catalogued tools the chain's capabilities could permit, the proxy's `tools/list`
+    // filter: no other tool can be a result (the capability stage denies it), and paging over
+    // them would count the catalog for the caller (SR-116).
+    let caps = a.chain.effective_capabilities();
+    let candidates: Vec<&str> = engine
+        .catalog()
+        .iter()
+        .filter(|((s, _), _)| *s == server)
+        .map(|((_, tool), _)| tool.as_str())
+        .filter(|tool| {
+            caps.is_some_and(|c| attenuo_proxy::filter::could_permit_tool(c, &server, tool))
+        })
+        .collect();
+    let start = page_start.min(candidates.len());
+    let end = start.saturating_add(page.limit).min(candidates.len());
+    let window = &candidates[start..end];
+    let allowed = state
+        .pipeline
+        .would_allow(&engine, &a.chain, &a.call, window, a.now);
+    let results: Vec<Value> = window
+        .iter()
+        .zip(allowed)
+        .filter(|(_, allow)| *allow)
+        .map(|(tool, _)| json!({ "name": tool, "properties": { "server": server } }))
+        .collect();
+    let next_token = if end < candidates.len() {
+        super::page::encode_search(end as u64, &binding)
+    } else {
+        String::new()
+    };
+    // Not a decision, so not in the audit log (see `search_action`); the log line says that a
+    // search ran, for whom, and how much it looked at. `server` is the caller's: Debug-format
+    // it so a newline cannot forge a log line (SR-18, SR-115).
+    tracing::info!(
+        chain_id = attenuo_core::chain_id_of(&a.chain).unwrap_or_default(),
+        server = ?server,
+        evaluated = window.len(),
+        permitted = results.len(),
+        "AuthZEN action search"
+    );
+    Ok(json!({
+        "page": { "next_token": next_token, "count": results.len() },
+        "results": results,
+    }))
 }
 
 /// `options.evaluations_semantic` of a batch (AuthZEN 1.0 section 7.1.2.1).
@@ -248,9 +516,10 @@ impl Semantic {
 }
 
 fn item_error(e: &ApiError) -> Value {
+    e.debug_check();
     json!({
         "decision": false,
-        "context": { "error": { "status": e.status.as_u16(), "code": e.code, "message": e.detail } },
+        "context": { "error": { "status": e.status.as_u16(), "code": e.stable_code(), "message": e.detail } },
     })
 }
 
@@ -310,9 +579,38 @@ fn evaluate(
     headers: &HeaderMap,
     body: &Bytes,
 ) -> Result<EvaluationResponse, ApiError> {
-    let value = parse_json(body)?;
+    let mut value = parse_json(body)?;
     let bearer = bearer_auth(state, headers, "/access/v1/evaluation")?;
-    evaluate_value(state, headers, bearer.as_ref(), value)
+    let pep = pep_assertion(state, headers, &mut value)?;
+    evaluate_value(state, headers, bearer.as_ref(), pep.as_deref(), value)
+}
+
+/// A PEP's `private_key_jwt` client assertion (`client_assertion_type` and
+/// `client_assertion` at the top level of the body), verified against `[[peps]]` and used
+/// once: the PEP's id, or `None` when the body has no assertion. The fields are removed from
+/// the body. `pep_id`, when sent, must equal the assertion's `sub`; a `pep_secret` or HTTP
+/// Basic credentials alongside it are `multiple_client_auth`.
+fn pep_assertion(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: &mut Value,
+) -> Result<Option<String>, ApiError> {
+    let Some(obj) = body.as_object_mut() else {
+        return Ok(None);
+    };
+    let Some(assertion) = clientauth::take_client_assertion(obj)? else {
+        return Ok(None);
+    };
+    let field = |k: &str| obj.get(k).and_then(Value::as_str);
+    let now = state.now();
+    let pep = state.peps.authenticate(
+        headers,
+        field("pep_id"),
+        field("pep_secret"),
+        Some(&assertion),
+        now,
+    )?;
+    pep.commit(&state.replay, now).map(Some)
 }
 
 /// The bearer's chain and DPoP binding, checked once per HTTP request: a batch's entries share
@@ -366,14 +664,47 @@ fn bearer_auth(
     }))
 }
 
-fn evaluate_value(
+/// An evaluation request whose caller is authenticated and whose chain is the bearer's, or a
+/// PEP's unsigned chain this server issued ([`admit`]).
+struct Admitted {
+    req: EvaluationRequest,
+    chain: DelegationChain,
+    /// The call, with `dpop_bound` set from the bearer.
+    call: attenuo_core::ToolCall,
+    /// The caller proved it is a `[[peps]]` entry, which decides whether it sees diagnostics.
+    pep_authenticated: bool,
+    /// The time the request was admitted at; the decision is made as of it too.
+    now: time::OffsetDateTime,
+}
+
+/// Authenticate the caller of one evaluation and settle its chain and call, deciding nothing:
+/// the bearer's chain (checked against a body chain), or with `[authzen] allow_unsigned_chain`
+/// a PEP's unsigned body chain checked against what this server issued. `pep_by_assertion` is
+/// the PEP a client assertion of the request authenticated ([`pep_assertion`]); without one, a
+/// PEP authenticates with its secret. Shared by the evaluation endpoints and action search, so
+/// the three admit exactly the same callers.
+fn admit(
     state: &AppState,
     headers: &HeaderMap,
     bearer: Option<&Bearer>,
+    pep_by_assertion: Option<&str>,
     raw: Value,
-) -> Result<EvaluationResponse, ApiError> {
+) -> Result<Admitted, ApiError> {
+    if raw.get("client_assertion").is_some() || raw.get("client_assertion_type").is_some() {
+        // Only the request's top level may carry an assertion (see `pep_assertion`).
+        return Err(clientauth::invalid_request(
+            "malformed_request",
+            "client_assertion goes at the top level of the request, not in an evaluation",
+        ));
+    }
     let pep_field = |k: &str| raw.get(k).and_then(Value::as_str).map(str::to_owned);
     let (pep_id, pep_secret) = (pep_field("pep_id"), pep_field("pep_secret"));
+    if pep_by_assertion.is_some() && pep_secret.is_some() {
+        return Err(clientauth::invalid_request(
+            "multiple_client_auth",
+            "use either pep_secret or client_assertion, not both (RFC 6749 §2.3)",
+        ));
+    }
     let mut req: EvaluationRequest = serde_json::from_value(raw)
         .map_err(|e| ApiError::bad_request("invalid_request", e.to_string()))?;
     let now = state.now();
@@ -385,15 +716,15 @@ fn evaluate_value(
             attach_chain(&mut req, &b.chain)?;
             // A PEP forwarding an agent's token may authenticate itself in the body (the
             // `Authorization` header holds the bearer) to receive diagnostics.
-            let pep = match pep_secret.as_deref() {
-                Some(secret) => Some(clientauth::authenticate(
-                    ClientKind::Pep,
-                    &state.peps,
-                    headers,
-                    pep_id.as_deref(),
-                    Some(secret),
-                )?),
-                None => None,
+            let pep = match (pep_by_assertion, pep_secret.as_deref()) {
+                (Some(pep), _) => Some(pep.to_owned()),
+                (None, Some(secret)) => Some(
+                    state
+                        .peps
+                        .authenticate(headers, pep_id.as_deref(), Some(secret), None, now)?
+                        .commit(&state.replay, now)?,
+                ),
+                (None, None) => None,
             };
             (None, pep.is_some())
         }
@@ -405,13 +736,13 @@ fn evaluate_value(
                      ([authzen] allow_unsigned_chain is off)",
                 ));
             }
-            let id = clientauth::authenticate(
-                ClientKind::Pep,
-                &state.peps,
-                headers,
-                pep_id.as_deref(),
-                pep_secret.as_deref(),
-            )?;
+            let id = match pep_by_assertion {
+                Some(pep) => pep.to_owned(),
+                None => state
+                    .peps
+                    .authenticate(headers, pep_id.as_deref(), pep_secret.as_deref(), None, now)?
+                    .commit(&state.replay, now)?,
+            };
             (Some(id), true)
         }
     };
@@ -421,7 +752,10 @@ fn evaluate_value(
     if let Some(pep) = body_chain_pep {
         chain_value
             .validate_at(now, state.verifier.max_depth())
-            .map_err(|e| ApiError::bad_request("invalid_request", e.to_string()))?;
+            .map_err(|e| {
+                // The code `POST /admin/policies/check` answers a chain that does not validate.
+                ApiError::bad_request("invalid_request", e.to_string()).with_code(INVALID_CHAIN)
+            })?;
         check_issued(state, &chain_value).map_err(|detail| {
             tracing::warn!(pep = ?pep, detail = ?detail, "AuthZEN body chain was not issued here");
             ApiError::new(StatusCode::FORBIDDEN, CHAIN_NOT_ISSUED, detail)
@@ -429,6 +763,30 @@ fn evaluate_value(
         tracing::debug!(pep = ?pep, "AuthZEN body chain accepted from an authenticated PEP");
     }
     let call = call.with_dpop_bound(bearer.is_some_and(|b| b.dpop_bound));
+    Ok(Admitted {
+        req,
+        chain: chain_value,
+        call,
+        pep_authenticated,
+        now,
+    })
+}
+
+/// Decide one evaluation: [`admit`], then the pipeline's decision.
+fn evaluate_value(
+    state: &AppState,
+    headers: &HeaderMap,
+    bearer: Option<&Bearer>,
+    pep_by_assertion: Option<&str>,
+    raw: Value,
+) -> Result<EvaluationResponse, ApiError> {
+    let Admitted {
+        req,
+        chain: chain_value,
+        call,
+        pep_authenticated,
+        now,
+    } = admit(state, headers, bearer, pep_by_assertion, raw)?;
     let approval_token = match req.context.as_ref().and_then(|c| c.get("approval_token")) {
         None | Some(Value::Null) => None,
         Some(Value::String(t)) => Some(t.clone()),

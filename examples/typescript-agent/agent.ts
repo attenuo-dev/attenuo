@@ -1,12 +1,17 @@
 /**
  * A planner delegates to a coder, and the coder works through attenuo's proxy.
  *
- * Run it against the GitHub-leak demo setup (an attenuo server with `[dev] allow_root_mint = true`
- * and the fake GitHub MCP upstream; `examples/github-leak-demo/run.sh` shows how to start both):
+ * Run it against the GitHub-leak demo setup: an attenuo server with the demo's config
+ * (`[dev] allow_root_mint = true`, listening on 127.0.0.1:18080) and the fake GitHub MCP upstream
+ * on the port that config names. From the repository root:
  *
+ *     cargo build -p attenuo-server
+ *     cargo build -p attenuo-proxy --features testing --example fake_mcp
+ *     target/debug/examples/fake_mcp --port 13001 &
+ *     target/debug/attenuo-server --config examples/github-leak-demo/config.toml &
  *     (cd sdk/typescript && npm install && npm run build)
  *     cd examples/typescript-agent && npm install
- *     ATTENUO_SERVER=http://127.0.0.1:8080 ATTENUO_ADMIN_TOKEN=demo-admin-token npm run agent
+ *     ATTENUO_SERVER=http://127.0.0.1:18080 ATTENUO_ADMIN_TOKEN=demo-admin-token npm run agent
  *
  * What happens:
  *
