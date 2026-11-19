@@ -19,7 +19,7 @@ Give it an address to listen on and, after `--`, the command that starts the ser
 attenuo stdio-bridge --listen 127.0.0.1:3001 -- npx -y @modelcontextprotocol/server-filesystem /srv/docs
 ```
 
-**Untested** with that server: the command shape is right, but only the test server below was run. Once it is bound, the bridge prints `listening on http://127.0.0.1:3001/mcp` on stdout. The server's own log lines (its stderr) show up on the bridge's stderr.
+This command was run against version 2.4.0 of that server; [the walkthrough below](#try-it-with-a-real-server) has the config and policy that go with it. Once it is bound, the bridge prints `listening on http://127.0.0.1:3001/mcp` on stdout. The server's own log lines (its stderr) show up on the bridge's stderr.
 
 The server gets the bridge's environment, so pass its API keys there (`GITHUB_TOKEN=... attenuo stdio-bridge ...`). The bridge never prints the server's arguments or environment, and it removes every variable whose name starts with `ATTENUO_` from what the server gets: the CLI's secrets (`ATTENUO_ADMIN_TOKEN`, `ATTENUO_TOKEN`, `ATTENUO_CLIENT_SECRET`, `ATTENUO_DPOP_KEY`), the server's (`ATTENUO_AUDIT_SINK_TOKEN`, `ATTENUO_APPROVAL_NOTIFY_SECRET`) and the `ATTENUO__*` configuration overrides. A variable of another name passes, so do not start the bridge in an environment that holds the server's other secrets under names you chose (`[approvals.notify] secret_env` and `headers`).
 
@@ -51,6 +51,123 @@ Authorization: Bearer <attenuo token>
 ```
 
 [Integrating MCP clients](integrating-mcp-clients.md) covers the client side.
+
+## Try it with a real server
+
+This puts attenuo in front of the reference filesystem server, `@modelcontextprotocol/server-filesystem`, and lets an agent read one folder and nothing else. It was run on Linux with version 2.4.0 of that server, Node 22 and attenuo 0.1.0. You need `attenuo-server` and the `attenuo` CLI built (step 1 of [Getting started](getting-started.md)), plus `node`, `jq` and `openssl`.
+
+Make two folders, one the agent may read and one it may not:
+
+```sh
+export REPO=$PWD            # your attenuo checkout
+mkdir -p ~/attenuo-files/data ~/attenuo-files/docs/public ~/attenuo-files/docs/private
+cd ~/attenuo-files
+echo "hello public" > docs/public/readme.txt
+echo "not for agents" > docs/private/salaries.txt
+```
+
+Start the bridge in one terminal. The filesystem server itself is told to serve all of `docs`; attenuo will narrow that:
+
+```sh
+$REPO/target/debug/attenuo stdio-bridge --listen 127.0.0.1:3001 -- \
+  npx -y @modelcontextprotocol/server-filesystem@2.4.0 $HOME/attenuo-files/docs
+```
+
+In a second terminal, from `~/attenuo-files` (set `REPO` again), write a policy and a config. The policy permits reading text files under `docs/public` and refuses any path with `..` in it. The filesystem server resolves `..` itself, so without that line `docs/public/../private/salaries.txt` would match `docs/public/*`:
+
+```sh
+cat > policy.cedar <<EOF
+@id("read_public_docs_only")
+permit(principal, action == Action::"files/read_text_file", resource)
+when {
+  context.input has path &&
+  context.input.path like "$HOME/attenuo-files/docs/public/*" &&
+  !(context.input.path like "*..*")
+};
+EOF
+
+export ATTENUO_ADMIN_TOKEN=$(openssl rand -hex 32)
+export CODER_SECRET=$(openssl rand -hex 16)
+export CODER_SECRET_SHA256=$(printf %s "$CODER_SECRET" | openssl dgst -sha256 | sed 's/.* //')
+
+cat > attenuo.toml <<EOF
+[server]
+listen = "127.0.0.1:8080"
+
+[issuer]
+private_key_pem_path = "data/issuer.pem"
+
+[policy]
+policies_path = "policy.cedar"
+
+[policy.catalog.files.read_text_file]
+readonly = true
+inputs = { path = "string" }
+
+[policy.catalog.files.write_file]
+inputs = { path = "string", content = "string" }
+
+[audit]
+sqlite_path = "data/attenuo.sqlite"
+
+[[upstreams]]
+name = "files"
+url = "http://127.0.0.1:3001/mcp"
+
+[admin]
+token = "$ATTENUO_ADMIN_TOKEN"
+
+[[agents]]
+id = "coder"
+secret_sha256 = "$CODER_SECRET_SHA256"
+
+[[root_grants]]
+issuer = "https://idp.example"
+agent = "planner"
+capabilities = ["files:*"]
+
+# DEVELOPMENT ONLY. Lets the admin mint a root token for any user, with no login.
+[dev]
+allow_root_mint = true
+EOF
+chmod 600 attenuo.toml
+
+$REPO/target/debug/attenuo-server --config attenuo.toml &
+```
+
+Mint a root token for the `planner` agent, hand the `coder` agent `read_text_file` only, and make four calls:
+
+```sh
+export ATTENUO_SERVER=http://127.0.0.1:8080
+alias attenuo=$REPO/target/debug/attenuo
+ROOT=$(attenuo --json token root --subject alice --agent planner --cap 'files:*' | jq -r .access_token)
+export ATTENUO_TOKEN=$(ATTENUO_TOKEN="$ROOT" ATTENUO_CLIENT_SECRET="$CODER_SECRET" \
+  attenuo token exchange --actor coder --cap files:read_text_file --print token)
+
+attenuo call --upstream files --tool read_text_file --arg path=$HOME/attenuo-files/docs/public/readme.txt
+attenuo call --upstream files --tool read_text_file --arg path=$HOME/attenuo-files/docs/private/salaries.txt
+attenuo call --upstream files --tool read_text_file --arg path=$HOME/attenuo-files/docs/public/../private/salaries.txt
+attenuo call --upstream files --tool write_file --arg path=$HOME/attenuo-files/docs/public/x.txt --arg content=hi
+attenuo audit verify
+```
+
+```text
+ALLOWED
+hello public
+
+DENIED  policy_deny
+decision 2ba9912e-01da-4f1d-9c58-2a06381c9674
+DENIED  policy_deny
+decision 0ba3ab6e-932c-4132-b208-0559a2080a7c
+DENIED  capability_denied
+decision 143acf15-b581-4f88-b109-fd5139905f18
+audit chain OK: 8 entries verified
+checkpoints: none signed yet
+```
+
+Your decision ids will differ. The first read reaches the filesystem server. The two reads outside `docs/public` are refused by the policy, and the write is refused before the policy runs, because `coder` was never handed `write_file`. No denied call reaches the filesystem server, and `x.txt` is not created. `attenuo tools --upstream files` lists only `read_text_file`, although the server offers sixteen tools.
+
+What this run does not show: whether a symbolic link inside `docs/public` that points elsewhere is followed is up to the filesystem server, not attenuo, which sees only the path text. Tools that take several paths (`read_multiple_files`, `move_file`) need their own catalog entries and policies before you delegate them.
 
 ## Try it with the test server
 
