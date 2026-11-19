@@ -13,7 +13,8 @@ use time::{Duration, OffsetDateTime};
 
 use crate::actor::ActorTrustRegistry;
 use crate::authz::Pipeline;
-use crate::config::{ActorAuth, AgentConfig, Config, RootGrant};
+use crate::clientauth::{AssertionPolicy, Clients};
+use crate::config::{ActorAuth, Config, RootGrant};
 use crate::idp::IdpRegistry;
 use crate::metrics::Metrics;
 
@@ -50,17 +51,31 @@ pub struct AppState {
     pub policies_path: Option<PathBuf>,
     /// Digest and load time of the policy set in force, for `GET /admin/policies`. The engine
     /// does not keep them, so they live here: set at startup and on every successful reload
-    /// (while the engine's write lock is held, so the two never disagree), and left alone by
-    /// a failed one.
+    /// (the engine is swapped while this lock is held for writing, and `GET /admin/policies`
+    /// takes its snapshot while holding it for reading, so the two never disagree), and left
+    /// alone by a failed one.
     pub loaded_policies: RwLock<LoadedPolicies>,
-    /// `[admin] token`, the bearer for `/admin/*`; `None` answers every admin call 403.
-    pub admin_token: Option<String>,
+    /// Held by `POST /admin/policies/reload` from reading the file to the swap, so two
+    /// reloads cannot cross (the one that read the older text swapping last).
+    pub policy_reload: tokio::sync::Mutex<()>,
+    /// The admin credentials in force (`[admin] token` and `[[admin.operators]]`, by digest);
+    /// none answers every admin call 403 `admin_disabled`. `POST /admin/operators/reload`
+    /// swaps the operators in whole.
+    pub admin_credentials: crate::operators::SharedAdminCredentials,
+    /// Held by `POST /admin/operators/reload` from reading the file to the swap, so two
+    /// reloads cannot cross.
+    pub operators_reload: tokio::sync::Mutex<()>,
+    /// The config file the server was started with ([`Config::source_path`]), which
+    /// `POST /admin/operators/reload` re-reads; `None` when the config was not read from a
+    /// file.
+    pub config_path: Option<PathBuf>,
     /// `[[root_grants]]`, the ceilings of root tokens.
     pub root_grants: Vec<RootGrant>,
     /// Trusted IdPs for hop-0 intake.
     pub idps: IdpRegistry,
-    /// Agents allowed to present IdP credentials (`[[agents]]`, validated).
-    pub agents: Vec<AgentConfig>,
+    /// Agents allowed to present IdP credentials (`[[agents]]`, validated, with their
+    /// `private_key_jwt` keys).
+    pub agents: Clients,
     /// `[dev] allow_root_mint`.
     pub dev_allow_root_mint: bool,
     /// `[token] require_actor_auth`.
@@ -75,8 +90,8 @@ pub struct AppState {
     pub authzen_max_batch: usize,
     /// `[authzen] diagnostics`.
     pub authzen_diagnostics: crate::config::AuthzenDiagnostics,
-    /// PEPs allowed to send unsigned chains (`[[peps]]`, validated).
-    pub peps: Vec<AgentConfig>,
+    /// PEPs allowed to send unsigned chains (`[[peps]]`, validated, with their keys).
+    pub peps: Clients,
     /// `[server] public_url`.
     pub public_url: Option<String>,
     /// `[issuer] lease_interval_seconds`: lifetime of a lease after issuance or renewal.
@@ -104,6 +119,15 @@ pub struct AppState {
     /// `[telemetry]`: the trace hook of the exported spans; `None` when export is off
     /// ([`crate::telemetry`]).
     pub trace: Option<Arc<crate::telemetry::ServerTrace>>,
+    /// `[limits]`: the in-flight cap, the deadlines and the rate limits ([`crate::limits`]).
+    pub(crate) limits: Arc<crate::limits::Limits>,
+    /// The single-writer fence on `<sqlite_path>.lock`, held for as long as the state lives
+    /// (the OS releases it when the process exits); `None` for `:memory:`. Declared last, so
+    /// it is released after the stores above.
+    store_fence: Option<attenuo_audit::WriterFence>,
+    /// Never sent on; dropped with the state, after the fence, which is what
+    /// [`AppState::released`] waits for.
+    released: tokio::sync::watch::Sender<()>,
 }
 
 impl AppState {
@@ -112,7 +136,7 @@ impl AppState {
     /// # Errors
     ///
     /// When a check of the config fails (server names, public URL, admin token, listeners,
-    /// `[authzen]`, `[proxy]`, `[token] dpop`, `[approvals]`, `[leases]`), when the issuer's keys
+    /// `[authzen]`, `[proxy]`, `[limits]`, `[token] dpop`, `[approvals]`, `[leases]`), when the issuer's keys
     /// cannot be loaded, when the policies do not parse or validate, when the audit log or lease
     /// store cannot be opened, or when the IdP, agent, PEP or actor-trust entries are invalid.
     pub fn from_config(config: &Config) -> anyhow::Result<Self> {
@@ -126,8 +150,21 @@ impl AppState {
         clock: Arc<dyn attenuo_core::Clock>,
     ) -> anyhow::Result<Self> {
         config.check_server_names()?;
+        config.check_ext_authz()?;
+        for warning in config.root_grant_warnings() {
+            tracing::warn!("{warning}");
+        }
         config.server.check_public_url()?;
+        config.admin.check_listen(config.server.listen)?;
+        config
+            .dev
+            .check(config.admin.api_listen(config.server.listen))?;
         config.check_admin_token()?;
+        config.check_admin_operators()?;
+        let admin_credentials = crate::operators::AdminCredentials::from_config(&config.admin)?;
+        // An entry that has expired is kept (its token is refused), so an old entry does not
+        // stop the server; it is named in a warning.
+        admin_credentials.warn_expired(clock.now_utc(), "at startup");
         config.metrics.check_listen()?;
         config.admin_ui.check_listen()?;
         if config.authzen.max_batch == 0 {
@@ -136,7 +173,11 @@ impl AppState {
         config.proxy.stream_recheck()?;
         config.proxy.check_limits()?;
         config.proxy.record_window()?;
+        config.proxy.upstream_timeouts()?;
+        config.limits.check()?;
+        config.audit.append_limits()?;
         config.token.check_dpop()?;
+        config.token.check_client_assertion()?;
         config.approvals.check()?;
         let lease_maintenance = config.leases.maintenance()?;
         let user_window_retention = config.leases.user_window_retention()?;
@@ -165,10 +206,11 @@ impl AppState {
             sha256: policies_sha256,
             loaded_at: OffsetDateTime::now_utc(),
         });
-        let policy = Arc::new(RwLock::new(engine));
+        let policy = Arc::new(crate::authz::SharedPolicy::new(engine));
 
         let checkpoint_keys = CheckpointKeys::from_jwks(&jwks)?;
         let metrics = Metrics::new();
+        let metrics_for_limits = metrics.clone();
         let checkpoint_sink = match &config.audit.sink {
             Some(cfg) => {
                 let sink = crate::sink::CheckpointSink::start(
@@ -183,12 +225,15 @@ impl AppState {
             }
             None => None,
         };
-        let (audit, leases) = open_storage(
+        let (audit, leases, store_fence) = open_storage(
             &config.audit,
             issuer.detached_signer(),
             metrics.clone(),
             checkpoint_sink.as_ref().map(|s| s.handle()),
         )?;
+        // Single use of credentials, in the same file as the leases it guards (`crate::replay`).
+        let replay =
+            crate::replay::ReplayCache::new(leases.clone(), crate::replay::DEFAULT_REPLAY_CAPACITY);
         let approval_notifier = match &config.approvals.notify {
             Some(cfg) => Some(crate::notify::ApprovalNotifier::start(
                 cfg,
@@ -206,19 +251,28 @@ impl AppState {
         let trace = trace_settings
             .as_ref()
             .map(|s| Arc::new(crate::telemetry::ServerTrace::new(s)));
-        if trace.is_some() {
-            // Keyed like the DPoP nonces, by the issuer's private key (open question 5).
-            pipeline = pipeline.with_subject_digest(crate::telemetry::SubjectDigest::derive(
-                issuer.private_key_pem().as_bytes(),
-            ));
+        if trace.is_some() || config.logging.redact_subjects {
+            // Keyed like the DPoP nonces, by the issuer's private key (open question 5). The
+            // log lines use the same digest as the exported span, so the two can be matched.
+            let digest =
+                crate::telemetry::SubjectDigest::derive(issuer.private_key_pem().as_bytes());
+            if config.logging.redact_subjects {
+                let d = digest.clone();
+                pipeline = pipeline
+                    .with_subject_log(attenuo_proxy::SubjectLog::digest(move |s| d.digest(s)));
+            }
+            if trace.is_some() {
+                pipeline = pipeline.with_subject_digest(digest);
+            }
         }
         if let Some(n) = &approval_notifier {
             pipeline = pipeline.with_approval_notifier(n.handle());
         }
         let pipeline = Arc::new(pipeline);
         let idps = IdpRegistry::from_config(&config.idps, &config.issuer.issuer)?;
-        let agents = crate::idp::intake::validate_agents(&config.agents)?;
-        let peps = crate::clientauth::validate_clients("[[peps]]", &config.peps)?;
+        let assertion_policy = AssertionPolicy::from_config(config);
+        let agents = Clients::agents(&config.agents, assertion_policy.clone())?;
+        let peps = Clients::peps(&config.peps, assertion_policy)?;
         for idp in &config.idps {
             for agent in agents
                 .iter()
@@ -239,6 +293,12 @@ impl AppState {
         if actor_auth == ActorAuth::ActorToken && actor_trust.is_empty() {
             anyhow::bail!(
                 "[token] actor_auth = \"actor_token\" needs at least one [[actor_trust]] entry"
+            );
+        }
+        if actor_auth == ActorAuth::ActorToken && agents.iter().any(|a| a.has_keys()) {
+            tracing::warn!(
+                "[[agents]] entries have jwks but [token] actor_auth = \"actor_token\": client \
+                 assertions, like client secrets, are refused"
             );
         }
         if actor_auth == ActorAuth::Secret && !actor_trust.is_empty() {
@@ -268,12 +328,6 @@ impl AppState {
             tracing::warn!(
                 "[authzen] allow_unsigned_chain = true: authenticated [[peps]] may send \
                  delegation chains without the signed token"
-            );
-        }
-        if config.dev.allow_root_mint {
-            tracing::warn!(
-                "!!! [dev] allow_root_mint = true: POST /admin/root-token mints root tokens for \
-                 users nobody has verified. Development only; never enable this in a deployment. !!!"
             );
         }
         if !idps.is_empty() && agents.is_empty() {
@@ -309,7 +363,10 @@ impl AppState {
             lease_maintenance,
             policies_path: config.policy.policies_path.clone(),
             loaded_policies,
-            admin_token: config.admin.token.clone(),
+            policy_reload: tokio::sync::Mutex::new(()),
+            admin_credentials: crate::operators::SharedAdminCredentials::new(admin_credentials),
+            operators_reload: tokio::sync::Mutex::new(()),
+            config_path: config.source_path.clone(),
             root_grants: config.root_grants.clone(),
             idps,
             agents,
@@ -325,7 +382,7 @@ impl AppState {
             lease_interval: lease_interval(config)?,
             jwks,
             metrics,
-            replay: crate::replay::ReplayCache::default(),
+            replay,
             dpop,
             checkpoint_sink,
             sink_fails_readiness: config.audit.sink.as_ref().is_some_and(|s| s.fail_readiness),
@@ -333,7 +390,35 @@ impl AppState {
             approval_notifier,
             clock,
             trace,
+            limits: Arc::new(crate::limits::Limits::new(
+                &config.limits,
+                metrics_for_limits,
+            )),
+            store_fence,
+            released: tokio::sync::watch::Sender::new(()),
         })
+    }
+
+    /// The lock file of the single-writer fence this state holds (`<sqlite_path>.lock`);
+    /// `None` for an in-memory store, which takes no fence.
+    pub fn store_fence(&self) -> Option<&Path> {
+        self.store_fence
+            .as_ref()
+            .map(attenuo_audit::WriterFence::path)
+    }
+
+    /// Resolves once this state has been dropped: its stores are closed and its single-writer
+    /// fence is released, so another server can open the same database. The state lives as
+    /// long as anything holds it (the router and every copy of it, a request still running,
+    /// a background task), so this is how a caller that stopped a server in this process
+    /// knows the file is free, rather than trying the lock until it is.
+    pub fn released(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let mut rx = self.released.subscribe();
+        async move {
+            // Nothing is ever sent: `changed` fails once the sender, a field of the state,
+            // is dropped.
+            while rx.changed().await.is_ok() {}
+        }
     }
 
     /// The current time by [`AppState::clock`].
@@ -570,7 +655,12 @@ fn open_storage(
     signer: attenuo_token::DetachedSigner,
     metrics: Arc<Metrics>,
     sink: Option<crate::sink::SinkHandle>,
-) -> anyhow::Result<(Arc<SqliteAudit>, Arc<SqliteLeaseStore>)> {
+) -> anyhow::Result<(
+    Arc<SqliteAudit>,
+    Arc<SqliteLeaseStore>,
+    Option<attenuo_audit::WriterFence>,
+)> {
+    let (append_queue, append_timeout) = cfg.append_limits()?;
     let wal_metrics = Arc::clone(&metrics);
     // Runs after the commit that wrote the checkpoint was synced (SR-50); the sink only queues.
     let count = move |cp: &attenuo_audit::Checkpoint| {
@@ -582,23 +672,41 @@ fn open_storage(
     let path = cfg.sqlite_path.as_str();
     if path == ":memory:" {
         tracing::warn!("audit.sqlite_path is :memory:; the audit log is lost on exit");
-        return Ok((
-            Arc::new(
-                SqliteAudit::open_in_memory()?
-                    .with_checkpointing(signer, cfg.checkpoint_every)
-                    .with_checkpoint_hook(count),
-            ),
-            Arc::new(SqliteLeaseStore::open_in_memory()?),
-        ));
+        // Private to this process: nothing to fence.
+        let audit = Arc::new(
+            SqliteAudit::open_in_memory()?
+                .with_append_limits(append_queue, append_timeout)
+                .with_checkpointing(signer, cfg.checkpoint_every)
+                .with_checkpoint_hook(count),
+        );
+        watch_append_shedding(&wal_metrics, &audit);
+        return Ok((audit, Arc::new(SqliteLeaseStore::open_in_memory()?), None));
     }
     let p = Path::new(path);
     if let Some(dir) = p.parent().filter(|d| !d.as_os_str().is_empty()) {
-        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        // A directory created here is the server user's alone (SR-103); one that exists keeps
+        // its mode.
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder
+            .create(dir)
+            .with_context(|| format!("creating {}", dir.display()))?;
     }
+    // Before the lock and the file: on a network filesystem neither can be trusted.
+    check_filesystem(p, cfg.allow_network_filesystem)
+        .with_context(|| format!("checking the filesystem of {path}"))?;
+    // Before the file is opened: a second server on the same file stops here, before it has
+    // touched the database, recovered the outbox or started a writer (audit A-2).
+    let fence = attenuo_audit::WriterFence::acquire(p)
+        .with_context(|| format!("taking the single-writer fence of {path}"))?;
+    tracing::info!(lock = %fence.path().display(), "single-writer fence held");
     let wal_interval = std::time::Duration::from_secs(cfg.wal_checkpoint_seconds);
     let audit = Arc::new(
         SqliteAudit::open_with(p, cfg.durability)
             .with_context(|| format!("opening audit log {path}"))?
+            .with_append_limits(append_queue, append_timeout)
             .with_checkpointing(signer, cfg.checkpoint_every)
             .with_checkpoint_hook(count)
             .with_wal_checkpoints(wal_interval)
@@ -608,19 +716,92 @@ fn open_storage(
     // keep the store (and its final WAL checkpoint on drop) alive forever.
     let weak = Arc::downgrade(&audit);
     wal_metrics.set_wal_source(move || weak.upgrade().and_then(|a| a.wal_stats()));
+    watch_append_shedding(&wal_metrics, &audit);
     let mut leases = SqliteLeaseStore::open_with(p, cfg.durability)
         .with_context(|| format!("opening lease store {path}"))?;
     if !wal_interval.is_zero() {
         // Same file: the audit store's checkpointer covers it.
         leases = leases.without_wal_autocheckpoint()?;
     }
+    // The audit log opens first and migrates the file; the lease store finds it current.
+    let schema = audit.schema();
+    if let Some(from) = schema.migrated_from {
+        tracing::info!(path, from, to = schema.version, "database schema migrated");
+    }
     tracing::info!(
         path,
         durability = %cfg.durability,
         wal_checkpoint_seconds = cfg.wal_checkpoint_seconds,
+        schema_version = schema.version,
         "audit store opened (WAL)"
     );
-    Ok((audit, Arc::new(leases)))
+    Ok((audit, Arc::new(leases), Some(fence)))
+}
+
+/// Refuse a database whose directory is on a network filesystem, unless `allow` (the
+/// `[audit] allow_network_filesystem` escape hatch, which logs a warning instead).
+fn check_filesystem(database: &Path, allow: bool) -> Result<(), attenuo_audit::AuditError> {
+    let probed = attenuo_audit::sqlite::filesystem::probe(database);
+    filesystem_verdict(database, probed, allow)
+}
+
+/// What [`check_filesystem`] does with what the probe found. FUSE is logged and allowed: it
+/// may be local or remote. Not knowing (a `statfs` error, a platform without the check) is
+/// logged and allowed too: the check exists to stop a known-bad placement, not to make
+/// start-up depend on it (multi-replica design, step 2).
+fn filesystem_verdict(
+    database: &Path,
+    probed: std::io::Result<attenuo_audit::Filesystem>,
+    allow: bool,
+) -> Result<(), attenuo_audit::AuditError> {
+    use attenuo_audit::Filesystem;
+    let path = database.display().to_string();
+    match probed {
+        Ok(Filesystem::Network(fs)) if allow => {
+            tracing::warn!(
+                path,
+                filesystem = fs,
+                "the database is on a network filesystem and [audit] allow_network_filesystem \
+                 is set: SQLite's WAL mode and the single-writer lock are not reliable there; \
+                 make sure only this host ever mounts it"
+            );
+            Ok(())
+        }
+        Ok(Filesystem::Network(fs)) => Err(attenuo_audit::AuditError::NetworkFilesystem {
+            dir: attenuo_audit::sqlite::filesystem::directory_of(database),
+            fs,
+        }),
+        Ok(Filesystem::Fuse) => {
+            tracing::warn!(
+                path,
+                "the database is on a FUSE filesystem; if it is a network filesystem (sshfs, \
+                 s3fs, GlusterFS, ceph-fuse), SQLite's WAL mode and the single-writer lock are \
+                 not reliable there: move it to a local disk"
+            );
+            Ok(())
+        }
+        Ok(Filesystem::Other) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+            tracing::info!(path, "{e}; the database's filesystem was not checked");
+            Ok(())
+        }
+        Err(e) => {
+            tracing::warn!(
+                path,
+                error = %e,
+                "could not tell the filesystem type of the database's directory; not checked \
+                 for a network filesystem"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Serve the audit store's shed appends as `audit_append_shed_total`. Weak, as for the WAL
+/// source: the metrics must not keep the store alive.
+fn watch_append_shedding(metrics: &Metrics, audit: &Arc<SqliteAudit>) {
+    let weak = Arc::downgrade(audit);
+    metrics.set_append_source(move || weak.upgrade().map(|a| a.append_stats()));
 }
 
 #[cfg(test)]
@@ -638,9 +819,9 @@ mod tests {
         cfg.issuer.private_key_pem_path = None;
         cfg.audit.sqlite_path = ":memory:".into();
         let state = AppState::from_config(&cfg).unwrap();
-        let ids = state.pipeline.policy().read().unwrap().policy_ids();
+        let ids = state.pipeline.policy().snapshot().policy_ids();
         assert!(ids.contains(&"permit_readonly_tools".to_string()));
-        assert_eq!(state.admin_token, None);
+        assert!(state.admin_credentials.snapshot().is_empty());
     }
 
     /// SR-64: a policy that asks for approvals with `[approvals] client_id` unset warns on a
@@ -667,10 +848,12 @@ mod tests {
             cfg.policy.policies_path = Some(policies.to_path_buf());
             cfg.approvals.client_id = client_id.map(str::to_string);
             cfg.approvals.allow_unset_client_id = allow;
+            // Off loopback the admin API needs a listener of its own (S-1).
+            cfg.admin.listen = Some("127.0.0.1:9102".parse().unwrap());
             cfg
         };
         let state = AppState::from_config(&config("127.0.0.1:8080", &asks, None, false)).unwrap();
-        assert!(state.pipeline.policy().read().unwrap().asks_for_approval());
+        assert!(state.pipeline.policy().snapshot().asks_for_approval());
         // Loopback: starts, and the check says to warn.
         let cfg = config("127.0.0.1:8080", &asks, None, false);
         assert!(cfg
@@ -701,7 +884,7 @@ mod tests {
             .unwrap());
         let cfg = config("0.0.0.0:8080", &plain, None, false);
         let state = AppState::from_config(&cfg).unwrap();
-        assert!(!state.pipeline.policy().read().unwrap().asks_for_approval());
+        assert!(!state.pipeline.policy().snapshot().asks_for_approval());
         assert!(!cfg
             .approvals
             .audience_check(false, cfg.server.listen)
@@ -840,7 +1023,7 @@ mod tests {
 
         let warnings = |cfg: &Config| {
             let state = AppState::from_config(cfg).unwrap();
-            let engine = state.pipeline.policy().read().unwrap();
+            let engine = state.pipeline.policy().snapshot();
             engine.validation_warnings().to_vec()
         };
         assert!(!warnings(&cfg).is_empty(), "undeclared attributes warn");
@@ -852,13 +1035,7 @@ mod tests {
         .into();
         assert!(warnings(&cfg).is_empty());
         let state = AppState::from_config(&cfg).unwrap();
-        let schema = state
-            .pipeline
-            .policy()
-            .read()
-            .unwrap()
-            .schema_text()
-            .to_string();
+        let schema = state.pipeline.policy().snapshot().schema_text().to_string();
         assert!(schema.contains("\"groups\"?: Set<String>"), "{schema}");
         assert!(schema.contains("\"department\"?: String"), "{schema}");
 
@@ -891,15 +1068,14 @@ mod tests {
         let warned = !state
             .pipeline
             .policy()
-            .read()
-            .unwrap()
+            .snapshot()
             .validation_warnings()
             .is_empty();
         assert!(warned);
 
         cfg.policy.schema_path = Some(schema.clone());
         let state = AppState::from_config(&cfg).unwrap();
-        let engine = state.pipeline.policy().read().unwrap();
+        let engine = state.pipeline.policy().snapshot();
         assert!(engine.validation_warnings().is_empty());
         assert!(engine.schema_text().contains("owner?: String"));
         drop(engine);
@@ -919,6 +1095,166 @@ mod tests {
         assert!(err.contains("[policy] schema_path"), "{err}");
     }
 
+    /// The single-writer fence (audit A-2): a second server on the same SQLite file refuses
+    /// to start, naming the lock file and the holder, and starts once the first is gone.
+    #[test]
+    fn a_second_server_on_one_file_is_refused_until_the_first_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.audit.sqlite_path = dir
+            .path()
+            .join("data/audit.sqlite")
+            .to_string_lossy()
+            .into_owned();
+        let (router, first) = crate::build(&cfg).unwrap();
+        let lock = first.store_fence().unwrap().to_path_buf();
+        assert!(
+            lock.ends_with("data/audit.sqlite.lock"),
+            "{}",
+            lock.display()
+        );
+
+        let err = crate::build(&cfg)
+            .err()
+            .expect("a second server must not start");
+        let text = format!("{err:#}");
+        assert!(text.contains("single-writer fence"), "{text}");
+        assert!(text.contains("audit.sqlite.lock"), "{text}");
+        assert!(
+            text.contains(&format!("pid {}", std::process::id())),
+            "{text}"
+        );
+        assert!(text.contains("strategy: Recreate"), "{text}");
+        assert!(matches!(
+            err.downcast_ref::<attenuo_audit::AuditError>(),
+            Some(attenuo_audit::AuditError::Fenced { .. })
+        ));
+
+        drop(router);
+        drop(first);
+        let (_router, second) = crate::build(&cfg).unwrap();
+        assert_eq!(second.store_fence(), Some(lock.as_path()));
+    }
+
+    /// A database file written by a newer attenuo (a higher schema version) stops start-up
+    /// with an error naming both versions, before anything in it is changed, and the fence is
+    /// released so that the newer binary can start on it.
+    #[test]
+    fn a_database_from_a_newer_build_refuses_to_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("audit.sqlite");
+        let mut cfg = Config::default();
+        cfg.audit.sqlite_path = db.to_string_lossy().into_owned();
+        let (router, state) = crate::build(&cfg).unwrap();
+        drop((router, state));
+        let newer = attenuo_audit::SCHEMA_VERSION + 1;
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .pragma_update(None, "user_version", newer)
+            .unwrap();
+
+        let err = crate::build(&cfg)
+            .err()
+            .expect("an older binary must not open a newer file");
+        let text = format!("{err:#}");
+        assert!(text.contains("opening audit log"), "{text}");
+        assert!(text.contains(&format!("schema version {newer}")), "{text}");
+        assert!(
+            text.contains(&format!("up to {}", attenuo_audit::SCHEMA_VERSION)),
+            "{text}"
+        );
+        assert!(matches!(
+            err.downcast_ref::<attenuo_audit::AuditError>(),
+            Some(attenuo_audit::AuditError::SchemaTooNew { .. })
+        ));
+        let version: u32 = rusqlite::Connection::open(&db)
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, newer, "the refused file is left as it was");
+        // The failed start released the fence.
+        drop(attenuo_audit::WriterFence::acquire(&db).unwrap());
+    }
+
+    /// An in-memory store is private to its process: no fence, and any number of them.
+    #[test]
+    fn in_memory_stores_take_no_fence() {
+        let cfg = Config::default();
+        assert_eq!(cfg.audit.sqlite_path, ":memory:");
+        let a = AppState::from_config(&cfg).unwrap();
+        let b = AppState::from_config(&cfg).unwrap();
+        assert!(a.store_fence().is_none() && b.store_fence().is_none());
+    }
+
+    #[test]
+    fn audit_append_limits_are_range_checked() {
+        for (queue, timeout, bad) in [
+            (15, 10, Some("append_queue_max")),
+            (1_000_001, 10, Some("append_queue_max")),
+            (1024, 0, Some("append_timeout_seconds")),
+            (1024, 301, Some("append_timeout_seconds")),
+            (16, 1, None),
+            (1_000_000, 300, None),
+        ] {
+            let mut cfg = Config::default();
+            cfg.audit.append_queue_max = queue;
+            cfg.audit.append_timeout_seconds = timeout;
+            match (AppState::from_config(&cfg), bad) {
+                (Ok(_), None) => {}
+                (Err(e), Some(key)) => assert!(e.to_string().contains(key), "{e}"),
+                (Ok(_), Some(key)) => panic!("{key}: {queue}/{timeout} accepted"),
+                (Err(e), None) => panic!("{queue}/{timeout} refused: {e}"),
+            }
+        }
+    }
+
+    #[test]
+    fn upstream_timeouts_are_range_checked() {
+        for (connect, response, bad) in [
+            (0, 30, Some("upstream_connect_timeout_seconds")),
+            (301, 30, Some("upstream_connect_timeout_seconds")),
+            (5, 0, Some("upstream_response_timeout_seconds")),
+            (5, 3601, Some("upstream_response_timeout_seconds")),
+            (1, 1, None),
+            (300, 3600, None),
+        ] {
+            let mut cfg = Config::default();
+            cfg.proxy.upstream_connect_timeout_seconds = connect;
+            cfg.proxy.upstream_response_timeout_seconds = response;
+            match (AppState::from_config(&cfg), bad) {
+                (Ok(_), None) => {}
+                (Err(e), Some(key)) => assert!(e.to_string().contains(key), "{e}"),
+                (Ok(_), Some(key)) => panic!("{key}: {connect}/{response} accepted"),
+                (Err(e), None) => panic!("{connect}/{response} refused: {e}"),
+            }
+        }
+    }
+
+    /// SR-103: the data directory the server creates for `sqlite_path`, the database, its
+    /// lock file and SQLite's `-wal` and `-shm` files are the server user's alone.
+    #[cfg(unix)]
+    #[test]
+    fn storage_files_are_owner_only_sr103() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data/attenuo");
+        let db = data.join("audit.sqlite");
+        let mut cfg = Config::default();
+        cfg.audit.sqlite_path = db.display().to_string();
+        let state = AppState::from_config(&cfg).unwrap();
+        assert_eq!(mode(&data), 0o700);
+        for name in [
+            "audit.sqlite",
+            "audit.sqlite.lock",
+            "audit.sqlite-wal",
+            "audit.sqlite-shm",
+        ] {
+            assert_eq!(mode(&data.join(name)), 0o600, "{name}");
+        }
+        drop(state);
+    }
+
     #[test]
     fn issuer_key_is_written_once_and_reused() {
         let dir = tempfile::tempdir().unwrap();
@@ -936,5 +1272,64 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+    }
+
+    /// Multi-replica step 2: a database on a network filesystem stops start-up with the
+    /// stable error, naming the filesystem and the escape hatch.
+    #[test]
+    fn a_network_filesystem_refuses_to_start() {
+        use attenuo_audit::{AuditError, Filesystem};
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("audit.sqlite");
+        for fs in ["nfs", "cifs", "smb2", "9p", "ceph", "lustre", "smbfs"] {
+            let err = filesystem_verdict(&db, Ok(Filesystem::Network(fs)), false).unwrap_err();
+            let text = err.to_string();
+            assert!(matches!(err, AuditError::NetworkFilesystem { fs: f, .. } if f == fs));
+            let shown = std::fs::canonicalize(dir.path()).unwrap();
+            assert!(
+                text.starts_with(&format!(
+                    "{} is on a network filesystem ({fs}): ",
+                    shown.display()
+                )),
+                "{text}"
+            );
+            assert!(
+                text.contains("`[audit] allow_network_filesystem = true`"),
+                "{text}"
+            );
+            assert!(text.contains("ReadWriteOnce"), "{text}");
+        }
+    }
+
+    /// The escape hatch, FUSE, a local filesystem and a failed or unsupported probe all
+    /// start: only a known network filesystem without the setting is refused.
+    #[test]
+    fn everything_but_a_known_network_filesystem_starts() {
+        use attenuo_audit::Filesystem;
+        let db = Path::new("/var/lib/attenuo/audit.sqlite");
+        assert!(filesystem_verdict(db, Ok(Filesystem::Network("nfs")), true).is_ok());
+        for allow in [false, true] {
+            assert!(filesystem_verdict(db, Ok(Filesystem::Fuse), allow).is_ok());
+            assert!(filesystem_verdict(db, Ok(Filesystem::Other), allow).is_ok());
+            let failed = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+            assert!(filesystem_verdict(db, Err(failed), allow).is_ok());
+            let unsupported = std::io::Error::from(std::io::ErrorKind::Unsupported);
+            assert!(filesystem_verdict(db, Err(unsupported), allow).is_ok());
+        }
+    }
+
+    /// The real probe on a temp directory (local on any test machine) lets the server start
+    /// on a file there, with the setting at its default.
+    #[test]
+    fn a_local_temp_dir_passes_the_filesystem_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("data/audit.sqlite");
+        std::fs::create_dir(dir.path().join("data")).unwrap();
+        check_filesystem(&db, false).unwrap();
+        let mut cfg = Config::default();
+        assert!(!cfg.audit.allow_network_filesystem);
+        cfg.audit.sqlite_path = db.to_string_lossy().into_owned();
+        let (_router, state) = crate::build(&cfg).unwrap();
+        assert!(state.store_fence().is_some());
     }
 }

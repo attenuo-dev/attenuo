@@ -5,8 +5,8 @@
 mod common;
 
 use attenuo_audit::{
-    Approval, ApprovalLabel, ApprovalMethod, ApprovalState, Approver, AuditError, LeaseStore,
-    MemoryLeaseStore, SqliteLeaseStore, MAX_PENDING_APPROVALS_PER_RUN,
+    Approval, ApprovalLabel, ApprovalMethod, ApprovalState, ApprovalStore, Approver, AuditError,
+    LeaseStore, MemoryLeaseStore, SqliteLeaseStore, MAX_PENDING_APPROVALS_PER_RUN,
 };
 use attenuo_core::{LeaseId, UntrustedArg, UntrustedKind};
 use common::{chain, t0};
@@ -177,10 +177,16 @@ fn a_repeated_gated_call_reuses_the_pending_approval() {
             .create_approval(&pending(3, "h2", Duration::seconds(120)))
             .unwrap();
         assert!(created, "{name}: another call hash is another approval");
-        assert_eq!(store.approvals(None, 10).unwrap().len(), 2);
-        assert_eq!(store.approvals(Some(&id("l1")), 10).unwrap()[0], c);
-        assert!(store.approvals(Some(&id("other")), 10).unwrap().is_empty());
-        assert_eq!(store.approvals(None, 1).unwrap().len(), 1);
+        assert_eq!(store.approvals(None, None, None, 10).unwrap().len(), 2);
+        assert_eq!(
+            store.approvals(Some(&id("l1")), None, None, 10).unwrap()[0].1,
+            c
+        );
+        assert!(store
+            .approvals(Some(&id("other")), None, None, 10)
+            .unwrap()
+            .is_empty());
+        assert_eq!(store.approvals(None, None, None, 1).unwrap().len(), 1);
     }
 }
 
@@ -386,7 +392,10 @@ fn a_run_has_at_most_max_pending_approvals_sr92() {
             "{name}: not stored"
         );
         assert_eq!(
-            store.approvals(Some(&id("l1")), 100).unwrap().len(),
+            store
+                .approvals(Some(&id("l1")), None, None, 100)
+                .unwrap()
+                .len(),
             32,
             "{name}"
         );
@@ -492,4 +501,213 @@ fn a_revoked_child_frees_the_runs_pending_places_sr97() {
             "{name}: cap over live hops"
         );
     }
+}
+
+/// Every page of `approvals(chain, state, before, limit)` from the top, following the position
+/// of each page's last approval, as the ids in the order listed.
+fn page_all(
+    store: &dyn LeaseStore,
+    chain: Option<&LeaseId>,
+    state: Option<ApprovalState>,
+    limit: usize,
+    mut between: impl FnMut(usize),
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut before = None;
+    for page_no in 0.. {
+        let page = store.approvals(chain, state, before, limit).unwrap();
+        assert!(page.len() <= limit);
+        assert!(
+            page.windows(2).all(|w| w[0].0 > w[1].0),
+            "positions strictly decrease within a page"
+        );
+        if let (Some(b), Some((first, _))) = (before, page.first()) {
+            assert!(*first < b, "a page starts below its bound");
+        }
+        out.extend(page.iter().map(|(_, a)| a.id.clone()));
+        match page.last() {
+            Some((pos, _)) if page.len() == limit => before = Some(*pos),
+            _ => break,
+        }
+        between(page_no);
+    }
+    out
+}
+
+#[test]
+fn approvals_page_by_position_each_exactly_once() {
+    for (name, store) in stores() {
+        let store = store.as_ref();
+        leases(store);
+        // More than the pending cap allows at once: decide every other one so the run stays
+        // below it, which also gives the state filter something to keep and drop.
+        let n = 250u32;
+        for i in 0..n {
+            let (a, created) = store
+                .create_approval(&pending(i, &format!("h{i}"), Duration::seconds(600)))
+                .unwrap();
+            assert!(created, "{name}");
+            store
+                .decide_approval(&a.id, i.is_multiple_of(2), &user(), t0())
+                .unwrap();
+        }
+        let ids = |r: std::ops::Range<u32>| -> Vec<String> {
+            r.rev()
+                .map(|i| format!("00000000-0000-4000-8000-{i:012}"))
+                .collect()
+        };
+
+        // Newest first, every approval once, for page sizes that do and do not divide n.
+        for limit in [1usize, 7, 50, 250, 1000] {
+            let got = page_all(store, None, None, limit, |_| {});
+            assert_eq!(got, ids(0..n), "{name}: limit {limit}");
+        }
+
+        // Approvals created while paging sort above the first page: the pre-existing ones are
+        // each listed once, none skipped, and the new ones are not mixed in below.
+        let mut extra = n;
+        let got = page_all(store, None, None, 40, |_| {
+            let (a, _) = store
+                .create_approval(&pending(
+                    extra,
+                    &format!("h{extra}"),
+                    Duration::seconds(600),
+                ))
+                .unwrap();
+            store.decide_approval(&a.id, false, &user(), t0()).unwrap();
+            extra += 1;
+        });
+        assert_eq!(got, ids(0..n), "{name}: inserts during paging");
+
+        // The state filter applies before the limit, and pages like the unfiltered list.
+        let granted = page_all(store, None, Some(ApprovalState::Granted), 9, |_| {});
+        let want: Vec<String> = ids(0..n)
+            .into_iter()
+            .enumerate()
+            .filter(|(k, _)| (n as usize - 1 - k).is_multiple_of(2))
+            .map(|(_, id)| id)
+            .collect();
+        assert_eq!(granted, want, "{name}: state filter");
+        let chain_only = page_all(
+            store,
+            Some(&id("l1")),
+            Some(ApprovalState::Declined),
+            13,
+            |_| {},
+        );
+        assert_eq!(
+            chain_only.len(),
+            (n as usize) / 2 + (extra - n) as usize,
+            "{name}: chain and state"
+        );
+        assert!(page_all(store, Some(&id("other")), None, 10, |_| {}).is_empty());
+
+        // An approval removed at the page boundary does not lose the position.
+        let first = store.approvals(None, None, None, 10).unwrap();
+        let (pos, last) = first.last().unwrap().clone();
+        store.remove_approval(&last.id).unwrap();
+        let next = store.approvals(None, None, Some(pos), 1).unwrap();
+        assert!(next[0].0 < pos, "{name}");
+        assert_ne!(next[0].1.id, last.id);
+    }
+}
+
+/// Every position of a store, newest first.
+fn positions(store: &dyn LeaseStore) -> Vec<(u64, String)> {
+    store
+        .approvals(None, None, None, 1000)
+        .unwrap()
+        .into_iter()
+        .map(|(pos, a)| (pos, a.id))
+        .collect()
+}
+
+/// A position is never given twice: removing the newest approvals (as the server does when
+/// it cannot record a request) leaves the next approval above every position given before,
+/// so a client's cursor never has a new approval below it.
+#[test]
+fn a_position_is_never_given_again_after_the_newest_are_removed() {
+    for (name, store) in stores() {
+        let store = store.as_ref();
+        leases(store);
+        let mut given = Vec::new();
+        for i in 0..4u32 {
+            let (a, created) = store
+                .create_approval(&pending(i, &format!("h{i}"), Duration::seconds(600)))
+                .unwrap();
+            assert!(created, "{name}");
+            given.push(positions(store)[0].0);
+            store.decide_approval(&a.id, false, &user(), t0()).unwrap();
+        }
+        // Remove the newest two, then the only remaining ones too: an empty table.
+        for i in [3u32, 2] {
+            store
+                .remove_approval(&format!("00000000-0000-4000-8000-{i:012}"))
+                .unwrap();
+        }
+        let (a, _) = store
+            .create_approval(&pending(10, "h10", Duration::seconds(600)))
+            .unwrap();
+        let (pos, id) = positions(store)[0].clone();
+        assert_eq!(id, a.id, "{name}");
+        assert!(
+            given.iter().all(|g| pos > *g),
+            "{name}: {pos} is not above {given:?}"
+        );
+        given.push(pos);
+        for (_, id) in positions(store) {
+            store.remove_approval(&id).unwrap();
+        }
+        assert!(positions(store).is_empty(), "{name}");
+        store
+            .create_approval(&pending(11, "h11", Duration::seconds(600)))
+            .unwrap();
+        let (pos, _) = positions(store)[0].clone();
+        assert!(
+            given.iter().all(|g| pos > *g),
+            "{name}: {pos} after emptying the store is not above {given:?}"
+        );
+    }
+}
+
+/// The file store's positions also survive a delete of the newest row in SQL (what the
+/// run-state prune does, by rowid), a `VACUUM` and a reopen: kept rows keep theirs, and the
+/// next approval is above every one given before.
+#[test]
+fn file_store_positions_survive_delete_vacuum_and_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("leases.sqlite");
+    let before = {
+        let store = SqliteLeaseStore::open(&path).unwrap();
+        leases(&store);
+        for i in 0..5u32 {
+            let (a, _) = store
+                .create_approval(&pending(i, &format!("h{i}"), Duration::seconds(600)))
+                .unwrap();
+            store.decide_approval(&a.id, false, &user(), t0()).unwrap();
+        }
+        positions(&store)
+    };
+    let highest = before[0].0;
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute(
+            "DELETE FROM approvals WHERE rowid IN (?1, ?2)",
+            [highest as i64, before[2].0 as i64],
+        )
+        .unwrap();
+        conn.execute_batch("VACUUM").unwrap();
+    }
+    let store = SqliteLeaseStore::open(&path).unwrap();
+    let kept: Vec<(u64, String)> = before
+        .iter()
+        .filter(|(p, _)| *p != highest && *p != before[2].0)
+        .cloned()
+        .collect();
+    assert_eq!(positions(&store), kept, "kept rows keep their positions");
+    store
+        .create_approval(&pending(9, "h9", Duration::seconds(600)))
+        .unwrap();
+    let (pos, _) = positions(&store)[0].clone();
+    assert!(pos > highest, "{pos} is not above the deleted {highest}");
 }

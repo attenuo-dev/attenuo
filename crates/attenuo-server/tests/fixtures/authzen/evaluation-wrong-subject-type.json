@@ -29,6 +29,7 @@
         "status": 400,
         "body": {
           "error": "invalid_request",
+          "code": "invalid_request",
           "detail": "policy parse error: authzen: subject.type must be `agent`, got `user`"
         }
       }

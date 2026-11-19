@@ -10,7 +10,7 @@ use attenuo_core::{DelegationChain, OutputLabel, ToolCall};
 use attenuo_proxy::{
     AuthDecision, AuthError, Authenticated, Authorizer, CallContext, RequestAuth, Stage,
 };
-use attenuo_token::Verifier;
+use attenuo_token::{Claims, VerifiedToken, Verifier};
 use serde_json::Value;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -29,6 +29,7 @@ pub struct ServerAuthorizer {
     pub(super) verified: VerifiedTokens,
     dpop: Option<Arc<crate::dpop::Dpop>>,
     trace: Option<Arc<crate::telemetry::ServerTrace>>,
+    limits: Option<Arc<crate::limits::Limits>>,
 }
 
 impl ServerAuthorizer {
@@ -41,7 +42,15 @@ impl ServerAuthorizer {
             verified: VerifiedTokens::new(VERIFIED_TOKENS_CAPACITY),
             dpop: None,
             trace: None,
+            limits: None,
         }
+    }
+
+    /// Count each authenticated request against `[limits] mcp_requests_per_minute` of its run
+    /// ([`crate::limits`]). Without this nothing is counted.
+    pub(crate) fn with_limits(mut self, limits: Arc<crate::limits::Limits>) -> Self {
+        self.limits = Some(limits);
+        self
     }
 
     /// Join the proxy's exported spans to outside traces through `trace` (`[telemetry]`);
@@ -58,11 +67,7 @@ impl ServerAuthorizer {
         self
     }
 
-    fn verify(
-        &self,
-        token: &str,
-        now: OffsetDateTime,
-    ) -> Result<attenuo_token::VerifiedToken, AuthError> {
+    fn verify(&self, token: &str, now: OffsetDateTime) -> Result<Verified, AuthError> {
         let started = Instant::now();
         let out = self.verify_inner(token, now);
         let elapsed = started.elapsed();
@@ -82,16 +87,22 @@ impl ServerAuthorizer {
     }
 
     /// [`ServerAuthorizer::verify`], and whether the cache answered.
-    fn verify_inner(
+    pub(super) fn verify_inner(
         &self,
         token: &str,
         now: OffsetDateTime,
-    ) -> Result<(attenuo_token::VerifiedToken, bool), AuthError> {
+    ) -> Result<(Verified, bool), AuthError> {
         let key = VerifiedTokens::key(token);
-        if let Some(v) = self.verified.get(&key, now, self.verifier.max_depth()) {
-            return Ok((v, true));
+        if let Some(claims) = self.verified.get(&key, now, self.verifier.max_depth()) {
+            return Ok((
+                Verified {
+                    claims,
+                    chain: None,
+                },
+                true,
+            ));
         }
-        let v = self.verifier.verify(token, now).map_err(|e| {
+        let VerifiedToken { chain, claims } = self.verifier.verify(token, now).map_err(|e| {
             if crate::error::is_expiry(&e) {
                 AuthError::TokenExpired
             } else {
@@ -100,10 +111,41 @@ impl ServerAuthorizer {
         })?;
         // The cache is bounded by count; a size bound per entry makes it bounded in bytes
         // (SR-46). Larger tokens are verified on every call.
+        let claims = Arc::new(claims);
         if token.len() <= VERIFIED_TOKEN_MAX_BYTES {
-            self.verified.insert(key, &v, now);
+            self.verified.insert(key, Arc::clone(&claims), now);
         }
-        Ok((v, false))
+        Ok((
+            Verified {
+                claims,
+                chain: Some(chain),
+            },
+            false,
+        ))
+    }
+}
+
+/// A verified token as [`ServerAuthorizer::verify`] returns it.
+///
+/// [`VerifiedToken`] holds the chain twice, as `chain` and `claims.chain` (the same chain:
+/// [`Verifier::verify`] validates `claims.chain` and returns a copy of it beside the claims).
+/// The cache keeps only the claims, shared, so an entry holds one chain and a hit copies a
+/// pointer; the one chain copy a hit makes is the owned chain the proxy is handed.
+pub(super) struct Verified {
+    /// The token's claims; `claims.chain` is the verified chain.
+    pub(super) claims: Arc<Claims>,
+    /// On a miss, the chain `Verifier::verify` already copied out, so a miss does not copy
+    /// it again; `None` on a hit.
+    chain: Option<DelegationChain>,
+}
+
+impl Verified {
+    /// The verified chain, owned.
+    pub(super) fn into_chain(self) -> DelegationChain {
+        match self.chain {
+            Some(chain) => chain,
+            None => self.claims.chain.clone(),
+        }
     }
 }
 
@@ -115,8 +157,9 @@ pub const VERIFIED_TOKENS_CAPACITY: usize = 4096;
 /// narrowing of its parent), which would make the cache's 4096 entries hundreds of MiB (SR-46).
 pub const VERIFIED_TOKEN_MAX_BYTES: usize = 16 * 1024;
 
-/// Chains of tokens that already passed [`Verifier::verify`], keyed by the SHA-256 of the
-/// exact token text.
+/// Claims of tokens that already passed [`Verifier::verify`], keyed by the SHA-256 of the
+/// exact token text. An entry is the claims alone: `claims.chain` is the verified chain, and
+/// the copy [`VerifiedToken`] keeps beside it is not stored.
 ///
 /// An agent sends the same bearer token on every call, and verifying it (two Ed25519
 /// signatures, JSON decoding, structural checks) costs about 100 us, the largest single stage
@@ -129,7 +172,7 @@ pub const VERIFIED_TOKEN_MAX_BYTES: usize = 16 * 1024;
 /// Bounded: when full, expired chains are dropped, and if that frees nothing the map is
 /// cleared (the next calls simply verify again).
 pub(super) struct VerifiedTokens {
-    pub(super) chains: Mutex<HashMap<[u8; 32], attenuo_token::VerifiedToken>>,
+    pub(super) chains: Mutex<HashMap<[u8; 32], Arc<Claims>>>,
     capacity: usize,
 }
 
@@ -146,25 +189,15 @@ impl VerifiedTokens {
         Sha256::digest(token.as_bytes()).into()
     }
 
-    /// The cached verified token, if its chain is still valid at `now`.
-    fn get(
-        &self,
-        key: &[u8; 32],
-        now: OffsetDateTime,
-        max_depth: usize,
-    ) -> Option<attenuo_token::VerifiedToken> {
+    /// The cached claims, if their chain is still valid at `now`.
+    fn get(&self, key: &[u8; 32], now: OffsetDateTime, max_depth: usize) -> Option<Arc<Claims>> {
         let chains = self.chains.lock().ok()?;
-        let v = chains.get(key)?;
-        v.chain.validate_at(now, max_depth).ok()?;
-        Some(v.clone())
+        let claims = chains.get(key)?;
+        claims.chain.validate_at(now, max_depth).ok()?;
+        Some(Arc::clone(claims))
     }
 
-    pub(super) fn insert(
-        &self,
-        key: [u8; 32],
-        v: &attenuo_token::VerifiedToken,
-        now: OffsetDateTime,
-    ) {
+    pub(super) fn insert(&self, key: [u8; 32], claims: Arc<Claims>, now: OffsetDateTime) {
         let Ok(mut chains) = self.chains.lock() else {
             return;
         };
@@ -174,7 +207,7 @@ impl VerifiedTokens {
                 chains.clear();
             }
         }
-        chains.insert(key, v.clone());
+        chains.insert(key, claims);
     }
 }
 
@@ -190,7 +223,7 @@ impl Authorizer for ServerAuthorizer {
         if v.claims.cnf.is_some() {
             return Err(AuthError::DpopRequired);
         }
-        Ok(v.chain)
+        Ok(v.into_chain())
     }
 
     async fn authenticate_request(
@@ -201,7 +234,10 @@ impl Authorizer for ServerAuthorizer {
         let v = self.verify(req.token, now)?;
         let dpop_bound = match &self.dpop {
             Some(dpop) => {
-                let url = dpop.expected_url(req.host, req.path);
+                // An `[[ext_authz]]` entry names the gateway URL the agent's proof is for.
+                let url = req
+                    .url
+                    .map_or_else(|| dpop.expected_url(req.host, req.path), str::to_owned);
                 dpop.check_presented(
                     v.claims.cnf.as_ref(),
                     req.token,
@@ -218,8 +254,17 @@ impl Authorizer for ServerAuthorizer {
         let jkt = dpop_bound
             .then(|| v.claims.cnf.as_ref().map(|c| c.jkt.clone()))
             .flatten();
+        // The per-run rate limit, keyed by the root lease: known from the verified token (a
+        // cache hit after the first request), before any lease lookup, decision, audit append
+        // or upstream call. Counted only once the token and its DPoP proof verified, so a
+        // caller without the token's key cannot use up a run's requests.
+        if let Some(limits) = &self.limits {
+            if let Some(run) = v.claims.chain.hops.first().map(|h| h.lease.0.as_str()) {
+                limits.admit_mcp(run).map_err(AuthError::RateLimited)?;
+            }
+        }
         Ok(Authenticated {
-            chain: v.chain,
+            chain: v.into_chain(),
             dpop_bound,
             jkt,
         })
@@ -316,9 +361,9 @@ impl Authorizer for ServerAuthorizer {
         read_only_hint: Option<bool>,
         destructive_hint: Option<bool>,
     ) {
-        let Ok(engine) = self.pipeline.policy().read() else {
-            return;
-        };
+        // The narrowing is shared by every engine a reload builds from this one, so importing
+        // into the snapshot holds for the engine in force whatever is swapped in meanwhile.
+        let engine = self.pipeline.policy_snapshot();
         if engine.import_annotations(server, tool, read_only_hint, destructive_hint) {
             // Server and tool come from the upstream: Debug-format them (SR-18).
             tracing::info!(
@@ -345,13 +390,15 @@ impl Authorizer for ServerAuthorizer {
         .await
     }
 
+    fn subject_log(&self) -> &attenuo_proxy::SubjectLog {
+        self.pipeline.subject_log()
+    }
+
     fn knows_tool(&self, server: &str, tool: &str) -> bool {
-        // A poisoned lock fails closed: the tool counts as unknown.
         self.pipeline
-            .policy()
-            .read()
-            .map(|engine| engine.catalog().contains(server, tool))
-            .unwrap_or(false)
+            .policy_snapshot()
+            .catalog()
+            .contains(server, tool)
     }
 
     async fn record_rejection(

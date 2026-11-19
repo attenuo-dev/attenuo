@@ -8,7 +8,7 @@
 import {
   h, append, replace, link, mono, time, leaseState, leaseStatePill, empty, loading, kv, table,
 } from './dom.js';
-import { api, qs, showNotice } from './api.js';
+import { api, qs, showNotice, needsRole } from './api.js';
 
 const CONFIRM_CHARS = 6;
 // Ids of each list a selector preview shows; the counts are always complete.
@@ -35,30 +35,30 @@ export async function leaseView(root, leaseId) {
 function render(root, leaseId, tree) {
   const self = tree.nodes[0];
   const done = () => reload(root, leaseId);
-  const revokeBtn = h('button', {
+  const revokeBtn = needsRole(h('button', {
     type: 'button', class: 'danger', disabled: tree.would_revoke === 0,
     title: tree.would_revoke === 0 ? 'Nothing left to revoke in this subtree' : null,
     on: { click: () => openRevoke(leaseId, tree, done) },
-  }, 'Revoke…');
+  }, 'Revoke…'), 'operator');
   // An older server sends no chain_id; the tree's root is the same lease.
   const chainId = self.chain_id ?? tree.root;
-  const chainBtn = h('button', {
+  const chainBtn = needsRole(h('button', {
     type: 'button', class: 'danger', title: `Revoke every lease of the chain ${chainId}`,
     on: { click: () => openSelectorRevoke({ chain_id: chainId }, done) },
-  }, 'Revoke chain…');
+  }, 'Revoke chain…'), 'operator');
   // Only a lease whose originating user was recorded at issue gets the user action; leases
   // registered before the server kept subjects have none. The subject is caller-controlled
   // text: it only ever becomes text nodes and attribute values (h() never parses HTML).
   const subject = typeof self.subject === 'string' && self.subject !== '' ? self.subject : null;
-  const userBtn = subject !== null ? h('button', {
+  const userBtn = subject !== null ? needsRole(h('button', {
     type: 'button', class: 'danger', title: `Revoke every lease issued for ${subject}`,
     on: { click: () => openSelectorRevoke({ user: subject }, done) },
-  }, `Revoke all for ${clip(subject)}…`) : null;
+  }, `Revoke all for ${clip(subject)}…`), 'operator') : null;
   // Not tied to this lease: the session id is typed in, and may resolve to any chain.
-  const sessionBtn = h('button', {
+  const sessionBtn = needsRole(h('button', {
     type: 'button', class: 'danger', title: 'Revoke the chains that opened an MCP session, by its Mcp-Session-Id',
     on: { click: () => openSessionRevoke(done) },
-  }, 'Revoke by session…');
+  }, 'Revoke by session…'), 'operator');
 
   replace(root,
     h('section', { class: 'panel', 'aria-labelledby': 'lease-title' },
@@ -78,6 +78,7 @@ function render(root, leaseId, tree) {
         ['History', h('a', { href: `#/audit${qs({ lease: leaseId })}` }, 'Every record naming this lease')],
       ])),
     limitsPanel(tree),
+    userWindowsPanel(tree),
     h('section', { class: 'panel' },
       h('header', null, h('h2', null, 'Subtree'),
         h('span', { class: 'small muted' }, `${tree.nodes.length} lease${tree.nodes.length === 1 ? '' : 's'} listed`)),
@@ -133,6 +134,34 @@ function limitsPanel(tree) {
     hops.some((n) => n.budget && !n.budget.recorded)
       ? h('p', { class: 'small muted' }, 'Some hops were issued before the server kept their limits: their counters are shown without a maximum.')
       : null);
+}
+
+/**
+ * The run's originating user's per-user windows (run limits phase 3) for the tools this run
+ * used, from the tree's `user_windows`: every run of the user counts in them, this one and
+ * others. Read only. `null` from the server means the run's root lease was issued before the
+ * server kept the user's issuer, and the windows cannot be found; an older server sends no
+ * member, and a run with no window to show gets no panel.
+ */
+function userWindowsPanel(tree) {
+  const w = tree.user_windows;
+  if (w === undefined) return null;
+  const head = h('header', null, h('h2', null, 'User windows'));
+  if (w === null) {
+    return h('section', { class: 'panel' }, head,
+      h('p', { class: 'muted small' }, 'Not recorded: this run was issued before the server kept the originating user’s issuer, which a window is keyed by.'));
+  }
+  if (!w.windows.length) return null;
+  const rows = w.windows.map((e) => h('tr', null,
+    h('td', { class: 'wrap' }, mono(e.tool)),
+    h('td', null, h('span', { class: 'tag' }, e.kind)),
+    h('td', null, mono(e.start)),
+    h('td', { class: 'num' }, mono(e.calls)),
+    h('td', { class: 'num' }, mono(e.amount))));
+  return h('section', { class: 'panel' }, head,
+    h('p', { class: 'small muted' }, 'Allowed calls of each destructive tool this run used, by every run of its originating user in the current UTC window, as policies see them in ', mono('context.usage.user_window'), '.'),
+    table(['Tool', 'Window', 'Start (UTC)', 'Calls', 'Amount'], rows, { short: true }),
+    w.truncated ? h('p', { class: 'callout warn' }, 'The list is cut short at the server’s cap.') : null);
 }
 
 /** `used`, with how many values a `calls_per` limit has seen. */
@@ -231,7 +260,7 @@ async function loadRenewals(box, leaseId, root) {
     }
     replace(box, h('ul', null, mine.map((e) => h('li', null,
       link(['entry', e.seq], `seq ${e.seq}`), ' ', time(e.record.at), ' ', mono(e.record.reason)))),
-    page.prev !== null ? h('p', { class: 'muted' }, 'Older renewals exist; see the audit explorer.') : null);
+    page.next_cursor !== null ? h('p', { class: 'muted' }, 'Older renewals exist; see the audit explorer.') : null);
   } catch (e) {
     replace(box, h('span', { class: 'muted' }, `Could not load renewals: ${e.message}`));
   }

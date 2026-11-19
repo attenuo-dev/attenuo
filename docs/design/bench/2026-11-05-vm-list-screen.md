@@ -1,6 +1,6 @@
 # List screen: Cedar partial evaluation for 200 tools (2026-11-05)
 
-Branch `feat/cedar-list-filter`, base `a2d7a84`. Summary: [performance, List screen](../performance.md#list-screen-partial-evaluation-2026-11-05). Decision this measures: [ADR-0011](../../decisions/0011-cedar-aware-list-filtering.md) (proposed), whose confirmation asked for "a criterion bench of partial evaluation for 200 tools next to `policy_stage`" before acceptance. The ADR's estimate was 2 to 5 ms per warm 200-tool list and about 25 ms on a chain's first list.
+Branch `feat/cedar-list-filter`, base `a2d7a84`. Summary: [performance, List screen](../performance.md#list-screen-partial-evaluation-2026-11-05). Decision this measures: [ADR-0011](../../decisions/0011-cedar-aware-list-filtering.md) (proposed when this was measured, accepted 2026-11-12), whose confirmation asked for "a criterion bench of partial evaluation for 200 tools next to `policy_stage`" before acceptance. The ADR's estimate was 2 to 5 ms per warm 200-tool list and about 25 ms on a chain's first list.
 
 ## Feasibility
 

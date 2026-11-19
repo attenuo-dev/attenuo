@@ -298,7 +298,7 @@ fn ms(d: Duration) -> String {
     format!("{:.2}", d.as_secs_f64() * 1e3)
 }
 
-/// Measurement, not a check (board item 4 under "Performance follow-ups"): the pause an
+/// Measurement, not a check (a performance follow-up in `docs/design/performance.md`): the pause an
 /// append pays when the writer's backstop fires, against the background checkpointer's
 /// locked pass. Run it on a quiet box:
 ///

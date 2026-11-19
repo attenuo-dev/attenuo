@@ -15,10 +15,14 @@ use time::macros::datetime;
 use time::{Duration, OffsetDateTime};
 
 mod proptest_seed;
+mod strategies;
 use proptest_seed::proptest_config;
+use strategies::{
+    arg_constraint, name, path_constraint, path_string, range, related_path_constraints,
+    small_value,
+};
 
 const MAX_DEPTH: usize = 8;
-const NAMES: &[&str] = &["a", "ab", "abc", "b", "*", "a*", "ab*", "b*"];
 const ARGS: &[&str] = &["x", "y"];
 
 fn t0() -> OffsetDateTime {
@@ -38,37 +42,6 @@ fn config() -> ProptestConfig {
 }
 
 // ---------------------------------------------------------------- strategies
-
-fn small_string() -> impl Strategy<Value = String> {
-    "[ab]{0,3}"
-}
-
-fn small_value() -> impl Strategy<Value = Value> {
-    prop_oneof![
-        3 => small_string().prop_map(Value::String),
-        3 => (-1i64..4).prop_map(|n| json!(n)),
-        // Whole floats are the integer they spell; fractions are no integer at all.
-        1 => prop::sample::select(&[1.0f64, 2.0, 0.5, 2.5][..]).prop_map(|f| json!(f)),
-    ]
-}
-
-/// A checked `range` with small bounds, either side possibly missing, so nested, equal and
-/// single-integer ranges are common.
-fn range() -> impl Strategy<Value = ArgConstraint> {
-    (prop::option::of(-1i64..4), prop::option::of(-1i64..4))
-        .prop_filter_map("a range needs a bound and min <= max", |(min, max)| {
-            ArgConstraint::range(min, max).ok()
-        })
-}
-
-fn arg_constraint() -> impl Strategy<Value = ArgConstraint> {
-    prop_oneof![
-        small_value().prop_map(ArgConstraint::Equals),
-        prop::collection::vec(small_value(), 0..4).prop_map(ArgConstraint::OneOf),
-        "[ab]{0,2}".prop_map(ArgConstraint::Prefix),
-        range(),
-    ]
-}
 
 /// Limits over a small range so that equal and nested figures are common. `sum` counts `n`,
 /// which no constraint names, so every generated capability has well-formed limits.
@@ -92,10 +65,6 @@ fn limits() -> impl Strategy<Value = Limits> {
                 }
             }),
         })
-}
-
-fn name() -> impl Strategy<Value = String> {
-    prop::sample::select(NAMES).prop_map(str::to_owned)
 }
 
 fn capability() -> impl Strategy<Value = Capability> {
@@ -258,6 +227,26 @@ fn value_pool() -> impl Strategy<Value = Vec<Value>> {
         for s in ["", "a", "b", "aa", "ab", "ba", "bb", "abb", "aab", "abab"] {
             pool.push(json!(s));
         }
+        for s in [
+            "/",
+            "/a",
+            "/a/",
+            "/a/b",
+            "/a/b/",
+            "/ab",
+            "/a-",
+            "a/",
+            "a/b",
+            "/a/..",
+            "/a/../b",
+            "/a/./b",
+            "/a//b",
+            "/a\\b",
+            "/a/%2e%2e",
+            "/a%2Fb",
+        ] {
+            pool.push(json!(s));
+        }
         for n in -2..6 {
             pool.push(json!(n));
         }
@@ -362,6 +351,42 @@ proptest! {
                     "{v} satisfies {a:?} but not {b:?}");
             }
         }
+    }
+
+    /// 2b. The same for string constraints over paths, with each constraint's own string and
+    /// its continuations in the pool: a path prefix admits its base, so a wrong `implies`
+    /// against a string prefix or another path prefix shows on the base or just below it.
+    #[test]
+    fn path_implication_is_sound(
+        (a, b) in prop_oneof![
+            (path_constraint(), path_constraint()),
+            related_path_constraints(),
+        ],
+        extra in prop::collection::vec(path_string(), 0..12),
+    ) {
+        if a.implies(&b) {
+            let mut pool: Vec<String> = extra;
+            for c in [&a, &b] {
+                if let ArgConstraint::Prefix(p) | ArgConstraint::PathPrefix(p) = c {
+                    for tail in ["", "/", "a", "/a", "/a/", "-", "/..", "../a"] {
+                        pool.push(format!("{p}{tail}"));
+                    }
+                    pool.push(p.trim_end_matches('/').to_string());
+                }
+            }
+            for v in pool.iter().map(|s| json!(s)) {
+                prop_assert!(!a.satisfied_by(&v) || b.satisfied_by(&v),
+                    "{v} satisfies {a:?} but not {b:?}");
+            }
+        }
+    }
+
+    /// 2c. A path prefix is always within the string prefix of the same text, and a string
+    /// prefix is never within a path prefix.
+    #[test]
+    fn path_prefix_narrows_the_string_prefix_of_its_text(p in path_string(), q in path_string()) {
+        prop_assert!(ArgConstraint::PathPrefix(p.clone()).implies(&ArgConstraint::Prefix(p.clone())));
+        prop_assert!(!ArgConstraint::Prefix(q).implies(&ArgConstraint::PathPrefix(p)));
     }
 
     /// 3. Reflexivity.
@@ -648,6 +673,67 @@ proptest! {
     ) {
         let requested = CapabilitySet::from_iter(subset_of(&parent, &mask));
         prop_assert!(parent.attenuate(&requested).is_ok());
+    }
+
+    /// Hop 0 (SR-121, SR-128): `attenuate_root` refuses what `attenuate` refuses, with the
+    /// same error. Otherwise it refuses a split or a conflict of limits where `attenuate`
+    /// answers, or answers with the capabilities `attenuate` gives (the same patterns and
+    /// constraints) where each is within every capability of the grant that covers its calls,
+    /// and each limited capability of the grant covers the calls of at most one of them. With
+    /// no limited capability of the grant over any requested one it is `attenuate`. Under a
+    /// grant of one limited capability the root token holds at most one capability.
+    #[test]
+    fn attenuate_root_is_attenuate_under_every_covering_limit(
+        parent in capability_set(),
+        requested in capability_set(),
+        one in capability(),
+    ) {
+        let plain = parent.attenuate(&requested);
+        match parent.attenuate_root(&requested) {
+            Err(AttenuationError::LimitSplit { .. } | AttenuationError::LimitConflict { .. }) => {
+                prop_assert!(plain.is_ok(), "{:?}", plain);
+            }
+            Err(e) => prop_assert_eq!(Err(e), plain),
+            Ok(out) => {
+                prop_assert!(plain.is_ok(), "{:?}", plain);
+                let plain = plain.unwrap();
+                prop_assert!(parent.covers(&out));
+                let calls = |s: &CapabilitySet| -> std::collections::BTreeSet<Capability> {
+                    s.iter()
+                        .map(|c| Capability { limits: Limits::default(), ..c.clone() })
+                        .collect()
+                };
+                prop_assert_eq!(calls(&out), calls(&plain));
+                for c in out.iter() {
+                    for p in parent.iter().filter(|p| p.covers_calls(c)) {
+                        prop_assert!(c.limits.narrows(&p.limits), "{:?} under {:?}", c, p);
+                    }
+                }
+                for p in parent.iter().filter(|p| !p.limits.is_empty()) {
+                    prop_assert!(out.iter().filter(|c| p.covers_calls(c)).count() <= 1);
+                }
+                let unlimited = requested.iter().all(|r| {
+                    parent.iter().all(|p| p.limits.is_empty() || !p.covers_calls(r))
+                });
+                if unlimited {
+                    prop_assert_eq!(out, plain);
+                }
+            }
+        }
+        // `attenuate_root_each` is `attenuate_root` of each alone.
+        let each = parent.attenuate_root_each(requested.iter());
+        for (r, got) in requested.iter().zip(each) {
+            let alone = parent
+                .attenuate_root(&CapabilitySet::from_iter([r.clone()]))
+                .map(|out| out.iter().next().unwrap().clone());
+            prop_assert_eq!(got, alone);
+        }
+        if !one.limits.is_empty() {
+            let single = CapabilitySet::from_iter([one]);
+            if let Ok(out) = single.attenuate_root(&requested) {
+                prop_assert!(out.len() <= 1, "{:?}", out);
+            }
+        }
     }
 
     /// 7. Serde round trip preserves the digest (and the chain).

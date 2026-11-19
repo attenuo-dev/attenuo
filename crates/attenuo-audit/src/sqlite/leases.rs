@@ -1,5 +1,5 @@
 //! [`SqliteLeaseStore`]: the lease registry, revocation, sessions, subjects, pruning and the
-//! [`LeaseStore`] implementation.
+//! implementations of the store traits ([`crate::store`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -13,15 +13,14 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 use time::OffsetDateTime;
 
 use super::approvals::{
-    add_approval_columns, approval_from_row, approval_in, approvals_for_call, pending_of_run,
-    APPROVAL_COLUMNS,
+    approval_from_row, approval_in, approvals_for_call, pending_of_run, APPROVAL_COLUMNS,
+    APPROVAL_COLUMN_COUNT,
 };
 use super::budgets::{counter_in, prune_windows_in, refund_in, window_in};
 use super::connection::{
     file_of, open_connection, open_memory_connection, with_full_sync, Durability, WriteGate,
 };
-use super::outbox;
-use super::schema::LEASE_SCHEMA;
+use super::migrations::{migrate, SchemaState};
 use super::{fmt_time, parse_time};
 use crate::approval::{rules, Approval, ApprovalState, Approver};
 use crate::budget::{
@@ -31,22 +30,23 @@ use crate::budget::{
 use crate::error::AuditError;
 use crate::lease::{
     ancestors_of, breadth_first, classify, prune_pass, run_state_prunable, session_prunable,
-    LeasePrune, LeasePruneState, LeaseRow, LeaseSelector, LeaseStatus, LeaseStore, LeaseSubtree,
-    PruneOps, RunLabel, RunStatePrune, SelectorRevocation, SessionBinding, SessionPrune,
+    LeasePrune, LeasePruneState, LeaseRow, LeaseSelector, LeaseStatus, LeaseSubtree, PruneOps,
+    RunLabel, RunStatePrune, SelectorRevocation, SessionBinding, SessionPrune,
 };
 use crate::spans::{
     distinct_hashes, evictions, SpanHit, SpanKey, MAX_SEQS_PER_PROBE, MAX_SPANS_PER_RUN,
 };
+use crate::store::{ApprovalStore, LeaseRegistry, RunLimits, RunState, StoreRetention};
 use crate::window::{UserKey, WindowPrune};
 
 /// Lease registry in SQLite.
 ///
 /// A file-backed store runs at the [`Durability`] it was opened with, except that
-/// [`revoke`](LeaseStore::revoke) always commits with `synchronous=FULL`: losing a revocation
+/// [`revoke`](LeaseRegistry::revoke) always commits with `synchronous=FULL`: losing a revocation
 /// to a power failure would bring a revoked lease back, and revocations are rare enough that
-/// their `fsync` does not matter. A [`charge`](LeaseStore::charge) that charges a `sum` limit
+/// their `fsync` does not matter. A [`charge`](RunLimits::charge) that charges a `sum` limit
 /// commits with `synchronous=FULL` too, unless it is made with
-/// [`charge_sync_deferred`](LeaseStore::charge_sync_deferred), which commits it at the
+/// [`charge_sync_deferred`](RunLimits::charge_sync_deferred), which commits it at the
 /// store's level and leaves the sync to the caller's
 /// [`append_synced`](crate::AuditSink::append_synced) on a [`SqliteAudit`](super::SqliteAudit) in the same file.
 #[derive(Debug)]
@@ -77,9 +77,26 @@ pub struct SqliteLeaseStore {
     /// `budget_counters`, 2 `approvals`) and the `rowid` of the last row a pass looked at in
     /// it, 0 to start from the first.
     run_state_cursor: Mutex<(u8, i64)>,
+    /// The file's schema version and what this open did to it.
+    schema: SchemaState,
     /// Tests: every charge commit and the `synchronous` level it ran at.
     #[cfg(test)]
     pub(super) probe: Option<Arc<Mutex<Vec<String>>>>,
+    /// Tests: run once by `take_approval` after its read, with no lock held.
+    #[cfg(any(test, feature = "testing"))]
+    after_approval_read: AfterRead,
+}
+
+/// A test hook run between `take_approval`'s read and its write transaction.
+#[cfg(any(test, feature = "testing"))]
+#[derive(Default)]
+struct AfterRead(Mutex<Option<Box<dyn FnOnce() + Send>>>);
+
+#[cfg(any(test, feature = "testing"))]
+impl std::fmt::Debug for AfterRead {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AfterRead")
+    }
 }
 
 impl SqliteLeaseStore {
@@ -120,18 +137,20 @@ impl SqliteLeaseStore {
         Self::from_connection(open_memory_connection()?)
     }
 
-    /// Wrap an existing connection, creating or upgrading the lease, approval and outbox
-    /// tables as needed.
+    /// Wrap an existing connection, bringing its file to
+    /// [`SCHEMA_VERSION`](crate::SCHEMA_VERSION) first (see [`schema`](Self::schema)). On a
+    /// file that is already current (a [`SqliteAudit`](super::SqliteAudit) on the same file
+    /// migrated it) this only reads `user_version`.
     ///
     /// # Errors
     ///
-    /// [`AuditError::Sqlite`] when the schema cannot be created or upgraded on `conn` (a read-only
-    /// or foreign database, for example), and [`AuditError::Storage`] when a stored budget or span
-    /// key is not hex.
-    pub fn from_connection(conn: Connection) -> Result<Self, AuditError> {
-        conn.execute_batch(LEASE_SCHEMA)?;
-        add_approval_columns(&conn)?;
-        conn.execute_batch(outbox::OUTBOX_SCHEMA)?;
+    /// [`AuditError::SchemaTooNew`] when a newer attenuo wrote the file;
+    /// [`AuditError::Storage`] when a migration fails or the file holds an audit log this
+    /// version refuses to adopt, or a stored budget or span key is not hex;
+    /// [`AuditError::Sqlite`] when the schema cannot be read or written on `conn` (a read-only
+    /// or foreign database, for example).
+    pub fn from_connection(mut conn: Connection) -> Result<Self, AuditError> {
+        let schema = migrate(&mut conn)?;
         let key: String = conn.query_row(
             "SELECT value FROM budget_meta WHERE key = 'value_key'",
             [],
@@ -165,9 +184,17 @@ impl SqliteLeaseStore {
             session_cursor: Mutex::new(0),
             lease_prune: Mutex::default(),
             run_state_cursor: Mutex::new((0, 0)),
+            schema,
             #[cfg(test)]
             probe: None,
+            #[cfg(any(test, feature = "testing"))]
+            after_approval_read: AfterRead::default(),
         })
+    }
+
+    /// The file's schema version and whether this open migrated it.
+    pub fn schema(&self) -> SchemaState {
+        self.schema
     }
 
     /// Run `f` against the underlying connection while holding the store's lock. For tests
@@ -179,10 +206,10 @@ impl SqliteLeaseStore {
     /// returns.
     pub fn with_connection<R>(
         &self,
-        f: impl FnOnce(&Connection) -> Result<R, AuditError>,
+        f: impl FnOnce(&mut Connection) -> Result<R, AuditError>,
     ) -> Result<R, AuditError> {
-        let conn = self.conn.lock()?;
-        f(&conn)
+        let mut conn = self.conn.lock()?;
+        f(&mut conn)
     }
 
     /// Stop this connection from checkpointing the WAL when it commits
@@ -217,7 +244,7 @@ impl SqliteLeaseStore {
     }
 
     /// What revoking `lease` would touch, without changing anything; `None` for an unknown
-    /// lease. A dry run of [`revoke`](LeaseStore::revoke): it reads the subtree through the
+    /// lease. A dry run of [`revoke`](LeaseRegistry::revoke): it reads the subtree through the
     /// same recursive query over `leases_parent_idx`, so `would_revoke` is the count a
     /// revocation run now would return. `nodes` holds at most `max_nodes` leases (at least 1),
     /// found breadth-first; `would_revoke` counts the whole subtree regardless of the cap.
@@ -407,7 +434,7 @@ fn unrevoked_subtree(conn: &Connection, lease: &LeaseId) -> Result<Vec<LeaseId>,
     Ok(ids)
 }
 
-/// [`LeaseStore::preview_selected`] and [`LeaseStore::revoke_selected`] in one transaction
+/// [`LeaseRegistry::preview_selected`] and [`LeaseRegistry::revoke_selected`] in one transaction
 /// (`IMMEDIATE` when writing): `write` carries the reason and time of a real revocation,
 /// `None` for a preview. The selector's value is always a bound parameter.
 fn selected_in(
@@ -570,6 +597,45 @@ fn sessions_in(conn: &Connection, session: &str) -> Result<Vec<SessionBinding>, 
         .collect()
 }
 
+impl SqliteLeaseStore {
+    /// [`LeaseRegistry::record_subject`] (`issuer` `None`: a recorded issuer is kept and not
+    /// compared) or [`LeaseRegistry::record_originating_user`] (`issuer` set: it must be the one
+    /// recorded, and none recorded counts as a different one), in one write transaction.
+    fn record_user(
+        &self,
+        lease: &LeaseId,
+        issuer: Option<&str>,
+        subject: &str,
+    ) -> Result<(), AuditError> {
+        let _gate = self.gate.hold();
+        let mut conn = self.conn.lock()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if get_in(&tx, lease)?.is_none() {
+            return Err(AuditError::UnknownLease(lease.0.clone()));
+        }
+        let recorded: Option<(String, Option<String>)> = tx
+            .prepare_cached("SELECT subject, issuer FROM lease_subjects WHERE id = ?1")?
+            .query_row([&lease.0], |row| Ok((row.get(0)?, row.get(1)?)))
+            .optional()?;
+        match recorded {
+            // A row without an issuer is a lease from before issuers were kept: the same subject
+            // is accepted and the row is left as it is (never filled in), so re-registering
+            // such a lease after an upgrade is not a conflict.
+            Some((s, i))
+                if s == subject && (issuer.is_none() || i.is_none() || i.as_deref() == issuer) => {}
+            Some(_) => return Err(AuditError::BindingConflict(lease.0.clone())),
+            None => {
+                tx.prepare_cached(
+                    "INSERT INTO lease_subjects (id, subject, issuer) VALUES (?1, ?2, ?3)",
+                )?
+                .execute(params![lease.0, subject, issuer])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+}
+
 fn subject_in(conn: &Connection, lease: &LeaseId) -> Result<Option<String>, AuditError> {
     Ok(conn
         .prepare_cached("SELECT subject FROM lease_subjects WHERE id = ?1")?
@@ -685,7 +751,7 @@ fn get_in(conn: &Connection, lease: &LeaseId) -> Result<Option<LeaseRow>, AuditE
     }
 }
 
-impl LeaseStore for SqliteLeaseStore {
+impl LeaseRegistry for SqliteLeaseStore {
     fn register(
         &self,
         lease: &LeaseId,
@@ -792,22 +858,25 @@ impl LeaseStore for SqliteLeaseStore {
     }
 
     fn record_subject(&self, lease: &LeaseId, subject: &str) -> Result<(), AuditError> {
-        let _gate = self.gate.hold();
-        let mut conn = self.conn.lock()?;
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        if get_in(&tx, lease)?.is_none() {
-            return Err(AuditError::UnknownLease(lease.0.clone()));
-        }
-        match subject_in(&tx, lease)? {
-            Some(s) if s == subject => {}
-            Some(_) => return Err(AuditError::BindingConflict(lease.0.clone())),
-            None => {
-                tx.prepare_cached("INSERT INTO lease_subjects (id, subject) VALUES (?1, ?2)")?
-                    .execute(params![lease.0, subject])?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
+        self.record_user(lease, None, subject)
+    }
+
+    fn record_originating_user(
+        &self,
+        lease: &LeaseId,
+        issuer: &str,
+        subject: &str,
+    ) -> Result<(), AuditError> {
+        self.record_user(lease, Some(issuer), subject)
+    }
+
+    fn originating_user(&self, lease: &LeaseId) -> Result<Option<(String, String)>, AuditError> {
+        let conn = self.conn.lock()?;
+        let row: Option<(Option<String>, String)> = conn
+            .prepare_cached("SELECT issuer, subject FROM lease_subjects WHERE id = ?1")?
+            .query_row([&lease.0], |row| Ok((row.get(0)?, row.get(1)?)))
+            .optional()?;
+        Ok(row.and_then(|(issuer, subject)| Some((issuer?, subject))))
     }
 
     fn subject(&self, lease: &LeaseId) -> Result<Option<String>, AuditError> {
@@ -820,6 +889,54 @@ impl LeaseStore for SqliteLeaseStore {
         subjects_in(&conn, leases)
     }
 
+    fn preview_selected(&self, selector: &LeaseSelector) -> Result<SelectorRevocation, AuditError> {
+        let mut conn = self.conn.lock()?;
+        selected_in(&mut conn, selector, None)
+    }
+
+    fn revoke_selected(
+        &self,
+        selector: &LeaseSelector,
+        reason: &str,
+        now: OffsetDateTime,
+    ) -> Result<SelectorRevocation, AuditError> {
+        let _gate = self.gate.hold();
+        let mut conn = self.conn.lock()?;
+        // Synced like a single revocation (SR-51).
+        let relaxed = self
+            .durability
+            .filter(|d| *d != Durability::Full)
+            .map(Durability::level);
+        let out = with_full_sync(&mut conn, relaxed, |conn| {
+            selected_in(conn, selector, Some((reason, now)))
+        })??;
+        let mut prune = self.lease_prune.lock()?;
+        for id in &out.revoked {
+            prune.after_write(id);
+        }
+        Ok(out)
+    }
+
+    fn check_all(
+        &self,
+        leases: &[&LeaseId],
+        now: OffsetDateTime,
+    ) -> Result<LeaseStatus, AuditError> {
+        let rows = {
+            let conn = self.conn.lock()?;
+            rows_in(&conn, leases)?
+        };
+        // A chain has a handful of leases: a linear scan beats hashing them.
+        classify(leases, now, |id| {
+            Ok(rows
+                .iter()
+                .find(|(r, _)| *r == id.0)
+                .map(|(_, row)| row.clone()))
+        })
+    }
+}
+
+impl RunState for SqliteLeaseStore {
     fn record_session(
         &self,
         session: &str,
@@ -848,6 +965,512 @@ impl LeaseStore for SqliteLeaseStore {
         sessions_in(&conn, session)
     }
 
+    fn add_label(&self, chain_id: &LeaseId, label: &RunLabel) -> Result<(), AuditError> {
+        let _gate = self.gate.hold();
+        let mut conn = self.conn.lock()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if get_in(&tx, chain_id)?.is_none() {
+            return Err(AuditError::UnknownLease(chain_id.0.clone()));
+        }
+        let seq = i64::try_from(label.seq)
+            .map_err(|_| AuditError::Storage(format!("label seq {} out of range", label.seq)))?;
+        tx.prepare_cached(
+            // One row per source: the label with the smallest seq wins.
+            "INSERT INTO run_labels (chain_id, source, decision_id, seq, at) \
+             VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT (chain_id, source) DO UPDATE SET \
+               decision_id = excluded.decision_id, seq = excluded.seq, at = excluded.at \
+             WHERE excluded.seq < run_labels.seq",
+        )?
+        .execute(params![
+            chain_id.0,
+            label.source,
+            label.decision_id,
+            seq,
+            fmt_time(label.at)?
+        ])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn labels(&self, chain_id: &LeaseId) -> Result<Vec<RunLabel>, AuditError> {
+        let conn = self.conn.lock()?;
+        // One row per source, already the first (see `add_label`).
+        let mut stmt = conn.prepare_cached(
+            "SELECT source, decision_id, seq, at FROM run_labels WHERE chain_id = ?1 \
+             ORDER BY seq",
+        )?;
+        let rows = stmt.query_map(params![chain_id.0], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (source, decision_id, seq, at) = row?;
+            let seq = u64::try_from(seq)
+                .map_err(|_| AuditError::Storage(format!("label seq {seq} out of range")))?;
+            out.push(RunLabel {
+                source,
+                decision_id,
+                seq,
+                at: parse_time(&at)?,
+            });
+        }
+        Ok(out)
+    }
+
+    fn add_spans(
+        &self,
+        chain_id: &LeaseId,
+        seq: u64,
+        spans: &[Fingerprint],
+    ) -> Result<(), AuditError> {
+        let seq = i64::try_from(seq)
+            .map_err(|_| AuditError::Storage(format!("span seq {seq} out of range")))?;
+        let mut hashes = distinct_hashes(&self.span_key, spans);
+        hashes.truncate(MAX_SPANS_PER_RUN);
+        let _gate = self.gate.hold();
+        let mut conn = self.conn.lock()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if get_in(&tx, chain_id)?.is_none() {
+            return Err(AuditError::UnknownLease(chain_id.0.clone()));
+        }
+        if hashes.is_empty() {
+            return Ok(());
+        }
+        let stored: Vec<(u64, usize)> = tx
+            .prepare_cached(
+                "SELECT seq, COUNT(*) FROM run_spans WHERE chain_id = ?1 GROUP BY seq ORDER BY seq",
+            )?
+            .query_map(params![chain_id.0], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+            })?
+            .map(|row| {
+                let (s, n) = row?;
+                Ok((
+                    u64::try_from(s).unwrap_or_default(),
+                    usize::try_from(n).unwrap_or_default(),
+                ))
+            })
+            .collect::<Result<_, AuditError>>()?;
+        {
+            let mut delete =
+                tx.prepare_cached("DELETE FROM run_spans WHERE chain_id = ?1 AND seq = ?2")?;
+            for old in evictions(&stored, hashes.len()) {
+                delete.execute(params![chain_id.0, i64::try_from(old).unwrap_or(i64::MAX)])?;
+            }
+            delete.execute(params![chain_id.0, seq])?;
+            let mut insert = tx.prepare_cached(
+                "INSERT OR IGNORE INTO run_spans (chain_id, hash, seq) VALUES (?1, ?2, ?3)",
+            )?;
+            for h in &hashes {
+                insert.execute(params![chain_id.0, &h[..], seq])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn find_spans(
+        &self,
+        chain_id: &LeaseId,
+        probes: &[Fingerprint],
+    ) -> Result<Vec<SpanHit>, AuditError> {
+        let mut conn = self.conn.lock()?;
+        let tx = conn.transaction()?;
+        let mut hits = Vec::new();
+        {
+            let mut stmt = tx.prepare_cached(
+                "SELECT seq FROM run_spans WHERE chain_id = ?1 AND hash = ?2 ORDER BY seq LIMIT ?3",
+            )?;
+            let limit = i64::try_from(MAX_SEQS_PER_PROBE).unwrap_or(i64::MAX);
+            for (probe, f) in probes.iter().enumerate() {
+                let h = self.span_key.hash(f);
+                let seqs =
+                    stmt.query_map(params![chain_id.0, &h[..], limit], |r| r.get::<_, i64>(0))?;
+                for seq in seqs {
+                    let seq = seq?;
+                    let seq = u64::try_from(seq)
+                        .map_err(|_| AuditError::Storage(format!("span seq {seq} out of range")))?;
+                    hits.push(SpanHit { probe, seq });
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(hits)
+    }
+}
+
+impl ApprovalStore for SqliteLeaseStore {
+    fn create_approval(&self, approval: &Approval) -> Result<(Approval, bool), AuditError> {
+        let _gate = self.gate.hold();
+        let mut conn = self.conn.lock()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let now = approval.created_at;
+        let lease_expiry =
+            rules::live_lease(&approval.lease, get_in(&tx, &approval.lease)?.as_ref(), now)?;
+        if let Some(existing) = approvals_for_call(
+            &tx,
+            &approval.chain_id,
+            &approval.call_hash,
+            ApprovalState::Pending,
+        )?
+        .into_iter()
+        .find(|a| rules::reusable(a, approval, now))
+        {
+            return Ok((existing, false));
+        }
+        let pending = pending_of_run(&tx, &approval.chain_id, now)?;
+        rules::below_pending_cap(&approval.chain_id, pending)?;
+        let mut stored = approval.clone();
+        stored.state = ApprovalState::Pending;
+        stored.approver = None;
+        stored.decided_at = None;
+        stored.consumed_by = None;
+        stored.expires_at = stored.expires_at.min(lease_expiry);
+        tx.prepare_cached(
+            "INSERT INTO approvals (id, chain_id, lease, call_hash, server, tool, arguments, \
+             labels, decision_id, chain, created_at, expires_at, state, jkt, untrusted_args) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+        )?
+        .execute(params![
+            stored.id,
+            stored.chain_id.0,
+            stored.lease.0,
+            stored.call_hash,
+            stored.server,
+            stored.tool,
+            serde_json::to_string(&stored.arguments)?,
+            serde_json::to_string(&stored.labels)?,
+            stored.decision_id,
+            serde_json::to_string(&stored.chain)?,
+            fmt_time(stored.created_at)?,
+            fmt_time(stored.expires_at)?,
+            stored.state.as_str(),
+            stored.jkt,
+            (!stored.untrusted_args.is_empty())
+                .then(|| serde_json::to_string(&stored.untrusted_args))
+                .transpose()?,
+        ])?;
+        tx.commit()?;
+        Ok((stored, true))
+    }
+
+    fn approval(&self, id: &str) -> Result<Option<Approval>, AuditError> {
+        let conn = self.conn.lock()?;
+        approval_in(&conn, id)
+    }
+
+    fn approvals(
+        &self,
+        chain_id: Option<&LeaseId>,
+        state: Option<ApprovalState>,
+        before: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<(u64, Approval)>, AuditError> {
+        let conn = self.conn.lock()?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        // The position is the `position` column (schema version 2), an `INTEGER PRIMARY KEY
+        // AUTOINCREMENT`: it follows insertion order, which is creation order, a row keeps it
+        // (it is the rowid, which `VACUUM` keeps for such a column), and SQLite never gives it
+        // again, even after the newest rows are deleted. A bound is always passed, so the scan
+        // is a range of the table's b-tree from `before` down, however deep the page is.
+        let before = before.map_or(i64::MAX, |b| i64::try_from(b).unwrap_or(i64::MAX));
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT {APPROVAL_COLUMNS}, position FROM approvals \
+             WHERE position < ?3 AND (?1 IS NULL OR chain_id = ?1) \
+             AND (?2 IS NULL OR state = ?2) ORDER BY position DESC LIMIT ?4"
+        ))?;
+        let mut rows = stmt.query(params![
+            chain_id.map(|c| c.0.as_str()),
+            state.as_ref().map(ApprovalState::as_str),
+            before,
+            limit
+        ])?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next()? {
+            let pos: i64 = r.get(APPROVAL_COLUMN_COUNT)?;
+            out.push((u64::try_from(pos).unwrap_or(0), approval_from_row(r)?));
+        }
+        Ok(out)
+    }
+
+    fn decide_approval(
+        &self,
+        id: &str,
+        grant: bool,
+        approver: &Approver,
+        now: OffsetDateTime,
+    ) -> Result<Approval, AuditError> {
+        let _gate = self.gate.hold();
+        let mut conn = self.conn.lock()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mut a =
+            approval_in(&tx, id)?.ok_or_else(|| AuditError::UnknownApproval(id.to_owned()))?;
+        rules::decidable(&a, now)?;
+        rules::live_lease(&a.lease, get_in(&tx, &a.lease)?.as_ref(), now)?;
+        a.state = if grant {
+            ApprovalState::Granted
+        } else {
+            ApprovalState::Declined
+        };
+        a.approver = Some(approver.clone());
+        a.decided_at = Some(now);
+        tx.execute(
+            "UPDATE approvals SET state = ?2, approver_subject = ?3, approver_method = ?4, \
+             decided_at = ?5 WHERE id = ?1 AND state = 'pending'",
+            params![
+                id,
+                a.state.as_str(),
+                approver.subject,
+                approver.method.as_str(),
+                fmt_time(now)?
+            ],
+        )?;
+        tx.commit()?;
+        Ok(a)
+    }
+
+    fn take_approval(
+        &self,
+        chain_id: &LeaseId,
+        lease: &LeaseId,
+        call_hash: &str,
+        decision_id: &str,
+        now: OffsetDateTime,
+    ) -> Result<Option<Approval>, AuditError> {
+        // Read first, without the write gate or a write transaction (A-4): almost every call
+        // has no granted approval, and then there is nothing to consume. The read can only
+        // answer "nothing to consume": a row it finds is taken, or not, by the write
+        // transaction below, which reads the lease and the row again under the write lock. A
+        // grant committed after this read is left for the next call, as if it had landed
+        // after this one.
+        {
+            let conn = self.conn.lock()?;
+            let any = approvals_for_call(&conn, chain_id, call_hash, ApprovalState::Granted)?
+                .iter()
+                .any(|a| rules::usable(a, chain_id, lease, call_hash, now));
+            if !any {
+                #[cfg(any(test, feature = "testing"))]
+                {
+                    drop(conn);
+                    self.run_after_approval_read()?;
+                }
+                return Ok(None);
+            }
+        }
+        #[cfg(any(test, feature = "testing"))]
+        self.run_after_approval_read()?;
+        let _gate = self.gate.hold();
+        let mut conn = self.conn.lock()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if rules::live_lease(lease, get_in(&tx, lease)?.as_ref(), now).is_err() {
+            return Ok(None);
+        }
+        let Some(mut a) = approvals_for_call(&tx, chain_id, call_hash, ApprovalState::Granted)?
+            .into_iter()
+            .filter(|a| rules::usable(a, chain_id, lease, call_hash, now))
+            .min_by(|a, b| a.created_at.cmp(&b.created_at))
+        else {
+            return Ok(None);
+        };
+        let changed = tx.execute(
+            "UPDATE approvals SET state = 'consumed', consumed_by = ?2 \
+             WHERE id = ?1 AND state = 'granted'",
+            params![a.id, decision_id],
+        )?;
+        if changed != 1 {
+            return Ok(None);
+        }
+        tx.commit()?;
+        a.state = ApprovalState::Consumed;
+        a.consumed_by = Some(decision_id.to_owned());
+        Ok(Some(a))
+    }
+
+    fn take_approval_by_id(
+        &self,
+        id: &str,
+        chain_id: &LeaseId,
+        lease: &LeaseId,
+        call_hash: &str,
+        decision_id: &str,
+        now: OffsetDateTime,
+    ) -> Result<Option<Approval>, AuditError> {
+        let _gate = self.gate.hold();
+        let mut conn = self.conn.lock()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if rules::live_lease(lease, get_in(&tx, lease)?.as_ref(), now).is_err() {
+            return Ok(None);
+        }
+        let Some(mut a) =
+            approval_in(&tx, id)?.filter(|a| rules::usable(a, chain_id, lease, call_hash, now))
+        else {
+            return Ok(None);
+        };
+        let changed = tx.execute(
+            "UPDATE approvals SET state = 'consumed', consumed_by = ?2 \
+             WHERE id = ?1 AND state = 'granted'",
+            params![a.id, decision_id],
+        )?;
+        if changed != 1 {
+            return Ok(None);
+        }
+        tx.commit()?;
+        a.state = ApprovalState::Consumed;
+        a.consumed_by = Some(decision_id.to_owned());
+        Ok(Some(a))
+    }
+
+    fn restore_approval(&self, id: &str, decision_id: &str) -> Result<(), AuditError> {
+        let _gate = self.gate.hold();
+        let conn = self.conn.lock()?;
+        conn.execute(
+            "UPDATE approvals SET state = 'granted', consumed_by = NULL \
+             WHERE id = ?1 AND state = 'consumed' AND consumed_by = ?2",
+            params![id, decision_id],
+        )?;
+        Ok(())
+    }
+
+    fn remove_approval(&self, id: &str) -> Result<(), AuditError> {
+        let _gate = self.gate.hold();
+        let conn = self.conn.lock()?;
+        conn.execute("DELETE FROM approvals WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+}
+
+impl RunLimits for SqliteLeaseStore {
+    fn budget_used(&self, charges: &[Charge]) -> Result<Vec<u64>, AuditError> {
+        let keys = charges
+            .iter()
+            .map(|c| self.value_key.counter(c))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut conn = self.conn.lock()?;
+        // One read transaction, so every counter is read at the same moment.
+        let tx = conn.transaction()?;
+        keys.iter().map(|k| counter_in(&tx, k)).collect()
+    }
+
+    fn charge(
+        &self,
+        decision_id: &str,
+        charges: &[Charge],
+        at: OffsetDateTime,
+    ) -> Result<ChargeOutcome, AuditError> {
+        self.charge_with(decision_id, charges, &[], at, false)
+            .map(|(outcome, _)| outcome)
+    }
+
+    fn window_used(&self, windows: &[WindowCharge]) -> Result<Vec<u64>, AuditError> {
+        let keys = windows
+            .iter()
+            .map(|w| self.user_key.key(w))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut conn = self.conn.lock()?;
+        let tx = conn.transaction()?;
+        keys.iter().map(|k| window_in(&tx, k)).collect()
+    }
+
+    fn charge_windowed(
+        &self,
+        decision_id: &str,
+        charges: &[Charge],
+        windows: &[WindowCharge],
+        at: OffsetDateTime,
+        defer: bool,
+    ) -> Result<(ChargeOutcome, bool), AuditError> {
+        self.charge_with(decision_id, charges, windows, at, defer)
+    }
+
+    /// Defers the sync of a `sum` charge on a file store below `durability = "full"`; any
+    /// other charge commits exactly as [`charge`](RunLimits::charge) does.
+    fn charge_sync_deferred(
+        &self,
+        decision_id: &str,
+        charges: &[Charge],
+        at: OffsetDateTime,
+    ) -> Result<(ChargeOutcome, bool), AuditError> {
+        self.charge_with(decision_id, charges, &[], at, true)
+    }
+
+    fn sync_file(&self) -> Option<&Path> {
+        self.file.as_deref()
+    }
+
+    fn refund(&self, decision_id: &str, at: OffsetDateTime) -> Result<u64, AuditError> {
+        let _gate = self.gate.hold();
+        let mut conn = self.conn.lock()?;
+        refund_in(&mut conn, decision_id, at)
+    }
+
+    fn record_hop_limits(&self, lease: &LeaseId, limits: &[HopLimit]) -> Result<(), AuditError> {
+        let json = serde_json::to_string(limits)
+            .map_err(|e| AuditError::Storage(format!("hop limits do not serialize: {e}")))?;
+        let _gate = self.gate.hold();
+        let conn = self.conn.lock()?;
+        conn.prepare_cached(
+            "INSERT INTO hop_limits (lease, limits) VALUES (?1, ?2) \
+             ON CONFLICT (lease) DO UPDATE SET limits = excluded.limits",
+        )?
+        .execute(params![lease.0, json])?;
+        Ok(())
+    }
+
+    fn hop_limits(&self, lease: &LeaseId) -> Result<Option<Vec<HopLimit>>, AuditError> {
+        let conn = self.conn.lock()?;
+        let json: Option<String> = conn
+            .prepare_cached("SELECT limits FROM hop_limits WHERE lease = ?1")?
+            .query_row([&lease.0], |r| r.get(0))
+            .optional()?;
+        json.map(|j| {
+            serde_json::from_str(&j)
+                .map_err(|e| AuditError::Storage(format!("hop limits of `{}`: {e}", lease.0)))
+        })
+        .transpose()
+    }
+
+    fn budget_summary(&self, lease: &LeaseId) -> Result<Vec<CounterSummary>, AuditError> {
+        let conn = self.conn.lock()?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT cap, kind, arg, value, used FROM budget_counters WHERE lease = ?1",
+        )?;
+        let rows = stmt
+            .query_map([&lease.0], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, i64>(4)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut keyed = Vec::with_capacity(rows.len());
+        for (cap, kind, arg, value, used) in rows {
+            // A kind this version does not know is skipped rather than failing the read.
+            let Some(kind) = kind_static(&kind) else {
+                continue;
+            };
+            let key = CounterKey {
+                lease: lease.0.clone(),
+                cap,
+                kind,
+                arg,
+                value,
+            };
+            keyed.push((key, u64::try_from(used).unwrap_or(0)));
+        }
+        Ok(summarize(keyed.iter().map(|(k, v)| (k, *v))))
+    }
+}
+
+impl StoreRetention for SqliteLeaseStore {
     fn prune_sessions(
         &self,
         now: OffsetDateTime,
@@ -1059,435 +1682,6 @@ impl LeaseStore for SqliteLeaseStore {
         Ok(out)
     }
 
-    fn preview_selected(&self, selector: &LeaseSelector) -> Result<SelectorRevocation, AuditError> {
-        let mut conn = self.conn.lock()?;
-        selected_in(&mut conn, selector, None)
-    }
-
-    fn revoke_selected(
-        &self,
-        selector: &LeaseSelector,
-        reason: &str,
-        now: OffsetDateTime,
-    ) -> Result<SelectorRevocation, AuditError> {
-        let _gate = self.gate.hold();
-        let mut conn = self.conn.lock()?;
-        // Synced like a single revocation (SR-51).
-        let relaxed = self
-            .durability
-            .filter(|d| *d != Durability::Full)
-            .map(Durability::level);
-        let out = with_full_sync(&mut conn, relaxed, |conn| {
-            selected_in(conn, selector, Some((reason, now)))
-        })??;
-        let mut prune = self.lease_prune.lock()?;
-        for id in &out.revoked {
-            prune.after_write(id);
-        }
-        Ok(out)
-    }
-
-    fn check_all(
-        &self,
-        leases: &[&LeaseId],
-        now: OffsetDateTime,
-    ) -> Result<LeaseStatus, AuditError> {
-        let rows = {
-            let conn = self.conn.lock()?;
-            rows_in(&conn, leases)?
-        };
-        // A chain has a handful of leases: a linear scan beats hashing them.
-        classify(leases, now, |id| {
-            Ok(rows
-                .iter()
-                .find(|(r, _)| *r == id.0)
-                .map(|(_, row)| row.clone()))
-        })
-    }
-
-    fn add_label(&self, chain_id: &LeaseId, label: &RunLabel) -> Result<(), AuditError> {
-        let _gate = self.gate.hold();
-        let mut conn = self.conn.lock()?;
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        if get_in(&tx, chain_id)?.is_none() {
-            return Err(AuditError::UnknownLease(chain_id.0.clone()));
-        }
-        let seq = i64::try_from(label.seq)
-            .map_err(|_| AuditError::Storage(format!("label seq {} out of range", label.seq)))?;
-        tx.prepare_cached(
-            // One row per source: the label with the smallest seq wins.
-            "INSERT INTO run_labels (chain_id, source, decision_id, seq, at) \
-             VALUES (?1, ?2, ?3, ?4, ?5) \
-             ON CONFLICT (chain_id, source) DO UPDATE SET \
-               decision_id = excluded.decision_id, seq = excluded.seq, at = excluded.at \
-             WHERE excluded.seq < run_labels.seq",
-        )?
-        .execute(params![
-            chain_id.0,
-            label.source,
-            label.decision_id,
-            seq,
-            fmt_time(label.at)?
-        ])?;
-        tx.commit()?;
-        Ok(())
-    }
-
-    fn labels(&self, chain_id: &LeaseId) -> Result<Vec<RunLabel>, AuditError> {
-        let conn = self.conn.lock()?;
-        // One row per source, already the first (see `add_label`).
-        let mut stmt = conn.prepare_cached(
-            "SELECT source, decision_id, seq, at FROM run_labels WHERE chain_id = ?1 \
-             ORDER BY seq",
-        )?;
-        let rows = stmt.query_map(params![chain_id.0], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, i64>(2)?,
-                r.get::<_, String>(3)?,
-            ))
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            let (source, decision_id, seq, at) = row?;
-            let seq = u64::try_from(seq)
-                .map_err(|_| AuditError::Storage(format!("label seq {seq} out of range")))?;
-            out.push(RunLabel {
-                source,
-                decision_id,
-                seq,
-                at: parse_time(&at)?,
-            });
-        }
-        Ok(out)
-    }
-
-    fn add_spans(
-        &self,
-        chain_id: &LeaseId,
-        seq: u64,
-        spans: &[Fingerprint],
-    ) -> Result<(), AuditError> {
-        let seq = i64::try_from(seq)
-            .map_err(|_| AuditError::Storage(format!("span seq {seq} out of range")))?;
-        let mut hashes = distinct_hashes(&self.span_key, spans);
-        hashes.truncate(MAX_SPANS_PER_RUN);
-        let _gate = self.gate.hold();
-        let mut conn = self.conn.lock()?;
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        if get_in(&tx, chain_id)?.is_none() {
-            return Err(AuditError::UnknownLease(chain_id.0.clone()));
-        }
-        if hashes.is_empty() {
-            return Ok(());
-        }
-        let stored: Vec<(u64, usize)> = tx
-            .prepare_cached(
-                "SELECT seq, COUNT(*) FROM run_spans WHERE chain_id = ?1 GROUP BY seq ORDER BY seq",
-            )?
-            .query_map(params![chain_id.0], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
-            })?
-            .map(|row| {
-                let (s, n) = row?;
-                Ok((
-                    u64::try_from(s).unwrap_or_default(),
-                    usize::try_from(n).unwrap_or_default(),
-                ))
-            })
-            .collect::<Result<_, AuditError>>()?;
-        {
-            let mut delete =
-                tx.prepare_cached("DELETE FROM run_spans WHERE chain_id = ?1 AND seq = ?2")?;
-            for old in evictions(&stored, hashes.len()) {
-                delete.execute(params![chain_id.0, i64::try_from(old).unwrap_or(i64::MAX)])?;
-            }
-            delete.execute(params![chain_id.0, seq])?;
-            let mut insert = tx.prepare_cached(
-                "INSERT OR IGNORE INTO run_spans (chain_id, hash, seq) VALUES (?1, ?2, ?3)",
-            )?;
-            for h in &hashes {
-                insert.execute(params![chain_id.0, &h[..], seq])?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    fn find_spans(
-        &self,
-        chain_id: &LeaseId,
-        probes: &[Fingerprint],
-    ) -> Result<Vec<SpanHit>, AuditError> {
-        let mut conn = self.conn.lock()?;
-        let tx = conn.transaction()?;
-        let mut hits = Vec::new();
-        {
-            let mut stmt = tx.prepare_cached(
-                "SELECT seq FROM run_spans WHERE chain_id = ?1 AND hash = ?2 ORDER BY seq LIMIT ?3",
-            )?;
-            let limit = i64::try_from(MAX_SEQS_PER_PROBE).unwrap_or(i64::MAX);
-            for (probe, f) in probes.iter().enumerate() {
-                let h = self.span_key.hash(f);
-                let seqs =
-                    stmt.query_map(params![chain_id.0, &h[..], limit], |r| r.get::<_, i64>(0))?;
-                for seq in seqs {
-                    let seq = seq?;
-                    let seq = u64::try_from(seq)
-                        .map_err(|_| AuditError::Storage(format!("span seq {seq} out of range")))?;
-                    hits.push(SpanHit { probe, seq });
-                }
-            }
-        }
-        tx.commit()?;
-        Ok(hits)
-    }
-
-    fn create_approval(&self, approval: &Approval) -> Result<(Approval, bool), AuditError> {
-        let _gate = self.gate.hold();
-        let mut conn = self.conn.lock()?;
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let now = approval.created_at;
-        let lease_expiry =
-            rules::live_lease(&approval.lease, get_in(&tx, &approval.lease)?.as_ref(), now)?;
-        if let Some(existing) = approvals_for_call(
-            &tx,
-            &approval.chain_id,
-            &approval.call_hash,
-            ApprovalState::Pending,
-        )?
-        .into_iter()
-        .find(|a| rules::reusable(a, approval, now))
-        {
-            return Ok((existing, false));
-        }
-        let pending = pending_of_run(&tx, &approval.chain_id, now)?;
-        rules::below_pending_cap(&approval.chain_id, pending)?;
-        let mut stored = approval.clone();
-        stored.state = ApprovalState::Pending;
-        stored.approver = None;
-        stored.decided_at = None;
-        stored.consumed_by = None;
-        stored.expires_at = stored.expires_at.min(lease_expiry);
-        tx.prepare_cached(
-            "INSERT INTO approvals (id, chain_id, lease, call_hash, server, tool, arguments, \
-             labels, decision_id, chain, created_at, expires_at, state, jkt, untrusted_args) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
-        )?
-        .execute(params![
-            stored.id,
-            stored.chain_id.0,
-            stored.lease.0,
-            stored.call_hash,
-            stored.server,
-            stored.tool,
-            serde_json::to_string(&stored.arguments)?,
-            serde_json::to_string(&stored.labels)?,
-            stored.decision_id,
-            serde_json::to_string(&stored.chain)?,
-            fmt_time(stored.created_at)?,
-            fmt_time(stored.expires_at)?,
-            stored.state.as_str(),
-            stored.jkt,
-            (!stored.untrusted_args.is_empty())
-                .then(|| serde_json::to_string(&stored.untrusted_args))
-                .transpose()?,
-        ])?;
-        tx.commit()?;
-        Ok((stored, true))
-    }
-
-    fn approval(&self, id: &str) -> Result<Option<Approval>, AuditError> {
-        let conn = self.conn.lock()?;
-        approval_in(&conn, id)
-    }
-
-    fn approvals(
-        &self,
-        chain_id: Option<&LeaseId>,
-        limit: usize,
-    ) -> Result<Vec<Approval>, AuditError> {
-        let conn = self.conn.lock()?;
-        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
-        // `rowid` follows insertion order, which is creation order.
-        let mut stmt = conn.prepare_cached(&format!(
-            "SELECT {APPROVAL_COLUMNS} FROM approvals \
-             WHERE ?1 IS NULL OR chain_id = ?1 ORDER BY rowid DESC LIMIT ?2"
-        ))?;
-        let mut rows = stmt.query(params![chain_id.map(|c| c.0.as_str()), limit])?;
-        let mut out = Vec::new();
-        while let Some(r) = rows.next()? {
-            out.push(approval_from_row(r)?);
-        }
-        Ok(out)
-    }
-
-    fn decide_approval(
-        &self,
-        id: &str,
-        grant: bool,
-        approver: &Approver,
-        now: OffsetDateTime,
-    ) -> Result<Approval, AuditError> {
-        let _gate = self.gate.hold();
-        let mut conn = self.conn.lock()?;
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let mut a =
-            approval_in(&tx, id)?.ok_or_else(|| AuditError::UnknownApproval(id.to_owned()))?;
-        rules::decidable(&a, now)?;
-        rules::live_lease(&a.lease, get_in(&tx, &a.lease)?.as_ref(), now)?;
-        a.state = if grant {
-            ApprovalState::Granted
-        } else {
-            ApprovalState::Declined
-        };
-        a.approver = Some(approver.clone());
-        a.decided_at = Some(now);
-        tx.execute(
-            "UPDATE approvals SET state = ?2, approver_subject = ?3, approver_method = ?4, \
-             decided_at = ?5 WHERE id = ?1 AND state = 'pending'",
-            params![
-                id,
-                a.state.as_str(),
-                approver.subject,
-                approver.method.as_str(),
-                fmt_time(now)?
-            ],
-        )?;
-        tx.commit()?;
-        Ok(a)
-    }
-
-    fn take_approval(
-        &self,
-        chain_id: &LeaseId,
-        lease: &LeaseId,
-        call_hash: &str,
-        decision_id: &str,
-        now: OffsetDateTime,
-    ) -> Result<Option<Approval>, AuditError> {
-        let _gate = self.gate.hold();
-        let mut conn = self.conn.lock()?;
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        if rules::live_lease(lease, get_in(&tx, lease)?.as_ref(), now).is_err() {
-            return Ok(None);
-        }
-        let Some(mut a) = approvals_for_call(&tx, chain_id, call_hash, ApprovalState::Granted)?
-            .into_iter()
-            .filter(|a| rules::usable(a, chain_id, lease, call_hash, now))
-            .min_by(|a, b| a.created_at.cmp(&b.created_at))
-        else {
-            return Ok(None);
-        };
-        let changed = tx.execute(
-            "UPDATE approvals SET state = 'consumed', consumed_by = ?2 \
-             WHERE id = ?1 AND state = 'granted'",
-            params![a.id, decision_id],
-        )?;
-        if changed != 1 {
-            return Ok(None);
-        }
-        tx.commit()?;
-        a.state = ApprovalState::Consumed;
-        a.consumed_by = Some(decision_id.to_owned());
-        Ok(Some(a))
-    }
-
-    fn take_approval_by_id(
-        &self,
-        id: &str,
-        chain_id: &LeaseId,
-        lease: &LeaseId,
-        call_hash: &str,
-        decision_id: &str,
-        now: OffsetDateTime,
-    ) -> Result<Option<Approval>, AuditError> {
-        let _gate = self.gate.hold();
-        let mut conn = self.conn.lock()?;
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        if rules::live_lease(lease, get_in(&tx, lease)?.as_ref(), now).is_err() {
-            return Ok(None);
-        }
-        let Some(mut a) =
-            approval_in(&tx, id)?.filter(|a| rules::usable(a, chain_id, lease, call_hash, now))
-        else {
-            return Ok(None);
-        };
-        let changed = tx.execute(
-            "UPDATE approvals SET state = 'consumed', consumed_by = ?2 \
-             WHERE id = ?1 AND state = 'granted'",
-            params![a.id, decision_id],
-        )?;
-        if changed != 1 {
-            return Ok(None);
-        }
-        tx.commit()?;
-        a.state = ApprovalState::Consumed;
-        a.consumed_by = Some(decision_id.to_owned());
-        Ok(Some(a))
-    }
-
-    fn restore_approval(&self, id: &str, decision_id: &str) -> Result<(), AuditError> {
-        let _gate = self.gate.hold();
-        let conn = self.conn.lock()?;
-        conn.execute(
-            "UPDATE approvals SET state = 'granted', consumed_by = NULL \
-             WHERE id = ?1 AND state = 'consumed' AND consumed_by = ?2",
-            params![id, decision_id],
-        )?;
-        Ok(())
-    }
-
-    fn remove_approval(&self, id: &str) -> Result<(), AuditError> {
-        let _gate = self.gate.hold();
-        let conn = self.conn.lock()?;
-        conn.execute("DELETE FROM approvals WHERE id = ?1", params![id])?;
-        Ok(())
-    }
-
-    fn budget_used(&self, charges: &[Charge]) -> Result<Vec<u64>, AuditError> {
-        let keys = charges
-            .iter()
-            .map(|c| self.value_key.counter(c))
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut conn = self.conn.lock()?;
-        // One read transaction, so every counter is read at the same moment.
-        let tx = conn.transaction()?;
-        keys.iter().map(|k| counter_in(&tx, k)).collect()
-    }
-
-    fn charge(
-        &self,
-        decision_id: &str,
-        charges: &[Charge],
-        at: OffsetDateTime,
-    ) -> Result<ChargeOutcome, AuditError> {
-        self.charge_with(decision_id, charges, &[], at, false)
-            .map(|(outcome, _)| outcome)
-    }
-
-    fn window_used(&self, windows: &[WindowCharge]) -> Result<Vec<u64>, AuditError> {
-        let keys = windows
-            .iter()
-            .map(|w| self.user_key.key(w))
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut conn = self.conn.lock()?;
-        let tx = conn.transaction()?;
-        keys.iter().map(|k| window_in(&tx, k)).collect()
-    }
-
-    fn charge_windowed(
-        &self,
-        decision_id: &str,
-        charges: &[Charge],
-        windows: &[WindowCharge],
-        at: OffsetDateTime,
-        defer: bool,
-    ) -> Result<(ChargeOutcome, bool), AuditError> {
-        self.charge_with(decision_id, charges, windows, at, defer)
-    }
-
     fn prune_user_windows(
         &self,
         now: OffsetDateTime,
@@ -1498,86 +1692,37 @@ impl LeaseStore for SqliteLeaseStore {
         let mut conn = self.conn.lock()?;
         prune_windows_in(&mut conn, now, retention, max_rows)
     }
+}
 
-    /// Defers the sync of a `sum` charge on a file store below `durability = "full"`; any
-    /// other charge commits exactly as [`charge`](LeaseStore::charge) does.
-    fn charge_sync_deferred(
-        &self,
-        decision_id: &str,
-        charges: &[Charge],
-        at: OffsetDateTime,
-    ) -> Result<(ChargeOutcome, bool), AuditError> {
-        self.charge_with(decision_id, charges, &[], at, true)
+#[cfg(any(test, feature = "testing"))]
+impl SqliteLeaseStore {
+    /// How many writes have run on this store's file, by every store on it (the write gate's
+    /// turns): a lease store and a [`SqliteAudit`](super::SqliteAudit) on one file count
+    /// together. 0 for a store that is not on a file this crate opened. For tests and
+    /// measurements.
+    #[doc(hidden)]
+    pub fn write_turns(&self) -> u64 {
+        self.gate.turns()
     }
 
-    fn sync_file(&self) -> Option<&Path> {
-        self.file.as_deref()
+    /// Run `f` once, in the next [`take_approval`](ApprovalStore::take_approval), between its
+    /// read and its write transaction (whether or not the read found a usable approval),
+    /// with no lock of this store held. For tests.
+    #[doc(hidden)]
+    pub fn after_next_approval_read(&self, f: impl FnOnce() + Send + 'static) {
+        *self
+            .after_approval_read
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(f));
     }
 
-    fn refund(&self, decision_id: &str, at: OffsetDateTime) -> Result<u64, AuditError> {
-        let _gate = self.gate.hold();
-        let mut conn = self.conn.lock()?;
-        refund_in(&mut conn, decision_id, at)
-    }
-
-    fn record_hop_limits(&self, lease: &LeaseId, limits: &[HopLimit]) -> Result<(), AuditError> {
-        let json = serde_json::to_string(limits)
-            .map_err(|e| AuditError::Storage(format!("hop limits do not serialize: {e}")))?;
-        let _gate = self.gate.hold();
-        let conn = self.conn.lock()?;
-        conn.prepare_cached(
-            "INSERT INTO hop_limits (lease, limits) VALUES (?1, ?2) \
-             ON CONFLICT (lease) DO UPDATE SET limits = excluded.limits",
-        )?
-        .execute(params![lease.0, json])?;
-        Ok(())
-    }
-
-    fn hop_limits(&self, lease: &LeaseId) -> Result<Option<Vec<HopLimit>>, AuditError> {
-        let conn = self.conn.lock()?;
-        let json: Option<String> = conn
-            .prepare_cached("SELECT limits FROM hop_limits WHERE lease = ?1")?
-            .query_row([&lease.0], |r| r.get(0))
-            .optional()?;
-        json.map(|j| {
-            serde_json::from_str(&j)
-                .map_err(|e| AuditError::Storage(format!("hop limits of `{}`: {e}", lease.0)))
-        })
-        .transpose()
-    }
-
-    fn budget_summary(&self, lease: &LeaseId) -> Result<Vec<CounterSummary>, AuditError> {
-        let conn = self.conn.lock()?;
-        let mut stmt = conn.prepare_cached(
-            "SELECT cap, kind, arg, value, used FROM budget_counters WHERE lease = ?1",
-        )?;
-        let rows = stmt
-            .query_map([&lease.0], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, i64>(4)?,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut keyed = Vec::with_capacity(rows.len());
-        for (cap, kind, arg, value, used) in rows {
-            // A kind this version does not know is skipped rather than failing the read.
-            let Some(kind) = kind_static(&kind) else {
-                continue;
-            };
-            let key = CounterKey {
-                lease: lease.0.clone(),
-                cap,
-                kind,
-                arg,
-                value,
-            };
-            keyed.push((key, u64::try_from(used).unwrap_or(0)));
+    fn run_after_approval_read(&self) -> Result<(), AuditError> {
+        let hook = self.after_approval_read.0.lock()?.take();
+        if let Some(f) = hook {
+            f();
         }
-        Ok(summarize(keyed.iter().map(|(k, v)| (k, *v))))
+        Ok(())
     }
 }
 

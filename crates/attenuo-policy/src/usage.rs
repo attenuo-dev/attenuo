@@ -109,7 +109,7 @@ pub fn policies_read_user_window(policies: &PolicySet) -> Vec<WindowKind> {
 /// The attribute path of an access chain on `context` (`context.a.b` is `["a", "b"]`), or
 /// `None` when `v` is not one. An access whose attribute has an unexpected shape ends the
 /// path with `None` in it, which reads as "anything".
-fn context_path(v: &Value) -> Option<Vec<Option<String>>> {
+pub(crate) fn context_path(v: &Value) -> Option<Vec<Option<String>>> {
     if is_context(v) {
         return Some(Vec::new());
     }

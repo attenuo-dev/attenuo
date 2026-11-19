@@ -13,6 +13,7 @@ pub fn attenuo() -> Command {
         "ATTENUO_CLIENT_SECRET",
         "ATTENUO_TOKEN",
         "ATTENUO_SERVER",
+        "ATTENUO_ADMIN_SERVER",
         "ATTENUO_DPOP_KEY",
     ] {
         c.env_remove(var);

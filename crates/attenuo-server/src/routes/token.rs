@@ -19,6 +19,7 @@
 //! | `subject_token_type` | `urn:ietf:params:oauth:token-type:jwt` |
 //! | `actor` | the sub-agent's id; the request must authenticate as this agent (below) |
 //! | `client_id`, `client_secret` | the actor's `[[agents]]` credentials; HTTP Basic also accepted |
+//! | `client_assertion_type`, `client_assertion` | instead of a secret: a `private_key_jwt` client assertion (RFC 7523 §2.2) signed by one of the actor's `[[agents]] jwks` keys (`crate::clientauth`) |
 //! | `actor_token`, `actor_token_type` | RFC 8693 §2.1: a workload-identity JWT for the actor, type `urn:ietf:params:oauth:token-type:jwt` (`crate::actor`) |
 //! | `authorization_details` | RFC 9396 list with one `{"type":"attenuo_capabilities","capabilities":[...]}`; a JSON string in form encoding |
 //! | `scope` | form only, alternative to `authorization_details`: space-separated `server:tool` |
@@ -29,15 +30,19 @@
 //! caller must authenticate as `actor`, with whichever methods `[token] actor_auth` accepts
 //! (`either` by default):
 //!
-//! - client credentials from `[[agents]]` (HTTP Basic, or `client_id` / `client_secret`); the
-//!   client id must equal `actor`. Failures are 401 `invalid_client` (sub-codes as for intake).
+//! - client credentials from `[[agents]]` (HTTP Basic, `client_id` / `client_secret`, or a
+//!   `private_key_jwt` assertion, as the agent's entry allows); the client id must equal
+//!   `actor`. Failures are 401 `invalid_client` (sub-codes as for intake, and
+//!   `client_assertion_*`). An assertion is used up as soon as it authenticates, even when the
+//!   exchange is then refused, except by the agent's rate limit or a refused `DPoP` header
+//!   proof, which are checked first (SR-108, SR-111).
 //! - an `actor_token` from an `[[actor_trust]]` issuer (a SPIFFE JWT-SVID, or any JWT with a
 //!   JWKS), verified by `crate::actor::ActorTrustRegistry::verify`; the agent its `sub` maps
 //!   to must equal `actor`. Failures are 400 `invalid_request` with `actor_token_*` sub-codes.
 //!
 //! When both are sent, both are checked. A method `actor_auth` does not accept is refused
 //! (`actor_token_not_accepted`, `client_auth_not_accepted`); with `actor_auth = "actor_token"`
-//! and no token, `actor_token_required`. So an agent can only receive a delegation in its own
+//! and no token, 401 `invalid_client` / `actor_token_required`. So an agent can only receive a delegation in its own
 //! name, and `principal` in Cedar and the agent in the audit log are authenticated, not
 //! asserted. A mismatch is 400 `invalid_request` / `actor_mismatch`. An `actor` that already
 //! appears in the parent chain is 400 `invalid_request` / `duplicate_actor`.
@@ -76,7 +81,7 @@ use std::sync::Arc;
 
 use std::collections::HashMap;
 
-use attenuo_audit::LeaseStore;
+use attenuo_audit::{LeaseRegistry, RunLimits};
 use attenuo_core::{CapabilitySet, Charge, Hop, LimitKind, ToolCall};
 use attenuo_token::{ExchangeRequest, AUTHORIZATION_DETAILS_TYPE};
 use axum::body::Bytes;
@@ -87,11 +92,14 @@ use axum::Json;
 use serde_json::{json, Map, Value};
 use time::OffsetDateTime;
 
-use super::{audit_issuance, no_store, parse_json, register_issued};
+use super::extract::Body;
+use super::{audit_issuance, no_store, register_issued};
 use crate::actor::{VerifiedActor, ACTOR_TOKEN_TYPE};
-use crate::clientauth::{self, ClientKind};
+use crate::clientauth;
 use crate::config::{capability_set, ActorAuth, CapSpec};
-use crate::error::ApiError;
+use crate::error::{mint_refusal, ApiError, INVALID_CAPABILITY};
+use crate::limits::CallerMark;
+use crate::replay::ReplayRefusal;
 use crate::state::AppState;
 
 /// `POST /token`: RFC 8693 exchange from hop n to n+1, or hop-0 IdP intake (see the module
@@ -109,15 +117,27 @@ use crate::state::AppState;
 pub async fn exchange(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    body: Bytes,
+    extensions: axum::http::Extensions,
+    Body(body): Body,
 ) -> Result<Response, ApiError> {
+    // Set by `crate::limits::token_peer_limit`, which `crate::router` mounts on this route.
+    let mark = extensions.get::<CallerMark>().cloned();
     let value = parse_body(&headers, &body)?;
+    // A request from a new address on a full per-peer table goes on only to authenticate an
+    // agent with client credentials (SR-109, `crate::limits::refuse_on_full_table`).
+    if mark.as_ref().is_some_and(CallerMark::on_full_table) {
+        let present = |k: &str| value.get(k).is_some_and(|v| !v.is_null());
+        let client = present("client_secret")
+            || present("client_assertion")
+            || clientauth::basic_credentials(&headers).is_ok_and(|b| b.is_some());
+        crate::limits::refuse_on_full_table(mark.as_ref(), client, present("actor_token"))?;
+    }
     let now = state.now();
     if crate::idp::intake::is_intake(&value) {
         // Hop 0 from an IdP credential: the exported span (`crate::telemetry::trace_route`)
         // is `attenuo.token.root`, not `attenuo.token.exchange`.
-        tracing::Span::current().record("otel.name", "attenuo.token.root");
-        return crate::idp::intake::handle(&state, &headers, value, now).await;
+        crate::telemetry::rename_current_span("attenuo.token.root");
+        return crate::idp::intake::handle(&state, &headers, value, mark.as_ref(), now).await;
     }
     let mut value = value;
     // The actor token is verified here, on the async side: it may need a JWKS fetch.
@@ -127,7 +147,7 @@ pub async fn exchange(
     };
     // Lease lookups, registration and the audit append are SQLite calls: off the async workers.
     state
-        .blocking(move |s| exchange_sync(s, &headers, value, actor, now))
+        .blocking(move |s| exchange_sync(s, &headers, value, actor, mark.as_ref(), now))
         .await
 }
 
@@ -226,6 +246,14 @@ pub const EXCHANGE_REFUSAL_REASONS: [&str; 13] = [
     crate::authz::REASON_LEASE_UNKNOWN,
 ];
 
+/// `code` of a request that asks for no capability (as at hop-0 intake).
+pub(crate) const NO_CAPABILITIES_REQUESTED: &str = "no_capabilities_requested";
+/// `code` of a `POST /token` body, form parameter or field that does not parse or is missing
+/// (as at hop-0 intake).
+pub(crate) const MALFORMED_REQUEST: &str = "malformed_request";
+/// `code` of an exchange whose `subject_token_type` is not the JWT URN (as at hop-0 intake).
+const UNSUPPORTED_TOKEN_TYPE: &str = "unsupported_token_type";
+
 /// The audit `tool` of an exchange, issued or refused.
 const EXCHANGE_TOOL: &str = "token.exchange";
 
@@ -253,9 +281,11 @@ fn refusal_reason(e: &attenuo_token::TokenError) -> Option<&'static str> {
         TokenError::Chain(ChainError::AttenuationViolated { .. }) => REASON_EXCHANGE_WIDENING,
         TokenError::Chain(ChainError::TooDeep { .. }) => REASON_EXCHANGE_TOO_DEEP,
         TokenError::Chain(ChainError::DuplicateAgent { .. }) => REASON_EXCHANGE_DUPLICATE_ACTOR,
-        TokenError::Chain(ChainError::InvalidName { .. } | ChainError::InvalidLimit { .. }) => {
-            REASON_EXCHANGE_INVALID_CAPABILITY
-        }
+        TokenError::Chain(
+            ChainError::InvalidName { .. }
+            | ChainError::InvalidLimit { .. }
+            | ChainError::TooLarge { .. },
+        ) => REASON_EXCHANGE_INVALID_CAPABILITY,
         TokenError::ActorNotPermitted(_) => REASON_EXCHANGE_ACTOR_NOT_PERMITTED,
         TokenError::NoLifetimeLeft(_) => REASON_EXCHANGE_NO_LIFETIME_LEFT,
         _ => REASON_EXCHANGE_REFUSED,
@@ -267,19 +297,22 @@ fn exchange_sync(
     headers: &HeaderMap,
     value: Value,
     actor: Option<(VerifiedActor, String)>,
+    mark: Option<&CallerMark>,
     now: OffsetDateTime,
 ) -> Result<Response, ApiError> {
     let field = |k: &str| value.get(k).and_then(Value::as_str).map(str::to_owned);
     let (client_id, client_secret) = (field("client_id"), field("client_secret"));
     let subject_proof = field("subject_token_dpop");
     let mut value = value;
+    let mut assertion = None;
     if let Some(obj) = value.as_object_mut() {
         obj.remove("client_id");
         obj.remove("client_secret");
         obj.remove("subject_token_dpop");
+        assertion = clientauth::take_client_assertion(obj)?;
     }
     let mut req = parse_request(value)?;
-    let presented = client_secret.is_some() || clientauth::basic_credentials(headers)?.is_some();
+    let presented = clientauth::presented(headers, client_secret.as_deref(), assertion.as_deref())?;
     if presented && state.actor_auth == ActorAuth::ActorToken {
         return Err(clientauth::invalid_request(
             "client_auth_not_accepted",
@@ -290,6 +323,8 @@ fn exchange_sync(
     // subject token has verified, so that the refusal is audited against its chain.
     let mut mismatch = None;
     let mut actor_auth = "none";
+    // The agent this request authenticated as, for `[limits] token_requests_per_minute`.
+    let mut caller = actor.as_ref().map(|(verified, _)| verified.agent.clone());
     if let Some((verified, _)) = &actor {
         if verified.agent != req.actor.0 {
             mismatch = Some(clientauth::invalid_request(
@@ -304,18 +339,28 @@ fn exchange_sync(
     }
     if presented || (state.require_actor_auth && actor.is_none()) {
         if state.actor_auth == ActorAuth::ActorToken {
-            return Err(clientauth::invalid_request(
+            // No credential at all: RFC 6749 §5.2 `invalid_client` ("no client authentication
+            // included"), decided before any agent is looked up, so it reads the same for a
+            // known and an unknown `actor` (SR-110).
+            return Err(clientauth::invalid_client(
                 "actor_token_required",
                 format!("an actor_token (actor_token_type `{ACTOR_TOKEN_TYPE}`) is required"),
             ));
         }
-        let agent = clientauth::authenticate(
-            ClientKind::Agent,
-            &state.agents,
+        let client = state.agents.authenticate(
             headers,
             client_id.as_deref(),
             client_secret.as_deref(),
+            assertion.as_deref(),
+            now,
         )?;
+        let method = client.method();
+        // The rate limit and a DPoP proof that will be refused come first, so that a request
+        // the client is told to send again does not use its assertion up (SR-108, SR-111).
+        client.check_before_commit(state, headers, mark, now)?;
+        // Past that, an assertion authenticates this one request, whatever its outcome: its
+        // `jti` is recorded now (`crate::clientauth`).
+        let agent = client.commit(&state.replay, now)?;
         if agent != req.actor.0 && mismatch.is_none() {
             mismatch = Some(clientauth::invalid_request(
                 "actor_mismatch",
@@ -326,16 +371,22 @@ fn exchange_sync(
             ));
         }
         actor_auth = if actor.is_some() {
-            "actor_token+client_secret"
+            method.with_actor_token()
         } else {
-            "client_secret"
+            method.as_str()
         };
+        caller = Some(agent);
+    }
+    // Before the subject token, the lease lookups, signing and the audit append.
+    if let Some(agent) = &caller {
+        state.limits.admit_agent(mark, agent)?;
     }
     if req.requested.is_empty() {
         return Err(ApiError::bad_request(
             "invalid_request",
             format!("authorization_details must contain a `{AUTHORIZATION_DETAILS_TYPE}` entry with at least one capability"),
-        ));
+        )
+        .with_code(NO_CAPABILITIES_REQUESTED));
     }
     // A subject token that does not verify, or whose DPoP proof does not, is refused with a
     // server log line only, so an anonymous caller cannot write to the audit log (SR-18).
@@ -428,7 +479,8 @@ fn exchange_verified(
                     "subject token cannot delegate: {reason} ({})",
                     detail.join("; ")
                 ),
-            ),
+            )
+            .with_code(reason),
         ));
     }
 
@@ -486,8 +538,8 @@ fn exchange_verified(
     let resp = req
         .execute_with(&state.issuer, now, not_after, cnf)
         .map_err(|e| match refusal_reason(&e) {
-            Some(reason) => Failure::Refused(reason, e.into()),
-            None => Failure::Other(e.into()),
+            Some(reason) => Failure::Refused(reason, mint_refusal(e)),
+            None => Failure::Other(mint_refusal(e)),
         })?;
     // A parent token delegates to a given actor once, and an actor token authenticates one
     // exchange, keyed by its `jti` (see `crate::replay`). Recorded only once the exchange has
@@ -502,12 +554,9 @@ fn exchange_verified(
     if let Some((key, until)) = &actor_key {
         keys.push((key.as_str(), *until));
     }
-    state.replay.use_all_once(&keys, now).map_err(|e| {
-        if e.description == Some("replayed") {
-            Failure::Refused(REASON_EXCHANGE_REPLAYED, e)
-        } else {
-            Failure::Other(e)
-        }
+    state.replay.use_all_once(&keys, now).map_err(|r| match r {
+        ReplayRefusal::Replayed => Failure::Refused(REASON_EXCHANGE_REPLAYED, r.into()),
+        ReplayRefusal::Full | ReplayRefusal::Unavailable => Failure::Other(r.into()),
     })?;
     // The response carries no chain; read it back from the token we just minted.
     let issued = state
@@ -547,7 +596,10 @@ fn exchange_verified(
     }
     tracing::info!(
         // Caller-controlled strings are Debug-formatted (SR-18).
-        subject = ?issued.chain.originating_user.subject,
+        subject = ?state
+            .pipeline
+            .subject_log()
+            .show(&issued.chain.originating_user.subject),
         actor = ?req.actor,
         actor_auth,
         actor_subject = ?actor.map(|(v, _)| v.subject.as_str()),
@@ -624,60 +676,93 @@ fn is_form(headers: &HeaderMap) -> bool {
         .unwrap_or(false)
 }
 
-/// The request body as JSON, from either encoding.
-fn parse_body(headers: &HeaderMap, body: &Bytes) -> Result<Value, ApiError> {
-    if is_form(headers) {
-        form_to_json(body)
-    } else {
-        parse_json::<Value>(body)
+/// Why a `POST /token` body is not a request. The OAuth class and the code of each case are
+/// chosen by variant, in one place (`From<RequestError> for ApiError`), never from the text,
+/// which is for people and is sent as `detail` unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RequestError {
+    /// The body, a form parameter or a field of the request does not parse, or is missing.
+    Malformed(String),
+    /// A form `scope` entry is not a capability (`server:tool`).
+    InvalidScope(String),
+    /// `grant_type` is not the token-exchange grant (hop-0 grants are dispatched before).
+    UnsupportedGrantType(String),
+    /// `subject_token_type` is not the JWT URN (hop-0 credential types are dispatched before).
+    UnsupportedTokenType(String),
+}
+
+impl From<attenuo_token::ExchangeRequestError> for RequestError {
+    fn from(e: attenuo_token::ExchangeRequestError) -> Self {
+        use attenuo_token::ExchangeRequestError as E;
+        let text = e.to_string();
+        match e {
+            E::Malformed(_) => RequestError::Malformed(text),
+            E::UnsupportedGrantType(_) => RequestError::UnsupportedGrantType(text),
+            E::UnsupportedSubjectTokenType(_) => RequestError::UnsupportedTokenType(text),
+        }
     }
 }
 
-fn parse_request(value: Value) -> Result<ExchangeRequest, ApiError> {
-    serde_json::from_value(value).map_err(|e| {
-        let msg = e.to_string();
-        let code = if msg.contains("unsupported grant_type") {
-            "unsupported_grant_type"
-        } else {
-            "invalid_request"
-        };
-        ApiError::bad_request(code, msg)
-    })
+impl From<RequestError> for ApiError {
+    fn from(e: RequestError) -> Self {
+        match e {
+            // As hop-0 intake names it (there also as `error_description`).
+            RequestError::Malformed(detail) => {
+                ApiError::bad_request("invalid_request", detail).with_code(MALFORMED_REQUEST)
+            }
+            RequestError::InvalidScope(detail) => {
+                ApiError::bad_request("invalid_scope", detail).with_code(INVALID_CAPABILITY)
+            }
+            RequestError::UnsupportedGrantType(detail) => {
+                ApiError::bad_request("unsupported_grant_type", detail)
+            }
+            // The code hop-0 intake answers an unknown type with.
+            RequestError::UnsupportedTokenType(detail) => {
+                ApiError::bad_request("invalid_request", detail).with_code(UNSUPPORTED_TOKEN_TYPE)
+            }
+        }
+    }
+}
+
+/// The request body as JSON, from either encoding.
+fn parse_body(headers: &HeaderMap, body: &Bytes) -> Result<Value, ApiError> {
+    if is_form(headers) {
+        Ok(form_to_json(body)?)
+    } else {
+        serde_json::from_slice(body).map_err(|e| RequestError::Malformed(e.to_string()).into())
+    }
+}
+
+fn parse_request(value: Value) -> Result<ExchangeRequest, RequestError> {
+    Ok(ExchangeRequest::from_json(value)?)
 }
 
 /// Turn RFC 8693 form fields into the JSON shape `ExchangeRequest` deserializes.
-fn form_to_json(body: &Bytes) -> Result<Value, ApiError> {
-    let pairs: Vec<(String, String)> = serde_urlencoded::from_bytes(body)
-        .map_err(|e| ApiError::bad_request("invalid_request", e.to_string()))?;
+fn form_to_json(body: &Bytes) -> Result<Value, RequestError> {
+    let pairs: Vec<(String, String)> =
+        serde_urlencoded::from_bytes(body).map_err(|e| RequestError::Malformed(e.to_string()))?;
     let mut obj = Map::new();
     let mut scope: Option<String> = None;
     for (k, v) in pairs {
         // `scope` is kept aside until the end, so it is checked here too (SR-88).
         if obj.contains_key(&k) || (k == "scope" && scope.is_some()) {
             // RFC 6749 §3.1: parameters must not be included more than once.
-            return Err(ApiError::bad_request(
-                "invalid_request",
-                format!("parameter `{k}` repeated"),
-            ));
+            return Err(RequestError::Malformed(format!("parameter `{k}` repeated")));
         }
         let value = match k.as_str() {
             "authorization_details" => serde_json::from_str(&v).map_err(|e| {
-                ApiError::bad_request(
-                    "invalid_request",
-                    format!("authorization_details is not JSON: {e}"),
-                )
+                RequestError::Malformed(format!("authorization_details is not JSON: {e}"))
             })?,
-            "requested_ttl_seconds" => Value::from(v.parse::<u64>().map_err(|e| {
-                ApiError::bad_request("invalid_request", format!("requested_ttl_seconds: {e}"))
-            })?),
+            "requested_ttl_seconds" => Value::from(
+                v.parse::<u64>()
+                    .map_err(|e| RequestError::Malformed(format!("requested_ttl_seconds: {e}")))?,
+            ),
             "scope" => {
                 scope = Some(v);
                 continue;
             }
             "may_act" if v.trim_start().starts_with(['[', '{']) => serde_json::from_str(&v)
-                .map_err(|e| {
-                    ApiError::bad_request("invalid_request", format!("may_act is not JSON: {e}"))
-                })?,
+                .map_err(|e| RequestError::Malformed(format!("may_act is not JSON: {e}")))?,
             "may_act" => Value::from(v.split_whitespace().collect::<Vec<_>>()),
             _ => Value::String(v),
         };
@@ -685,16 +770,15 @@ fn form_to_json(body: &Bytes) -> Result<Value, ApiError> {
     }
     if let Some(scope) = scope {
         if obj.contains_key("authorization_details") {
-            return Err(ApiError::bad_request(
-                "invalid_request",
-                "use either scope or authorization_details, not both",
+            return Err(RequestError::Malformed(
+                "use either scope or authorization_details, not both".into(),
             ));
         }
         let specs: Vec<CapSpec> = scope
             .split_whitespace()
             .map(|s| CapSpec::Short(s.to_string()))
             .collect();
-        let caps = capability_set(&specs).map_err(|e| ApiError::bad_request("invalid_scope", e))?;
+        let caps = capability_set(&specs).map_err(RequestError::InvalidScope)?;
         obj.insert(
             "authorization_details".into(),
             json!([{ "type": AUTHORIZATION_DETAILS_TYPE, "capabilities": caps }]),

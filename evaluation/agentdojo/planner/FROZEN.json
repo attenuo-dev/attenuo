@@ -1,0 +1,11 @@
+{
+  "format": "attenuo-planner-grants-frozen/1",
+  "source": "G1",
+  "frozen_at": "2026-11-12T18:13:38Z",
+  "files": {
+    "workspace.json": "95f9a8250fad84979ad49b3fcc1912664ed54efc80589f55674082977513a7d9",
+    "travel.json": "c56c6a12713b49a802b71fb38585f48e55f1df176ab94c3a7e20989d3e75f661",
+    "banking.json": "26b2c5ebf082140afb84672c493796e6689aec79ebc7e2d7b5de5a3ae1a5af9a",
+    "slack.json": "daa24533a33d7ef8ca6f92ca26e06e1f8c7b155db2d1c97da96bd64af4421b6f"
+  }
+}

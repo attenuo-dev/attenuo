@@ -3,8 +3,8 @@
 //! - [`originating_user`]: the `OriginatingUser` block for hop 0, the same for both
 //!   credential types.
 //! - [`map_id_jag`]: the ID-JAG-specific claims. The ID-JAG draft
-//!   (draft-ietf-oauth-identity-assertion-authz-grant, -04 at the time of writing) is still
-//!   changing; everything that depends on its claim names is in that one function.
+//!   (draft-ietf-oauth-identity-assertion-authz-grant, checked against -06 of 31 October 2026)
+//!   is still changing; everything that depends on its claim names is in that one function.
 
 use std::collections::BTreeMap;
 
@@ -73,20 +73,47 @@ pub(crate) struct IdJagClaims {
     /// `client_id`: the client the IdP issued the assertion to. It must be the agent that
     /// presents it, and becomes the root hop's agent.
     pub client_id: String,
+    /// `cnf.jkt`: the thumbprint of the key the ID-JAG is bound to, when it is sender-constrained
+    /// (draft -04 §9.8.1, -06 §4.4.1). The request must then carry a DPoP proof by that key.
+    pub cnf_jkt: Option<String>,
 }
 
-/// Read the ID-JAG-specific claims (draft -04 §3): `client_id` is required.
+/// Read the ID-JAG-specific claims (draft -06 §3.1): `client_id` and `jti` are required,
+/// and a `cnf` claim must carry a `jkt` (the only binding this server can check).
 ///
-/// The draft's `resource` and `scope` claims are not used: the capabilities of the root token
-/// come from `[[root_grants]]` and the request, not from the IdP. If a later draft renames or
-/// adds required claims, this is the function to change.
+/// `iss`, `sub`, `aud`, `exp` and `iat`, also required, are checked by
+/// [`IdpRegistry::verify`](super::IdpRegistry::verify) for both credential kinds, and
+/// `tenant` there too, against `[[idps]] tenant`. The draft's `resource`, `scope` and
+/// `authorization_details` claims are read only under `[idps.id_jag_ceiling]`, and then only
+/// to narrow the root grant ([`super::ceiling`]); otherwise the capabilities of the root token
+/// come from `[[root_grants]]` and the request alone. If a later draft renames or adds
+/// required claims, this is the function to change.
 pub(crate) fn map_id_jag(claims: &Map<String, Value>) -> Result<IdJagClaims, IntakeError> {
-    match claims.get("client_id").and_then(Value::as_str) {
-        Some(c) if !c.is_empty() => Ok(IdJagClaims {
-            client_id: c.to_owned(),
-        }),
-        _ => Err(IntakeError::MissingClaim("client_id")),
+    let client_id = match claims.get("client_id").and_then(Value::as_str) {
+        Some(c) if !c.is_empty() => c.to_owned(),
+        _ => return Err(IntakeError::MissingClaim("client_id")),
+    };
+    // REQUIRED in every revision since -00. Without it the replay cache would fall back to a
+    // hash of the credential, which still works, but an IdP that omits it is not producing
+    // an ID-JAG.
+    match claims.get("jti").and_then(Value::as_str) {
+        Some(j) if !j.is_empty() => {}
+        _ => return Err(IntakeError::MissingClaim("jti")),
     }
+    let cnf_jkt = match claims.get("cnf") {
+        None | Some(Value::Null) => None,
+        Some(cnf) => match cnf.get("jkt").and_then(Value::as_str) {
+            Some(jkt) if !jkt.is_empty() => Some(jkt.to_owned()),
+            // Bound to something other than a DPoP key (an mTLS certificate, say): this server
+            // cannot check it, so it refuses rather than treating the grant as a bearer one.
+            _ => {
+                return Err(IntakeError::PopRequired(
+                    "the ID-JAG's cnf has no jkt; only DPoP-bound ID-JAGs are supported".into(),
+                ))
+            }
+        },
+    };
+    Ok(IdJagClaims { client_id, cnf_jkt })
 }
 
 #[cfg(test)]
@@ -138,12 +165,48 @@ mod tests {
     fn id_jag_requires_client_id() {
         let c = |v: Value| map_id_jag(v.as_object().unwrap());
         assert_eq!(
-            c(json!({"client_id": "planner"})).unwrap().client_id,
-            "planner"
+            c(json!({"client_id": "planner", "jti": "j1"})).unwrap(),
+            IdJagClaims {
+                client_id: "planner".into(),
+                cnf_jkt: None
+            }
         );
         assert_eq!(
-            c(json!({})).unwrap_err(),
+            c(json!({"jti": "j1"})).unwrap_err(),
             IntakeError::MissingClaim("client_id")
+        );
+        // jti is REQUIRED (draft -06 §3.1).
+        assert_eq!(
+            c(json!({"client_id": "planner"})).unwrap_err(),
+            IntakeError::MissingClaim("jti")
+        );
+        assert_eq!(
+            c(json!({"client_id": "planner", "jti": ""})).unwrap_err(),
+            IntakeError::MissingClaim("jti")
+        );
+    }
+
+    #[test]
+    fn id_jag_cnf_needs_a_jkt() {
+        let c = |v: Value| map_id_jag(v.as_object().unwrap());
+        let base = json!({"client_id": "planner", "jti": "j1"});
+        let with = |cnf: Value| {
+            let mut v = base.clone();
+            v["cnf"] = cnf;
+            c(v)
+        };
+        assert_eq!(
+            with(json!({"jkt": "abc"})).unwrap().cnf_jkt.as_deref(),
+            Some("abc")
+        );
+        assert_eq!(with(Value::Null).unwrap().cnf_jkt, None);
+        assert_eq!(
+            with(json!({"x5t#S256": "abc"})).unwrap_err().description(),
+            "credential_pop_required"
+        );
+        assert_eq!(
+            with(json!("abc")).unwrap_err().description(),
+            "credential_pop_required"
         );
     }
 }

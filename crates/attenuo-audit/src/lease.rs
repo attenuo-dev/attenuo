@@ -23,6 +23,11 @@ use crate::spans::{
 };
 use crate::window::{plan_windows, window_prunable, UserKey, WindowKey, WindowPrune};
 
+/// The store traits live in [`crate::store`]; re-exported so `attenuo_audit::lease::LeaseStore`
+/// keeps resolving.
+pub use crate::store::LeaseStore;
+use crate::store::{ApprovalStore, LeaseRegistry, RunLimits, RunState, StoreRetention};
+
 /// Outcome of checking a set of leases together (typically every lease in a chain).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LeaseStatus {
@@ -36,620 +41,6 @@ pub struct LeaseStatus {
     pub unknown: Vec<LeaseId>,
 }
 
-/// Registry of leases and their revocation state.
-///
-/// # Errors
-///
-/// Every method can fail on a store fault, which each method's own `# Errors` section calls
-/// that: [`AuditError::Poisoned`] when a writer panicked holding one of the store's locks,
-/// and, for the file store, [`AuditError::Sqlite`] when a query or commit fails,
-/// [`AuditError::Serde`], [`AuditError::TimeFormat`] or [`AuditError::TimeParse`] when a
-/// stored value cannot be written or read back, [`AuditError::Storage`] when a stored figure
-/// is out of range or the store is not as it must be, and [`AuditError::Corrupt`] when a
-/// row cannot be read back. The refusals a method makes on purpose (an unknown lease, a
-/// conflicting binding, an approval that is not pending) are listed on that method.
-pub trait LeaseStore: Send + Sync {
-    /// Record a lease. Registering an id that already exists overwrites its parent and expiry
-    /// but never clears a revocation.
-    ///
-    /// # Errors
-    ///
-    /// [`AuditError::UnknownLease`] when `lease` belongs to a tree that
-    /// [`prune_leases`](Self::prune_leases) has started deleting, or a store fault (see
-    /// [`LeaseStore`]).
-    fn register(
-        &self,
-        lease: &LeaseId,
-        parent: Option<&LeaseId>,
-        expires_at: OffsetDateTime,
-    ) -> Result<(), AuditError>;
-
-    /// Revoke `lease` and every lease descended from it. Returns how many leases changed from
-    /// unrevoked to revoked (already-revoked ones are not counted again).
-    ///
-    /// # Errors
-    ///
-    /// [`AuditError::UnknownLease`] when the store has no row for `lease`, so a typo cannot pass
-    /// for a successful revocation, or a store fault (see [`LeaseStore`]).
-    fn revoke(&self, lease: &LeaseId, reason: &str, now: OffsetDateTime)
-        -> Result<u64, AuditError>;
-
-    /// Set the expiry of `lease` to `new_expires_at` (a heartbeat). The caller computes the
-    /// new value and is responsible for capping it (token expiry, parent lease); the store
-    /// only refuses leases it must not revive. An expired but unrevoked lease may be renewed.
-    /// Revocation state and the parent link are untouched.
-    ///
-    /// # Errors
-    ///
-    /// [`AuditError::UnknownLease`] when the store has no row for `lease` or its tree is being
-    /// deleted by [`prune_leases`](Self::prune_leases), [`AuditError::LeaseRevoked`] when it is
-    /// revoked, or a store fault (see [`LeaseStore`]).
-    fn renew(
-        &self,
-        lease: &LeaseId,
-        new_expires_at: OffsetDateTime,
-        now: OffsetDateTime,
-    ) -> Result<(), AuditError>;
-
-    /// Known, not revoked, and `expires_at > now`.
-    ///
-    /// # Errors
-    ///
-    /// Only a store fault (see [`LeaseStore`]): an unknown lease is `Ok(false)`, not an error.
-    fn is_active(&self, lease: &LeaseId, now: OffsetDateTime) -> Result<bool, AuditError>;
-
-    /// Record which chain `lease` was issued for: the digest of the chain up to and including
-    /// the hop that holds the lease (`DelegationChain::prefix_digest`). Write-once: binding a
-    /// lease again to the same value is a no-op, to a different value an error.
-    ///
-    /// The issuer binds every lease it registers. A chain presented without its signed token
-    /// (an AuthZEN body chain) is accepted only if every hop's prefix digest equals its lease's
-    /// binding, so lease ids alone, which are not secret, cannot be stitched into a forged
-    /// chain.
-    ///
-    /// # Errors
-    ///
-    /// [`AuditError::UnknownLease`] when the store has no row for `lease`,
-    /// [`AuditError::BindingConflict`] when it is already bound to a different value, or a store
-    /// fault (see [`LeaseStore`]).
-    fn bind(&self, lease: &LeaseId, binding: &str) -> Result<(), AuditError>;
-
-    /// The binding recorded by [`bind`](Self::bind), or `None` (unknown or never bound).
-    ///
-    /// # Errors
-    ///
-    /// Only a store fault (see [`LeaseStore`]): an unknown or unbound lease is `Ok(None)`.
-    fn binding(&self, lease: &LeaseId) -> Result<Option<String>, AuditError>;
-
-    /// Record the originating user's subject (`sub` of the chain's originating-user block) of
-    /// the token `lease` was issued for, so [`LeaseSelector::Subject`] can find it. The issuer
-    /// records it for every lease it registers. Write-once, like [`bind`](Self::bind):
-    /// recording the same subject again is a no-op, a different one an error.
-    /// Leases registered before the store kept subjects have none and are never matched by a
-    /// subject selector.
-    ///
-    /// # Errors
-    ///
-    /// [`AuditError::UnknownLease`] when the store has no row for `lease`,
-    /// [`AuditError::BindingConflict`] when a different subject is already recorded, or a store
-    /// fault (see [`LeaseStore`]).
-    fn record_subject(&self, lease: &LeaseId, subject: &str) -> Result<(), AuditError>;
-
-    /// The subject recorded by [`record_subject`](Self::record_subject), or `None`.
-    ///
-    /// # Errors
-    ///
-    /// Only a store fault (see [`LeaseStore`]): an unknown lease or one without a subject is
-    /// `Ok(None)`.
-    fn subject(&self, lease: &LeaseId) -> Result<Option<String>, AuditError>;
-
-    /// [`subject`](Self::subject) for many leases at once: the recorded subject of each lease
-    /// in `leases` that has one. Leases with no recorded subject (unknown, or registered before
-    /// subjects were kept) are absent from the map. The stores answer with one lock (the file
-    /// store with `IN (...)` queries), so a lease tree of thousands of nodes costs no query per
-    /// node; the default asks [`subject`](Self::subject) once per lease.
-    ///
-    /// # Errors
-    ///
-    /// Only a store fault (see [`LeaseStore`]), the first one met; unknown leases are left out of
-    /// the map.
-    fn subjects(&self, leases: &[&LeaseId]) -> Result<BTreeMap<LeaseId, String>, AuditError> {
-        let mut out = BTreeMap::new();
-        for lease in leases {
-            if let Some(s) = self.subject(lease)? {
-                out.insert((*lease).clone(), s);
-            }
-        }
-        Ok(out)
-    }
-
-    /// Record that the MCP session whose id hashes to `session` was opened through the proxy
-    /// to upstream `server` by a caller of the chain `chain_id` (the lease of the chain's
-    /// first hop), at `now`, so [`LeaseSelector::Session`] can find the chain. `session` is the
-    /// SHA-256 of the `Mcp-Session-Id` in lowercase hex (`attenuo_proxy::session::session_digest`;
-    /// the audit tag of the session is its first 12 characters): raw session ids are never
-    /// stored. Write-once per `(session, server)`: returns `true` when the binding is new and
-    /// `false` when one was already recorded, whatever its chain, which is then kept.
-    ///
-    /// # Errors
-    ///
-    /// [`AuditError::UnknownLease`] when the store has no row for `chain_id`, or a store fault (see
-    /// [`LeaseStore`]). A binding already recorded for `(session, server)` is `Ok(false)`.
-    fn record_session(
-        &self,
-        session: &str,
-        server: &str,
-        chain_id: &LeaseId,
-        now: OffsetDateTime,
-    ) -> Result<bool, AuditError>;
-
-    /// The bindings [`record_session`](Self::record_session) recorded for the session digest
-    /// `session`, ordered by server; empty for an unknown session.
-    ///
-    /// # Errors
-    ///
-    /// Only a store fault (see [`LeaseStore`]): an unknown session is an empty list.
-    fn sessions(&self, session: &str) -> Result<Vec<SessionBinding>, AuditError>;
-
-    /// One pass of session retention: look at up to `max_rows` session bindings, in the order
-    /// they were recorded and continuing after the last binding the previous pass looked at,
-    /// and delete those [`session_prunable`] at `now` with `retention` as the grace period.
-    /// When a pass reaches the last binding it reports `wrapped`, and the next pass starts
-    /// from the first again. One transaction per pass, so a pass never deletes a binding whose
-    /// chain a concurrent renewal has just revived. A pruned session resolves to no chain,
-    /// like a session that was never recorded: [`LeaseSelector::Session`] matches nothing and
-    /// [`sessions`](Self::sessions) is empty.
-    ///
-    /// # Errors
-    ///
-    /// Only a store fault (see [`LeaseStore`]); the pass's transaction is then rolled back and
-    /// nothing is deleted.
-    fn prune_sessions(
-        &self,
-        now: OffsetDateTime,
-        retention: time::Duration,
-        max_rows: usize,
-    ) -> Result<SessionPrune, AuditError>;
-
-    /// One pass of lease retention: look at leases in the order they were registered,
-    /// continuing after the last lease the previous pass looked at, and delete every lease
-    /// tree whose top is among them and that is [`tree_prunable`] at `now` with `retention` as
-    /// the grace period. A tree is the top lease (one with no parent, or whose parent the
-    /// store does not know) and everything delegated from it; it is deleted whole, with the
-    /// subjects, chain bindings, session bindings, hop limits, run labels and span indexes of
-    /// its leases. Leases that are not tops are skipped (their tree is decided at its top),
-    /// but count as examined. When a pass reaches the last lease it reports `wrapped`, and the
-    /// next pass starts from the first again.
-    ///
-    /// A pass touches at most `max_rows` lease rows (see [`LeasePrune`]): those its window
-    /// looks at, those it reads walking a tree from a prunable top, and those it deletes. A
-    /// tree that does not fit is carried over and finished first by the following passes:
-    /// walked to the end before anything of it is deleted, then deleted children before
-    /// parents, the top last, so no lease is ever left whose parent row is gone and the top
-    /// (in every chain of the tree) is there until the end. One write transaction per pass.
-    /// Between passes, a renewal or a new registration of a lease of a tree being walked, a
-    /// revocation of one, or a child registered under one, abandons the walk (the tree is
-    /// decided again from its top on a later sweep, so a late revocation still restarts the
-    /// grace period); once deleting has started, renewing or registering again a lease of the
-    /// tree is refused as [`AuditError::UnknownLease`], so no part of it is live again.
-    /// Every lease of such a tree is inactive throughout: a check reads it as revoked or
-    /// expired until its row goes, then as unknown. A pruned lease reads as unknown, which
-    /// every check treats as inactive (`lease_unknown`); selectors no longer match it.
-    ///
-    /// # Errors
-    ///
-    /// Only a store fault (see [`LeaseStore`]); the pass's transaction is then rolled back and
-    /// nothing is deleted.
-    fn prune_leases(
-        &self,
-        now: OffsetDateTime,
-        retention: time::Duration,
-        max_rows: usize,
-    ) -> Result<LeasePrune, AuditError>;
-
-    /// One pass of run-state retention: look at up to `max_rows` rows of run-limit state and
-    /// approvals, continuing after the last row the previous pass looked at, and delete what
-    /// [`run_state_prunable`] allows at `now` with `retention` as the grace period. The tables
-    /// are walked in a fixed order, each in insertion order: the charge log (decided per
-    /// charged decision: every lease it charged must be gone from the registry, and its charge
-    /// and any refund older than `retention`), then the counters (a counter goes once its
-    /// lease is gone and no charge under that lease is left in the log, so a counter outlives
-    /// its newest charge by at least `retention`), then the approvals (gone once neither their
-    /// lease nor their run's chain id is in the registry and their creation, decision and
-    /// expiry are all older than `retention`). Nothing of a lease the registry still holds is
-    /// ever deleted, whatever its age; the lease registry itself waits
-    /// [`prune_leases`](Self::prune_leases)' retention after a run ended. When a pass reaches
-    /// the end of the approvals it reports `wrapped`, and the next pass starts again with the
-    /// charge log. One write transaction per pass. A refund of a pruned charge is refused as
-    /// [`AuditError::UnknownCharge`], like a decision that charged nothing.
-    ///
-    /// # Errors
-    ///
-    /// Only a store fault (see [`LeaseStore`]); the pass's transaction is then rolled back and
-    /// nothing is deleted.
-    fn prune_run_state(
-        &self,
-        now: OffsetDateTime,
-        retention: time::Duration,
-        max_rows: usize,
-    ) -> Result<RunStatePrune, AuditError>;
-
-    /// What [`revoke_selected`](Self::revoke_selected) would do now, without writing:
-    /// `matched` is every unrevoked lease the selector names, `revoked` every unrevoked lease
-    /// a revocation would change (the matches and their descendants). Read in one
-    /// transaction.
-    ///
-    /// # Errors
-    ///
-    /// Only a store fault (see [`LeaseStore`]): a selector that matches nothing is an empty result.
-    fn preview_selected(&self, selector: &LeaseSelector) -> Result<SelectorRevocation, AuditError>;
-
-    /// Revoke every unrevoked lease `selector` names, each with the cascade of
-    /// [`revoke`](Self::revoke), in one transaction. Returns the matches and every lease that
-    /// changed from unrevoked to revoked. Matching nothing is not an error (an empty result):
-    /// a selector names a set, and an empty set is a valid answer during an incident.
-    ///
-    /// # Errors
-    ///
-    /// Only a store fault (see [`LeaseStore`]), in which case nothing is revoked: a selector that
-    /// matches nothing is an empty result.
-    fn revoke_selected(
-        &self,
-        selector: &LeaseSelector,
-        reason: &str,
-        now: OffsetDateTime,
-    ) -> Result<SelectorRevocation, AuditError>;
-
-    /// Classify every lease. A lease that is both revoked and expired is reported as revoked.
-    ///
-    /// # Errors
-    ///
-    /// Only a store fault (see [`LeaseStore`]): unknown leases are reported in
-    /// [`LeaseStatus::unknown`], not as an error.
-    fn check_all(
-        &self,
-        leases: &[&LeaseId],
-        now: OffsetDateTime,
-    ) -> Result<LeaseStatus, AuditError>;
-
-    /// Add an output label to the taint state of the delegation run `chain_id` (the lease of
-    /// the run's first hop; ADR-0009). The run's lease must be known; the check and the write
-    /// are one transaction.
-    /// The store keeps one label per source, the one with the smallest `seq`, so reading the
-    /// taint state costs the same however many results the run reads (every result is in the
-    /// audit log as a `tool_result` record). Labels are never removed: taint only grows.
-    ///
-    /// # Errors
-    ///
-    /// [`AuditError::UnknownLease`] when the store has no row for `chain_id`, or a store fault (see
-    /// [`LeaseStore`]), including a `label.seq` the file store cannot hold
-    /// ([`AuditError::Storage`]).
-    fn add_label(&self, chain_id: &LeaseId, label: &RunLabel) -> Result<(), AuditError>;
-
-    /// The taint state of the run `chain_id`: the first label of each source, ordered by
-    /// `seq`. Empty for a run that has read nothing untrusted. Callers must treat an error as
-    /// tainted (fail closed).
-    ///
-    /// # Errors
-    ///
-    /// Only a store fault (see [`LeaseStore`]), which the caller must read as tainted.
-    fn labels(&self, chain_id: &LeaseId) -> Result<Vec<RunLabel>, AuditError>;
-
-    /// Add the fingerprints of one untrusted result to the span index of the run `chain_id`
-    /// (ADR-0009 phase 2, [`crate::spans`]), tagged with `seq`, the audit `seq` of the result's
-    /// `tool_result` record. The run's lease must be known. Keeps at most [`MAX_SPANS_PER_RUN`] per
-    /// run, evicting the oldest results' sets first; the check, the eviction and the write are one
-    /// transaction. Nothing is written for an empty `spans`.
-    ///
-    /// # Errors
-    ///
-    /// [`AuditError::UnknownLease`] when the store has no row for `chain_id`, or a store fault (see
-    /// [`LeaseStore`]), including a `seq` the file store cannot hold ([`AuditError::Storage`]).
-    fn add_spans(
-        &self,
-        chain_id: &LeaseId,
-        seq: u64,
-        spans: &[Fingerprint],
-    ) -> Result<(), AuditError>;
-
-    /// Look `probes` up in the span index of the run `chain_id`: one [`SpanHit`] per probe and
-    /// stored result that holds it, at most [`MAX_SEQS_PER_PROBE`] per probe (the lowest
-    /// `seq`s), ordered by probe, then `seq`. Empty for a run with no index. One lookup per
-    /// probe, so callers bound and deduplicate `probes`. Callers must treat an error as a
-    /// match (fail closed).
-    ///
-    /// # Errors
-    ///
-    /// Only a store fault (see [`LeaseStore`]), which the caller must read as a match.
-    fn find_spans(
-        &self,
-        chain_id: &LeaseId,
-        probes: &[Fingerprint],
-    ) -> Result<Vec<SpanHit>, AuditError>;
-
-    /// Store a pending approval (ADR-0009). `approval.state` is ignored (stored as pending);
-    /// `approval.expires_at` is lowered to the expiry of `approval.lease`, which must be known
-    /// and live; the check and the write are one transaction. When a pending, unexpired approval
-    /// for the same run, lease and call hash already exists, nothing is written and that one is
-    /// returned with `false`, so an agent that repeats a gated call gets the same approval id.
-    /// Otherwise, when the run already has [`crate::MAX_PENDING_APPROVALS_PER_RUN`] pending,
-    /// unexpired approvals, nothing is written and the approval is refused (SR-92). Returns the
-    /// stored approval and whether it is new.
-    ///
-    /// # Errors
-    ///
-    /// [`AuditError::UnknownLease`] when `approval.lease` is unknown, [`AuditError::LeaseRevoked`]
-    /// when it is revoked, [`AuditError::ApprovalExpired`] when it has expired,
-    /// [`AuditError::TooManyPendingApprovals`] when the run is at the cap, or a store fault (see
-    /// [`LeaseStore`]).
-    fn create_approval(&self, approval: &Approval) -> Result<(Approval, bool), AuditError>;
-
-    /// One approval by id, or `None`.
-    ///
-    /// # Errors
-    ///
-    /// Only a store fault (see [`LeaseStore`]): an unknown id is `Ok(None)`.
-    fn approval(&self, id: &str) -> Result<Option<Approval>, AuditError>;
-
-    /// Approvals newest first, at most `limit`; only those of the run `chain_id` when given.
-    ///
-    /// # Errors
-    ///
-    /// Only a store fault (see [`LeaseStore`]): an unknown run is an empty list.
-    fn approvals(
-        &self,
-        chain_id: Option<&LeaseId>,
-        limit: usize,
-    ) -> Result<Vec<Approval>, AuditError>;
-
-    /// Grant (`grant = true`) or decline a pending approval; the checks and the write are one
-    /// transaction.
-    ///
-    /// # Errors
-    ///
-    /// [`AuditError::UnknownApproval`] when no approval has this id,
-    /// [`AuditError::ApprovalNotPending`] when it was already decided or consumed,
-    /// [`AuditError::ApprovalExpired`] when it or its lease has expired,
-    /// [`AuditError::LeaseRevoked`] when its lease is revoked, [`AuditError::UnknownLease`] when
-    /// its lease is gone, or a store fault (see [`LeaseStore`]).
-    fn decide_approval(
-        &self,
-        id: &str,
-        grant: bool,
-        approver: &Approver,
-        now: OffsetDateTime,
-    ) -> Result<Approval, AuditError>;
-
-    /// Find a granted, unexpired approval for `call_hash` made by the hop holding `lease` in
-    /// the run `chain_id`, and mark it consumed by `decision_id`, in one transaction, so two
-    /// concurrent retries cannot both use it. The lease must be live. `None` when there is
-    /// none.
-    ///
-    /// # Errors
-    ///
-    /// Only a store fault (see [`LeaseStore`]): a dead lease or no usable approval is `Ok(None)`.
-    fn take_approval(
-        &self,
-        chain_id: &LeaseId,
-        lease: &LeaseId,
-        call_hash: &str,
-        decision_id: &str,
-        now: OffsetDateTime,
-    ) -> Result<Option<Approval>, AuditError>;
-
-    /// [`take_approval`](Self::take_approval) for one approval named by `id` (the `jti` of a
-    /// presented approval token): mark it consumed by `decision_id` only if it is granted,
-    /// unexpired, of the run `chain_id`, of the hop holding `lease` (which must be live) and
-    /// for `call_hash`, in one transaction. `None` otherwise (unknown, pending, declined,
-    /// already consumed, expired, another call or hop, or a dead lease).
-    ///
-    /// # Errors
-    ///
-    /// Only a store fault (see [`LeaseStore`]): every refusal listed above is `Ok(None)`.
-    fn take_approval_by_id(
-        &self,
-        id: &str,
-        chain_id: &LeaseId,
-        lease: &LeaseId,
-        call_hash: &str,
-        decision_id: &str,
-        now: OffsetDateTime,
-    ) -> Result<Option<Approval>, AuditError>;
-
-    /// Undo [`take_approval`](Self::take_approval) (or
-    /// [`take_approval_by_id`](Self::take_approval_by_id)) for a decision that did not go through
-    /// (denied anyway, or its audit append failed): an approval consumed by `decision_id` is
-    /// granted again. Anything else is left alone.
-    ///
-    /// # Errors
-    ///
-    /// Only a store fault (see [`LeaseStore`]): an unknown id or an approval not consumed by
-    /// `decision_id` is left alone and is `Ok(())`.
-    fn restore_approval(&self, id: &str, decision_id: &str) -> Result<(), AuditError>;
-
-    /// Delete an approval whose request could not be recorded.
-    ///
-    /// # Errors
-    ///
-    /// Only a store fault (see [`LeaseStore`]): removing an unknown id is `Ok(())`.
-    fn remove_approval(&self, id: &str) -> Result<(), AuditError>;
-
-    /// Run limits (ADR-0010): what the counter of each charge holds now, in order. A counter
-    /// never charged holds 0. The charges' `amount` and `max` are ignored. Reading does not
-    /// look at the leases, so the counters of a revoked or expired lease can still be read.
-    /// Callers must deny a limited call when this fails (`budget_error`).
-    ///
-    /// # Errors
-    ///
-    /// A charge whose capability index does not fit the counter key ([`AuditError::Storage`]), or a
-    /// store fault (see [`LeaseStore`]).
-    fn budget_used(&self, charges: &[Charge]) -> Result<Vec<u64>, AuditError>;
-
-    /// Charge one allowed call (ADR-0010): check every charge against its counter and either
-    /// apply all of them, logged under `decision_id`, or none (`Exhausted`, naming the first
-    /// that would go over its `max`), in one transaction. An empty `charges` writes nothing.
-    /// A decision id that already has charges is refused, so a decision is charged once.
-    ///
-    /// # Errors
-    ///
-    /// [`AuditError::Storage`] when `decision_id` already has charges or a charge's figures do not
-    /// fit the store, or a store fault (see [`LeaseStore`]); nothing is charged then. A charge that
-    /// would go over its `max` is not an error but `Ok(ChargeOutcome::Exhausted { .. })`.
-    fn charge(
-        &self,
-        decision_id: &str,
-        charges: &[Charge],
-        at: OffsetDateTime,
-    ) -> Result<ChargeOutcome, AuditError>;
-
-    /// [`charge`](Self::charge), except that a store which would sync the commit of a `sum`
-    /// charge itself (a file store below `durability = "full"`, design 3.4) may commit it
-    /// unsynced and leave the sync to the caller. The `bool` says whether it did: then the
-    /// caller must not act on the charge (forward the call) before an
-    /// [`AuditSink::append_synced`](crate::AuditSink::append_synced) on a sink with the same
-    /// [`sync_file`](Self::sync_file) has returned, since that sync covers this commit too.
-    /// The default charges and syncs as `charge` does and returns `false`.
-    ///
-    /// # Errors
-    ///
-    /// As [`charge`](Self::charge).
-    fn charge_sync_deferred(
-        &self,
-        decision_id: &str,
-        charges: &[Charge],
-        at: OffsetDateTime,
-    ) -> Result<(ChargeOutcome, bool), AuditError> {
-        self.charge(decision_id, charges, at).map(|o| (o, false))
-    }
-
-    /// The database file whose sync makes this store's commits durable (canonical path), when
-    /// [`charge_sync_deferred`](Self::charge_sync_deferred) can leave a sync to a sink sharing
-    /// it. `None` (the default) for a store that never defers.
-    fn sync_file(&self) -> Option<&std::path::Path> {
-        None
-    }
-
-    /// Return what `decision_id` charged to every counter it charged, at most once, in one
-    /// transaction, run-usage counters included. Returns how many token-limit counters were
-    /// restored (run usage is not counted, so a decision that charged only usage returns 0).
-    /// A `distinct` value is freed, and counted, only when no other unrefunded decision used
-    /// it (SR-62; see [`crate::budget`]). Used by the pipeline when a charged decision's audit
-    /// append fails, and by the operator refund (`POST /admin/budgets/refund`).
-    ///
-    /// # Errors
-    ///
-    /// [`AuditError::UnknownCharge`] when `decision_id` charged nothing (or its charge was pruned),
-    /// [`AuditError::ChargeRefunded`] when it was already refunded, or a store fault (see
-    /// [`LeaseStore`]).
-    fn refund(&self, decision_id: &str, at: OffsetDateTime) -> Result<u64, AuditError>;
-
-    /// Per-user windows (run limits phase 3, [`crate::window`]): what the window counter of
-    /// each charge holds now, in order. A window never charged holds 0. The charges' `amount`
-    /// is ignored. Callers decide on the worst case when this fails. The default keeps no
-    /// windows and fails, so a store without them is read as the worst case.
-    ///
-    /// # Errors
-    ///
-    /// [`AuditError::Storage`] when the store keeps no windows (the default) or a counter does
-    /// not fit, or a store fault (see [`LeaseStore`]).
-    fn window_used(&self, windows: &[WindowCharge]) -> Result<Vec<u64>, AuditError> {
-        let _ = windows;
-        Err(AuditError::Storage(
-            "this lease store keeps no per-user windows".into(),
-        ))
-    }
-
-    /// [`charge`](Self::charge) (or, with `defer`,
-    /// [`charge_sync_deferred`](Self::charge_sync_deferred)) together with the per-user
-    /// window charges of the same decision, in one transaction: either everything is applied,
-    /// logged under `decision_id`, or nothing. A window charge never refuses (it saturates at
-    /// [`WindowCharge::MAX`]) and never adds a sync of its own. A refund returns the window
-    /// charges with the rest. The default refuses any window charge, and otherwise is
-    /// `charge` or `charge_sync_deferred`.
-    ///
-    /// # Errors
-    ///
-    /// As [`charge`](Self::charge), plus [`AuditError::Storage`] when `windows` is not empty
-    /// and the store keeps no windows (the default).
-    fn charge_windowed(
-        &self,
-        decision_id: &str,
-        charges: &[Charge],
-        windows: &[WindowCharge],
-        at: OffsetDateTime,
-        defer: bool,
-    ) -> Result<(ChargeOutcome, bool), AuditError> {
-        if !windows.is_empty() {
-            return Err(AuditError::Storage(
-                "this lease store keeps no per-user windows".into(),
-            ));
-        }
-        if defer {
-            self.charge_sync_deferred(decision_id, charges, at)
-        } else {
-            self.charge(decision_id, charges, at).map(|o| (o, false))
-        }
-    }
-
-    /// One pass of per-user window retention: delete up to `max_rows` window counters, and
-    /// the charges logged against them, whose window ended more than `retention` before
-    /// `now` ([`window_prunable`]). Open windows are never touched.
-    /// One write transaction per pass. The default keeps nothing and reports `wrapped`.
-    ///
-    /// # Errors
-    ///
-    /// A store fault (see [`LeaseStore`]); the default never fails.
-    fn prune_user_windows(
-        &self,
-        now: OffsetDateTime,
-        retention: time::Duration,
-        max_rows: usize,
-    ) -> Result<WindowPrune, AuditError> {
-        let _ = (now, retention, max_rows);
-        Ok(WindowPrune {
-            wrapped: true,
-            ..WindowPrune::default()
-        })
-    }
-
-    /// Keep the limited capabilities of the hop whose lease is `lease`, as issued (ADR-0010),
-    /// for the admin console. Display only: enforcement reads the limits from the token. The
-    /// default keeps nothing.
-    ///
-    /// # Errors
-    ///
-    /// A store that keeps the limits fails on a store fault (see [`LeaseStore`]) or when `limits`
-    /// cannot be serialized ([`AuditError::Storage`]). The default cannot fail.
-    fn record_hop_limits(&self, lease: &LeaseId, limits: &[HopLimit]) -> Result<(), AuditError> {
-        let _ = (lease, limits);
-        Ok(())
-    }
-
-    /// What [`record_hop_limits`](Self::record_hop_limits) kept for `lease`. `None` when
-    /// nothing was kept (a hop without limits, a lease issued before this was recorded, or a
-    /// store that keeps none, the default).
-    ///
-    /// # Errors
-    ///
-    /// A store that keeps the limits fails on a store fault (see [`LeaseStore`]) or when the kept
-    /// value no longer deserializes ([`AuditError::Storage`]). The default cannot fail.
-    fn hop_limits(&self, lease: &LeaseId) -> Result<Option<Vec<HopLimit>>, AuditError> {
-        let _ = lease;
-        Ok(None)
-    }
-
-    /// Every counter under `lease`, grouped ([`CounterSummary`]): its limits' counters and,
-    /// for a run's root lease, the run's usage. Empty when nothing was charged, and by default.
-    ///
-    /// # Errors
-    ///
-    /// Only a store fault (see [`LeaseStore`]). The default cannot fail.
-    fn budget_summary(&self, lease: &LeaseId) -> Result<Vec<CounterSummary>, AuditError> {
-        let _ = lease;
-        Ok(Vec::new())
-    }
-}
-
 /// Which leases a selector revocation names (`POST /admin/leases/revoke`).
 ///
 /// A selector matches leases that are not revoked. An expired lease matches too: while its
@@ -658,7 +49,7 @@ pub trait LeaseStore: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LeaseSelector {
     /// Every lease issued for this originating user (`sub`), as recorded by
-    /// [`LeaseStore::record_subject`]. The subject is matched under every issuer.
+    /// [`LeaseRegistry::record_subject`]. The subject is matched under every issuer.
     Subject(String),
     /// Every lease of one delegation chain: the chain id is the lease of the chain's first
     /// hop (`attenuo_core::chain_id_of`), so this is that lease and everything delegated
@@ -666,14 +57,14 @@ pub enum LeaseSelector {
     /// through the parent links, so leases registered before subjects were recorded match.
     Chain(LeaseId),
     /// Every lease of the chains an MCP session was opened by, as recorded by
-    /// [`LeaseStore::record_session`]: the value is the session digest (SHA-256 of the
+    /// [`RunState::record_session`]: the value is the session digest (SHA-256 of the
     /// `Mcp-Session-Id`, lowercase hex), and each bound chain is matched as
     /// [`LeaseSelector::Chain`] matches it. A session opened through more than one upstream
     /// can name more than one chain; an unknown session matches nothing.
     Session(String),
 }
 
-/// One recorded session binding ([`LeaseStore::record_session`]).
+/// One recorded session binding ([`RunState::record_session`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionBinding {
     /// The upstream server the session was opened with.
@@ -684,7 +75,7 @@ pub struct SessionBinding {
     pub bound_at: OffsetDateTime,
 }
 
-/// What one [`LeaseStore::prune_sessions`] pass did.
+/// What one [`StoreRetention::prune_sessions`] pass did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SessionPrune {
     /// Bindings the pass looked at (at most its `max_rows`).
@@ -713,7 +104,7 @@ pub fn session_prunable(
     }
 }
 
-/// What one [`LeaseStore::prune_leases`] pass did.
+/// What one [`StoreRetention::prune_leases`] pass did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct LeasePrune {
     /// Leases the pass's window looked at, tops or not.
@@ -793,7 +184,7 @@ pub(crate) trait PruneOps {
     fn delete(&mut self, lease: &LeaseId) -> Result<bool, AuditError>;
 }
 
-/// The lease-retention state a store keeps between [`LeaseStore::prune_leases`] passes: the
+/// The lease-retention state a store keeps between [`StoreRetention::prune_leases`] passes: the
 /// window's position and the run being pruned, if one is.
 #[derive(Debug)]
 pub(crate) struct LeasePruneState<P> {
@@ -998,7 +389,7 @@ impl RunSweep {
     }
 }
 
-/// One [`LeaseStore::prune_leases`] pass over `ops`: both stores' logic. The pass spends at
+/// One [`StoreRetention::prune_leases`] pass over `ops`: both stores' logic. The pass spends at
 /// most `max_rows` lease rows (at least one): each lease the window looks at, each lease read
 /// while walking a run from its top, and each lease deleted costs one. A run that does not fit
 /// in what is left is carried over in `state.sweep` and continued first by the next pass; the
@@ -1048,7 +439,7 @@ pub(crate) fn prune_pass<O: PruneOps>(
     Ok(out)
 }
 
-/// What one [`LeaseStore::prune_run_state`] pass did.
+/// What one [`StoreRetention::prune_run_state`] pass did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RunStatePrune {
     /// Rows the pass looked at across the charge log, the counters and the approvals (at most
@@ -1094,7 +485,7 @@ pub fn approval_last_touched(approval: &Approval) -> OffsetDateTime {
     last
 }
 
-/// The result of [`LeaseStore::revoke_selected`] or [`LeaseStore::preview_selected`].
+/// The result of [`LeaseRegistry::revoke_selected`] or [`LeaseRegistry::preview_selected`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SelectorRevocation {
     /// The unrevoked leases the selector named, ordered by id.
@@ -1339,6 +730,9 @@ pub struct MemoryLeaseStore {
     bindings: Mutex<BTreeMap<LeaseId, String>>,
     /// The originating user's subject of each lease (`record_subject`).
     subjects: Mutex<BTreeMap<LeaseId, String>>,
+    /// The originating user's issuer of each lease recorded by `record_originating_user`.
+    /// Taken after `subjects`.
+    issuers: Mutex<BTreeMap<LeaseId, String>>,
     /// Session bindings by `(session digest, server)` (`record_session`).
     sessions: Mutex<BTreeMap<(String, String), (LeaseId, OffsetDateTime)>>,
     /// The last session binding a `prune_sessions` pass looked at; `None` to start from the
@@ -1353,12 +747,17 @@ pub struct MemoryLeaseStore {
     labels: Mutex<BTreeMap<LeaseId, BTreeMap<String, RunLabel>>>,
     /// Per run, the span index (ADR-0009 phase 2).
     spans: Mutex<Spans>,
-    /// Approvals by id.
-    approvals: Mutex<BTreeMap<String, Approval>>,
+    /// Approvals by id, each with its position (see [`ApprovalStore::approvals`]).
+    approvals: Mutex<BTreeMap<String, (u64, Approval)>>,
+    /// The position the last created approval got; read and bumped under `approvals`, never
+    /// lowered (removing or pruning approvals leaves it), so no position is given twice.
+    approval_pos: std::sync::atomic::AtomicU64,
     /// Run-limit counters and the charges of each decision, under one lock (ADR-0010).
     budgets: Mutex<Budgets>,
     /// The limited capabilities of each hop, as issued (display only).
     hop_limits: Mutex<BTreeMap<LeaseId, Vec<HopLimit>>>,
+    /// Single-use credential markers ([`crate::replay`]).
+    used_credentials: crate::replay::MemoryReplay,
 }
 
 /// Where a memory store's `prune_run_state` pass resumes: the table, and the last key a pass
@@ -1460,6 +859,41 @@ impl MemoryLeaseStore {
         Self::default()
     }
 
+    /// `record_subject` (`issuer` `None`: a recorded issuer is kept and not compared) or
+    /// `record_originating_user` (`issuer` set: it must be the one recorded, and none
+    /// recorded counts as a different one).
+    fn record_user(
+        &self,
+        lease: &LeaseId,
+        issuer: Option<&str>,
+        subject: &str,
+    ) -> Result<(), AuditError> {
+        let rows = self.rows.lock()?;
+        if !rows.contains_key(lease) {
+            return Err(AuditError::UnknownLease(lease.0.clone()));
+        }
+        let mut subjects = self.subjects.lock()?;
+        let mut issuers = self.issuers.lock()?;
+        match subjects.get(lease) {
+            Some(s)
+                if s == subject
+                    && (issuer.is_none()
+                        || !issuers.contains_key(lease)
+                        || issuers.get(lease).map(String::as_str) == issuer) =>
+            {
+                Ok(())
+            }
+            Some(_) => Err(AuditError::BindingConflict(lease.0.clone())),
+            None => {
+                subjects.insert(lease.clone(), subject.to_string());
+                if let Some(i) = issuer {
+                    issuers.insert(lease.clone(), i.to_string());
+                }
+                Ok(())
+            }
+        }
+    }
+
     /// After a revocation: a revoked run's span index ends with it (`crate::spans`), and so
     /// does its run usage (`crate::budget`). Called with the rows lock held, so the lock order
     /// is rows, spans, then rows, budgets.
@@ -1480,7 +914,7 @@ impl MemoryLeaseStore {
         Ok(())
     }
 
-    /// [`LeaseStore::preview_selected`] and [`LeaseStore::revoke_selected`]: `write` carries
+    /// [`LeaseRegistry::preview_selected`] and [`LeaseRegistry::revoke_selected`]: `write` carries
     /// the reason and time of a real revocation, `None` for a preview.
     fn selected(
         &self,
@@ -1647,6 +1081,7 @@ impl PruneOps for MemoryPrune<'_> {
         let found = self.rows.remove(lease).is_some();
         s.bindings.lock()?.remove(lease);
         s.subjects.lock()?.remove(lease);
+        s.issuers.lock()?.remove(lease);
         s.sessions.lock()?.retain(|_, (chain, _)| chain != lease);
         s.labels.lock()?.remove(lease);
         s.spans.lock()?.runs.remove(lease);
@@ -1655,7 +1090,7 @@ impl PruneOps for MemoryPrune<'_> {
     }
 }
 
-impl LeaseStore for MemoryLeaseStore {
+impl LeaseRegistry for MemoryLeaseStore {
     fn register(
         &self,
         lease: &LeaseId,
@@ -1744,19 +1179,25 @@ impl LeaseStore for MemoryLeaseStore {
     }
 
     fn record_subject(&self, lease: &LeaseId, subject: &str) -> Result<(), AuditError> {
-        let rows = self.rows.lock()?;
-        if !rows.contains_key(lease) {
-            return Err(AuditError::UnknownLease(lease.0.clone()));
-        }
-        let mut subjects = self.subjects.lock()?;
-        match subjects.get(lease) {
-            Some(s) if s == subject => Ok(()),
-            Some(_) => Err(AuditError::BindingConflict(lease.0.clone())),
-            None => {
-                subjects.insert(lease.clone(), subject.to_string());
-                Ok(())
-            }
-        }
+        self.record_user(lease, None, subject)
+    }
+
+    fn record_originating_user(
+        &self,
+        lease: &LeaseId,
+        issuer: &str,
+        subject: &str,
+    ) -> Result<(), AuditError> {
+        self.record_user(lease, Some(issuer), subject)
+    }
+
+    fn originating_user(&self, lease: &LeaseId) -> Result<Option<(String, String)>, AuditError> {
+        let subjects = self.subjects.lock()?;
+        let issuers = self.issuers.lock()?;
+        Ok(subjects
+            .get(lease)
+            .zip(issuers.get(lease))
+            .map(|(s, i)| (i.clone(), s.clone())))
     }
 
     fn subject(&self, lease: &LeaseId) -> Result<Option<String>, AuditError> {
@@ -1771,6 +1212,30 @@ impl LeaseStore for MemoryLeaseStore {
             .collect())
     }
 
+    fn preview_selected(&self, selector: &LeaseSelector) -> Result<SelectorRevocation, AuditError> {
+        self.selected(selector, None)
+    }
+
+    fn revoke_selected(
+        &self,
+        selector: &LeaseSelector,
+        reason: &str,
+        now: OffsetDateTime,
+    ) -> Result<SelectorRevocation, AuditError> {
+        self.selected(selector, Some((reason, now)))
+    }
+
+    fn check_all(
+        &self,
+        leases: &[&LeaseId],
+        now: OffsetDateTime,
+    ) -> Result<LeaseStatus, AuditError> {
+        let rows = self.rows.lock()?;
+        classify(leases, now, |id| Ok(rows.get(id).cloned()))
+    }
+}
+
+impl RunState for MemoryLeaseStore {
     fn record_session(
         &self,
         session: &str,
@@ -1805,6 +1270,493 @@ impl LeaseStore for MemoryLeaseStore {
             .collect())
     }
 
+    fn add_label(&self, chain_id: &LeaseId, label: &RunLabel) -> Result<(), AuditError> {
+        // The rows lock is held across the insert, so the lease cannot appear or vanish in
+        // between (the memory store's "transaction").
+        let rows = self.rows.lock()?;
+        if !rows.contains_key(chain_id) {
+            return Err(AuditError::UnknownLease(chain_id.0.clone()));
+        }
+        let mut labels = self.labels.lock()?;
+        let first = labels.entry(chain_id.clone()).or_default();
+        match first.get(&label.source) {
+            Some(cur) if cur.seq <= label.seq => {}
+            _ => {
+                first.insert(label.source.clone(), label.clone());
+            }
+        }
+        Ok(())
+    }
+
+    fn labels(&self, chain_id: &LeaseId) -> Result<Vec<RunLabel>, AuditError> {
+        Ok(self
+            .labels
+            .lock()?
+            .get(chain_id)
+            .map(|first| {
+                let mut out: Vec<RunLabel> = first.values().cloned().collect();
+                out.sort_by_key(|l| l.seq);
+                out
+            })
+            .unwrap_or_default())
+    }
+
+    fn add_spans(
+        &self,
+        chain_id: &LeaseId,
+        seq: u64,
+        spans: &[Fingerprint],
+    ) -> Result<(), AuditError> {
+        // As in `add_label`, the rows lock is held across the write.
+        let rows = self.rows.lock()?;
+        if !rows.contains_key(chain_id) {
+            return Err(AuditError::UnknownLease(chain_id.0.clone()));
+        }
+        if spans.is_empty() {
+            return Ok(());
+        }
+        let mut all = self.spans.lock()?;
+        let key = all.key()?;
+        let mut hashes = distinct_hashes(&key, spans);
+        hashes.truncate(MAX_SPANS_PER_RUN);
+        let run = all.runs.entry(chain_id.clone()).or_default();
+        let stored: Vec<(u64, usize)> = run.by_seq.iter().map(|(s, v)| (*s, v.len())).collect();
+        for old in evictions(&stored, hashes.len()) {
+            run.remove(old);
+        }
+        run.remove(seq);
+        for h in &hashes {
+            run.index.entry(*h).or_default().insert(seq);
+        }
+        run.len += hashes.len();
+        run.by_seq.insert(seq, hashes);
+        Ok(())
+    }
+
+    fn find_spans(
+        &self,
+        chain_id: &LeaseId,
+        probes: &[Fingerprint],
+    ) -> Result<Vec<SpanHit>, AuditError> {
+        let mut all = self.spans.lock()?;
+        let key = all.key()?;
+        let Some(run) = all.runs.get(chain_id) else {
+            return Ok(Vec::new());
+        };
+        let mut hits = Vec::new();
+        for (probe, f) in probes.iter().enumerate() {
+            if let Some(seqs) = run.index.get(&key.hash(f)) {
+                hits.extend(
+                    seqs.iter()
+                        .take(MAX_SEQS_PER_PROBE)
+                        .map(|&seq| SpanHit { probe, seq }),
+                );
+            }
+        }
+        Ok(hits)
+    }
+}
+
+impl ApprovalStore for MemoryLeaseStore {
+    fn create_approval(&self, approval: &Approval) -> Result<(Approval, bool), AuditError> {
+        // Lock order as in `add_label`: rows, then approvals.
+        let rows = self.rows.lock()?;
+        let now = approval.created_at;
+        let lease_expiry = rules::live_lease(&approval.lease, rows.get(&approval.lease), now)?;
+        let mut approvals = self.approvals.lock()?;
+        if let Some((_, existing)) = approvals
+            .values()
+            .find(|(_, a)| rules::reusable(a, approval, now))
+        {
+            return Ok((existing.clone(), false));
+        }
+        let pending = approvals
+            .values()
+            .filter(|(_, a)| {
+                rules::counts_as_pending(a, rows.get(&a.lease), &approval.chain_id, now)
+            })
+            .count();
+        rules::below_pending_cap(&approval.chain_id, pending)?;
+        let mut stored = approval.clone();
+        stored.state = ApprovalState::Pending;
+        stored.approver = None;
+        stored.decided_at = None;
+        stored.consumed_by = None;
+        stored.expires_at = stored.expires_at.min(lease_expiry);
+        // Bumped under the `approvals` lock, so positions follow insertion order.
+        let pos = self
+            .approval_pos
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        approvals.insert(stored.id.clone(), (pos, stored.clone()));
+        Ok((stored, true))
+    }
+
+    fn approval(&self, id: &str) -> Result<Option<Approval>, AuditError> {
+        Ok(self.approvals.lock()?.get(id).map(|(_, a)| a.clone()))
+    }
+
+    fn approvals(
+        &self,
+        chain_id: Option<&LeaseId>,
+        state: Option<ApprovalState>,
+        before: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<(u64, Approval)>, AuditError> {
+        let mut out: Vec<(u64, Approval)> = self
+            .approvals
+            .lock()?
+            .values()
+            .filter(|(pos, a)| {
+                before.is_none_or(|b| *pos < b)
+                    && chain_id.is_none_or(|c| &a.chain_id == c)
+                    && state.is_none_or(|s| a.state == s)
+            })
+            .cloned()
+            .collect();
+        out.sort_by_key(|(pos, _)| std::cmp::Reverse(*pos));
+        out.truncate(limit);
+        Ok(out)
+    }
+
+    fn decide_approval(
+        &self,
+        id: &str,
+        grant: bool,
+        approver: &Approver,
+        now: OffsetDateTime,
+    ) -> Result<Approval, AuditError> {
+        let rows = self.rows.lock()?;
+        let mut approvals = self.approvals.lock()?;
+        let (_, a) = approvals
+            .get_mut(id)
+            .ok_or_else(|| AuditError::UnknownApproval(id.to_owned()))?;
+        rules::decidable(a, now)?;
+        rules::live_lease(&a.lease, rows.get(&a.lease), now)?;
+        a.state = if grant {
+            ApprovalState::Granted
+        } else {
+            ApprovalState::Declined
+        };
+        a.approver = Some(approver.clone());
+        a.decided_at = Some(now);
+        Ok(a.clone())
+    }
+
+    fn take_approval(
+        &self,
+        chain_id: &LeaseId,
+        lease: &LeaseId,
+        call_hash: &str,
+        decision_id: &str,
+        now: OffsetDateTime,
+    ) -> Result<Option<Approval>, AuditError> {
+        let rows = self.rows.lock()?;
+        if rules::live_lease(lease, rows.get(lease), now).is_err() {
+            return Ok(None);
+        }
+        let mut approvals = self.approvals.lock()?;
+        let Some(a) = approvals
+            .values_mut()
+            .map(|(_, a)| a)
+            .filter(|a| rules::usable(a, chain_id, lease, call_hash, now))
+            .min_by(|a, b| a.created_at.cmp(&b.created_at))
+        else {
+            return Ok(None);
+        };
+        a.state = ApprovalState::Consumed;
+        a.consumed_by = Some(decision_id.to_owned());
+        Ok(Some(a.clone()))
+    }
+
+    fn take_approval_by_id(
+        &self,
+        id: &str,
+        chain_id: &LeaseId,
+        lease: &LeaseId,
+        call_hash: &str,
+        decision_id: &str,
+        now: OffsetDateTime,
+    ) -> Result<Option<Approval>, AuditError> {
+        let rows = self.rows.lock()?;
+        if rules::live_lease(lease, rows.get(lease), now).is_err() {
+            return Ok(None);
+        }
+        let mut approvals = self.approvals.lock()?;
+        let Some(a) = approvals
+            .get_mut(id)
+            .map(|(_, a)| a)
+            .filter(|a| rules::usable(a, chain_id, lease, call_hash, now))
+        else {
+            return Ok(None);
+        };
+        a.state = ApprovalState::Consumed;
+        a.consumed_by = Some(decision_id.to_owned());
+        Ok(Some(a.clone()))
+    }
+
+    fn restore_approval(&self, id: &str, decision_id: &str) -> Result<(), AuditError> {
+        if let Some((_, a)) = self.approvals.lock()?.get_mut(id) {
+            if a.state == ApprovalState::Consumed && a.consumed_by.as_deref() == Some(decision_id) {
+                a.state = ApprovalState::Granted;
+                a.consumed_by = None;
+            }
+        }
+        Ok(())
+    }
+
+    fn remove_approval(&self, id: &str) -> Result<(), AuditError> {
+        self.approvals.lock()?.remove(id);
+        Ok(())
+    }
+}
+
+impl RunLimits for MemoryLeaseStore {
+    fn budget_used(&self, charges: &[Charge]) -> Result<Vec<u64>, AuditError> {
+        let mut b = self.budgets.lock()?;
+        let keys = b.keys(charges)?;
+        Ok(keys
+            .iter()
+            .map(|k| b.counters.get(k).copied().unwrap_or(0))
+            .collect())
+    }
+
+    fn charge(
+        &self,
+        decision_id: &str,
+        charges: &[Charge],
+        at: OffsetDateTime,
+    ) -> Result<ChargeOutcome, AuditError> {
+        self.charge_windowed(decision_id, charges, &[], at, false)
+            .map(|(outcome, _)| outcome)
+    }
+
+    fn window_used(&self, windows: &[WindowCharge]) -> Result<Vec<u64>, AuditError> {
+        let mut b = self.budgets.lock()?;
+        let keys = b.window_keys(windows)?;
+        Ok(keys
+            .iter()
+            .map(|k| b.windows.get(k).copied().unwrap_or(0))
+            .collect())
+    }
+
+    fn charge_windowed(
+        &self,
+        decision_id: &str,
+        charges: &[Charge],
+        windows: &[WindowCharge],
+        at: OffsetDateTime,
+        _defer: bool,
+    ) -> Result<(ChargeOutcome, bool), AuditError> {
+        if charges.is_empty() && windows.is_empty() {
+            let none = ChargeOutcome::Charged {
+                used_after: Vec::new(),
+            };
+            return Ok((none, false));
+        }
+        // The lock is held from the check to the write: the memory store's transaction.
+        let mut b = self.budgets.lock()?;
+        if b.log.contains_key(decision_id) || b.window_log.contains_key(decision_id) {
+            return Err(AuditError::Storage(format!(
+                "decision `{decision_id}` is already charged"
+            )));
+        }
+        let window_keys = b.window_keys(windows)?;
+        let keys = b.keys(charges)?;
+        let planned = match plan(&keys, charges, |k| {
+            Ok(b.counters.get(k).copied().unwrap_or(0))
+        })? {
+            Ok(planned) => planned,
+            Err(exhausted) => return Ok((exhausted, false)),
+        };
+        let window_writes = plan_windows(&window_keys, windows, |k| {
+            Ok(b.windows.get(k).copied().unwrap_or(0))
+        })?;
+        if !window_writes.is_empty() {
+            let mut logged = Vec::with_capacity(window_writes.len());
+            for (key, after, amount) in window_writes {
+                b.windows.insert(key.clone(), after);
+                logged.push((key, amount));
+            }
+            b.window_log.insert(decision_id.to_owned(), (logged, None));
+        }
+        if charges.is_empty() {
+            let none = ChargeOutcome::Charged {
+                used_after: Vec::new(),
+            };
+            return Ok((none, false));
+        }
+        let mut log = ChargeLog {
+            charges: Vec::new(),
+            at,
+            refunded_at: None,
+        };
+        for w in planned.writes {
+            if w.key.kind == DISTINCT_VALUE_KIND {
+                *b.holders.entry(w.key.clone()).or_insert(0) += 1;
+            }
+            b.counters.insert(w.key.clone(), w.after);
+            log.charges.push(LoggedCharge {
+                counter: w.key,
+                amount: w.amount,
+            });
+        }
+        b.log.insert(decision_id.to_owned(), log);
+        let outcome = ChargeOutcome::Charged {
+            used_after: planned.used_after,
+        };
+        Ok((outcome, false))
+    }
+
+    fn record_hop_limits(&self, lease: &LeaseId, limits: &[HopLimit]) -> Result<(), AuditError> {
+        self.hop_limits
+            .lock()?
+            .insert(lease.clone(), limits.to_vec());
+        Ok(())
+    }
+
+    fn hop_limits(&self, lease: &LeaseId) -> Result<Option<Vec<HopLimit>>, AuditError> {
+        Ok(self.hop_limits.lock()?.get(lease).cloned())
+    }
+
+    fn budget_summary(&self, lease: &LeaseId) -> Result<Vec<CounterSummary>, AuditError> {
+        let b = self.budgets.lock()?;
+        Ok(summarize(
+            b.counters
+                .iter()
+                .filter(|(k, _)| k.lease == lease.0)
+                .map(|(k, v)| (k, *v)),
+        ))
+    }
+
+    fn refund(&self, decision_id: &str, at: OffsetDateTime) -> Result<u64, AuditError> {
+        let mut b = self.budgets.lock()?;
+        let Budgets {
+            counters,
+            log,
+            holders,
+            windows,
+            window_log,
+            ..
+        } = &mut *b;
+        // Per-user windows the decision charged: returned with the rest, each recomputed from
+        // the unrefunded charges left, since a window saturates like run usage.
+        let windowed = match window_log.get(decision_id) {
+            Some((_, Some(_))) => {
+                return Err(AuditError::ChargeRefunded(decision_id.to_owned()));
+            }
+            Some((charged, None)) => Some(charged.clone()),
+            None => None,
+        };
+        let refund_windows =
+            |windows: &mut BTreeMap<WindowKey, u64>,
+             window_log: &mut BTreeMap<String, WindowLog>| {
+                let Some(charged) = &windowed else { return };
+                if let Some(entry) = window_log.get_mut(decision_id) {
+                    entry.1 = Some(at);
+                }
+                for (key, _) in charged {
+                    let total = window_log
+                        .values()
+                        .filter(|(_, refunded)| refunded.is_none())
+                        .flat_map(|(c, _)| c)
+                        .filter(|(k, _)| k == key)
+                        .fold(0u64, |t, (_, a)| t.saturating_add(*a))
+                        .min(WindowCharge::MAX);
+                    windows.insert(key.clone(), total);
+                }
+            };
+        // An entry left empty by a revocation that ended its run's usage charged nothing now.
+        let Some(entry) = log.get_mut(decision_id).filter(|e| !e.charges.is_empty()) else {
+            if windowed.is_none() {
+                return Err(AuditError::UnknownCharge(decision_id.to_owned()));
+            }
+            refund_windows(windows, window_log);
+            return Ok(0);
+        };
+        if entry.refunded_at.is_some() {
+            return Err(AuditError::ChargeRefunded(decision_id.to_owned()));
+        }
+        refund_windows(windows, window_log);
+        let distinct = LimitKind::Distinct.as_str();
+        let mut restored = 0u64;
+        for c in &entry.charges {
+            let key = &c.counter;
+            if key.kind == DISTINCT_VALUE_KIND {
+                // Free the value only when no other unrefunded decision used it (SR-62); the
+                // limit's count moves with it.
+                let left = holders.get_mut(key).map_or(0, |n| {
+                    *n = n.saturating_sub(1);
+                    *n
+                });
+                if left == 0 {
+                    holders.remove(key);
+                    if counters.get(key).is_some_and(|v| *v > 0) {
+                        counters.insert(key.clone(), 0);
+                        let count_key = CounterKey {
+                            kind: distinct,
+                            value: String::new(),
+                            ..key.clone()
+                        };
+                        if let Some(v) = counters.get_mut(&count_key) {
+                            *v = v.saturating_sub(1);
+                        }
+                        restored += 1;
+                    }
+                }
+                continue;
+            }
+            if key.kind == distinct {
+                continue;
+            }
+            if USAGE_KINDS.contains(&key.kind) {
+                continue; // Recomputed below.
+            }
+            if let Some(v) = counters.get_mut(key) {
+                *v = v.saturating_sub(c.amount);
+            }
+            restored += 1;
+        }
+        entry.refunded_at = Some(at);
+        // A run-usage counter saturates at `MAX_LIMIT`, so what one decision logged is not
+        // what it added once the counter was full: recompute it from the decisions left
+        // (fuzzing round 2, FZ2-4).
+        let usage: Vec<CounterKey> = entry
+            .charges
+            .iter()
+            .filter(|c| USAGE_KINDS.contains(&c.counter.kind))
+            .map(|c| c.counter.clone())
+            .collect();
+        for key in usage {
+            let total = log
+                .values()
+                .filter(|e| e.refunded_at.is_none())
+                .flat_map(|e| &e.charges)
+                .filter(|c| c.counter == key)
+                .fold(0u64, |t, c| t.saturating_add(c.amount))
+                .min(MAX_LIMIT);
+            counters.insert(key, total);
+        }
+        Ok(restored)
+    }
+}
+
+impl crate::replay::ReplayStore for MemoryLeaseStore {
+    fn use_all_once(
+        &self,
+        keys: &[(&str, i64)],
+        now: i64,
+        capacity: usize,
+    ) -> Result<crate::replay::ReplayOutcome, AuditError> {
+        self.used_credentials.use_all_once(keys, now, capacity)
+    }
+
+    fn replay_markers(&self) -> Result<usize, AuditError> {
+        self.used_credentials.len()
+    }
+}
+
+impl StoreRetention for MemoryLeaseStore {
     fn prune_sessions(
         &self,
         now: OffsetDateTime,
@@ -1968,7 +1920,7 @@ impl LeaseStore for MemoryLeaseStore {
                     let window: Vec<(String, bool)> = approvals
                         .range(after(&from))
                         .take(budget)
-                        .map(|(id, a)| {
+                        .map(|(id, (_, a))| {
                             let lease_known =
                                 rows.contains_key(&a.lease) || rows.contains_key(&a.chain_id);
                             let prunable = run_state_prunable(
@@ -1997,347 +1949,6 @@ impl LeaseStore for MemoryLeaseStore {
             }
         }
         Ok(out)
-    }
-
-    fn preview_selected(&self, selector: &LeaseSelector) -> Result<SelectorRevocation, AuditError> {
-        self.selected(selector, None)
-    }
-
-    fn revoke_selected(
-        &self,
-        selector: &LeaseSelector,
-        reason: &str,
-        now: OffsetDateTime,
-    ) -> Result<SelectorRevocation, AuditError> {
-        self.selected(selector, Some((reason, now)))
-    }
-
-    fn check_all(
-        &self,
-        leases: &[&LeaseId],
-        now: OffsetDateTime,
-    ) -> Result<LeaseStatus, AuditError> {
-        let rows = self.rows.lock()?;
-        classify(leases, now, |id| Ok(rows.get(id).cloned()))
-    }
-
-    fn add_label(&self, chain_id: &LeaseId, label: &RunLabel) -> Result<(), AuditError> {
-        // The rows lock is held across the insert, so the lease cannot appear or vanish in
-        // between (the memory store's "transaction").
-        let rows = self.rows.lock()?;
-        if !rows.contains_key(chain_id) {
-            return Err(AuditError::UnknownLease(chain_id.0.clone()));
-        }
-        let mut labels = self.labels.lock()?;
-        let first = labels.entry(chain_id.clone()).or_default();
-        match first.get(&label.source) {
-            Some(cur) if cur.seq <= label.seq => {}
-            _ => {
-                first.insert(label.source.clone(), label.clone());
-            }
-        }
-        Ok(())
-    }
-
-    fn labels(&self, chain_id: &LeaseId) -> Result<Vec<RunLabel>, AuditError> {
-        Ok(self
-            .labels
-            .lock()?
-            .get(chain_id)
-            .map(|first| {
-                let mut out: Vec<RunLabel> = first.values().cloned().collect();
-                out.sort_by_key(|l| l.seq);
-                out
-            })
-            .unwrap_or_default())
-    }
-
-    fn add_spans(
-        &self,
-        chain_id: &LeaseId,
-        seq: u64,
-        spans: &[Fingerprint],
-    ) -> Result<(), AuditError> {
-        // As in `add_label`, the rows lock is held across the write.
-        let rows = self.rows.lock()?;
-        if !rows.contains_key(chain_id) {
-            return Err(AuditError::UnknownLease(chain_id.0.clone()));
-        }
-        if spans.is_empty() {
-            return Ok(());
-        }
-        let mut all = self.spans.lock()?;
-        let key = all.key()?;
-        let mut hashes = distinct_hashes(&key, spans);
-        hashes.truncate(MAX_SPANS_PER_RUN);
-        let run = all.runs.entry(chain_id.clone()).or_default();
-        let stored: Vec<(u64, usize)> = run.by_seq.iter().map(|(s, v)| (*s, v.len())).collect();
-        for old in evictions(&stored, hashes.len()) {
-            run.remove(old);
-        }
-        run.remove(seq);
-        for h in &hashes {
-            run.index.entry(*h).or_default().insert(seq);
-        }
-        run.len += hashes.len();
-        run.by_seq.insert(seq, hashes);
-        Ok(())
-    }
-
-    fn find_spans(
-        &self,
-        chain_id: &LeaseId,
-        probes: &[Fingerprint],
-    ) -> Result<Vec<SpanHit>, AuditError> {
-        let mut all = self.spans.lock()?;
-        let key = all.key()?;
-        let Some(run) = all.runs.get(chain_id) else {
-            return Ok(Vec::new());
-        };
-        let mut hits = Vec::new();
-        for (probe, f) in probes.iter().enumerate() {
-            if let Some(seqs) = run.index.get(&key.hash(f)) {
-                hits.extend(
-                    seqs.iter()
-                        .take(MAX_SEQS_PER_PROBE)
-                        .map(|&seq| SpanHit { probe, seq }),
-                );
-            }
-        }
-        Ok(hits)
-    }
-
-    fn create_approval(&self, approval: &Approval) -> Result<(Approval, bool), AuditError> {
-        // Lock order as in `add_label`: rows, then approvals.
-        let rows = self.rows.lock()?;
-        let now = approval.created_at;
-        let lease_expiry = rules::live_lease(&approval.lease, rows.get(&approval.lease), now)?;
-        let mut approvals = self.approvals.lock()?;
-        if let Some(existing) = approvals
-            .values()
-            .find(|a| rules::reusable(a, approval, now))
-        {
-            return Ok((existing.clone(), false));
-        }
-        let pending = approvals
-            .values()
-            .filter(|a| rules::counts_as_pending(a, rows.get(&a.lease), &approval.chain_id, now))
-            .count();
-        rules::below_pending_cap(&approval.chain_id, pending)?;
-        let mut stored = approval.clone();
-        stored.state = ApprovalState::Pending;
-        stored.approver = None;
-        stored.decided_at = None;
-        stored.consumed_by = None;
-        stored.expires_at = stored.expires_at.min(lease_expiry);
-        approvals.insert(stored.id.clone(), stored.clone());
-        Ok((stored, true))
-    }
-
-    fn approval(&self, id: &str) -> Result<Option<Approval>, AuditError> {
-        Ok(self.approvals.lock()?.get(id).cloned())
-    }
-
-    fn approvals(
-        &self,
-        chain_id: Option<&LeaseId>,
-        limit: usize,
-    ) -> Result<Vec<Approval>, AuditError> {
-        let mut out: Vec<Approval> = self
-            .approvals
-            .lock()?
-            .values()
-            .filter(|a| chain_id.is_none_or(|c| &a.chain_id == c))
-            .cloned()
-            .collect();
-        out.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.id.cmp(&a.id)));
-        out.truncate(limit);
-        Ok(out)
-    }
-
-    fn decide_approval(
-        &self,
-        id: &str,
-        grant: bool,
-        approver: &Approver,
-        now: OffsetDateTime,
-    ) -> Result<Approval, AuditError> {
-        let rows = self.rows.lock()?;
-        let mut approvals = self.approvals.lock()?;
-        let a = approvals
-            .get_mut(id)
-            .ok_or_else(|| AuditError::UnknownApproval(id.to_owned()))?;
-        rules::decidable(a, now)?;
-        rules::live_lease(&a.lease, rows.get(&a.lease), now)?;
-        a.state = if grant {
-            ApprovalState::Granted
-        } else {
-            ApprovalState::Declined
-        };
-        a.approver = Some(approver.clone());
-        a.decided_at = Some(now);
-        Ok(a.clone())
-    }
-
-    fn take_approval(
-        &self,
-        chain_id: &LeaseId,
-        lease: &LeaseId,
-        call_hash: &str,
-        decision_id: &str,
-        now: OffsetDateTime,
-    ) -> Result<Option<Approval>, AuditError> {
-        let rows = self.rows.lock()?;
-        if rules::live_lease(lease, rows.get(lease), now).is_err() {
-            return Ok(None);
-        }
-        let mut approvals = self.approvals.lock()?;
-        let Some(a) = approvals
-            .values_mut()
-            .filter(|a| rules::usable(a, chain_id, lease, call_hash, now))
-            .min_by(|a, b| a.created_at.cmp(&b.created_at))
-        else {
-            return Ok(None);
-        };
-        a.state = ApprovalState::Consumed;
-        a.consumed_by = Some(decision_id.to_owned());
-        Ok(Some(a.clone()))
-    }
-
-    fn take_approval_by_id(
-        &self,
-        id: &str,
-        chain_id: &LeaseId,
-        lease: &LeaseId,
-        call_hash: &str,
-        decision_id: &str,
-        now: OffsetDateTime,
-    ) -> Result<Option<Approval>, AuditError> {
-        let rows = self.rows.lock()?;
-        if rules::live_lease(lease, rows.get(lease), now).is_err() {
-            return Ok(None);
-        }
-        let mut approvals = self.approvals.lock()?;
-        let Some(a) = approvals
-            .get_mut(id)
-            .filter(|a| rules::usable(a, chain_id, lease, call_hash, now))
-        else {
-            return Ok(None);
-        };
-        a.state = ApprovalState::Consumed;
-        a.consumed_by = Some(decision_id.to_owned());
-        Ok(Some(a.clone()))
-    }
-
-    fn restore_approval(&self, id: &str, decision_id: &str) -> Result<(), AuditError> {
-        if let Some(a) = self.approvals.lock()?.get_mut(id) {
-            if a.state == ApprovalState::Consumed && a.consumed_by.as_deref() == Some(decision_id) {
-                a.state = ApprovalState::Granted;
-                a.consumed_by = None;
-            }
-        }
-        Ok(())
-    }
-
-    fn remove_approval(&self, id: &str) -> Result<(), AuditError> {
-        self.approvals.lock()?.remove(id);
-        Ok(())
-    }
-
-    fn budget_used(&self, charges: &[Charge]) -> Result<Vec<u64>, AuditError> {
-        let mut b = self.budgets.lock()?;
-        let keys = b.keys(charges)?;
-        Ok(keys
-            .iter()
-            .map(|k| b.counters.get(k).copied().unwrap_or(0))
-            .collect())
-    }
-
-    fn charge(
-        &self,
-        decision_id: &str,
-        charges: &[Charge],
-        at: OffsetDateTime,
-    ) -> Result<ChargeOutcome, AuditError> {
-        self.charge_windowed(decision_id, charges, &[], at, false)
-            .map(|(outcome, _)| outcome)
-    }
-
-    fn window_used(&self, windows: &[WindowCharge]) -> Result<Vec<u64>, AuditError> {
-        let mut b = self.budgets.lock()?;
-        let keys = b.window_keys(windows)?;
-        Ok(keys
-            .iter()
-            .map(|k| b.windows.get(k).copied().unwrap_or(0))
-            .collect())
-    }
-
-    fn charge_windowed(
-        &self,
-        decision_id: &str,
-        charges: &[Charge],
-        windows: &[WindowCharge],
-        at: OffsetDateTime,
-        _defer: bool,
-    ) -> Result<(ChargeOutcome, bool), AuditError> {
-        if charges.is_empty() && windows.is_empty() {
-            let none = ChargeOutcome::Charged {
-                used_after: Vec::new(),
-            };
-            return Ok((none, false));
-        }
-        // The lock is held from the check to the write: the memory store's transaction.
-        let mut b = self.budgets.lock()?;
-        if b.log.contains_key(decision_id) || b.window_log.contains_key(decision_id) {
-            return Err(AuditError::Storage(format!(
-                "decision `{decision_id}` is already charged"
-            )));
-        }
-        let window_keys = b.window_keys(windows)?;
-        let keys = b.keys(charges)?;
-        let planned = match plan(&keys, charges, |k| {
-            Ok(b.counters.get(k).copied().unwrap_or(0))
-        })? {
-            Ok(planned) => planned,
-            Err(exhausted) => return Ok((exhausted, false)),
-        };
-        let window_writes = plan_windows(&window_keys, windows, |k| {
-            Ok(b.windows.get(k).copied().unwrap_or(0))
-        })?;
-        if !window_writes.is_empty() {
-            let mut logged = Vec::with_capacity(window_writes.len());
-            for (key, after, amount) in window_writes {
-                b.windows.insert(key.clone(), after);
-                logged.push((key, amount));
-            }
-            b.window_log.insert(decision_id.to_owned(), (logged, None));
-        }
-        if charges.is_empty() {
-            let none = ChargeOutcome::Charged {
-                used_after: Vec::new(),
-            };
-            return Ok((none, false));
-        }
-        let mut log = ChargeLog {
-            charges: Vec::new(),
-            at,
-            refunded_at: None,
-        };
-        for w in planned.writes {
-            if w.key.kind == DISTINCT_VALUE_KIND {
-                *b.holders.entry(w.key.clone()).or_insert(0) += 1;
-            }
-            b.counters.insert(w.key.clone(), w.after);
-            log.charges.push(LoggedCharge {
-                counter: w.key,
-                amount: w.amount,
-            });
-        }
-        b.log.insert(decision_id.to_owned(), log);
-        let outcome = ChargeOutcome::Charged {
-            used_after: planned.used_after,
-        };
-        Ok((outcome, false))
     }
 
     fn prune_user_windows(
@@ -2370,137 +1981,5 @@ impl LeaseStore for MemoryLeaseStore {
             pruned_charges,
             wrapped: gone.len() < max_rows,
         })
-    }
-
-    fn record_hop_limits(&self, lease: &LeaseId, limits: &[HopLimit]) -> Result<(), AuditError> {
-        self.hop_limits
-            .lock()?
-            .insert(lease.clone(), limits.to_vec());
-        Ok(())
-    }
-
-    fn hop_limits(&self, lease: &LeaseId) -> Result<Option<Vec<HopLimit>>, AuditError> {
-        Ok(self.hop_limits.lock()?.get(lease).cloned())
-    }
-
-    fn budget_summary(&self, lease: &LeaseId) -> Result<Vec<CounterSummary>, AuditError> {
-        let b = self.budgets.lock()?;
-        Ok(summarize(
-            b.counters
-                .iter()
-                .filter(|(k, _)| k.lease == lease.0)
-                .map(|(k, v)| (k, *v)),
-        ))
-    }
-
-    fn refund(&self, decision_id: &str, at: OffsetDateTime) -> Result<u64, AuditError> {
-        let mut b = self.budgets.lock()?;
-        let Budgets {
-            counters,
-            log,
-            holders,
-            windows,
-            window_log,
-            ..
-        } = &mut *b;
-        // Per-user windows the decision charged: returned with the rest, each recomputed from
-        // the unrefunded charges left, since a window saturates like run usage.
-        let windowed = match window_log.get(decision_id) {
-            Some((_, Some(_))) => {
-                return Err(AuditError::ChargeRefunded(decision_id.to_owned()));
-            }
-            Some((charged, None)) => Some(charged.clone()),
-            None => None,
-        };
-        let refund_windows =
-            |windows: &mut BTreeMap<WindowKey, u64>,
-             window_log: &mut BTreeMap<String, WindowLog>| {
-                let Some(charged) = &windowed else { return };
-                if let Some(entry) = window_log.get_mut(decision_id) {
-                    entry.1 = Some(at);
-                }
-                for (key, _) in charged {
-                    let total = window_log
-                        .values()
-                        .filter(|(_, refunded)| refunded.is_none())
-                        .flat_map(|(c, _)| c)
-                        .filter(|(k, _)| k == key)
-                        .fold(0u64, |t, (_, a)| t.saturating_add(*a))
-                        .min(WindowCharge::MAX);
-                    windows.insert(key.clone(), total);
-                }
-            };
-        // An entry left empty by a revocation that ended its run's usage charged nothing now.
-        let Some(entry) = log.get_mut(decision_id).filter(|e| !e.charges.is_empty()) else {
-            if windowed.is_none() {
-                return Err(AuditError::UnknownCharge(decision_id.to_owned()));
-            }
-            refund_windows(windows, window_log);
-            return Ok(0);
-        };
-        if entry.refunded_at.is_some() {
-            return Err(AuditError::ChargeRefunded(decision_id.to_owned()));
-        }
-        refund_windows(windows, window_log);
-        let distinct = LimitKind::Distinct.as_str();
-        let mut restored = 0u64;
-        for c in &entry.charges {
-            let key = &c.counter;
-            if key.kind == DISTINCT_VALUE_KIND {
-                // Free the value only when no other unrefunded decision used it (SR-62); the
-                // limit's count moves with it.
-                let left = holders.get_mut(key).map_or(0, |n| {
-                    *n = n.saturating_sub(1);
-                    *n
-                });
-                if left == 0 {
-                    holders.remove(key);
-                    if counters.get(key).is_some_and(|v| *v > 0) {
-                        counters.insert(key.clone(), 0);
-                        let count_key = CounterKey {
-                            kind: distinct,
-                            value: String::new(),
-                            ..key.clone()
-                        };
-                        if let Some(v) = counters.get_mut(&count_key) {
-                            *v = v.saturating_sub(1);
-                        }
-                        restored += 1;
-                    }
-                }
-                continue;
-            }
-            if key.kind == distinct {
-                continue;
-            }
-            if USAGE_KINDS.contains(&key.kind) {
-                continue; // Recomputed below.
-            }
-            if let Some(v) = counters.get_mut(key) {
-                *v = v.saturating_sub(c.amount);
-            }
-            restored += 1;
-        }
-        entry.refunded_at = Some(at);
-        // A run-usage counter saturates at `MAX_LIMIT`, so what one decision logged is not
-        // what it added once the counter was full: recompute it from the decisions left
-        // (fuzzing round 2, FZ2-4).
-        let usage: Vec<CounterKey> = entry
-            .charges
-            .iter()
-            .filter(|c| USAGE_KINDS.contains(&c.counter.kind))
-            .map(|c| c.counter.clone())
-            .collect();
-        for key in usage {
-            let total = log
-                .values()
-                .filter(|e| e.refunded_at.is_none())
-                .flat_map(|e| &e.charges)
-                .filter(|c| c.counter == key)
-                .fold(0u64, |t, c| t.saturating_add(c.amount))
-                .min(MAX_LIMIT);
-            counters.insert(key, total);
-        }
-        Ok(restored)
     }
 }

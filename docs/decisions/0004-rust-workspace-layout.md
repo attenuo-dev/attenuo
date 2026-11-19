@@ -1,7 +1,12 @@
-# ADR-0004: Rust workspace layout
+---
+status: accepted (amended 2026-11-05 and 2026-11-06, see [More Information](#more-information))
+date: 2026-10-22
+decision-makers: [7Mudit]
+consulted: []
+informed: []
+---
 
-- Status: accepted (amended 2026-11-05 and 2026-11-06, see [More Information](#more-information))
-- Date: 2026-10-22
+# ADR-0004. Rust workspace layout
 
 ## Context
 
@@ -112,11 +117,11 @@ Corrections to the update of 2026-11-05:
 - **The pipeline is `authz/`, not `authz.rs` alone.** `e40e3ee` (2026-11-06, #180) split it by stage: `authz.rs` keeps the module documentation and re-exports, and the stages live in `authz/pipeline.rs`, `authorizer.rs`, `labels.rs`, `budgets.rs` and `usage.rs`. The [server design](../design/server.md) already names `authz/pipeline.rs`.
 - **Two files named for keys.** `9023ce5` (2026-11-06) renamed the server's `src/jwks.rs`, which builds the issuer's own JWK Set for `GET /.well-known/jwks.json`, to `src/issuer_keys.rs`, so that it no longer shares a name with the IdP key cache in `src/idp/jwks.rs`. The same commit made `actor`, `clientauth`, `idp`, `replay` and `state` `pub(crate)`.
 
-What the original table says that is no longer true, with the reason where the log, a commit or an ADR gives one:
+What the original table says that is no longer true, with the reason where a commit or an ADR gives one:
 
 1. **Seven crates.** There are eight; `attenuo-bench` (end-to-end latency and throughput, `scripts/bench-e2e.sh`) was added on 2026-10-23 (`75b8625`, the end-to-end latency harness) and drives the release binaries over HTTP, so it needs no workspace dependency.
-2. **`attenuo-token` does ID-JAG and OIDC intake and JWKS fetching.** Both are in `attenuo-server/src/idp/` (`intake.rs`, `jwks.rs`, `claims.rs`), next to the `[[idps]]` configuration and the HTTP client they use; `attenuo-token` keeps minting, verification and detached signatures and has no HTTP client. No log entry records it as a decision: intake was written in the server from its first commit (`4692f75`, 2026-10-22, "feat(server): hop-0 intake from OIDC ID tokens and ID-JAG").
-3. **`attenuo-policy` has a `RelationResolver` trait.** It was never built (`git grep RelationResolver` finds only docs). ReBAC composition stays planned under [ADR-0002](0002-cedar-for-policy.md) and is an open item on the board; policy reload is driven by the server (`POST /admin/policies/reload`).
+2. **`attenuo-token` does ID-JAG and OIDC intake and JWKS fetching.** Both are in `attenuo-server/src/idp/` (`intake.rs`, `jwks.rs`, `claims.rs`), next to the `[[idps]]` configuration and the HTTP client they use; `attenuo-token` keeps minting, verification and detached signatures and has no HTTP client. No separate decision was recorded for it: intake was written in the server from its first commit (`4692f75`, 2026-10-22, "feat(server): hop-0 intake from OIDC ID tokens and ID-JAG").
+3. **`attenuo-policy` has a `RelationResolver` trait.** It was never built (`git grep RelationResolver` finds only docs). ReBAC composition stays planned under [ADR-0002](0002-cedar-for-policy.md) and is not built; policy reload is driven by the server (`POST /admin/policies/reload`).
 4. **`attenuo-audit` is the log and depends only on core.** It depends on `attenuo-token` for `DetachedSigner` and `verify_detached`, which sign and check audit checkpoints with the issuer key (audit hardening, 2026-10-23). It also holds the lease store (`lease`, `approval`, `budget`, `spans`: leases, approvals, run counters and the span index), so the SQLite state of a deployment sits in one crate.
 5. **The verifier is a separate binary entry point.** It is `attenuo audit verify` in the CLI; `--file` checks an export offline with only the JWKS (2026-10-23).
 6. **`attenuo-cli` depends on core and token only and decides nothing.** It also depends on audit (offline `audit verify --file`) and policy (`policy test` and `policy lint`, which run the real `PolicyEngineBuilder` locally). It holds no keys of the server and its online commands decide nothing; the offline commands evaluate policy and verify logs on the operator's machine.

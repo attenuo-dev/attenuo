@@ -16,10 +16,9 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use attenuo_audit::LeaseStore;
+use attenuo_audit::LeaseRegistry;
 use attenuo_core::{AgentId, CapabilitySet, OriginatingUser};
 use attenuo_token::{ExchangeResponse, IssueOptions, MayAct};
-use axum::body::Bytes;
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -27,11 +26,15 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use time::Duration;
 
+use super::extract::Body;
 use super::{
     audit_admin, audit_issuance, no_store, parse_json, register_issued, REASON_ADMIN_ACTION,
 };
 use crate::config::{capability_set, CapSpec, RootGrant};
-use crate::error::ApiError;
+use crate::error::{
+    limit_conflict_detail, limit_split_detail, size_code, ApiError, INVALID_CAPABILITY,
+    LIMIT_CONFLICT_AT_ROOT, LIMIT_SPLIT_AT_ROOT,
+};
 use crate::state::AppState;
 use attenuo_core::Decision;
 
@@ -73,17 +76,19 @@ pub struct RootTokenRequest {
 /// registered or audited.
 pub async fn mint_root(
     State(state): State<Arc<AppState>>,
+    axum::Extension(who): axum::Extension<crate::operators::AdminIdentity>,
     headers: axum::http::HeaderMap,
-    body: Bytes,
+    Body(body): Body,
 ) -> Result<Response, ApiError> {
     let req: RootTokenRequest = parse_json(&body)?;
     state
-        .blocking(move |s| mint_root_sync(s, &headers, req))
+        .blocking(move |s| mint_root_sync(s, &who, &headers, req))
         .await
 }
 
 fn mint_root_sync(
     state: &AppState,
+    who: &crate::operators::AdminIdentity,
     headers: &axum::http::HeaderMap,
     req: RootTokenRequest,
 ) -> Result<Response, ApiError> {
@@ -123,18 +128,21 @@ fn mint_root_sync(
         authenticated_at: now,
         attributes,
     };
-    let issued = state.issuer.issue_root_with(
-        user,
-        AgentId::new(req.agent.clone()),
-        capabilities,
-        ttl,
-        now,
-        &IssueOptions {
-            may_act,
-            not_after: None,
-            cnf,
-        },
-    )?;
+    let issued = state
+        .issuer
+        .issue_root_with(
+            user,
+            AgentId::new(req.agent.clone()),
+            capabilities,
+            ttl,
+            now,
+            &IssueOptions {
+                may_act,
+                not_after: None,
+                cnf,
+            },
+        )
+        .map_err(crate::error::mint_refusal)?;
     register_issued(
         state,
         &issued.token,
@@ -154,6 +162,7 @@ fn mint_root_sync(
         .and_then(|_| {
             audit_admin(
                 state,
+                who,
                 "admin.root_token",
                 Decision::Allow,
                 REASON_ADMIN_ACTION,
@@ -167,7 +176,7 @@ fn mint_root_sync(
         return Err(e);
     }
     tracing::warn!(
-        subject = ?req.subject,
+        subject = ?state.pipeline.subject_log().show(&req.subject),
         agent = ?req.agent,
         lease = %issued.lease.0,
         "dev root token minted (no user credential verified)"
@@ -176,6 +185,10 @@ fn mint_root_sync(
     no_store(out.headers_mut());
     Ok(out)
 }
+
+/// `code` of a request that asks for more than its `[[root_grants]]` entry allows (as at hop-0
+/// intake).
+const SCOPE_EXCEEDS_GRANT: &str = "scope_exceeds_grant";
 
 /// What a grant allows: capabilities, attributes, `may_act`.
 type Granted = (CapabilitySet, BTreeMap<String, Value>, Option<MayAct>);
@@ -188,10 +201,12 @@ fn resolve_grant(grants: &[RootGrant], req: &RootTokenRequest) -> Result<Granted
         .as_deref()
         .map(capability_set)
         .transpose()
-        .map_err(|e| ApiError::bad_request("invalid_scope", e))?;
+        .map_err(|e| ApiError::bad_request("invalid_scope", e).with_code(INVALID_CAPABILITY))?;
     if grants.is_empty() {
-        let caps = requested
-            .ok_or_else(|| ApiError::bad_request("invalid_request", "capabilities are required"))?;
+        let caps = requested.ok_or_else(|| {
+            ApiError::bad_request("invalid_request", "capabilities are required")
+                .with_code(super::token::NO_CAPABILITIES_REQUESTED)
+        })?;
         return Ok((caps, BTreeMap::new(), req.may_act.clone()));
     }
     let grant =
@@ -208,9 +223,27 @@ fn resolve_grant(grants: &[RootGrant], req: &RootTokenRequest) -> Result<Granted
     let ceiling = capability_set(&grant.capabilities).map_err(ApiError::internal)?;
     let caps = match requested {
         None => ceiling,
-        Some(r) => ceiling
-            .attenuate(&r)
-            .map_err(|e| ApiError::bad_request("invalid_scope", e.to_string()))?,
+        // `attenuate_root`: a limit of the grant bounds one capability of the root token
+        // (SR-121), and each of the grant's limited capabilities over a requested one bounds it
+        // (SR-128).
+        Some(r) => ceiling.attenuate_root(&r).map_err(|e| match e {
+            attenuo_core::AttenuationError::LimitSplit { first, second } => ApiError::bad_request(
+                "invalid_scope",
+                limit_split_detail(&first, &second, "the [[root_grants]] entry"),
+            )
+            .with_code(LIMIT_SPLIT_AT_ROOT),
+            attenuo_core::AttenuationError::LimitConflict { requested } => ApiError::bad_request(
+                "invalid_scope",
+                limit_conflict_detail(&requested, "the [[root_grants]] entry"),
+            )
+            .with_code(LIMIT_CONFLICT_AT_ROOT),
+            attenuo_core::AttenuationError::TooLarge(e) => {
+                ApiError::bad_request("invalid_scope", e.to_string()).with_code(size_code(&e))
+            }
+            e => {
+                ApiError::bad_request("invalid_scope", e.to_string()).with_code(SCOPE_EXCEEDS_GRANT)
+            }
+        })?,
     };
     let may_act = grant.may_act_for(req.may_act.clone()).map_err(|e| {
         ApiError::bad_request("invalid_request", e).with_description("may_act_exceeds_grant")

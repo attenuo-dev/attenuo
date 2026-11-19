@@ -10,6 +10,7 @@ import {
   mcpFetch,
   AttenuoClient,
   AttenuoError,
+  TransportError,
 } from "../src/index.js";
 import { jsonResponse, mockFetch, rpcOk, Signer, tokenResponse, type Seen } from "./helpers.js";
 
@@ -87,6 +88,42 @@ describe("DPoP keys", () => {
       expect(Math.abs(Number(claims.iat) - Date.now() / 1000)).toBeLessThan(5);
       expect(claims.jti).toBeTruthy();
     }
+  });
+
+  it("makes private_key_jwt client assertions", async () => {
+    const ed = await DpopKey.generate();
+    const key = await DpopKey.fromJwk({ ...ed.privateJwk(), kid: "coder-1" });
+    expect(key.kid).toBe("coder-1");
+    const a = await key.clientAssertion("coder", "https://attenuo.example", { iat: 1_000_000 });
+    const [h, p, s] = a.split(".") as [string, string, string];
+    const header = JSON.parse(Buffer.from(h, "base64url").toString()) as Json;
+    const claims = JSON.parse(Buffer.from(p, "base64url").toString()) as Json;
+    expect(header).toEqual({ alg: "EdDSA", typ: "client-authentication+jwt", kid: "coder-1" });
+    const pub = await crypto.subtle.importKey(
+      "jwk",
+      { ...ed.publicJwk } as JsonWebKey,
+      "Ed25519",
+      false,
+      ["verify"],
+    );
+    expect(
+      await crypto.subtle.verify("Ed25519", pub, unb64(s), new TextEncoder().encode(`${h}.${p}`)),
+    ).toBe(true);
+    expect(claims).toMatchObject({
+      iss: "coder",
+      sub: "coder",
+      aud: "https://attenuo.example",
+      iat: 1_000_000,
+      exp: 1_000_060,
+    });
+    const b = await key.clientAssertion("coder", "x", { kid: "other", lifetime: 30 });
+    const hb = JSON.parse(Buffer.from(b.split(".")[0]!, "base64url").toString()) as Json;
+    const pb = JSON.parse(Buffer.from(b.split(".")[1]!, "base64url").toString()) as Json;
+    expect(hb.kid).toBe("other");
+    expect(Number(pb.exp) - Number(pb.iat)).toBe(30);
+    expect(pb.jti).not.toBe(claims.jti);
+    const noKid = await ed.clientAssertion("c", "a");
+    expect(Buffer.from(noKid.split(".")[0]!, "base64url").toString()).not.toContain("kid");
   });
 
   it("refuses public, mismatched and unsupported keys", async () => {
@@ -308,6 +345,22 @@ describe("DPoP server nonces", () => {
     expect(claims.htu).toBe(`${BASE}/mcp/github`);
   });
 
+  it("sends an exchange's client assertion again on the nonce retry", async () => {
+    // `use_dpop_nonce` leaves the assertion unused (the server checks the header proof first),
+    // so the retry sends the same body, assertion included, with a new proof.
+    const key = await DpopKey.generate();
+    const child = await bound(key.thumbprint, ["planner", "coder"]);
+    const server = nonceServer(okForEveryRoute(child));
+    const { fetch, calls } = mockFetch(server.handler);
+    const ob = new AttenuoClient(BASE, { fetch, dpopKey: key });
+    const assertion = await (await DpopKey.generate()).clientAssertion("reviewer", "https://a");
+    await ob.exchange(child, "reviewer", ["github:read_file"], { clientAssertion: assertion });
+    expect(server.state.seen).toEqual([undefined, "n-1"]);
+    const [first, retry] = calls as [Seen, Seen];
+    expect(retry.body).toEqual(first.body);
+    expect((first.body as { client_assertion: string }).client_assertion).toBe(assertion);
+  });
+
   it("retries only once", async () => {
     const key = await DpopKey.generate();
     const child = await bound(key.thumbprint);
@@ -399,7 +452,10 @@ describe("DPoP server nonces", () => {
     };
     const { fetch, calls } = mockFetch((seen) => (fail ? fail() : server.handler(seen)));
     const ob = new AttenuoClient(BASE, { fetch, dpopKey: key });
-    await expect(ob.callTool(child, "github", "read_file")).rejects.toThrow(TypeError);
+    // The client wraps fetch's TypeError in a TransportError (its cause).
+    const first = await ob.callTool(child, "github", "read_file").catch((e: unknown) => e);
+    expect(first).toBeInstanceOf(TransportError);
+    expect((first as TransportError).cause).toBeInstanceOf(TypeError);
     expect(calls).toHaveLength(1);
 
     fail = undefined;
@@ -409,7 +465,9 @@ describe("DPoP server nonces", () => {
       return server.handler(seen);
     });
     const ob2 = new AttenuoClient(BASE, { fetch: drops.fetch, dpopKey: key });
-    await expect(ob2.callTool(child, "github", "read_file")).rejects.toThrow(TypeError);
+    const second = await ob2.callTool(child, "github", "read_file").catch((e: unknown) => e);
+    expect(second).toBeInstanceOf(TransportError);
+    expect((second as TransportError).cause).toBeInstanceOf(TypeError);
     expect(drops.calls).toHaveLength(3);
 
     const aborts = mockFetch((seen) => {

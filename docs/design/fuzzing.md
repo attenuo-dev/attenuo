@@ -1,6 +1,6 @@
 # Fuzzing
 
-- Status: first campaign 2026-10-23 (`test/fuzz-targets`); second campaign, 10 minutes per target, 2026-10-23 evening (below); round 2 over run limits, budgets, approval tokens, the usage walker and the server routes, 2026-10-24 ([write-up](../research/fuzzing-2026-10-24-round2.md)); round 3 over the pass 7 SSE parsing (`SseFramer`, `SseRewriter`, `parse_data`, the stream-end scan and rewrite), 2026-10-25 ([write-up](../research/fuzz-round-3-2026-10-25.md)); `decimal` and `set<decimal>` inputs in `policy_context`, checked against an exact-digit oracle, 2026-11-06 (`fuzz/policy-context-decimal`, 300 s, 424 k runs, no crash; the order of `Outcome::policy_ids` varies between identical calls)
+- Status: first campaign 2026-10-23 (`test/fuzz-targets`); second campaign, 10 minutes per target, 2026-10-23 evening (below); round 2 over run limits, budgets, approval tokens, the usage walker and the server routes, 2026-10-24 ([write-up](../research/fuzzing-2026-10-24-round2.md)); round 3 over the pass 7 SSE parsing (`SseFramer`, `SseRewriter`, `parse_data`, the stream-end scan and rewrite), 2026-10-25 ([write-up](../research/fuzz-round-3-2026-10-25.md)); `decimal` and `set<decimal>` inputs in `policy_context`, checked against an exact-digit oracle, 2026-11-06 (`fuzz/policy-context-decimal`, 300 s, 424 k runs, no crash; the order of `Outcome::policy_ids` varies between identical calls); the prepared implication and the hop-0 split rule, `capability_prepared` and `capability_attenuate_root`, 2026-11-15 ([below](#prepared-implication-and-hop-0-2026-11-15)); the ID-JAG ceiling, `idjag_ceiling`, 2026-11-15 ([below](#id-jag-ceiling-2026-11-15))
 - Crate: `fuzz/` (cargo-fuzz, libFuzzer), outside the workspace
 - Related: [threat model](../spec/threat-model.md), [security review pass 3](../research/security-review-2026-10-23.md)
 
@@ -10,8 +10,8 @@ How to run them, and a table of targets, is in [`fuzz/README.md`](https://github
 
 ## Design
 
-- **cargo-fuzz on nightly, outside the workspace.** libFuzzer needs `-Zsanitizer` and coverage flags only nightly has, so `fuzz/` is excluded from the root workspace (`exclude = ["fuzz"]`) and has its own `Cargo.lock`. `cargo clippy --workspace`, `cargo test --workspace` and `cargo deny check` do not see it. CI builds it on nightly (job `fuzz-build`).
-- **Public APIs only, with one exception.** Until round 3 no crate exposed anything new for fuzzing. Round 3 reaches the crate-private SSE helpers through `attenuo_proxy::fuzzing`, a `#[doc(hidden)]` module of thin wrappers behind the `fuzzing` cargo feature that only `fuzz/Cargo.toml` turns on; it is not an API. The proxy target drives `attenuo_proxy::router` through `tower::ServiceExt::oneshot` with a small `Authorizer` and an in-process upstream; the DPoP target calls both `attenuo_token::dpop::verify_proof` and the server's `Dpop::verify`.
+- **cargo-fuzz on nightly, outside the workspace.** libFuzzer needs `-Zsanitizer` and coverage flags only nightly has, so `fuzz/` is excluded from the root workspace (`exclude = ["fuzz"]`) and has its own `Cargo.lock`. `cargo clippy --workspace`, `cargo test --workspace` and `cargo deny check` do not see it. CI builds it on nightly (job `fuzz-build`), and compiles it on stable with `--cfg fuzzing` and `--locked` on every pull request that can change Rust (job `fuzz-check`), so a library change cannot break a target or leave its lockfile stale unnoticed.
+- **Public APIs only, with two exceptions.** Until round 3 no crate exposed anything new for fuzzing. Round 3 reaches the crate-private SSE helpers through `attenuo_proxy::fuzzing`, a `#[doc(hidden)]` module of thin wrappers behind the `fuzzing` cargo feature that only `fuzz/Cargo.toml` turns on; it is not an API. `attenuo_server::fuzzing` does the same for the ID-JAG ceiling (`IdJagCeiling::from_config` and `apply`, and the hop-0 narrowing of `intake::narrow` once the ceiling is looked up). The proxy target drives `attenuo_proxy::router` through `tower::ServiceExt::oneshot` with a small `Authorizer` and an in-process upstream; the DPoP target calls both `attenuo_token::dpop::verify_proof` and the server's `Dpop::verify`.
 - **Properties, not only crashes.** "No panic" finds overflow and `expect` bugs. Most targets also assert a property the code is supposed to guarantee: an accepted chain narrows at every hop; `child ⊆ parent` means every call the child permits is permitted by the parent; nothing reaches the upstream that the chain does not permit; a verified audit export has not changed a countersigned entry.
 - **Structured inputs.** Random bytes rarely get past a signature check. The token, DPoP and audit targets start from a valid object (a token minted by an issuer with a fixed key, a signed export) and mutate it, re-signing where the attacker model allows: a holder of a second issuer key can re-sign the JWT but not `ou_sig`, a holder of the DPoP key can sign any proof, an attacker without the checkpoint key can re-hash the audit chain but not re-sign checkpoints.
 - **Overflow checks on.** cargo-fuzz builds with debug assertions, so integer overflow panics instead of wrapping silently.
@@ -69,6 +69,88 @@ Same container (4 vCPU, shared with other builds), `-s none`, `-timeout=20`, eac
 | `token_verify_mutated` | 78,851 | 4,233 |
 
 The spread in run counts is the targets' setup cost, as in the first campaign: `token_verify_mutated` signs and parses a whole token per input and `proxy_jsonrpc` makes an HTTP round trip. Ten minutes is still short for the slow targets; a campaign on a dedicated machine should give those an hour or more. Corpora were not kept.
+
+## Prepared implication and hop 0 (2026-11-15)
+
+Two targets over the code merged on 2026-11-14: the prepared implication of SR-123 (#329) and the hop-0 split rule of SR-121 (#328).
+
+- `capability_prepared` asks each question twice. The core compares small constraints and sets pair by pair and larger ones through `capability/prepared.rs`; both are private, so the target reaches them by size. Its reference (`fuzz/src/caps.rs`) splits every `one_of` into its values, so the core only ever answers it on the pairwise path, and each set check runs again with the parent padded by a capability that covers nothing but is too large for the pairwise path. It also checks that `jcs::value_key` is equal exactly when `jcs::value_eq` is, on values `serde_json` parses from generated text, and that `validate_size` refuses exactly at the documented bounds.
+- `capability_attenuate_root` checks `attenuate_root` against `attenuate` and against a reference written from its documentation. Since SR-128's fix the rule is checked against every limited grant capability that covers a request's calls: each covers the calls of at most one result capability, whose limits are within it, and `LimitConflict` is answered only when one capability cannot carry their limits. A limited grant capability that only overlaps a request is outside it, by design.
+
+Before the runs, each target was checked against a bug planted in the core for the check and then taken out again, one at a time: a `>` turned into `>=` in the path summary, the `keys.len() == 1` test dropped from the `one_of` against `equals` arm, `MAX_CONSTRAINTS` refused one early, and the split check turned off. Each was caught within three minutes. The first one was missed until the generator was biased towards lists of a single kind (all paths, all strings, all integers), so how well a generator reaches the summaries matters as much as the run time.
+
+Same 4 vCPU container, `-s none`, `-timeout=20`, one target at a time, on `cb99e91a` with the targets added. Each started from the corpus of a short trial run. No crash, no timeout and no property violation.
+
+| Target | Run (s) | Runs | Edges (`cov:`) |
+| --- | ---: | ---: | ---: |
+| `capability_prepared` | 600 | 1,085,986 | 4,586 |
+| `capability_attenuate_root` | 600 | 714,282 | 4,048 |
+| `capability_attenuation` (again, the code under it changed) | 300 | 2,103,562 | 1,961 |
+| `limits_charges` (again) | 300 | 498,743 | 4,718 |
+
+The slowest input of `capability_prepared` took 10 s. Its `one_of` values come from the shared JSON generator, which can repeat a string of 9 KB 2,000 times in one value, and the reference clones each value once per comparison. That is the size of the generated input, not a cost of the code under test: a request body that large would be over the server's 2 MiB limit. The ID-JAG ceiling (`IdJagCeiling::apply`, the intake narrowing) was not fuzzed by these targets. It is crate-private in `attenuo-server`, which had no `fuzzing` feature then, and reaching it over HTTP would need an IdP key server and signed ID-JAGs in the harness. It is fuzzed since #339 ([below](#id-jag-ceiling-2026-11-15)).
+
+## ID-JAG ceiling (2026-11-15)
+
+`idjag_ceiling` covers the code that #338 left out: `[idps.id_jag_ceiling]` (`idp/ceiling.rs`, `IdJagCeiling::from_config` and `apply`) and the hop-0 narrowing under it (`intake::narrow`). Two security passes found three problems there (SR-121's route through the ceiling, SR-127, SR-129). The code is crate-private, so attenuo-server now has a `fuzzing` feature, off by default and enabled only by `fuzz/Cargo.toml`, with a `#[doc(hidden)]` module `attenuo_server::fuzzing` of three thin wrappers: building the ceiling from its config, `apply`, and the narrowing. The narrowing wrapper calls `intake::narrow_with`, which is `narrow` after the ceiling is looked up. `narrow` itself now only looks the ceiling up and calls it, so the target runs the server's code and has no copy of its logic. `--all-features` builds the module, and clippy and the docs stay clean with it.
+
+Generated inputs: a config whose `resources` and `scopes` map to small capability sets, some with limits; a root grant, some of its capabilities limited; the three claims (`scope` with repeated tokens and odd whitespace, `resource` as a string or an array with repeats and non-strings, `authorization_details` with the right and the wrong `type`, capabilities with and without limits, and malformed members); and a request. Half the inputs are shaped to reach the narrow path: a broad grant, both `scope` and `authorization_details` present, the details built under the `scopes` entries the claim names, and a request with one capability per named one or two per named one. Without that shaping, fewer than one input in a thousand passed every check with a limited step between, and no planted bug in the step check was caught in ten minutes.
+
+The properties are listed in the target's header. In short: an accepted config is built whole; the ceiling and every recorded step are within the grant; a claim with repeated or reordered values gives the same ceiling as its distinct set, and costs at most 80 more heap allocations in `apply` (SR-129 was a cost bug, which equal answers alone do not show); every recorded step holds a limit; a narrowed result is within the grant, the final ceiling, every recorded step and what every claim with limits named, and each limited capability of any of them that covers a result capability's calls covers those of at most one, whose limits are within it (SR-121, SR-127, SR-128); the request's order does not change the answer. The budget property is stronger than the split rule: for each limited capability of the grant, and of a `scopes` entry the claim names, the `calls` figures of the result capabilities whose calls it covers add up to at most its own, and so do their `sum` figures on its argument. `calls_per` and `distinct` are left out because a per-value bound does not add up. It is checked on every input: for the grant since SR-128's fix, and for `scopes` since SR-131's. Before SR-131's fix the `scopes` half held only in a mode where no two limited capabilities overlap, because `meet` keeps a grant capability that a limited `scopes` capability covers with its own limits, and the `scopes` capability was then in no set the server checked; stating the property on every input is how SR-131 was found. A third of the inputs still use that mode (limited capabilities on their own servers, `authorization_details` without limits), where many more requests are accepted. Not covered, by design: a capability without limits that only overlaps a limited one gives its calls without the limit, which is how a grant read as a union has always worked.
+
+Before the run, four bugs were planted one at a time and then taken out. The time is the fuzzing time until the first violation (runs over the run rate), from a fresh corpus, after a build of about two minutes. These runs were made before the 2 MiB skip described below was added; it skips only inputs far larger than any of those.
+
+| Planted bug | Caught by | Runs | About |
+| --- | --- | ---: | ---: |
+| (a) the per-step loop in `narrow` removed (SR-127 back) | split rule, at a recorded step | 7,111 | 2 s |
+| (a) again, with the step clause of the split rule off | budget (a `scopes` `calls` of 3 spent 12 times) | 19,690 | 5 s |
+| (b) the de-duplication of SR-129 removed | allocation bound (4,604 against 4,304) | 80,027 | 23 s |
+| (c) `meet` keeping the claim's limits instead of the clamped ones | the ceiling not within a recorded step | 8,690 | 3 s |
+| (d) the split check against the final ceiling made a no-op | split rule, at the final ceiling | 187,766 | 100 s |
+
+Property 3 alone (equal ceilings) does not see (b): the result is the same set, only slower to build. The allocation count does, because without the de-duplication each repeat clones the capabilities its token maps to. The first version of (d) took longer than five minutes, until the request generator also made pairs of capabilities under one named capability.
+
+The run: same 4 vCPU container, `-s none`, `-timeout=20`, on `8c077d08` with the target added, from an empty corpus. No crash, no timeout and no property violation.
+
+| Target | Run (s) | Runs | Edges (`cov:`) | Features (`ft:`) | Corpus | Crashes |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `idjag_ceiling` | 900 | 999,975 | 6,073 | 31,928 | 6,534 | 0 |
+| `idjag_ceiling`, an earlier run before the 2 MiB skip | 900 | 840,676 | 5,980 | 31,111 | 6,214 | 0 |
+
+The run rate fell from about 2,900 a second to 1,100 as the corpus grew to longer inputs; peak RSS was 695 MB. libFuzzer reported no input of 10 s or more.
+
+Inputs whose request and claims are over 2 MiB of JSON are skipped. The server refuses a body that large, and the earlier run spent 13 s on one input with a 36 MB request, 2.2 s of it in the narrowing, which grows with the size of the input. Fifteen minutes on one VM shows that the properties hold on what this generator reaches in that time. It does not show that they hold everywhere. The generator decides most of what is reached: the step check was out of reach until the inputs were shaped.
+
+## All targets, 5 minutes each (2026-11-15)
+
+Every target in `cargo fuzz list` (22) was run once on `main` at #339, one at a time, on the 4 vCPU VM used for the runs above: `cargo +nightly fuzz run <target> -s none -- -max_total_time=300 -timeout=20`, each from an empty corpus. No target crashed, timed out or reported a property violation, and no artifact was written. Together they executed 191,805,781 inputs.
+
+| Target | Runs | `cov:` |
+|---|---:|---:|
+| `approval_token` | 234,490 | 4,531 |
+| `audit_export_bytes` | 21,321,638 | 1,125 |
+| `audit_export_mutated` | 714,525 | 3,025 |
+| `budget_plan` | 104,664 | 3,437 |
+| `capability_attenuate_root` | 831,065 | 4,040 |
+| `capability_attenuation` | 1,927,373 | 1,953 |
+| `capability_prepared` | 565,240 | 4,569 |
+| `chain_validate` | 38,409,186 | 1,822 |
+| `dpop_proof` | 2,548,945 | 1,767 |
+| `idjag_ceiling` | 444,950 | 5,943 |
+| `limits_charges` | 261,951 | 4,406 |
+| `names` | 57,256,050 | 155 |
+| `ou_sig` | 836,829 | 2,478 |
+| `policy_context` | 491,738 | 6,904 |
+| `policy_usage` | 251,958 | 8,247 |
+| `proxy_jsonrpc` | 746,142 | 9,020 |
+| `proxy_sse` | 3,829,163 | 1,827 |
+| `server_http` | 277,077 | 24,625 |
+| `sse_framer_rewriter` | 1,556,131 | 2,218 |
+| `sse_parse_data` | 13,857,804 | 1,724 |
+| `token_verify_bytes` | 45,294,456 | 1,123 |
+| `token_verify_mutated` | 44,406 | 4,127 |
+
+Five minutes from an empty corpus is a smoke run: it shows that nothing shallow broke in the targets' reach after the changes of 14 November, and nothing more. The slow targets (`token_verify_mutated`, `budget_plan`, `approval_token`) got the fewest inputs.
 
 ## Limits
 

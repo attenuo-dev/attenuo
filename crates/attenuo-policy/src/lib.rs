@@ -29,6 +29,12 @@
 //! for, and every argument of a tool evaluated under [`UnknownTools::Sensitive`] or
 //! [`UnknownTools::Allow`], are passed to Cedar unchecked.
 //!
+//! Before the capability stage, a call with a top-level argument name that differs only in
+//! case from a name the decision reads for the tool (its catalog entry, a constraint or run
+//! limit of a capability that covers it, a name a loaded policy reads) without being that name
+//! is denied with reason `argument_case_mismatch` (SR-133): an upstream that ignores case would
+//! read it as the name every check saw absent.
+//!
 //! # Request shape
 //!
 //! The Cedar request mirrors the shape used by AWS Bedrock AgentCore policies, so policies
@@ -247,6 +253,7 @@
     clippy::cast_possible_wrap
 )]
 
+mod arg_names;
 pub mod authzen;
 mod catalog;
 mod lint;
@@ -259,7 +266,7 @@ mod usage;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use attenuo_core::{Decision, DelegationChain, ToolCall};
 use cedar_policy::{
@@ -308,6 +315,13 @@ pub const REASON_ATTRIBUTE_TYPE_MISMATCH: &str = "attribute_type_mismatch";
 /// Reason code when a call argument does not have the type the catalog declares for it
 /// ([`ToolAttrs::inputs`]). Decided before Cedar, so never `policy_error`.
 pub const REASON_INPUT_TYPE_MISMATCH: &str = "input_type_mismatch";
+
+/// Reason code when a top-level argument name differs only in case from a name the decision
+/// reads for the tool (its catalog entry, a constraint or run limit of a capability that
+/// covers it, or a loaded policy) without being that name. An upstream that matches names
+/// without regard to case (Go's `encoding/json`) would read it as the name the checks saw
+/// absent (SR-133). Decided before the capability stage.
+pub const REASON_ARGUMENT_CASE_MISMATCH: &str = "argument_case_mismatch";
 
 /// Reason code when Cedar denies only through forbids annotated `@obligation("approval")`
 /// and would allow without them (ADR-0009). Always a deny.
@@ -765,6 +779,7 @@ impl PolicyEngineBuilder {
             policies_read_user_window: loaded.reads_user_window,
             policies_read_session_id: loaded.reads_session_id,
             policies_read_arg_taint: loaded.reads_arg_taint,
+            policy_arg_names: loaded.arg_names,
             catalog_names_usage,
             track_usage: self.track_usage,
             schema,
@@ -776,7 +791,7 @@ impl PolicyEngineBuilder {
             unknown_tools: self.unknown_tools,
             legacy_bare_actions: self.legacy_bare_actions,
             annotation_import: self.annotation_import,
-            narrowed: RwLock::new(HashMap::new()),
+            narrowed: Arc::new(RwLock::new(HashMap::new())),
             authorizer: Authorizer::new(),
             validation_warnings,
             request_cache: request::RequestCache::new(request::REQUEST_CACHE_CAPACITY),
@@ -801,6 +816,8 @@ struct LoadedPolicies {
     /// Some policy may read `context.args_contain_untrusted`, `context.untrusted_args` or
     /// `context.untrusted_outbound` ([`PolicyEngine::reads_arg_taint`]).
     reads_arg_taint: bool,
+    /// The argument names the policies read (`context.input`, `context.untrusted_args`).
+    arg_names: arg_names::PolicyArgNames,
 }
 
 /// The forbids annotated `@obligation("approval")`, and the policy set without them, used to
@@ -899,7 +916,9 @@ fn load_policies(text: &str, schema: &Schema) -> Result<LoadedPolicies, PolicyEr
         }
         Some(set)
     };
+    let arg_names = arg_names::PolicyArgNames::of(&policies).map_err(PolicyError::Parse)?;
     Ok(LoadedPolicies {
+        arg_names,
         reads_usage: policies_read_usage(&policies),
         reads_user_window: policies_read_user_window(&policies),
         reads_session_id: usage::policies_read_context_attr(&policies, "session_id"),
@@ -1052,8 +1071,10 @@ pub struct PolicyEngine {
     legacy_bare_actions: bool,
     annotation_import: AnnotationImport,
     /// Narrowing imported from MCP tool annotations, per catalog tool (sticky; bounded by the
-    /// catalog). Empty unless `annotation_import` is `Narrowing`.
-    narrowed: RwLock<HashMap<(String, String), Narrowing>>,
+    /// catalog). Empty unless `annotation_import` is `Narrowing`. Shared with the engines
+    /// [`with_policies_reloaded`](PolicyEngine::with_policies_reloaded) builds from this one (the
+    /// catalog is the same), so a narrowing imported into either is never lost by a reload.
+    narrowed: Arc<RwLock<HashMap<(String, String), Narrowing>>>,
     authorizer: Authorizer,
     validation_warnings: Vec<String>,
     request_cache: request::RequestCache,
@@ -1070,6 +1091,9 @@ pub struct PolicyEngine {
     /// Some loaded policy may read `context.args_contain_untrusted`,
     /// `context.untrusted_args` or `context.untrusted_outbound`; recomputed on reload.
     policies_read_arg_taint: bool,
+    /// The argument names the loaded policies read, for the argument name check (stage 0a);
+    /// recomputed on reload.
+    policy_arg_names: arg_names::PolicyArgNames,
     /// The catalog declares `amount` or `destination` for some tool.
     catalog_names_usage: bool,
     track_usage: TrackUsage,
@@ -1103,6 +1127,17 @@ impl PolicyEngine {
         // client, and `/` in a server name would make the action and resource ids ambiguous.
         if let Err(e) = call.check_names() {
             return Outcome::deny(REASON_INVALID_NAME, vec![e.to_string()]);
+        }
+
+        // Stage 0a: argument names (SR-133). Every stage below reads arguments by exact name,
+        // and an upstream that ignores case would read `Path` as the `path` they saw absent.
+        if let Err(e) = arg_names::check(
+            call,
+            chain,
+            self.catalog.entry(&call.server, &call.tool),
+            &self.policy_arg_names,
+        ) {
+            return Outcome::deny(REASON_ARGUMENT_CASE_MISMATCH, vec![e]);
         }
 
         // Stage 1: capabilities.
@@ -1385,29 +1420,61 @@ impl PolicyEngine {
     }
 
     /// Replace the policy set. The new policies are parsed and validated against the engine's
-    /// schema first; on error the previous policies stay in force.
+    /// schema first; on error the previous policies stay in force. Same as replacing the
+    /// engine with [`with_policies_reloaded`](Self::with_policies_reloaded).
     ///
     /// # Errors
     ///
     /// As for the policies in [`PolicyEngineBuilder::build`]: [`PolicyError::Parse`],
     /// [`PolicyError::Validation`] or [`PolicyError::Obligation`]. The engine is unchanged.
     pub fn reload_policies_str(&mut self, policies: &str) -> Result<(), PolicyError> {
-        let loaded = load_policies(policies, &self.schema)?;
-        self.policies = loaded.policies;
-        self.obligations = loaded.obligations;
-        self.validation_warnings = loaded.warnings;
-        self.validation_warnings.extend(self.catalog.warnings());
-        self.policies_read_usage = loaded.reads_usage;
-        self.policies_read_user_window = loaded.reads_user_window;
-        self.policies_read_session_id = loaded.reads_session_id;
-        self.policies_read_arg_taint = loaded.reads_arg_taint;
-        // The cached request parts do not depend on the policies, but a reload is the
-        // operator's "start from scratch", so it starts with an empty cache too.
-        self.request_cache.clear();
-        // A new policy set may hide or show other tools.
-        self.generation += 1;
-        self.screen_memo.clear();
+        *self = self.with_policies_reloaded(policies)?;
         Ok(())
+    }
+
+    /// A new engine with `policies` in place of this one's policy set, and everything else
+    /// (schema, catalog, settings, imported annotation narrowing) as here. It only reads
+    /// `self`, so a server compiles a reload without holding any lock and then swaps the new
+    /// engine in whole: a decision sees either the old engine or the new one, never a mix.
+    /// The new engine starts with empty caches and the next
+    /// [`policy_generation`](Self::policy_generation). The narrowing imported from tool
+    /// annotations is shared, not copied: an import into either engine holds for both.
+    ///
+    /// # Errors
+    ///
+    /// As for the policies in [`PolicyEngineBuilder::build`]: [`PolicyError::Parse`],
+    /// [`PolicyError::Validation`] or [`PolicyError::Obligation`].
+    pub fn with_policies_reloaded(&self, policies: &str) -> Result<PolicyEngine, PolicyError> {
+        let loaded = load_policies(policies, &self.schema)?;
+        let mut validation_warnings = loaded.warnings;
+        validation_warnings.extend(self.catalog.warnings());
+        Ok(PolicyEngine {
+            schema: self.schema.clone(),
+            schema_text: self.schema_text.clone(),
+            policies: loaded.policies,
+            obligations: loaded.obligations,
+            catalog: self.catalog.clone(),
+            user_attrs: self.user_attrs.clone(),
+            unknown_tools: self.unknown_tools,
+            legacy_bare_actions: self.legacy_bare_actions,
+            annotation_import: self.annotation_import,
+            narrowed: Arc::clone(&self.narrowed),
+            authorizer: Authorizer::new(),
+            validation_warnings,
+            // The cached request parts do not depend on the policies, but a reload is the
+            // operator's "start from scratch", so it starts with an empty cache too.
+            request_cache: request::RequestCache::new(request::REQUEST_CACHE_CAPACITY),
+            // A new policy set may hide or show other tools.
+            generation: self.generation + 1,
+            screen_memo: screen::ScreenMemo::default(),
+            policies_read_usage: loaded.reads_usage,
+            policies_read_user_window: loaded.reads_user_window,
+            policies_read_session_id: loaded.reads_session_id,
+            policies_read_arg_taint: loaded.reads_arg_taint,
+            policy_arg_names: loaded.arg_names,
+            catalog_names_usage: self.catalog_names_usage,
+            track_usage: self.track_usage,
+        })
     }
 
     /// Ids of the loaded policies (static policies and templates), sorted.

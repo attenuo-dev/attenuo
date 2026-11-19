@@ -230,7 +230,7 @@ pub trait AuditSink: Send + Sync {
     /// before returning, whatever durability the sink runs at: the commit is synced, and with
     /// it every earlier commit to that file, from any connection. The pipeline uses it for a
     /// decision whose `sum` charge left its sync to the append (see
-    /// [`LeaseStore::charge_sync_deferred`](crate::LeaseStore::charge_sync_deferred)). The
+    /// [`RunLimits::charge_sync_deferred`](crate::RunLimits::charge_sync_deferred)). The
     /// default is a plain `append`, right for a sink with nothing to sync.
     ///
     /// # Errors

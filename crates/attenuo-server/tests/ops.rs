@@ -29,10 +29,11 @@ impl Harness {
         cfg.admin.token = Some("admin".into());
         cfg.dev.allow_root_mint = true;
         // Exchanges authenticate as their actor (SR-10).
-        cfg.agents.push(attenuo_server::config::AgentConfig {
-            id: "coder".into(),
-            secret_sha256: hex::encode(sha2::Sha256::digest(CODER_SECRET.as_bytes())),
-        });
+        cfg.agents
+            .push(attenuo_server::config::AgentConfig::with_secret_sha256(
+                "coder",
+                hex::encode(sha2::Sha256::digest(CODER_SECRET.as_bytes())),
+            ));
         let (router, state) = attenuo_server::build(&cfg).unwrap();
         let server = spawn_router(router).await.unwrap();
         Self {
@@ -55,7 +56,7 @@ async fn readyz_ok_when_stores_answer() {
     let body: Value = r.json().await.unwrap();
     assert_eq!(
         body,
-        json!({"ready": true, "checks": {"audit": "ok", "leases": "ok"}})
+        json!({"ready": true, "checks": {"audit": "ok", "audit_append": "ok", "leases": "ok"}})
     );
 }
 
@@ -75,7 +76,7 @@ async fn readyz_503_when_audit_store_fails_but_healthz_stays_ok() {
     // Stable shape, and none of the SQLite error text (SR-38).
     assert_eq!(
         body,
-        json!({"ready": false, "checks": {"audit": "error", "leases": "ok"}})
+        json!({"ready": false, "checks": {"audit": "error", "audit_append": "ok", "leases": "ok"}})
     );
     assert_eq!(h.get("/healthz").await.status(), StatusCode::OK);
 }
@@ -95,8 +96,63 @@ async fn readyz_503_when_lease_store_fails() {
     let body: Value = r.json().await.unwrap();
     assert_eq!(
         body,
-        json!({"ready": false, "checks": {"audit": "ok", "leases": "error"}})
+        json!({"ready": false, "checks": {"audit": "ok", "audit_append": "ok", "leases": "error"}})
     );
+}
+
+/// A-12: a full disk fails appends while reads go on working. Readiness follows the
+/// appends: not ready after a failed one, ready again after the next one that succeeds.
+#[tokio::test]
+async fn readyz_503_while_audit_appends_fail_and_ok_after_the_next_success() {
+    let h = Harness::start().await;
+    // Every insert into the log fails, as on a full disk; the log still reads.
+    h.state
+        .audit
+        .with_connection(|c| {
+            c.execute_batch(
+                "CREATE TRIGGER full_disk BEFORE INSERT ON audit \
+                 BEGIN SELECT RAISE(FAIL, 'database or disk is full'); END;",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        h.get("/readyz").await.status(),
+        StatusCode::OK,
+        "no append yet"
+    );
+    let minted = reqwest::Client::new()
+        .post(h.server.url("/admin/root-token"))
+        .bearer_auth("admin")
+        .json(&json!({"subject": "alice", "issuer": "https://idp.example",
+                      "agent": "planner", "capabilities": ["github:*"]}))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        !minted.status().is_success(),
+        "an unrecorded token is refused"
+    );
+    let r = h.get("/readyz").await;
+    assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(
+        body,
+        json!({"ready": false, "checks": {"audit": "ok", "audit_append": "error", "leases": "ok"}})
+    );
+    // Space is freed: the next append succeeds and readiness comes back with it.
+    h.state
+        .audit
+        .with_connection(|c| {
+            c.execute_batch("DROP TRIGGER full_disk")?;
+            Ok(())
+        })
+        .unwrap();
+    mint_root(&h.server).await;
+    let r = h.get("/readyz").await;
+    assert_eq!(r.status(), StatusCode::OK);
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["checks"]["audit_append"], "ok");
 }
 
 // ---------------------------------------------------------------------------------------------

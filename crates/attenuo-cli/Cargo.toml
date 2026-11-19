@@ -6,7 +6,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-readme.workspace = true
+readme = "README.md"
 rust-version.workspace = true
 keywords = ["mcp", "authorization", "delegation", "agents", "cli"]
 categories = ["command-line-utilities", "authentication"]
@@ -21,10 +21,15 @@ attenuo-token = { workspace = true }
 attenuo-audit = { workspace = true }
 attenuo-policy = { workspace = true }
 anyhow = { workspace = true }
+# The HTTP side of `stdio-bridge`; already in the workspace through the server and the proxy.
+axum = { workspace = true }
 base64 = { workspace = true }
 clap = { workspace = true, features = ["env"] }
+hex = { workspace = true }
 reqwest = { workspace = true }
+ring = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true }
 
@@ -33,5 +38,3 @@ tempfile = { workspace = true }
 attenuo-core = { workspace = true }
 attenuo-server = { path = "../attenuo-server" }
 attenuo-proxy = { workspace = true, features = ["testing"] }
-hex = { workspace = true }
-sha2 = { workspace = true }

@@ -1,7 +1,7 @@
 /**
  * Client for the attenuo server. It mirrors what the `attenuo` CLI does over HTTP:
- * `POST /token`, `POST /token/renew`, `POST /mcp/{server}`, `POST /access/v1/evaluation` and
- * `GET /approvals/{id}`.
+ * `POST /token`, `POST /token/renew`, `POST /mcp/{server}`, `POST /access/v1/evaluation` (and
+ * `/evaluations`), `GET` and `POST /approvals/{id}` and `DELETE /mcp/{server}`.
  */
 
 import type { CapabilityLike } from "./capability.js";
@@ -14,8 +14,14 @@ import {
   type DpopKeyLike,
 } from "./dpop.js";
 import { META_APPROVAL_KEY } from "./approval.js";
-import { ApprovalNotGrantedError, ApprovalRequiredError, AttenuoError } from "./errors.js";
+import {
+  ApprovalNotGrantedError,
+  ApprovalRequiredError,
+  AttenuoError,
+  TransportTimeoutError,
+} from "./errors.js";
 import { Http, type HttpOptions } from "./http.js";
+import { RetryPolicy, retryHooks } from "./retry.js";
 import { bearer, decodeToken, verifyToken, type Jwks, type Token } from "./token.js";
 import { mcpHeaders } from "./mcp.js";
 import { DEFAULT_MAX_EVENT_BYTES, callStream, type StreamEvent } from "./sse.js";
@@ -32,6 +38,23 @@ export interface ClientOptions extends HttpOptions {
    * the latest one, puts it in every proof, and retries a request once on `use_dpop_nonce`.
    */
   dpopKey?: DpopKeyLike;
+  /**
+   * Retry a request the server refused for its load before doing any work, up to this many times
+   * (default 0: off; at most 10): 503 `overloaded` (`UnavailableError`) and 429 `rate_limited`
+   * (`RateLimitedError`). Each retry waits the answer's `Retry-After` (1 s when it has none), up
+   * to 20 % longer so refused clients spread out; a `Retry-After` over `maxRetryDelayMs` is not
+   * waited out and the error is thrown at once, so all retries of one call wait at most
+   * `maxRetries * maxRetryDelayMs`. Every retry is a new request with new DPoP proofs; an
+   * exchange sends its `clientAssertion` again (a refused load leaves it unused), but not once it
+   * has expired: a wait that would reach the assertion's `exp` is not made and the refusal is
+   * thrown at once. Nothing else is retried: not a `request_timeout` (the server may have done
+   * the work), not a denial, not an `UnauthorizedError`, not a transport error. A streamed call is
+   * retried only before its stream starts, and not past its `deadlineMs`; its `signal` aborts the
+   * wait. When the retries run out, the last refusal is thrown.
+   */
+  maxRetries?: number;
+  /** The longest `Retry-After` a retry waits out, in milliseconds (default 10000, at most 300000). */
+  maxRetryDelayMs?: number;
 }
 
 export interface InspectOptions {
@@ -72,8 +95,8 @@ export interface CallToolStreamOptions extends CallToolOptions {
    * A total deadline for the whole call in milliseconds, counted from the request's start
    * (default none). The idle `timeoutMs` restarts on every read, so an upstream that sends only
    * keep-alive comments would hold the stream open forever without it (SR-82). On expiry the
-   * request is aborted and the stream throws `AttenuoError`. At most 2147483647 (`setTimeout`'s
-   * limit).
+   * request is aborted and the stream throws `TransportTimeoutError`. At most 2147483647
+   * (`setTimeout`'s limit).
    */
   deadlineMs?: number;
 }
@@ -95,6 +118,28 @@ export interface CallWithApprovalOptions extends McpOptions, ApprovalWaitOptions
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
+/**
+ * How a call bounds the retry of its request: a streamed call by its deadline, an exchange by
+ * its client assertion's `exp`.
+ */
+interface RetryBound {
+  /** Milliseconds left before the request may no longer be sent, undefined without a bound. */
+  leftMs: () => number | undefined;
+  /** Called before a wait of `ms`, so a streamed call's idle timer allows for it. */
+  waiting?: (ms: number) => void;
+}
+
+/**
+ * `value` as one percent-encoded URL path segment; `.` and `..` are refused because URL
+ * normalization removes them even when encoded (SR-31).
+ */
+function pathSegment(value: string, what: string): string {
+  if (value === "" || value === "." || value === "..") {
+    throw new TypeError(`${what} must be a non-empty name, got ${JSON.stringify(value)}`);
+  }
+  return encodeURIComponent(value);
+}
+
 export class AttenuoClient {
   readonly serverUrl: string;
   /** Default bearer; assign a new one after a re-exchange. */
@@ -104,8 +149,10 @@ export class AttenuoClient {
   private readonly dpopKeyLike: DpopKeyLike | undefined;
   private dpopKeyPromise: Promise<DpopKey | undefined> | undefined;
   private readonly nonce = new NonceCache();
+  private readonly retry: RetryPolicy;
 
   constructor(serverUrl: string, opts: ClientOptions = {}) {
+    this.retry = new RetryPolicy(opts.maxRetries, opts.maxRetryDelayMs);
     this.http = new Http(serverUrl, opts);
     this.serverUrl = this.http.base;
     this.token = opts.token;
@@ -131,24 +178,51 @@ export class AttenuoClient {
       presented(jwt, await this.dpopKey(), method, `${this.serverUrl}${path}`, nonce);
   }
 
-  /** `POST path` with `headers(nonce)`; once more with the server's new nonce on `use_dpop_nonce`. */
+  /**
+   * `POST path` with `headers(nonce)`; once more with the server's new nonce on `use_dpop_nonce`;
+   * again, with new headers, on a load refusal while `maxRetries` allows (`retrying`).
+   */
   private async post(
     path: string,
     headers: (nonce?: string) => Promise<Record<string, string>>,
     json?: unknown,
     method = "POST",
     signal?: AbortSignal,
+    stream?: RetryBound,
   ): Promise<Response> {
     const send = (h: Record<string, string>) =>
       this.http.request(method, path, { headers: h, json, ...(signal ? { signal } : {}) });
-    let res = await send(await headers(this.nonce.value));
-    if ((await this.dpopKey()) !== undefined && (await this.nonce.update(res))) {
+    const once = async () => {
+      let res = await send(await headers(this.nonce.value));
+      if ((await this.dpopKey()) !== undefined && (await this.nonce.update(res))) {
+        await res.body?.cancel();
+        const h = await headers(this.nonce.value);
+        res = await resendOnce(() => send(h));
+        await this.nonce.update(res);
+      }
+      return res;
+    };
+    return this.retrying(once, signal, stream);
+  }
+
+  /**
+   * `send()`, and again after a wait while it answers a load refusal the client's retry policy
+   * retries (`maxRetries`). `signal` aborts the wait; `stream` bounds it by a streamed call's
+   * deadline and tells the call's idle timer about it.
+   */
+  private async retrying(
+    send: () => Promise<Response>,
+    signal?: AbortSignal,
+    stream?: RetryBound,
+  ): Promise<Response> {
+    for (let retries = 0; ; retries++) {
+      const res = await send();
+      const wait = await this.retry.delayMs(res, retries, stream?.leftMs());
+      if (wait === undefined) return res;
       await res.body?.cancel();
-      const h = await headers(this.nonce.value);
-      res = await resendOnce(() => send(h));
-      await this.nonce.update(res);
+      stream?.waiting?.(wait);
+      await retryHooks.sleep(wait, signal);
     }
-    return res;
   }
 
   /**
@@ -197,7 +271,13 @@ export class AttenuoClient {
       if (given !== undefined) body.subject_token_dpop = given;
       return header === undefined ? {} : { dpop: header };
     };
-    return w.tokenFromResponse(await w.jsonBody(await this.post("/token", headers, body)));
+    // A load refusal leaves the assertion unspent, so the retry sends it again, but not once it
+    // has expired: the server would refuse it, so the refusal is thrown instead.
+    const exp = w.assertionExpiry(body);
+    const bound: RetryBound | undefined =
+      exp === undefined ? undefined : { leftMs: () => exp * 1000 - retryHooks.now() };
+    const res = await this.post("/token", headers, body, "POST", undefined, bound);
+    return w.tokenFromResponse(await w.jsonBody(res));
   }
 
   /** Extend the lease of the token's last hop (`POST /token/renew`). */
@@ -274,8 +354,9 @@ export class AttenuoClient {
    * `decisionId` of the proxy's `stream.end` record; any other JSON-RPC error throws what
    * `callTool` throws. A plain JSON answer is yielded as the one final event. An event over
    * `maxEventBytes` throws `AttenuoError`. The client's `timeoutMs` applies between reads, so a
-   * stream quiet for longer is aborted; leaving the loop early closes the connection.
-   * `deadlineMs` bounds the whole call, keep-alives included: on expiry it throws `AttenuoError`.
+   * stream quiet for longer is aborted with a `TransportTimeoutError`; leaving the loop early
+   * closes the connection. `deadlineMs` bounds the whole call, keep-alives included: on expiry it
+   * throws `TransportTimeoutError`. An abort through `signal` is thrown as it came.
    */
   callToolStream(
     token: Token | string | undefined,
@@ -320,25 +401,31 @@ export class AttenuoClient {
     opts.signal?.addEventListener("abort", onAbort, { once: true });
     const ms = this.http.timeoutMs;
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const restart = () => {
+    // The reason the idle timer aborted with, told apart from the caller's own abort by identity:
+    // the client's timeout is a `TransportTimeoutError`, the caller's abort is thrown as it came.
+    let idle: DOMException | undefined;
+    const restart = (extra = 0) => {
       if (ms <= 0) return;
       clearTimeout(timer);
-      timer = setTimeout(
-        () => ctl.abort(new DOMException("no data within the timeout", "TimeoutError")),
-        ms,
-      );
+      timer = setTimeout(() => {
+        idle = new DOMException("no data within the timeout", "TimeoutError");
+        ctl.abort(idle);
+      }, ms + extra);
     };
     // The optional total deadline (SR-82): not restarted by reads, so keep-alives cannot hold
     // the stream open past it. A read that still completes after it throws too.
     const deadlineMs = opts.deadlineMs;
+    const started = Date.now();
     let expired = false;
-    const deadlineError = () => new AttenuoError(`stream deadline of ${deadlineMs}ms elapsed`);
+    const deadlineAbort = new DOMException("stream deadline elapsed", "TimeoutError");
+    const deadlineError = () =>
+      new TransportTimeoutError(`stream deadline of ${deadlineMs}ms elapsed`, deadlineAbort);
     const deadline =
       deadlineMs === undefined
         ? undefined
         : setTimeout(() => {
             expired = true;
-            ctl.abort(deadlineError());
+            ctl.abort(deadlineAbort);
           }, deadlineMs);
     const onChunk = () => {
       if (expired) throw deadlineError();
@@ -346,23 +433,60 @@ export class AttenuoClient {
     };
     try {
       restart();
+      // A load refusal is retried in `post`, before anything of the stream has been yielded.
       const res = await this.post(
         path,
         async (nonce) => ({ ...headers, ...(await auth(nonce)) }),
         body,
         "POST",
         ctl.signal,
+        {
+          leftMs: () => (deadlineMs === undefined ? undefined : started + deadlineMs - Date.now()),
+          waiting: (wait) => restart(wait),
+        },
       );
       onChunk();
       yield* callStream(res, id, maxEventBytes, onChunk);
     } catch (e) {
       if (expired) throw deadlineError();
+      if (idle !== undefined && ctl.signal.reason === idle) {
+        throw new TransportTimeoutError(
+          `POST ${this.serverUrl}${path}: no data within ${ms}ms`,
+          idle,
+        );
+      }
       throw e;
     } finally {
       clearTimeout(timer);
       clearTimeout(deadline);
       opts.signal?.removeEventListener("abort", onAbort);
     }
+  }
+
+  /**
+   * End an MCP session (`DELETE /mcp/{server}` with its `Mcp-Session-Id`). Resolves to `true` when
+   * the upstream closed it, `false` when the upstream does not let clients close sessions (405).
+   * The proxy's refusals throw what a call would (an unknown session is an `RpcError` with code
+   * `-32600`).
+   */
+  async closeSession(
+    token: Token | string | undefined,
+    server: string,
+    sessionId: string,
+  ): Promise<boolean> {
+    if (typeof sessionId !== "string" || sessionId === "") {
+      throw new TypeError("sessionId must be the Mcp-Session-Id to close");
+    }
+    const path = `/mcp/${pathSegment(server, "server")}`;
+    const auth = this.auth(bearer(token, this.token), path, "DELETE");
+    const headers = { accept: w.MCP_ACCEPT, [w.SESSION_HEADER]: sessionId };
+    const res = await this.post(
+      path,
+      async (nonce) => ({ ...headers, ...(await auth(nonce)) }),
+      undefined,
+      "DELETE",
+    );
+    return w.sessionClosed(res);
   }
 
   /** `tools/list`; the proxy shows only the tools this token may call. */
@@ -444,6 +568,35 @@ export class AttenuoClient {
     return this.callTool(token, server, tool, args, retry);
   }
 
+  /**
+   * Grant a pending approval as the run's originating user (`POST /approvals/{id}`,
+   * `by = "user"`); resolves to it. `idToken` is that user's OIDC ID token, sent as a plain
+   * bearer: a delegation token is refused (403 `agent_token_refused`), another user's is 403
+   * `wrong_user`, and an ID token decides once (400 `invalid_grant` after). 409
+   * (`approval_not_pending`, `approval_expired`, `lease_revoked`) when it cannot be decided any
+   * more, 404 when it is unknown; all `ApiError` (`UnauthorizedError` for a 401).
+   */
+  async grantApproval(approvalId: string, idToken: string): Promise<w.Approval> {
+    return this.decideApproval(approvalId, idToken, "grant");
+  }
+
+  /** Decline a pending approval as the run's originating user; errors as `grantApproval`. */
+  async declineApproval(approvalId: string, idToken: string): Promise<w.Approval> {
+    return this.decideApproval(approvalId, idToken, "decline");
+  }
+
+  private async decideApproval(
+    approvalId: string,
+    idToken: string,
+    decision: "grant" | "decline",
+  ): Promise<w.Approval> {
+    const path = `/approvals/${pathSegment(approvalId, "approvalId")}`;
+    const headers = w.idTokenHeaders(idToken);
+    const json = w.approvalDecisionBody(decision);
+    const res = await this.retrying(() => this.http.post(path, { headers, json }));
+    return w.approvalFromJson(await w.jsonBody(res));
+  }
+
   /** Ask for a decision without calling the tool. A deny is returned, not thrown. */
   async authzenEvaluate(
     token: Token | string | undefined,
@@ -459,9 +612,85 @@ export class AttenuoClient {
     return w.authzenFromResponse(await w.jsonBody(res));
   }
 
+  /**
+   * Decide several calls in one request (`POST /access/v1/evaluations`), each decided, charged
+   * and audited like `authzenEvaluate`. Resolves to one decision per call, in order; denies are
+   * returned, not thrown.
+   *
+   * `semantic` is AuthZEN's `evaluations_semantic`: `execute_all` (the server's default),
+   * `deny_on_first_deny` or `permit_on_first_permit`. A batch stopped by it answers only the
+   * calls it decided, so the array can be shorter than `evaluations`. A call the server could
+   * not decide is a deny whose `error` says why. More calls than `[authzen] max_batch` is an
+   * `ApiError` (400 `batch_too_large`).
+   */
+  async authzenEvaluateBatch(
+    token: Token | string | undefined,
+    evaluations: readonly w.AuthzenEvaluationLike[],
+    opts: { semantic?: w.EvaluationsSemantic } = {},
+  ): Promise<w.AuthzenDecision[]> {
+    const body = w.authzenBatchBody(evaluations, opts.semantic);
+    const path = "/access/v1/evaluations";
+    const res = await this.post(path, this.auth(bearer(token, this.token), path), body);
+    return w.authzenBatchFromResponse(await w.jsonBody(res));
+  }
+
+  /**
+   * One page of AuthZEN action search (`POST /access/v1/search/action`): the tools the
+   * `[policy] catalog` lists for `server` that an evaluation with this token and `args` would
+   * allow now. Nothing is audited or charged, and no approval is taken, so an approval-gated
+   * tool is never a result.
+   *
+   * `opts.limit` is how many catalogued tools the page evaluates (the server clamps it to
+   * `[authzen] max_batch`); `opts.pageToken` is the `nextToken` of the previous page, sent with
+   * the same arguments. `authzenSearchActionIter` follows it. Authentication, DPoP and retries
+   * are as for `authzenEvaluate`; a refusal throws `ApiError` (400 `invalid_search_resource`
+   * for a `server` holding `/`, 400 `invalid_page` or `invalid_cursor` for a bad page).
+   */
+  async authzenSearchAction(
+    token: Token | string | undefined,
+    server: string,
+    args?: Record<string, unknown>,
+    opts: w.AuthzenSearchOptions = {},
+  ): Promise<w.AuthzenActionPage> {
+    const path = "/access/v1/search/action";
+    const body = w.authzenSearchActionBody(server, args, opts);
+    const res = await this.post(path, this.auth(bearer(token, this.token), path), body);
+    return w.authzenSearchActionFromResponse(await w.jsonBody(res));
+  }
+
+  /**
+   * Every result of `authzenSearchAction`, following `nextToken` until the last page. Pages
+   * lazily: stop iterating to stop asking.
+   */
+  async *authzenSearchActionIter(
+    token: Token | string | undefined,
+    server: string,
+    args?: Record<string, unknown>,
+    opts: { limit?: number } = {},
+  ): AsyncGenerator<w.AuthzenAction> {
+    let pageToken: string | undefined;
+    for (;;) {
+      const page = await this.authzenSearchAction(token, server, args, { ...opts, pageToken });
+      yield* page.actions;
+      if (page.nextToken !== undefined && page.nextToken === pageToken) {
+        throw new AttenuoError("paging did not advance (the server sent the same cursor again)");
+      }
+      pageToken = page.nextToken;
+      if (pageToken === undefined) return;
+    }
+  }
+
+  /** `GET /.well-known/authzen-configuration`: the AuthZEN discovery document. No credential is sent. */
+  async authzenConfiguration(): Promise<w.AuthzenConfiguration> {
+    const res = await this.retrying(() => this.http.get("/.well-known/authzen-configuration"));
+    return w.authzenConfigurationFromJson(await w.jsonBody(res));
+  }
+
   /** `GET /.well-known/jwks.json`. */
   async jwks(url?: string): Promise<Jwks> {
-    const res = url ? await this.http.getUrl(url) : await this.http.get("/.well-known/jwks.json");
+    const res = url
+      ? await this.http.getUrl(url)
+      : await this.retrying(() => this.http.get("/.well-known/jwks.json"));
     return w.asObject(await w.jsonBody(res), "JWKS") as Jwks;
   }
 

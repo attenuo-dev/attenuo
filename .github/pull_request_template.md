@@ -1,3 +1,5 @@
+<!-- This description and the CHANGELOG entry are the lasting record of the change: say what changed and why. -->
+
 ## What
 
 ## Why
@@ -15,7 +17,7 @@
 - [ ] `CHANGELOG.md` updated under Unreleased, if user-visible
 - [ ] ADR added/updated if a design decision was made (docs/decisions/)
 - [ ] RFC status updated if this implements one (docs/spec/)
-- [ ] Task board (`docs/tasks/board.md`) updated, if the change is on it (maintainers)
+- [ ] Reference docs (docs/reference/) and any page that described the old behaviour updated
 
 ## Process
 - [ ] Commits follow Conventional Commits and are signed off (`git commit -s`, DCO)

@@ -7,7 +7,7 @@ mod common;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use attenuo_audit::LeaseStore;
+use attenuo_audit::{LeaseRegistry, RunState};
 use attenuo_core::{LeaseId, RecordKind, ToolCall};
 use attenuo_policy::ToolAttrs;
 use attenuo_proxy::jsonrpc::CODE_DENIED;

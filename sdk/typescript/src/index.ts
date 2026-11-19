@@ -30,7 +30,17 @@ export {
   verifyApprovalToken,
 } from "./approval.js";
 export type { ApprovalClaims, ApprovalVerifyOptions } from "./approval.js";
-export { ExportError, SHIPPED_FORMAT, crossCheck, parseShipped, verifyExport } from "./audit.js";
+export {
+  ENTRY_HASH_VERSION,
+  EXPORT_FORMAT,
+  ExportError,
+  GENESIS_HASH,
+  SHIPPED_FORMAT,
+  crossCheck,
+  entryHash,
+  parseShipped,
+  verifyExport,
+} from "./audit.js";
 export type {
   BadCheckpoint,
   CheckpointFields,
@@ -42,15 +52,18 @@ export type {
   VerifyExportOptions,
 } from "./audit.js";
 export type {
+  AdminIdentity,
   ApprovalBy,
   ApprovalQuery,
   AuditCheckpoint,
   AuditEntry,
   AuditEntryDetail,
   AuditExportFilter,
+  ApprovalPage,
   AuditPage,
   AuditQuery,
   BudgetLimit,
+  BudgetRefund,
   CheckpointPage,
   Decision,
   EvaluationBudget,
@@ -64,8 +77,11 @@ export type {
   LeaseStatus,
   LeaseTree,
   LeaseUsage,
+  LeaseUserWindow,
+  LeaseUserWindows,
   LimitKind,
   MintRootOptions,
+  OperatorsReload,
   PolicyCheck,
   PolicyEvaluateOptions,
   PolicyEvaluation,
@@ -90,6 +106,8 @@ export {
   formatCapability,
   oneOf,
   parseCapability,
+  pathPrefix,
+  pathProblem,
   prefix,
   range,
   withLimits,
@@ -110,6 +128,7 @@ export {
   jwkThumbprint,
   NONCE_HEADER,
   NonceCache,
+  PROOF_TYPE,
   USE_DPOP_NONCE,
 } from "./dpop.js";
 export type { DpopKeyLike, Jwk } from "./dpop.js";
@@ -129,11 +148,16 @@ export {
   ApprovalRequiredError,
   DeniedError,
   AttenuoError,
+  RateLimitedError,
   RefreshError,
   RpcError,
+  TransportError,
+  TransportTimeoutError,
   UnauthorizedError,
+  UnavailableError,
   VerificationError,
 } from "./errors.js";
+export type { RunUsage, UntrustedArg, UserWindow, WindowUsage } from "./errors.js";
 export type { FetchLike, HttpOptions } from "./http.js";
 export { TokenRefresher } from "./refresh.js";
 export { DEFAULT_MAX_EVENT_BYTES, SseParser } from "./sse.js";
@@ -144,7 +168,15 @@ export { decodeToken, Token, TOKEN_TYPE, verifyToken } from "./token.js";
 export type { Chain, Hop, Jwks, User, VerifyOptions } from "./token.js";
 export type {
   Approval,
+  AuthzenAction,
+  AuthzenActionPage,
+  AuthzenConfiguration,
   AuthzenDecision,
+  AuthzenEntryError,
+  AuthzenEvaluation,
+  AuthzenEvaluationLike,
+  AuthzenSearchOptions,
+  EvaluationsSemantic,
   ExchangeOptions,
   Lease,
   Tool,

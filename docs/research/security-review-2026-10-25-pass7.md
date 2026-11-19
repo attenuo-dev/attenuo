@@ -2,7 +2,7 @@
 
 - Date: 2026-10-25
 - Branch: `security/pass7` (base: `ea4d35a` on main)
-- Related: [pass 1 and 2](security-review-2026-10-22.md), [pass 3](security-review-2026-10-23.md), [pass 4](security-review-2026-10-23-pass4.md), [pass 5](security-review-2026-10-24-pass5.md), [pass 6](security-review-2026-10-25-pass6.md), [threat model](../spec/threat-model.md), [task board](../tasks/board.md)
+- Related: [pass 1 and 2](security-review-2026-10-22.md), [pass 3](security-review-2026-10-23.md), [pass 4](security-review-2026-10-23-pass4.md), [pass 5](security-review-2026-10-24-pass5.md), [pass 6](security-review-2026-10-25-pass6.md), [threat model](../spec/threat-model.md), task board
 
 ## Scope and method
 
@@ -29,8 +29,8 @@ Every finding fixed here has a regression test that failed on `ea4d35a` and pass
 | High | 0 | 0 | 0 | 0 |
 | Medium | 3 | 3 | 0 | 0 |
 | Low | 1 | 1 | 0 | 0 |
-| Info | 4 | 2 (SR-81, SR-82, after the pass) | 1 | 1 |
-| **Total** | **8** | **6** | **1** | **1** |
+| Info | 4 | 3 (SR-81, SR-82, SR-83, after the pass) | 0 | 1 |
+| **Total** | **8** | **7** | **0** | **1** |
 
 | ID | Area | Severity | Status |
 |---|---|---|---|
@@ -40,7 +40,7 @@ Every finding fixed here has a regression test that failed on `ea4d35a` and pass
 | SR-80 | proxy: the same depth differential on the list filter | Low | Fixed |
 | SR-81 | proxy: a record window opens on a failed audit append | Info | Fixed |
 | SR-82 | SDKs: SSE reader cost and streams that never go idle | Info | Fixed (#125, #126) |
-| SR-83 | CI: release workflow build toolchain and install scripts | Info | Open |
+| SR-83 | CI: release workflow build toolchain and install scripts | Info | Fixed (`fix/sr-83-release-tooling`) |
 | SR-84 | server: AuthZEN batch refused after earlier entries were decided | Info | Accepted |
 
 The three Medium findings have one root: the proxy's reading of an upstream SSE event and a client's reading of it differed, and where the proxy could not read an event it relayed it byte for byte. Output labelling (ADR-0009) and the stream-end rewrite (#117) only act on events the proxy reads, so an upstream (A3) could send a `tools/call` result that a client acts on with no `tool_result` record and no `untrusted` label, which keeps `context.session.tainted` off and the approval rules for destructive calls ungated. That is the same effect as SR-69, reached through the transport instead of the message shape. The fixes make the proxy read what clients read where it can (a leading BOM, lone surrogates), and drop what it still cannot read on a stream it must inspect.
@@ -97,11 +97,12 @@ Fixed after the pass: part (1) in #125, part (2) in #126.
 - **Observation.** (1) The Python parser keeps the unfinished line as `self._buf += chunk` and searches it again from the start on every chunk, so a long line delivered in many small reads costs time quadratic in its length, up to `max_event_bytes` (16 MiB). The proxy forwards whole events in one write, so a read is usually large, which bounds this in practice. The TypeScript parser keeps the parts in a list and is linear. (2) Both SDKs reset their idle timer on every read, so an upstream that sends `:\n\n` every few seconds keeps a call open with no event until the proxy's stream re-check ends it at token expiry or revocation. A caller can pass its own signal or deadline. Both are denial of service against one client by its upstream, which the threat model leaves out. Hostile `id:` (NUL is ignored as the standard says), CR/LF mixes, CR at a chunk end, UTF-8 split across chunks and oversized `data:` lines were checked in both parsers and behave as specified.
 - **Fix sketch** (another branch is editing these files): in `feed`, remember where the last search stopped and search from there, and keep the partial line as a list of chunks joined once per line, as the TypeScript parser does. For (2), an optional total deadline on `call_tool_stream` / `callToolStream`.
 
-### SR-83: the release workflow builds with an unpinned toolchain (Info, open)
+### SR-83: the release workflow builds with an unpinned toolchain (Info, fixed)
 
 - **Component.** `.github/workflows/release-packages.yml`.
 - **Observation.** The `python` job runs `pip install -e '.[dev]' build twine` and `python -m build`, which fetches `hatchling>=1.27` in an isolated environment: every tool is resolved at release time without hashes, and the wheel and sdist it builds are what `python-publish` uploads to PyPI under trusted publishing. A compromised release of `build`, `hatchling` or a dev dependency on release day changes the published package without a commit. The `typescript-publish` job runs `npm ci` in a job that holds `id-token: write` and, in a later step, `NPM_TOKEN`; the lockfile pins every package by integrity hash and none of them has an install script today, so this needs a lockfile change, which review sees. What a tag push can do was checked and is sound (see below).
 - **Fix sketch.** A hashed `sdk/python/requirements-release.txt` (`pip install --require-hashes`) for `build`, `twine` and `hatchling`, and `python -m build --no-isolation` with that environment; `npm ci --ignore-scripts` in both npm jobs. Not done here: it needs a new file and a CI run to prove, and Actions are blocked.
+- **Fixed** on `fix/sr-83-release-tooling`. `sdk/python/release-requirements.txt`, compiled with `pip-compile --generate-hashes` from `release-requirements.in` for Python 3.12 on Linux, pins `build`, `twine`, `hatchling` and their dependencies with their sha256 hashes. A new `python-build` job installs only that file (`pip install --require-hashes --only-binary :all:`) into a fresh venv and runs `python -m build --no-isolation`, so the isolated build environment that fetched `hatchling` from the index is gone; it builds, checks and uploads the files `python-publish` sends to PyPI. The tests and their unpinned dev extras moved to the `python` job, which builds nothing that is published, so a dev dependency cannot touch the published files either. Both npm jobs run `npm ci --ignore-scripts`; the build and tests pass that way (esbuild's postinstall only checks its platform binary). Dependabot recompiles the hashed file (`.github/dependabot.yml`), and CONTRIBUTING.md, "Release tooling", says how to by hand. Checked locally (install, offline `--no-isolation` build, `twine check --strict`, `actionlint`); the workflow itself has not run on GitHub.
 
 ### SR-84: an AuthZEN batch is refused whole after earlier entries were decided (Info, accepted)
 
@@ -127,7 +128,7 @@ Fixed after the pass: part (1) in #125, part (2) in #126.
 - **SDK SSE parsing (#115).** CR, LF and CRLF line ends, a CR at the end of a chunk, an `id:` with NUL (ignored), a BOM only at the stream start, UTF-8 split across chunks (lines are decoded whole), and `max_event_bytes` counted over the lines of an event including comments: both parsers behave as the WHATWG rules say. Neither treats a later event after the call's answer as anything.
 - **TypeScript idle timer.** The timer is restarted after the response headers and after every read, and cleared in `finally`; an aborted fetch ends the reader. It fires when no read completes within `timeoutMs`; see SR-82 for keep-alive bytes.
 - **`fake_mcp --sse` and `hold_ms`.** An example binary for tests and demos, not shipped in a package; `hold_ms` delays its own answer.
-- **Release workflow (#118), what a tag push can do.** A tag push is a dry run: the publish jobs run only on `workflow_dispatch` with `dry_run == false`, and they need the check job, whose version step fails unless the ref is a tag named `v<version>`. A dispatch from a branch fails there. Workflow permissions are `contents: read`; only the publish jobs get `id-token: write`, in the `pypi` and `npm` environments, where reviewers can be required. Every action is pinned to a commit SHA, checkouts do not persist credentials, the PyPI upload uses the artifact the check job built, and the npm publish job does not use the shared cache. Who may push a `v*` tag is a repository setting (tag protection), which the release notes should name.
+- **Release workflow (#118), what a tag push can do.** A tag push is a dry run: the publish jobs run only on `workflow_dispatch` with `dry_run == false`, and they need the check job, whose version step fails unless the ref is a tag named `v<version>`. A dispatch from a branch fails there. Workflow permissions are `contents: read`; only the publish jobs get `id-token: write`, in the `pypi` and `npm` environments, where reviewers can be required. Every action is pinned to a commit SHA, checkouts do not persist credentials, the PyPI upload uses the artifact the check job built, and the npm publish job does not use the shared cache. Who may push a `v*` tag is a repository setting (tag protection), which the release notes should name; [release 0.1.0](../release/0.1.0.md#6-publish-the-sdks) names it since the SR-83 fix.
 
 ## Not covered
 

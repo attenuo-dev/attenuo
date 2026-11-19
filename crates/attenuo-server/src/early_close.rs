@@ -6,7 +6,7 @@
 //! missing bearer or content type the same way. Hyper then closes the connection, since the
 //! unread rest of the body would be read as the next request, but the answer did not say so,
 //! and a client that reused the connection at once (the retry after 401 `use_dpop_nonce`)
-//! got no answer (board item 63). [`mark_early_refusal`] wraps the request body to see
+//! got no answer. [`mark_early_refusal`] wraps the request body to see
 //! whether it was read to its end, and if not adds `Connection: close` to the answer, which
 //! makes every HTTP/1.1 client open a new connection for its next request.
 //!

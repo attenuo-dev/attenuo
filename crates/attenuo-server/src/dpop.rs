@@ -63,6 +63,15 @@
 //! holds `[token] dpop_replay_capacity` live entries, new proofs are refused with 503
 //! `temporarily_unavailable` (`dpop_replay_cache_full`): fail closed, as the credential replay
 //! cache does (`crate::replay`).
+//!
+//! Unlike the credential markers, proof `jti`s are not written to the database. A proof is
+//! checked on every proxied call with a bound token, so persisting them would put a write,
+//! through the file's write gate and behind the audit appends, on the per-call path; and a
+//! proof is accepted for only `dpop_max_age_seconds` (300 by default) after its `iat`. So a
+//! restart forgets the proofs of that window: one captured together with its access token can
+//! be replayed once more, for the same method, URL and token, until its `iat` is too old.
+//! Server nonces do not close this, because they are derived from the issuer key and the time
+//! and so stay valid across a restart; a shorter `dpop_max_age_seconds` narrows it.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Mutex;
@@ -382,6 +391,30 @@ impl Dpop {
                 let v = self.verify(p, method, url, None, now)?;
                 Ok(Some(Confirmation::jkt(v.jkt)))
             }
+        }
+    }
+
+    /// The checks [`bind_new`](Self::bind_new) and [`bind_exchange`](Self::bind_exchange) make
+    /// on the request's `DPoP` header proof for `POST url`, the server nonce included, without
+    /// using up its `jti`; nothing when there is no header or `dpop = "off"`. For a `POST
+    /// /token` that is about to use up a client assertion before the binding runs: a proof
+    /// that will be refused, `use_dpop_nonce` above all, is refused first, so the client can
+    /// send the same request again with a new proof (SR-111). It only refuses: the binding
+    /// still checks the proof and records it.
+    ///
+    /// # Errors
+    ///
+    /// As [`bind_new`](Self::bind_new) for a proof that is sent, except the replay-cache
+    /// failures.
+    pub fn check_header_first(
+        &self,
+        header: Option<&str>,
+        url: &str,
+        now: OffsetDateTime,
+    ) -> Result<(), DpopFailure> {
+        match (self.mode, header) {
+            (DpopMode::Off, _) | (_, None) => Ok(()),
+            (_, Some(p)) => self.check(p, "POST", url, None, now).map(|_| ()),
         }
     }
 

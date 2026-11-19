@@ -42,11 +42,11 @@ class Console {
     });
   }
 
-  static async open(ui, { colorScheme = 'dark' } = {}) {
+  static async open(ui, { colorScheme = 'dark', deviceScaleFactor = 1 } = {}) {
     const browser = await chromium.launch();
     // Reduced motion: no colour transitions, so a contrast reading right after a theme switch
     // sees the final colours.
-    const context = await browser.newContext({ colorScheme, reducedMotion: 'reduce', viewport: { width: 1280, height: 900 } });
+    const context = await browser.newContext({ colorScheme, deviceScaleFactor, reducedMotion: 'reduce', viewport: { width: 1280, height: 900 } });
     await context.addInitScript(violationRecorder);
     const page = await context.newPage();
     const c = new Console(browser, context, page);

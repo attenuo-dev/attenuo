@@ -7,7 +7,8 @@
 mod common;
 
 use attenuo_audit::{
-    window_prunable, AuditError, ChargeOutcome, LeaseStore, MemoryLeaseStore, SqliteLeaseStore,
+    window_prunable, AuditError, ChargeOutcome, LeaseStore, MemoryLeaseStore, RunLimits,
+    SqliteLeaseStore,
 };
 use attenuo_core::limits::{usage_charges, MAX_LIMIT};
 use attenuo_core::windows::window_charges;

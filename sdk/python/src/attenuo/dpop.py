@@ -42,6 +42,8 @@ SIGN_OFF_CHILD_ACTOR = "child_actor"
 NONCE_HEADER = "DPoP-Nonce"
 #: ``error`` of a refusal asking for a proof with the server's nonce.
 USE_DPOP_NONCE = "use_dpop_nonce"
+#: ``typ`` of the client assertions :meth:`DpopKey.client_assertion` makes.
+CLIENT_ASSERTION_TYP = "client-authentication+jwt"
 
 
 def _b64(data: bytes) -> str:
@@ -195,9 +197,43 @@ class DpopKey:
         }
         return self.sign(claims)
 
+    def client_assertion(
+        self,
+        client_id: str,
+        audience: str,
+        *,
+        kid: str | None = None,
+        lifetime: int = 60,
+        iat: int | None = None,
+    ) -> str:
+        """A ``private_key_jwt`` client assertion (RFC 7523 §2.2) signed by this key, for an
+        agent or PEP whose server entry lists the public key in ``jwks``: ``iss`` = ``sub`` =
+        ``client_id``, ``aud`` = ``audience`` (the server's ``[issuer] issuer``, the ``iss`` of
+        the tokens it mints), a fresh ``jti``, and ``exp`` ``lifetime`` seconds ahead. ``kid``
+        defaults to the ``kid`` of the JWK the key was loaded from, if any. Each assertion
+        authenticates one request; pass it to :meth:`Client.exchange` as ``client_assertion``.
+        """
+        now = int(time.time()) if iat is None else iat
+        header: dict[str, Any] = {"alg": self.alg, "typ": CLIENT_ASSERTION_TYP}
+        kid = kid if kid is not None else self._private.get("kid")
+        if kid is not None:
+            header["kid"] = kid
+        claims = {
+            "iss": client_id,
+            "sub": client_id,
+            "aud": audience,
+            "jti": str(uuid.uuid4()),
+            "iat": now,
+            "exp": now + int(lifetime),
+        }
+        return self._sign_jws(header, claims)
+
     def sign(self, claims: dict[str, Any]) -> str:
         """Sign arbitrary proof claims with a DPoP header (for tests and special cases)."""
         header = {"typ": PROOF_TYPE, "alg": self.alg, "jwk": self.public_jwk}
+        return self._sign_jws(header, claims)
+
+    def _sign_jws(self, header: dict[str, Any], claims: dict[str, Any]) -> str:
         signing = (
             f"{_b64(json.dumps(header, separators=(',', ':')).encode())}."
             f"{_b64(json.dumps(claims, separators=(',', ':')).encode())}"

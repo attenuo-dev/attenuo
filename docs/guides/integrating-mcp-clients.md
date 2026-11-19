@@ -65,6 +65,8 @@ The response:
 }
 ```
 
+The CLI sends the same request with `attenuo token exchange --subject-token-type id-token` ([CLI reference](../reference/cli.md#hop-0-from-an-id-token)).
+
 Keep `access_token` and `lease`. You need the token for every call and the lease id if your orchestration wants to show or revoke it.
 
 Each ID token or ID-JAG can be used once. Presenting the same one again, from any agent, fails with `invalid_grant` / `replayed`, so fetch a fresh credential for every root token. The root token never outlives the credential: its `expires_in` is at most the time left until the credential's `exp`.
@@ -101,7 +103,7 @@ curl -s -X POST https://attenuo.example.com/token \
   }'
 ```
 
-The form encoding takes `scope` instead, a space-separated list of `server:tool` with no constraints:
+The form encoding takes `scope` instead, a space-separated list of `server:tool` with no constraints. It is an alternative to the JSON request, not a second step: a parent token delegates to a given actor once, so sending both with the same `$PLANNER_TOKEN` gets `invalid_grant` / `replayed` on the second.
 
 ```sh
 curl -s -X POST https://attenuo.example.com/token \
@@ -136,12 +138,12 @@ Rules to know:
 - A child must constrain every argument its parent constrains, at least as tightly. It may add constraints.
 - A child is covered only by a single parent capability, not by a combination of several. If you need to split authority, ask for each piece separately.
 - A parent whose lease is revoked, expired or unknown cannot delegate. The exchange fails with `invalid_grant`.
-- The request must authenticate as `actor`. Either with that agent's `[[agents]]` client secret (HTTP Basic, or `client_id` and `client_secret` in the body), or with an `actor_token`: a workload-identity JWT for the agent, such as a SPIFFE JWT-SVID, from an `[[actor_trust]]` issuer (see [Workload identity for sub-agents](identity-providers.md#workload-identity-for-sub-agents)). `[token] actor_auth` says which the server accepts. The agent receiving the token proves who it is, so whoever orchestrates the exchange needs the receiving agent's credential, or the receiving agent makes the request itself with the parent token. A wrong or missing secret is 401 `invalid_client`, a bad actor token is 400 `invalid_request` with an `actor_token_*` code, and authenticating as someone else is 400 `actor_mismatch`. An operator can turn this off with `[token] require_actor_auth = false` (the server warns), and then `actor` is only asserted.
+- The request must authenticate as `actor`. Either with that agent's `[[agents]]` client credentials (its client secret by HTTP Basic or as `client_id` and `client_secret` in the body, or a signed client assertion, `private_key_jwt`, when the entry holds `jwks`: see [A key instead of a secret](identity-providers.md#a-key-instead-of-a-secret)), or with an `actor_token`: a workload-identity JWT for the agent, such as a SPIFFE JWT-SVID, from an `[[actor_trust]]` issuer (see [Workload identity for sub-agents](identity-providers.md#workload-identity-for-sub-agents)). `[token] actor_auth` says which the server accepts. The agent receiving the token proves who it is, so whoever orchestrates the exchange needs the receiving agent's credential, or the receiving agent makes the request itself with the parent token. A wrong or missing secret is 401 `invalid_client`, a bad actor token is 400 `invalid_request` with an `actor_token_*` code, and authenticating as someone else is 400 `actor_mismatch`. An operator can turn this off with `[token] require_actor_auth = false` (the server warns), and then `actor` is only asserted.
 - An actor token works for one exchange (`replayed` the second time), and the child token expires no later than the actor token. Fetch a fresh one per exchange.
 - A parent can name who may exchange it next with `may_act` (RFC 8693 §4.4). Send `"may_act": ["coder"]` on the exchange that mints it (or let `[[root_grants]] may_act` set it at hop 0). Exchanging such a token for an agent that is not listed fails with `actor_not_permitted`. Without `may_act`, any authenticated agent may.
 - An agent cannot appear twice in a chain (`duplicate_actor`).
 - A parent token delegates to a given actor once. A second exchange of the same token for the same actor is `invalid_grant` / `replayed`; renew the child's lease (below) to keep it alive instead.
-- Failed exchanges answer `{"error": "...", "detail": "..."}`. `invalid_scope` means you asked for too much. `invalid_grant` means the parent token or one of its leases is no good. When the parent token verified, the refusal is also a `deny` audit record and the body carries its `decision_id` (also in `X-Attenuo-Decision-Id`).
+- Failed exchanges answer `{"error": "...", "code": "...", "detail": "..."}`: `error` is the OAuth error and `code` the stable code to branch on (`replayed`, `actor_not_permitted`, ...); `detail` is for people. `scope_exceeds_parent` means you asked for more than the parent token holds and `chain_too_deep` that the chain would be deeper than `max_depth` (both with `error` `invalid_scope`); `invalid_capability` means a capability you asked for is not one a call can have, and `malformed_request` that the request itself does not parse. `lease_revoked`, `lease_expired` or `lease_unknown` means a lease of the parent's chain is no longer live, and `token_expired` that the parent token has expired (all with `error` `invalid_grant`); `code` `invalid_grant` means the parent token is no good. When the parent token verified, the refusal is also a `deny` audit record and the body carries its `decision_id` (also in `X-Attenuo-Decision-Id`).
 
 Each hop gets its own lease. Revoking a lease revokes its whole subtree. So if the tester misbehaves, revoke the tester's lease and only the tester stops. If the planner's lease is revoked, all three stop.
 
@@ -173,13 +175,14 @@ A denied `tools/call` comes back as HTTP 200 with a JSON-RPC error. The MCP requ
     "message": "attenuo: denied: capability_denied",
     "data": {
       "reason": "capability_denied",
-      "decision_id": "98849dc3-f053-4649-9b1a-fae0c2f11426"
+      "decision_id": "98849dc3-f053-4649-9b1a-fae0c2f11426",
+      "code": "capability_denied"
     }
   }
 }
 ```
 
-Code on `-32003`. Branch on `error.data.reason`, not on the message text. The `decision_id` is the id of the audit record for this decision. It is also in the `X-Attenuo-Decision-Id` header.
+Code on `-32003`. Branch on `error.data.reason` (or `error.data.code`, the stable error code, which for a denial is the same string), not on the message text. The `decision_id` is the id of the audit record for this decision. It is also in the `X-Attenuo-Decision-Id` header.
 
 What each reason means for the agent:
 
@@ -192,9 +195,12 @@ What each reason means for the agent:
 | `lease_unknown` | The server does not know a lease in the chain | Treat as fatal. The token was not issued by this server, or the database was reset |
 | `tool_not_in_catalog` | The tool is not in the server's catalog, and the operator denies unknown tools (the default) | Do not retry. The operator has to add the tool to `[policy.catalog]` |
 | `input_type_mismatch` | An argument does not have the type the catalog declares for it (a number where a string is declared, for example) | Do not retry as is. Send each argument with the type the catalog declares (`tools/list` input schemas usually say the same) |
+| `argument_case_mismatch` | An argument name differs only in case from the name the catalog, the token's constraints or limits, or a policy uses for it (`Path` where the tool's argument is `path`) | Do not retry as is. Send the argument under the exact name in the tool's `tools/list` input schema |
 | `audit_error`, `lease_error`, `policy_error` | Internal failure. The server fails closed | Retry with backoff a few times, then give up and alert an operator |
 
-A request with no valid token is different: HTTP 401, JSON-RPC `-32001`, and `"id": null` when the proxy could not read the request id. The message ends in the cause, for example `lease inactive: lease_revoked` on a request that carries no per-call decision, such as `tools/list`. An expired or malformed token is a 401 as well. On a 401, a client that holds a fresh credential can re-run its exchange. One that does not should stop.
+A request with no valid token is different: HTTP 401, JSON-RPC `-32001`, and `"id": null` when the proxy could not read the request id. Branch on `error.data.reason`, as for a denial: `missing_token`, `invalid_token`, `token_expired`, `dpop_required`, `invalid_dpop_proof`, `use_dpop_nonce`, or `lease_revoked`, `lease_expired`, `lease_unknown` on a request that carries no per-call decision, such as `tools/list`; such a lease refusal also names its audit record in `data.decision_id` and `X-Attenuo-Decision-Id`. The SDKs raise it as `Unauthorized` (Python) and `UnauthorizedError` (TypeScript) with `reason` and `decision_id` / `decisionId`. An expired or malformed token is a 401 as well. On a 401, a client that holds a fresh credential can re-run its exchange. One that does not should stop.
+
+A request the server refused for its load is not a decision either: HTTP 503 with JSON-RPC `-32006` (`data.reason` `overloaded`, `[limits] max_in_flight` reached) or HTTP 429 with `-32007` (`rate_limited`, the run is over `[limits] mcp_requests_per_minute`), each with `Retry-After` in seconds. The request was refused before any decision, audit record or upstream call, so it is safe to send again after `Retry-After`. The SDKs raise these as `Unavailable` / `RateLimited` (Python) and `UnavailableError` / `RateLimitedError` (TypeScript), with `reason` and `retry_after` / `retryAfter`, and never as a denial; they retry them only when the client is built with `max_retries` / `maxRetries` ([HTTP API reference](../reference/http-api.md#mcp-proxy)).
 
 Other proxy errors: `-32004` (HTTP 404) for an unknown upstream name, `-32005` (HTTP 502) when the upstream cannot be reached, `-32602` for a request missing a field the proxy needs.
 
@@ -205,7 +211,7 @@ Other proxy errors: `-32004` (HTTP 404) for an unknown upstream name, `-32005` (
 Good client behaviour:
 
 - Return the denial to the model as a plain tool error that says what was denied and why, in your words. Do not paste raw server output into the model's context, and do not invite it to try other routes.
-- Log the `decision_id` next to your own request id. When a user asks "why did the agent not do X", an operator can look it up. Over HTTP: `GET /admin/audit?from=1&limit=1000`, then pick the entry where `record.id` matches. With the CLI and `jq`: `attenuo --json audit tail -n 1000 | jq '.entries[] | select(.record.id == "<decision id>")'`. Untested against a large log.
+- Log the `decision_id` next to your own request id. When a user asks "why did the agent not do X", an operator can look it up. Over HTTP: `GET /admin/audit?from=1&limit=1000`, then pick the entry where `record.id` matches. With the CLI: `attenuo audit show --id <decision id>` (`GET /admin/audit/records/{id}`), which also shows the state of the chain's leases now.
 - Do not loop on a denial. A denial is a decision, not a glitch.
 
 ## Renewing leases
@@ -230,7 +236,7 @@ How to use it:
 - Renew your own hop only. The bearer is your token, and only the last hop's lease is extended. A parent's lease is the parent's job.
 - Renew at about a third of `lease_interval_seconds` (default 300, so about every 100 seconds). The response's `expires_in` tells you the real window. Use it instead of a hard-coded number.
 - The new expiry is the shortest of now plus the interval, the token's own `exp`, and the parent lease's expiry. It never shortens an existing lease. When the token itself is about to expire, renewing cannot help. Ask for a new token through an exchange.
-- Renewal fails with `400 invalid_grant` and `detail` `lease_revoked`, `lease_expired` or `lease_unknown` when the lease or an ancestor is in that state. A revoked lease is final. Stop.
+- Renewal fails with `400 invalid_grant` and `code` `lease_revoked`, `lease_expired` or `lease_unknown` when the lease or an ancestor is in that state. Branch on `code`, not on `detail`, which is text for people. A revoked lease is final. Stop.
 - An expired token gets 401. Mint a new one.
 - Every renewal is one audit row. Do not renew faster than you need to.
 
@@ -284,9 +290,9 @@ Field notes:
 - The call is audited as an ordinary decision, so the `decision_id` points at a real row.
 - Each question is a decision, and it is logged. Ask once per action you will enforce.
 
-The CLI does the same: `ATTENUO_TOKEN="$TOKEN" attenuo authzen eval --server github --tool create_issue --arg repo=acme/api --arg title=x`. It exits 2 on a negative decision.
+The CLI does the same: `ATTENUO_TOKEN="$TOKEN" attenuo authzen eval --upstream github --tool create_issue --arg repo=acme/api --arg title=x`. It exits 2 on a negative decision.
 
-**Without a bearer.** By default a request without a bearer gets 401. An operator can allow PEPs that cannot carry the token to send the chain in `subject.properties.chain` instead, with `[authzen] allow_unsigned_chain = true` and a `[[peps]]` entry per PEP. The PEP then authenticates with its client secret (HTTP Basic, or `pep_id` and `pep_secret` at the top level of the body). The server checks that the chain is well-formed, and that every hop's lease is live and was issued for exactly that chain prefix; a chain it never issued, or one with any field changed, is 403 `chain_not_issued`. Prefer the bearer.
+**Without a bearer.** By default a request without a bearer gets 401. An operator can allow PEPs that cannot carry the token to send the chain in `subject.properties.chain` instead, with `[authzen] allow_unsigned_chain = true` and a `[[peps]]` entry per PEP. The PEP then authenticates with its client secret (HTTP Basic, or `pep_id` and `pep_secret` at the top level of the body), or, when its entry holds `jwks`, with a client assertion (`client_assertion_type` and `client_assertion` at the top level of the body, one per request; [details](../reference/http-api.md#client-authentication)). The server checks that the chain is well-formed, and that every hop's lease is live and was issued for exactly that chain prefix; a chain it never issued, or one with any field changed, is 403 `chain_not_issued`, and one that does not validate (an expired hop, say) is 400 `invalid_request` with `code` `invalid_chain`. Prefer the bearer.
 
 **Enforcing the answer.** attenuo only answers. The PEP has to refuse the action on `false`, and refuse it when the call to attenuo fails. A PEP that fails open turns attenuo off. Revocation reaches a PEP only when it asks, since there is no push channel in v0. Do not cache an allow for longer than you are willing to leave a revoked agent running.
 

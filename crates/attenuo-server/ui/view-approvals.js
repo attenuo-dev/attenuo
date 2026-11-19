@@ -7,9 +7,11 @@
 import {
   h, append, replace, link, mono, time, pill, empty, loading, kv, table, jsonTree,
 } from './dom.js';
-import { api, qs, showNotice } from './api.js';
+import { api, qs, showNotice, needsRole } from './api.js';
 import { untrustedArgs } from './view-entry.js';
 
+// Approvals per page; the server's maximum is 500.
+const PAGE = 100;
 const STATE_KIND = { pending: 'expired', granted: 'allow', declined: 'deny', consumed: 'active' };
 
 function statePill(a) {
@@ -44,18 +46,32 @@ export async function approvalsView(root, params) {
       form,
       list),
   ]);
-  const page = await api(`/admin/approvals${qs({ chain_id: chainId, state, limit: 200 })}`);
-  if (!page.approvals.length) {
+  // Pages of PAGE, newest first; "Older" follows the server's next_cursor with the same
+  // filters, so every approval is reachable however many there are.
+  const t = table(['Approval', 'State', 'Call', 'User', 'Run', 'Expires'], []);
+  const rows = t.querySelector('tbody');
+  let cursor = null;
+  const older = h('button', { type: 'button', on: { click: () => loadPage() } }, 'Older');
+  async function loadPage() {
+    older.disabled = true;
+    const page = await api(`/admin/approvals${qs({ chain_id: chainId, state, limit: PAGE, cursor })}`);
+    append(rows, page.approvals.map((a) => h('tr', null,
+      h('td', null, link(['approval', a.approval_id], mono(a.approval_id.slice(0, 8) + '…'), { title: a.approval_id })),
+      h('td', null, statePill(a)),
+      h('td', null, mono(`${a.call.server}/${a.call.tool}`)),
+      h('td', null, a.subject),
+      h('td', null, link(['lease', a.chain_id], mono(a.chain_id.slice(0, 10) + '…'), { title: a.chain_id })),
+      h('td', null, time(a.expires_at)))));
+    cursor = page.next_cursor;
+    older.disabled = cursor === null;
+    older.hidden = cursor === null;
+  }
+  await loadPage();
+  if (!rows.childNodes.length) {
     replace(list, empty('No approvals match.'));
     return;
   }
-  replace(list, table(['Approval', 'State', 'Call', 'User', 'Run', 'Expires'], page.approvals.map((a) => h('tr', null,
-    h('td', null, link(['approval', a.approval_id], mono(a.approval_id.slice(0, 8) + '…'), { title: a.approval_id })),
-    h('td', null, statePill(a)),
-    h('td', null, mono(`${a.call.server}/${a.call.tool}`)),
-    h('td', null, a.subject),
-    h('td', null, link(['lease', a.chain_id], mono(a.chain_id.slice(0, 10) + '…'), { title: a.chain_id })),
-    h('td', null, time(a.expires_at))))));
+  replace(list, t, h('div', { class: 'pager' }, older));
 }
 
 export async function approvalView(root, id) {
@@ -93,13 +109,13 @@ function render(root, a) {
         ? 'Writes are disabled on this listener. Set [admin_ui] allow_write = true to decide from the console, or use `attenuo approval grant` against the main listener.'
         : `Could not ${decision}: ${e.message}`;
       err.hidden = false;
-      for (const b of buttons) b.disabled = false;
+      for (const b of buttons) needsRole(Object.assign(b, { disabled: false }), 'operator');
     }
   };
   const buttons = open ? [
     h('button', { type: 'button', class: 'primary', on: { click: decide('grant') } }, 'Grant'),
     h('button', { type: 'button', class: 'danger', on: { click: decide('decline') } }, 'Decline'),
-  ] : [];
+  ].map((b) => needsRole(b, 'operator')) : [];
   const labels = a.labels.length
     ? h('ul', null, a.labels.map((l) => h('li', null, mono(l.source), ' ', link(['entry', l.seq], `tool_result at seq ${l.seq}`))))
     : h('span', { class: 'muted' }, 'none');

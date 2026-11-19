@@ -1,6 +1,8 @@
 //! SQLite-backed audit sink and lease store.
 //!
-//! Both wrap a single `rusqlite::Connection` behind a `Mutex`. Audit appends go through one
+//! Each writes through one `rusqlite::Connection` behind a `Mutex`. The audit log on a file in
+//! WAL mode also reads through a second, read-only connection with its own lock, so a long
+//! read never holds the writer's (see "Reads" on [`SqliteAudit`]). Audit appends go through one
 //! writer thread (group commit, see [`SqliteAudit`]): it takes the lock, reads the current head
 //! and inserts the next rows in one transaction, so two entries can never share a `prev_hash`.
 //! The lock and the single writer, not SQLite's locking, keep the chain linear within a
@@ -9,8 +11,10 @@
 //!
 //! The code is split by store: [`SqliteAudit`] is in `log.rs` (with the WAL checkpointer in
 //! `wal.rs`), [`SqliteLeaseStore`] in `leases.rs` (with run limits in `budgets.rs`, approvals
-//! in `approvals.rs` and the notice outbox in `outbox.rs`). Both open their connections
-//! through `connection.rs` and share the schema in `schema.rs`.
+//! in `approvals.rs`, the notice outbox in `outbox.rs` and the credential replay markers in
+//! `replay.rs`). Both open their connections
+//! through `connection.rs`, share the schema in `schema.rs` and bring a file to the current
+//! schema version with the one list of migrations in `migrations.rs`.
 
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -20,9 +24,13 @@ use crate::error::AuditError;
 mod approvals;
 mod budgets;
 mod connection;
+mod fence;
+pub mod filesystem;
 mod leases;
 mod log;
+mod migrations;
 mod outbox;
+mod replay;
 mod schema;
 #[cfg(test)]
 mod tests;
@@ -30,8 +38,11 @@ mod wal;
 
 use approvals::{approval_from_row, APPROVAL_COLUMNS};
 pub use connection::Durability;
+pub use fence::WriterFence;
+pub use filesystem::Filesystem;
 pub use leases::SqliteLeaseStore;
-pub use log::{SqliteAudit, MAX_BATCH};
+pub use log::{AppendStats, SqliteAudit, DEFAULT_APPEND_QUEUE, DEFAULT_APPEND_TIMEOUT, MAX_BATCH};
+pub use migrations::{SchemaState, SCHEMA_VERSION};
 pub use outbox::{NewNotice, OutboxNotice};
 pub use wal::{
     WalCheckpoint, WalStats, CHECKPOINT_PRESYNC_LEAD, DEFAULT_WAL_CHECKPOINT_INTERVAL,

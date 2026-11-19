@@ -39,7 +39,7 @@ The assistant delegates to a coder that has its own key. A child of a bound toke
 
 ```sh
 # The assistant, with assistant.jwk:
-attenuo token sign-off --subject-token "$ROOT" --dpop-key assistant.jwk \
+ATTENUO_TOKEN="$ROOT" attenuo token sign-off --dpop-key assistant.jwk \
   --child-jkt "$CODER_JKT" --actor coder > sign-off.txt
 
 # The coder, with coder.jwk and the sign-off:
@@ -55,7 +55,7 @@ When the child should stay on the parent's key (one agent, two tokens), pass the
 The coder calls tools with its key. `--dpop-key` (or `ATTENUO_DPOP_KEY`) works on `call`, `tools` and `authzen eval`:
 
 ```console
-$ ATTENUO_TOKEN="$CODER" attenuo call --dpop-key coder.jwk --server github --tool read_file \
+$ ATTENUO_TOKEN="$CODER" attenuo call --dpop-key coder.jwk --upstream github --tool read_file \
     --arg repo=alice/public-docs --arg path=README.md
 ALLOWED
 ```
@@ -63,7 +63,7 @@ ALLOWED
 The same token without the key:
 
 ```console
-$ ATTENUO_TOKEN="$CODER" attenuo call --server github --tool read_file \
+$ ATTENUO_TOKEN="$CODER" attenuo call --upstream github --tool read_file \
     --arg repo=alice/public-docs --arg path=README.md
 error -32001: attenuo: unauthorized: dpop_required
 ```
@@ -98,6 +98,7 @@ For an MCP client library on `httpx`, `TokenAuth(provider, dpop_key=key)` adds t
 TypeScript (no extra dependencies; WebCrypto signs):
 
 ```ts
+import { readFileSync } from "node:fs";
 import { AdminClient, DpopKey, mcpFetch, AttenuoClient } from "@attenuo/sdk";
 
 const assistantKey = await DpopKey.fromJwk(JSON.parse(readFileSync("assistant.jwk", "utf8")));
@@ -170,7 +171,7 @@ The server keeps no nonce state. A nonce is an HMAC of the current time bucket (
 
 ## Limits
 
-- Replay protection is in memory, per process. With several server replicas, a proof could be replayed against another replica within the `iat` window.
+- Proof replay protection is in memory, per process. With several server replicas, a proof could be replayed against another replica within the `iat` window, and after a restart a proof made before it can be replayed once until its `iat` is older than `dpop_max_age_seconds`. Proof `jti`s are not written to the database because every proxied call with a bound token checks one, and a write per call would slow every call; the single-use credentials of `POST /token` and approvals are written there and survive a restart.
 - Server nonces are off by default; freshness then rests on `iat` and the `jti` cache. With nonces on, a nonce is shared by every client of the server for its lifetime, so it limits how far ahead a proof can be made. It does not stop the cross-replica replay above.
 - Binding is checked by the server and the built-in proxy. An external enforcement point that verifies tokens itself must check proofs too, or ask the AuthZEN endpoint with the token and a proof.
 - Cedar policies cannot see whether a call was bound yet; only the audit record says so.

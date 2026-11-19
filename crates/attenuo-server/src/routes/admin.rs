@@ -1,5 +1,6 @@
-//! `/admin/*`: leases, audit log and policy reload. Every route requires the static admin
-//! bearer from `[admin] token` (v0; see [`require_admin`]). The read-only policy routes
+//! `/admin/*`: leases, audit log and policy reload. Every route requires an admin
+//! credential (`[admin] token` or an `[[admin.operators]]` entry) whose role reaches the
+//! route's (see [`require_admin`] and [`crate::operators`]). The read-only policy routes
 //! (`GET /admin/policies`, `/check`, `POST /admin/policies/evaluate`) are in
 //! [`super::policies`].
 
@@ -7,58 +8,92 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use attenuo_audit::{
-    AuditEntry, AuditError, AuditSink, EntryFilter, LeaseNode, LeaseSelector, LeaseStore, Order,
-    SelectorRevocation, SignedVerifyReport,
+    AuditEntry, AuditError, AuditSink, EntryFilter, LeaseNode, LeaseRegistry, LeaseSelector, Order,
+    RunLimits, RunState, SelectorRevocation, SignedVerifyReport,
 };
 use attenuo_core::{AgentId, LeaseId, RecordKind};
 use axum::body::Bytes;
-use axum::extract::{Path, Query, Request, State};
+use axum::extract::{MatchedPath, Request, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
+use axum::{Extension, Json};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
+use super::extract::{Body, Path, Query};
+use super::page;
 use super::{audit_admin, bearer_of, REASON_ADMIN_ACTION};
 use crate::error::ApiError;
 use crate::metrics::RefundSource;
+use crate::operators::{required_role, AdminIdentity, AuthFailure};
 use crate::state::AppState;
 use attenuo_core::Decision;
 use attenuo_proxy::session::{session_digest, session_tag};
 use sha2::Digest;
 
-/// Largest page `GET /admin/audit` returns.
-pub const MAX_AUDIT_PAGE: usize = 1000;
-const DEFAULT_AUDIT_PAGE: usize = 100;
+/// The 401 code of an admin bearer that matches an operator whose `expires_at` has passed.
+pub const REASON_ADMIN_CREDENTIAL_EXPIRED: &str = "admin_credential_expired";
 
-/// Middleware: the request must carry `Authorization: Bearer <[admin] token>`.
+/// Largest page `GET /admin/audit` and `GET /admin/audit/checkpoints` return; a larger
+/// `limit` is a 400.
+pub const MAX_AUDIT_PAGE: usize = 1000;
+/// Page size of `GET /admin/audit` and `GET /admin/audit/checkpoints` without `limit`.
+pub const DEFAULT_AUDIT_PAGE: usize = 100;
+
+/// Middleware: the request must carry `Authorization: Bearer <token>` with the token of an
+/// admin credential whose role is at least the one the route needs.
 ///
-/// When no admin token is configured every admin route answers 403, so a forgotten setting
-/// fails closed rather than open.
+/// - No credential configured: 403 `admin_disabled` on every route, so a forgotten setting
+///   fails closed rather than open.
+/// - No bearer, or one that matches no credential: 401 with
+///   `WWW-Authenticate: Bearer realm="attenuo-admin"`. The bearer is hashed and compared with
+///   every credential in constant time ([`AdminCredentials::authenticate`]).
+/// - A bearer that matches an operator whose `expires_at` has passed: the same 401, with the
+///   code `admin_credential_expired`. The expiry is checked only after the comparison with
+///   every credential.
+/// - A role below [`required_role`] of the matched route (a route with no entry in
+///   [`crate::operators::ROUTE_ROLES`] needs `admin`): 403 `admin_role_insufficient`, naming
+///   the role needed.
+///
+/// Otherwise the request goes on with an [`AdminIdentity`] in its extensions, which the
+/// handlers record as the actor. The credentials are read once, from the set in force when
+/// the request arrives: a request admitted before an operators reload completes even if the
+/// reload removed or demoted its operator.
+///
+/// [`AdminCredentials::authenticate`]: crate::operators::AdminCredentials::authenticate
 pub async fn require_admin(
     State(state): State<Arc<AppState>>,
-    req: Request,
+    mut req: Request,
     next: Next,
 ) -> Response {
-    let Some(expected) = state.admin_token.as_deref() else {
+    // One snapshot per request: a reload that swaps the set meanwhile does not affect it.
+    let creds = state.admin_credentials.snapshot();
+    if creds.is_empty() {
         return ApiError::new(
             StatusCode::FORBIDDEN,
             "admin_disabled",
-            "no [admin] token is configured",
+            "no admin credential is configured ([admin] token or [[admin.operators]])",
         )
         .into_response();
+    }
+    let identity = match bearer_of(req.headers()) {
+        Ok(Some(token)) => creds.authenticate(token, state.now()),
+        _ => Err(AuthFailure::Unknown),
     };
-    match bearer_of(req.headers()) {
-        Ok(Some(token)) if constant_time_eq(token.as_bytes(), expected.as_bytes()) => {
-            next.run(req).await
-        }
-        other => {
-            let reason = match other {
-                Ok(None) => crate::error::REASON_MISSING_TOKEN,
-                _ => crate::error::REASON_INVALID_TOKEN,
+    drop(creds);
+    let identity = match identity {
+        Ok(identity) => identity,
+        Err(failure) => {
+            let reason = match (&failure, bearer_of(req.headers())) {
+                (AuthFailure::Expired { name }, _) => {
+                    tracing::info!(operator = %name, "an expired admin credential was presented");
+                    REASON_ADMIN_CREDENTIAL_EXPIRED
+                }
+                (AuthFailure::Unknown, Ok(None)) => crate::error::REASON_MISSING_TOKEN,
+                (AuthFailure::Unknown, _) => crate::error::REASON_INVALID_TOKEN,
             };
             let mut resp =
                 ApiError::unauthorized(reason, "admin bearer token required").into_response();
@@ -66,9 +101,28 @@ pub async fn require_admin(
                 header::WWW_AUTHENTICATE,
                 HeaderValue::from_static("Bearer realm=\"attenuo-admin\""),
             );
-            resp
+            return resp;
         }
+    };
+    let route = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|p| p.as_str().to_owned());
+    let needed = required_role(req.method(), route.as_deref());
+    if identity.role < needed {
+        return ApiError::new(
+            StatusCode::FORBIDDEN,
+            "admin_role_insufficient",
+            format!(
+                "this route needs the `{needed}` role; the credential presented has the `{}` \
+                 role",
+                identity.role
+            ),
+        )
+        .into_response();
     }
+    req.extensions_mut().insert(identity);
+    next.run(req).await
 }
 
 pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -76,6 +130,18 @@ pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         return false;
     }
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// `GET /admin/whoami`: the name, role and expiry of the credential that sent the request,
+/// `{"name": ..., "role": "viewer" | "operator" | "admin", "expires_at": <RFC 3339> | null}`.
+/// The operator of `[admin] token` is `{"name": "admin", "role": "admin", "expires_at":
+/// null}`. Reads nothing else and records nothing.
+pub async fn whoami(Extension(who): Extension<AdminIdentity>) -> Json<Value> {
+    let expires_at = who
+        .expires_at
+        .and_then(|t| t.format(&Rfc3339).ok())
+        .map_or(Value::Null, Value::String);
+    Json(json!({ "name": who.name, "role": who.role, "expires_at": expires_at }))
 }
 
 /// Body of `POST /admin/leases/{lease_id}/revoke`; an empty body is allowed.
@@ -98,8 +164,9 @@ pub struct RevokeBody {
 /// write the audit record is not an error (`audit_id` is null).
 pub async fn revoke_lease(
     State(state): State<Arc<AppState>>,
+    Extension(who): Extension<AdminIdentity>,
     Path(lease_id): Path<String>,
-    body: Bytes,
+    Body(body): Body,
 ) -> Result<Json<Value>, ApiError> {
     let body: RevokeBody = if body.is_empty() {
         RevokeBody::default()
@@ -108,7 +175,7 @@ pub async fn revoke_lease(
     };
     let reason = body
         .reason
-        .unwrap_or_else(|| "revoked by admin".to_string());
+        .unwrap_or_else(|| format!("revoked by {}", who.name));
     let lease = LeaseId::new(lease_id);
     let now = state.now();
     state
@@ -120,6 +187,7 @@ pub async fn revoke_lease(
             // unsafe direction. The response says whether it was audited.
             let audit_id = audit_admin(
                 state,
+                &who,
                 "admin.lease.revoke",
                 Decision::Allow,
                 REASON_ADMIN_ACTION,
@@ -282,7 +350,7 @@ fn selector_response(
 ///   lease with a parent is not a chain id and matches nothing.
 /// - `session` takes a raw MCP session id, hashes it ([`session_digest`]) and matches, as
 ///   `chain_id` would, the chain of each caller that opened the session through the proxy
-///   (`LeaseStore::record_session`, written when the proxy binds a new session for a verified
+///   (`RunState::record_session`, written when the proxy binds a new session for a verified
 ///   token). The response's `selector` is `{session_tag, chain_ids}`: the session's audit
 ///   tag and the resolved chains, never the id. A session the server never recorded (unknown,
 ///   or opened before this route existed) resolves to no chain and matches nothing.
@@ -308,8 +376,9 @@ fn selector_response(
 /// errors.
 pub async fn revoke_by_selector(
     State(state): State<Arc<AppState>>,
+    Extension(who): Extension<AdminIdentity>,
     Query(q): Query<SelectorRevokeQuery>,
-    body: Bytes,
+    Body(body): Body,
 ) -> Result<Json<Value>, ApiError> {
     let body: SelectorRevokeBody = if body.is_empty() {
         SelectorRevokeBody::default()
@@ -319,7 +388,7 @@ pub async fn revoke_by_selector(
     let (selector, mut shown) = selector_of(&body)?;
     let reason = body
         .reason
-        .unwrap_or_else(|| "revoked by admin".to_string());
+        .unwrap_or_else(|| format!("revoked by {}", who.name));
     let now = state.now();
     state
         .blocking(move |state| {
@@ -348,6 +417,7 @@ pub async fn revoke_by_selector(
             let listed = audited.len();
             let audit_id = audit_admin(
                 state,
+                &who,
                 "admin.lease.revoke",
                 Decision::Allow,
                 REASON_ADMIN_ACTION,
@@ -403,12 +473,13 @@ pub struct RefundBody {
 /// audit lookup fails.
 pub async fn refund_budget(
     State(state): State<Arc<AppState>>,
-    body: Bytes,
+    Extension(who): Extension<AdminIdentity>,
+    Body(body): Body,
 ) -> Result<Json<Value>, ApiError> {
     let body: RefundBody = super::parse_json(&body)?;
     let reason = body
         .reason
-        .unwrap_or_else(|| "refunded by admin".to_string());
+        .unwrap_or_else(|| format!("refunded by {}", who.name));
     let decision_id = body.decision_id;
     let now = state.now();
     state
@@ -426,6 +497,7 @@ pub async fn refund_budget(
             tracing::warn!(decision = ?decision_id, reason = ?reason, refunded, "budget refunded");
             let audit_id = audit_admin(
                 state,
+                &who,
                 "admin.budget.refund",
                 Decision::Allow,
                 REASON_ADMIN_ACTION,
@@ -559,7 +631,7 @@ pub struct TreeQuery {
 }
 
 /// `GET /admin/leases/{lease_id}/tree?max_nodes=`: a dry-run revocation. Answers
-/// `{root, ancestors, nodes, would_revoke, truncated}`:
+/// `{root, ancestors, nodes, would_revoke, truncated, user_windows}`:
 ///
 /// - `nodes`: the lease, then everything delegated from it, breadth-first, at most
 ///   `max_nodes`; `truncated` says the cap cut the list short.
@@ -567,10 +639,13 @@ pub struct TreeQuery {
 ///   chain's first hop (also the audit `chain_id`).
 /// - `would_revoke`: how many leases `POST /admin/leases/{lease_id}/revoke` would revoke if
 ///   sent now, counted over the whole subtree with the same query the revocation runs.
+/// - `user_windows`: the run's originating user's per-user windows (run limits phase 3) for
+///   the tools the run used, read at `root` (see `run_user_windows`); null for a run whose
+///   root lease has no recorded issuer (issued before schema version 4).
 ///
 /// Each node carries its registry row, whether it is active now, `chain_id` (the chain's
 /// first-hop lease, the same as `root`; the selector `POST /admin/leases/revoke` takes),
-/// `subject` (the originating user recorded at issue, [`LeaseStore::subject`], read for all
+/// `subject` (the originating user recorded at issue, [`LeaseRegistry::subject`], read for all
 /// nodes in one store call; null for a lease registered before subjects were recorded),
 /// `agent`, `issued_at` and `issued_seq` from the audit record that issued it (null when none
 /// is found), and `budget`, the hop's run limits and what is left of them (see `hop_budget`;
@@ -640,15 +715,117 @@ pub async fn lease_tree(
                     "issued_seq": issuance.map(|e| e.seq),
                 })
             };
+            let engine = state.pipeline.policy_snapshot();
+            let user_windows = run_user_windows(
+                state.leases.as_ref(),
+                engine.user_window_kinds(),
+                &root,
+                now,
+                MAX_TREE_WINDOWS,
+            )?;
             Ok(Json(json!({
                 "root": root,
                 "ancestors": tree.ancestors.iter().map(node).collect::<Vec<_>>(),
                 "nodes": tree.nodes.iter().map(node).collect::<Vec<_>>(),
                 "would_revoke": tree.would_revoke,
                 "truncated": tree.truncated,
+                "user_windows": user_windows,
             })))
         })
         .await
+}
+
+/// Most entries `user_windows.windows` of `GET /admin/leases/{id}/tree` lists: the tree's own
+/// cap, [`MAX_TREE_NODES`]. A run that used more tools than that (times the kinds kept) gets
+/// the first ones by tool and `truncated` set.
+pub const MAX_TREE_WINDOWS: usize = MAX_TREE_NODES;
+
+/// The `user_windows` member of a lease tree (run limits phase 3, step 2): the per-user
+/// windows of the run whose first-hop lease is `root`, as policies read them now. `null` when
+/// the store has no issuer for `root` (a lease issued before schema version 4, or by a store
+/// that keeps none): the windows are keyed by issuer and subject, and the issuer is never
+/// guessed. Else `{windows: [..], truncated}`:
+///
+/// - `windows`: for each tool the run has run usage of (the `usage` of its root lease's
+///   budget, so the tools of destructive calls it was allowed), and each window kind a loaded
+///   policy reads (`kinds`, hour before day), the window holding `now`: `{tool, kind, start,
+///   calls, amount}`. `start` is the window's start in UTC (RFC 3339); `calls` and `amount`
+///   are what the window holds for every run of the user, this one and others. Ordered by
+///   tool, then kind. Empty when the run has no usage (none yet, or it was revoked, which
+///   deletes run usage but never a window) or no policy reads a window.
+/// - `truncated`: the list stopped at `max` ([`MAX_TREE_WINDOWS`]).
+///
+/// Read only. The user's digest is never shown, and neither is the issuer: the user is the
+/// `subject` the tree's nodes already carry.
+fn run_user_windows(
+    leases: &dyn attenuo_audit::LeaseStore,
+    kinds: &[attenuo_core::WindowKind],
+    root: &LeaseId,
+    now: OffsetDateTime,
+    max: usize,
+) -> Result<Value, ApiError> {
+    let Some((issuer, subject)) = leases.originating_user(root)? else {
+        return Ok(Value::Null);
+    };
+    let tools: std::collections::BTreeSet<String> = leases
+        .budget_summary(root)?
+        .into_iter()
+        .filter(|c| c.kind.starts_with("usage_"))
+        .map(|c| c.arg)
+        .collect();
+    let mut kinds = kinds.to_vec();
+    kinds.sort();
+    let mut shown: Vec<(&str, attenuo_core::WindowKind)> = Vec::new();
+    let mut truncated = false;
+    'tools: for tool in &tools {
+        for &kind in &kinds {
+            if shown.len() == max {
+                truncated = true;
+                break 'tools;
+            }
+            shown.push((tool, kind));
+        }
+    }
+    let charges: Vec<attenuo_core::WindowCharge> = shown
+        .iter()
+        .flat_map(|&(tool, kind)| {
+            [
+                attenuo_core::WindowMeasure::Calls,
+                attenuo_core::WindowMeasure::Amount,
+            ]
+            .map(|measure| attenuo_core::WindowCharge {
+                issuer: issuer.clone(),
+                subject: subject.clone(),
+                kind,
+                start: kind.start_of(now),
+                tool: tool.to_owned(),
+                measure,
+                amount: 0,
+            })
+        })
+        .collect();
+    let used = if charges.is_empty() {
+        Vec::new()
+    } else {
+        leases.window_used(&charges)?
+    };
+    let windows: Vec<Value> = shown
+        .iter()
+        .zip(used.chunks(2))
+        .map(|(&(tool, kind), u)| {
+            let start = OffsetDateTime::from_unix_timestamp(kind.start_of(now))
+                .ok()
+                .and_then(|t| t.format(&Rfc3339).ok());
+            json!({
+                "tool": tool,
+                "kind": kind.as_str(),
+                "start": start,
+                "calls": u.first().copied().unwrap_or(0),
+                "amount": u.get(1).copied().unwrap_or(0),
+            })
+        })
+        .collect();
+    Ok(json!({"windows": windows, "truncated": truncated}))
 }
 
 /// The `budget` member of a lease tree node (run limits, ADR-0010): `null` when the hop has no
@@ -666,7 +843,7 @@ pub async fn lease_tree(
 ///   amount, destinations}`.
 ///
 /// Read only; value hashes are never shown.
-fn hop_budget(leases: &dyn attenuo_audit::LeaseStore, lease: &LeaseId) -> Result<Value, ApiError> {
+fn hop_budget(leases: &dyn RunLimits, lease: &LeaseId) -> Result<Value, ApiError> {
     let recorded = leases.hop_limits(lease)?;
     let counters = leases.budget_summary(lease)?;
     if recorded.is_none() && counters.is_empty() {
@@ -746,20 +923,23 @@ fn hop_budget(leases: &dyn attenuo_audit::LeaseStore, lease: &LeaseId) -> Result
 
 /// Most seqs one filtered `GET /admin/audit` page reads. `agent`, `lease`, `since` and
 /// `until` cannot use an index, so without a bound one request could read the whole log. A
-/// page that reaches the bound before it fills comes back short (possibly empty) with `next`
-/// or `prev` set, and the client keeps paging. Unfiltered pages need no bound: they read
+/// page that reaches the bound before it fills comes back short (possibly empty) with
+/// `next_cursor` set, and the client keeps paging. Unfiltered pages need no bound: they read
 /// exactly the rows they return.
 pub const MAX_AUDIT_SCAN: u64 = 50_000;
 
-/// Query string of `GET /admin/audit`. Every field is optional; with none of the filter
-/// fields, `order` or `before`, the answer is the same as before filters existed.
+/// Query string of `GET /admin/audit`. Every field is optional.
 #[derive(Debug, Default, Deserialize)]
 pub struct AuditQuery {
-    /// First sequence number to return, for `order=asc` (default 1).
+    /// Lowest seq to return (default 1), as `from` of `GET /admin/audit/export`.
     pub from: Option<u64>,
-    /// Return entries with `seq < before`, for `order=desc` (default: up to the head).
-    pub before: Option<u64>,
-    /// Page size (default 100, at most [`MAX_AUDIT_PAGE`]).
+    /// Highest seq to return (default: the head), as `to` of `GET /admin/audit/export`.
+    pub to: Option<u64>,
+    /// Removed: refused with a message pointing at `cursor` and `to`.
+    pub before: Option<String>,
+    /// The `next_cursor` of the previous page ([`super::page`]).
+    pub cursor: Option<String>,
+    /// Page size (default [`DEFAULT_AUDIT_PAGE`], at most [`MAX_AUDIT_PAGE`]).
     pub limit: Option<usize>,
     /// `asc` (oldest first, the default) or `desc` (newest first).
     pub order: Option<String>,
@@ -845,33 +1025,43 @@ fn entry_filter(q: &AuditQuery) -> Result<EntryFilter, ApiError> {
     })
 }
 
-/// `GET /admin/audit`: a page of audit entries, oldest first by default.
+/// `GET /admin/audit`: a page of audit entries, oldest first by default, as
+/// `{entries, next_cursor, head}`. Paging is the one style of [`super::page`].
 ///
-/// - `order=asc` (default) with `from`: entries with `seq >= from` ascending. `next` is the
-///   `from` of the following page, or null at the end.
-/// - `order=desc` with `before`: entries with `seq < before` (default: up to the head)
-///   newest first. `prev` is the `before` of the following (older) page, or null at seq 1;
-///   `next` is the `from` for reading forward (`order=asc`) from just above this page, or
-///   null when the page reached the head.
+/// - `from` and `to` (inclusive seqs, default the whole log) select a range, as on
+///   `GET /admin/audit/export`; they are filters, not page links.
+/// - `order=asc` (default) returns the range oldest first, `order=desc` newest first.
+/// - `cursor` continues where the previous page's `next_cursor` points; `next_cursor` is null
+///   once the range has been read (oldest first: up to the head as it was when the page was
+///   read; a later request with `from` just above the last seq reads what was appended since).
 /// - Filters (`kind`, `decision`, `reason`, `subject`, `agent`, `lease`, `server`, `tool`,
 ///   `chain_id`, `since`, `until`) keep only matching entries; all are exact matches. A
-///   filtered page reads at most [`MAX_AUDIT_SCAN`] seqs, so it can come back short with
-///   `next`/`prev` set: keep paging until it is null.
+///   filtered page reads at most [`MAX_AUDIT_SCAN`] seqs, so it can come back short, even
+///   empty, with `next_cursor` set: keep paging until it is null.
 ///
-/// `head` is the newest seq (0 for an empty log); reading it signs nothing, unlike
-/// `/admin/audit/checkpoint`. An ascending answer is `{entries, next, head}`, exactly as
-/// before filters existed; a descending one adds `prev`.
+/// The cursor's position is a seq, so entries appended while a client pages never shift the
+/// ones it has not read: each is returned once. `head` is the newest seq (0 for an empty log);
+/// reading it signs nothing, unlike `/admin/audit/checkpoint`.
 ///
 /// # Errors
 ///
-/// 400 `invalid_request` for an `order` other than `asc` or `desc`, `before` without `order=desc`,
-/// `from` with it, `before=0`, or a filter that is empty or does not parse (an unknown `kind`, a
-/// `decision` other than `allow` or `deny`, a `since` or `until` that is not RFC 3339); 500
-/// `server_error` when the audit log fails.
+/// 400 `invalid_cursor` for a cursor that is malformed, of another route or of the other
+/// `order`; 400 `invalid_request` for an `order` other than `asc` or `desc`, a `limit` of 0 or
+/// above [`MAX_AUDIT_PAGE`], `from` or `to` of 0, `to < from`, the removed `before`, or a
+/// filter that is empty or does not parse (an unknown `kind`, a `decision` other than `allow`
+/// or `deny`, a `since` or `until` that is not RFC 3339); 500 `server_error` when the audit
+/// log fails.
 pub async fn audit_range(
     State(state): State<Arc<AppState>>,
     Query(q): Query<AuditQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    if q.before.is_some() {
+        return Err(page::removed(
+            "before",
+            "page with `cursor` (the `next_cursor` of the previous page) and select a range \
+             with `from` and `to`",
+        ));
+    }
     let order = match q.order.as_deref() {
         None | Some("asc") => Order::Ascending,
         Some("desc") => Order::Descending,
@@ -882,86 +1072,90 @@ pub async fn audit_range(
             ))
         }
     };
+    let dir = match order {
+        Order::Ascending => page::Direction::Ascending,
+        Order::Descending => page::Direction::Descending,
+    };
     let filter = entry_filter(&q)?;
-    let limit = q
-        .limit
-        .unwrap_or(DEFAULT_AUDIT_PAGE)
-        .clamp(1, MAX_AUDIT_PAGE);
-    // How many seqs a page may read below or above where it starts (see MAX_AUDIT_SCAN).
+    let limit = page::limit(q.limit, DEFAULT_AUDIT_PAGE, MAX_AUDIT_PAGE)?;
+    let cursor = page::decode(q.cursor.as_deref(), page::List::Audit, dir)?;
+    let (lo, hi) = seq_range(q.from, q.to)?;
+    // How many seqs a page may read past where it starts (see MAX_AUDIT_SCAN).
     let span = if filter.is_empty() {
         u64::MAX
     } else {
         MAX_AUDIT_SCAN - 1
     };
-    match order {
-        Order::Ascending => {
-            if q.before.is_some() {
-                return Err(ApiError::bad_request(
-                    "invalid_request",
-                    "`before` needs `order=desc`; use `from` to page forward",
-                ));
-            }
-            let from = q.from.unwrap_or(1).max(1);
-            let to = from.saturating_add(span);
-            let (entries, head) = state
-                .blocking(move |s| {
-                    let entries = s.audit.entries_matching(from, to, &filter, order, limit)?;
-                    let head = s.audit.head()?.map_or(0, |h| h.seq);
-                    Ok::<_, attenuo_audit::AuditError>((entries, head))
-                })
-                .await?;
-            let next = match entries.last() {
-                Some(last) if entries.len() == limit => Some(last.seq + 1),
-                _ if to < head => Some(to + 1),
-                _ => None,
-            };
-            Ok(Json(
-                json!({ "entries": entries, "next": next, "head": head }),
-            ))
-        }
-        Order::Descending => {
-            if q.from.is_some() {
-                return Err(ApiError::bad_request(
-                    "invalid_request",
-                    "`from` needs `order=asc`; use `before` to page backward",
-                ));
-            }
-            if q.before == Some(0) {
-                return Err(ApiError::bad_request(
-                    "invalid_request",
-                    "`before` must be at least 1",
-                ));
-            }
-            let (entries, head, top, bottom) = state
-                .blocking(move |s| {
-                    let head = s.audit.head()?.map_or(0, |h| h.seq);
-                    // The newest seq this page may return, and the oldest it may read.
-                    let top = q.before.map_or(head, |b| (b - 1).min(head));
-                    let bottom = top.saturating_sub(span).max(1);
-                    let entries = if top == 0 {
-                        Vec::new()
+    let (entries, next, head) = state
+        .blocking(move |s| {
+            // Read before the entries: entries appended after it are outside this page.
+            let head = s.audit.head()?.map_or(0, |h| h.seq);
+            let end = hi.min(head);
+            // One more than the page, to tell whether anything follows it.
+            let fetch = limit + 1;
+            let (mut entries, next) = match order {
+                Order::Ascending => {
+                    // The cursor is the first seq of this page.
+                    let start = cursor.map_or(lo, |c| c.max(lo));
+                    if start > end {
+                        (Vec::new(), None)
                     } else {
-                        s.audit
-                            .entries_matching(bottom, top, &filter, order, limit)?
-                    };
-                    Ok::<_, attenuo_audit::AuditError>((entries, head, top, bottom))
-                })
-                .await?;
-            let prev = match entries.last() {
-                Some(last) if entries.len() == limit => Some(last.seq),
-                _ if bottom > 1 => Some(bottom),
-                _ => None,
-            }
-            .filter(|&b| b > 1);
-            let next = (top < head).then_some(top + 1);
-            Ok(Json(json!({
-                "entries": entries,
-                "next": next,
-                "prev": prev,
-                "head": head,
-            })))
-        }
+                        let stop = start.saturating_add(span).min(end);
+                        let entries = s
+                            .audit
+                            .entries_matching(start, stop, &filter, order, fetch)?;
+                        let next = match entries.get(limit) {
+                            Some(_) => Some(entries[limit - 1].seq + 1),
+                            None => (stop < end).then_some(stop + 1),
+                        };
+                        (entries, next)
+                    }
+                }
+                Order::Descending => {
+                    // The cursor is the seq every entry of this page is below.
+                    let top = cursor.map_or(end, |c| (c - 1).min(end));
+                    if top < lo || top == 0 {
+                        (Vec::new(), None)
+                    } else {
+                        let bottom = top.saturating_sub(span).max(lo);
+                        let entries = s
+                            .audit
+                            .entries_matching(bottom, top, &filter, order, fetch)?;
+                        let next = match entries.get(limit) {
+                            Some(_) => Some(entries[limit - 1].seq),
+                            None => (bottom > lo).then_some(bottom),
+                        };
+                        (entries, next)
+                    }
+                }
+            };
+            entries.truncate(limit);
+            Ok::<_, attenuo_audit::AuditError>((entries, next, head))
+        })
+        .await?;
+    Ok(Json(json!({
+        "entries": entries,
+        "next_cursor": next.map(|p| page::encode(page::List::Audit, dir, p)),
+        "head": head,
+    })))
+}
+
+/// `from` and `to` of `GET /admin/audit`, as an inclusive range (`to` defaults to the
+/// largest seq).
+fn seq_range(from: Option<u64>, to: Option<u64>) -> Result<(u64, u64), ApiError> {
+    let bad = |m: &str| Err(ApiError::bad_request("invalid_request", m.to_string()));
+    let lo = from.unwrap_or(1);
+    let hi = to.unwrap_or(u64::MAX);
+    if lo == 0 {
+        return bad("`from` must be at least 1");
     }
+    if hi == 0 {
+        return bad("`to` must be at least 1");
+    }
+    if hi < lo {
+        return bad("`to` must not be below `from`");
+    }
+    Ok((lo, hi))
 }
 
 /// `GET /admin/audit/verify`: walk the whole chain and verify every stored checkpoint
@@ -1112,42 +1306,50 @@ pub async fn audit_record(
 /// Query string of `GET /admin/audit/checkpoints`.
 #[derive(Debug, Default, Deserialize)]
 pub struct CheckpointsQuery {
-    /// Only checkpoints with `seq < before` (default: all).
-    pub before: Option<u64>,
-    /// Page size (default 100, at most [`MAX_AUDIT_PAGE`]).
+    /// Removed: refused with a message pointing at `cursor`.
+    pub before: Option<String>,
+    /// The `next_cursor` of the previous page ([`super::page`]).
+    pub cursor: Option<String>,
+    /// Page size (default [`DEFAULT_AUDIT_PAGE`], at most [`MAX_AUDIT_PAGE`]).
     pub limit: Option<usize>,
 }
 
-/// `GET /admin/audit/checkpoints?before=&limit=`: stored checkpoints, newest first, as
-/// `{checkpoints, prev}`; `prev` is the `before` of the next (older) page, or null after the
-/// oldest. Read-only: unlike `GET /admin/audit/checkpoint` it never signs a new checkpoint.
+/// `GET /admin/audit/checkpoints?cursor=&limit=`: stored checkpoints, newest first, as
+/// `{checkpoints, next_cursor}`; `next_cursor` fetches the next (older) page and is null after
+/// the oldest. The cursor's position is a checkpoint seq, so checkpoints signed while a client
+/// pages do not shift the older ones. Read-only: unlike `GET /admin/audit/checkpoint` it never
+/// signs a new checkpoint.
 ///
 /// # Errors
 ///
-/// 400 `invalid_request` when `before` is 0, and 500 `server_error` when the audit log fails.
+/// 400 `invalid_cursor` for a cursor that is malformed or of another route, 400
+/// `invalid_request` for a `limit` of 0 or above [`MAX_AUDIT_PAGE`] or the removed `before`,
+/// and 500 `server_error` when the audit log fails.
 pub async fn audit_checkpoints(
     State(state): State<Arc<AppState>>,
     Query(q): Query<CheckpointsQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    if q.before == Some(0) {
-        return Err(ApiError::bad_request(
-            "invalid_request",
-            "`before` must be at least 1",
+    if q.before.is_some() {
+        return Err(page::removed(
+            "before",
+            "page with `cursor` (the `next_cursor` of the previous page)",
         ));
     }
-    let before = q.before.unwrap_or(u64::MAX);
-    let limit = q
-        .limit
-        .unwrap_or(DEFAULT_AUDIT_PAGE)
-        .clamp(1, MAX_AUDIT_PAGE);
-    let checkpoints = state
-        .blocking(move |s| s.audit.checkpoints_before(before, limit))
+    let dir = page::Direction::Descending;
+    let limit = page::limit(q.limit, DEFAULT_AUDIT_PAGE, MAX_AUDIT_PAGE)?;
+    let before = page::decode(q.cursor.as_deref(), page::List::Checkpoints, dir)?;
+    let mut checkpoints = state
+        .blocking(move |s| {
+            s.audit
+                .checkpoints_before(before.unwrap_or(u64::MAX), limit + 1)
+        })
         .await?;
-    let prev = match checkpoints.last() {
-        Some(last) if checkpoints.len() == limit && last.seq > 1 => Some(last.seq),
-        _ => None,
-    };
-    Ok(Json(json!({ "checkpoints": checkpoints, "prev": prev })))
+    let next = (checkpoints.len() > limit).then(|| checkpoints[limit - 1].seq);
+    checkpoints.truncate(limit);
+    Ok(Json(json!({
+        "checkpoints": checkpoints,
+        "next_cursor": next.map(|p| page::encode(page::List::Checkpoints, dir, p)),
+    })))
 }
 
 /// Middleware on every `/admin/*` route: `Cache-Control: no-store` (unless the handler chose
@@ -1333,9 +1535,12 @@ pub async fn audit_export(
 /// # Errors
 ///
 /// 409 `reload_unavailable` when `policy.policies_path` is not configured, 500 `server_error` when
-/// the file cannot be read or a policy lock is poisoned, and 422 when the file does not parse or
+/// the file cannot be read or the loaded policy info lock is poisoned, and 422 when the file does not parse or
 /// validate (the previous set stays in force).
-pub async fn reload_policies(State(state): State<Arc<AppState>>) -> Result<Json<Value>, ApiError> {
+pub async fn reload_policies(
+    State(state): State<Arc<AppState>>,
+    Extension(who): Extension<AdminIdentity>,
+) -> Result<Json<Value>, ApiError> {
     let path = state.policies_path.as_ref().ok_or_else(|| {
         ApiError::new(
             StatusCode::CONFLICT,
@@ -1343,40 +1548,44 @@ pub async fn reload_policies(State(state): State<Arc<AppState>>) -> Result<Json<
             "policy.policies_path is not configured; there is nothing to reload",
         )
     })?;
+    // One reload at a time, from reading the file to the swap.
+    let _reloading = state.policy_reload.lock().await;
     let text = tokio::fs::read_to_string(path)
         .await
         .map_err(|e| ApiError::internal(format!("reading {}: {e}", path.display())))?;
     let digest = hex::encode(sha2::Sha256::digest(text.as_bytes()));
     let now = state.now();
-    // The write guard is not `Send`, so it lives only inside this block.
-    let reloaded = {
-        let mut engine = state
-            .pipeline
-            .policy()
-            .write()
-            .map_err(|_| ApiError::internal("policy engine lock poisoned"))?;
-        match engine.reload_policies_str(&text) {
-            Err(e) => Err(e.to_string()),
-            Ok(()) => {
-                // Under the engine's write lock, so `GET /admin/policies` never pairs the new
-                // policies with the old digest. A failed reload leaves both as they were.
+    // Compile the new set on the blocking pool from a snapshot of the engine in force, with no
+    // lock held: decisions go on with the old engine meanwhile (A-7). Then swap it in whole.
+    let compiled = state
+        .blocking(move |s| s.pipeline.policy_snapshot().with_policies_reloaded(&text))
+        .await;
+    let reloaded = match compiled {
+        Err(e) => Err(e.to_string()),
+        Ok(engine) => {
+            let engine = Arc::new(engine);
+            {
+                // The swap happens under the loaded-policy info's write lock, so
+                // `GET /admin/policies` never pairs the new policies with the old digest. A
+                // failed reload leaves both as they were.
                 let mut loaded = state
                     .loaded_policies
                     .write()
                     .map_err(|_| ApiError::internal("loaded policy info lock poisoned"))?;
+                state.pipeline.policy().swap(Arc::clone(&engine));
                 *loaded = crate::state::LoadedPolicies {
                     sha256: Some(digest.clone()),
                     loaded_at: now,
                 };
-                tracing::info!(
-                    run_usage = ?engine.usage_tracking_reasons(),
-                    "policies reloaded; run usage kept for these reasons (none: not kept)"
-                );
-                if engine.asks_for_approval() && state.approvals_client_id.is_none() {
-                    tracing::warn!("{}", crate::config::UNSET_APPROVAL_CLIENT_ID);
-                }
-                Ok((engine.policy_ids(), engine.validation_warnings().to_vec()))
             }
+            tracing::info!(
+                run_usage = ?engine.usage_tracking_reasons(),
+                "policies reloaded; run usage kept for these reasons (none: not kept)"
+            );
+            if engine.asks_for_approval() && state.approvals_client_id.is_none() {
+                tracing::warn!("{}", crate::config::UNSET_APPROVAL_CLIENT_ID);
+            }
+            Ok((engine.policy_ids(), engine.validation_warnings().to_vec()))
         }
     };
     let (ids, warnings) = match reloaded {
@@ -1387,6 +1596,7 @@ pub async fn reload_policies(State(state): State<Arc<AppState>>) -> Result<Json<
                 .blocking(move |state| {
                     audit_admin(
                         state,
+                        &who,
                         "admin.policies.reload",
                         Decision::Deny,
                         "policy_invalid",
@@ -1412,6 +1622,7 @@ pub async fn reload_policies(State(state): State<Arc<AppState>>) -> Result<Json<
         .blocking(move |state| {
             audit_admin(
                 state,
+                &who,
                 "admin.policies.reload",
                 Decision::Allow,
                 REASON_ADMIN_ACTION,
@@ -1431,9 +1642,224 @@ pub async fn reload_policies(State(state): State<Arc<AppState>>) -> Result<Json<
     })))
 }
 
+/// Audit a refused operators reload as a `deny` whose reason is the refusal's code, then
+/// hand the refusal back. A failure to audit is logged; the refusal is answered either way.
+async fn audited_refusal(
+    state: &Arc<AppState>,
+    who: AdminIdentity,
+    path: &std::path::Path,
+    refusal: ApiError,
+    now: OffsetDateTime,
+) -> ApiError {
+    let p = path.to_path_buf();
+    let reason = refusal.stable_code().to_string();
+    let _ = state
+        .blocking(move |state| {
+            audit_admin(
+                state,
+                &who,
+                "admin.operators.reload",
+                Decision::Deny,
+                &reason,
+                Vec::new(),
+                json!({ "path": p }),
+                now,
+            )
+        })
+        .await
+        .inspect_err(|e| tracing::error!(error = ?e.detail, "failed reload was not audited"));
+    refusal
+}
+
+/// `POST /admin/operators/reload`: re-read the `[[admin.operators]]` array, and nothing else,
+/// from the config file the server was started with, check it as at startup (against the
+/// `[admin] token` in force, which is not reloaded) and swap the operators in force for it in
+/// one step. Answers the names of the operators `added`, `removed` and `changed` (role,
+/// `token_sha256` or `expires_at`), never a digest, and the id of the audit record.
+///
+/// A reload may remove or demote the operator who sent it; that request still completes, and
+/// the next one is checked against the new set. Requests admitted before the swap complete as
+/// they were admitted. A reload that would leave no unexpired credential with role `admin`
+/// (no `[admin] token` and no such operator) is refused, so that a typo cannot lock everyone
+/// out until a restart.
+///
+/// # Errors
+///
+/// Nothing changes on any error. 409 `reload_unavailable` when the server was not started
+/// from a config file; 500 `config_unreadable` when the file cannot be read (the cause is in
+/// the log); 422 `operators_invalid` when the file is not TOML or the list breaks a startup
+/// rule; 422 `operators_no_admin` for the lock-out above. The two 422s are audited as a
+/// `deny`.
+pub async fn reload_operators(
+    State(state): State<Arc<AppState>>,
+    Extension(who): Extension<AdminIdentity>,
+) -> Result<Json<Value>, ApiError> {
+    let path = state.config_path.clone().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::CONFLICT,
+            "reload_unavailable",
+            "the server was not started from a config file; there is nothing to reload",
+        )
+    })?;
+    // One reload at a time, from reading the file to the swap.
+    let _reloading = state.operators_reload.lock().await;
+    let text = tokio::fs::read_to_string(&path).await.map_err(|e| {
+        ApiError::internal(format!("reading {}: {e}", path.display()))
+            .with_code("config_unreadable")
+    })?;
+    let now = state.now();
+    let current = state.admin_credentials.snapshot();
+    let checked =
+        crate::operators::operators_from_toml(&text).and_then(|ops| current.with_operators(&ops));
+    let new = match checked {
+        Ok(new) => new,
+        Err(e) => {
+            let refusal = ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "operators_invalid",
+                format!("{e:#}; the operators in force are unchanged"),
+            );
+            return Err(audited_refusal(&state, who, &path, refusal, now).await);
+        }
+    };
+    if !new.has_live_admin(now) {
+        let refusal = ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "operators_no_admin",
+            "the reloaded list leaves no unexpired credential with role `admin` (no [admin] \
+             token and no such operator); the operators in force are unchanged",
+        );
+        return Err(audited_refusal(&state, who, &path, refusal, now).await);
+    }
+    let changes = current.changes_to(&new);
+    new.warn_expired(now, "by the reload");
+    state.admin_credentials.swap(Arc::new(new));
+    tracing::info!(
+        added = ?changes.added,
+        removed = ?changes.removed,
+        changed = ?changes.changed,
+        "admin operators reloaded"
+    );
+    let args = json!({
+        "path": path,
+        "added": changes.added,
+        "removed": changes.removed,
+        "changed": changes.changed,
+    });
+    let audit_id = state
+        .blocking(move |state| {
+            audit_admin(
+                state,
+                &who,
+                "admin.operators.reload",
+                Decision::Allow,
+                REASON_ADMIN_ACTION,
+                Vec::new(),
+                args,
+                now,
+            )
+        })
+        .await
+        .inspect_err(|e| tracing::error!(error = ?e.detail, "operators reload was not audited"))
+        .ok();
+    Ok(Json(json!({
+        "added": changes.added,
+        "removed": changes.removed,
+        "changed": changes.changed,
+        "audit_id": audit_id,
+    })))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::constant_time_eq;
+    use super::{constant_time_eq, run_user_windows};
+    use attenuo_audit::{LeaseRegistry, MemoryLeaseStore, RunLimits};
+    use attenuo_core::{LeaseId, WindowCharge, WindowKind, WindowMeasure};
+    use serde_json::json;
+    use time::macros::datetime;
+
+    /// Tools by name, then hour before day; the cap cuts the list and says so; the window
+    /// figures are the user's, read at the window holding `now`.
+    #[test]
+    fn run_user_windows_are_ordered_and_capped() {
+        let store = MemoryLeaseStore::new();
+        let root = LeaseId::new("r");
+        let now = datetime!(2026-11-14 09:30 UTC);
+        store
+            .register(&root, None, now + time::Duration::hours(1))
+            .unwrap();
+        // No issuer recorded: null, whatever else is there.
+        assert!(run_user_windows(&store, &WindowKind::ALL, &root, now, 10)
+            .unwrap()
+            .is_null());
+        store
+            .record_originating_user(&root, "https://idp.example", "alice")
+            .unwrap();
+        let mut charges = Vec::new();
+        let mut windows = Vec::new();
+        for (i, tool) in ["bank/pay", "bank/refund"].into_iter().enumerate() {
+            let (server, name) = tool.split_once('/').unwrap();
+            let call = attenuo_core::ToolCall::new(server, name, json!({"amount": 7}));
+            charges.extend(attenuo_core::limits::usage_charges(
+                &root,
+                &call,
+                Some("amount"),
+                None,
+            ));
+            for kind in WindowKind::ALL {
+                for (measure, amount) in [(WindowMeasure::Calls, 1), (WindowMeasure::Amount, 7)] {
+                    windows.push(WindowCharge {
+                        issuer: "https://idp.example".into(),
+                        subject: "alice".into(),
+                        kind,
+                        start: kind.start_of(now),
+                        tool: tool.into(),
+                        measure,
+                        amount: amount * (i as u64 + 1),
+                    });
+                }
+            }
+        }
+        store
+            .charge_windowed("d1", &charges, &windows, now, false)
+            .unwrap();
+        let all =
+            run_user_windows(&store, &[WindowKind::Day, WindowKind::Hour], &root, now, 10).unwrap();
+        assert_eq!(
+            all,
+            json!({"truncated": false, "windows": [
+                {"tool": "bank/pay", "kind": "hour", "start": "2026-11-14T09:00:00Z",
+                 "calls": 1, "amount": 7},
+                {"tool": "bank/pay", "kind": "day", "start": "2026-11-14T00:00:00Z",
+                 "calls": 1, "amount": 7},
+                {"tool": "bank/refund", "kind": "hour", "start": "2026-11-14T09:00:00Z",
+                 "calls": 2, "amount": 14},
+                {"tool": "bank/refund", "kind": "day", "start": "2026-11-14T00:00:00Z",
+                 "calls": 2, "amount": 14},
+            ]})
+        );
+        let cut = run_user_windows(&store, &WindowKind::ALL, &root, now, 3).unwrap();
+        assert_eq!(cut["truncated"], true);
+        assert_eq!(cut["windows"].as_array().unwrap().len(), 3);
+        let exact = run_user_windows(&store, &WindowKind::ALL, &root, now, 4).unwrap();
+        assert_eq!(exact["truncated"], false);
+        // An hour later the hour window is a new one, empty; the day still holds the calls.
+        let later = run_user_windows(
+            &store,
+            &[WindowKind::Hour],
+            &root,
+            now + time::Duration::hours(1),
+            10,
+        )
+        .unwrap();
+        assert_eq!(later["windows"][0]["start"], "2026-11-14T10:00:00Z");
+        assert_eq!(later["windows"][0]["calls"], 0);
+        // No kind kept: nothing listed.
+        assert_eq!(
+            run_user_windows(&store, &[], &root, now, 10).unwrap(),
+            json!({"windows": [], "truncated": false})
+        );
+    }
 
     #[test]
     fn ct_eq() {
