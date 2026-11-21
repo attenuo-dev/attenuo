@@ -62,7 +62,7 @@ has "type: Recreate"
 has "runAsNonRoot: true"
 has "readOnlyRootFilesystem: true"
 has "automountServiceAccountToken: false"
-has "terminationGracePeriodSeconds: 30"
+has "terminationGracePeriodSeconds: 35"
 has "failureThreshold: 150"
 # The admin API is on loopback in the pod unless its Service is on.
 has 'value: "127.0.0.1:9102"'

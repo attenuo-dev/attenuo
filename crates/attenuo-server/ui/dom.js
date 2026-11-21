@@ -106,6 +106,17 @@ export function decisionPill(decision, big = false) {
   return pill(decision || '?', decision === 'allow' ? 'allow' : decision === 'deny' ? 'deny' : '', big);
 }
 
+/** Kinds whose record is not a decision, though its `decision` member says `allow`. */
+const NOT_DECISIONS = new Set(['tool_result', 'approval_request', 'approval_grant', 'search']);
+
+/** The decision cell of an audit row: a pill for a decision, a dash for a record that is none. */
+export function recordPill(record, big = false) {
+  if (NOT_DECISIONS.has(record.kind)) {
+    return h('span', { class: 'muted', title: `A ${record.kind} record is not a decision` }, '—');
+  }
+  return decisionPill(record.decision, big);
+}
+
 /** Lease state from a registry row or tree node: active, revoked or expired. */
 export function leaseState(row) {
   if (!row || row.known === false) return { label: 'unknown', kind: '' };

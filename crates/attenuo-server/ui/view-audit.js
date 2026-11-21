@@ -6,7 +6,7 @@
 'use strict';
 
 import {
-  h, append, replace, link, mono, short, time, decisionPill, table, empty, loading,
+  h, append, replace, link, mono, short, time, recordPill, table, empty, loading,
   explainReason,
 } from './dom.js';
 import { api, download, qs } from './api.js';
@@ -19,7 +19,8 @@ const FOLLOW_MS = 2000;
 // Follow mode keeps at most this many rows on screen.
 const FOLLOW_CAP = 500;
 
-export const KINDS = ['decision', 'exchange', 'root_token', 'lease_renew', 'lease_revoke', 'admin', 'search'];
+export const KINDS = ['decision', 'exchange', 'root_token', 'lease_renew', 'lease_revoke', 'admin',
+  'tool_result', 'approval_request', 'approval_grant', 'search'];
 const TEXT_FILTERS = [
   ['reason', 'Reason', 'policy_deny'],
   ['subject', 'Subject', 'alice'],
@@ -123,7 +124,7 @@ function row(entry, onChain, fresh) {
     h('td', { class: 'num' }, link(['entry', entry.seq], mono(entry.seq))),
     h('td', null, time(r.at)),
     h('td', null, h('span', { class: 'tag' }, r.kind)),
-    h('td', null, decisionPill(r.decision)),
+    h('td', null, recordPill(r)),
     h('td', { class: 'wrap' }, mono(`${r.server} / ${r.tool}`)),
     h('td', { class: 'wrap' }, agents),
     h('td', { class: 'wrap' }, r.originating_subject),
