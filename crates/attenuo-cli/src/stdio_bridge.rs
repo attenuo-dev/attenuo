@@ -735,29 +735,55 @@ pub(crate) fn check_listen(addr: SocketAddr, allow_non_loopback: bool) -> Result
     Ok(())
 }
 
-/// Resolve on SIGINT or SIGTERM.
+/// Resolve on SIGINT, SIGTERM, SIGHUP or SIGQUIT.
+///
+/// SIGHUP and SIGQUIT are here because the child is in a process group of its own: a
+/// closing terminal or Ctrl-\ reaches the bridge and no longer the child, so the bridge
+/// has to stop the child itself.
 async fn stop_signal() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
-        let mut term = signal(SignalKind::terminate()).ok();
-        let term = async {
-            match term.as_mut() {
-                Some(t) => {
-                    t.recv().await;
+        async fn got(kind: SignalKind) {
+            match signal(kind) {
+                Ok(mut s) => {
+                    s.recv().await;
                 }
-                None => std::future::pending::<()>().await,
+                Err(_) => std::future::pending::<()>().await,
             }
-        };
+        }
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {}
-            () = term => {}
+            () = got(SignalKind::terminate()) => {}
+            () = got(SignalKind::hangup()) => {}
+            () = got(SignalKind::quit()) => {}
         }
     }
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
     }
+}
+
+/// Kills the child's process group when dropped, unless [`stop_child`] already stopped it:
+/// an early return or a panic between starting the child and stopping it must not leave
+/// the processes the child started behind (`kill_on_drop` covers the child alone).
+struct GroupGuard(Option<u32>);
+
+impl Drop for GroupGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(pid) = self.0.take().and_then(group_pid) {
+            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn group_pid(group: u32) -> Option<rustix::process::Pid> {
+    i32::try_from(group)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
 }
 
 /// `attenuo stdio-bridge`: `Ok` when stopped by a signal, an error when the child cannot be
@@ -780,12 +806,17 @@ pub(crate) async fn run(args: StdioBridgeArgs) -> Result<()> {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
         .kill_on_drop(true);
+    // A process group of its own, so that stopping reaches what the child started too: a
+    // launcher such as `npx` or `uvx` is the child, and the real server is its child.
+    #[cfg(unix)]
+    cmd.process_group(0);
     for var in scrubbed_env(std::env::vars_os().map(|(name, _)| name)) {
         cmd.env_remove(var);
     }
     let mut child = cmd
         .spawn()
         .with_context(|| format!("cannot start the STDIO server `{name}`"))?;
+    let mut group = GroupGuard(child.id());
     let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
         bail!("the STDIO server `{name}` was started without pipes");
     };
@@ -820,7 +851,7 @@ pub(crate) async fn run(args: StdioBridgeArgs) -> Result<()> {
         )),
         () = stop_signal() => Ok(()),
     };
-    stop_child(&bridge, &mut child).await;
+    stop_child(&bridge, &mut child, group.0.take()).await;
     if let Some(line) = bridge.counts.summary() {
         errln!("{line}");
     }
@@ -828,14 +859,50 @@ pub(crate) async fn run(args: StdioBridgeArgs) -> Result<()> {
     outcome
 }
 
-/// Stop the child: close its stdin, give it [`STOP_GRACE`] to exit, then kill it.
-async fn stop_child(bridge: &Bridge, child: &mut tokio::process::Child) {
+/// Stop the child: close its stdin, give it [`STOP_GRACE`] to exit, then kill it. Then stop
+/// whatever is left of its process group (`group`, the child's pid): the processes it
+/// started that did not exit with it.
+async fn stop_child(bridge: &Bridge, child: &mut tokio::process::Child, group: Option<u32>) {
     bridge.close_stdin();
-    if let Ok(Ok(_)) = tokio::time::timeout(STOP_GRACE, child.wait()).await {
+    if tokio::time::timeout(STOP_GRACE, child.wait())
+        .await
+        .is_err()
+    {
+        let _ = child.kill().await;
+    }
+    stop_group(group).await;
+}
+
+/// Ask the rest of the process group to stop (SIGTERM, and SIGCONT so that a stopped
+/// member sees it), give it [`STOP_GRACE`], then kill it.
+///
+/// The group's id is the pid of the child, which has been waited for by now. The kernel
+/// does not give that number to a new process while a member of the group lives. With no
+/// member left the number is free, so a new group could take it between the child's exit
+/// and the signal; that needs the pid counter to wrap within that moment.
+#[cfg(unix)]
+async fn stop_group(group: Option<u32>) {
+    use rustix::process::{kill_process_group, test_kill_process_group, Signal};
+    let Some(pid) = group.and_then(group_pid) else {
+        return;
+    };
+    // An error here means nobody is left in the group (or it is not ours to signal).
+    if kill_process_group(pid, Signal::TERM).is_err() {
         return;
     }
-    let _ = child.kill().await;
+    let _ = kill_process_group(pid, Signal::CONT);
+    let deadline = tokio::time::Instant::now() + STOP_GRACE;
+    while tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        if test_kill_process_group(pid).is_err() {
+            return;
+        }
+    }
+    let _ = kill_process_group(pid, Signal::KILL);
 }
+
+#[cfg(not(unix))]
+async fn stop_group(_group: Option<u32>) {}
 
 #[cfg(test)]
 mod tests {
