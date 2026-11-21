@@ -48,6 +48,17 @@ With the Rust toolchain, the first run compiles the workspace: about a minute an
 
 A recorded run is in [transcript.md](examples/github-leak-demo/transcript.md) (the recording above is [docs/demo](docs/demo/README.md), paced for reading), and the step table is in the [demo README](examples/github-leak-demo/README.md). The demo mints Alice's root token through a development-only endpoint. A real deployment mints it from an OIDC ID token, as shown in [getting started](docs/guides/getting-started.md) and [identity providers](docs/guides/identity-providers.md).
 
+## Install
+
+Prebuilt binaries for Linux (x86_64, aarch64) and macOS (Intel, Apple silicon):
+
+<!-- check: skip downloads a release over the network; CI job install-script runs it -->
+```sh
+curl -fsSL https://raw.githubusercontent.com/attenuo-dev/attenuo/main/scripts/install.sh | sh
+```
+
+The script downloads the latest release's archive for your machine, checks its SHA-256 against the release's `SHA256SUMS`, and puts `attenuo` (the CLI) and `attenuo-server` in `~/.local/bin`. It does not use `sudo`. Set `ATTENUO_VERSION=v0.1.0` to pin a release and `ATTENUO_INSTALL_DIR` to choose the directory; [read the script](scripts/install.sh) first if you prefer. There is also a container image, `ghcr.io/attenuo-dev/attenuo`, and you can [build from source](CONTRIBUTING.md).
+
 ## How it works
 
 ```text
