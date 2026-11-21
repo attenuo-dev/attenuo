@@ -12,7 +12,8 @@
 //! - [`verify_proof`]: check a proof's header (`typ` = `dpop+jwt`, an `alg` from
 //!   [`DPOP_ALGS`], a public `jwk` that matches `alg`), signature, `htm`, `htu` (compared with
 //!   [`normalize_htu`]: scheme, host, port and path, without query or fragment), `iat` within
-//!   a window, and `ath` when the request presents a bound token. Replay of `jti` is the
+//!   a window (up to [`ProofCheck::max_age`] in the past and [`ProofCheck::future_skew`] in
+//!   the future), and `ath` when the request presents a bound token. Replay of `jti` is the
 //!   caller's business (it needs a cache shared by requests); [`VerifiedProof::replay_key`]
 //!   gives the key to use.
 //! - [`jwk_thumbprint`] and [`access_token_hash`]: the two hashes the scheme is built on.
@@ -117,6 +118,11 @@ pub enum DpopError {
     /// `iat` is outside the accepted window around the server's clock.
     #[error("DPoP proof iat is outside the accepted window")]
     Stale,
+    /// `iat` is from before the server's restart fence: the previous server process on the
+    /// same database could have accepted this proof, so this one does not. Not raised by
+    /// [`verify_proof`]; the server checks it, since it needs server state.
+    #[error("DPoP proof iat is from before this server started; make a new proof")]
+    BeforeRestart,
     /// The request presents a bound token and the proof has no `ath`, or a wrong one.
     #[error("DPoP proof ath does not match the presented token")]
     AthMismatch,
@@ -147,8 +153,11 @@ pub struct ProofCheck<'a> {
     pub access_token: Option<&'a str>,
     /// The server's clock.
     pub now: OffsetDateTime,
-    /// How far `iat` may be from `now`, either way.
+    /// How far `iat` may be before `now`.
     pub max_age: Duration,
+    /// How far `iat` may be after `now` (a client clock that runs ahead). A proof is accepted
+    /// when `iat - future_skew <= now <= iat + max_age`, both ends included.
+    pub future_skew: Duration,
 }
 
 /// A proof that verified.
@@ -327,7 +336,7 @@ fn decode_part(part: &str, what: &str) -> Result<Map<String, Value>, DpopError> 
 /// [`DpopError::BadKey`] for the header `jwk`, [`DpopError::UnsupportedAlg`] for an `alg`
 /// that is not `EdDSA` or `ES256` or does not match the key, [`DpopError::BadSignature`],
 /// [`DpopError::MethodMismatch`], [`DpopError::UrlMismatch`], [`DpopError::Stale`] when
-/// `iat` is more than `max_age` from `now`, and [`DpopError::AthMismatch`] when
+/// `iat` is more than `max_age` before `now` or more than `future_skew` after it, and [`DpopError::AthMismatch`] when
 /// `check.access_token` is set and `ath` is missing or wrong.
 pub fn verify_proof(proof: &str, check: &ProofCheck<'_>) -> Result<VerifiedProof, DpopError> {
     if proof.len() > MAX_PROOF_BYTES {
@@ -394,12 +403,15 @@ pub fn verify_proof(proof: &str, check: &ProofCheck<'_>) -> Result<VerifiedProof
         .get("iat")
         .and_then(Value::as_i64)
         .ok_or_else(|| DpopError::Malformed("`iat` is missing or not an integer".into()))?;
-    // `iat` is the caller's: `now - iat` can overflow (and `abs` of `i64::MIN` too), which
-    // panics in a debug build and, wrapped in a release build, made a proof with
-    // `iat = now - 2^63` look fresh. `abs_diff` is exact for every pair of `i64`s.
+    // Accepted iff `iat - future_skew <= now <= iat + max_age`. `iat` is the caller's:
+    // `now - iat` can overflow in `i64`, which panics in a debug build and, wrapped in a
+    // release build, made a proof with `iat = now - 2^63` look fresh. The difference of two
+    // `i64`s is exact in `i128`.
     let now = check.now.unix_timestamp();
-    let max_age = u64::try_from(check.max_age.whole_seconds()).unwrap_or(0);
-    if now.abs_diff(iat) > max_age {
+    let age = i128::from(now) - i128::from(iat);
+    let max_age = i128::from(check.max_age.whole_seconds().max(0));
+    let future_skew = i128::from(check.future_skew.whole_seconds().max(0));
+    if age > max_age || -age > future_skew {
         return Err(DpopError::Stale);
     }
     let opt_str = |k: &str| claims.get(k).and_then(Value::as_str).map(str::to_owned);
@@ -662,6 +674,7 @@ mod tests {
             access_token: token,
             now,
             max_age: Duration::seconds(300),
+            future_skew: Duration::seconds(10),
         }
     }
 
@@ -760,7 +773,7 @@ mod tests {
             Err(DpopError::Stale)
         );
         assert_eq!(
-            ok(&k.proof("POST", URL, Some("tok"), t + Duration::seconds(301))),
+            ok(&k.proof("POST", URL, Some("tok"), t + Duration::seconds(11))),
             Err(DpopError::Stale)
         );
         // `iat` at the i64 edges is stale, not an overflow (found by the `dpop_proof` fuzz
@@ -790,6 +803,38 @@ mod tests {
             &check(None, t),
         )
         .unwrap();
+    }
+
+    /// The window is asymmetric: `iat` up to `max_age` (300) in the past and up to
+    /// `future_skew` (10) in the future, both ends included.
+    #[test]
+    fn iat_window_edges_past_and_future() {
+        let k = DpopKey::generate().unwrap();
+        let t = now();
+        let at = |offset: i64| {
+            verify_proof(
+                &k.proof("POST", URL, None, t + Duration::seconds(offset)),
+                &check(None, t),
+            )
+        };
+        assert!(at(-300).is_ok());
+        assert_eq!(at(-301), Err(DpopError::Stale));
+        assert!(at(0).is_ok());
+        assert!(at(10).is_ok());
+        assert_eq!(at(11), Err(DpopError::Stale));
+        // No future allowance at all: only `iat <= now`.
+        let strict = ProofCheck {
+            future_skew: Duration::ZERO,
+            ..check(None, t)
+        };
+        assert!(verify_proof(&k.proof("POST", URL, None, t), &strict).is_ok());
+        assert_eq!(
+            verify_proof(
+                &k.proof("POST", URL, None, t + Duration::seconds(1)),
+                &strict
+            ),
+            Err(DpopError::Stale)
+        );
     }
 
     #[test]

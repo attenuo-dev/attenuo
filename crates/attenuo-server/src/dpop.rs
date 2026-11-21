@@ -17,8 +17,9 @@
 //! The proof must name the request's method (`htm`) and URL (`htu`: `[server] public_url` plus
 //! the request path, or `http://<Host>` plus the path when `public_url` is unset; scheme, host,
 //! port and path are compared, the query is not), carry `ath` = base64url(SHA-256(token)),
-//! have an `iat` within `[token] dpop_max_age_seconds` of the server's clock, and a `jti` this
-//! process has not seen. This holds whatever `[token] dpop` says: once bound, always bound.
+//! have an `iat` at most `[token] dpop_max_age_seconds` behind the server's clock and at most
+//! `[token] dpop_future_skew_seconds` ahead of it, not be from before a restart (see "Restart
+//! fence"), and have a `jti` this process has not seen. This holds whatever `[token] dpop` says: once bound, always bound.
 //! With `dpop = "required"`, an unbound token is refused on these routes too.
 //!
 //! **Attenuation.** A child of a bound token must be bound (`TokenError::BindingRequired`).
@@ -66,14 +67,44 @@
 //!
 //! Unlike the credential markers, proof `jti`s are not written to the database. A proof is
 //! checked on every proxied call with a bound token, so persisting them would put a write,
-//! through the file's write gate and behind the audit appends, on the per-call path; and a
-//! proof is accepted for only `dpop_max_age_seconds` (300 by default) after its `iat`. So a
-//! restart forgets the proofs of that window: one captured together with its access token can
-//! be replayed once more, for the same method, URL and token, until its `iat` is too old.
-//! Server nonces do not close this, because they are derived from the issuer key and the time
-//! and so stay valid across a restart; a shorter `dpop_max_age_seconds` narrows it.
+//! through the file's write gate and behind the audit appends, on the per-call path. The cache
+//! is per process: it is not shared between replicas.
+//!
+//! **Restart fence.** A new process has an empty cache, so without more it would accept once
+//! more a proof the previous process had already accepted. It refuses instead every proof the
+//! previous process could have accepted. A proof is accepted at server second `n` only when
+//! `iat - F <= n <= iat + M` (`F` = `dpop_future_skew_seconds`, default 10; `M` =
+//! `dpop_max_age_seconds`, default 300).
+//!
+//! - While it runs, the server keeps a liveness marker in the database file (the
+//!   `dpop_max_iat` row of `audit_meta`): it writes `now + 10 + F` at start and again every 5
+//!   seconds, from a thread of its own, never per call. Each write commits with
+//!   `synchronous=FULL`.
+//! - After a write `now + 10 + F` is on disk, the server accepts proofs until `now + 10`, and
+//!   never later: at a second past that, it first writes the marker again, and if that fails
+//!   it refuses the proof with 503 `temporarily_unavailable` (`dpop_liveness_stale`). So every
+//!   proof it accepted has `iat <= n + F <= marker`.
+//! - At start, before its own first write, the server reads the marker the previous process
+//!   left (`B`) and refuses every proof with `iat <= B` as `invalid_dpop_proof` (detail: from
+//!   before this server started). A proof with `iat = B + 1` could not have been accepted
+//!   before, and is accepted. The check runs after the signature and every other check, and
+//!   before the `jti` is recorded, so a refused proof takes no cache slot. The marker only
+//!   grows: a clock that went back keeps it, and the fence then holds until the clock passes
+//!   it again.
+//! - With no marker (a new file, or one last used by a build from before this) there is no
+//!   fence. With `sqlite_path = ":memory:"` there is no marker and no fence: nothing survives
+//!   such a restart anyway, tokens included.
+//!
+//! The cost: after a restart that comes within about `F + 10` seconds (20 by default) of the
+//! old process's last marker write, proofs made now are refused until the clock passes `B`,
+//! at most about 21 seconds by default. A client whose clock is slow waits that much longer. A
+//! slower restart costs nothing. Clients do not retry `invalid_dpop_proof` by themselves: the
+//! CLI and the SDKs retry only `use_dpop_nonce`. Once the clock is past `B + M`, the fence
+//! refuses nothing the `iat` check would not. Server nonces do not replace the fence: they are
+//! derived from the issuer key and the time, so they stay valid across a restart.
 
 use std::collections::{BTreeMap, HashSet};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Mutex;
 
 use std::sync::Arc;
@@ -104,6 +135,15 @@ pub const USE_NONCE: &str = USE_DPOP_NONCE;
 /// `error_description` (and the proxy's `data.reason`, with HTTP 503) when the replay cache is
 /// full of live proofs.
 pub const DPOP_REPLAY_CACHE_FULL: &str = "dpop_replay_cache_full";
+/// `error_description` (and the proxy's `data.reason`, with HTTP 503) when the server could
+/// not move its liveness marker ahead of its clock, so it may not accept proofs (see
+/// "Restart fence" in the module docs).
+pub const DPOP_LIVENESS_STALE: &str = "dpop_liveness_stale";
+/// Seconds between two writes of the liveness marker ([`Liveness::extend`]).
+pub const LIVENESS_HEARTBEAT_SECONDS: i64 = 5;
+/// How far ahead of the clock a marker write reaches: two heartbeats, so one late or failed
+/// write does not stop the server from accepting proofs.
+pub const LIVENESS_LEAD_SECONDS: i64 = 2 * LIVENESS_HEARTBEAT_SECONDS;
 
 /// Why DPoP refused a request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,6 +156,8 @@ pub enum DpopFailure {
     UseNonce(String),
     /// The replay cache is full of live entries.
     Unavailable,
+    /// The liveness marker is behind the clock and could not be moved: the proof may be fine.
+    LivenessStale,
 }
 
 impl From<DpopError> for DpopFailure {
@@ -145,6 +187,13 @@ impl From<DpopFailure> for ApiError {
                 "too many DPoP proofs in flight; retry later",
             )
             .with_description(DPOP_REPLAY_CACHE_FULL),
+            DpopFailure::LivenessStale => ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "temporarily_unavailable",
+                "the server cannot record that it is running, so it accepts no DPoP proof; \
+                 retry later",
+            )
+            .with_description(DPOP_LIVENESS_STALE),
         }
     }
 }
@@ -157,7 +206,85 @@ impl From<DpopFailure> for AuthError {
             DpopFailure::UseNonce(detail) => AuthError::UseDpopNonce(detail),
             // 503, not 401: the proof may be fine (SR-47).
             DpopFailure::Unavailable => AuthError::Unavailable(DPOP_REPLAY_CACHE_FULL.into()),
+            DpopFailure::LivenessStale => AuthError::Unavailable(DPOP_LIVENESS_STALE.into()),
         }
+    }
+}
+
+/// Persist the liveness marker: store the given second, or keep the stored one when it is
+/// later, and return the value now stored. `Ok` means the value is on disk.
+pub type MarkerWrite = Box<dyn Fn(i64) -> Result<i64, String> + Send + Sync>;
+
+/// The running server's side of the restart fence: the marker it keeps ahead of its clock, and
+/// the second until which it may accept proofs. See "Restart fence" in the module docs.
+pub struct Liveness {
+    write: MarkerWrite,
+    /// How far ahead of `now` a proof's `iat` may be (`[token] dpop_future_skew_seconds`).
+    future_skew: i64,
+    /// The last second at which a proof may be accepted: a marker this process wrote minus
+    /// `future_skew`. Only raised, and only after the write that covers it succeeded.
+    alive_until: AtomicI64,
+    /// Taken by a request that finds the marker behind the clock, so only one writes.
+    refresh: Mutex<()>,
+}
+
+impl Liveness {
+    /// Write the first marker at `now` (Unix seconds) and start from it. The caller reads the
+    /// previous marker before this, since the write may replace it.
+    ///
+    /// # Errors
+    ///
+    /// The write's error.
+    pub fn start(write: MarkerWrite, future_skew_seconds: u64, now: i64) -> Result<Self, String> {
+        let live = Self {
+            write,
+            future_skew: i64::try_from(future_skew_seconds).unwrap_or(i64::MAX),
+            alive_until: AtomicI64::new(i64::MIN),
+            refresh: Mutex::new(()),
+        };
+        live.extend(now)?;
+        Ok(live)
+    }
+
+    /// Move the marker to `now + LIVENESS_LEAD_SECONDS + future_skew`, and once that is on
+    /// disk, accept proofs until `now + LIVENESS_LEAD_SECONDS`. The heartbeat calls this every
+    /// [`LIVENESS_HEARTBEAT_SECONDS`].
+    ///
+    /// # Errors
+    ///
+    /// The write's error; nothing changes then.
+    pub fn extend(&self, now: i64) -> Result<(), String> {
+        let until = now.saturating_add(LIVENESS_LEAD_SECONDS);
+        // The stored value may be later (a previous process, a clock that went back): it only
+        // grows, and this process accepts only up to what it wrote itself.
+        (self.write)(until.saturating_add(self.future_skew))?;
+        self.alive_until.fetch_max(until, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// The last second at which this process may accept a proof.
+    pub fn alive_until(&self) -> i64 {
+        self.alive_until.load(Ordering::SeqCst)
+    }
+
+    /// May a proof be accepted at `now`? When the marker is behind (the heartbeat is late, or
+    /// its writes fail), one request writes it before answering.
+    fn admits(&self, now: i64) -> bool {
+        if now <= self.alive_until() {
+            return true;
+        }
+        let _turn = self.refresh.lock().unwrap_or_else(|e| e.into_inner());
+        if now <= self.alive_until() {
+            return true;
+        }
+        if let Err(e) = self.extend(now) {
+            tracing::error!(
+                error = %e,
+                "cannot move the DPoP liveness marker ahead of the clock; refusing DPoP proofs"
+            );
+            return false;
+        }
+        now <= self.alive_until()
     }
 }
 
@@ -165,16 +292,25 @@ impl From<DpopFailure> for AuthError {
 pub struct Dpop {
     mode: DpopMode,
     max_age: Duration,
+    future_skew: Duration,
     public_url: Option<String>,
     replay: ProofReplayCache,
     nonces: Option<Nonces>,
+    /// The previous process's liveness marker: a proof with `iat` at or before it is refused.
+    /// `None` without a previous process (or without a marker at all).
+    fence: Option<i64>,
+    /// This process's marker; `None` with no database file (`:memory:`).
+    liveness: Option<Arc<Liveness>>,
 }
 
 impl Dpop {
     /// DPoP checks in `mode`, accepting proofs whose `iat` is within `max_age_seconds` of the
     /// clock (at least 1) and remembering up to `replay_capacity` of them for replay detection.
-    /// `public_url` (a trailing `/` dropped) is the base of the expected `htu`. No server nonces
-    /// until [`Self::with_nonce`].
+    /// `public_url` (a trailing `/` dropped) is the base of the expected `htu`. A proof's `iat`
+    /// may be [`DEFAULT_DPOP_FUTURE_SKEW_SECONDS`](crate::config::DEFAULT_DPOP_FUTURE_SKEW_SECONDS)
+    /// ahead of the clock (at most `max_age_seconds`) until [`Self::with_future_skew`]. No
+    /// server nonces until [`Self::with_nonce`], and no restart fence until
+    /// [`Self::with_restart_fence`].
     pub fn new(
         mode: DpopMode,
         max_age_seconds: u64,
@@ -185,10 +321,39 @@ impl Dpop {
         Self {
             mode,
             max_age: Duration::seconds(secs),
+            future_skew: Duration::seconds(
+                i64::try_from(crate::config::DEFAULT_DPOP_FUTURE_SKEW_SECONDS)
+                    .unwrap_or(i64::MAX)
+                    .min(secs),
+            ),
             public_url: public_url.map(|u| u.trim_end_matches('/').to_owned()),
             replay: ProofReplayCache::new(replay_capacity, secs),
             nonces: None,
+            fence: None,
+            liveness: None,
         }
+    }
+
+    /// Accept proofs whose `iat` is up to `seconds` ahead of the clock (`[token]
+    /// dpop_future_skew_seconds`), at most the past allowance.
+    pub fn with_future_skew(mut self, seconds: u64) -> Self {
+        let secs = i64::try_from(seconds).unwrap_or(i64::MAX);
+        self.future_skew = Duration::seconds(secs.min(self.max_age.whole_seconds()));
+        self
+    }
+
+    /// The restart fence: refuse every proof with `iat <= previous` (the marker the previous
+    /// process on this database left, `None` when there was none), and accept a proof only
+    /// while `liveness` is ahead of the clock. See "Restart fence" in the module docs.
+    pub fn with_restart_fence(mut self, previous: Option<i64>, liveness: Arc<Liveness>) -> Self {
+        self.fence = previous;
+        self.liveness = Some(liveness);
+        self
+    }
+
+    /// `[token] dpop_future_skew_seconds`, as applied.
+    pub fn future_skew_seconds(&self) -> u64 {
+        u64::try_from(self.future_skew.whole_seconds()).unwrap_or(0)
     }
 
     /// Require server nonces when `mode` says so, with a nonce key derived from `secret` (the
@@ -241,9 +406,11 @@ impl Dpop {
     /// # Errors
     ///
     /// [`DpopFailure::Invalid`] when the proof does not verify (signature, `htm`, `htu`, `iat`
-    /// window, `ath`) or its `jti` was already used, [`DpopFailure::UseNonce`] when it lacks a
-    /// current server nonce that `[token] dpop_nonce` asks for, and [`DpopFailure::Unavailable`]
-    /// when the replay cache is full of live entries.
+    /// window, `ath`), is from before the restart fence, or its `jti` was already used,
+    /// [`DpopFailure::UseNonce`] when it lacks a current server nonce that `[token] dpop_nonce`
+    /// asks for, [`DpopFailure::Unavailable`] when the replay cache is full of live entries, and
+    /// [`DpopFailure::LivenessStale`] when the liveness marker cannot be kept ahead of the
+    /// clock.
     pub fn verify(
         &self,
         proof: &str,
@@ -302,7 +469,7 @@ impl Dpop {
         access_token: Option<&str>,
         now: OffsetDateTime,
     ) -> Result<VerifiedProof, DpopFailure> {
-        Ok(verify_proof(
+        let verified = verify_proof(
             proof,
             &ProofCheck {
                 method,
@@ -310,13 +477,31 @@ impl Dpop {
                 access_token,
                 now,
                 max_age: self.max_age,
+                future_skew: self.future_skew,
             },
-        )?)
+        )?;
+        // The restart fence, after the signature and every other check, so it tells a caller
+        // without a valid proof nothing new. The previous process accepted a proof only at a
+        // second `n` with `iat - future_skew <= n <= its alive_until`, and its marker is at
+        // least `alive_until + future_skew`, so every proof it could have accepted has
+        // `iat <= marker`: refuse exactly those. `iat = marker + 1` could not have been
+        // accepted there, and is accepted here.
+        if self.fence.is_some_and(|marker| verified.iat <= marker) {
+            return Err(DpopError::BeforeRestart.into());
+        }
+        Ok(verified)
     }
 
-    /// Record the `jti`s of `proofs` as used: all of them, or none when one was already used or
-    /// the cache is full.
+    /// Record the `jti`s of `proofs` as used: all of them, or none when one was already used,
+    /// the cache is full, or the liveness marker is behind the clock. This is where a proof is
+    /// accepted, so it is where the marker must cover `now`: a proof accepted at `now` has
+    /// `iat <= now + future_skew`, which the stored marker then covers for the next process.
     fn use_once(&self, proofs: &[&VerifiedProof], now: OffsetDateTime) -> Result<(), DpopFailure> {
+        if let Some(live) = &self.liveness {
+            if !live.admits(now.unix_timestamp()) {
+                return Err(DpopFailure::LivenessStale);
+            }
+        }
         let keys: Vec<(String, i64)> = proofs
             .iter()
             .map(|p| (p.replay_key(), p.replay_until(self.max_age)))
@@ -939,6 +1124,237 @@ mod tests {
             let p = key.proof_with_nonce("POST", &url, None, nonce, now);
             assert!(d.bind_new(Some(&p), "POST", &url, now).unwrap().is_some());
         }
+    }
+
+    /// A marker kept in memory for the restart fence tests: `fail` makes every write fail.
+    struct Marker {
+        stored: Arc<Mutex<Option<i64>>>,
+        fail: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Marker {
+        fn new(previous: Option<i64>) -> Self {
+            Self {
+                stored: Arc::new(Mutex::new(previous)),
+                fail: Arc::default(),
+            }
+        }
+
+        fn stored(&self) -> Option<i64> {
+            *self.stored.lock().unwrap()
+        }
+
+        fn write(&self) -> MarkerWrite {
+            let (stored, fail) = (self.stored.clone(), self.fail.clone());
+            Box::new(move |until| {
+                if fail.load(Ordering::SeqCst) {
+                    return Err("disk full".into());
+                }
+                let mut s = stored.lock().unwrap();
+                let v = s.map_or(until, |old| old.max(until));
+                *s = Some(v);
+                Ok(v)
+            })
+        }
+    }
+
+    /// A checker (max age 300, future skew 10) started at `start` on a database whose previous
+    /// marker is `previous`, as `AppState` builds it: the marker is read, then written.
+    fn fenced(previous: Option<i64>, start: i64) -> (Dpop, Marker) {
+        let marker = Marker::new(previous);
+        let d = Dpop::new(DpopMode::Optional, 300, 100, None).with_future_skew(10);
+        let live = Liveness::start(marker.write(), d.future_skew_seconds(), start).unwrap();
+        (d.with_restart_fence(previous, Arc::new(live)), marker)
+    }
+
+    #[test]
+    fn the_liveness_marker_covers_every_iat_this_process_may_accept() {
+        let (d, marker) = fenced(None, 1_000_000);
+        // Written at start: accept until start + 10, and every such proof has iat <= that + 10.
+        assert_eq!(marker.stored(), Some(1_000_020));
+        let live = d.liveness.clone().unwrap();
+        assert_eq!(live.alive_until(), 1_000_010);
+        live.extend(1_000_005).unwrap();
+        assert_eq!(
+            (marker.stored(), live.alive_until()),
+            (Some(1_000_025), 1_000_015)
+        );
+        // A clock that goes back never lowers either.
+        live.extend(999_000).unwrap();
+        assert_eq!(
+            (marker.stored(), live.alive_until()),
+            (Some(1_000_025), 1_000_015)
+        );
+    }
+
+    /// The fence refuses exactly `iat <= previous marker`, after the other checks and before
+    /// the `jti` is stored.
+    #[test]
+    fn restart_fence_refuses_proofs_from_before_the_restart() {
+        let marker = 1_000_020; // the previous process accepted proofs until 1_000_010
+        let (d, _) = fenced(Some(marker), 1_000_012);
+        let key = DpopKey::generate().unwrap();
+        let url = d.expected_url(None, "/token");
+        let now = t(1_000_015);
+        let bind = |iat: i64| {
+            d.bind_new(
+                Some(&key.proof("POST", &url, None, t(iat))),
+                "POST",
+                &url,
+                now,
+            )
+        };
+        let before = DpopFailure::Invalid(DpopError::BeforeRestart.to_string());
+        // Before the start, at the start, and up to the marker: refused.
+        for iat in [999_990, 1_000_012, 1_000_015, marker] {
+            assert_eq!(bind(iat), Err(before.clone()), "iat {iat}");
+        }
+        assert_eq!(d.replay.len(), 0, "a fenced proof takes no replay slot");
+        // The same proof again is fenced again, not a replay: its `jti` was not stored.
+        let p = key.proof("POST", &url, None, t(marker));
+        assert_eq!(d.bind_new(Some(&p), "POST", &url, now), Err(before.clone()));
+        assert_eq!(d.bind_new(Some(&p), "POST", &url, now), Err(before.clone()));
+        assert_eq!(d.replay.len(), 0);
+        // Just after the marker: accepted (within the 10 s future skew of `now`).
+        assert!(bind(marker + 1).unwrap().is_some());
+        assert_eq!(d.replay.len(), 1);
+        // A bad proof is still refused for what is wrong with it first.
+        let wrong_url = key.proof("POST", "http://localhost/x", None, t(marker));
+        assert_eq!(
+            d.bind_new(Some(&wrong_url), "POST", &url, now),
+            Err(DpopError::UrlMismatch.into())
+        );
+        // The same holds for a presented bound token and for an exchange sign-off.
+        let cnf = Confirmation::jkt(key.thumbprint());
+        let old = key.proof("POST", &url, Some("tok"), t(marker));
+        assert_eq!(
+            d.check_presented(Some(&cnf), "tok", Some(&old), "POST", &url, now),
+            Err(before.clone())
+        );
+        let child = DpopKey::generate().unwrap();
+        let header = child.proof("POST", &url, None, t(marker + 2));
+        let sign_off = key.sign_off(&url, "tok", child.thumbprint(), "coder", t(marker));
+        assert_eq!(
+            d.bind_exchange(
+                Some(&cnf),
+                "tok",
+                "coder",
+                Some(&header),
+                Some(&sign_off),
+                &url,
+                now
+            ),
+            Err(before.clone())
+        );
+        assert_eq!(
+            d.check_header_first(Some(&key.proof("POST", &url, None, t(marker))), &url, now),
+            Err(before)
+        );
+    }
+
+    /// Once the clock is past the marker plus the past allowance, every proof the fence would
+    /// refuse is too old anyway: the fence changes nothing.
+    #[test]
+    fn restart_fence_is_inert_after_its_window() {
+        let marker = 1_000_020;
+        let (d, _) = fenced(Some(marker), 1_000_012);
+        let key = DpopKey::generate().unwrap();
+        let url = d.expected_url(None, "/token");
+        let now = marker + 300 + 1;
+        d.liveness.as_ref().unwrap().extend(now).unwrap();
+        for iat in [marker - 5, marker] {
+            let p = key.proof("POST", &url, None, t(iat));
+            assert_eq!(
+                d.bind_new(Some(&p), "POST", &url, t(now)),
+                Err(DpopError::Stale.into()),
+                "iat {iat}"
+            );
+        }
+        let fresh = key.proof("POST", &url, None, t(now));
+        assert!(d
+            .bind_new(Some(&fresh), "POST", &url, t(now))
+            .unwrap()
+            .is_some());
+    }
+
+    /// No marker (a new database): nothing is fenced, even a proof made before the start.
+    #[test]
+    fn no_previous_marker_no_fence() {
+        let (d, marker) = fenced(None, 1_000_000);
+        let key = DpopKey::generate().unwrap();
+        let url = d.expected_url(None, "/token");
+        let p = key.proof("POST", &url, None, t(999_990));
+        assert!(d
+            .bind_new(Some(&p), "POST", &url, t(1_000_000))
+            .unwrap()
+            .is_some());
+        assert_eq!(marker.stored(), Some(1_000_020));
+    }
+
+    /// A marker that cannot be moved ahead of the clock stops the server from accepting
+    /// proofs (503 `dpop_liveness_stale`) instead of accepting past what is on disk. A late
+    /// heartbeat is made up by the request itself.
+    #[test]
+    fn a_stale_liveness_marker_refuses_proofs() {
+        let (d, marker) = fenced(None, 1_000_000);
+        let key = DpopKey::generate().unwrap();
+        let url = d.expected_url(None, "/token");
+        let bind = |now: i64| {
+            let p = key.proof("POST", &url, None, t(now));
+            d.bind_new(Some(&p), "POST", &url, t(now))
+        };
+        marker.fail.store(true, Ordering::SeqCst);
+        // Still covered by the last write (alive until 1_000_010): accepted.
+        assert!(bind(1_000_010).unwrap().is_some());
+        // Past it, and the write fails: refused, and nothing is stored.
+        assert_eq!(bind(1_000_011), Err(DpopFailure::LivenessStale));
+        assert_eq!(d.replay.len(), 1);
+        assert_eq!(marker.stored(), Some(1_000_020));
+        // The write works again: the request writes the marker and is accepted.
+        marker.fail.store(false, Ordering::SeqCst);
+        assert!(bind(1_000_100).unwrap().is_some());
+        assert_eq!(marker.stored(), Some(1_000_120));
+        // The 503 forms.
+        let api: ApiError = DpopFailure::LivenessStale.into();
+        assert_eq!(api.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(api.code, "temporarily_unavailable");
+        let auth: AuthError = DpopFailure::LivenessStale.into();
+        assert_eq!(auth.reason(), DPOP_LIVENESS_STALE);
+    }
+
+    /// With server nonces, a nonce from before the restart is still good (nonces are
+    /// stateless), but the fence still refuses the old proof; a new proof with that nonce
+    /// works once past the marker.
+    #[test]
+    fn restart_fence_with_nonces() {
+        let marker = 1_000_020;
+        let key = DpopKey::generate().unwrap();
+        let mk = |previous| {
+            Dpop::new(DpopMode::Optional, 300, 100, None)
+                .with_nonce(DpopNonceMode::Required, b"issuer key material")
+                .with_restart_fence(
+                    previous,
+                    Arc::new(
+                        Liveness::start(Marker::new(previous).write(), 10, 1_000_012).unwrap(),
+                    ),
+                )
+        };
+        let before = mk(None);
+        let url = before.expected_url(None, "/mcp/github");
+        let nonce = before.current_nonce(t(1_000_005)).unwrap();
+        let cnf = Confirmation::jkt(key.thumbprint());
+        let old = key.proof_with_nonce("POST", &url, Some("tok"), Some(&nonce), t(1_000_005));
+        let after = mk(Some(marker));
+        let now = t(1_000_015);
+        assert_eq!(
+            after.check_presented(Some(&cnf), "tok", Some(&old), "POST", &url, now),
+            Err(DpopError::BeforeRestart.into())
+        );
+        let fresh = key.proof_with_nonce("POST", &url, Some("tok"), Some(&nonce), t(marker + 1));
+        assert_eq!(
+            after.check_presented(Some(&cnf), "tok", Some(&fresh), "POST", &url, now),
+            Ok(true)
+        );
     }
 
     /// SR-42: without `public_url`, only a loopback `Host` goes into the expected `htu`.

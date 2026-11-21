@@ -71,13 +71,13 @@ What survives a restart today: leases and revocations (revocations commit with `
 What does not survive:
 
 - The credential replay cache, until step 1. Now closed: the markers are in the file and survive the restart. Before it, an ID token or ID-JAG that had not expired could mint a second root token after a restart, a parent could delegate to the same actor again, and an approval ID token could decide a second approval, for the credential's remaining lifetime plus the IdP's clock skew. The upgrade to schema version 3 is the last restart with that window.
-- The DPoP `jti` cache. A proof made before the restart can be replayed once more for up to `dpop_max_age_seconds`. Left in memory on purpose (step 1, open question 2).
+- The DPoP `jti` cache. Left in memory on purpose (step 1, open question 2). A proof made before the restart is not accepted again, though: the server keeps a liveness marker in the file, and the next process refuses every proof the previous one could have accepted (the restart fence in `crates/attenuo-server/src/dpop.rs`). The cost is up to about 21 seconds of `invalid_dpop_proof` after a quick restart. The marker does not make the cache shared: replicas on different files still each accept a proof once.
 - The session table. Every client gets 404 and starts a new session, as server.md says.
 - Annotation narrowing, until the next `tools/list` from each upstream.
 - The checkpoint sink's queue. A checkpoint that was queued and not shipped is lost; the next one covers its entries.
 - Record windows, listed tool names, and the policy and token caches, all of which only cost an extra record, a fail-closed refusal or a cache miss.
 
-So the gap for a single replica was the two replay caches. Step 1 made the credential one durable in the same SQLite file without touching the deployment model; the DPoP one stays in memory, a window of `dpop_max_age_seconds` after each restart.
+So the gap for a single replica was the two replay caches. Step 1 made the credential one durable in the same SQLite file without touching the deployment model; the DPoP one stays in memory, and the restart fence keeps a restart from accepting a proof twice.
 
 ### (b) Active/passive on a shared volume
 

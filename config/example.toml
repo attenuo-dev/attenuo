@@ -234,8 +234,12 @@ actor_auth = "either"
 # key. "off": never bind new tokens. "required": every token must be bound; unbound ones are
 # refused. Bound tokens always need proofs, whatever this says.
 dpop = "optional"
-# How far a proof's iat may be from the server's clock (seconds, 1 to 3600).
+# How far a proof's iat may be behind the server's clock (seconds, 1 to 3600).
 dpop_max_age_seconds = 300
+# How far a proof's iat may be ahead of the server's clock (seconds, 0 to dpop_max_age_seconds).
+# A client whose clock runs further ahead is refused. After a quick restart, proofs are refused
+# for up to this long plus about 10 seconds.
+dpop_future_skew_seconds = 10
 # Most proof jtis remembered for replay detection; when full, new proofs get 503.
 dpop_replay_capacity = 1000000
 # Server-provided DPoP nonces (RFC 9449 section 8). "required": every proof must carry the

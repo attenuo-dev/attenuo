@@ -537,7 +537,7 @@ A server with [`[limits]`](https://github.com/attenuo-dev/attenuo/blob/main/docs
 | `rate_limited` | `RateLimited` (429) | No: `POST /token` per agent or address, `/mcp/{server}` and AuthZEN action search per run, refused before the work. Safe to retry after `retry_after` (the end of the caller's minute). | Yes |
 | `request_timeout` | `Unavailable` (503) | Maybe: the handler may have issued a token or written a decision. | No |
 | `too_many_sessions`, `session_registry_full` | `RateLimited` (429), `Unavailable` (503) | The upstream answered `initialize`; the proxy then closed that session. | No |
-| `jwks_unavailable`, `dpop_replay_cache_full` | `Unavailable` (503) | No decision was made. | No |
+| `jwks_unavailable`, `dpop_replay_cache_full`, `dpop_liveness_stale` | `Unavailable` (503) | No decision was made. | No |
 
 A body that does not arrive within `request_body_timeout_seconds` is a plain `ApiError` (408 `request_timeout`). On `/mcp/{server}`, a `-32006` or `-32007` counts as the proxy's own only when the answer carries `Retry-After`, which the proxy sets on its refusals and never relays from an upstream; an upstream's error of that shape stays an `RpcError`.
 

@@ -118,6 +118,7 @@ fn key_gen_and_call_with_a_dpop_key_sr24() {
             access_token: Some("a.b.c"),
             now: time::OffsetDateTime::now_utc(),
             max_age: time::Duration::seconds(60),
+            future_skew: time::Duration::seconds(60),
         },
     )
     .unwrap();

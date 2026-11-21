@@ -121,6 +121,11 @@ pub struct AppState {
     pub trace: Option<Arc<crate::telemetry::ServerTrace>>,
     /// `[limits]`: the in-flight cap, the deadlines and the rate limits ([`crate::limits`]).
     pub(crate) limits: Arc<crate::limits::Limits>,
+    /// The thread that keeps the DPoP liveness marker ahead of the clock; `None` for
+    /// `:memory:`. Stopped and joined when the state drops, before the fence is released, so
+    /// it writes nothing once the next server may have read the marker.
+    #[allow(dead_code)] // held for its `Drop`
+    dpop_heartbeat: Option<LivenessHeartbeat>,
     /// The single-writer fence on `<sqlite_path>.lock`, held for as long as the state lives
     /// (the OS releases it when the process exits); `None` for `:memory:`. Declared last, so
     /// it is released after the stores above.
@@ -183,15 +188,14 @@ impl AppState {
         let user_window_retention = config.leases.user_window_retention()?;
         let issuer = load_issuer(config)?;
         // Server DPoP nonces are keyed by the issuer's private key (see `crate::dpop`).
-        let dpop = Arc::new(
-            crate::dpop::Dpop::new(
-                config.token.dpop,
-                config.token.dpop_max_age_seconds,
-                config.token.dpop_replay_capacity,
-                config.server.public_url.clone(),
-            )
-            .with_nonce(config.token.dpop_nonce, issuer.private_key_pem().as_bytes()),
-        );
+        let dpop = crate::dpop::Dpop::new(
+            config.token.dpop,
+            config.token.dpop_max_age_seconds,
+            config.token.dpop_replay_capacity,
+            config.server.public_url.clone(),
+        )
+        .with_future_skew(config.token.dpop_future_skew_seconds)
+        .with_nonce(config.token.dpop_nonce, issuer.private_key_pem().as_bytes());
         let verifier = issuer.verifier();
         let jwks = crate::issuer_keys::jwks_from_keys(&issuer.trusted_public_keys())?;
 
@@ -231,6 +235,14 @@ impl AppState {
             metrics.clone(),
             checkpoint_sink.as_ref().map(|s| s.handle()),
         )?;
+        // The DPoP restart fence, from the liveness marker in the same file; none in memory.
+        let (dpop, dpop_heartbeat) = if store_fence.is_some() {
+            let (dpop, heartbeat) = restart_fence(dpop, &leases, clock.clone())?;
+            (dpop, Some(heartbeat))
+        } else {
+            (dpop, None)
+        };
+        let dpop = Arc::new(dpop);
         // Single use of credentials, in the same file as the leases it guards (`crate::replay`).
         let replay =
             crate::replay::ReplayCache::new(leases.clone(), crate::replay::DEFAULT_REPLAY_CAPACITY);
@@ -394,6 +406,7 @@ impl AppState {
                 &config.limits,
                 metrics_for_limits,
             )),
+            dpop_heartbeat,
             store_fence,
             released: tokio::sync::watch::Sender::new(()),
         })
@@ -648,6 +661,84 @@ fn warn_if_same_mount(sink_path: &Path, sqlite_path: &str) {
     }
     #[cfg(not(unix))]
     let _ = (sink_path, sqlite_path);
+}
+
+/// Read the previous process's DPoP liveness marker, write this one's, and start the thread
+/// that keeps it ahead of the clock (`crate::dpop`, "Restart fence"). The marker is read before
+/// the first write, which may replace it.
+fn restart_fence(
+    dpop: crate::dpop::Dpop,
+    leases: &Arc<SqliteLeaseStore>,
+    clock: Arc<dyn attenuo_core::Clock>,
+) -> anyhow::Result<(crate::dpop::Dpop, LivenessHeartbeat)> {
+    use crate::dpop::{Liveness, LIVENESS_HEARTBEAT_SECONDS};
+    let previous = leases
+        .dpop_max_iat()
+        .context("reading the DPoP liveness marker")?;
+    let store = Arc::downgrade(leases);
+    let write: crate::dpop::MarkerWrite = Box::new(move |until| {
+        let store = store
+            .upgrade()
+            .ok_or_else(|| "the lease store is closed".to_owned())?;
+        store.extend_dpop_max_iat(until).map_err(|e| e.to_string())
+    });
+    let now = clock.now_utc().unix_timestamp();
+    let liveness = Arc::new(
+        Liveness::start(write, dpop.future_skew_seconds(), now)
+            .map_err(|e| anyhow::anyhow!("writing the DPoP liveness marker: {e}"))?,
+    );
+    if let Some(marker) = previous {
+        let refused_for = marker.saturating_add(1).saturating_sub(now);
+        if refused_for > 0 {
+            tracing::warn!(
+                marker,
+                seconds = refused_for,
+                "a server used this database moments ago: DPoP proofs with iat at or before \
+                 `marker` are refused with invalid_dpop_proof (the restart fence), for about \
+                 `seconds` more"
+            );
+        }
+    }
+    let (stop, stopped) = std::sync::mpsc::channel::<()>();
+    let beat = liveness.clone();
+    let period = std::time::Duration::from_secs(LIVENESS_HEARTBEAT_SECONDS.unsigned_abs());
+    let thread = std::thread::Builder::new()
+        .name("attenuo-dpop-liveness".into())
+        .spawn(move || {
+            while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = stopped.recv_timeout(period)
+            {
+                if let Err(e) = beat.extend(clock.now_utc().unix_timestamp()) {
+                    tracing::error!(
+                        error = %e,
+                        "cannot write the DPoP liveness marker; DPoP proofs are refused with \
+                         503 dpop_liveness_stale once it falls behind the clock"
+                    );
+                }
+            }
+        })
+        .context("starting the DPoP liveness thread")?;
+    Ok((
+        dpop.with_restart_fence(previous, liveness),
+        LivenessHeartbeat {
+            stop: Some(stop),
+            thread: Some(thread),
+        },
+    ))
+}
+
+/// The DPoP liveness thread: stopped and joined on drop.
+struct LivenessHeartbeat {
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for LivenessHeartbeat {
+    fn drop(&mut self) {
+        drop(self.stop.take());
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
 }
 
 fn open_storage(

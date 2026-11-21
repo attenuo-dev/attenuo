@@ -113,6 +113,7 @@ fn proof_of(req: &str, url: &str, token: Option<&str>) -> VerifiedProof {
             access_token: token,
             now: time::OffsetDateTime::now_utc(),
             max_age: time::Duration::seconds(60),
+            future_skew: time::Duration::seconds(60),
         },
     )
     .unwrap()

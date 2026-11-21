@@ -66,6 +66,7 @@ struct Input {
     url: String,
     token: Option<String>,
     max_age: u64,
+    future_skew: u64,
     reuse: bool,
 }
 
@@ -88,6 +89,10 @@ impl<'a> Arbitrary<'a> for Input {
             0 => u.arbitrary()?,
             1 => u64::MAX,
             _ => u.int_in_range(1u64..=600)?,
+        };
+        let future_skew = match u.int_in_range(0u8..=2)? {
+            0 => u.arbitrary()?,
+            _ => u.int_in_range(0u64..=60)?,
         };
         let proof = if u.ratio(1u8, 5u8)? {
             u.arbitrary()?
@@ -142,6 +147,7 @@ impl<'a> Arbitrary<'a> for Input {
             url,
             token,
             max_age,
+            future_skew,
             reuse: u.arbitrary()?,
         })
     }
@@ -159,22 +165,24 @@ fuzz_target!(|input: Input| {
     let f = attenuo_fuzz::fixture();
     let _ = normalize_htu(&input.url);
     let max_age_secs = i64::try_from(input.max_age).unwrap_or(i64::MAX).max(1);
+    let future_secs = i64::try_from(input.future_skew).unwrap_or(i64::MAX);
     let check = ProofCheck {
         method: &input.method,
         url: &input.url,
         access_token: input.token.as_deref(),
         now: f.now,
         max_age: Duration::seconds(max_age_secs),
+        future_skew: Duration::seconds(future_secs),
     };
     if let Ok(v) = verify_proof(&input.proof, &check) {
         let (header, claims) = claims_of(&input.proof);
         assert_eq!(claims["htm"].as_str(), Some(input.method.as_str()));
         let htu = normalize_htu(claims["htu"].as_str().unwrap());
         assert!(htu.is_some() && htu == normalize_htu(&input.url));
-        let skew = (f.now.unix_timestamp() as i128 - v.iat as i128).abs();
+        let age = f.now.unix_timestamp() as i128 - v.iat as i128;
         assert!(
-            skew <= max_age_secs as i128,
-            "stale proof accepted: iat {}",
+            age <= max_age_secs as i128 && -age <= future_secs as i128,
+            "proof outside the window accepted: iat {}",
             v.iat
         );
         assert_eq!(Some(v.iat), claims["iat"].as_i64());
