@@ -1,6 +1,6 @@
 # CLI commands
 
-The `attenuo` binary comes from the `attenuo-cli` crate. It talks to a running attenuo server over HTTP, except for `key gen` (`--dpop` and `--client`), `admin operator new` and `admin operator hash`, `policy lint`, `policy test` with `--via local` (the default), `token inspect` without `--verify`, `audit verify --file` with `--jwks`, and `approval verify` with a `--jwks` file, which run offline, and `stdio-bridge`, which serves a local STDIO MCP server over HTTP and talks to no attenuo server.
+The `attenuo` binary comes from the `attenuo-cli` crate. It talks to a running attenuo server over HTTP, except for `key gen` (`--dpop` and `--client`), `admin operator new` and `admin operator hash`, `policy lint`, `policy test` with `--via local` (the default), `token inspect` without `--verify`, `audit verify --file` with `--jwks`, and `approval verify` with a `--jwks` file, which run offline, `stdio-bridge`, which serves a local STDIO MCP server over HTTP and talks to no attenuo server, and `init`, which writes a starter configuration and talks only to the MCP server it is for.
 
 ```
 attenuo [--server URL] [--json] <command>
@@ -57,6 +57,43 @@ printf '%s\n' "$CODER" | attenuo call --token - --upstream github --tool read_fi
 - `--attr key=value` follows the same rule for user attributes.
 
 ## Commands
+
+### `init --upstream NAME=URL`
+
+Write a working starter configuration for one MCP server. It is the quickest way from an installed binary to a proxied call, and it is for trying attenuo on one machine: the configuration listens on loopback and turns on the development root mint.
+
+```text
+attenuo init --upstream github=http://127.0.0.1:3001/mcp --dir ~/attenuo-try
+```
+
+It asks the MCP server for its tools (`initialize`, then every page of `tools/list`; no tool is called) and writes three files into `--dir` (default: the current directory; created when missing), plus an empty `data/` directory (mode 0700) for the issuer key and the audit log:
+
+| File | Mode | What it holds |
+| --- | --- | --- |
+| `attenuo.toml` | 0600 | The server configuration: the upstream, a fresh admin token, the agent `coder` (the SHA-256 of its client secret), a root grant for the agent `planner` over `NAME:*`, and every tool in `[policy.catalog]`. |
+| `policy.cedar` | 0644 | A starter policy: read-only tools are permitted, chains deeper than 3 are forbidden, and each other tool has a commented-out permit to fill in. |
+| `attenuo.env` | 0600 | `ATTENUO_SERVER`, `ATTENUO_ADMIN_TOKEN` and `ATTENUO_CLIENT_SECRET` as `export` lines, to load with `. ./attenuo.env`. |
+
+No secret is printed. The command ends with the next commands to run: start `attenuo-server`, mint a root token, exchange it for `coder`, list the tools and call one.
+
+What it takes from the MCP server, which is the thing being guarded and so is not trusted further than this:
+
+- A tool whose name breaks the naming rules (`[A-Za-z0-9_.-]`) cannot be called through the proxy. It is left out and named in the output.
+- `annotations.readOnlyHint == true` marks the tool `readonly` in the catalog, and the starter policy permits read-only tools. That is the server's own claim, so the output lists those tools: check the list. `--no-readonly-hints` ignores the hint, and then nothing is permitted until you write a permit. A tool that claims to be both read-only and destructive is not marked read-only.
+- `annotations.destructiveHint == true` marks the tool `sensitive`.
+- Arguments of type `string`, `integer` and `boolean` in the tool's `inputSchema` become catalog `inputs` (`string`, `long`, `bool`) so a policy can test them; other types and names that are not plain identifiers are left out (at most 64 per tool).
+- Descriptions and every other text from the server are written nowhere.
+
+Options:
+
+- `--upstream NAME=URL` (required): the name the MCP server gets in attenuo and its Streamable HTTP URL (`http://` or `https://`, no user name, password or fragment).
+- `--dir DIR`: where the files go.
+- `--listen ADDR`: the address the attenuo server will listen on, `127.0.0.1:8080` by default. Must be loopback, because the server refuses the development root mint elsewhere, and must name a port (not 0).
+- `--no-discover`: do not contact the MCP server. The catalog is left empty with an example entry in a comment, so every call is denied (`tool_not_in_catalog`) until you list the tools. Use it for a server that needs credentials (discovery sends none) or is not running.
+- `--no-readonly-hints`: see above. Cannot be combined with `--no-discover`.
+- `--force`: overwrite the three files when they exist; new secrets are generated and the files are set to their modes again. Without it the command refuses, before it contacts the MCP server, when any of the three exists, and changes nothing.
+
+Limits: at most 2,000 tools over at most 200 pages, each answer at most 16 MB, a 30 s timeout per request, and no redirect is followed. Exit status 1 with a message when the MCP server cannot be reached, answers with an HTTP or JSON-RPC error, or does not answer as an MCP server; nothing is written then. Tested in `crates/attenuo-cli/tests/init.rs`, where a real attenuo server loads the files as written and proxies one allowed and two denied calls.
 
 ### `health`
 

@@ -23,6 +23,7 @@ mod client;
 mod client_key;
 mod dpop_key;
 mod health;
+mod init_cmd;
 mod jwt;
 mod operator_cmd;
 mod policy_cmd;
@@ -149,6 +150,7 @@ async fn run(cli: Cli) -> Result<Outcome> {
         Command::Health(a) => health(&client?, &a, json).await,
         // Talks to no attenuo server.
         Command::StdioBridge(a) => stdio_bridge::run(a).await.map(|()| Outcome::Ok),
+        Command::Init(a) => init_cmd::run(a).await.map(|()| Outcome::Ok),
         Command::Admin(AdminCmd::Operator(OperatorCmd::New {
             name,
             role,
