@@ -22,8 +22,8 @@ spec:
     - host: {{ .host | quote }}
       http:
         paths:
-          {{- range .paths }}
-          - path: {{ .path | quote }}
+          {{- range (.paths | default (list (dict "path" "/"))) }}
+          - path: {{ .path | default "/" | quote }}
             pathType: {{ .pathType | default "Prefix" }}
             backend:
               service:

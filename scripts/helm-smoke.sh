@@ -62,7 +62,11 @@ has "type: Recreate"
 has "runAsNonRoot: true"
 has "readOnlyRootFilesystem: true"
 has "automountServiceAccountToken: false"
-has "terminationGracePeriodSeconds: 15"
+has "terminationGracePeriodSeconds: 30"
+has "failureThreshold: 150"
+# The admin API is on loopback in the pod unless its Service is on.
+has 'value: "127.0.0.1:9102"'
+lacks "0.0.0.0:9102"
 has "helm.sh/resource-policy: keep"
 has "path: /readyz"
 has "name: ATTENUO_ADMIN_TOKEN"
@@ -72,6 +76,7 @@ lacks "$release-attenuo-admin"
 lacks "name: metrics"
 # The Service carries the main port only.
 svc=$(awk '/^kind: Service$/,/^---$/' <<<"$out")
+[ -n "$svc" ] || fail "no Service in the render"
 if grep -q "9102\|targetPort: admin" <<<"$svc"; then fail "the Service exposes the admin port"; fi
 
 say "render with every optional part on"
@@ -79,12 +84,18 @@ out=$(helm template "$release" "$chart" --kube-version 1.30.0 "${base_values[@]}
     --set publicUrl=https://attenuo.example.com --set allowInsecureHttp=false \
     --set issuerKey.existingSecret=attenuo-issuer \
     --set admin.service.enabled=true --set metrics.enabled=true \
-    --set persistence.existingClaim=my-claim \
+    --set persistence.existingClaim=my-claim --set service.type=LoadBalancer \
+    --set 'extraVolumes[0].name=ca' --set 'extraVolumes[0].secret.secretName=my-ca' \
+    --set 'extraVolumeMounts[0].name=ca' --set 'extraVolumeMounts[0].mountPath=/etc/attenuo/ca' \
     --set ingress.enabled=true --set ingress.className=nginx \
-    --set 'ingress.hosts[0].host=attenuo.example.com' --set 'ingress.hosts[0].paths[0].path=/' \
+    --set 'ingress.hosts[0].host=attenuo.example.com' \
     --set 'extraEnv[0].name=ATTENUO__LIMITS__MAX_IN_FLIGHT' --set-string 'extraEnv[0].value=64')
 has "kind: Ingress"
 has "$release-attenuo-admin"
+has "$release-attenuo-metrics"
+has 'value: "0.0.0.0:9102"'
+has "secretName: my-ca"
+has "mountPath: /etc/attenuo/ca"
 has "value: /etc/attenuo/issuer/issuer.pem"
 has "claimName: my-claim"
 has "ATTENUO__METRICS__ENABLED"
@@ -92,6 +103,14 @@ has "ATTENUO__LIMITS__MAX_IN_FLIGHT"
 lacks "kind: PersistentVolumeClaim"
 lacks "ALLOW_INSECURE_HTTP"
 ing=$(awk '/^kind: Ingress$/,/^---$/' <<<"$out")
+[ -n "$ing" ] || fail "no Ingress in the render"
+# A host given without paths gets "/".
+grep -qF 'path: "/"' <<<"$ing" || fail "the Ingress host has no path"
+# The main Service is a LoadBalancer here. The metrics and admin ports have no
+# authentication of that kind to rely on, so neither may be on it.
+lb=$(awk -v RS='---\n' '/type: LoadBalancer/' <<<"$out")
+[ -n "$lb" ] || fail "no LoadBalancer Service in the render"
+if grep -q "metrics\|9100\|9102" <<<"$lb"; then fail "the LoadBalancer Service carries the metrics or admin port"; fi
 if grep -q "name: admin\|9102\|attenuo-admin" <<<"$ing"; then fail "the Ingress routes to the admin port"; fi
 
 say "values the chart refuses"
@@ -124,6 +143,8 @@ image_args=()
 [ -n "${ATTENUO_IMAGE_REPOSITORY:-}" ] && image_args+=(--set "image.repository=$ATTENUO_IMAGE_REPOSITORY")
 [ -n "${ATTENUO_IMAGE_TAG:-}" ] && image_args+=(--set "image.tag=$ATTENUO_IMAGE_TAG")
 
+created=0
+changed_config=$(mktemp)
 cleanup() {
     status=$?
     if [ "$status" -ne 0 ]; then
@@ -135,7 +156,9 @@ cleanup() {
         echo "---- logs" >&2
         kubectl -n "$ns" logs "$deploy" --tail=80 >&2 || true
     fi
-    if [ "${KEEP:-}" != "1" ]; then
+    rm -f "$changed_config"
+    # Only a namespace this run created is deleted.
+    if [ "$created" = "1" ] && [ "${KEEP:-}" != "1" ]; then
         kubectl delete namespace "$ns" --wait=false >/dev/null 2>&1 || true
     fi
     exit "$status"
@@ -143,7 +166,8 @@ cleanup() {
 trap cleanup EXIT
 
 say "namespace, admin token, fake MCP server"
-kubectl create namespace "$ns"
+kubectl create namespace "$ns" || fail "could not create the namespace $ns (if it exists, it is not this test's: choose another with NAMESPACE)"
+created=1
 admin_token=$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')
 kubectl -n "$ns" create secret generic attenuo-admin --from-literal=admin-token="$admin_token"
 kubectl -n "$ns" create configmap fake-mcp --from-file="$root/examples/github-leak-demo/fake_github_mcp.py"
@@ -203,8 +227,13 @@ verify_token() { # <token>: signature, issuer, audience and chain against the po
 say "the pod runs as the chart says"
 uid=$(kubectl -n "$ns" exec "$deploy" -- id -u)
 [ "$uid" = "10001" ] || fail "the container runs as uid $uid"
-if kubectl -n "$ns" exec "$deploy" -- sh -c 'echo x > /tmp/x' 2>/dev/null; then
-    fail "the root filesystem is writable"
+ro=$(kubectl -n "$ns" exec "$deploy" -- sh -c 'if touch /tmp/x 2>/dev/null; then echo writable; else echo read-only; fi')
+[ "$ro" = "read-only" ] || fail "the root filesystem is: $ro"
+# The admin API answers on loopback in the pod and not on the pod's address.
+pod_ip=$(kubectl -n "$ns" get pods -l app.kubernetes.io/name=attenuo -o jsonpath='{.items[0].status.podIP}')
+[ -n "$pod_ip" ] || fail "no pod address"
+if printf '%s\n' "$admin_token" | kubectl -n "$ns" exec -i "$deploy" -- attenuo --server "http://$pod_ip:9102" --admin-token-stdin audit verify >/dev/null 2>&1; then
+    fail "the admin API answers on the pod's address"
 fi
 if kubectl -n "$ns" exec "$deploy" -- test -e /var/run/secrets/kubernetes.io/serviceaccount/token; then
     fail "a service account token is mounted"
@@ -234,11 +263,23 @@ verify_token "$coder" >/dev/null || fail "the new token does not verify"
 echo "audit entries: $entries_before"
 
 say "delete the pod: the data volume keeps the key and the log"
+# The one pod that is not $1, once it is Ready.
+ready_pod_other_than() {
+    local old=$1 name i
+    for i in $(seq 1 60); do
+        name=$(kubectl -n "$ns" get pods -l app.kubernetes.io/name=attenuo \
+            -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | grep -vx "$old" | head -1 || true)
+        if [ -n "$name" ] && kubectl -n "$ns" wait --for=condition=Ready "pod/$name" --timeout=5s >/dev/null 2>&1; then
+            echo "$name"
+            return 0
+        fi
+        sleep 2
+    done
+    return 1
+}
 old_pod=$(kubectl -n "$ns" get pods -l app.kubernetes.io/name=attenuo -o jsonpath='{.items[0].metadata.name}')
 kubectl -n "$ns" delete pod "$old_pod" --wait=true
-kubectl -n "$ns" rollout status "$deploy" --timeout=120s
-new_pod=$(kubectl -n "$ns" get pods -l app.kubernetes.io/name=attenuo -o jsonpath='{.items[0].metadata.name}')
-[ "$new_pod" != "$old_pod" ] || fail "the pod was not replaced"
+new_pod=$(ready_pod_other_than "$old_pod") || fail "no new pod became ready after the old one was deleted"
 # Signed with the same key, so the old token still verifies and is still accepted.
 verify_token "$coder" >/dev/null || fail "the token minted before the restart no longer verifies"
 allowed=$(call_with "$coder" --upstream github --tool read_file --arg repo=alice/public-docs --arg path=README.md)
@@ -249,12 +290,10 @@ entries_after=$(admin_cli --json audit verify | sed -n 's/.*"entries": *\([0-9]*
 echo "audit entries after the restart: $entries_after"
 
 say "a changed config rolls the pod"
-sed 's/audience = "attenuo"/audience = "attenuo-2"/' "$chart/ci/kind-config.toml" >"${TMPDIR:-/tmp}/kind-config-2.toml"
+sed 's/audience = "attenuo"/audience = "attenuo-2"/' "$chart/ci/kind-config.toml" >"$changed_config"
 helm upgrade "$release" "$chart" -n "$ns" "${base_values[@]}" "${image_args[@]}" \
-    --set-file "config=${TMPDIR:-/tmp}/kind-config-2.toml" --wait --timeout 240s
-kubectl -n "$ns" rollout status "$deploy" --timeout=120s
-third_pod=$(kubectl -n "$ns" get pods -l app.kubernetes.io/name=attenuo -o jsonpath='{.items[0].metadata.name}')
-[ "$third_pod" != "$new_pod" ] || fail "the pod was not rolled after the config changed"
+    --set-file "config=$changed_config" --wait --timeout 240s
+ready_pod_other_than "$new_pod" >/dev/null || fail "the pod was not rolled after the config changed"
 cli --server "$MAIN" health --ready
 admin_cli audit verify
 

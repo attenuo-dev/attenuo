@@ -341,7 +341,9 @@ jobs:
   # The Helm chart (deploy/helm/attenuo, scripts/helm-smoke.sh): template checks, then an
   # install into a kind cluster with the published release image, a token minted and
   # exchanged, one allowed and one denied call, a pod restart and a config change. The
-  # runner image ships kind, helm and kubectl.
+  # runner image ships kind, helm and kubectl. It runs the published image, not a server
+  # built from this commit, so it does not notice a config key renamed on main: the next
+  # release's chart bump does.
   helm-chart:
     name: helm chart
     needs: changes

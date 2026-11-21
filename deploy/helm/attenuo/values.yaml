@@ -61,7 +61,7 @@ issuerKey:
 persistence:
   enabled: true
   size: 2Gi
-  # "" uses the cluster's default StorageClass.
+  # "" uses the cluster's default StorageClass; "-" asks for none (a pre-made volume).
   storageClass: ""
   accessModes:
     - ReadWriteOnce
@@ -75,17 +75,23 @@ service:
   port: 8080
   annotations: {}
 
-# The admin API has a listener of its own and is NOT exposed by default: reach it with
-#   kubectl port-forward deploy/<release>-attenuo 9102:9102
-# Enable the Service only for clients inside the cluster that you trust, and protect it
-# with a NetworkPolicy.
+# The admin API has a listener of its own, port 9102 in the pod. By default it listens on
+# loopback inside the pod, so nothing else in the cluster can reach it. Use
+#   kubectl port-forward deploy/<name of the Deployment> 9102:9102
+# (the install notes print the exact command).
+#
+# service.enabled makes it listen on the pod's address and adds a ClusterIP Service, for
+# clients inside the cluster. Every pod the cluster's network policy lets through can then
+# reach it, and only the admin credential protects it: add a NetworkPolicy.
 admin:
-  port: 9102
   service:
     enabled: false
+    port: 9102
     annotations: {}
 
-# Prometheus metrics on a listener of their own (GET /metrics, no authentication).
+# Prometheus metrics on a listener of their own (GET /metrics, no authentication), port
+# 9100 in the pod, with a ClusterIP Service of their own (<name>-metrics). They are never
+# added to the main Service. Restrict who can reach the pod's port with a NetworkPolicy.
 metrics:
   enabled: false
   port: 9100
@@ -110,6 +116,22 @@ logLevel: info
 # Extra environment variables for the container, as a list of {name, value} or
 # {name, valueFrom}. ATTENUO__<SECTION>__<KEY> overrides one key of the config file.
 extraEnv: []
+
+# Extra volumes and mounts, for the config keys that name files: [issuer]
+# previous_key_paths (key rotation), [policy] catalog_path and schema_path, and the
+# ca_pem_path keys. The root filesystem is read-only, so anything the server reads must
+# be mounted.
+extraVolumes: []
+extraVolumeMounts: []
+
+# How long the server may take to start: failureThreshold x 2 s (default 5 minutes).
+# Schema migrations run before it answers; raise this for a very large audit log.
+startupProbe:
+  failureThreshold: 150
+
+# Above the server's worst case at shutdown: 10 s drain, then the checkpoint sink and
+# telemetry flush.
+terminationGracePeriodSeconds: 30
 
 resources: {}
 podAnnotations: {}

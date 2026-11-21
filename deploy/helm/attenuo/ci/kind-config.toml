@@ -40,4 +40,3 @@ secret_sha256 = "f0f962bada9d92c8a30f5c55a388ce47d1074ddff4bfdb099ef67ad43003bae
 
 [dev]
 allow_root_mint = true
-allow_root_mint_off_loopback = true

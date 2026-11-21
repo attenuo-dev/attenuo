@@ -39,8 +39,9 @@ spec:
       {{- if .Values.priorityClassName }}
       priorityClassName: {{ .Values.priorityClassName | quote }}
       {{- end }}
-      # The server drains for up to 10 s after SIGTERM.
-      terminationGracePeriodSeconds: 15
+      # The server drains for up to 10 s after SIGTERM, then flushes the checkpoint sink
+      # and telemetry.
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
@@ -67,8 +68,10 @@ spec:
             - name: ATTENUO__SERVER__ALLOW_INSECURE_HTTP
               value: "true"
             {{- end }}
+            # Loopback unless the admin Service is on: `kubectl port-forward` and
+            # `kubectl exec` reach it, other pods in the cluster do not.
             - name: ATTENUO__ADMIN__LISTEN
-              value: "0.0.0.0:9102"
+              value: {{ if .Values.admin.service.enabled }}"0.0.0.0:9102"{{ else }}"127.0.0.1:9102"{{ end }}
             - name: ATTENUO__POLICY__POLICIES_PATH
               value: /etc/attenuo/policy/policy.cedar
             - name: ATTENUO__AUDIT__SQLITE_PATH
@@ -111,8 +114,10 @@ spec:
             httpGet:
               path: /healthz
               port: http
+            # Schema migrations run before the listener opens, and one on a large
+            # database can take minutes. A probe that gives up restarts it from the start.
             periodSeconds: 2
-            failureThreshold: 30
+            failureThreshold: {{ .Values.startupProbe.failureThreshold }}
           livenessProbe:
             httpGet:
               path: /healthz
@@ -148,6 +153,9 @@ spec:
             {{- end }}
             - name: data
               mountPath: /var/lib/attenuo
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
       volumes:
         - name: config
           secret:
@@ -173,6 +181,9 @@ spec:
           # No persistence: the audit log and every lease are lost when the pod restarts.
           emptyDir: {}
           {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

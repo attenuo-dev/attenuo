@@ -14,7 +14,9 @@ metadata:
 spec:
   accessModes:
     {{- toYaml .Values.persistence.accessModes | nindent 4 }}
-  {{- if .Values.persistence.storageClass }}
+  {{- if eq .Values.persistence.storageClass "-" }}
+  storageClassName: ""
+  {{- else if .Values.persistence.storageClass }}
   storageClassName: {{ .Values.persistence.storageClass | quote }}
   {{- end }}
   resources:
