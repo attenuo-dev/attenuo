@@ -197,7 +197,7 @@ pub(crate) enum Command {
     /// Streamable HTTP, with a fresh delegation token as the bearer. The client starts it as
     /// a command. It gets a new token from `--token-command` or `--token-file` before the old
     /// one runs out, renews the lease, and writes only MCP messages on stdout; everything it
-    /// logs goes to stderr. Runs until stdin ends or SIGINT or SIGTERM (exit 0); exits 1
+    /// logs goes to stderr. Runs until stdin ends or a stop signal (exit 0); exits 1
     /// before reading stdin when no token can be had.
     Connect(ConnectArgs),
 }

@@ -101,7 +101,7 @@ The same entry in a project's `.mcp.json` has the shape of the Claude Desktop en
 
 **Cursor.** The same `mcpServers` entry as for Claude Desktop goes in `.cursor/mcp.json` in the project (for the other places Cursor reads, see the client's documentation).
 
-What was run: the connector is tested against a real attenuo server and a fake MCP server in `crates/attenuo-cli/tests/connect.rs`, driven as a client drives it. For Claude Desktop and Cursor, the configuration follows each client's documented format and was not run in that app. For Claude Code, the configuration follows its documented format; a run with Claude Code's CLI is still to be recorded here.
+What was run: the connector is tested against a real attenuo server and a fake MCP server in `crates/attenuo-cli/tests/connect.rs`, driven as a client drives it. For Claude Desktop and Cursor, the configuration follows each client's documented format and was not run in that app. For Claude Code, the `claude mcp add` command above was run with Claude Code 2.1.330 on 2026-11-21, on Linux, against the starter setup and a fake MCP server: `claude mcp list` reported the server as connected, and the audit log showed the root token minted by the token command and its lease renewed. That run has no model in it, so a tool call made by Claude Code through the connector was not run. Claude Code also sent one method attenuo does not know (`server/discover`), which was denied and recorded, and the connection was not affected.
 
 ## Getting the first token
 

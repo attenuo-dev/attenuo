@@ -26,7 +26,7 @@
 //! - **Listen stream.** After `notifications/initialized`, a `GET` opens the server-to-client
 //!   stream. `405` (the upstream has none) ends it quietly. Its requests and notifications are
 //!   written to stdout; it is opened again, with a growing pause, when it ends.
-//! - **End.** At end of stdin, or SIGINT or SIGTERM: stop reading, give requests in flight
+//! - **End.** At end of stdin, or SIGINT, SIGTERM, SIGHUP or SIGQUIT: stop reading, give requests in flight
 //!   [`STOP_GRACE`] to finish, end the MCP session with `DELETE`, exit 0.
 //!
 //! Nothing that comes from the proxy or the upstream is run, and none of it is logged.
