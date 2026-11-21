@@ -902,6 +902,13 @@ async fn a_proof_accepted_before_a_restart_is_refused_after_it() {
     // Restarted at once, on the same file and the same clock.
     let next = start(Duration::ZERO).await;
     let marker = next.state.leases.dpop_max_iat().unwrap().unwrap();
+    // Not ready while fenced, so a rolling deploy keeps DPoP traffic away; alive all along.
+    let ready = next.client.get(next.url("/readyz")).send().await.unwrap();
+    assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let v: Value = ready.json().await.unwrap();
+    assert_eq!(v["checks"]["dpop_restart_fence"], "fenced", "{v}");
+    let health = next.client.get(next.url("/healthz")).send().await.unwrap();
+    assert_eq!(health.status(), StatusCode::OK);
     let resp = next
         .call(&token, Some(captured.clone()))
         .send()
@@ -948,6 +955,12 @@ async fn a_proof_accepted_before_a_restart_is_refused_after_it() {
     let wait = marker + 1 - next.now().unix_timestamp();
     assert!((1..=25).contains(&wait), "fenced for {wait} s");
     next.clock.advance(Duration::from_secs(wait.unsigned_abs()));
+    // What the heartbeat would do within 5 s: write the marker at the moved clock.
+    next.state.beat_dpop_liveness().unwrap();
+    let ready = next.client.get(next.url("/readyz")).send().await.unwrap();
+    assert_eq!(ready.status(), StatusCode::OK);
+    let v: Value = ready.json().await.unwrap();
+    assert!(v["checks"].get("dpop_restart_fence").is_none(), "{v}");
     let resp = next.call(&token, Some(captured)).send().await.unwrap();
     assert_eq!(refusal(resp).await.1, "invalid_dpop_proof");
     let fresh = next.proof(&key, &mcp, Some(&token));
@@ -999,4 +1012,52 @@ async fn a_new_file_or_a_slow_restart_is_not_fenced() {
         .await
         .unwrap();
     assert!(allowed(&resp.json().await.unwrap()));
+}
+
+/// A liveness marker behind the clock (here: the clock moved and the heartbeat has not
+/// written yet) refuses proofs with 503 `dpop_liveness_stale` and `Retry-After: 1`, on a REST
+/// route and through the proxy (`-32006`), and the request itself writes nothing.
+#[tokio::test]
+async fn a_stale_liveness_marker_is_a_503_with_retry_after() {
+    for proxy in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let s = start(dir.path(), DpopMode::Optional).await;
+        let key = DpopKey::generate().unwrap();
+        let token = s.root_token(Some(&key)).await;
+        let before = s.state.leases.dpop_max_iat().unwrap();
+        // Past the marker; the heartbeat (every 5 s) has not run yet.
+        s.clock.advance(Duration::from_secs(60));
+        let resp = if proxy {
+            let mcp = s.url("/mcp/github");
+            s.call(&token, Some(s.proof(&key, &mcp, Some(&token))))
+                .send()
+                .await
+                .unwrap()
+        } else {
+            let url = s.url("/token/renew");
+            s.renew(&token, Some(s.proof(&key, &url, Some(&token))))
+                .send()
+                .await
+                .unwrap()
+        };
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "proxy {proxy}"
+        );
+        assert_eq!(resp.headers()["retry-after"], "1", "proxy {proxy}");
+        let v: Value = resp.json().await.unwrap();
+        if proxy {
+            assert_eq!(v["error"]["code"], -32006, "{v}");
+            assert_eq!(v["error"]["data"]["reason"], "dpop_liveness_stale", "{v}");
+        } else {
+            assert_eq!(v["error"], "temporarily_unavailable", "{v}");
+            assert_eq!(v["code"], "dpop_liveness_stale", "{v}");
+        }
+        // The marker is written by the heartbeat (woken now), never by the request; a
+        // heartbeat write that has already happened can only have moved it forward.
+        assert!(s.state.leases.dpop_max_iat().unwrap() >= before);
+        assert_eq!(s.upstream.recorded_calls().len(), 0);
+        s.stop().await;
+    }
 }

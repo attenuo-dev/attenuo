@@ -229,10 +229,12 @@ pub struct TokenSection {
     #[serde(default = "default_dpop_max_age")]
     pub dpop_max_age_seconds: u64,
     /// How far a DPoP proof's `iat` may be ahead of the server's clock (a client clock that
-    /// runs fast), in seconds. Default 10; 0 to `dpop_max_age_seconds`. Also how long proofs
-    /// are refused after a quick restart ([`crate::dpop`], "Restart fence").
-    #[serde(default = "default_dpop_future_skew")]
-    pub dpop_future_skew_seconds: u64,
+    /// runs fast), in seconds: 0 to `dpop_max_age_seconds`. Unset: 10, or
+    /// `dpop_max_age_seconds` when that is smaller ([`TokenSection::dpop_future_skew`]). Also
+    /// sets how long proofs are refused after a quick restart ([`crate::dpop`], "Restart
+    /// fence").
+    #[serde(default)]
+    pub dpop_future_skew_seconds: Option<u64>,
     /// Most DPoP proofs remembered for replay detection (each until its `iat` plus
     /// `dpop_max_age_seconds`). When full of live proofs, new ones get 503. Default 1000000.
     #[serde(default = "default_dpop_replay_capacity")]
@@ -265,10 +267,6 @@ fn default_dpop_max_age() -> u64 {
     DEFAULT_DPOP_MAX_AGE_SECONDS
 }
 
-fn default_dpop_future_skew() -> u64 {
-    DEFAULT_DPOP_FUTURE_SKEW_SECONDS
-}
-
 fn default_dpop_replay_capacity() -> usize {
     DEFAULT_DPOP_REPLAY_CAPACITY
 }
@@ -287,7 +285,7 @@ impl Default for TokenSection {
             actor_auth: ActorAuth::default(),
             dpop: DpopMode::default(),
             dpop_max_age_seconds: DEFAULT_DPOP_MAX_AGE_SECONDS,
-            dpop_future_skew_seconds: DEFAULT_DPOP_FUTURE_SKEW_SECONDS,
+            dpop_future_skew_seconds: None,
             dpop_replay_capacity: DEFAULT_DPOP_REPLAY_CAPACITY,
             dpop_nonce: DpopNonceMode::default(),
             client_assertion_max_lifetime_seconds: DEFAULT_CLIENT_ASSERTION_MAX_LIFETIME_SECONDS,
@@ -297,6 +295,13 @@ impl Default for TokenSection {
 }
 
 impl TokenSection {
+    /// `dpop_future_skew_seconds` as applied: the value set, else 10 or
+    /// `dpop_max_age_seconds` when that is smaller.
+    pub fn dpop_future_skew(&self) -> u64 {
+        self.dpop_future_skew_seconds
+            .unwrap_or_else(|| DEFAULT_DPOP_FUTURE_SKEW_SECONDS.min(self.dpop_max_age_seconds))
+    }
+
     /// Startup check of the DPoP settings.
     ///
     /// # Errors
@@ -307,7 +312,10 @@ impl TokenSection {
         if !(1..=3600).contains(&self.dpop_max_age_seconds) {
             anyhow::bail!("[token] dpop_max_age_seconds must be between 1 and 3600");
         }
-        if self.dpop_future_skew_seconds > self.dpop_max_age_seconds {
+        if self
+            .dpop_future_skew_seconds
+            .is_some_and(|f| f > self.dpop_max_age_seconds)
+        {
             anyhow::bail!(
                 "[token] dpop_future_skew_seconds must be between 0 and dpop_max_age_seconds ({})",
                 self.dpop_max_age_seconds
@@ -3811,12 +3819,23 @@ mod tests {
         assert!(Config::from_toml("[[agents]]\nid = \"a\"\njwks = { keys = [] }\n").is_err());
     }
 
-    /// `dpop_future_skew_seconds`: default 10, from 0 up to `dpop_max_age_seconds`.
+    /// `dpop_future_skew_seconds`: default 10, or the max age when that is smaller; set, from
+    /// 0 up to `dpop_max_age_seconds`.
     #[test]
     fn dpop_future_skew_is_bounded_by_the_max_age() {
         let d = TokenSection::default();
-        assert_eq!(d.dpop_future_skew_seconds, DEFAULT_DPOP_FUTURE_SKEW_SECONDS);
+        assert_eq!(d.dpop_future_skew(), DEFAULT_DPOP_FUTURE_SKEW_SECONDS);
         d.check_dpop().unwrap();
+        // A short max age with no skew set starts, with the skew at the max age.
+        let short = Config::from_toml("[token]\ndpop_max_age_seconds = 5\n")
+            .unwrap()
+            .token;
+        short.check_dpop().unwrap();
+        assert_eq!(short.dpop_future_skew(), 5);
+        let set = Config::from_toml("[token]\ndpop_future_skew_seconds = 0\n")
+            .unwrap()
+            .token;
+        assert_eq!(set.dpop_future_skew(), 0);
         for good in [
             "[token]\ndpop_future_skew_seconds = 0\n",
             "[token]\ndpop_max_age_seconds = 60\ndpop_future_skew_seconds = 60\n",

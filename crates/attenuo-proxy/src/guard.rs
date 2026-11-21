@@ -308,7 +308,7 @@ impl StreamGuard {
                 fail(reason, true, cause)
             }
             Err(AuthError::TokenExpired) => expired(),
-            Err(AuthError::Unavailable(reason)) => {
+            Err(AuthError::Unavailable(reason) | AuthError::UnavailableFor { reason, .. }) => {
                 fail(reason, false, StreamEndCause::RecheckUnavailable)
             }
             Err(

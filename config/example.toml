@@ -236,9 +236,10 @@ actor_auth = "either"
 dpop = "optional"
 # How far a proof's iat may be behind the server's clock (seconds, 1 to 3600).
 dpop_max_age_seconds = 300
-# How far a proof's iat may be ahead of the server's clock (seconds, 0 to dpop_max_age_seconds).
-# A client whose clock runs further ahead is refused. After a quick restart, proofs are refused
-# for up to this long plus about 10 seconds.
+# How far a proof's iat may be ahead of the server's clock (seconds, 0 to dpop_max_age_seconds;
+# unset: 10, or dpop_max_age_seconds when that is smaller). A client whose clock runs further
+# ahead is refused. After a quick restart, proofs made then are refused for up to this long
+# plus about 11 seconds.
 dpop_future_skew_seconds = 10
 # Most proof jtis remembered for replay detection; when full, new proofs get 503.
 dpop_replay_capacity = 1000000

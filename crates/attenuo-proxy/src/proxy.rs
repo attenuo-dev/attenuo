@@ -370,7 +370,12 @@ fn unauthorized_recorded(err: AuthError, decision_id: Option<Uuid>) -> Response 
             .insert(header::RETRY_AFTER, HeaderValue::from((*secs).max(1)));
         return resp;
     }
-    if let AuthError::Unavailable(_) = &err {
+    let retry_after = match &err {
+        AuthError::Unavailable(_) => Some(5),
+        AuthError::UnavailableFor { seconds, .. } => Some((*seconds).max(1)),
+        _ => None,
+    };
+    if let Some(secs) = retry_after {
         // A server-side limit, not a bad credential: 503, so the client keeps its token and
         // key and retries (SR-47).
         tracing::warn!(reason = ?reason, "request refused: temporarily unavailable");
@@ -383,7 +388,7 @@ fn unauthorized_recorded(err: AuthError, decision_id: Option<Uuid>) -> Response 
         );
         let mut resp = json_response(StatusCode::SERVICE_UNAVAILABLE, &body);
         resp.headers_mut()
-            .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+            .insert(header::RETRY_AFTER, HeaderValue::from(secs));
         return resp;
     }
     tracing::warn!(reason = ?reason, "request rejected: unauthenticated");

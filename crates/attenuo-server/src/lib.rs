@@ -1058,12 +1058,19 @@ mod shutdown_tests {
                     "round {round}: {}",
                     resp.status()
                 );
+                // Ready, except for the DPoP restart fence: a restart this quick fences
+                // proofs for some seconds, and `/readyz` says so (`crate::dpop`).
                 let resp = client.get(&ready).send().await.unwrap();
+                let status = resp.status();
+                let body: serde_json::Value = resp.json().await.unwrap();
+                let fenced = round > 0 && body["checks"]["dpop_restart_fence"] == "fenced";
                 assert!(
-                    resp.status().is_success(),
-                    "round {round}: {}",
-                    resp.status()
+                    status.is_success() || fenced,
+                    "round {round}: {status} {body}"
                 );
+                for check in ["audit", "audit_append", "leases"] {
+                    assert_eq!(body["checks"][check], "ok", "round {round}: {body}");
+                }
                 stop.send(()).unwrap();
             };
             let (res, ()) = tokio::join!(serving, using);
