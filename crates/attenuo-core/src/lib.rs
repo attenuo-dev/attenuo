@@ -58,10 +58,11 @@ pub use capability::{
 pub use chain::{AgentId, DelegationChain, Hop, LeaseId, OriginatingUser};
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use decision::{
-    chain_id_of, ApprovalInfo, BudgetCharge, Decision, DecisionRecord, OutputLabel, RecordBudget,
-    RecordKind, RecordLabels, RecordUsage, RecordUserWindow, RecordWindow, ResultInfo,
-    UntrustedArg, UntrustedKind, REASON_APPROVAL_DECLINED, REASON_APPROVAL_GRANTED,
-    REASON_APPROVAL_INVALID, REASON_APPROVAL_REQUESTED, REASON_TOOL_RESULT,
+    chain_id_of, ApprovalInfo, BudgetCharge, CeilingInfo, Decision, DecisionRecord, OutputLabel,
+    RecordBudget, RecordKind, RecordLabels, RecordUsage, RecordUserWindow, RecordWindow,
+    ResultInfo, SearchInfo, UntrustedArg, UntrustedKind, REASON_APPROVAL_DECLINED,
+    REASON_APPROVAL_GRANTED, REASON_APPROVAL_INVALID, REASON_APPROVAL_REQUESTED,
+    REASON_SEARCH_ANSWERED, REASON_TOOL_RESULT,
 };
 pub use error::{AttenuationError, ChainError, SizeError};
 pub use limits::{ArgLimit, Charge, Derive, LimitKind, Limits};

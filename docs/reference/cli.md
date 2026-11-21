@@ -413,7 +413,7 @@ Show the most recent audit entries, oldest of them first. Filters keep only matc
 | `--before SEQ` | the head | Show the `-n` matching entries just below `SEQ` instead of the newest (the range `to=SEQ-1` of `GET /admin/audit`). To page back, pass the oldest `seq` shown. Not with `--follow`. |
 | `-f`, `--follow` | off | Keep polling for new matching entries. |
 | `--interval-ms` | 1000 | Polling interval with `--follow`. |
-| `--kind` | all | Record kind: `decision`, `tool_result`, `approval_request`, `approval_grant`, `exchange`, `root_token`, `lease_renew`, `lease_revoke` or `admin`. Repeatable, or comma-separated; any of them matches. |
+| `--kind` | all | Record kind: `decision`, `tool_result`, `approval_request`, `approval_grant`, `exchange`, `root_token`, `lease_renew`, `lease_revoke`, `admin` or `search`. Repeatable, or comma-separated; any of them matches. |
 | `--decision` | all | `allow` or `deny`. It matches every kind whose record carries that decision: the `tool_result` record of an allowed call is `allow` too, so add `--kind decision` to get only decision records (for example to find the `id=` for `budget refund`). |
 | `--reason` | all | The record's `reason` (`policy_deny`, `lease_revoked`, ...). |
 | `--subject` | all | The originating user. |
@@ -443,11 +443,13 @@ Every line starts with the sequence number and the time. Decisions, token issuan
 #5    2026-10-24T08:45:18Z  DENY  github/create_issue  assistant for alice  reason=approval_required  id=b9ad...
 #6    2026-10-24T08:45:18Z  approval_request  github/create_issue  assistant for alice  decision=b9ad...  approval=1388... expires=2026-10-24T08:47:18Z  id=7a41...
 #7    2026-10-24T08:45:18Z  approval_grant  github/create_issue  assistant for alice  decision=b9ad...  approval=1388... outcome=grant by=operator  id=e966...
+#8    2026-10-24T08:45:19Z  search  github/authzen.search  assistant for alice  evaluated=4 permitted=3  id=c2e1...
 ```
 
 - `tool_result`: `decision=` is the call it answers, `label=` is `untrusted` or `trusted`, `size=` the bytes of the canonical result; ` error` follows when the upstream answered with a JSON-RPC error. The content is not stored.
 - `approval_request`: `decision=` is the gated decision, `expires=` when the approval stops being usable.
 - `approval_grant`: `outcome=` is `grant` or `decline`, `by=` is `user` or `operator`.
+- `search`: one AuthZEN action search. `evaluated=` is how many candidate tools it evaluated, `permitted=` how many it returned. It is not a decision.
 - `exchange`, `root_token`, `lease_renew`, `lease_revoke` and `admin` records already name themselves in `server/tool` (`attenuo/token.exchange`, `attenuo/admin.lease.revoke`, ...) and print as before. `audit show` prints the same first line.
 
 ### `audit show <SEQ>` / `audit show --id <UUID>`
@@ -483,7 +485,7 @@ Write entries and the checkpoints inside the range. Needs the admin token.
 | `--to` | the head | Last sequence number, inclusive. |
 | `--format` | `jsonl` | `jsonl` streams one object per line (header, entries, checkpoints). `json` writes one object `{header, entries, checkpoints}`. |
 | `--out` | stdout | Write to this file. |
-| `--kind` | all | Keep only records of this kind: `decision`, `tool_result`, `approval_request`, `approval_grant`, `exchange`, `root_token`, `lease_renew`, `lease_revoke` or `admin`. |
+| `--kind` | all | Keep only records of this kind: `decision`, `tool_result`, `approval_request`, `approval_grant`, `exchange`, `root_token`, `lease_renew`, `lease_revoke`, `admin` or `search`. |
 | `--chain-id` | all | Keep only records of this delegation chain (the `chain_id` field: the lease id of the chain's first hop). |
 | `--tool` | all | Keep only records for this tool, as on `audit tail`: an MCP tool name, or one of attenuo's own (`token.root`, `token.exchange`, `lease.renew`, `admin.*`). Exact match. |
 | `--decision` | all | Keep only records with this decision: `allow` or `deny`. |
@@ -588,7 +590,7 @@ Ask the decision endpoint whether the token's chain may make a call, without mak
 
 ### `authzen search`
 
-List the tools of one MCP upstream that the token's chain may call with these arguments, without calling them: AuthZEN action search, `POST /access/v1/search/action` ([AuthZEN conformance](authzen.md#action-search)). The candidates are the tools the server's `[policy] catalog` lists for the upstream that the token's capabilities name. A search writes no audit record, charges no run limit and takes no approval, so an approval-gated tool is never listed.
+List the tools of one MCP upstream that the token's chain may call with these arguments, without calling them: AuthZEN action search, `POST /access/v1/search/action` ([AuthZEN conformance](authzen.md#action-search)). The candidates are the tools the server's `[policy] catalog` lists for the upstream that the token's capabilities name. A search writes one `search` audit record, charges no run limit and takes no approval, so an approval-gated tool is never listed.
 
 | Option | Default | Meaning |
 | --- | --- | --- |

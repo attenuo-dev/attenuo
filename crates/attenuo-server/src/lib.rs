@@ -12,7 +12,7 @@
 //! | `POST /token/renew` | delegation token (bearer; with a `DPoP` proof when bound, [`dpop`]) | extend the last hop's lease |
 //! | `POST /access/v1/evaluation` | delegation token (bearer); or `[[peps]]` credentials with `[authzen] allow_unsigned_chain` | AuthZEN evaluation |
 //! | `POST /access/v1/evaluations` | same as above | AuthZEN batch evaluation, at most `[authzen] max_batch` entries |
-//! | `POST /access/v1/search/action` | same as above | AuthZEN action search: the catalog tools of one server the pipeline would allow, at most `[authzen] max_batch` evaluated per page; no audit record, charge or approval |
+//! | `POST /access/v1/search/action` | same as above | AuthZEN action search: the catalog tools of one server the pipeline would allow, at most `[authzen] max_batch` evaluated per page; one `search` audit record, no charge or approval |
 //! | `GET /.well-known/authzen-configuration` | none | AuthZEN metadata |
 //! | `GET /.well-known/jwks.json` | none | issuer public key |
 //! | `GET /healthz` | none | liveness |

@@ -88,7 +88,7 @@ permit(principal, action == Action::"github/pay", resource);
 
 struct Harness {
     server: Spawned,
-    _state: Arc<AppState>,
+    state: Arc<AppState>,
     client: reqwest::Client,
     _dir: tempfile::TempDir,
 }
@@ -124,7 +124,7 @@ impl Harness {
         let (router, state) = attenuo_server::build(&cfg).unwrap();
         Self {
             server: spawn_router(router).await.unwrap(),
-            _state: state,
+            state,
             client: reqwest::Client::new(),
             _dir: dir,
         }
@@ -539,6 +539,14 @@ impl Harness {
         resp.json().await.unwrap()
     }
 
+    /// The `entries` of an audit listing.
+    async fn entries(&self, path: &str) -> Vec<Value> {
+        self.admin_get(path).await["entries"]
+            .as_array()
+            .unwrap()
+            .clone()
+    }
+
     async fn post_as(&self, token: &str, path: &str, body: &Value) -> Value {
         let resp = self
             .client
@@ -556,11 +564,12 @@ impl Harness {
 /// The catalog's github tools, in the order action search evaluates them.
 const GITHUB_TOOLS: [&str; 4] = ["create_issue", "delete_repo", "pay", "read_file"];
 
-/// Action search (AuthZEN 1.0 section 8) acts on nothing: however often it runs, over an
-/// approval-gated tool and a tool with a run limit alike, it appends no
-/// audit record, creates no pending approval and charges no limit.
+/// Action search (AuthZEN 1.0 section 8) acts on nothing but the audit log: however often it
+/// runs, over an approval-gated tool and a tool with a run limit alike, each request appends
+/// exactly one `search` record (SR-117), and none of them is a decision, creates a pending
+/// approval or charges a limit.
 #[tokio::test]
-async fn action_search_writes_nothing() {
+async fn action_search_writes_one_search_record_and_charges_nothing() {
     let h = Harness::start().await;
     let token = h
         .mint(&json!({"capabilities": [
@@ -568,9 +577,10 @@ async fn action_search_writes_nothing() {
             {"server": "github", "tool": "pay", "limits": {"calls": 1}},
         ]}))
         .await;
-    let before = h.admin_get("/admin/audit?from=1&limit=1000").await["entries"]
-        .as_array()
-        .unwrap()
+    let before = h.entries("/admin/audit?from=1&limit=1000").await.len();
+    let decisions_before = h
+        .entries("/admin/audit?kind=decision&limit=1000")
+        .await
         .len();
     let body = json!({
         "subject": {"type": "agent", "id": ""},
@@ -587,11 +597,19 @@ async fn action_search_writes_nothing() {
             .collect();
         assert_eq!(names, ["create_issue", "pay", "read_file"], "{a}");
     }
-    let after = h.admin_get("/admin/audit?from=1&limit=1000").await;
+    let after = h.entries("/admin/audit?from=1&limit=1000").await;
+    let written: Vec<&Value> = after[before..].iter().map(|e| &e["record"]).collect();
+    assert_eq!(written.len(), 3, "one record per search: {written:?}");
+    for r in &written {
+        assert_eq!(r["kind"], "search", "{r}");
+        assert_eq!(r["search"], json!({"evaluated": 4, "permitted": 3}), "{r}");
+    }
+    // None of them is a decision: `kind=decision` lists what it listed before.
+    let decisions = h.admin_get("/admin/audit?kind=decision&limit=1000").await;
     assert_eq!(
-        after["entries"].as_array().unwrap().len(),
-        before,
-        "a search appended to the audit log: {after}"
+        decisions["entries"].as_array().unwrap().len(),
+        decisions_before,
+        "a search record is listed as a decision: {decisions}"
     );
     let approvals = h.admin_get("/admin/approvals").await;
     assert_eq!(
@@ -613,6 +631,198 @@ async fn action_search_writes_nothing() {
         .await;
     assert_eq!(e["decision"], true, "{e}");
     assert_eq!(e["context"]["budget"]["calls_remaining"], 1, "{e}");
+    // No search moved a decision metric: the evaluation above is the only decision.
+    let metrics = h.state.metrics.render();
+    let decided: u64 = metrics
+        .lines()
+        .filter(|l| l.starts_with("attenuo_decisions_total{"))
+        .filter_map(|l| l.rsplit(' ').next()?.parse::<u64>().ok())
+        .sum();
+    assert_eq!(decided, 1, "{metrics}");
+}
+
+/// SR-117: the record of an action search names the search: kind `search`, `allow`,
+/// `search_answered`, the run's chain, the searched server, tool `authzen.search`, the page's
+/// counts, and the call's session and DPoP flag. Its `arguments_digest` is the digest of
+/// `context.input` that an evaluation of the same request records, so an operator can match a
+/// search to the calls that followed it. The log still verifies, hash chain and signature.
+#[tokio::test]
+async fn action_search_record_names_the_search_sr117() {
+    let h = Harness::start().await;
+    let token = h.mint(&json!({})).await;
+    let input = json!({"repo": "alice/public-site"});
+    let search = json!({
+        "subject": {"type": "agent", "id": ""},
+        "resource": {"type": "mcp_server", "id": "github"},
+        "context": {"input": input, "session_id": "s-117"},
+        "page": {"limit": 2},
+    });
+    let a = h.post_as(&token, "/access/v1/search/action", &search).await;
+    // The first page: `create_issue` and `delete_repo`, of which the gated delete is no result.
+    assert_eq!(
+        a["results"],
+        json!([{"name": "create_issue", "properties": {"server": "github"}}]),
+        "{a}"
+    );
+    let records = h.admin_get("/admin/audit?kind=search&limit=1000").await;
+    let records = records["entries"].as_array().unwrap();
+    assert_eq!(records.len(), 1, "{records:?}");
+    let r = &records[0]["record"];
+    assert_eq!(r["kind"], "search");
+    assert_eq!(r["decision"], "allow");
+    assert_eq!(r["reason"], "search_answered");
+    assert_eq!(r["server"], "github");
+    assert_eq!(r["tool"], "authzen.search");
+    assert_eq!(r["search"], json!({"evaluated": 2, "permitted": 1}));
+    assert_eq!(r["session_id"], "s-117");
+    assert!(r.get("dpop_bound").is_none(), "no DPoP proof was sent: {r}");
+    assert_eq!(r["agents"], json!(["planner"]));
+    assert_eq!(r["originating_subject"], "alice");
+    assert!(
+        r.get("policy_ids").is_none() && r.get("budget").is_none(),
+        "{r}"
+    );
+    assert_eq!(
+        r["arguments_digest"],
+        attenuo_core::digest::sha256_json(&input),
+        "the digest of context.input"
+    );
+    // The run's chain: the chain id of the root token's issuance.
+    let roots = h.admin_get("/admin/audit?kind=root_token&limit=1000").await;
+    let root = roots["entries"].as_array().unwrap().last().unwrap()["record"].clone();
+    assert_eq!(r["chain_id"], root["chain_id"], "{r}");
+    assert_eq!(r["chain_digest"], root["chain_digest"], "{r}");
+
+    // An evaluation of the same request, a result as its action: the same arguments digest,
+    // session and chain.
+    let mut eval = search.clone();
+    eval.as_object_mut().unwrap().remove("page");
+    eval["action"] = json!({"name": "create_issue", "properties": {"server": "github"}});
+    let e = h.post_as(&token, "/access/v1/evaluation", &eval).await;
+    assert_eq!(e["decision"], true, "{e}");
+    let id = e["context"]["decision_id"].as_str().unwrap();
+    let d = h.admin_get(&format!("/admin/audit/records/{id}")).await;
+    let d = &d["entry"]["record"];
+    assert_eq!(d["kind"], "decision");
+    assert_eq!(d["arguments_digest"], r["arguments_digest"], "{d}");
+    assert_eq!(d["session_id"], r["session_id"], "{d}");
+    assert_eq!(d["chain_id"], r["chain_id"], "{d}");
+    assert_eq!(d["dpop_bound"], r["dpop_bound"], "{d}");
+
+    // The hash chain and a signed checkpoint over the head, which holds the search record.
+    let cp = h.admin_get("/admin/audit/checkpoint").await;
+    let report = h.admin_get("/admin/audit/verify").await;
+    assert_eq!(report["ok"], true, "{report}");
+    assert_eq!(report["bad_checkpoints"], json!([]), "{report}");
+    assert_eq!(report["last_signed_seq"], cp["seq"], "{report}");
+    assert_eq!(report["unsigned_tail"], 0, "{report}");
+    assert!(
+        records[0]["seq"].as_u64().unwrap() <= cp["seq"].as_u64().unwrap(),
+        "the checkpoint covers the search record"
+    );
+}
+
+/// SR-117: a search refused before any candidate is evaluated writes no record: a malformed
+/// `page` (refused before authentication), no token, an approval token and a page token of
+/// another query (both refused after it).
+#[tokio::test]
+async fn a_refused_action_search_writes_no_record_sr117() {
+    let h = Harness::start().await;
+    let token = h.mint(&json!({})).await;
+    let other = h.mint(&json!({})).await;
+    let body = json!({
+        "subject": {"type": "agent", "id": ""},
+        "resource": {"type": "mcp_server", "id": "github"},
+        "context": {"input": {"repo": "alice/public-site"}},
+        "page": {"limit": 1},
+    });
+    // A page token of the other run, for the cursor refusal below.
+    let theirs = h.post_as(&other, "/access/v1/search/action", &body).await;
+    let theirs = theirs["page"]["next_token"].as_str().unwrap().to_string();
+    let before = h.entries("/admin/audit?from=1&limit=1000").await.len();
+    let mut bad_page = body.clone();
+    bad_page["page"] = json!({"limit": 0});
+    let mut approval = body.clone();
+    approval["context"]["approval_token"] = json!("eyJ.not.checked");
+    let mut cursor = body.clone();
+    cursor["page"]["token"] = json!(theirs);
+    for (what, bearer, body, status, code) in [
+        ("invalid page", Some(&token), &bad_page, 400, "invalid_page"),
+        ("no token", None, &body, 401, "missing_token"),
+        (
+            "approval token",
+            Some(&token),
+            &approval,
+            400,
+            "approval_token_not_accepted",
+        ),
+        (
+            "another run's page token",
+            Some(&token),
+            &cursor,
+            400,
+            "invalid_cursor",
+        ),
+    ] {
+        let mut req = h
+            .client
+            .post(h.server.url("/access/v1/search/action"))
+            .json(body);
+        if let Some(b) = bearer {
+            req = req.bearer_auth(b);
+        }
+        let resp = req.send().await.unwrap();
+        assert_eq!(resp.status().as_u16(), status, "{what}");
+        let v: Value = resp.json().await.unwrap();
+        assert_eq!(v["code"], code, "{what}: {v}");
+    }
+    assert_eq!(
+        h.entries("/admin/audit?from=1&limit=1000").await.len(),
+        before,
+        "a refused search wrote a record"
+    );
+}
+
+/// SR-117: a search whose record cannot be appended fails closed, as an issuance does: 500
+/// `server_error` and no results, and the failed append is counted.
+#[tokio::test]
+async fn an_action_search_that_cannot_be_recorded_answers_nothing_sr117() {
+    let h = Harness::start().await;
+    let token = h.mint(&json!({})).await;
+    // Every insert into the log fails, as on a full disk.
+    h.state
+        .audit
+        .with_connection(|c| {
+            c.execute_batch(
+                "CREATE TRIGGER full_disk BEFORE INSERT ON audit \
+                 BEGIN SELECT RAISE(FAIL, 'database or disk is full'); END;",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let resp = h
+        .client
+        .post(h.server.url("/access/v1/search/action"))
+        .bearer_auth(&token)
+        .json(&json!({
+            "subject": {"type": "agent", "id": ""},
+            "resource": {"type": "mcp_server", "id": "github"},
+            "context": {"input": {"repo": "alice/public-site"}},
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(v["code"], "server_error", "{v}");
+    assert!(v.get("results").is_none(), "{v}");
+    assert!(
+        h.state
+            .metrics
+            .render()
+            .contains("attenuo_audit_append_errors_total 1\n"),
+        "the failed append is counted"
+    );
 }
 
 /// What action search returns is exactly the set of candidates that `POST

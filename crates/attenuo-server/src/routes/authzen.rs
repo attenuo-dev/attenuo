@@ -218,6 +218,9 @@ fn evaluate_batch(state: &AppState, headers: &HeaderMap, body: &Bytes) -> Result
 /// The path of the Action Search API (AuthZEN 1.0 section 8, default path of section 10.1).
 pub const SEARCH_ACTION_PATH: &str = "/access/v1/search/action";
 
+/// The `tool` of the audit record an action search appends (kind `search`, SR-117).
+pub const SEARCH_AUDIT_TOOL: &str = "authzen.search";
+
 /// `POST /access/v1/search/action`: the AuthZEN Action Search API. Which actions (tools) the
 /// subject may perform on the resource (an MCP server), in the request's context.
 ///
@@ -239,14 +242,21 @@ pub const SEARCH_ACTION_PATH: &str = "/access/v1/search/action";
 ///   <tool>, "properties": {"server": <server>}}`. No reason, policy id or diagnostic is
 ///   returned, so a caller learns no more than evaluating each candidate one at a time would
 ///   tell it.
-/// - **No side effects.** No audit record, no charge to run limits or usage, no approval taken
-///   or requested: a search acts on nothing, as the admin dry run and the list screen do not.
-///   An approval-gated tool is not a result. `context.approval_token` is refused (400
+/// - **One audit record, no other side effect.** Each answered request appends one record of
+///   kind `search` (SR-117): decision `allow`, reason `search_answered`, the chain, `server`
+///   the searched server, tool `authzen.search`, the `arguments_digest` an evaluation of the
+///   same `context.input` would record, `session_id` and `dpop_bound` as an evaluation sets
+///   them, and `search: {evaluated, permitted}`, the counts of this page. Not per candidate,
+///   and not a decision: no charge to run limits or usage, no approval taken or requested, no
+///   decision metric. If the append fails the search fails (500) and nothing is answered. A
+///   request refused before any candidate is evaluated (a 400, 401, 403 or 429) writes no
+///   record. An approval-gated tool is not a result. `context.approval_token` is refused (400
 ///   `approval_token_not_accepted`): an approval token is spent by the one decision it names.
 /// - **Rate limit.** `[limits] authzen_search_requests_per_minute` (off by default) counts
 ///   searches per run, the chain's root lease, once the caller has authenticated and before
 ///   any candidate is evaluated, in a table apart from `mcp_requests_per_minute`. Over it the
-///   answer is 429 `rate_limited` with `Retry-After`, and nothing is evaluated (SR-117).
+///   answer is 429 `rate_limited` with `Retry-After`, nothing is evaluated and no record is
+///   written (SR-117).
 /// - **Paging** (section 8.2). At most `[authzen] max_batch` candidates are evaluated per
 ///   request, the bound of a batch. `page.limit` (1 or more; above `max_batch` it is clamped)
 ///   is how many candidates one page evaluates, so a page holds at most that many results and
@@ -267,8 +277,8 @@ pub const SEARCH_ACTION_PATH: &str = "/access/v1/search/action";
 /// `invalid_cursor` for a `page.token` this route did not issue or issued for another chain,
 /// server or `context`; 400 `invalid_search_resource`
 /// when the resource names no server; 400 `approval_token_not_accepted`; 429 `rate_limited`
-/// over `[limits] authzen_search_requests_per_minute`; and the 401 and 403 of
-/// authentication, as for evaluation.
+/// over `[limits] authzen_search_requests_per_minute`; the 401 and 403 of authentication, as
+/// for evaluation; and 500 `server_error` when the search's audit record cannot be appended.
 // The `Err` is a full response, built once per refused request; boxing it buys nothing.
 #[allow(clippy::result_large_err)]
 pub async fn search_action(
@@ -397,8 +407,8 @@ fn search_actions(state: &AppState, headers: &HeaderMap, body: &Bytes) -> Result
     // `[limits] authzen_search_requests_per_minute`, per run (the root lease of the bearer's
     // chain, or of a PEP's issued unsigned chain): only once the caller has authenticated, so
     // a caller without the credentials cannot use up a run's searches, and before any
-    // candidate is evaluated. A search writes no audit record, so this is what bounds how fast
-    // a run can try arguments (SR-117).
+    // candidate is evaluated. A search over it writes no record; this bounds how fast a run
+    // can try arguments, and the record of each answered search shows that it did (SR-117).
     if let Some(run) = attenuo_core::chain_id_of(&a.chain) {
         state.limits.admit_search(&run)?;
     }
@@ -451,9 +461,29 @@ fn search_actions(state: &AppState, headers: &HeaderMap, body: &Bytes) -> Result
     } else {
         String::new()
     };
-    // Not a decision, so not in the audit log (see `search_action`); the log line says that a
-    // search ran, for whom, and how much it looked at. `server` is the caller's: Debug-format
-    // it so a newline cannot forge a log line (SR-18, SR-115).
+    // One record per answered search, not per candidate (SR-117): the arguments are the call's,
+    // as an evaluation of the same `context.input` digests them, and the counts of this page.
+    // Not a decision: no decision metric, no charge, no approval. A failed append fails the
+    // search, as it fails an issuance: nothing is answered that the log does not show.
+    let mut call = a.call.clone();
+    call.server.clone_from(&server);
+    call.tool = SEARCH_AUDIT_TOOL.to_string();
+    let record = attenuo_core::DecisionRecord::new(
+        a.now,
+        attenuo_core::Decision::Allow,
+        attenuo_core::REASON_SEARCH_ANSWERED,
+        &a.chain,
+        &call,
+        Vec::new(),
+    )
+    .with_kind(attenuo_core::RecordKind::Search)
+    .with_search(attenuo_core::SearchInfo {
+        evaluated: window.len() as u64,
+        permitted: results.len() as u64,
+    });
+    super::append_audit(state, record)?;
+    // The log line says that a search ran, for whom, and how much it looked at. `server` is
+    // the caller's: Debug-format it so a newline cannot forge a log line (SR-18, SR-115).
     tracing::info!(
         chain_id = attenuo_core::chain_id_of(&a.chain).unwrap_or_default(),
         server = ?server,

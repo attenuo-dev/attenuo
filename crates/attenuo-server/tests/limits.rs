@@ -677,7 +677,8 @@ async fn the_search_rate_limit_is_off_by_default() {
 /// the run shares them, the N+1st is `429` `rate_limited` with `Retry-After` and evaluates
 /// nothing; another run is not touched; evaluation, batch evaluation and `/mcp` of the limited
 /// run still answer, and MCP requests spend no searches (a table of its own); a bad token
-/// counts against no one; and no search, admitted or refused, writes an audit record.
+/// counts against no one; and each admitted search writes one `search` record, a refused one
+/// none (SR-117).
 #[tokio::test]
 async fn the_search_rate_limit_is_per_run() {
     let h = Harness::start(|c| {
@@ -727,10 +728,11 @@ async fn the_search_rate_limit_is_per_run() {
         assert_eq!(v["error_description"], "rate_limited", "{v}");
         assert!(v.get("results").is_none(), "{v}");
     }
+    // The three admitted searches wrote a `search` record each; the two 429s wrote nothing.
     assert_eq!(
         h.audit_len().await,
-        before,
-        "a search wrote an audit record"
+        before + 3,
+        "a refused search wrote an audit record, or an admitted one did not"
     );
     // Another run searches as before.
     assert_eq!(h.search(&bob).await.status(), StatusCode::OK);
@@ -746,7 +748,8 @@ async fn the_search_rate_limit_is_per_run() {
             .map(Vec::len),
         Some(2)
     );
-    assert_eq!(h.audit_len().await, before + 3);
+    // Bob's search, then the evaluation and the two entries of the batch.
+    assert_eq!(h.audit_len().await, before + 7);
     let m = h.metrics();
     assert!(
         m.contains(

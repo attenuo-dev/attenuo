@@ -164,6 +164,7 @@ const NOT_ERROR_CODES: &[&str] = &[
     "exchange_widening",
     "lease_renewed",
     "policy_allow",
+    "search_answered",
     "token_issued",
     "tool_result",
 ];

@@ -749,6 +749,79 @@ fn budget_records_keep_existing_hashes_and_pin_their_own() {
     );
 }
 
+/// SR-117 and SR-126: `search` and `id_jag_ceiling` are omitted when absent, so the golden
+/// decision record and a root token record without the ceiling keep their bytes and hashes,
+/// and a `search` record and a root token record with the ceiling pin their own.
+#[test]
+fn search_and_ceiling_records_keep_existing_hashes_and_pin_their_own() {
+    let base = serde_json::json!({
+        "agents": ["agent:planner"], "arguments_digest": "ab".repeat(32), "chain_depth": 1,
+        "chain_digest": "cd".repeat(32), "chain_id": "l1", "decision": "allow",
+        "id": "00000000-0000-4000-8000-000000000001", "kind": "decision", "leases": ["l1"],
+        "originating_subject": "user:mudit", "reason": "policy_allow", "server": "github",
+        "tool": "read_file", "at": "2026-10-23T12:00:00Z"
+    });
+    let record: attenuo_core::DecisionRecord = serde_json::from_value(base.clone()).unwrap();
+    assert!(record.search.is_none() && record.id_jag_ceiling.is_none());
+    let json = attenuo_audit::canonical_record_json(&record);
+    assert!(
+        !json.contains("search") && !json.contains("id_jag_ceiling"),
+        "{json}"
+    );
+    // The same bytes as the record built field by field: nothing new is written for it.
+    assert_eq!(json, attenuo_core::jcs::to_string(&base).unwrap());
+    assert_eq!(
+        compute_entry_hash(7, &"11".repeat(32), &record),
+        "e8ababad86538918f6eee2d5edb7e6aa4bfa8f8f6ea032f2b5fde00dfe52d693"
+    );
+
+    // A root token record without the ceiling: the bytes it had before the member existed.
+    let mut root = base.clone();
+    root["kind"] = "root_token".into();
+    root["reason"] = "token_issued".into();
+    root["server"] = "attenuo".into();
+    root["tool"] = "token.root".into();
+    let plain: attenuo_core::DecisionRecord = serde_json::from_value(root.clone()).unwrap();
+    assert_eq!(
+        attenuo_audit::canonical_record_json(&plain),
+        attenuo_core::jcs::to_string(&root).unwrap()
+    );
+
+    let mut search = base;
+    search["kind"] = "search".into();
+    search["reason"] = "search_answered".into();
+    search["tool"] = "authzen.search".into();
+    search["search"] = serde_json::json!({"evaluated": 4, "permitted": 3});
+    let search: attenuo_core::DecisionRecord = serde_json::from_value(search).unwrap();
+    assert_eq!(search.kind, RecordKind::Search);
+    let json = attenuo_audit::canonical_record_json(&search);
+    assert!(
+        json.contains(r#""search":{"evaluated":4,"permitted":3}"#),
+        "{json}"
+    );
+    assert_eq!(
+        compute_entry_hash(10, &"11".repeat(32), &search),
+        "5bbfb05884bd1a1e320017277ae5b60020ab8cbe3c2c8fc8f7ab2929f30ef713"
+    );
+
+    root["id_jag_ceiling"] = serde_json::json!({
+        "claims": ["resource", "scope"], "claims_digest": "ef".repeat(32)
+    });
+    let ceiling: attenuo_core::DecisionRecord = serde_json::from_value(root).unwrap();
+    let json = attenuo_audit::canonical_record_json(&ceiling);
+    assert!(
+        json.contains(&format!(
+            r#""id_jag_ceiling":{{"claims":["resource","scope"],"claims_digest":"{}"}}"#,
+            "ef".repeat(32)
+        )),
+        "{json}"
+    );
+    assert_eq!(
+        compute_entry_hash(11, &"11".repeat(32), &ceiling),
+        "c5900b32c3465f080b2be38a67525b73c09a4a6b75fa6a46cb07f751ae5d9949"
+    );
+}
+
 /// Fuzzing F4: an entry whose `seq` is `u64::MAX`, with a correct hash, used to overflow
 /// `seq + 1` in the chain walk (a panic with overflow checks on). It is now a bad entry.
 #[test]

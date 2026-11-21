@@ -1450,6 +1450,8 @@ async fn id_jag_claims_are_ignored_without_a_ceiling() {
     );
     let rec = root_record(&h, got.1["lease"].as_str().unwrap()).await;
     assert_eq!(rec["arguments_digest"], intake_digest(&h, token, json!({})));
+    // And the record has no `id_jag_ceiling` member (SR-126): it is as it was before.
+    assert!(rec.get("id_jag_ceiling").is_none(), "{rec}");
     // A request wider than the grant keeps its old code.
     let jag = jag_with(&h, json!({}));
     assert_error(
@@ -1457,6 +1459,145 @@ async fn id_jag_claims_are_ignored_without_a_ceiling() {
         StatusCode::BAD_REQUEST,
         "invalid_scope",
         "scope_exceeds_grant",
+    );
+}
+
+/// How many `root_token` records the audit log holds.
+async fn root_records(h: &Harness) -> usize {
+    let audit: Value = h
+        .client
+        .get(h.url("/admin/audit?kind=root_token&limit=1000"))
+        .bearer_auth(ADMIN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    audit["entries"].as_array().unwrap().len()
+}
+
+/// The SHA-256 (hex) of the RFC 8785 JSON of `value`, computed here rather than by the
+/// server's helper, so the record's `claims_digest` is checked independently.
+fn jcs_sha256(value: &Value) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(
+        attenuo_core::jcs::to_vec(value).unwrap(),
+    ))
+}
+
+/// SR-126: under `[idps.id_jag_ceiling]` the root token record names the claims that narrowed
+/// the grant in a readable `id_jag_ceiling` member, with the digest of their full values (not
+/// the log line's cut ones). Not on an ID token's record, and a refused intake writes no
+/// record. The arguments digest keeps its `id_jag_ceiling` member as before.
+#[tokio::test]
+async fn the_root_token_record_shows_the_id_jag_ceiling_sr126() {
+    let h = ceiling_harness(true).await;
+    // A `resource` value longer than the 512 bytes the log line keeps.
+    let long = format!("https://unmapped.example/{}", "x".repeat(600));
+    let claims = json!({
+        "resource": [GITHUB_RESOURCE, SLACK_RESOURCE, long],
+        "scope": "files.read",
+        "authorization_details": [{
+            "type": "attenuo_capabilities",
+            "capabilities": [{"server": "github", "tool": "read_file"}],
+        }],
+    });
+    let got = present(
+        &h,
+        &jag_with(&h, claims.clone()),
+        ("scope", "github:read_file"),
+    )
+    .await;
+    assert_eq!(got.0, StatusCode::OK, "{}", got.1);
+    let token = got.1["access_token"].as_str().unwrap();
+    let rec = root_record(&h, got.1["lease"].as_str().unwrap()).await;
+    assert_eq!(rec["kind"], "root_token");
+    assert_eq!(
+        rec["id_jag_ceiling"],
+        json!({
+            "claims": ["resource", "scope", "authorization_details"],
+            "claims_digest": jcs_sha256(&claims),
+        }),
+        "{rec}"
+    );
+    assert_eq!(
+        rec["arguments_digest"],
+        intake_digest(
+            &h,
+            token,
+            json!({"id_jag_ceiling": ["resource", "scope", "authorization_details"]})
+        )
+    );
+
+    // One claim: only it is named, and only its value is in the digest.
+    let one = json!({"scope": "files.read"});
+    let got = present(
+        &h,
+        &jag_with(&h, one.clone()),
+        ("scope", "github:read_file"),
+    )
+    .await;
+    assert_eq!(got.0, StatusCode::OK, "{}", got.1);
+    let rec = root_record(&h, got.1["lease"].as_str().unwrap()).await;
+    assert_eq!(
+        rec["id_jag_ceiling"],
+        json!({"claims": ["scope"], "claims_digest": jcs_sha256(&one)}),
+        "{rec}"
+    );
+
+    // None of the claims: the ceiling ran and kept the grant; the member says so with an empty
+    // list and the digest of `{}`. A `null` claim is absent, as the ceiling reads it.
+    let got = present(
+        &h,
+        &jag_with(&h, json!({"scope": null})),
+        ("scope", "slack:post_message"),
+    )
+    .await;
+    assert_eq!(got.0, StatusCode::OK, "{}", got.1);
+    let rec = root_record(&h, got.1["lease"].as_str().unwrap()).await;
+    assert_eq!(
+        rec["id_jag_ceiling"],
+        json!({"claims": [], "claims_digest": jcs_sha256(&json!({}))}),
+        "{rec}"
+    );
+
+    // An ID token under the same entry: no member.
+    let got = h
+        .intake(&h.idp.id_token("alice"), "slack:post_message")
+        .await;
+    assert_eq!(got.0, StatusCode::OK, "{}", got.1);
+    let rec = root_record(&h, got.1["lease"].as_str().unwrap()).await;
+    assert!(rec.get("id_jag_ceiling").is_none(), "{rec}");
+
+    // Refusals at the ceiling write no record.
+    let before = root_records(&h).await;
+    assert_error(
+        &present(
+            &h,
+            &jag_with(&h, json!({"scope": "files.read"})),
+            ("scope", "github:create_issue"),
+        )
+        .await,
+        StatusCode::BAD_REQUEST,
+        "invalid_scope",
+        "scope_exceeds_id_jag",
+    );
+    assert_error(
+        &present(
+            &h,
+            &jag_with(&h, json!({"scope": "nothing"})),
+            ("scope", "github:read_file"),
+        )
+        .await,
+        StatusCode::BAD_REQUEST,
+        "invalid_scope",
+        "id_jag_ceiling_empty",
+    );
+    assert_eq!(
+        root_records(&h).await,
+        before,
+        "a refused intake wrote a record"
     );
 }
 

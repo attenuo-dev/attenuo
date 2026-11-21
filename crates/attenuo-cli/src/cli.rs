@@ -1132,8 +1132,8 @@ pub(crate) enum AuditCmd {
         /// Write here instead of stdout.
         #[arg(long)]
         out: Option<std::path::PathBuf>,
-        /// Keep only records of this kind: decision, tool_result, exchange, root_token,
-        /// lease_renew, lease_revoke or admin. A refused exchange or renewal is a `decision`,
+        /// Keep only records of this kind: decision, tool_result, approval_request,
+        /// approval_grant, exchange, root_token, lease_renew, lease_revoke, admin or search. A refused exchange or renewal is a `decision`,
         /// not an `exchange` or `lease_renew`; `--tool token.exchange --decision deny` exports
         /// those. A filtered export has gaps in its hash chain, so `audit verify --file`
         /// refuses it; verify an unfiltered export, then filter.
@@ -1178,8 +1178,9 @@ impl From<DecisionArg> for attenuo_core::Decision {
 /// the server would check them, so a typo fails before any request.
 #[derive(Debug, Default, Args)]
 pub(crate) struct AuditFilter {
-    /// Record kind: decision, tool_result, exchange, root_token, lease_renew, lease_revoke or
-    /// admin. Repeatable, or comma-separated; any of them matches.
+    /// Record kind: decision, tool_result, approval_request, approval_grant, exchange,
+    /// root_token, lease_renew, lease_revoke, admin or search. Repeatable, or comma-separated;
+    /// any of them matches.
     #[arg(long, value_parser = parse_record_kind, value_delimiter = ',')]
     pub kind: Vec<attenuo_core::RecordKind>,
     /// `allow` or `deny`.
@@ -1422,7 +1423,8 @@ pub(crate) enum AuthzenCmd {
         args: Vec<(String, Value)>,
     },
     /// List the catalogued tools of an upstream that the token's chain may call with these
-    /// arguments (AuthZEN action search), without calling or auditing anything.
+    /// arguments (AuthZEN action search). Nothing is called or charged; the server writes one
+    /// `search` audit record.
     Search {
         /// The delegation token, sent as the bearer.
         #[command(flatten)]

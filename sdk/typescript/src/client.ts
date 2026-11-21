@@ -637,8 +637,8 @@ export class AttenuoClient {
   /**
    * One page of AuthZEN action search (`POST /access/v1/search/action`): the tools the
    * `[policy] catalog` lists for `server` that an evaluation with this token and `args` would
-   * allow now. Nothing is audited or charged, and no approval is taken, so an approval-gated
-   * tool is never a result.
+   * allow now. The server writes one `search` audit record. Nothing is charged and no
+   * approval is taken, so an approval-gated tool is never a result.
    *
    * `opts.limit` is how many catalogued tools the page evaluates (the server clamps it to
    * `[authzen] max_batch`); `opts.pageToken` is the `nextToken` of the previous page, sent with
