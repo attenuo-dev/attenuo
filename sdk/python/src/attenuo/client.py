@@ -538,8 +538,8 @@ class Client:
     ) -> w.AuthzenActionPage:
         """One page of AuthZEN action search (``POST /access/v1/search/action``): the tools the
         ``[policy] catalog`` lists for ``server`` that an evaluation with this token and
-        ``arguments`` would allow now. Nothing is audited or charged, and no approval is taken,
-        so an approval-gated tool is never a result.
+        ``arguments`` would allow now. The server writes one ``search`` audit record. Nothing
+        is charged and no approval is taken, so an approval-gated tool is never a result.
 
         ``limit`` is how many catalogued tools the page evaluates (the server clamps it to
         ``[authzen] max_batch``); ``page_token`` is the ``next_token`` of the previous page, sent

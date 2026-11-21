@@ -1423,7 +1423,8 @@ pub(crate) enum AuthzenCmd {
         args: Vec<(String, Value)>,
     },
     /// List the catalogued tools of an upstream that the token's chain may call with these
-    /// arguments (AuthZEN action search), without calling or auditing anything.
+    /// arguments (AuthZEN action search). Nothing is called or charged; the server writes one
+    /// `search` audit record.
     Search {
         /// The delegation token, sent as the bearer.
         #[command(flatten)]

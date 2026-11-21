@@ -222,7 +222,14 @@ fn strs(v: &Value) -> Vec<&str> {
 /// `attenuo/token.exchange`). The records that are not decisions but would read like one,
 /// `tool_result`, `approval_request`, `approval_grant` and `search`, print their kind in place
 /// of `ALLOW`/`DENY` and the details that matter for that kind.
+///
+/// Control characters are escaped: `server`, `tool` and the names in a record are the
+/// caller's, and a terminal would act on them (SR-59).
 pub(crate) fn fmt_audit_entry(e: &Value) -> String {
+    escape_controls(&audit_entry_line(e))
+}
+
+fn audit_entry_line(e: &Value) -> String {
     let r = &e["record"];
     let agents = strs(&r["agents"]);
     // Admin actions have no delegation chain, so no agents.
@@ -960,6 +967,20 @@ mod tests {
             fmt_audit_entry(&e),
             "#8    2026-10-24T10:00:00Z  search  github/authzen.search  planner > coder for alice  evaluated=4 permitted=3  id=rec1"
         );
+    }
+
+    #[test]
+    fn a_line_escapes_the_callers_control_characters() {
+        let mut e = entry(
+            9,
+            "search",
+            json!({"reason": "search_answered", "tool": "authzen.search",
+                   "search": {"evaluated": 0, "permitted": 0}}),
+        );
+        e["record"]["server"] = json!("x\u{1b}[2J\ny");
+        let line = fmt_audit_entry(&e);
+        assert!(!line.chars().any(char::is_control), "{line:?}");
+        assert!(line.contains("x\\u{1b}[2J\\ny/authzen.search"), "{line:?}");
     }
 
     #[test]
