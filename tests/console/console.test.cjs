@@ -130,6 +130,31 @@ test('audit explorer filters by decision through the hash', async () => {
   await bothThemes('audit-filtered');
 });
 
+test('audit explorer: a search record shows a dash, an approval record its pill', async () => {
+  // An AuthZEN action search decides nothing and writes one `search` record with `allow`.
+  const resp = await fetch(`${E.server}/access/v1/search/action`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${data.rootToken}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ subject: { type: 'agent', id: '' }, resource: { type: 'mcp_server', id: 'github' } }),
+  });
+  assert.equal(resp.status, 200, await resp.text());
+  const cell = (kind) => c.page.locator('#main table tbody tr', { has: c.page.locator('td:nth-child(3) .tag', { hasText: new RegExp(`^${kind}$`) }) })
+    .first().locator('td:nth-child(4)');
+
+  await c.go('#/audit?kind=search');
+  await cell('search').waitFor();
+  assert.equal(await cell('search').locator('.pill').count(), 0, 'a search record has no decision pill');
+  assert.equal((await cell('search').innerText()).trim(), '—');
+
+  // The request refused the call until approved, so it is a deny and stays a pill.
+  await c.go('#/audit?kind=approval_request');
+  await cell('approval_request').waitFor();
+  assert.equal(await cell('approval_request').locator('.pill').textContent(), 'deny');
+  await c.go('#/audit?kind=approval_grant');
+  await cell('approval_grant').waitFor();
+  assert.equal(await cell('approval_grant').locator('.pill').textContent(), 'allow');
+});
+
 test('decision view of the budget_exhausted denial: verdict and delegation chain', async () => {
   await c.go(`#/record/${data.budgetExhaustedDecision}`);
   const verdict = c.page.locator('.verdict');
