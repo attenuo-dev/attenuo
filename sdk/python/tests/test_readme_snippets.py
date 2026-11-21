@@ -1,7 +1,7 @@
-"""The Python snippets of the READMEs, checked as code.
+"""The Python snippets of the README and the walkthrough, checked as code.
 
-Every fenced ``python`` block of ``sdk/python/README.md`` and of the repository README's "Python
-SDK" section is
+Every fenced ``python`` block of ``sdk/python/README.md`` and of the "Python SDK" section of
+``docs/guides/walkthrough.md`` is
 
 - compiled (``compile()``), so a syntax error fails;
 - checked for its ``from attenuo... import`` names, so a renamed export fails;
@@ -37,7 +37,8 @@ import httpx
 import pytest
 
 REPO = Path(__file__).resolve().parents[3]
-PAGES = [REPO / "sdk" / "python" / "README.md", REPO / "README.md"]
+WALKTHROUGH = REPO / "docs" / "guides" / "walkthrough.md"
+PAGES = [REPO / "sdk" / "python" / "README.md", WALKTHROUGH]
 FENCE = re.compile(r"^```python\s*\n(.*?)^```\s*$", re.S | re.M)
 # The types the type check gives to free names; the rest are Any.
 KNOWN = {
@@ -104,8 +105,8 @@ def snippets() -> list[Snippet]:
     found = []
     for page in PAGES:
         text = page.read_text(encoding="utf-8")
-        if page.name == "README.md" and page.parent == REPO:
-            # Only the repository README's Python SDK section.
+        if page == WALKTHROUGH:
+            # Only the walkthrough's Python SDK section.
             start = text.index("\n## Python SDK\n")
             text_part = text[start : text.index("\n## ", start + 1)]
             offset = text[:start].count("\n")
@@ -185,7 +186,7 @@ RUNNABLE = [s for s in ALL if s.runnable()]
 
 def test_some_snippets_are_runnable() -> None:
     """The quick starts must stay self-contained, or nothing below runs them."""
-    assert any(s.page == REPO / "README.md" for s in RUNNABLE)
+    assert any(s.page == WALKTHROUGH for s in RUNNABLE)
     assert any(s.page.parent.name == "python" for s in RUNNABLE)
 
 
