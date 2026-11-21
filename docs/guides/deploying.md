@@ -210,7 +210,7 @@ This changes how you roll out a new version. Anything that starts the new instan
       type: Recreate
     template:
       spec:
-        terminationGracePeriodSeconds: 15
+        terminationGracePeriodSeconds: 35
   ```
 
 - **Docker Compose, systemd, a VM pair:** stop the old instance before starting the new one; a failover script must make sure the old host has let go of the volume.
@@ -343,7 +343,7 @@ services:
       - ./policy.cedar:/etc/attenuo/policy.cedar:ro
       - ./issuer.pem:/etc/attenuo/issuer.pem:ro
       - attenuo-data:/var/lib/attenuo
-    stop_grace_period: 15s         # the server drains for up to 10s after SIGTERM
+    stop_grace_period: 35s         # above the server's worst case at shutdown, see Signals
     restart: unless-stopped
     read_only: true
     cap_drop: [ALL]
@@ -372,7 +372,7 @@ Matching settings in `attenuo.toml`: `policies_path = "/etc/attenuo/policy.cedar
 
 Notes:
 
-- **Signals.** The server shuts down gracefully on SIGTERM (what `docker stop` and Kubernetes send) and on SIGINT. It stops accepting connections, gives in-flight requests up to 10 seconds to finish (on the admin API, admin console and metrics listeners too), stops its timers, closes the database and releases its lock, then exits; it logs `shutdown signal received; draining`, `shutdown complete` and `single-writer fence released`. Set `stop_grace_period` (or `terminationGracePeriodSeconds`) above 10 seconds. The 15 seconds in the examples fit the drain. With `[audit.sink]`, `[approvals.notify]` or `[leases.notify]` set, the server then gives what they still have queued 5 more seconds, shared by all three, and a request already in flight can run to its own `timeout_seconds`. With `[telemetry]` set, spans get up to 5 seconds after that. So the worst case is 10 + 5 + the longest `timeout_seconds` + 5 + 2 seconds, which is 32 seconds with the default timeouts. A grace shorter than that only cuts this tail: approval and revocation notices still queued stay in the outbox and are sent at the next start. No `stop_signal` override is needed. SQLite writes are transactional, so even a kill does not corrupt the log.
+- **Signals.** The server shuts down gracefully on SIGTERM (what `docker stop` and Kubernetes send) and on SIGINT. It stops accepting connections, gives in-flight requests up to 10 seconds to finish (on the admin API, admin console and metrics listeners too), stops its timers, closes the database and releases its lock, then exits; it logs `shutdown signal received; draining`, `shutdown complete` and `single-writer fence released`. With `[audit.sink]`, `[approvals.notify]` or `[leases.notify]` set, the server then gives what they still have queued 5 more seconds, shared by all three, and a request already in flight can run to its own `timeout_seconds`. With `[telemetry]` set, spans get up to 5 seconds after that. So the worst case is 10 + 5 + the longest `timeout_seconds` + 5 + 2 seconds, which is 32 seconds with the default timeouts. Set `stop_grace_period` (or `terminationGracePeriodSeconds`) above that; the examples and the Helm chart use 35 seconds. A grace above 10 seconds but shorter than the worst case only cuts this tail: approval and revocation notices still queued stay in the outbox and are sent at the next start. No `stop_signal` override is needed. SQLite writes are transactional, so even a kill does not corrupt the log.
 - **Read-only root.** The server only writes under the data directory and, when the key file is missing, to the key path. Keep the key file in the read-only mount, so a missing key is an error you see, not a new key you did not plan.
 - **Upstreams** must be reachable from the container. `127.0.0.1` in `[[upstreams]]` means the container itself. The proxy gives an upstream `[proxy] upstream_connect_timeout_seconds` (default 5) to accept a connection and `upstream_response_timeout_seconds` (default 120) to send response headers, or a JSON answer it must read; past that the agent gets `502 upstream_unreachable` or `504 upstream_timeout`. Raise the second for tools that answer in JSON after a long run. Streams (SSE) are not cut by it.
 
@@ -409,7 +409,7 @@ What the chart decides, and why:
 - **Probes.** Liveness and startup ask `/healthz`, readiness asks `/readyz` ([Health and readiness](#health-and-readiness)).
 - **A change to `config` restarts the pod.** The config is read at start, and the chart puts its checksum on the pod. With `existingConfigSecret`, and after changing the admin token's Secret, restart it yourself: `kubectl -n attenuo rollout restart deploy/attenuo`. The policy needs no restart: after changing it, wait for the ConfigMap to reach the pod (up to about a minute) and run `attenuo policy reload`.
 - **Files the config names must be mounted.** The root filesystem is read-only. For `[issuer] previous_key_paths` (key rotation), `[policy] catalog_path` and `schema_path`, and the `ca_pem_path` keys, use `extraVolumes` and `extraVolumeMounts`.
-- **Start and stop.** The startup probe waits up to 5 minutes (`startupProbe.failureThreshold`), because schema migrations run before the server answers; raise it for a very large audit log. The pod gets 30 seconds to shut down (`terminationGracePeriodSeconds`).
+- **Start and stop.** The startup probe waits up to 5 minutes (`startupProbe.failureThreshold`), because schema migrations run before the server answers; raise it for a very large audit log. The pod gets 35 seconds to shut down (`terminationGracePeriodSeconds`).
 
 `metrics.enabled=true` opens the metrics listener on port 9100 in the pod and adds a ClusterIP Service of its own (`attenuo-metrics`) for a scraper inside the cluster. It is never added to the main Service, which may be a LoadBalancer. Metrics have no authentication, so restrict the port with a NetworkPolicy.
 

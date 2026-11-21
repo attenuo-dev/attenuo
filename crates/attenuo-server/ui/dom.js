@@ -106,6 +106,18 @@ export function decisionPill(decision, big = false) {
   return pill(decision || '?', decision === 'allow' ? 'allow' : decision === 'deny' ? 'deny' : '', big);
 }
 
+// Records that always carry `allow` without deciding anything. Approval records
+// stay pills: a request is a deny, and a grant is an allow or a deny.
+const NOT_DECISIONS = new Set(['tool_result', 'search']);
+
+/** The decision cell of an audit row: a pill for a decision, a dash for a record that is none. */
+export function recordPill(record, big = false) {
+  if (NOT_DECISIONS.has(record.kind)) {
+    return h('span', { class: 'muted', title: `A ${record.kind} record is not a decision` }, '—');
+  }
+  return decisionPill(record.decision, big);
+}
+
 /** Lease state from a registry row or tree node: active, revoked or expired. */
 export function leaseState(row) {
   if (!row || row.known === false) return { label: 'unknown', kind: '' };

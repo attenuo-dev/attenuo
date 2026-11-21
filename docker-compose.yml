@@ -47,7 +47,7 @@ services:
     depends_on:
       fake-mcp:
         condition: service_started
-    stop_grace_period: 15s # the server drains for up to 10s after SIGTERM
+    stop_grace_period: 35s # above the server's worst case at shutdown (docs/guides/deploying.md, Signals)
     read_only: true
     cap_drop: [ALL]
     security_opt:

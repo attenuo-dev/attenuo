@@ -4,7 +4,7 @@
 'use strict';
 
 import {
-  h, append, replace, link, mono, short, time, decisionPill, leaseStatePill, table,
+  h, append, replace, link, mono, short, time, recordPill, leaseStatePill, table,
   empty, loading, kv, explainReason, jsonTree,
 } from './dom.js';
 import { api, qs } from './api.js';
@@ -48,7 +48,7 @@ function verdict(entry) {
       h('h1', { id: 'entry-title' }, `Entry `, mono(`#${entry.seq}`)),
       h('a', { href: '#/audit' }, 'Audit log')),
     h('div', { class: 'verdict' },
-      decisionPill(r.decision, true),
+      recordPill(r, true),
       h('span', { class: 'reason' }, r.reason),
       h('span', { class: 'explain' }, why || 'No description for this reason code.')),
     kv([
@@ -225,7 +225,7 @@ function timelinePanel(entry) {
       h('td', { class: 'num' }, e.seq === entry.seq ? mono(e.seq) : link(['entry', e.seq], mono(e.seq))),
       h('td', null, time(e.record.at)),
       h('td', null, h('span', { class: 'tag' }, e.record.kind)),
-      h('td', null, decisionPill(e.record.decision)),
+      h('td', null, recordPill(e.record)),
       h('td', null, e.record.agents.join(' > ') || '—'),
       h('td', { class: 'wrap' }, mono(`${e.record.server} / ${e.record.tool}`)),
       h('td', null, mono(e.record.reason))));

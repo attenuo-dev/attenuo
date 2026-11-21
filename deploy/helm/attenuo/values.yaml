@@ -129,9 +129,9 @@ extraVolumeMounts: []
 startupProbe:
   failureThreshold: 150
 
-# Above the server's worst case at shutdown: 10 s drain, then the checkpoint sink and
-# telemetry flush.
-terminationGracePeriodSeconds: 30
+# Above the server's worst case at shutdown with the default timeouts (32 s): 10 s drain,
+# then the checkpoint sink and the notifiers, then the telemetry flush.
+terminationGracePeriodSeconds: 35
 
 resources: {}
 podAnnotations: {}
