@@ -185,6 +185,42 @@ pub(crate) enum Command {
     /// Runs until SIGINT or SIGTERM (exit 0) or until the child exits (exit 1); the child is
     /// stopped with it.
     StdioBridge(StdioBridgeArgs),
+    /// Write a working starter configuration for one MCP server into a directory:
+    /// `attenuo.toml`, `policy.cedar` and `attenuo.env`. Asks the MCP server for its tools
+    /// and lists each in the catalog; the starter policy denies every call until a permit is
+    /// written (or, with `--trust-readonly-hints`, permits the tools the server marks
+    /// read-only). For trying attenuo on one machine: the configuration
+    /// listens on loopback with the development root mint on. Talks to no attenuo server.
+    Init(InitArgs),
+}
+
+/// `attenuo init`.
+#[derive(Debug, Args)]
+pub(crate) struct InitArgs {
+    /// The MCP server to protect, as `NAME=URL`: the name it gets in attenuo (the server
+    /// part of capabilities such as `github:read_file`) and its Streamable HTTP URL
+    /// (`github=http://127.0.0.1:3001/mcp`).
+    #[arg(long, value_name = "NAME=URL")]
+    pub upstream: String,
+    /// The directory the files are written into; created when it does not exist.
+    #[arg(long, value_name = "DIR", default_value = ".")]
+    pub dir: std::path::PathBuf,
+    /// The address the attenuo server will listen on. Must be loopback.
+    #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:8080")]
+    pub listen: std::net::SocketAddr,
+    /// Do not ask the MCP server for its tools. The catalog is left empty, so every call is
+    /// denied until the tools are listed by hand. For a server that needs credentials or is
+    /// not running.
+    #[arg(long)]
+    pub no_discover: bool,
+    /// Believe the MCP server's `readOnlyHint` annotations: a tool that carries one is marked
+    /// read-only, and the starter policy permits read-only tools. Without this flag the hint
+    /// is only reported and nothing is permitted, because it is the server's own claim.
+    #[arg(long, conflicts_with = "no_discover")]
+    pub trust_readonly_hints: bool,
+    /// Overwrite the three files when they exist. New secrets are generated.
+    #[arg(long)]
+    pub force: bool,
 }
 
 /// `attenuo stdio-bridge`.
