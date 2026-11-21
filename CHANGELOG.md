@@ -17,6 +17,7 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 
 ### Documentation
 
+- The README is shorter: 169 lines, down from 468. Its long second half (running the server by hand, the `curl` flow, the command line and the SDK snippets) moved, unchanged apart from its links, to a new guide, [Walkthrough](docs/guides/walkthrough.md), which CI still runs command by command (`scripts/check-doc-commands.sh docs/guides/walkthrough.md`, `just walkthrough`). The README keeps the pitch, the demo, install, how it works, numbers, status and a short list of where to look.
 - The STDIO servers guide has a walkthrough against a real server, `@modelcontextprotocol/server-filesystem` 2.4.0, with the config, policy and the output of one allowed and three denied calls. The `stdio-bridge` example command is no longer marked untested.
 
 ## [0.1.0] - 2026-11-19

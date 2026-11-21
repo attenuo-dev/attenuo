@@ -31,9 +31,9 @@ demo:
 guide:
     bash scripts/check-getting-started.sh
 
-# run the README's server, curl and CLI commands as written and check their outputs
-readme:
-    bash scripts/check-doc-commands.sh README.md
+# run the walkthrough's server, curl and CLI commands as written and check their outputs
+walkthrough:
+    bash scripts/check-doc-commands.sh docs/guides/walkthrough.md
 
 # compile and type-check the SDK READMEs' Python and TypeScript snippets
 snippets:
@@ -71,7 +71,7 @@ deny:
     cargo deny check
 
 # everything CI runs that can run locally
-ci: fmt clippy test demo guide readme snippets policy docs links hygiene deny fuzz-check lean
+ci: fmt clippy test demo guide walkthrough snippets policy docs links hygiene deny fuzz-check lean
 
 # print a random admin token
 admin-token:

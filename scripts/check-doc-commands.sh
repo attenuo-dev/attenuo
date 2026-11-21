@@ -5,7 +5,7 @@
 #   scripts/check-doc-commands.sh PAGE.md
 #
 # The pages under this check: docs/guides/getting-started.md (through
-# scripts/check-getting-started.sh) and README.md. The commands are read from the page itself,
+# scripts/check-getting-started.sh) and docs/guides/walkthrough.md. The commands are read from the page itself,
 # not copied here, so a change to the page is checked on the next run and a command cannot be
 # edited without the check running the new text. The rules:
 #

@@ -12,7 +12,7 @@ SDK" section is
   keyword argument or a renamed attribute of a result fails;
 - run, when ``ATTENUO_INTEGRATION=1``, if it is self-contained: no free names and no local file
   it would need. It runs against a real ``attenuo-server`` started from ``config/example.toml``
-  with ``[dev] allow_root_mint = true``, as the README's "Run the server yourself" starts it,
+  with ``[dev] allow_root_mint = true``, as the walkthrough's "Run the server" starts it,
   and the fake MCP upstream (binaries as in ``test_integration.py``). Its
   ``http://127.0.0.1:8080`` is replaced by the server's address.
 """

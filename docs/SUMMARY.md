@@ -6,6 +6,7 @@
 
 - [Guides](guides/README.md)
   - [Getting started](guides/getting-started.md)
+  - [Walkthrough: HTTP, CLI, SDKs](guides/walkthrough.md)
   - [Integrating MCP clients](guides/integrating-mcp-clients.md)
   - [STDIO MCP servers](guides/stdio-servers.md)
   - [Binding tokens to keys](guides/binding-tokens-to-keys.md)
