@@ -21,6 +21,7 @@ mod out;
 mod cli;
 mod client;
 mod client_key;
+mod connect;
 mod dpop_key;
 mod health;
 mod init_cmd;
@@ -29,6 +30,7 @@ mod operator_cmd;
 mod policy_cmd;
 mod render;
 mod secrets;
+mod sse;
 mod stdio_bridge;
 mod watch;
 
@@ -132,6 +134,10 @@ fn print_json(v: &Value) -> Result<()> {
 
 async fn run(cli: Cli) -> Result<Outcome> {
     let json = cli.json;
+    if matches!(cli.command, Command::Connect(_)) && cli.admin_token_stdin {
+        // Standard input carries the MCP messages.
+        anyhow::bail!("connect reads MCP messages from standard input: --admin-token-stdin cannot be used with it");
+    }
     // `token inspect` without --verify is purely local; do not insist on a sane --server.
     let mut stdin = secrets::Stdin::default();
     let admin_token = secrets::resolve(
@@ -151,6 +157,7 @@ async fn run(cli: Cli) -> Result<Outcome> {
         // Talks to no attenuo server.
         Command::StdioBridge(a) => stdio_bridge::run(a).await.map(|()| Outcome::Ok),
         Command::Init(a) => init_cmd::run(a).await.map(|()| Outcome::Ok),
+        Command::Connect(a) => connect::run(&cli.server, a).await.map(|()| Outcome::Ok),
         Command::Admin(AdminCmd::Operator(OperatorCmd::New {
             name,
             role,

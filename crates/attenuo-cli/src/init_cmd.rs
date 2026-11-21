@@ -35,6 +35,7 @@ use serde_json::{json, Value};
 use crate::cli::InitArgs;
 use crate::client::{http_client, parse_rpc_body};
 use crate::operator_cmd::{generate_token, token_sha256_hex};
+use crate::sse::{event_end, parse_event};
 
 /// Most tools read from one server, and most `tools/list` pages followed.
 const MAX_TOOLS: usize = 2000;
@@ -161,43 +162,16 @@ pub(crate) fn sort_tools(entries: &[Value], trust_readonly: bool) -> Discovered 
     d
 }
 
-/// The first blank line (the end of an SSE event) in `buf` at or after `from`: where the
-/// event's text ends, and where the next event starts. A blank line is `\n\n`, or `\n\r\n`
-/// when lines end in CRLF.
-fn event_end(buf: &[u8], from: usize) -> Option<(usize, usize)> {
-    let mut i = from;
-    while let Some(off) = buf.get(i..)?.iter().position(|b| *b == b'\n') {
-        let nl = i + off;
-        match buf.get(nl + 1..) {
-            Some([b'\n', ..]) => return Some((nl, nl + 2)),
-            Some([b'\r', b'\n', ..]) => return Some((nl, nl + 3)),
-            _ => i = nl + 1,
-        }
-    }
-    None
-}
-
 /// The JSON-RPC response carried by one SSE event: its `data:` lines joined with a line
 /// feed, as the SSE format says, and parsed as one JSON text. `None` for an event that is
 /// something else (a comment, a notification, a request of the server's own).
 fn sse_event_reply(event: &str) -> Option<Value> {
-    let mut data = String::new();
-    let mut any = false;
-    for line in event.lines() {
-        if let Some(d) = line.strip_prefix("data:") {
-            if any {
-                data.push('\n');
-            }
-            any = true;
-            data.push_str(d.strip_prefix(' ').unwrap_or(d));
-        }
-    }
-    let v: Value = serde_json::from_str(&data).ok()?;
+    let v: Value = serde_json::from_str(&parse_event(event).data?).ok()?;
     (v.get("result").is_some() || v.get("error").is_some()).then_some(v)
 }
 
 /// A value the MCP server gave that goes back to it in a header: visible ASCII, bounded.
-fn header_safe(s: &str) -> bool {
+pub(crate) fn header_safe(s: &str) -> bool {
     !s.is_empty() && s.len() <= 256 && s.bytes().all(|b| (0x21..=0x7e).contains(&b))
 }
 
@@ -987,18 +961,6 @@ mod tests {
             .collect();
         let entries = vec![json!({"name": "t", "inputSchema": {"properties": props}})];
         assert_eq!(sort_tools(&entries, true).tools[0].inputs.len(), MAX_INPUTS);
-    }
-
-    #[test]
-    fn sse_events_end_at_a_blank_line() {
-        assert_eq!(event_end(b"data: 1\n\ndata: 2\n\n", 0), Some((7, 9)));
-        assert_eq!(event_end(b"data: 1\n\ndata: 2\n\n", 9), Some((16, 18)));
-        assert_eq!(event_end(b"data: 1\r\n\r\nrest", 0), Some((8, 11)));
-        assert_eq!(event_end(b"event: m\ndata: 1\n\n", 0), Some((16, 18)));
-        assert_eq!(event_end(b"data: 1\n", 0), None);
-        assert_eq!(event_end(b"data: 1\ndata", 0), None);
-        assert_eq!(event_end(b"", 0), None);
-        assert_eq!(event_end(b"abc", 7), None);
     }
 
     #[test]

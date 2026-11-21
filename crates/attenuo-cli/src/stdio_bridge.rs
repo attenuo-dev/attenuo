@@ -736,7 +736,7 @@ pub(crate) fn check_listen(addr: SocketAddr, allow_non_loopback: bool) -> Result
 }
 
 /// Resolve on SIGINT or SIGTERM.
-async fn stop_signal() {
+pub(crate) async fn stop_signal() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};

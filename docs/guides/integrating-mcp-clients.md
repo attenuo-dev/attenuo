@@ -29,11 +29,79 @@ Things that are different from a plain MCP server:
 - **Tokens can be bound to keys.** A token with `cnf.jkt` needs a DPoP proof on every request, and the 401 then says `WWW-Authenticate: DPoP`. See [Binding tokens to keys](binding-tokens-to-keys.md).
 - **The bearer is not forwarded.** The upstream never sees the attenuo token. If the upstream needs its own credential, attenuo has no setting for injecting one in v0. Today that means the upstream must trust the proxy by network placement, or hold its own static credential.
 - **No OAuth discovery.** attenuo does not serve Protected Resource Metadata (RFC 9728) or an authorization server. A 401 carries `WWW-Authenticate: Bearer realm="attenuo"` and nothing else. An MCP client that tries to discover an authorization server will not find one. Configure the bearer yourself, as a static header or through a token provider you write.
-- **Whether your MCP client lets you set a header** (and refresh it) depends on the client. Most Streamable HTTP clients take custom headers. Which ones support changing the header between requests is untested here. If yours cannot, run a small local forwarder that adds a fresh bearer. The SDKs have the per-request hook: `TokenAuth(provider)` in Python and `mcpFetch(provider)` in TypeScript, and a token refresher is such a provider.
+- **Whether your MCP client lets you set a header** (and refresh it) depends on the client. Most Streamable HTTP clients take custom headers. Which ones support changing the header between requests is untested here. If yours cannot, or it starts MCP servers as local commands, give it [`attenuo connect`](#desktop-clients-claude-desktop-claude-code-cursor), which adds a fresh bearer to every request. The SDKs have the per-request hook: `TokenAuth(provider)` in Python and `mcpFetch(provider)` in TypeScript, and a token refresher is such a provider.
 - **`tools/list` is filtered.** You see only the tools the token may call. A tool missing from the list is not necessarily missing upstream.
 - **Resources and prompts are authorized like tool calls.** `resources/read`, `resources/subscribe`, `prompts/get` and `completion/complete` need a capability with the method name as the tool, for example `github:resources/read`. Any other method outside a short allowlist is denied unless a capability and the policy permit it. `tools/list`, `resources/list`, `resources/templates/list` and `prompts/list` show only entries your capabilities could permit (the cursor is passed through, so a page can be empty while `nextCursor` is set). See [design/server.md](../design/server.md#mcp-method-coverage).
 
 Every response to a request that was decided carries the header `X-Attenuo-Decision-Id`, a comma-separated list in request order when the body is a batch.
+
+## Desktop clients: Claude Desktop, Claude Code, Cursor
+
+A desktop MCP client is configured with a server in one of two ways: a command it starts and talks to over STDIO, or a URL with headers that do not change. A fixed header does not work with attenuo. The token expires after 15 minutes by default, and its lease after 5 minutes unless it is renewed.
+
+So give the client a command: [`attenuo connect`](../reference/cli.md#connect---upstream-name). The client starts it and speaks MCP to it over STDIO. The connector sends each message to `<server>/mcp/<upstream>` with a fresh token, and writes the answers back. It gets a new token from a command you give it before the old one runs out, and at once when the proxy refuses one. It renews the lease in the background. It writes only MCP messages on stdout and logs to stderr. It decides nothing: denials come from the proxy as JSON-RPC errors and are passed on unchanged.
+
+```sh
+attenuo --server http://127.0.0.1:8080 connect --upstream github --token-command 'CMD ARGS...'
+```
+
+The token command is one string, split into words like a shell would, but no shell runs it. Its first line of output is the token. Instead of a command you can pass `--token-file PATH`, a file that something else keeps fresh, or set `ATTENUO_TOKEN`, which is used as it is and stops working when it expires. If no token can be had at start, the connector exits 1 with a message on stderr before it reads anything.
+
+### A worked example on one machine
+
+This example uses the starter setup from [`attenuo init`](../reference/cli.md#init---upstream-nameurl), with an MCP server at `http://127.0.0.1:3001/mcp`:
+
+```sh
+attenuo init --upstream github=http://127.0.0.1:3001/mcp --dir ~/attenuo-try --trust-readonly-hints
+cd ~/attenuo-try
+attenuo-server --config attenuo.toml     # keep it running
+. ./attenuo.env                          # ATTENUO_ADMIN_TOKEN, among others
+```
+
+The example is for trying attenuo on one machine. Its token command mints a root token with the admin token and the development root mint (`[dev] allow_root_mint = true`), so the client's configuration holds the admin token, and anyone who can read that file can mint any token. A real deployment's token command must get the user's credential from the identity provider and exchange it at `POST /token` instead (see [Identity providers](identity-providers.md) and [Getting the first token](#getting-the-first-token)), and the admin token must not be in a client's configuration.
+
+The token command of the example:
+
+```text
+/ABSOLUTE/PATH/TO/attenuo --server http://127.0.0.1:8080 token root --subject alice --agent planner --cap github:* --print token
+```
+
+Write the full path of `attenuo`, in `command` and in the token command: an app started from the desktop may not have your shell's `PATH`. The token command gets the connector's environment, so `ATTENUO_ADMIN_TOKEN` goes in the client's `env` for the server entry. `github:*` needs no quoting, because no shell reads the string. What the client may call is what the policy permits: with `--trust-readonly-hints`, the tools the MCP server marks read-only, and nothing else.
+
+**Claude Desktop.** Add the server to `mcpServers` in `claude_desktop_config.json` (on macOS, `~/Library/Application Support/Claude/claude_desktop_config.json`; on Windows, `%APPDATA%\Claude\claude_desktop_config.json`; otherwise see the client's documentation):
+
+```json
+{
+  "mcpServers": {
+    "github-via-attenuo": {
+      "command": "/ABSOLUTE/PATH/TO/attenuo",
+      "args": [
+        "--server", "http://127.0.0.1:8080",
+        "connect", "--upstream", "github",
+        "--token-command",
+        "/ABSOLUTE/PATH/TO/attenuo --server http://127.0.0.1:8080 token root --subject alice --agent planner --cap github:* --print token"
+      ],
+      "env": {
+        "ATTENUO_ADMIN_TOKEN": "<the value from attenuo.env>"
+      }
+    }
+  }
+}
+```
+
+**Claude Code.** In a shell where `attenuo.env` is loaded:
+
+```sh
+claude mcp add github-via-attenuo --env ATTENUO_ADMIN_TOKEN="$ATTENUO_ADMIN_TOKEN" -- \
+  /ABSOLUTE/PATH/TO/attenuo --server http://127.0.0.1:8080 connect --upstream github \
+  --token-command '/ABSOLUTE/PATH/TO/attenuo --server http://127.0.0.1:8080 token root --subject alice --agent planner --cap github:* --print token'
+```
+
+The same entry in a project's `.mcp.json` has the shape of the Claude Desktop entry above: `mcpServers`, then the server's name with `command`, `args` and `env`. A `.mcp.json` is usually committed with the project; do not commit one that holds the admin token.
+
+**Cursor.** The same `mcpServers` entry as for Claude Desktop goes in `.cursor/mcp.json` in the project (for the other places Cursor reads, see the client's documentation).
+
+What was run: the connector is tested against a real attenuo server and a fake MCP server in `crates/attenuo-cli/tests/connect.rs`, driven as a client drives it. For Claude Desktop and Cursor, the configuration follows each client's documented format and was not run in that app. For Claude Code, the configuration follows its documented format; a run with Claude Code's CLI is still to be recorded here.
 
 ## Getting the first token
 

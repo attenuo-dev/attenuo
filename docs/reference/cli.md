@@ -1,6 +1,6 @@
 # CLI commands
 
-The `attenuo` binary comes from the `attenuo-cli` crate. It talks to a running attenuo server over HTTP, except for `key gen` (`--dpop` and `--client`), `admin operator new` and `admin operator hash`, `policy lint`, `policy test` with `--via local` (the default), `token inspect` without `--verify`, `audit verify --file` with `--jwks`, and `approval verify` with a `--jwks` file, which run offline, `stdio-bridge`, which serves a local STDIO MCP server over HTTP and talks to no attenuo server, and `init`, which writes a starter configuration and talks only to the MCP server it is for.
+The `attenuo` binary comes from the `attenuo-cli` crate. It talks to a running attenuo server over HTTP, except for `key gen` (`--dpop` and `--client`), `admin operator new` and `admin operator hash`, `policy lint`, `policy test` with `--via local` (the default), `token inspect` without `--verify`, `audit verify --file` with `--jwks`, and `approval verify` with a `--jwks` file, which run offline, `stdio-bridge`, which serves a local STDIO MCP server over HTTP and talks to no attenuo server, and `init`, which writes a starter configuration and talks only to the MCP server it is for. `connect` talks to the attenuo server, but over STDIO on its own side: it is started by a desktop MCP client, not typed.
 
 ```
 attenuo [--server URL] [--json] <command>
@@ -633,3 +633,50 @@ The child's arguments and environment are never printed; error messages name onl
 ```sh
 attenuo stdio-bridge --listen 127.0.0.1:3001 -- npx -y @modelcontextprotocol/server-filesystem /srv/docs
 ```
+
+### `connect --upstream NAME`
+
+A STDIO front for desktop MCP clients (Claude Desktop, Claude Code, Cursor), which start a local MCP server as a command and talk to it over STDIO. The client starts `attenuo connect` in place of the MCP server. It reads MCP messages from stdin, one JSON-RPC message per line, sends each one to the proxy at `<--server>/mcp/<NAME>` as a Streamable HTTP `POST` with a fresh delegation token as the bearer, and writes what comes back to stdout, one message per line. It decides nothing and adds no authority: it sends the token it was given, and only to `--server`. The guide, with the configuration for each client, is [Desktop clients](../guides/integrating-mcp-clients.md#desktop-clients-claude-desktop-claude-code-cursor).
+
+```sh
+attenuo --server http://127.0.0.1:8080 connect --upstream github --token-command '/usr/local/bin/get-attenuo-token alice'
+```
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--upstream NAME` | | The upstream name, as mounted at `/mcp/NAME`. Required. |
+| `--token-command CMD` | | A program and its arguments, as one string, that prints a delegation token on the first line of its stdout. See below. |
+| `--token-file PATH` | | Read the token from the first line of this file, and read it again whenever a new token is needed. Something else keeps the file fresh. |
+| `--token-command-timeout SECS` | `60` | How long the token command may run (1 to 600). Past it, it is killed and counts as failed. Only with `--token-command`. |
+| `--timeout SECS` | `300` | How long one request may take, its answer included, also a streamed one (1 to 86400). Past it the client gets a JSON-RPC error with the request's id. |
+| `--max-message-bytes BYTES` | `16777216` (16 MiB) | Largest single message: a line from stdin, a JSON answer, or one event of a streamed answer. |
+| `--max-stream-bytes BYTES` | `67108864` (64 MiB) | Most bytes read from the streamed (SSE) answer to one request, all its events together. |
+| `--max-in-flight N` | `64` | Most requests waiting for an answer at once (1 to 4096). A request over the limit gets a JSON-RPC error at once and is not sent. |
+
+**The token.** It comes from exactly one place: `--token-command`, `--token-file`, or, with neither, the `ATTENUO_TOKEN` environment variable. `--token-command` and `--token-file` cannot be given together.
+
+- `--token-command` is split into words the way a shell splits a command line: spaces separate words, `'...'` keeps its text as it is, `"..."` keeps its text except that `\"`, `\\`, `\$` and a backslash before a backtick stand for the character, and a backslash outside quotes keeps the next character. No shell runs it, so there are no variables, globs, pipes or redirections. For those, give a script, or `sh -c '...'`. The command runs at start and again whenever a new token is needed. It gets this process's environment, an empty stdin (stdin carries MCP), and its stderr goes to this process's stderr. Exit status other than 0, a timeout, or an empty first line is a failure.
+- `ATTENUO_TOKEN` is used as it is and never replaced. When it expires, the connector says so once on stderr and answers every request with a JSON-RPC error without sending it. A token that has already expired at start is refused (exit 1).
+- A token must be visible ASCII and at most 16 KiB. A token bound to a DPoP key (`cnf.jkt`) gets a warning: the connector sends no DPoP proofs, so the proxy refuses it.
+
+**Keeping the token fresh.** The connector reads the token's `exp` without checking the signature. It gets a new token when two thirds of the token's lifetime have passed, and at once when the proxy answers 401. The request that got the 401 is then sent once more with the new token, and only once; a second 401 is passed to the client. A token whose `exp` cannot be read (not an attenuo token) is replaced only on a 401. Failed tries are repeated after 1, 2, 4, ... seconds, at most 30.
+
+**Renewing the lease.** In the background, `POST /token/renew` with the current token: once when a token is new, then at a third of the `expires_in` the answer gives, at most once a second. A renewal refused with `code` `lease_revoked` is final: the connector says so once on stderr, stops renewing, and fetches no new token from then on, not even on a 401. Calls then fail as the proxy answers them. Restart the connector to start again. `lease_expired` or `lease_unknown` gets a new token (with a new lease) from `--token-command` or `--token-file`. Any other failure is tried again after 1, 2, 4, ... seconds, at most 30.
+
+What happens to each line from stdin:
+
+- A request is sent with `Accept: application/json, text/event-stream`, `Content-Type: application/json`, the bearer, and, after `initialize`, the `Mcp-Session-Id` the proxy returned and the negotiated `Mcp-Protocol-Version`. Requests may be in flight together. `initialize` and notifications are sent in the order they are read, and the next line is read when they are done.
+- A JSON answer is written as one line. An SSE answer is written one message per line, in order, the upstream's notifications and requests in it too, up to the answer to the request. `202` with no body writes nothing for a notification.
+- The proxy's own JSON-RPC errors (a denial, `-32003`, or `-32001` on a bad token) are passed on as they came. When one has `"id": null`, because the proxy refused the request before it read it, the request's id is put in, so that the client can match it.
+- A request that cannot be answered gets a JSON-RPC error `-32603` with its id, a message that starts with `attenuo connect:`, and `error.data.reason`: `unreachable`, `timeout` or `transport` (the network), `http_status` (an HTTP error without a JSON-RPC body), `redirect`, `not_jsonrpc`, `no_answer` (`202` for a request), `too_large`, `no_token`, `too_many_in_flight`, or `session_ended`. A notification or response that cannot be delivered is only logged.
+- A line that is not JSON gets `-32700` with `"id": null`. A JSON array (a batch) gets `-32600` with `"id": null`: MCP 2025-06-18 removed batching. A line over `--max-message-bytes` gets `-32600` with `"id": null`. An empty line is skipped.
+- A `404` to a request that carried the session id means the proxy no longer knows the session (it ended, or the proxy restarted). The client gets the proxy's error, and stderr says so once. The connector does not open a new session by itself; the client's next `initialize` does.
+- No redirect is followed. A `3xx` answer is a JSON-RPC error, and nothing is sent to its `Location`.
+
+**The listen stream.** After `notifications/initialized` is accepted, the connector opens `GET` on the endpoint for messages from the server. A `405` (the upstream has none) ends it quietly. The requests and notifications it carries are written to stdout; responses on it (the proxy's end-of-stream error) are not, since they answer nothing the client sent. When it ends it is opened again after 1, 2, 4, ... seconds (at most 30), with `Last-Event-ID` when the stream gave event ids.
+
+**The end.** At end of stdin, or on SIGINT or SIGTERM, the connector stops reading, gives the requests in flight 5 seconds to finish, sends `DELETE` with the session id, and exits 0. Exit status 1 when no token can be had at start (the token command fails, the file is missing or empty, `ATTENUO_TOKEN` is unset or expired), or `--server` or `--upstream` is not valid. That happens before stdin is read and nothing is written to stdout. `--server` must be an `http://` or `https://` URL without a user name, password, query or fragment. `--admin-token-stdin` cannot be used with `connect`, since stdin carries MCP.
+
+**What is logged.** stdout carries MCP messages only. On stderr: where it forwards to, each new token's source and how long it lives, failures of renewals and of token fetches, requests that got no answer (by method), a lost session, a revoked lease, and how many requests were dropped at the end. The token, the token command's arguments and the content of messages are never logged; the token command is named by its program only. Strings from the server's error bodies are logged with control characters escaped.
+
+Tested in `crates/attenuo-cli/tests/connect.rs`, which runs the binary in front of a real attenuo server (configured by `attenuo init`) and a fake MCP server, and in front of a canned HTTP server for answers the proxy rarely gives. The tests cover the handshake, allowed and denied calls, concurrent requests, JSON and SSE answers, the listen stream's first opening and a `405`, a refused token replaced from `--token-command` and from `--token-file`, a token command that fails at start, renewal with a 2-second lease, a revoked lease, a lost session (a `404` with the proxy's error), the `http_status`, `redirect`, `no_answer`, `too_large` and `too_many_in_flight` errors, and the end at end of stdin and on SIGTERM. Not run by the tests: SIGINT, the `unreachable`, `timeout`, `transport`, `not_jsonrpc` and `session_ended` errors, and opening the listen stream again after it ends. The token schedule and the sorting of renewal answers are unit tests in `src/connect.rs`.
