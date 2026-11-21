@@ -70,7 +70,7 @@ function snippets(): Snippet[] {
     if (page === WALKTHROUGH) {
       // Only the walkthrough's TypeScript SDK section.
       const start = text.indexOf("\n## TypeScript SDK\n");
-      if (start < 0) throw new Error("the walkthrough has no \"TypeScript SDK\" section");
+      if (start < 0) throw new Error('the walkthrough has no "TypeScript SDK" section');
       const next = text.indexOf("\n## ", start + 1);
       const end = next < 0 ? text.length : next;
       offset = text.slice(0, start).split("\n").length - 1;
