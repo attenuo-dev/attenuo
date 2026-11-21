@@ -129,11 +129,16 @@ fn collect(mut r: impl Read + Send + 'static) -> Arc<Mutex<String>> {
 
 /// Start `attenuo stdio-bridge --listen 127.0.0.1:0 <flags> -- stdio_mcp`.
 fn bridge(flags: &[&str]) -> Bridge {
+    bridge_running(flags, &[stdio_mcp().as_os_str()])
+}
+
+/// A bridge in front of `command` (the program and its arguments).
+fn bridge_running(flags: &[&str], command: &[&std::ffi::OsStr]) -> Bridge {
     let mut child = attenuo()
         .args(["stdio-bridge", "--listen", "127.0.0.1:0"])
         .args(flags)
         .arg("--")
-        .arg(stdio_mcp())
+        .args(command)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -431,6 +436,60 @@ async fn sigterm_stops_the_bridge_and_its_child() {
     assert_eq!(b.wait_exit().code(), Some(0), "{}", b.stderr());
     // The bridge waited for the child before exiting: it is gone, not orphaned.
     assert!(!alive(&pid), "child {pid} outlived the bridge");
+}
+
+/// SR-135: a launcher (`npx`, `uvx`, a shell script) is the bridge's child and the real server
+/// is the launcher's child. Stopping the bridge stops that process too: one left behind
+/// when the launcher exits on end of input, and one that ignores SIGTERM.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn stopping_the_bridge_stops_what_the_child_started_sr135() {
+    use std::ffi::OsStr;
+    // Running, by `ps`: a process that was killed and not yet reaped by its new parent
+    // (a zombie, state Z) still answers `kill -0`, and it is not running.
+    let alive = |pid: &str| {
+        let out = Command::new("ps")
+            .args(["-o", "stat=", "-p", pid])
+            .output()
+            .unwrap();
+        let state = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        !state.is_empty() && !state.starts_with('Z')
+    };
+    // Each script starts a `sleep` in the background, prints its pid on stderr, and then:
+    // exits when its input ends; or ignores SIGTERM (the `sleep` inherits that) and stays.
+    for script in [
+        "sleep 4242 & echo \"grandchild $!\" >&2; cat >/dev/null",
+        "trap '' TERM; sleep 4243 & echo \"grandchild $!\" >&2; wait",
+    ] {
+        let mut b = bridge_running(
+            &[],
+            &[OsStr::new("sh"), OsStr::new("-c"), OsStr::new(script)],
+        );
+        let end = Instant::now() + Duration::from_secs(10);
+        let pid = loop {
+            let err = b.stderr();
+            if let Some(pid) = err
+                .lines()
+                .find_map(|l| l.strip_prefix("grandchild "))
+                .map(str::to_string)
+            {
+                break pid;
+            }
+            assert!(Instant::now() < end, "no pid from the script: {err}");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(alive(&pid), "{script}");
+        let status = Command::new("kill")
+            .args(["-TERM", &b.child.id().to_string()])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(b.wait_exit().code(), Some(0), "{}", b.stderr());
+        assert!(
+            !alive(&pid),
+            "the grandchild {pid} outlived the bridge: {script}"
+        );
+    }
 }
 
 /// SR-134: the child gets no `ATTENUO_*` variable of the bridge's environment, the server's
