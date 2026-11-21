@@ -10,6 +10,7 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 
 ### Added
 
+- `scripts/install.sh`, a one-line install of the release binaries: `curl -fsSL https://raw.githubusercontent.com/attenuo-dev/attenuo/main/scripts/install.sh | sh`. It picks the archive for the machine (Linux x86_64 and aarch64, macOS Intel and Apple silicon), checks its SHA-256 against the release's `SHA256SUMS`, and copies `attenuo` and `attenuo-server` into `~/.local/bin` (or `ATTENUO_INSTALL_DIR`) without `sudo`; `ATTENUO_VERSION` pins a release. Nothing is installed when the checksum, the `SHA256SUMS` entry or the archive's contents are wrong. `scripts/test-install.sh` runs it against a fake release for every target and every refusal, and the CI job `install-script` also installs the published 0.1.0 on Linux and macOS runners and runs both binaries. The checksum comes from the same release as the archive, so it guards the download, not the release.
 - The GitHub leak demo runs without a Rust toolchain: `examples/github-leak-demo/run-docker.sh` pulls the published image `ghcr.io/attenuo-dev/attenuo:0.1.0` and plays the scenario against a fake GitHub MCP server written in Python (`fake_github_mcp.py`, `compose.image.yml`). The README shows it next to the source run, and the CI job `docker-quickstart` runs it against the published image.
 
 ### Documentation

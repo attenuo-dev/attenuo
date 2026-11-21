@@ -59,6 +59,7 @@ jobs:
       quickstart: ${{ github.event_name != 'pull_request' || steps.filter.outputs.quickstart == 'true' }}
       guide: ${{ github.event_name != 'pull_request' || steps.filter.outputs.guide == 'true' }}
       lean: ${{ github.event_name != 'pull_request' || steps.filter.outputs.lean == 'true' }}
+      install: ${{ github.event_name != 'pull_request' || steps.filter.outputs.install == 'true' }}
     steps:
       - id: filter
         if: github.event_name == 'pull_request'
@@ -94,6 +95,9 @@ jobs:
             # differential check runs against it.
             lean:
               - "{proofs/lean/**,scripts/check-lean.sh,scripts/check-lean-differential.sh,crates/attenuo-core/**,Cargo.lock,.github/workflows/ci.yml}"
+            # The install script and its test.
+            install:
+              - "{scripts/install.sh,scripts/test-install.sh,.github/workflows/ci.yml}"
 
   fmt:
     name: rustfmt
@@ -308,6 +312,28 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: bash examples/github-leak-demo/run-docker.sh
 
+  # scripts/install.sh: its test against a fake release (every target, every refusal), then
+  # a real install of the published release 0.1.0 on this runner, and the binaries run.
+  install-script:
+    name: install script (${{ matrix.os }})
+    needs: changes
+    if: needs.changes.outputs.install == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: bash scripts/test-install.sh
+      - name: Install the published release and run it
+        run: |
+          set -euo pipefail
+          ATTENUO_VERSION=v0.1.0 ATTENUO_INSTALL_DIR="$RUNNER_TEMP/bin" sh scripts/install.sh
+          "$RUNNER_TEMP/bin/attenuo" --version
+          "$RUNNER_TEMP/bin/attenuo-server" --version
+
   # The admin console in headless Chromium: every page in both themes, with zero console
   # errors and CSP violations allowed (scripts/console-smoke.sh, tests/console/).
   console-browser:
@@ -486,7 +512,7 @@ jobs:
   ci-ok:
     name: ci-ok
     if: always()
-    needs: [changes, fmt, clippy, test, msrv, deny, audit, demo, getting-started, compose, docker-quickstart, console-browser, policy-tests, fuzz-check, fuzz-build, lean, docs]
+    needs: [changes, fmt, clippy, test, msrv, deny, audit, demo, getting-started, compose, docker-quickstart, install-script, console-browser, policy-tests, fuzz-check, fuzz-build, lean, docs]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
