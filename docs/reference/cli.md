@@ -71,7 +71,7 @@ It asks the MCP server for its tools (`initialize`, then every page of `tools/li
 | File | Mode | What it holds |
 | --- | --- | --- |
 | `attenuo.toml` | 0600 | The server configuration: the upstream, a fresh admin token, the agent `coder` (the SHA-256 of its client secret), a root grant for the agent `planner` over `NAME:*`, and every tool in `[policy.catalog]`. |
-| `policy.cedar` | 0644 | A starter policy: read-only tools are permitted, chains deeper than 3 are forbidden, and each other tool has a commented-out permit to fill in. |
+| `policy.cedar` | 0644 | A starter policy: tools marked `readonly` in the catalog are permitted, chains deeper than 3 are forbidden, and each other tool has a commented-out permit to fill in. As written, no tool is marked `readonly`, so every call is denied until you allow it. |
 | `attenuo.env` | 0600 | `ATTENUO_SERVER`, `ATTENUO_ADMIN_TOKEN` and `ATTENUO_CLIENT_SECRET` as `export` lines, to load with `. ./attenuo.env`. |
 
 No secret is printed. The command ends with the next commands to run: start `attenuo-server`, mint a root token, exchange it for `coder`, list the tools and call one.
@@ -79,7 +79,7 @@ No secret is printed. The command ends with the next commands to run: start `att
 What it takes from the MCP server, which is the thing being guarded and so is not trusted further than this:
 
 - A tool whose name breaks the naming rules (`[A-Za-z0-9_.-]`) cannot be called through the proxy. It is left out and named in the output.
-- `annotations.readOnlyHint == true` marks the tool `readonly` in the catalog, and the starter policy permits read-only tools. That is the server's own claim, so the output lists those tools: check the list. `--no-readonly-hints` ignores the hint, and then nothing is permitted until you write a permit. A tool that claims to be both read-only and destructive is not marked read-only.
+- `annotations.readOnlyHint == true` is only reported: the output lists the tools the server says only read, and nothing is permitted because of it. It is the server's own claim, and a server that lies about it would otherwise get its tools allowed. With `--trust-readonly-hints` you accept the claim: those tools are marked `readonly` in the catalog, and the starter policy permits them. A tool that claims to be both read-only and destructive is never marked read-only.
 - `annotations.destructiveHint == true` marks the tool `sensitive`.
 - Arguments of type `string`, `integer` and `boolean` in the tool's `inputSchema` become catalog `inputs` (`string`, `long`, `bool`) so a policy can test them; other types and names that are not plain identifiers are left out (at most 64 per tool).
 - Descriptions and every other text from the server are written nowhere.
@@ -90,10 +90,12 @@ Options:
 - `--dir DIR`: where the files go.
 - `--listen ADDR`: the address the attenuo server will listen on, `127.0.0.1:8080` by default. Must be loopback, because the server refuses the development root mint elsewhere, and must name a port (not 0).
 - `--no-discover`: do not contact the MCP server. The catalog is left empty with an example entry in a comment, so every call is denied (`tool_not_in_catalog`) until you list the tools. Use it for a server that needs credentials (discovery sends none) or is not running.
-- `--no-readonly-hints`: see above. Cannot be combined with `--no-discover`.
-- `--force`: overwrite the three files when they exist; new secrets are generated and the files are set to their modes again. Without it the command refuses, before it contacts the MCP server, when any of the three exists, and changes nothing.
+- `--trust-readonly-hints`: see above. Cannot be combined with `--no-discover`.
+- `--force`: replace the three files when they exist, with new secrets. Without it the command refuses, before it contacts the MCP server, when any of the three exists, and changes nothing.
 
-Limits: at most 2,000 tools over at most 200 pages, each answer at most 16 MB, a 30 s timeout per request, and no redirect is followed. Exit status 1 with a message when the MCP server cannot be reached, answers with an HTTP or JSON-RPC error, or does not answer as an MCP server; nothing is written then. Tested in `crates/attenuo-cli/tests/init.rs`, where a real attenuo server loads the files as written and proxies one allowed and two denied calls.
+Each file is written in full under a temporary name and then moved into place, so a failure part-way leaves no half-written file. A symbolic link at one of the three names counts as an existing file: without `--force` it is refused, and with `--force` the link itself is replaced and the file it points to is not touched. A `data/` directory that is already there is left as it is, its mode too. The upstream name `attenuo` is refused, because the server's own audit records use it.
+
+Limits: at most 2,000 tools over at most 200 pages, each answer at most 16 MB and all of them together at most 48 MB, a 30 s timeout per request, and no redirect is followed. Exit status 1 with a message when the MCP server cannot be reached, answers with an HTTP or JSON-RPC error, or does not answer as an MCP server; nothing is written then. Tested in `crates/attenuo-cli/tests/init.rs`, where a real attenuo server loads the files as written and proxies the calls: all denied by default, and one allowed and two denied with `--trust-readonly-hints`.
 
 ### `health`
 

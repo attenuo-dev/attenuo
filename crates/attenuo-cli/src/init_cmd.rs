@@ -11,11 +11,12 @@
 //!
 //! - **Tool names.** A name that breaks attenuo's naming rules cannot be called through the
 //!   proxy at all; it is left out and reported.
-//! - **`annotations.readOnlyHint == true`** marks the tool `readonly` in the catalog, and the
-//!   starter policy permits read-only tools. This is the server's own claim. The command
-//!   lists those tools so the operator can check them, and the generated files say where the
-//!   flag came from. `--no-readonly-hints` ignores the hint: then every tool is denied until
-//!   the operator writes a permit.
+//! - **`annotations.readOnlyHint`** is the server's own claim, and attenuo's rule is that an
+//!   annotation may only narrow (ADR-0009). So by default it is not believed: no tool is
+//!   marked `readonly`, the starter policy permits nothing, and the tools that carry the hint
+//!   are only listed, for the operator to judge. `--trust-readonly-hints` is the operator
+//!   saying "I trust this server's hints": then those tools are marked `readonly`, which the
+//!   starter policy permits.
 //! - **`annotations.destructiveHint == true`** marks the tool `sensitive`.
 //! - **`inputSchema.properties`** of type `string`, `integer` or `boolean` become catalog
 //!   inputs (`string`, `long`, `bool`), so a policy can test them. Other types are left out.
@@ -42,6 +43,8 @@ const MAX_PAGES: usize = 200;
 const MAX_INPUTS: usize = 64;
 /// Largest `tools/list` or `initialize` answer read, in bytes.
 const MAX_BODY: usize = 16 * 1024 * 1024;
+/// Largest total of all answers read from one server, in bytes.
+const MAX_TOTAL: usize = 48 * 1024 * 1024;
 /// The MCP protocol revision offered in `initialize`.
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
@@ -49,6 +52,8 @@ const PROTOCOL_VERSION: &str = "2025-06-18";
 const CONFIG_FILE: &str = "attenuo.toml";
 const POLICY_FILE: &str = "policy.cedar";
 const ENV_FILE: &str = "attenuo.env";
+/// The server name attenuo keeps for its own audit records (SR-34).
+const RESERVED_SERVER: &str = "attenuo";
 
 /// One tool as the catalog will hold it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +75,9 @@ pub(crate) struct Discovered {
     pub nameless: usize,
     /// Tools listed more than once (the first one is kept).
     pub duplicates: usize,
+    /// Kept tools the server says only read (`readOnlyHint`), whether or not that is
+    /// believed; never one it also calls destructive.
+    pub claimed_readonly: Vec<String>,
 }
 
 /// An argument name the catalog and a Cedar policy can both write without quoting.
@@ -134,30 +142,31 @@ pub(crate) fn sort_tools(entries: &[Value], trust_readonly: bool) -> Discovered 
                 .and_then(Value::as_bool)
                 == Some(true)
         };
-        let readonly = trust_readonly && hint("readOnlyHint");
+        let sensitive = hint("destructiveHint");
+        // A server that calls one tool both read-only and destructive contradicts itself:
+        // the read-only claim is the one that could permit a call, so it is dropped.
+        let claims_readonly = hint("readOnlyHint") && !sensitive;
+        if claims_readonly {
+            d.claimed_readonly.push(name.to_string());
+        }
         d.tools.push(Tool {
             name: name.to_string(),
-            readonly,
-            // A tool cannot be both: the read-only claim is the one the policy acts on, and
-            // a server that claims both is contradicting itself, so neither is believed.
-            sensitive: hint("destructiveHint"),
+            readonly: trust_readonly && claims_readonly,
+            sensitive,
             inputs: inputs_of(entry.get("inputSchema")),
         });
     }
-    for t in &mut d.tools {
-        if t.readonly && t.sensitive {
-            t.readonly = false;
-        }
-    }
+    d.claimed_readonly.sort();
     d.tools.sort_by(|a, b| a.name.cmp(&b.name));
     d
 }
 
-/// The first complete SSE event in `buf`: where it ends, and where the next one starts. An
-/// event ends at a blank line (`\n\n`, or `\n\r\n` when lines end in CRLF).
-fn event_end(buf: &[u8]) -> Option<(usize, usize)> {
-    let mut i = 0;
-    while let Some(off) = buf[i..].iter().position(|b| *b == b'\n') {
+/// The first blank line (the end of an SSE event) in `buf` at or after `from`: where the
+/// event's text ends, and where the next event starts. A blank line is `\n\n`, or `\n\r\n`
+/// when lines end in CRLF.
+fn event_end(buf: &[u8], from: usize) -> Option<(usize, usize)> {
+    let mut i = from;
+    while let Some(off) = buf.get(i..)?.iter().position(|b| *b == b'\n') {
         let nl = i + off;
         match buf.get(nl + 1..) {
             Some([b'\n', ..]) => return Some((nl, nl + 2)),
@@ -168,157 +177,151 @@ fn event_end(buf: &[u8]) -> Option<(usize, usize)> {
     None
 }
 
-/// One JSON-RPC exchange with the MCP server. Returns the response headers and, for a
-/// request (one with an id), the JSON-RPC response.
-async fn rpc(
-    http: &reqwest::Client,
-    url: &str,
-    session: Option<&str>,
-    protocol: Option<&str>,
-    body: &Value,
-) -> Result<(reqwest::header::HeaderMap, Option<Value>)> {
-    let mut req = http
-        .post(url)
-        .header("accept", "application/json, text/event-stream")
-        .json(body);
-    if let Some(s) = session {
-        req = req.header("mcp-session-id", s);
-    }
-    if let Some(p) = protocol {
-        req = req.header("mcp-protocol-version", p);
-    }
-    let method = body.get("method").and_then(Value::as_str).unwrap_or("?");
-    let mut resp = req
-        .send()
-        .await
-        .with_context(|| format!("could not reach the MCP server at {url}"))?;
-    let status = resp.status();
-    if status.is_redirection() {
-        bail!("the MCP server answered `{method}` with a redirect (HTTP {status}); give the URL that answers without one");
-    }
-    if !status.is_success() {
-        bail!(
-            "the MCP server answered `{method}` with HTTP {status}{}",
-            if status == reqwest::StatusCode::UNAUTHORIZED
-                || status == reqwest::StatusCode::FORBIDDEN
-            {
-                "; `attenuo init` cannot discover the tools of a server that needs credentials: use --no-discover and fill in [policy.catalog] by hand"
-            } else {
-                ""
+/// The JSON-RPC response carried by one SSE event: its `data:` lines joined with a line
+/// feed, as the SSE format says, and parsed as one JSON text. `None` for an event that is
+/// something else (a comment, a notification, a request of the server's own).
+fn sse_event_reply(event: &str) -> Option<Value> {
+    let mut data = String::new();
+    let mut any = false;
+    for line in event.lines() {
+        if let Some(d) = line.strip_prefix("data:") {
+            if any {
+                data.push('\n');
             }
-        );
-    }
-    let headers = resp.headers().clone();
-    if body.get("id").is_none() {
-        return Ok((headers, None));
-    }
-    let sse = headers
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.contains("event-stream"));
-    let mut bytes = Vec::new();
-    // Where the next unread SSE event starts: each event is parsed once, so a body sent in
-    // many small pieces costs no more than one sent whole.
-    let mut event_start = 0;
-    let mut reply = None;
-    'read: while let Some(chunk) = resp
-        .chunk()
-        .await
-        .with_context(|| format!("reading the MCP server's answer to `{method}`"))?
-    {
-        if bytes.len() + chunk.len() > MAX_BODY {
-            bail!("the MCP server's answer to `{method}` is larger than {MAX_BODY} bytes");
-        }
-        bytes.extend_from_slice(&chunk);
-        if !sse {
-            continue;
-        }
-        // An SSE answer may stay open after the response event: stop once it is there.
-        while let Some((end, next)) = event_end(&bytes[event_start..]) {
-            let event = String::from_utf8_lossy(&bytes[event_start..event_start + end]);
-            event_start += next;
-            if let Some(v) = parse_rpc_body(&event, true) {
-                reply = Some(v);
-                break 'read;
-            }
+            any = true;
+            data.push_str(d.strip_prefix(' ').unwrap_or(d));
         }
     }
-    let reply = match reply {
-        Some(v) => Some(v),
-        // Plain JSON, or a last SSE event that no blank line ended.
-        None => parse_rpc_body(&String::from_utf8_lossy(&bytes[event_start..]), sse),
-    }
-    .with_context(|| format!("the MCP server's answer to `{method}` is not a JSON-RPC response"))?;
-    if let Some(err) = reply.get("error") {
-        let code = err.get("code").and_then(Value::as_i64).unwrap_or(0);
-        bail!("the MCP server refused `{method}` (JSON-RPC error {code})");
-    }
-    Ok((headers, Some(reply)))
+    let v: Value = serde_json::from_str(&data).ok()?;
+    (v.get("result").is_some() || v.get("error").is_some()).then_some(v)
 }
 
-/// Ask the MCP server at `url` for its tools: the raw entries of every `tools/list` page.
-pub(crate) async fn discover(url: &str) -> Result<Vec<Value>> {
-    let http = http_client()?;
-    let (headers, reply) = rpc(
-        &http,
-        url,
-        None,
-        None,
-        &json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": {},
-                "clientInfo": {"name": "attenuo-init", "version": env!("CARGO_PKG_VERSION")}
+/// A value the MCP server gave that goes back to it in a header: visible ASCII, bounded.
+fn header_safe(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 256 && s.bytes().all(|b| (0x21..=0x7e).contains(&b))
+}
+
+/// The conversation with one MCP server.
+struct Mcp<'a> {
+    http: reqwest::Client,
+    url: &'a str,
+    session: Option<String>,
+    protocol: Option<String>,
+    /// Bytes of answers that may still be read, over the whole conversation.
+    budget: usize,
+}
+
+impl Mcp<'_> {
+    /// One JSON-RPC exchange. Returns the response headers and, for a request (a message
+    /// with an id), the JSON-RPC response, which is a result and carries the request's id.
+    async fn rpc(&mut self, body: &Value) -> Result<(reqwest::header::HeaderMap, Option<Value>)> {
+        let mut req = self
+            .http
+            .post(self.url)
+            .header("accept", "application/json, text/event-stream")
+            .json(body);
+        if let Some(s) = &self.session {
+            req = req.header("mcp-session-id", s);
+        }
+        if let Some(p) = &self.protocol {
+            req = req.header("mcp-protocol-version", p);
+        }
+        let method = body.get("method").and_then(Value::as_str).unwrap_or("?");
+        let mut resp = req
+            .send()
+            .await
+            .with_context(|| format!("could not reach the MCP server at {}", self.url))?;
+        let status = resp.status();
+        if status.is_redirection() {
+            bail!("the MCP server answered `{method}` with a redirect (HTTP {status}); give the URL that answers without one");
+        }
+        if !status.is_success() {
+            bail!(
+                "the MCP server answered `{method}` with HTTP {status}{}",
+                if status == reqwest::StatusCode::UNAUTHORIZED
+                    || status == reqwest::StatusCode::FORBIDDEN
+                {
+                    "; `attenuo init` cannot discover the tools of a server that needs credentials: use --no-discover and fill in [policy.catalog] by hand"
+                } else {
+                    ""
+                }
+            );
+        }
+        let headers = resp.headers().clone();
+        if body.get("id").is_none() {
+            return Ok((headers, None));
+        }
+        let sse = headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.contains("event-stream"));
+        let mut bytes: Vec<u8> = Vec::new();
+        // Where the next unread SSE event starts, and from where its end is still to be
+        // looked for: every byte is scanned once, however small the pieces it arrives in.
+        let mut event_start = 0;
+        let mut scan_from = 0;
+        let mut reply = None;
+        'read: while let Some(chunk) = resp
+            .chunk()
+            .await
+            .with_context(|| format!("reading the MCP server's answer to `{method}`"))?
+        {
+            if chunk.len() > self.budget || bytes.len() + chunk.len() > MAX_BODY {
+                bail!("the MCP server's answer to `{method}` is too large (one answer may be {MAX_BODY} bytes, all of them together {MAX_TOTAL})");
             }
-        }),
-    )
-    .await?;
-    // Both values go back to the server in headers: keep them only if they can be one.
-    let header_safe =
-        |s: &str| !s.is_empty() && s.len() <= 256 && s.bytes().all(|b| (0x21..=0x7e).contains(&b));
-    let session = headers
-        .get("mcp-session-id")
-        .and_then(|v| v.to_str().ok())
-        .filter(|s| header_safe(s))
-        .map(str::to_string);
-    let protocol = reply
-        .as_ref()
-        .and_then(|r| r.pointer("/result/protocolVersion"))
-        .and_then(Value::as_str)
-        .filter(|s| header_safe(s))
-        .unwrap_or(PROTOCOL_VERSION)
-        .to_string();
-    let session = session.as_deref();
-    let protocol = Some(protocol.as_str());
+            self.budget -= chunk.len();
+            bytes.extend_from_slice(&chunk);
+            if !sse {
+                continue;
+            }
+            // An SSE answer may stay open after the response event: stop once it is there.
+            while let Some((end, next)) = event_end(&bytes, scan_from) {
+                let event = String::from_utf8_lossy(&bytes[event_start..end]);
+                event_start = next;
+                scan_from = next;
+                if let Some(v) = sse_event_reply(&event) {
+                    reply = Some(v);
+                    break 'read;
+                }
+            }
+            // No blank line up to here. One may still straddle the end (`\n` now, `\n` or
+            // `\r\n` in the next piece), so step back over at most two bytes.
+            scan_from = scan_from.max(bytes.len().saturating_sub(2));
+        }
+        let rest = String::from_utf8_lossy(&bytes[event_start..]);
+        let reply = match reply {
+            Some(v) => Some(v),
+            // A last SSE event that no blank line ended.
+            None if sse => sse_event_reply(&rest),
+            None => parse_rpc_body(&rest, false),
+        }
+        .with_context(|| {
+            format!("the MCP server's answer to `{method}` is not a JSON-RPC response")
+        })?;
+        if reply.get("id") != body.get("id") {
+            bail!("the MCP server answered `{method}` with the id of another request");
+        }
+        if let Some(err) = reply.get("error") {
+            let code = err.get("code").and_then(Value::as_i64).unwrap_or(0);
+            bail!("the MCP server refused `{method}` (JSON-RPC error {code})");
+        }
+        Ok((headers, Some(reply)))
+    }
 
-    rpc(
-        &http,
-        url,
-        session,
-        protocol,
-        &json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
-    )
-    .await?;
-
-    let mut entries = Vec::new();
-    let mut cursor: Option<String> = None;
-    let listed = async {
+    /// `notifications/initialized`, then every page of `tools/list`.
+    async fn list_tools(&mut self) -> Result<Vec<Value>> {
+        self.rpc(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
+            .await?;
+        let mut entries = Vec::new();
+        let mut cursor: Option<String> = None;
         for page in 0..MAX_PAGES {
             let mut params = serde_json::Map::new();
             if let Some(c) = &cursor {
                 params.insert("cursor".into(), Value::String(c.clone()));
             }
-            let (_, reply) = rpc(
-                &http,
-                url,
-                session,
-                protocol,
-                &json!({"jsonrpc": "2.0", "id": page + 2, "method": "tools/list", "params": params}),
-            )
-            .await?;
+            let (_, reply) = self
+                .rpc(&json!({"jsonrpc": "2.0", "id": page + 2, "method": "tools/list", "params": params}))
+                .await?;
             let result = reply
                 .as_ref()
                 .and_then(|r| r.get("result"))
@@ -338,19 +341,62 @@ pub(crate) async fn discover(url: &str) -> Result<Vec<Value>> {
                     }
                     cursor = Some(next.to_string());
                 }
-                _ => return Ok(()),
+                _ => return Ok(entries),
             }
         }
         bail!("the MCP server's `tools/list` did not end within {MAX_PAGES} pages")
     }
-    .await;
+}
+
+/// Ask the MCP server at `url` for its tools: the raw entries of every `tools/list` page.
+pub(crate) async fn discover(url: &str) -> Result<Vec<Value>> {
+    let mut mcp = Mcp {
+        http: http_client()?,
+        url,
+        session: None,
+        protocol: None,
+        budget: MAX_TOTAL,
+    };
+    let (headers, reply) = mcp
+        .rpc(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "attenuo-init", "version": env!("CARGO_PKG_VERSION")}
+            }
+        }))
+        .await?;
+    // Both values go back to the server in headers.
+    if let Some(id) = headers.get("mcp-session-id") {
+        match id.to_str().ok().filter(|s| header_safe(s)) {
+            Some(s) => mcp.session = Some(s.to_string()),
+            None => bail!("the MCP server's Mcp-Session-Id cannot be sent back: it is longer than 256 bytes or not visible ASCII"),
+        }
+    }
+    mcp.protocol = Some(
+        reply
+            .as_ref()
+            .and_then(|r| r.pointer("/result/protocolVersion"))
+            .and_then(Value::as_str)
+            .filter(|s| header_safe(s))
+            .unwrap_or(PROTOCOL_VERSION)
+            .to_string(),
+    );
+
+    let listed = mcp.list_tools().await;
 
     // End the session whatever happened; a server may not support it, so the answer is ignored.
-    if let Some(s) = session {
-        let _ = http.delete(url).header("mcp-session-id", s).send().await;
+    if let Some(s) = &mcp.session {
+        let mut req = mcp.http.delete(url).header("mcp-session-id", s);
+        if let Some(p) = &mcp.protocol {
+            req = req.header("mcp-protocol-version", p);
+        }
+        let _ = req.send().await;
     }
-    listed?;
-    Ok(entries)
+    listed
 }
 
 /// A TOML basic string.
@@ -445,10 +491,14 @@ pub(crate) fn render_config(p: &Plan<'_>) -> String {
         Some(tools) => {
             s.push_str(
                 "# The catalog: every tool the MCP server listed when `attenuo init` ran, with the\n\
-                 # arguments a policy can test. `readonly` and `sensitive` are the server's own\n\
-                 # claims about its tools (the MCP annotations readOnlyHint and destructiveHint).\n\
-                 # The starter policy permits readonly tools, so CHECK each `readonly = true` below.\n\
-                 # A tool the server adds later is denied until you add it here.\n\n",
+                 # arguments a policy can test. A tool the server adds later is denied until you\n\
+                 # add it here.\n\
+                 #\n\
+                 # `sensitive = true` is from the server's destructiveHint annotation.\n\
+                 # `readonly = true` appears only when `attenuo init` ran with\n\
+                 # --trust-readonly-hints: it is the server's own readOnlyHint, and the starter\n\
+                 # policy permits every readonly tool. Set it yourself for a tool you know only\n\
+                 # reads; a readonly tool is also never treated as destructive.\n\n",
             );
             for t in tools {
                 s.push_str(&format!("[policy.catalog.{up}.{}]\n", toml_key(&t.name)));
@@ -512,8 +562,8 @@ pub(crate) fn render_policy(upstream: &str, tools: Option<&[Tool]>) -> String {
          // Guide: https://github.com/attenuo-dev/attenuo/blob/main/docs/guides/writing-policies.md\n\
          // Check a change before the server loads it: attenuo policy check --help\n\n\
          // Read-only tools are allowed for any agent whose token covers them. `readonly` is\n\
-         // set per tool in [policy.catalog] of attenuo.toml, from the MCP server's own\n\
-         // readOnlyHint annotation: check that list.\n\
+         // set per tool in [policy.catalog] of attenuo.toml. `attenuo init` sets it only with\n\
+         // --trust-readonly-hints (the MCP server's own claim); otherwise set it yourself.\n\
          @id(\"permit_readonly_tools\")\n\
          permit(principal, action, resource)\n\
          when { resource.readonly };\n\n\
@@ -538,16 +588,28 @@ pub(crate) fn render_policy(upstream: &str, tools: Option<&[Tool]>) -> String {
          //\n\
          // Only arguments listed under the tool's `inputs` in attenuo.toml can be tested.\n",
     );
+    // Policy ids must be unique, and `a-b`, `a_b` and `a.b` would all give `permit_a_b`.
+    let mut ids: std::collections::BTreeSet<String> =
+        ["permit_readonly_tools", "forbid_deep_chains"]
+            .into_iter()
+            .map(String::from)
+            .collect();
     for t in rest {
+        let base = format!("permit_{}", t.name.replace(['.', '-'], "_"));
+        let mut id = base.clone();
+        let mut n = 2;
+        while !ids.insert(id.clone()) {
+            id = format!("{base}_{n}");
+            n += 1;
+        }
         s.push_str(&format!(
-            "\n// {name}{note}\n// @id(\"permit_{id}\")\n// permit(principal, action == Action::\"{upstream}/{name}\", resource);\n",
+            "\n// {name}{note}\n// @id(\"{id}\")\n// permit(principal, action == Action::\"{upstream}/{name}\", resource);\n",
             name = t.name,
             note = if t.sensitive {
                 " (marked sensitive: the server says it can destroy data)"
             } else {
                 ""
             },
-            id = t.name.replace(['.', '-'], "_"),
         ));
     }
     s
@@ -558,10 +620,10 @@ fn render_env(listen: std::net::SocketAddr, admin_token: &str, coder_secret: &st
     format!(
         "# Written by `attenuo init`. Secrets: keep this file readable by you only (0600).\n\
          # Load it into a shell with:  . ./attenuo.env\n\
-         export ATTENUO_SERVER=http://{listen}\n\
-         export ATTENUO_ADMIN_TOKEN={admin_token}\n\
+         export ATTENUO_SERVER='http://{listen}'\n\
+         export ATTENUO_ADMIN_TOKEN='{admin_token}'\n\
          # The client secret of the agent `coder`, for `attenuo token exchange --actor coder`.\n\
-         export ATTENUO_CLIENT_SECRET={coder_secret}\n"
+         export ATTENUO_CLIENT_SECRET='{coder_secret}'\n"
     )
 }
 
@@ -572,6 +634,9 @@ fn parse_upstream(spec: &str) -> Result<(String, String)> {
         .context("--upstream takes NAME=URL, for example github=http://127.0.0.1:3001/mcp")?;
     attenuo_core::names::check_server_name(name)
         .map_err(|e| anyhow::anyhow!("--upstream: the name is not a valid server name: {e}"))?;
+    if name == RESERVED_SERVER {
+        bail!("--upstream: the name `{RESERVED_SERVER}` is not a valid server name: it is reserved for the server's own audit records");
+    }
     let parsed = reqwest::Url::parse(url)
         .map_err(|e| anyhow::anyhow!("--upstream: `{}` is not a URL: {e}", url.escape_debug()))?;
     if !matches!(parsed.scheme(), "http" | "https") {
@@ -589,36 +654,82 @@ fn parse_upstream(spec: &str) -> Result<(String, String)> {
     Ok((name.to_string(), url.to_string()))
 }
 
-/// Create `path` with `text`, readable by the owner only when `secret`. Fails when the file
-/// exists unless `force`.
-fn write_file(path: &Path, text: &str, secret: bool, force: bool) -> Result<()> {
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true);
-    if force {
-        opts.create(true).truncate(true);
-    } else {
-        opts.create_new(true);
+/// Whether something is at `path`, a symbolic link that points nowhere included.
+fn occupied(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
+/// A file being written next to its final place. It is moved there by [`Pending::commit`]
+/// and removed when dropped before that.
+struct Pending {
+    tmp: PathBuf,
+    dest: PathBuf,
+    done: bool,
+}
+
+impl Pending {
+    /// Write `text` to a new file beside `dest`, mode 0600 when `secret` and 0644 otherwise.
+    fn write(dest: &Path, text: &str, secret: bool) -> Result<Self> {
+        let name = dest.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+        let tmp = dest.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
+        let mut opts = std::fs::OpenOptions::new();
+        // `create_new` never follows a link and never reuses a file someone else made.
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(if secret { 0o600 } else { 0o644 });
+        }
+        #[cfg(not(unix))]
+        let _ = secret;
+        let mut f = opts
+            .open(&tmp)
+            .with_context(|| format!("could not create {}", tmp.display()))?;
+        let pending = Self {
+            tmp,
+            dest: dest.to_path_buf(),
+            done: false,
+        };
+        f.write_all(text.as_bytes())
+            .and_then(|()| f.sync_all())
+            .with_context(|| format!("could not write {}", pending.tmp.display()))?;
+        Ok(pending)
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(if secret { 0o600 } else { 0o644 });
+
+    /// Move the file to its place. With `force`, a rename replaces what is there, a symbolic
+    /// link too (the link itself, not the file it points to), and the new file keeps its
+    /// own mode.
+    ///
+    /// Without `force` nothing is replaced: the file is linked into place, which fails when
+    /// something is already there, however late it appeared.
+    fn commit(mut self, force: bool) -> Result<()> {
+        if !force {
+            match std::fs::hard_link(&self.tmp, &self.dest) {
+                // The temporary name is removed when `self` is dropped.
+                Ok(()) => return Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    bail!(
+                        "{} already exists; it was left as it is",
+                        self.dest.display()
+                    )
+                }
+                // A filesystem without hard links: fall back to the rename.
+                Err(_) => {}
+            }
+        }
+        std::fs::rename(&self.tmp, &self.dest)
+            .with_context(|| format!("could not create {}", self.dest.display()))?;
+        self.done = true;
+        Ok(())
     }
-    let mut f = opts
-        .open(path)
-        .with_context(|| format!("could not create {}", path.display()))?;
-    #[cfg(unix)]
-    if secret {
-        // An existing file keeps its mode on open: with --force, tighten it before writing.
-        use std::os::unix::fs::PermissionsExt;
-        f.set_permissions(std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("could not set the mode of {}", path.display()))?;
+}
+
+impl Drop for Pending {
+    fn drop(&mut self) {
+        if !self.done {
+            let _ = std::fs::remove_file(&self.tmp);
+        }
     }
-    #[cfg(not(unix))]
-    let _ = secret;
-    f.write_all(text.as_bytes())
-        .with_context(|| format!("could not write {}", path.display()))?;
-    Ok(())
 }
 
 /// A path for display in a shell command: quoted when it needs it.
@@ -650,7 +761,7 @@ pub(crate) async fn run(args: InitArgs) -> Result<()> {
     if !args.force {
         // Check before anything is asked or written, so a refusal leaves nothing half done.
         for f in files {
-            if dir.join(f).exists() {
+            if occupied(&dir.join(f)) {
                 bail!(
                     "{} already exists; choose another --dir, or pass --force to overwrite the three files",
                     dir.join(f).display()
@@ -665,7 +776,7 @@ pub(crate) async fn run(args: InitArgs) -> Result<()> {
         let entries = discover(&url).await.with_context(|| {
             "could not read the tools of the MCP server (start it first, or pass --no-discover to write the configuration without a catalog)"
         })?;
-        Some(sort_tools(&entries, !args.no_readonly_hints))
+        Some(sort_tools(&entries, args.trust_readonly_hints))
     };
 
     let admin_token = generate_token()?;
@@ -682,18 +793,41 @@ pub(crate) async fn run(args: InitArgs) -> Result<()> {
     let policy = render_policy(&upstream, plan.tools);
     let env = render_env(args.listen, &admin_token, &coder_secret);
 
-    std::fs::create_dir_all(dir.join("data"))
-        .with_context(|| format!("could not create {}", dir.join("data").display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        // The issuer key and the audit log will live here.
-        std::fs::set_permissions(dir.join("data"), std::fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("could not set the mode of {}", dir.join("data").display()))?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("could not create {}", dir.display()))?;
+    // The issuer key and the audit log will live in data/. A directory that is already
+    // there is the operator's: it is left as it is.
+    let data = dir.join("data");
+    if !occupied(&data) {
+        let mut b = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            b.mode(0o700);
+        }
+        b.create(&data)
+            .with_context(|| format!("could not create {}", data.display()))?;
     }
-    write_file(&dir.join(CONFIG_FILE), &config, true, args.force)?;
-    write_file(&dir.join(POLICY_FILE), &policy, false, args.force)?;
-    write_file(&dir.join(ENV_FILE), &env, true, args.force)?;
+    // All three are written in full before any takes its place, so a failure part-way
+    // leaves no half-made set behind.
+    let pending = [
+        Pending::write(&dir.join(CONFIG_FILE), &config, true)?,
+        Pending::write(&dir.join(POLICY_FILE), &policy, false)?,
+        Pending::write(&dir.join(ENV_FILE), &env, true)?,
+    ];
+    if !args.force {
+        // Again, now that the MCP server has been asked: something may have appeared.
+        for f in files {
+            if occupied(&dir.join(f)) {
+                bail!(
+                    "{} already exists; nothing was written",
+                    dir.join(f).display()
+                );
+            }
+        }
+    }
+    for p in pending {
+        p.commit(args.force)?;
+    }
 
     outln!("wrote {}", dir.join(CONFIG_FILE).display())?;
     outln!("wrote {}", dir.join(POLICY_FILE).display())?;
@@ -710,24 +844,38 @@ pub(crate) async fn run(args: InitArgs) -> Result<()> {
             outln!("[policy.catalog] of {CONFIG_FILE}.")?;
         }
         Some(d) => {
-            let readonly: Vec<&str> = d
+            let permitted: Vec<&str> = d
                 .tools
                 .iter()
                 .filter(|t| t.readonly)
                 .map(|t| t.name.as_str())
                 .collect();
             outln!("{} tools found on `{upstream}`.", d.tools.len())?;
-            if readonly.is_empty() {
-                outln!("None is permitted yet: write a permit in {POLICY_FILE} for each tool to allow.")?;
-            } else {
+            if !permitted.is_empty() {
                 outln!(
-                    "Permitted by the starter policy, because the server says they only read ({}):",
-                    readonly.len()
+                    "Permitted by the starter policy, on the server's word that they only read ({}):",
+                    permitted.len()
                 )?;
-                for chunk in readonly.chunks(6) {
+                for chunk in permitted.chunks(6) {
                     outln!("  {}", chunk.join(", "))?;
                 }
-                outln!("Check that list. Every other tool is denied until you write a permit in {POLICY_FILE}.")?;
+                outln!("Every other tool is denied until you write a permit in {POLICY_FILE}.")?;
+            } else {
+                outln!("None is permitted yet: every call is denied until you allow it in {POLICY_FILE}.")?;
+                if !d.claimed_readonly.is_empty() {
+                    outln!(
+                        "The server says these only read ({}):",
+                        d.claimed_readonly.len()
+                    )?;
+                    for chunk in d.claimed_readonly.chunks(6) {
+                        outln!("  {}", chunk.join(", "))?;
+                    }
+                    outln!("That is the server's own claim. If you trust it, run again with")?;
+                    outln!(
+                        "--trust-readonly-hints --force to permit them, or set `readonly = true`"
+                    )?;
+                    outln!("in {CONFIG_FILE} for the ones you have checked.")?;
+                }
             }
             if !d.skipped.is_empty() {
                 outln!(
@@ -746,7 +894,7 @@ pub(crate) async fn run(args: InitArgs) -> Result<()> {
     }
     let example_tool = discovered
         .as_ref()
-        .and_then(|d| d.tools.iter().find(|t| t.readonly))
+        .and_then(|d| d.tools.iter().find(|t| t.readonly).or(d.tools.first()))
         .map_or("<tool>", |t| t.name.as_str());
     outln!("")?;
     outln!("Next:")?;
@@ -818,13 +966,18 @@ mod tests {
         assert_eq!(d.skipped, vec!["\"bad/name\"", "\"ctl\\u{1b}[31m\""]);
         assert_eq!(d.nameless, 2);
         assert_eq!(d.duplicates, 1);
+        // `both` contradicts itself and `stringy` is not a boolean: neither counts.
+        assert_eq!(d.claimed_readonly, vec!["read_file"]);
     }
 
     #[test]
     fn readonly_hints_can_be_ignored() {
         let entries = vec![json!({"name": "read_file", "annotations": {"readOnlyHint": true}})];
         assert!(sort_tools(&entries, true).tools[0].readonly);
-        assert!(!sort_tools(&entries, false).tools[0].readonly);
+        // Not believed, but still reported.
+        let d = sort_tools(&entries, false);
+        assert!(!d.tools[0].readonly);
+        assert_eq!(d.claimed_readonly, vec!["read_file"]);
     }
 
     #[test]
@@ -838,12 +991,32 @@ mod tests {
 
     #[test]
     fn sse_events_end_at_a_blank_line() {
-        assert_eq!(event_end(b"data: 1\n\ndata: 2\n\n"), Some((7, 9)));
-        assert_eq!(event_end(b"data: 1\r\n\r\nrest"), Some((8, 11)));
-        assert_eq!(event_end(b"event: m\ndata: 1\n\n"), Some((16, 18)));
-        assert_eq!(event_end(b"data: 1\n"), None);
-        assert_eq!(event_end(b"data: 1\ndata"), None);
-        assert_eq!(event_end(b""), None);
+        assert_eq!(event_end(b"data: 1\n\ndata: 2\n\n", 0), Some((7, 9)));
+        assert_eq!(event_end(b"data: 1\n\ndata: 2\n\n", 9), Some((16, 18)));
+        assert_eq!(event_end(b"data: 1\r\n\r\nrest", 0), Some((8, 11)));
+        assert_eq!(event_end(b"event: m\ndata: 1\n\n", 0), Some((16, 18)));
+        assert_eq!(event_end(b"data: 1\n", 0), None);
+        assert_eq!(event_end(b"data: 1\ndata", 0), None);
+        assert_eq!(event_end(b"", 0), None);
+        assert_eq!(event_end(b"abc", 7), None);
+    }
+
+    #[test]
+    fn an_sse_event_may_spread_its_json_over_data_lines() {
+        let one = "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}";
+        assert_eq!(sse_event_reply(one).unwrap()["id"], 1);
+        let split = "data: {\"jsonrpc\":\"2.0\",\ndata: \"id\":2,\r\ndata:\"result\":{}}";
+        assert_eq!(sse_event_reply(split).unwrap()["id"], 2);
+        // Not a response: a comment, a notification, a request from the server, bad JSON.
+        for other in [
+            ": keep-alive",
+            "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\"}",
+            "data: {\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"ping\"}",
+            "data: {",
+            "",
+        ] {
+            assert!(sse_event_reply(other).is_none(), "{other}");
+        }
     }
 
     #[test]
@@ -872,6 +1045,7 @@ mod tests {
             "github=http://user:pw@x/mcp",
             "github=http://x/mcp#frag",
             "github=file:///etc/passwd",
+            "attenuo=http://x/mcp",
         ] {
             assert!(parse_upstream(bad).is_err(), "{bad} was accepted");
         }
@@ -891,6 +1065,26 @@ mod tests {
         ));
         assert!(p.contains("marked sensitive"));
         assert!(!p.contains("Action::\"files/read_file\""));
+        // Names that differ only in `.`, `-` and `_`, and one that would take the id of a
+        // policy the file already has: every id is still unique.
+        let tools = [
+            tool("a-b", false, false, &[]),
+            tool("a.b", false, false, &[]),
+            tool("a_b", false, false, &[]),
+            tool("readonly_tools", false, false, &[]),
+        ];
+        let p = render_policy("s", Some(&tools));
+        let mut ids: Vec<&str> = p
+            .lines()
+            .filter_map(|l| l.trim_start_matches("// ").strip_prefix("@id(\""))
+            .map(|l| l.trim_end_matches("\")"))
+            .collect();
+        assert_eq!(ids.len(), 6, "{p}");
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 6, "{p}");
+        assert!(p.contains("@id(\"permit_a_b_2\")") && p.contains("@id(\"permit_a_b_3\")"));
+        assert!(p.contains("// @id(\"permit_readonly_tools_2\")"));
         // Without discovery there is nothing to list.
         assert!(!render_policy("files", None).contains("action == Action::"));
     }

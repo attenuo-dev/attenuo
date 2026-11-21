@@ -1,5 +1,6 @@
 //! `attenuo init` against a fake MCP server, and the configuration it writes loaded by a real
-//! attenuo server: the tool the MCP server marks read-only is allowed through the proxy, the
+//! attenuo server: nothing is permitted on the MCP server's word unless the operator asks
+//! (`--trust-readonly-hints`); then the tool it marks read-only is allowed through the proxy, the
 //! others are denied by policy, and nothing reaches the MCP server for a denied call.
 
 mod common;
@@ -49,6 +50,7 @@ fn env_value(dir: &Path, name: &str) -> String {
     env.lines()
         .find_map(|l| l.strip_prefix(&format!("export {name}=")))
         .unwrap_or_else(|| panic!("{name} is not in attenuo.env:\n{env}"))
+        .trim_matches('\'')
         .to_string()
 }
 
@@ -94,10 +96,10 @@ async fn init_then_serve(fake: FakeMcpServer) {
     let dir = tmp.path().join("try");
 
     let spec = format!("github={}", upstream.url("/mcp"));
-    let out = ok(&run(init(&spec, &dir, &[])).await);
+    let out = ok(&run(init(&spec, &dir, &["--trust-readonly-hints"])).await);
     assert!(out.contains("3 tools found on `github`."), "{out}");
     assert!(
-        out.contains("because the server says they only read (1):\n  read_file\n"),
+        out.contains("on the server's word that they only read (1):\n  read_file\n"),
         "{out}"
     );
     assert!(out.contains("Left out"), "{out}");
@@ -125,6 +127,8 @@ async fn init_then_serve(fake: FakeMcpServer) {
     );
     assert!(methods.contains(&"tools/list".to_string()), "{methods:?}");
     assert!(fake.recorded_calls().is_empty());
+    // The session it opened is closed again.
+    assert_eq!(fake.deleted_sessions(), vec![fake.session_id().to_string()]);
 
     let config = std::fs::read_to_string(dir.join("attenuo.toml")).unwrap();
     assert!(
@@ -262,17 +266,210 @@ async fn existing_files_are_kept_unless_forced() {
     load(&dir);
 }
 
+/// By default the MCP server's `readOnlyHint` permits nothing: it is the server's own claim, so
+/// it is reported and the choice is left to the operator.
 #[tokio::test(flavor = "multi_thread")]
-async fn readonly_hints_can_be_ignored() {
-    let upstream = fake().spawn().await.unwrap();
+async fn readonly_hints_are_not_believed_unless_asked() {
+    let fake = fake();
+    let upstream = fake.spawn().await.unwrap();
     let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
     let spec = format!("github={}", upstream.url("/mcp"));
-    let out = ok(&run(init(&spec, tmp.path(), &["--no-readonly-hints"])).await);
+    let out = ok(&run(init(&spec, dir, &[])).await);
     assert!(out.contains("None is permitted yet"), "{out}");
-    let config = std::fs::read_to_string(tmp.path().join("attenuo.toml")).unwrap();
+    assert!(
+        out.contains("The server says these only read (1):\n  read_file\n"),
+        "{out}"
+    );
+    assert!(out.contains("--trust-readonly-hints --force"), "{out}");
+    let config = std::fs::read_to_string(dir.join("attenuo.toml")).unwrap();
     assert!(!config.contains("\nreadonly = true\n"), "{config}");
-    let cfg = load(tmp.path());
+    assert!(
+        config.contains("[policy.catalog.github.read_file]\n"),
+        "{config}"
+    );
+
+    let cfg = load(dir);
+    let (router, _state) = attenuo_server::build(&cfg).unwrap();
+    let server = spawn_router(router).await.unwrap();
+    let url = server.url("").trim_end_matches('/').to_string();
+    let mut c = attenuo();
+    c.env("ATTENUO_ADMIN_TOKEN", env_value(dir, "ATTENUO_ADMIN_TOKEN"))
+        .args(["--server", &url, "token", "root", "--subject", "alice"])
+        .args([
+            "--agent", "planner", "--cap", "github:*", "--print", "token",
+        ]);
+    let root = ok(&run(c).await).trim().to_string();
+    let mut c = attenuo();
+    c.env("ATTENUO_TOKEN", &root).args([
+        "--server",
+        &url,
+        "call",
+        "--upstream",
+        "github",
+        "--tool",
+        "read_file",
+    ]);
+    let out = run(c).await;
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stdout));
+    assert!(
+        text(&out.stdout).contains("DENIED  policy_deny"),
+        "{}",
+        text(&out.stdout)
+    );
+    assert!(fake.recorded_calls().is_empty());
+}
+
+/// Names that differ only in `.`, `-` and `_`, and names that look like the starter policy's
+/// own ids or like catalog keys, still give a policy and a catalog the server accepts once
+/// every suggested permit is switched on.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_generated_permit_can_be_uncommented() {
+    let fake = FakeMcpServer::new(&["a-b", "a_b", "a.b", "readonly_tools", "inputs", "-x"]);
+    let upstream = fake.spawn().await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    ok(&run(init(&format!("s={}", upstream.url("/mcp")), dir, &[])).await);
+    let policy = std::fs::read_to_string(dir.join("policy.cedar")).unwrap();
+    let mut on = String::new();
+    let mut permits = 0;
+    for line in policy.lines() {
+        match line
+            .strip_prefix("// @id(")
+            .map(|r| format!("@id({r}"))
+            .or_else(|| {
+                line.strip_prefix("// permit(")
+                    .map(|r| format!("permit({r}"))
+            }) {
+            Some(l) => {
+                permits += usize::from(l.starts_with("permit("));
+                on.push_str(&l);
+            }
+            None => on.push_str(line),
+        }
+        on.push('\n');
+    }
+    assert_eq!(permits, 6, "{policy}");
+    std::fs::write(dir.join("policy.cedar"), on).unwrap();
+    let cfg = load(dir);
+    assert_eq!(cfg.policy.catalog["s"].len(), 6);
     let _built = attenuo_server::build(&cfg).unwrap();
+}
+
+/// A symbolic link where a file should go is neither written through nor half handled.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn symbolic_links_are_neither_followed_nor_half_handled() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("d");
+    std::fs::create_dir(&dir).unwrap();
+    let victim = tmp.path().join("victim");
+    let spec = "files=http://127.0.0.1:9/mcp";
+
+    // A link to nothing: refused, and nothing appears, at the link's target either.
+    symlink(&victim, dir.join("attenuo.env")).unwrap();
+    let out = run(init(spec, &dir, &["--no-discover"])).await;
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        text(&out.stderr).contains("already exists"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert!(!victim.exists());
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+
+    // --force replaces the link itself; the file it points to is not touched. A data
+    // directory that was already there keeps its mode.
+    std::fs::write(&victim, "mine").unwrap();
+    std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::create_dir(dir.join("data")).unwrap();
+    std::fs::set_permissions(dir.join("data"), std::fs::Permissions::from_mode(0o750)).unwrap();
+    ok(&run(init(spec, &dir, &["--no-discover", "--force"])).await);
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "mine");
+    assert_eq!(mode(&victim), 0o644);
+    let env = dir.join("attenuo.env");
+    assert!(std::fs::symlink_metadata(&env).unwrap().is_file());
+    assert_eq!(mode(&env), 0o600);
+    assert_eq!(mode(&dir.join("data")), 0o750);
+    // No temporary file is left.
+    let mut names: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        ["attenuo.env", "attenuo.toml", "data", "policy.cedar"]
+    );
+}
+
+/// An MCP endpoint that answers `initialize` with `init` and `tools/list` with `list` (a
+/// content type and a body each; `{id}` in a body is replaced by the request's id).
+async fn canned(
+    init: (&'static str, &'static str),
+    list: (&'static str, &'static str),
+) -> attenuo_proxy::testing::Spawned {
+    use axum::http::{header, StatusCode};
+    use axum::response::IntoResponse;
+    use axum::routing::post;
+    let handler = move |axum::Json(req): axum::Json<serde_json::Value>| async move {
+        let (kind, body) = match req["method"].as_str() {
+            Some("initialize") => init,
+            Some("tools/list") => list,
+            _ => return StatusCode::ACCEPTED.into_response(),
+        };
+        let body = body.replace("{id}", &req["id"].to_string());
+        ([(header::CONTENT_TYPE, kind)], body).into_response()
+    };
+    spawn_router(axum::Router::new().route("/mcp", post(handler)))
+        .await
+        .unwrap()
+}
+
+const INIT_OK: (&str, &str) = (
+    "application/json",
+    r#"{"jsonrpc":"2.0","id":{id},"result":{"protocolVersion":"2025-06-18","capabilities":{},"serverInfo":{"name":"t","version":"1"}}}"#,
+);
+
+#[tokio::test(flavor = "multi_thread")]
+async fn odd_answers_are_handled() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    // An answer that carries the id of another request is not taken for ours.
+    let wrong_id = canned(
+        INIT_OK,
+        (
+            "application/json",
+            r#"{"jsonrpc":"2.0","id":999,"result":{"tools":[{"name":"x"}]}}"#,
+        ),
+    )
+    .await;
+    let dir = tmp.path().join("a");
+    let out = run(init(&format!("a={}", wrong_id.url("/mcp")), &dir, &[])).await;
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        text(&out.stderr).contains("the id of another request"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert!(!dir.exists());
+
+    // SSE with CRLF line ends, a comment, another message first, and the answer's JSON
+    // spread over several `data:` lines.
+    let sse = canned(
+        INIT_OK,
+        (
+            "text/event-stream",
+            ": hello\r\n\r\nevent: message\r\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{}}\r\n\r\nevent: message\r\ndata: {\"jsonrpc\":\"2.0\",\"id\":{id},\r\ndata: \"result\":{\"tools\":[\r\ndata: {\"name\":\"one\"},{\"name\":\"two\"}]}}\r\n\r\n",
+        ),
+    )
+    .await;
+    let dir = tmp.path().join("b");
+    let out = ok(&run(init(&format!("b={}", sse.url("/mcp")), &dir, &[])).await);
+    assert!(out.contains("2 tools found on `b`."), "{out}");
+    let cfg = load(&dir);
+    assert_eq!(cfg.policy.catalog["b"].len(), 2);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -300,7 +497,7 @@ async fn without_discovery_the_catalog_is_empty_and_the_server_still_starts() {
 async fn refusals_write_nothing() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("x");
-    let cases: [(&[&str], &str, &str); 6] = [
+    let cases: [(&[&str], &str, &str); 7] = [
         // The MCP server is not there.
         (&[], "files=http://127.0.0.1:9/mcp", "--no-discover"),
         (
@@ -323,6 +520,12 @@ async fn refusals_write_nothing() {
             &["--no-discover"],
             "files=ftp://127.0.0.1/mcp",
             "http:// or https://",
+        ),
+        // The server's own audit records use this name.
+        (
+            &["--no-discover"],
+            "attenuo=http://127.0.0.1:9/mcp",
+            "reserved",
         ),
     ];
     for (extra, spec, expect) in cases {

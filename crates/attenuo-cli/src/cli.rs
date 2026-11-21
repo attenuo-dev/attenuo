@@ -187,8 +187,9 @@ pub(crate) enum Command {
     StdioBridge(StdioBridgeArgs),
     /// Write a working starter configuration for one MCP server into a directory:
     /// `attenuo.toml`, `policy.cedar` and `attenuo.env`. Asks the MCP server for its tools
-    /// and lists each in the catalog; the starter policy permits the tools the server marks
-    /// read-only and denies the rest. For trying attenuo on one machine: the configuration
+    /// and lists each in the catalog; the starter policy denies every call until a permit is
+    /// written (or, with `--trust-readonly-hints`, permits the tools the server marks
+    /// read-only). For trying attenuo on one machine: the configuration
     /// listens on loopback with the development root mint on. Talks to no attenuo server.
     Init(InitArgs),
 }
@@ -212,10 +213,11 @@ pub(crate) struct InitArgs {
     /// not running.
     #[arg(long)]
     pub no_discover: bool,
-    /// Do not believe the MCP server's `readOnlyHint` annotations: no tool is marked
-    /// read-only, so the starter policy permits none.
+    /// Believe the MCP server's `readOnlyHint` annotations: a tool that carries one is marked
+    /// read-only, and the starter policy permits read-only tools. Without this flag the hint
+    /// is only reported and nothing is permitted, because it is the server's own claim.
     #[arg(long, conflicts_with = "no_discover")]
-    pub no_readonly_hints: bool,
+    pub trust_readonly_hints: bool,
     /// Overwrite the three files when they exist. New secrets are generated.
     #[arg(long)]
     pub force: bool,
