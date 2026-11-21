@@ -41,6 +41,11 @@ pub const AUDIT_APPEND_FAILURE_HOLD: std::time::Duration = std::time::Duration::
 /// `"degraded"` on the same rule (queue full, or the oldest undelivered notification or the
 /// current run of failures older than its `max_lag_seconds`), and `"degraded"` is true when
 /// either is. A degraded notifier never fails readiness: notifications are best effort.
+///
+/// Right after a quick restart, while the DPoP restart fence refuses every proof made now
+/// (`crate::dpop`, "Restart fence"; at most about 21 seconds with the defaults), the answer is
+/// 503 with `checks.dpop_restart_fence` = `"fenced"`, so a rolling deploy sends no DPoP traffic
+/// to the new server yet. The member is absent otherwise. `/healthz` is not affected.
 pub async fn readyz(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Value>) {
     let (audit, leases) = state
         .blocking(|s| {
@@ -70,7 +75,8 @@ pub async fn readyz(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Val
             "readiness check failed: the last audit append failed"
         );
     }
-    let mut ready = audit.is_ok() && leases.is_ok() && !appends_failing;
+    let fenced = state.dpop_fenced_until();
+    let mut ready = audit.is_ok() && leases.is_ok() && !appends_failing && fenced.is_none();
     let mut body = json!({
         "ready": ready,
         "checks": {
@@ -79,6 +85,10 @@ pub async fn readyz(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Val
             "leases": leases_status,
         },
     });
+    if fenced.is_some() {
+        // Moments after a restart, every DPoP proof made now is refused: keep traffic away.
+        body["checks"]["dpop_restart_fence"] = json!("fenced");
+    }
     if let Some(sink) = &state.checkpoint_sink {
         let status = sink.status();
         if status.degraded {

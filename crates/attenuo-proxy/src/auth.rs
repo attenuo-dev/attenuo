@@ -165,6 +165,15 @@ pub enum AuthError {
     /// good token or key (SR-47).
     #[error("temporarily unavailable: {0}")]
     Unavailable(String),
+    /// [`AuthError::Unavailable`] with its own `Retry-After`, in seconds: for a refusal the
+    /// server expects to clear within that time (a DPoP liveness marker being rewritten).
+    #[error("temporarily unavailable: {reason}; retry in {seconds} s")]
+    UnavailableFor {
+        /// The reason code.
+        reason: String,
+        /// Seconds the client should wait, sent as `Retry-After` (at least 1).
+        seconds: u64,
+    },
     /// The caller is over a rate limit of the authorizer (the server's `[limits]
     /// mcp_requests_per_minute`, per run). The number is how many seconds until it may retry.
     /// The proxy answers `429` with `Retry-After` and JSON-RPC `-32007`, not `401`: the token
@@ -208,7 +217,7 @@ impl AuthError {
             AuthError::DpopRequired => REASON_DPOP_REQUIRED,
             AuthError::InvalidDpopProof(_) => REASON_INVALID_DPOP_PROOF,
             AuthError::UseDpopNonce(_) => REASON_USE_DPOP_NONCE,
-            AuthError::Unavailable(reason) => reason,
+            AuthError::Unavailable(reason) | AuthError::UnavailableFor { reason, .. } => reason,
             AuthError::RateLimited(_) => REASON_RATE_LIMITED,
         }
     }

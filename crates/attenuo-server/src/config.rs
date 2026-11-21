@@ -225,10 +225,16 @@ pub struct TokenSection {
     /// this says.
     #[serde(default)]
     pub dpop: DpopMode,
-    /// How far a DPoP proof's `iat` may be from the server's clock, either way, in seconds.
-    /// Default 300.
+    /// How far a DPoP proof's `iat` may be behind the server's clock, in seconds. Default 300.
     #[serde(default = "default_dpop_max_age")]
     pub dpop_max_age_seconds: u64,
+    /// How far a DPoP proof's `iat` may be ahead of the server's clock (a client clock that
+    /// runs fast), in seconds: 0 to `dpop_max_age_seconds`. Unset: 10, or
+    /// `dpop_max_age_seconds` when that is smaller ([`TokenSection::dpop_future_skew`]). Also
+    /// sets how long proofs are refused after a quick restart ([`crate::dpop`], "Restart
+    /// fence").
+    #[serde(default)]
+    pub dpop_future_skew_seconds: Option<u64>,
     /// Most DPoP proofs remembered for replay detection (each until its `iat` plus
     /// `dpop_max_age_seconds`). When full of live proofs, new ones get 503. Default 1000000.
     #[serde(default = "default_dpop_replay_capacity")]
@@ -252,6 +258,8 @@ pub struct TokenSection {
 
 /// Default for `[token] dpop_max_age_seconds`.
 pub const DEFAULT_DPOP_MAX_AGE_SECONDS: u64 = 300;
+/// Default for `[token] dpop_future_skew_seconds`.
+pub const DEFAULT_DPOP_FUTURE_SKEW_SECONDS: u64 = 10;
 /// Default for `[token] dpop_replay_capacity`.
 pub const DEFAULT_DPOP_REPLAY_CAPACITY: usize = 1_000_000;
 
@@ -277,6 +285,7 @@ impl Default for TokenSection {
             actor_auth: ActorAuth::default(),
             dpop: DpopMode::default(),
             dpop_max_age_seconds: DEFAULT_DPOP_MAX_AGE_SECONDS,
+            dpop_future_skew_seconds: None,
             dpop_replay_capacity: DEFAULT_DPOP_REPLAY_CAPACITY,
             dpop_nonce: DpopNonceMode::default(),
             client_assertion_max_lifetime_seconds: DEFAULT_CLIENT_ASSERTION_MAX_LIFETIME_SECONDS,
@@ -286,14 +295,31 @@ impl Default for TokenSection {
 }
 
 impl TokenSection {
+    /// `dpop_future_skew_seconds` as applied: the value set, else 10 or
+    /// `dpop_max_age_seconds` when that is smaller.
+    pub fn dpop_future_skew(&self) -> u64 {
+        self.dpop_future_skew_seconds
+            .unwrap_or_else(|| DEFAULT_DPOP_FUTURE_SKEW_SECONDS.min(self.dpop_max_age_seconds))
+    }
+
     /// Startup check of the DPoP settings.
     ///
     /// # Errors
     ///
-    /// When `dpop_max_age_seconds` is outside 1..=3600 or `dpop_replay_capacity` is 0.
+    /// When `dpop_max_age_seconds` is outside 1..=3600, `dpop_future_skew_seconds` is above
+    /// `dpop_max_age_seconds`, or `dpop_replay_capacity` is 0.
     pub fn check_dpop(&self) -> anyhow::Result<()> {
         if !(1..=3600).contains(&self.dpop_max_age_seconds) {
             anyhow::bail!("[token] dpop_max_age_seconds must be between 1 and 3600");
+        }
+        if self
+            .dpop_future_skew_seconds
+            .is_some_and(|f| f > self.dpop_max_age_seconds)
+        {
+            anyhow::bail!(
+                "[token] dpop_future_skew_seconds must be between 0 and dpop_max_age_seconds ({})",
+                self.dpop_max_age_seconds
+            );
         }
         if self.dpop_replay_capacity == 0 {
             anyhow::bail!("[token] dpop_replay_capacity must be at least 1");
@@ -3791,6 +3817,41 @@ mod tests {
         }
         // A jwks given as a table instead of JSON text is refused when parsing.
         assert!(Config::from_toml("[[agents]]\nid = \"a\"\njwks = { keys = [] }\n").is_err());
+    }
+
+    /// `dpop_future_skew_seconds`: default 10, or the max age when that is smaller; set, from
+    /// 0 up to `dpop_max_age_seconds`.
+    #[test]
+    fn dpop_future_skew_is_bounded_by_the_max_age() {
+        let d = TokenSection::default();
+        assert_eq!(d.dpop_future_skew(), DEFAULT_DPOP_FUTURE_SKEW_SECONDS);
+        d.check_dpop().unwrap();
+        // A short max age with no skew set starts, with the skew at the max age.
+        let short = Config::from_toml("[token]\ndpop_max_age_seconds = 5\n")
+            .unwrap()
+            .token;
+        short.check_dpop().unwrap();
+        assert_eq!(short.dpop_future_skew(), 5);
+        let set = Config::from_toml("[token]\ndpop_future_skew_seconds = 0\n")
+            .unwrap()
+            .token;
+        assert_eq!(set.dpop_future_skew(), 0);
+        for good in [
+            "[token]\ndpop_future_skew_seconds = 0\n",
+            "[token]\ndpop_max_age_seconds = 60\ndpop_future_skew_seconds = 60\n",
+        ] {
+            Config::from_toml(good).unwrap().token.check_dpop().unwrap();
+        }
+        let bad = "[token]\ndpop_max_age_seconds = 60\ndpop_future_skew_seconds = 61\n";
+        let err = Config::from_toml(bad)
+            .unwrap()
+            .token
+            .check_dpop()
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("dpop_future_skew_seconds"),
+            "{err}"
+        );
     }
 
     #[test]

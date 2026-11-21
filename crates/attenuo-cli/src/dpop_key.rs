@@ -201,6 +201,7 @@ mod tests {
                     access_token: token,
                     now: OffsetDateTime::now_utc(),
                     max_age: time::Duration::seconds(60),
+                    future_skew: time::Duration::seconds(60),
                 },
             )
             .unwrap()

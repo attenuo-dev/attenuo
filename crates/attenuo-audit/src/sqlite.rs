@@ -11,8 +11,8 @@
 //!
 //! The code is split by store: [`SqliteAudit`] is in `log.rs` (with the WAL checkpointer in
 //! `wal.rs`), [`SqliteLeaseStore`] in `leases.rs` (with run limits in `budgets.rs`, approvals
-//! in `approvals.rs`, the notice outbox in `outbox.rs` and the credential replay markers in
-//! `replay.rs`). Both open their connections
+//! in `approvals.rs`, the notice outbox in `outbox.rs`, the credential replay markers in
+//! `replay.rs` and the server's liveness marker in `liveness.rs`). Both open their connections
 //! through `connection.rs`, share the schema in `schema.rs` and bring a file to the current
 //! schema version with the one list of migrations in `migrations.rs`.
 
@@ -27,6 +27,7 @@ mod connection;
 mod fence;
 pub mod filesystem;
 mod leases;
+mod liveness;
 mod log;
 mod migrations;
 mod outbox;

@@ -100,6 +100,9 @@ token_sha256 = "0000000000000000000000000000000000000000000000000000000000000000
 role = "viewer"
 expires_at = "2030-01-01T00:00:00Z"
 
+[token]
+dpop_future_skew_seconds = 10
+
 [approvals]
 client_id = "approver"
 

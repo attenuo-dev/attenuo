@@ -294,9 +294,9 @@ class Unavailable(ApiError):
     - ``request_timeout`` (REST routes): no answer within ``[limits] request_timeout_seconds``.
       The handler may have done its work (an issued token, a decision and its audit record), so
       it is never retried for you.
-    - Others: ``jwks_unavailable``, ``dpop_replay_cache_full`` and, on the proxy,
-      ``session_registry_full`` (the upstream answered ``initialize`` and the proxy then closed
-      that session). Not retried for you.
+    - Others: ``jwks_unavailable``, ``dpop_replay_cache_full``, ``dpop_liveness_stale`` and,
+      on the proxy, ``session_registry_full`` (the upstream answered ``initialize`` and the
+      proxy then closed that session). Not retried for you.
 
     On ``/mcp/{server}`` a ``-32006`` counts as the proxy's own only with a ``Retry-After``
     header, which the proxy sets on its refusals and never relays from an upstream; without it,

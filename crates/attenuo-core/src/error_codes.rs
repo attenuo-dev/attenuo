@@ -183,6 +183,7 @@ pub const ERROR_CODES: &[ErrorCode] = &[
     e("credential_pop_mismatch", BAD_GRANT, NO_RPC, "The DPoP proof is by another key than the one the ID-JAG is bound to (`cnf.jkt`)."),
     e("credential_pop_required", BAD_GRANT, NO_RPC, "The ID-JAG is bound to a key (`cnf`) and the request has no DPoP proof that this server checks."),
     e("credential_type_not_accepted", BAD_GRANT, NO_RPC, "The credential's issuer is an `[[idps]]` entry whose `credentials` does not list this kind (an ID token or an ID-JAG)."),
+    e("dpop_liveness_stale", UNAVAILABLE_503, &[j(UNAVAILABLE, 503)], "The server cannot keep its liveness marker ahead of its clock (a database write fails), so it accepts no DPoP proof; retry later."),
     e("dpop_replay_cache_full", UNAVAILABLE_503, &[j(UNAVAILABLE, 503)], "Too many DPoP proofs are in flight; retry later."),
     e("dpop_required", &[r(401, "dpop_required")], &[j(UNAUTHORIZED, 401)], "The token is bound to a key and no DPoP proof was sent."),
     e("duplicate_actor", BAD_REQUEST, NO_RPC, "The `actor` is already in the chain."),

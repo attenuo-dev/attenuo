@@ -121,6 +121,12 @@ pub struct AppState {
     pub trace: Option<Arc<crate::telemetry::ServerTrace>>,
     /// `[limits]`: the in-flight cap, the deadlines and the rate limits ([`crate::limits`]).
     pub(crate) limits: Arc<crate::limits::Limits>,
+    /// The thread that keeps the DPoP liveness marker ahead of the clock; `None` for
+    /// `:memory:`. Its drop runs before the single-writer fence below is released: it closes
+    /// the marker, so no `Dpop` still held elsewhere (a router, a request) can move the
+    /// marker or accept a proof after that, and then joins the thread, so no write is under
+    /// way once the next server may open the file.
+    dpop_heartbeat: Option<crate::dpop::LivenessHeartbeat>,
     /// The single-writer fence on `<sqlite_path>.lock`, held for as long as the state lives
     /// (the OS releases it when the process exits); `None` for `:memory:`. Declared last, so
     /// it is released after the stores above.
@@ -183,15 +189,14 @@ impl AppState {
         let user_window_retention = config.leases.user_window_retention()?;
         let issuer = load_issuer(config)?;
         // Server DPoP nonces are keyed by the issuer's private key (see `crate::dpop`).
-        let dpop = Arc::new(
-            crate::dpop::Dpop::new(
-                config.token.dpop,
-                config.token.dpop_max_age_seconds,
-                config.token.dpop_replay_capacity,
-                config.server.public_url.clone(),
-            )
-            .with_nonce(config.token.dpop_nonce, issuer.private_key_pem().as_bytes()),
-        );
+        let dpop = crate::dpop::Dpop::new(
+            config.token.dpop,
+            config.token.dpop_max_age_seconds,
+            config.token.dpop_replay_capacity,
+            config.server.public_url.clone(),
+        )
+        .with_future_skew(config.token.dpop_future_skew())
+        .with_nonce(config.token.dpop_nonce, issuer.private_key_pem().as_bytes());
         let verifier = issuer.verifier();
         let jwks = crate::issuer_keys::jwks_from_keys(&issuer.trusted_public_keys())?;
 
@@ -231,6 +236,14 @@ impl AppState {
             metrics.clone(),
             checkpoint_sink.as_ref().map(|s| s.handle()),
         )?;
+        // The DPoP restart fence, from the liveness marker in the same file; none in memory.
+        let (dpop, dpop_heartbeat) = if store_fence.is_some() {
+            let (dpop, heartbeat) = restart_fence(dpop, &leases, clock.clone())?;
+            (dpop, Some(heartbeat))
+        } else {
+            (dpop, None)
+        };
+        let dpop = Arc::new(dpop);
         // Single use of credentials, in the same file as the leases it guards (`crate::replay`).
         let replay =
             crate::replay::ReplayCache::new(leases.clone(), crate::replay::DEFAULT_REPLAY_CAPACITY);
@@ -394,9 +407,35 @@ impl AppState {
                 &config.limits,
                 metrics_for_limits,
             )),
+            dpop_heartbeat,
             store_fence,
             released: tokio::sync::watch::Sender::new(()),
         })
+    }
+
+    /// Write the DPoP liveness marker now, as the heartbeat thread does (`crate::dpop`,
+    /// "Restart fence"). For tests that move a [`attenuo_core::ManualClock`] past the marker;
+    /// the server itself never calls it, and no request writes the marker.
+    ///
+    /// # Errors
+    ///
+    /// When there is no marker (`:memory:`), the write fails, or the heartbeat has stopped.
+    pub fn beat_dpop_liveness(&self) -> Result<(), String> {
+        let beat = self
+            .dpop_heartbeat
+            .as_ref()
+            .ok_or_else(|| "no DPoP liveness marker (sqlite_path = \":memory:\")".to_owned())?;
+        beat.liveness()
+            .extend(self.clock.now_utc().unix_timestamp())
+    }
+
+    /// Until when the DPoP restart fence refuses proofs made now: the previous process's
+    /// liveness marker while the clock is at or before it, else `None`. `/readyz` is not ready
+    /// until then.
+    pub fn dpop_fenced_until(&self) -> Option<i64> {
+        self.dpop
+            .fence()
+            .filter(|&b| self.clock.now_utc().unix_timestamp() <= b)
     }
 
     /// The lock file of the single-writer fence this state holds (`<sqlite_path>.lock`);
@@ -648,6 +687,66 @@ fn warn_if_same_mount(sink_path: &Path, sqlite_path: &str) {
     }
     #[cfg(not(unix))]
     let _ = (sink_path, sqlite_path);
+}
+
+/// Read the previous process's DPoP liveness marker, write this one's, and start the thread
+/// that keeps it ahead of the clock (`crate::dpop`, "Restart fence"). The marker is read before
+/// the first write, which may replace it. A failed first write stops the start-up.
+fn restart_fence(
+    dpop: crate::dpop::Dpop,
+    leases: &Arc<SqliteLeaseStore>,
+    clock: Arc<dyn attenuo_core::Clock>,
+) -> anyhow::Result<(crate::dpop::Dpop, crate::dpop::LivenessHeartbeat)> {
+    use crate::dpop::{
+        Liveness, LivenessHeartbeat, LIVENESS_HEARTBEAT_SECONDS, LIVENESS_LEAD_SECONDS,
+    };
+    let previous = leases
+        .dpop_max_iat()
+        .context("reading the DPoP liveness marker")?;
+    let store = Arc::downgrade(leases);
+    let write: crate::dpop::MarkerWrite = Box::new(move |until| {
+        let store = store
+            .upgrade()
+            .ok_or_else(|| "the lease store is closed".to_owned())?;
+        store.extend_dpop_max_iat(until).map_err(|e| e.to_string())
+    });
+    let now = clock.now_utc().unix_timestamp();
+    let skew = dpop.future_skew_seconds();
+    let liveness = Arc::new(
+        Liveness::start(write, skew, now)
+            .map_err(|e| anyhow::anyhow!("writing the DPoP liveness marker: {e}"))?,
+    );
+    if let Some(marker) = previous {
+        let refused_for = marker.saturating_add(1).saturating_sub(now);
+        // A marker no running server would have written: the clock was stepped back, or was
+        // ahead when the marker was written (a VM resumed with a wrong clock, say).
+        let normal = LIVENESS_LEAD_SECONDS
+            .saturating_add(i64::try_from(skew).unwrap_or(i64::MAX))
+            .saturating_add(60);
+        if refused_for > normal {
+            tracing::error!(
+                marker,
+                seconds = refused_for,
+                "the DPoP liveness marker in this database is far ahead of the clock: every \
+                 DPoP proof is refused (invalid_dpop_proof) until the clock passes it. If the \
+                 clock is right now, stop the server, delete the marker (sqlite3 <sqlite_path> \
+                 \"DELETE FROM audit_meta WHERE key = 'dpop_max_iat'\") and start again; that \
+                 start is then not fenced"
+            );
+        } else if refused_for > 0 {
+            tracing::warn!(
+                marker,
+                seconds = refused_for,
+                "a server used this database moments ago: DPoP proofs with iat at or before \
+                 `marker` are refused with invalid_dpop_proof (the restart fence), for about \
+                 `seconds` more; /readyz answers 503 until then"
+            );
+        }
+    }
+    let period = std::time::Duration::from_secs(LIVENESS_HEARTBEAT_SECONDS.unsigned_abs());
+    let heartbeat = LivenessHeartbeat::spawn(liveness.clone(), clock, period)
+        .context("starting the DPoP liveness thread")?;
+    Ok((dpop.with_restart_fence(previous, liveness), heartbeat))
 }
 
 fn open_storage(

@@ -179,7 +179,7 @@ decision 6c65098c-383f-4119-8c0f-95ce3a384bdc
 
 ### `token sign-off`
 
-Made by the holder of a bound parent token, to consent to one exchange that binds the child to another key. Prints a proof by `--dpop-key` (the parent's key) for `POST` to the server's `/token`, with `ath` of the parent token and the claims `child_jkt` and `child_actor`; with `--json`, `{"subject_token_dpop": ...}`. The server accepts it only for an exchange whose `DPoP` key and `actor` are the ones it names, within `[token] dpop_max_age_seconds`, once. Hand it to the sub-agent, which passes it with `token exchange --subject-token-dpop-file`; the parent's key stays with the parent.
+Made by the holder of a bound parent token, to consent to one exchange that binds the child to another key. Prints a proof by `--dpop-key` (the parent's key) for `POST` to the server's `/token`, with `ath` of the parent token and the claims `child_jkt` and `child_actor`; with `--json`, `{"subject_token_dpop": ...}`. The server accepts it only for an exchange whose `DPoP` key and `actor` are the ones it names, within `[token] dpop_max_age_seconds`, once. A sign-off made before a server restart is refused after it (`invalid_dpop_proof`, the restart fence of [binding tokens to keys](../guides/binding-tokens-to-keys.md#limits)): make a new one. Hand it to the sub-agent, which passes it with `token exchange --subject-token-dpop-file`; the parent's key stays with the parent.
 
 | Option | Meaning |
 | --- | --- |

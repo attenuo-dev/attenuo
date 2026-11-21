@@ -10,7 +10,9 @@ mod common;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
+use attenuo_core::{Clock, ManualClock};
 use attenuo_policy::{ArgType, ToolAttrs};
 use attenuo_proxy::testing::{FakeMcpServer, Spawned};
 use attenuo_proxy::UpstreamConfig;
@@ -38,6 +40,9 @@ struct Server {
     server: Running,
     state: Arc<AppState>,
     client: reqwest::Client,
+    /// The server's clock: the system clock, moved ahead for a server started by
+    /// [`start_later`].
+    clock: Arc<ManualClock>,
 }
 
 /// A server with `[token] dpop = mode`. Servers started on the same `dir` share the issuer key
@@ -50,6 +55,29 @@ async fn start(dir: &Path, mode: DpopMode) -> Server {
 
 /// [`start`] with `[token] dpop_nonce = nonce`.
 async fn start_with(dir: &Path, mode: DpopMode, nonce: DpopNonceMode) -> Server {
+    start_later(dir, mode, nonce, Duration::ZERO).await
+}
+
+/// How far ahead [`start_later`] runs a restarted server: past the restart fence, which
+/// refuses proofs for up to about 21 seconds after a quick restart (`attenuo_server::dpop`).
+const RESTART_TAKES: Duration = Duration::from_secs(30);
+
+/// [`start_with`] on a clock `after` ahead of the system clock: a server restarted on `dir`
+/// that long after the previous one stopped, without the test waiting for it. Make proofs for
+/// it with [`Server::proof`], at its time.
+async fn start_later(dir: &Path, mode: DpopMode, nonce: DpopNonceMode, after: Duration) -> Server {
+    start_at(dir, mode, nonce, after, None).await
+}
+
+/// [`start_later`] with `[server] public_url`, which then is what proofs name in `htu`
+/// ([`Server::htu`]), whatever port the server listens on.
+async fn start_at(
+    dir: &Path,
+    mode: DpopMode,
+    nonce: DpopNonceMode,
+    after: Duration,
+    public_url: Option<&str>,
+) -> Server {
     let upstream = FakeMcpServer::new(&["read_file"]);
     let upstream_task = upstream.spawn().await.unwrap();
     let policy = dir.join("policies.cedar");
@@ -79,13 +107,17 @@ async fn start_with(dir: &Path, mode: DpopMode, nonce: DpopNonceMode) -> Server 
     cfg.token.dpop = mode;
     cfg.token.dpop_nonce = nonce;
     cfg.agents = agent_configs(AGENTS, secret);
-    let (router, state) = attenuo_server::build(&cfg).unwrap();
+    cfg.server.public_url = public_url.map(str::to_owned);
+    let clock = ManualClock::new();
+    clock.advance(after);
+    let (router, state) = attenuo_server::build_with_clock(&cfg, clock.clone()).unwrap();
     Server {
         upstream,
         _upstream_task: upstream_task,
         server: Running::start(cfg, state.clone(), router).await,
         state,
         client: reqwest::Client::new(),
+        clock,
     }
 }
 
@@ -99,6 +131,16 @@ fn proof(key: &DpopKey, url: &str, token: Option<&str>) -> String {
 }
 
 impl Server {
+    /// The server's time.
+    fn now(&self) -> OffsetDateTime {
+        self.clock.now_utc()
+    }
+
+    /// A proof for `POST <url>` at the server's time, covering `token` when given.
+    fn proof(&self, key: &DpopKey, url: &str, token: Option<&str>) -> String {
+        key.proof("POST", url, token, self.now())
+    }
+
     /// Stop this server as `serve` does after a signal; once this returns it has let go of
     /// the SQLite file, so the next server on the same `dir` can start ([`Running::stop`]).
     async fn stop(self) {
@@ -110,9 +152,18 @@ impl Server {
         self.server.url(path)
     }
 
+    /// The URL a proof for `path` names: `[server] public_url` plus the path when it is set.
+    fn htu(&self, path: &str) -> String {
+        match self.state.public_url {
+            Some(_) => self.state.dpop.expected_url(None, path),
+            None => self.url(path),
+        }
+    }
+
     /// `POST /admin/root-token` for alice's planner, bound to `key` when given.
     async fn root(&self, key: Option<&DpopKey>) -> reqwest::Response {
         let url = self.url("/admin/root-token");
+        let htu = self.htu("/admin/root-token");
         let mut req = self.client.post(&url).bearer_auth(ADMIN).json(&json!({
             "subject": "alice",
             "issuer": "https://idp.example",
@@ -120,7 +171,7 @@ impl Server {
             "capabilities": ["github:read_file"],
         }));
         if let Some(k) = key {
-            req = req.header("DPoP", proof(k, &url, None));
+            req = req.header("DPoP", self.proof(k, &htu, None));
         }
         req.send().await.unwrap()
     }
@@ -563,7 +614,13 @@ async fn required_mode_refuses_unbound_exchanges_sr24() {
     let unbound = optional.root_token(None).await;
     let bound = optional.root_token(Some(&key)).await;
     optional.stop().await;
-    let required = start(dir.path(), DpopMode::Required).await;
+    let required = start_later(
+        dir.path(),
+        DpopMode::Required,
+        DpopNonceMode::Off,
+        RESTART_TAKES,
+    )
+    .await;
 
     // `required`: no unbound issuance, no unbound token accepted.
     assert_eq!(refusal(required.root(None).await).await.1, "dpop_required");
@@ -579,7 +636,12 @@ async fn required_mode_refuses_unbound_exchanges_sr24() {
     let url = required.url("/token");
     bound_token(
         required
-            .exchange(&unbound, "coder", Some(proof(&key, &url, None)), None)
+            .exchange(
+                &unbound,
+                "coder",
+                Some(required.proof(&key, &url, None)),
+                None,
+            )
             .await,
     )
     .await;
@@ -587,7 +649,13 @@ async fn required_mode_refuses_unbound_exchanges_sr24() {
     required.stop().await;
 
     // `off`: proofs are ignored at issuance, but a bound token still needs one.
-    let off = start(dir.path(), DpopMode::Off).await;
+    let off = start_later(
+        dir.path(),
+        DpopMode::Off,
+        DpopNonceMode::Off,
+        2 * RESTART_TAKES,
+    )
+    .await;
     let resp = off.root(Some(&key)).await;
     let v: Value = resp.json().await.unwrap();
     assert_eq!(v["token_type"], "Bearer");
@@ -595,7 +663,7 @@ async fn required_mode_refuses_unbound_exchanges_sr24() {
     assert_eq!(refusal(resp).await.1, "dpop_required");
     let mcp = off.url("/mcp/github");
     let resp = off
-        .call(&bound, Some(proof(&key, &mcp, Some(&bound))))
+        .call(&bound, Some(off.proof(&key, &mcp, Some(&bound))))
         .send()
         .await
         .unwrap();
@@ -713,17 +781,33 @@ async fn server_nonce_required_through_the_proxy() {
 
     // A server with the same issuer key accepts the nonce (no shared storage needed); one
     // with nonces off neither sends nor checks them. They run on the same file, so in turn.
+    // A proof made before the restart is refused by the restart fence, nonce or not.
     s.stop().await;
-    let twin = start_with(dir.path(), DpopMode::Optional, DpopNonceMode::Required).await;
+    let twin = start_later(
+        dir.path(),
+        DpopMode::Optional,
+        DpopNonceMode::Required,
+        RESTART_TAKES,
+    )
+    .await;
     let twin_mcp = twin.url("/mcp/github");
-    let p = key.proof_with_nonce("POST", &twin_mcp, Some(&token), Some(&nonce), now());
+    let before = key.proof_with_nonce("POST", &twin_mcp, Some(&token), Some(&nonce), now());
+    let resp = twin.call(&token, Some(before)).send().await.unwrap();
+    assert_eq!(refusal(resp).await.1, "invalid_dpop_proof");
+    let p = key.proof_with_nonce("POST", &twin_mcp, Some(&token), Some(&nonce), twin.now());
     let resp = twin.call(&token, Some(p)).send().await.unwrap();
     assert!(allowed(&resp.json().await.unwrap()));
     twin.stop().await;
-    let off = start(dir.path(), DpopMode::Optional).await;
+    let off = start_later(
+        dir.path(),
+        DpopMode::Optional,
+        DpopNonceMode::Off,
+        2 * RESTART_TAKES,
+    )
+    .await;
     let off_mcp = off.url("/mcp/github");
     let resp = off
-        .call(&token, Some(proof(&key, &off_mcp, Some(&token))))
+        .call(&token, Some(off.proof(&key, &off_mcp, Some(&token))))
         .send()
         .await
         .unwrap();
@@ -775,4 +859,205 @@ async fn action_search_needs_a_proof_for_its_own_url() {
         json!([{"name": "read_file", "properties": {"server": "github"}}]),
         "{v}"
     );
+}
+
+/// The restart fence (`attenuo_server::dpop`): a proof one server accepted is refused by the
+/// next server on the same database file, even right after a quick restart, though the
+/// replay cache is in memory. A new proof is accepted once the clock is past the old server's
+/// liveness marker.
+#[tokio::test]
+async fn a_proof_accepted_before_a_restart_is_refused_after_it() {
+    let dir = tempfile::tempdir().unwrap();
+    // One public URL, so a proof names the same `htu` whatever port each server listens on.
+    let public = Some("http://127.0.0.1");
+    let start = |after| {
+        start_at(
+            dir.path(),
+            DpopMode::Optional,
+            DpopNonceMode::Off,
+            after,
+            public,
+        )
+    };
+    let first = start(Duration::ZERO).await;
+    let key = DpopKey::generate().unwrap();
+    let token = first.root_token(Some(&key)).await;
+    let mcp = first.htu("/mcp/github");
+    let captured = first.proof(&key, &mcp, Some(&token));
+    let resp = first
+        .call(&token, Some(captured.clone()))
+        .send()
+        .await
+        .unwrap();
+    assert!(allowed(&resp.json().await.unwrap()));
+    // Replayed to the same process: the replay cache refuses it.
+    let resp = first
+        .call(&token, Some(captured.clone()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refusal(resp).await.1, "invalid_dpop_proof");
+    first.stop().await;
+
+    // Restarted at once, on the same file and the same clock.
+    let next = start(Duration::ZERO).await;
+    let marker = next.state.leases.dpop_max_iat().unwrap().unwrap();
+    // Not ready while fenced, so a rolling deploy keeps DPoP traffic away; alive all along.
+    let ready = next.client.get(next.url("/readyz")).send().await.unwrap();
+    assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let v: Value = ready.json().await.unwrap();
+    assert_eq!(v["checks"]["dpop_restart_fence"], "fenced", "{v}");
+    let health = next.client.get(next.url("/healthz")).send().await.unwrap();
+    assert_eq!(health.status(), StatusCode::OK);
+    let resp = next
+        .call(&token, Some(captured.clone()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let challenge = resp.headers()["www-authenticate"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        challenge.starts_with("DPoP error=\"invalid_dpop_proof\""),
+        "{challenge}"
+    );
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(v["error"]["data"]["reason"], "invalid_dpop_proof", "{v}");
+    assert_eq!(next.upstream.recorded_calls().len(), 0);
+    // A new proof made now is refused too, until the clock passes the old marker: the cost of
+    // a quick restart. The same holds at `POST /token/renew`, whose `detail` says why.
+    let fresh = next.proof(&key, &mcp, Some(&token));
+    let resp = next.call(&token, Some(fresh)).send().await.unwrap();
+    assert_eq!(refusal(resp).await.1, "invalid_dpop_proof");
+    let resp = next
+        .renew(
+            &token,
+            Some(next.proof(&key, &next.htu("/token/renew"), Some(&token))),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let v: Value = resp.json().await.unwrap();
+    assert_eq!(v["error"], "invalid_dpop_proof", "{v}");
+    assert!(
+        v["detail"]
+            .as_str()
+            .unwrap()
+            .contains("before this server started"),
+        "{v}"
+    );
+
+    // Past the marker (the test moves the server's clock instead of waiting): a new proof
+    // is accepted, and the captured one is still refused, though its `iat` is in the window.
+    let wait = marker + 1 - next.now().unix_timestamp();
+    assert!((1..=25).contains(&wait), "fenced for {wait} s");
+    next.clock.advance(Duration::from_secs(wait.unsigned_abs()));
+    // What the heartbeat would do within 5 s: write the marker at the moved clock.
+    next.state.beat_dpop_liveness().unwrap();
+    let ready = next.client.get(next.url("/readyz")).send().await.unwrap();
+    assert_eq!(ready.status(), StatusCode::OK);
+    let v: Value = ready.json().await.unwrap();
+    assert!(v["checks"].get("dpop_restart_fence").is_none(), "{v}");
+    let resp = next.call(&token, Some(captured)).send().await.unwrap();
+    assert_eq!(refusal(resp).await.1, "invalid_dpop_proof");
+    let fresh = next.proof(&key, &mcp, Some(&token));
+    let resp = next.call(&token, Some(fresh)).send().await.unwrap();
+    assert!(allowed(&resp.json().await.unwrap()));
+    assert_eq!(next.upstream.recorded_calls().len(), 1);
+}
+
+/// The restart fence costs nothing on a new database file, and nothing after a restart that
+/// comes once the old server's marker is in the past.
+#[tokio::test]
+async fn a_new_file_or_a_slow_restart_is_not_fenced() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = start(dir.path(), DpopMode::Optional).await;
+    // A new file has no marker: even a proof made before the server started is accepted.
+    let key = DpopKey::generate().unwrap();
+    let url = first.url("/admin/root-token");
+    let early = key.proof("POST", &url, None, first.now() - Duration::from_secs(60));
+    let resp = first
+        .client
+        .post(&url)
+        .bearer_auth(ADMIN)
+        .header("DPoP", early)
+        .json(&json!({"subject": "alice", "issuer": "https://idp.example",
+            "agent": "planner", "capabilities": ["github:read_file"]}))
+        .send()
+        .await
+        .unwrap();
+    let token = bound_token(resp).await;
+    first.stop().await;
+
+    // Restarted after the marker has passed: a proof made at once is accepted.
+    let next = start_later(
+        dir.path(),
+        DpopMode::Optional,
+        DpopNonceMode::Off,
+        RESTART_TAKES,
+    )
+    .await;
+    let marker = next.state.leases.dpop_max_iat().unwrap().unwrap();
+    assert!(
+        marker > next.now().unix_timestamp(),
+        "a new marker is written at start"
+    );
+    let mcp = next.url("/mcp/github");
+    let resp = next
+        .call(&token, Some(next.proof(&key, &mcp, Some(&token))))
+        .send()
+        .await
+        .unwrap();
+    assert!(allowed(&resp.json().await.unwrap()));
+}
+
+/// A liveness marker behind the clock (here: the clock moved and the heartbeat has not
+/// written yet) refuses proofs with 503 `dpop_liveness_stale` and `Retry-After: 1`, on a REST
+/// route and through the proxy (`-32006`), and the request itself writes nothing.
+#[tokio::test]
+async fn a_stale_liveness_marker_is_a_503_with_retry_after() {
+    for proxy in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let s = start(dir.path(), DpopMode::Optional).await;
+        let key = DpopKey::generate().unwrap();
+        let token = s.root_token(Some(&key)).await;
+        let before = s.state.leases.dpop_max_iat().unwrap();
+        // Past the marker; the heartbeat (every 5 s) has not run yet.
+        s.clock.advance(Duration::from_secs(60));
+        let resp = if proxy {
+            let mcp = s.url("/mcp/github");
+            s.call(&token, Some(s.proof(&key, &mcp, Some(&token))))
+                .send()
+                .await
+                .unwrap()
+        } else {
+            let url = s.url("/token/renew");
+            s.renew(&token, Some(s.proof(&key, &url, Some(&token))))
+                .send()
+                .await
+                .unwrap()
+        };
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "proxy {proxy}"
+        );
+        assert_eq!(resp.headers()["retry-after"], "1", "proxy {proxy}");
+        let v: Value = resp.json().await.unwrap();
+        if proxy {
+            assert_eq!(v["error"]["code"], -32006, "{v}");
+            assert_eq!(v["error"]["data"]["reason"], "dpop_liveness_stale", "{v}");
+        } else {
+            assert_eq!(v["error"], "temporarily_unavailable", "{v}");
+            assert_eq!(v["code"], "dpop_liveness_stale", "{v}");
+        }
+        // The marker is written by the heartbeat (woken now), never by the request; a
+        // heartbeat write that has already happened can only have moved it forward.
+        assert!(s.state.leases.dpop_max_iat().unwrap() >= before);
+        assert_eq!(s.upstream.recorded_calls().len(), 0);
+        s.stop().await;
+    }
 }

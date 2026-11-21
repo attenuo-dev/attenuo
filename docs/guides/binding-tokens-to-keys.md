@@ -48,7 +48,7 @@ CODER=$(ATTENUO_TOKEN="$ROOT" ATTENUO_CLIENT_SECRET=demo-coder-secret \
   --dpop-key coder.jwk --subject-token-dpop-file sign-off.txt --print token)
 ```
 
-The sign-off is good for one exchange (its `jti` is single-use), within `[token] dpop_max_age_seconds` of when it was made, and only for the key and agent it names: whoever intercepts it cannot use it to bind a token to their own key, or exchange as another agent. When one process holds both keys (tests, a single-binary agent), `--subject-dpop-key assistant.jwk` on the exchange makes the sign-off in place.
+The sign-off is good for one exchange (its `jti` is single-use), within `[token] dpop_max_age_seconds` of when it was made, and only for the key and agent it names: whoever intercepts it cannot use it to bind a token to their own key, or exchange as another agent. A sign-off made before a server restart is refused after it, like any proof (see [Limits](#limits)): make a new one. When one process holds both keys (tests, a single-binary agent), `--subject-dpop-key assistant.jwk` on the exchange makes the sign-off in place.
 
 When the child should stay on the parent's key (one agent, two tokens), pass the same file as `--dpop-key` and leave out the sign-off.
 
@@ -129,7 +129,7 @@ A proof is a JWS with header `{"typ": "dpop+jwt", "alg": "EdDSA" or "ES256", "jw
 | --- | --- |
 | `htm` | The request method, `POST` or `GET` |
 | `htu` | The request URL without query or fragment, as the server sees it: `[server] public_url` plus the path. When `public_url` is unset, `http://<Host>` plus the path for a loopback `Host` (`localhost`, `127.0.0.1`, `[::1]`, with any port), and `http://localhost` plus the path for any other `Host`; set `public_url` on any server reached by another name |
-| `iat` | Now, in seconds. Accepted within `[token] dpop_max_age_seconds` (default 300) either side of the server's clock |
+| `iat` | Now, in seconds. Accepted up to `[token] dpop_max_age_seconds` (default 300) behind the server's clock and `dpop_future_skew_seconds` (default 10) ahead of it |
 | `jti` | Unique per proof. A repeated `jti` for the same key is refused |
 | `ath` | base64url(SHA-256(token)), whenever a bound token goes with the request |
 
@@ -140,12 +140,13 @@ Send it as the `DPoP` header (exactly one). For an exchange whose child is bound
 | Situation | Answer |
 | --- | --- |
 | A bound token without a proof | 401 `dpop_required` (MCP: `-32001`, `data.reason` `dpop_required`) |
-| A proof by another key, for another method or URL, too old, replayed, badly signed, or several `DPoP` headers | 401 `invalid_dpop_proof` |
+| A proof by another key, for another method or URL, too old or too far ahead, replayed, made before a quick restart, badly signed, or several `DPoP` headers | 401 `invalid_dpop_proof` |
 | Exchanging a bound parent without binding the child | 401 `dpop_required` |
 | Binding the child to a new key without `subject_token_dpop` | 401 `dpop_required` |
 | A `subject_token_dpop` that names another key or agent, or none | 401 `invalid_dpop_proof` |
 | `[token] dpop = "required"` and a request without a proof, or an unbound token | 401 `dpop_required` |
 | The replay cache is full (`[token] dpop_replay_capacity`) | 503 `temporarily_unavailable` (`dpop_replay_cache_full`); at the proxy, HTTP 503 with JSON-RPC `-32006` (`data.reason` `dpop_replay_cache_full`) and `Retry-After` |
+| The server's liveness marker is behind its clock (see Limits) | 503 `temporarily_unavailable` (`dpop_liveness_stale`) with `Retry-After: 1`; at the proxy, JSON-RPC `-32006` with the same `data.reason` |
 
 Each 401 carries `WWW-Authenticate: DPoP error="…", algs="EdDSA ES256"`. Audit records of requests made with a bound token, and of issuances that bound a token, carry `"dpop_bound": true`.
 
@@ -154,7 +155,8 @@ Each 401 carries `WWW-Authenticate: DPoP error="…", algs="EdDSA ES256"`. Audit
 ```toml
 [token]
 dpop = "optional"            # "off": never bind new tokens; "required": every token must be bound
-dpop_max_age_seconds = 300   # how far a proof's iat may be from the server's clock
+dpop_max_age_seconds = 300   # how far a proof's iat may be behind the server's clock
+dpop_future_skew_seconds = 10 # how far it may be ahead (unset: 10, or the max age if smaller)
 dpop_replay_capacity = 1000000
 dpop_nonce = "off"           # "required": every proof must carry the server's current nonce
 ```
@@ -171,7 +173,14 @@ The server keeps no nonce state. A nonce is an HMAC of the current time bucket (
 
 ## Limits
 
-- Proof replay protection is in memory, per process. With several server replicas, a proof could be replayed against another replica within the `iat` window, and after a restart a proof made before it can be replayed once until its `iat` is older than `dpop_max_age_seconds`. Proof `jti`s are not written to the database because every proxied call with a bound token checks one, and a write per call would slow every call; the single-use credentials of `POST /token` and approvals are written there and survive a restart.
+- Proof replay protection is in memory, per process. With several server replicas, a proof could be replayed against another replica within the `iat` window. Proof `jti`s are not written to the database because every proxied call with a bound token checks one, and a write per call would slow every call; the single-use credentials of `POST /token` and approvals are written there and survive a restart.
+- A proof made before a restart is refused after it, with 401 `invalid_dpop_proof`, whether the restart was quick or slow. The server writes a liveness marker to its database file at start and every 5 seconds, and the next server on the file refuses every proof the previous one could have accepted. This includes an exchange sign-off (`subject_token_dpop`) made ahead of time, and a request a client retries across a deploy with the same proof: make a new proof.
+- Proofs made after the start can be refused too, right after a quick restart: until the clock passes the old marker, which is up to about 21 seconds with the defaults (`dpop_future_skew_seconds` plus 11). A client whose clock is slow waits longer. `/readyz` answers 503 (`checks.dpop_restart_fence` `"fenced"`) for that time, so a rolling deploy sends the new server no traffic yet. A start more than about 20 seconds after the old server's last marker write costs nothing, and so does a new database file. With `sqlite_path = ":memory:"` there is no marker and no fence. If the clock went back between the two runs, proofs are refused until it passes the old marker again.
+- The marker only moves forward. If the clock was far ahead when it was written (a VM resumed with a wrong clock, say), every proof is refused until the clock catches up, and the server logs an error at start. To recover: stop the server, run `sqlite3 /var/lib/attenuo/audit.sqlite "DELETE FROM audit_meta WHERE key = 'dpop_max_iat'"` (your `[audit] sqlite_path`), and start it again. That one start is not fenced.
+- These starts are not fenced either: the first start of this version on a file used by an older one, and a start on a restored older backup or a replaced file, since the marker there is older than the proofs the last server accepted.
+- The heartbeat runs whatever `[token] dpop` says, because bound tokens are checked in every mode. A failed first write stops the start-up. Later, if a write fails (a full disk, a broken file), the server retries every half second and refuses proofs with 503 `dpop_liveness_stale` and `Retry-After: 1` once the marker falls behind its clock, rather than accept proofs a later restart could not fence. No request writes the marker.
+- The CLI and both SDKs do not retry `invalid_dpop_proof` (they retry only `use_dpop_nonce`). A call made during the fence fails; the next call makes a new proof and works once the fence has passed. Server nonces survive a restart, so they neither help nor hurt here.
+- A proof's `iat` may be at most `dpop_future_skew_seconds` ahead of the server's clock: 10 by default, or `dpop_max_age_seconds` when that is smaller. A client whose clock runs further ahead is refused until its clock is fixed.
 - Server nonces are off by default; freshness then rests on `iat` and the `jti` cache. With nonces on, a nonce is shared by every client of the server for its lifetime, so it limits how far ahead a proof can be made. It does not stop the cross-replica replay above.
 - Binding is checked by the server and the built-in proxy. An external enforcement point that verifies tokens itself must check proofs too, or ask the AuthZEN endpoint with the token and a proof.
 - Cedar policies cannot see whether a call was bound yet; only the audit record says so.
