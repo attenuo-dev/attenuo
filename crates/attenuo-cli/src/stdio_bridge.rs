@@ -735,12 +735,12 @@ pub(crate) fn check_listen(addr: SocketAddr, allow_non_loopback: bool) -> Result
     Ok(())
 }
 
-/// Resolve on SIGINT, SIGTERM, SIGHUP or SIGQUIT.
+/// Resolve on SIGINT, SIGTERM, SIGHUP or SIGQUIT. `attenuo connect` stops on the same.
 ///
-/// SIGHUP and SIGQUIT are here because the child is in a process group of its own: a
+/// For the bridge, SIGHUP and SIGQUIT are here because the child is in a process group of its own: a
 /// closing terminal or Ctrl-\ reaches the bridge and no longer the child, so the bridge
 /// has to stop the child itself.
-async fn stop_signal() {
+pub(crate) async fn stop_signal() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
@@ -765,10 +765,11 @@ async fn stop_signal() {
     }
 }
 
-/// Kills the child's process group when dropped, unless [`stop_child`] already stopped it:
+/// Kills the child's process group when dropped, unless [`stop_child`] already stopped it
+/// (`attenuo connect` uses it for the token command):
 /// an early return or a panic between starting the child and stopping it must not leave
 /// the processes the child started behind (`kill_on_drop` covers the child alone).
-struct GroupGuard(Option<u32>);
+pub(crate) struct GroupGuard(pub(crate) Option<u32>);
 
 impl Drop for GroupGuard {
     fn drop(&mut self) {

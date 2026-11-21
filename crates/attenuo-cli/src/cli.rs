@@ -192,6 +192,70 @@ pub(crate) enum Command {
     /// read-only). For trying attenuo on one machine: the configuration
     /// listens on loopback with the development root mint on. Talks to no attenuo server.
     Init(InitArgs),
+    /// Speak MCP over STDIO for a desktop MCP client (Claude Desktop, Claude Code, Cursor)
+    /// and forward every message to the proxy at `<--server>/mcp/<--upstream>` over
+    /// Streamable HTTP, with a fresh delegation token as the bearer. The client starts it as
+    /// a command. It gets a new token from `--token-command` or `--token-file` before the old
+    /// one runs out, renews the lease, and writes only MCP messages on stdout; everything it
+    /// logs goes to stderr. Runs until stdin ends or a stop signal (exit 0); exits 1
+    /// before reading stdin when no token can be had.
+    Connect(ConnectArgs),
+}
+
+/// `attenuo connect`. Its `Debug` leaves out the token command, which may hold a secret.
+#[derive(Args)]
+pub(crate) struct ConnectArgs {
+    /// MCP upstream name, as mounted at `/mcp/<name>`.
+    #[arg(long, value_name = "NAME")]
+    pub upstream: String,
+    /// A program and its arguments, as one string, that prints a delegation token on the
+    /// first line of its stdout. It is split into words the way a shell would (spaces,
+    /// `'...'`, `"..."`, `\`), but no shell runs it: no variables, globs or pipes. It runs at
+    /// start and whenever a new token is needed, with this process's environment, no stdin,
+    /// and its stderr on ours. Its arguments are never logged.
+    #[arg(long, value_name = "CMD", conflicts_with = "token_file")]
+    pub token_command: Option<String>,
+    /// Read the delegation token from the first line of this file, again whenever a new
+    /// token is needed (something else keeps the file fresh).
+    #[arg(long, value_name = "PATH")]
+    pub token_file: Option<std::path::PathBuf>,
+    /// How long `--token-command` may run, in seconds, before it is killed and counts as
+    /// failed.
+    #[arg(long, value_name = "SECS", default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..=600), requires = "token_command")]
+    pub token_command_timeout: u64,
+    /// How long one request may take, answer included (a streamed answer too), in seconds.
+    /// Past it the client gets a JSON-RPC error with the request's id.
+    #[arg(long, value_name = "SECS", default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..=86400))]
+    pub timeout: u64,
+    /// Largest single message, in bytes: a line from stdin, a JSON answer, or one event of a
+    /// streamed answer.
+    #[arg(long, value_name = "BYTES", default_value_t = 16 * 1024 * 1024, value_parser = clap::value_parser!(u64).range(1024..=(1 << 30)))]
+    pub max_message_bytes: u64,
+    /// Most bytes read from the streamed (SSE) answer to one request, all events together.
+    #[arg(long, value_name = "BYTES", default_value_t = 64 * 1024 * 1024, value_parser = clap::value_parser!(u64).range(1024..=(1 << 34)))]
+    pub max_stream_bytes: u64,
+    /// Most requests waiting for an answer at once. A request over the limit gets a JSON-RPC
+    /// error at once and is not sent.
+    #[arg(long, value_name = "N", default_value_t = 64, value_parser = clap::value_parser!(u64).range(1..=4096))]
+    pub max_in_flight: u64,
+}
+
+impl std::fmt::Debug for ConnectArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectArgs")
+            .field("upstream", &self.upstream)
+            .field(
+                "token_command",
+                &self.token_command.as_ref().map(|_| "<redacted>"),
+            )
+            .field("token_file", &self.token_file)
+            .field("token_command_timeout", &self.token_command_timeout)
+            .field("timeout", &self.timeout)
+            .field("max_message_bytes", &self.max_message_bytes)
+            .field("max_stream_bytes", &self.max_stream_bytes)
+            .field("max_in_flight", &self.max_in_flight)
+            .finish()
+    }
 }
 
 /// `attenuo init`.
