@@ -45,7 +45,9 @@ So give the client a command: [`attenuo connect`](../reference/cli.md#connect---
 attenuo --server http://127.0.0.1:8080 connect --upstream github --token-command 'CMD ARGS...'
 ```
 
-The token command is one string, split into words like a shell would, but no shell runs it. Its first line of output is the token. Instead of a command you can pass `--token-file PATH`, a file that something else keeps fresh, or set `ATTENUO_TOKEN`, which is used as it is and stops working when it expires. If no token can be had at start, the connector exits 1 with a message on stderr before it reads anything.
+The token command is one string, split into words like a shell would, but no shell runs it. Its first line of output is the token. A backslash is an escape in that string, so on Windows write paths with forward slashes or in single quotes. Instead of a command you can pass `--token-file PATH`, a file that something else keeps fresh, or set `ATTENUO_TOKEN`, which is used as it is and stops working when it expires. If no token can be had at start, or the token has expired, the connector exits 1 with a message on stderr before it reads anything.
+
+Two things a desktop client does not do for itself. When the proxy restarts and forgets the MCP session, the connector opens a new one with the client's own `initialize`, and the client carries on. When the lease is revoked (`attenuo lease revoke`), the connector answers what is in flight with an error and exits with status 3, so the client shows the server as stopped. It never gets a new token after a revocation.
 
 ### A worked example on one machine
 
@@ -304,7 +306,7 @@ How to use it:
 - Renew your own hop only. The bearer is your token, and only the last hop's lease is extended. A parent's lease is the parent's job.
 - Renew at about a third of `lease_interval_seconds` (default 300, so about every 100 seconds). The response's `expires_in` tells you the real window. Use it instead of a hard-coded number.
 - The new expiry is the shortest of now plus the interval, the token's own `exp`, and the parent lease's expiry. It never shortens an existing lease. When the token itself is about to expire, renewing cannot help. Ask for a new token through an exchange.
-- Renewal fails with `400 invalid_grant` and `code` `lease_revoked`, `lease_expired` or `lease_unknown` when the lease or an ancestor is in that state. Branch on `code`, not on `detail`, which is text for people. A revoked lease is final. Stop.
+- Renewal fails with `400 invalid_grant` and `code` `lease_revoked` when your lease or an ancestor's is revoked, and `lease_unknown` when one of them is not known. Your own lease may have lapsed: renewal repairs that. So `lease_expired` means an ancestor's lease has run out, and only a new token from the parent helps. Branch on `code`, not on `detail`, which is text for people. A revoked lease is final. Stop.
 - An expired token gets 401. Mint a new one.
 - Every renewal is one audit row. Do not renew faster than you need to.
 

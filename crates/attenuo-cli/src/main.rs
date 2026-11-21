@@ -157,7 +157,10 @@ async fn run(cli: Cli) -> Result<Outcome> {
         // Talks to no attenuo server.
         Command::StdioBridge(a) => stdio_bridge::run(a).await.map(|()| Outcome::Ok),
         Command::Init(a) => init_cmd::run(a).await.map(|()| Outcome::Ok),
-        Command::Connect(a) => connect::run(&cli.server, a).await.map(|()| Outcome::Ok),
+        Command::Connect(a) => connect::run(&cli.server, a).await.map(|code| match code {
+            0 => Outcome::Ok,
+            code => Outcome::Exit(code),
+        }),
         Command::Admin(AdminCmd::Operator(OperatorCmd::New {
             name,
             role,

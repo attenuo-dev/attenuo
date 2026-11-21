@@ -202,8 +202,8 @@ pub(crate) enum Command {
     Connect(ConnectArgs),
 }
 
-/// `attenuo connect`.
-#[derive(Debug, Args)]
+/// `attenuo connect`. Its `Debug` leaves out the token command, which may hold a secret.
+#[derive(Args)]
 pub(crate) struct ConnectArgs {
     /// MCP upstream name, as mounted at `/mcp/<name>`.
     #[arg(long, value_name = "NAME")]
@@ -238,6 +238,24 @@ pub(crate) struct ConnectArgs {
     /// error at once and is not sent.
     #[arg(long, value_name = "N", default_value_t = 64, value_parser = clap::value_parser!(u64).range(1..=4096))]
     pub max_in_flight: u64,
+}
+
+impl std::fmt::Debug for ConnectArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectArgs")
+            .field("upstream", &self.upstream)
+            .field(
+                "token_command",
+                &self.token_command.as_ref().map(|_| "<redacted>"),
+            )
+            .field("token_file", &self.token_file)
+            .field("token_command_timeout", &self.token_command_timeout)
+            .field("timeout", &self.timeout)
+            .field("max_message_bytes", &self.max_message_bytes)
+            .field("max_stream_bytes", &self.max_stream_bytes)
+            .field("max_in_flight", &self.max_in_flight)
+            .finish()
+    }
 }
 
 /// `attenuo init`.

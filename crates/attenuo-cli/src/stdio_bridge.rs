@@ -765,10 +765,11 @@ pub(crate) async fn stop_signal() {
     }
 }
 
-/// Kills the child's process group when dropped, unless [`stop_child`] already stopped it:
+/// Kills the child's process group when dropped, unless [`stop_child`] already stopped it
+/// (`attenuo connect` uses it for the token command):
 /// an early return or a panic between starting the child and stopping it must not leave
 /// the processes the child started behind (`kill_on_drop` covers the child alone).
-struct GroupGuard(Option<u32>);
+pub(crate) struct GroupGuard(pub(crate) Option<u32>);
 
 impl Drop for GroupGuard {
     fn drop(&mut self) {
