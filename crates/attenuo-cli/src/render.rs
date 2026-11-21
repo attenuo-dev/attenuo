@@ -220,8 +220,8 @@ fn strs(v: &Value) -> Vec<&str> {
 /// Decisions, token issuance, lease and admin records print `ALLOW`/`DENY` and the reason as
 /// they always did (the latter three name themselves in `server/tool`, e.g.
 /// `attenuo/token.exchange`). The records that are not decisions but would read like one,
-/// `tool_result`, `approval_request` and `approval_grant`, print their kind in place of
-/// `ALLOW`/`DENY` and the details that matter for that kind.
+/// `tool_result`, `approval_request`, `approval_grant` and `search`, print their kind in place
+/// of `ALLOW`/`DENY` and the details that matter for that kind.
 pub(crate) fn fmt_audit_entry(e: &Value) -> String {
     let r = &e["record"];
     let agents = strs(&r["agents"]);
@@ -267,6 +267,14 @@ pub(crate) fn fmt_audit_entry(e: &Value) -> String {
                 s(a, "outcome"),
                 s(a, "by")
             )
+        }
+        "search" => {
+            let n = |key: &str| {
+                r["search"][key]
+                    .as_u64()
+                    .map_or("-".to_string(), |n| n.to_string())
+            };
+            format!("evaluated={} permitted={}", n("evaluated"), n("permitted"))
         }
         _ => String::new(),
     };
@@ -938,6 +946,20 @@ mod tests {
         declined["record"]["approval"]["outcome"] = json!("decline");
         declined["record"]["approval"]["by"] = json!("user");
         assert!(fmt_audit_entry(&declined).contains("outcome=decline by=user"));
+    }
+
+    #[test]
+    fn search_line_names_its_kind_and_counts() {
+        let e = entry(
+            8,
+            "search",
+            json!({"reason": "search_answered", "tool": "authzen.search",
+                   "search": {"evaluated": 4, "permitted": 3}}),
+        );
+        assert_eq!(
+            fmt_audit_entry(&e),
+            "#8    2026-10-24T10:00:00Z  search  github/authzen.search  planner > coder for alice  evaluated=4 permitted=3  id=rec1"
+        );
     }
 
     #[test]

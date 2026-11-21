@@ -65,11 +65,16 @@ pub enum RecordKind {
     /// Carries [`DecisionRecord::approval`] (id, call hash, approver, outcome, expiry). Using a
     /// granted approval is recorded on the decision that consumed it.
     ApprovalGrant,
+    /// An AuthZEN action search was answered (`POST /access/v1/search/action`, SR-117): one
+    /// record per request, not per candidate, with tool `authzen.search`. Not a decision: it
+    /// allows nothing and charges nothing. Carries [`DecisionRecord::search`] (how many
+    /// candidates were evaluated and how many were permitted).
+    Search,
 }
 
 impl RecordKind {
     /// Every kind, in declaration order.
-    pub const ALL: [RecordKind; 9] = [
+    pub const ALL: [RecordKind; 10] = [
         RecordKind::Decision,
         RecordKind::Exchange,
         RecordKind::RootToken,
@@ -79,10 +84,11 @@ impl RecordKind {
         RecordKind::ToolResult,
         RecordKind::ApprovalRequest,
         RecordKind::ApprovalGrant,
+        RecordKind::Search,
     ];
 
     /// The wire string (`decision`, `exchange`, `root_token`, `lease_renew`, `lease_revoke`,
-    /// `admin`, `tool_result`, `approval_request`, `approval_grant`).
+    /// `admin`, `tool_result`, `approval_request`, `approval_grant`, `search`).
     pub fn as_str(&self) -> &'static str {
         match self {
             RecordKind::Decision => "decision",
@@ -94,6 +100,7 @@ impl RecordKind {
             RecordKind::ToolResult => "tool_result",
             RecordKind::ApprovalRequest => "approval_request",
             RecordKind::ApprovalGrant => "approval_grant",
+            RecordKind::Search => "search",
         }
     }
 }
@@ -198,6 +205,66 @@ pub struct DecisionRecord {
     /// the hashes of older records unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<RecordUsage>,
+    /// For a [`RecordKind::Search`] record: how many candidate tools the search evaluated and
+    /// how many it returned as permitted. Absent on every other kind, which keeps the hashes of
+    /// older records unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search: Option<SearchInfo>,
+    /// For a [`RecordKind::RootToken`] record of an IdP intake under `[idps.id_jag_ceiling]`:
+    /// which claims of the ID-JAG narrowed the root grant and a digest of their values
+    /// (SR-126). Absent on every other record, an ID token's intake and an intake without the
+    /// ceiling included, which keeps the hashes of older records unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id_jag_ceiling: Option<CeilingInfo>,
+}
+
+/// What a [`RecordKind::Search`] record says about one action search (see
+/// [`DecisionRecord::search`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct SearchInfo {
+    /// Candidate tools evaluated on this page.
+    pub evaluated: u64,
+    /// Of those, the tools returned as permitted (the answer's `page.count`).
+    pub permitted: u64,
+}
+
+/// What a root token record says about the ID-JAG ceiling (see
+/// [`DecisionRecord::id_jag_ceiling`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CeilingInfo {
+    /// The ID-JAG claims that narrowed the root grant (`resource`, `scope`,
+    /// `authorization_details`), in that order: the ones the ID-JAG carried with a value other
+    /// than `null`. Empty when the ceiling applied but the ID-JAG carried none of them, so the
+    /// root grant was kept as it is.
+    pub claims: Vec<String>,
+    /// SHA-256 (hex) of the RFC 8785 canonical JSON of an object mapping each name in
+    /// `claims` to its full value in the verified ID-JAG ([`crate::digest::sha256_json`], as
+    /// for `arguments_digest`). With no claims, the digest of `{}`.
+    pub claims_digest: String,
+}
+
+impl CeilingInfo {
+    /// The ceiling member for the claims `names` of the verified ID-JAG `claims`. A name the
+    /// claims do not hold maps to `null`.
+    pub fn new<'a>(
+        names: impl IntoIterator<Item = &'a str>,
+        claims: &serde_json::Map<String, serde_json::Value>,
+    ) -> Self {
+        let names: Vec<String> = names.into_iter().map(str::to_owned).collect();
+        let values: serde_json::Map<String, serde_json::Value> = names
+            .iter()
+            .map(|n| {
+                (
+                    n.clone(),
+                    claims.get(n).cloned().unwrap_or(serde_json::Value::Null),
+                )
+            })
+            .collect();
+        Self {
+            claims_digest: crate::digest::sha256_json(&values),
+            claims: names,
+        }
+    }
 }
 
 /// What a decision record says about run usage (see [`DecisionRecord::usage`]): the figures
@@ -482,7 +549,21 @@ impl DecisionRecord {
             approval: None,
             budget: None,
             usage: None,
+            search: None,
+            id_jag_ceiling: None,
         }
+    }
+
+    /// Attach what an action search evaluated and permitted ([`DecisionRecord::search`]).
+    pub fn with_search(mut self, search: SearchInfo) -> Self {
+        self.search = Some(search);
+        self
+    }
+
+    /// Attach the ID-JAG ceiling of a root token intake ([`DecisionRecord::id_jag_ceiling`]).
+    pub fn with_id_jag_ceiling(mut self, ceiling: CeilingInfo) -> Self {
+        self.id_jag_ceiling = Some(ceiling);
+        self
     }
 
     /// Attach the run's labels; empty labels leave the field absent.
@@ -529,3 +610,6 @@ pub const REASON_APPROVAL_INVALID: &str = "approval_invalid";
 
 /// `reason` of every [`RecordKind::ToolResult`] record.
 pub const REASON_TOOL_RESULT: &str = "tool_result";
+
+/// `reason` of every [`RecordKind::Search`] record: an AuthZEN action search was answered.
+pub const REASON_SEARCH_ANSWERED: &str = "search_answered";

@@ -1109,7 +1109,8 @@ async fn unsigned_authzen_chains_need_a_pep_and_an_issued_chain() {
 /// Action search takes the same unsigned-chain path as evaluation: with `allow_unsigned_chain`,
 /// a `[[peps]]` entry may search for a chain this server issued, and answers come from that
 /// chain's capabilities. A PEP without its credentials, or a chain the server did not issue, is
-/// refused as at evaluation, and no search (accepted or refused) writes an audit record.
+/// refused as at evaluation. Each accepted search writes one `search` record for its chain (SR-117)
+/// and a refused one writes none.
 #[tokio::test]
 async fn unsigned_authzen_chains_can_search_actions_from_a_pep() {
     let h = Harness::start_tweaked(false, |cfg| {
@@ -1222,11 +1223,24 @@ async fn unsigned_authzen_chains_can_search_actions_from_a_pep() {
         assert_eq!(err["error"], "chain_not_issued", "{name}: {err}");
     }
 
+    let after = h.audit_entries().await;
+    let written: Vec<&Value> = after[before..].iter().map(|e| &e["record"]).collect();
     assert_eq!(
-        h.audit_entries().await.len(),
-        before,
-        "a search, accepted or refused, writes no audit record"
+        written.len(),
+        2,
+        "the two accepted searches write a record each, the refused ones none: {written:?}"
     );
+    let chain_id = attenuo_core::chain_id_of(&chain).unwrap();
+    for (r, agents) in written
+        .iter()
+        .zip([json!(["planner", "coder"]), json!(["planner"])])
+    {
+        assert_eq!(r["kind"], "search", "{r}");
+        assert_eq!(r["tool"], "authzen.search", "{r}");
+        assert_eq!(r["server"], "github", "{r}");
+        assert_eq!(r["chain_id"], chain_id.as_str(), "{r}");
+        assert_eq!(r["agents"], agents, "{r}");
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2929,6 +2943,8 @@ fn append_synthetic(h: &Harness, n: usize) {
             approval: None,
             budget: None,
             usage: None,
+            search: None,
+            id_jag_ceiling: None,
         };
         h.state.audit.append(record).unwrap();
     }

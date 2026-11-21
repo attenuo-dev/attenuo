@@ -47,10 +47,11 @@
 //! token's `exp` (`actor_token_expired`); use the credential and the actor token once
 //! ([`crate::replay`], `replayed`); then `Issuer::issue_root`, register the lease, and audit
 //! as `token.root` / `token_issued`, with `agent_auth` and the actor token's subject and trust
-//! entry in the record's arguments.
+//! entry in the record's arguments, and, under `[idps.id_jag_ceiling]`, the record's
+//! `id_jag_ceiling` member (the claims that narrowed and a digest of their values, SR-126).
 
 use attenuo_audit::LeaseRegistry;
-use attenuo_core::{AgentId, CapabilitySet};
+use attenuo_core::{AgentId, CapabilitySet, CeilingInfo};
 use attenuo_token::{ExchangeResponse, AUTHORIZATION_DETAILS_TYPE, TOKEN_EXCHANGE_GRANT_TYPE};
 use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
@@ -70,7 +71,7 @@ use crate::error::{
     LIMIT_SPLIT_AT_ROOT,
 };
 use crate::routes::token::take_actor_token;
-use crate::routes::{audit_issuance, no_store, register_issued};
+use crate::routes::{audit_issuance_with, no_store, register_issued};
 use crate::state::AppState;
 
 /// Does this `/token` request carry an IdP credential (rather than an attenuo token)?
@@ -256,6 +257,7 @@ pub(crate) async fn handle(
     let Narrowed {
         capabilities,
         ceiling_claims,
+        ceiling_record,
         ceiling_log,
     } = narrowed?;
     let may_act = grant
@@ -353,9 +355,17 @@ pub(crate) async fn handle(
                 args["actor_subject"] = subject.into();
                 args["actor_trust"] = trust.into();
             }
-            if let Err(e) =
-                audit_issuance(state, "token.root", &issued.chain, args, dpop_bound, now)
-            {
+            // The same claims as a readable member of the record, with a digest of their full
+            // values (SR-126); absent without the ceiling, so other records are unchanged.
+            if let Err(e) = audit_issuance_with(
+                state,
+                "token.root",
+                &issued.chain,
+                args,
+                dpop_bound,
+                ceiling_record,
+                now,
+            ) {
                 let _ = state.leases.revoke(&issued.lease, "audit_error", now);
                 return Err(e);
             }
@@ -392,10 +402,12 @@ const CONFLICT_OF_THE_CLAIMS: &str = "a requested capability is under one or mor
      capabilities of the ID-JAG's claims whose limits one capability cannot carry together";
 
 /// What [`narrow`] gives: the root token's capabilities and, under `[idps.id_jag_ceiling]`,
-/// the claims that narrowed (for the record) and their names and values (for the log line).
+/// the claims that narrowed (for the record's arguments and its `id_jag_ceiling` member) and
+/// their names and values (for the log line).
 pub(crate) struct Narrowed {
     pub(crate) capabilities: CapabilitySet,
     ceiling_claims: Option<Vec<&'static str>>,
+    ceiling_record: Option<CeilingInfo>,
     ceiling_log: Option<(String, String)>,
 }
 
@@ -600,15 +612,20 @@ pub(crate) fn narrow_with(
                 applied.claims.join(","),
                 ceiling_claim_values(&applied.claims, claims),
             ));
+            // The full values, not the log line's cut ones: the digest lets an investigation
+            // check the claims of an ID-JAG it holds against the record (SR-126).
+            let ceiling_record = Some(CeilingInfo::new(applied.claims.iter().copied(), claims));
             Ok(Narrowed {
                 capabilities: narrowed,
                 ceiling_claims: Some(applied.claims),
+                ceiling_record,
                 ceiling_log,
             })
         }
         None => Ok(Narrowed {
             capabilities,
             ceiling_claims: None,
+            ceiling_record: None,
             ceiling_log: None,
         }),
     }

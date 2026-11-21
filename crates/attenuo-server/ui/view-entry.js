@@ -60,7 +60,25 @@ function verdict(entry) {
       ['DPoP-bound', r.dpop_bound ? 'yes' : 'no'],
       ['Run tainted by', taintedBy(r.labels)],
       ['Untrusted arguments', untrustedArgs(r.labels && r.labels.untrusted_args)],
+      ['Action search', searchCounts(r.search)],
+      ['ID-JAG ceiling', ceilingClaims(r.id_jag_ceiling)],
     ]));
+}
+
+// search (kind `search`, SR-117): how many candidate tools one action search evaluated and
+// how many it returned as permitted. Not a decision.
+function searchCounts(search) {
+  if (!search) return undefined;
+  return `${search.evaluated} evaluated, ${search.permitted} permitted`;
+}
+
+// id_jag_ceiling (a root_token record, SR-126): the ID-JAG claims that narrowed the root
+// grant and the digest of their values. Claim names come from the server's own list.
+function ceilingClaims(ceiling) {
+  if (!ceiling) return undefined;
+  const claims = Array.isArray(ceiling.claims) ? ceiling.claims : [];
+  const names = claims.length ? claims.join(', ') : 'none (the grant was kept as it is)';
+  return h('span', null, names, ' ', h('span', { class: 'muted small' }, 'claims digest '), short(ceiling.claims_digest, 16));
 }
 
 // labels.tainted_by: seqs of the tool_result records that tainted the run.

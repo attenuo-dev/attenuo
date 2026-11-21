@@ -86,7 +86,10 @@ export interface SelectorRevocation {
 
 /** Filters for `auditExport`; the ones you set combine with AND. */
 export interface AuditExportFilter {
-  /** `decision`, `tool_result`, `exchange`, `root_token`, `lease_renew`, `lease_revoke` or `admin`. */
+  /**
+   * `decision`, `tool_result`, `approval_request`, `approval_grant`, `exchange`, `root_token`,
+   * `lease_renew`, `lease_revoke`, `admin` or `search`.
+   */
   kind?: string;
   /** The delegation chain: the lease id of its first hop. */
   chainId?: string;
@@ -115,8 +118,9 @@ export interface AuditEntry {
    */
   dpopBound: boolean;
   /**
-   * What sort of event the record is: `decision`, `exchange`, `root_token`, `lease_renew`,
-   * `lease_revoke` or `admin`.
+   * What sort of event the record is: `decision`, `tool_result`, `approval_request`,
+   * `approval_grant`, `exchange`, `root_token`, `lease_renew`, `lease_revoke`, `admin` or
+   * `search` (one AuthZEN action search, not a decision).
    */
   kind: string | undefined;
   /** The lease id of the delegation chain's first hop (undefined for admin records). */
@@ -191,7 +195,10 @@ export interface AuditQuery {
   cursor?: string;
   /** Page size (server default 100, at most 1000). */
   limit?: number;
-  /** One kind or several: `decision`, `exchange`, `root_token`, `lease_renew`, `lease_revoke`, `admin`. */
+  /**
+   * One kind or several: `decision`, `tool_result`, `approval_request`, `approval_grant`,
+   * `exchange`, `root_token`, `lease_renew`, `lease_revoke`, `admin`, `search`.
+   */
   kind?: string | readonly string[];
   decision?: Decision;
   reason?: string;
@@ -964,8 +971,8 @@ export class AdminClient {
    * `checkpoint` objects, each tagged with `type`. Write the raw lines to a file and check it
    * offline with `verifyExport`.
    *
-   * `filter.kind` (`decision`, `tool_result`, `exchange`, `root_token`, `lease_renew`,
-   * `lease_revoke`, `admin`), `filter.chainId`, `filter.tool` (for example `token.exchange`)
+   * `filter.kind` (`decision`, `tool_result`, `approval_request`, `approval_grant`,
+   * `exchange`, `root_token`, `lease_renew`, `lease_revoke`, `admin`, `search`), `filter.chainId`, `filter.tool` (for example `token.exchange`)
    * and `filter.decision` (`allow` or `deny`) keep only matching entries, combined with AND.
    * The header then carries a `filter` naming them and the file cannot be verified (its chain
    * has gaps): verify an unfiltered export, then filter. An unknown kind or decision, or an

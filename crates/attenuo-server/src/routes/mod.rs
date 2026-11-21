@@ -187,6 +187,8 @@ pub(crate) fn audit_admin(
         approval: None,
         budget: None,
         usage: None,
+        search: None,
+        id_jag_ceiling: None,
     };
     let id = record.id;
     state
@@ -210,19 +212,29 @@ pub(crate) fn audit_issuance(
     dpop_bound: bool,
     now: OffsetDateTime,
 ) -> Result<uuid::Uuid, ApiError> {
-    let id = audit_event(
-        state,
-        if tool == "token.root" {
-            RecordKind::RootToken
-        } else {
-            RecordKind::Exchange
-        },
-        tool,
-        chain,
-        arguments,
-        dpop_bound,
-        now,
-    )?;
+    audit_issuance_with(state, tool, chain, arguments, dpop_bound, None, now)
+}
+
+/// [`audit_issuance`], with the record's `id_jag_ceiling` member for a root token minted
+/// under `[idps.id_jag_ceiling]` (SR-126). `None` gives exactly the record of
+/// [`audit_issuance`].
+pub(crate) fn audit_issuance_with(
+    state: &AppState,
+    tool: &str,
+    chain: &DelegationChain,
+    arguments: Value,
+    dpop_bound: bool,
+    ceiling: Option<attenuo_core::CeilingInfo>,
+    now: OffsetDateTime,
+) -> Result<uuid::Uuid, ApiError> {
+    let kind = if tool == "token.root" {
+        RecordKind::RootToken
+    } else {
+        RecordKind::Exchange
+    };
+    let mut record = event_record(kind, tool, chain, arguments, dpop_bound, now);
+    record.id_jag_ceiling = ceiling;
+    let id = append_audit(state, record)?;
     state.metrics.token_issued(if tool == "token.root" {
         TokenKind::Root
     } else {
@@ -243,13 +255,36 @@ pub(crate) fn audit_event(
     dpop_bound: bool,
     now: OffsetDateTime,
 ) -> Result<uuid::Uuid, ApiError> {
+    append_audit(
+        state,
+        event_record(kind, tool, chain, arguments, dpop_bound, now),
+    )
+}
+
+/// The record [`audit_event`] appends.
+fn event_record(
+    kind: RecordKind,
+    tool: &str,
+    chain: &DelegationChain,
+    arguments: Value,
+    dpop_bound: bool,
+    now: OffsetDateTime,
+) -> DecisionRecord {
     let reason = match kind {
         RecordKind::LeaseRenew => REASON_LEASE_RENEWED,
         _ => REASON_TOKEN_ISSUED,
     };
     let call = ToolCall::new(AUDIT_SERVER, tool, arguments).with_dpop_bound(dpop_bound);
-    let record =
-        DecisionRecord::new(now, Decision::Allow, reason, chain, &call, Vec::new()).with_kind(kind);
+    DecisionRecord::new(now, Decision::Allow, reason, chain, &call, Vec::new()).with_kind(kind)
+}
+
+/// Append `record` to the audit log, timed (`audit_append_seconds`), and count a failure
+/// (`audit_append_errors_total`). A failure is the caller's error: the action it records
+/// must not happen, or be answered, without its record (fail closed).
+pub(crate) fn append_audit(
+    state: &AppState,
+    record: DecisionRecord,
+) -> Result<uuid::Uuid, ApiError> {
     let id = record.id;
     if let Err(e) = state
         .metrics

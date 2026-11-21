@@ -184,6 +184,7 @@ export const REASONS = {
   token_issued: 'A token was issued (root mint or exchange).',
   lease_renewed: 'A lease was renewed.',
   admin_action: 'An action taken with the admin token.',
+  search_answered: 'An AuthZEN action search was answered. Not a decision: nothing was allowed, charged or approved.',
   policy_invalid: 'A policy reload was refused because the file did not load.',
   // Approvals (ADR-0009).
   approval_required: 'A policy gated the call on an approval; the agent got JSON-RPC -32008.',

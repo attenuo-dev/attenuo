@@ -10,6 +10,7 @@ attenuo writes one record for every decision it makes. The records are chained b
 - Every token issued, at hop 0 and at each exchange.
 - Every successful lease renewal.
 - Every approval opened for a gated call, and every grant or decline of one.
+- Every AuthZEN action search, as one `search` record per request. It is not a decision (see [Action searches](#action-searches)).
 
 Requests that carry no decision, such as `tools/list` and `ping`, are not recorded while the token's leases are live. When they are not, the refusal is a `deny` record with the lease reason (`lease_revoked`, ...) and `tool` set to the method (`initialize`, `tools/list`, or `http.POST`, `http.GET`, `http.DELETE`), so an agent that keeps opening sessions after a revocation shows up. These refusals are bounded: the first per delegation chain, tool and reason within the record window (`[proxy] record_window_seconds`, default 60 s) is recorded, and a retry within that window is still refused (its 401 names the first record) but is only logged and counted in `audit_records_suppressed_total{tool,reason}`. One such record can therefore stand for many refused requests of that chain in the following window; the count is in the metric only. An agent that keeps retrying leaves one record per tool per window (a minute by default). When the proxy ends an open response stream (a `GET` listen stream, or a streamed answer) because the leases are no longer live or the token expired, that is one `deny` record with `tool` `stream.end`, the reason (`lease_revoked`, `token_expired`, ...) and the session's hash tag in `session_id`; the stream's last event carries its id as `data.decision_id`. Only the proxy speaks in that shape (`id: null`, error `-32001`): an upstream message of the same shape, in a stream or a plain JSON answer, reaches the client rewritten as error `-32005` with `data.reason` `upstream_stream_end_shape` and the upstream's error under `data.upstream_error`, so a decision id at `data.decision_id` of a `-32001` always names a record. On the `GET` listen stream these records are bounded: at most one per delegation chain and reason per record window (the same `record_window_seconds`, default 60 s), and it is the first, so the log shows when the condition began. Further listen streams of that chain ended for that reason within the window end the same way (their last event names the window's record) but are not recorded: the proxy logs them and counts them in the metric `audit_records_suppressed_total{tool="stream.end",reason}`. One listen-stream `stream.end` record can therefore stand for many streams; it names the server and session of the first, and has no field for the count, which only the metric holds. Nothing else is bounded this way: every tool-call decision, the `stream.end` of a streamed answer, every refused exchange or renewal and every other refusal is recorded each time. A stream the client drops or the upstream ends leaves no record, so a session with a `stream.end` record was cut by attenuo (or shares its chain's record of that window) and one without was not (`attenuo audit tail --tool stream.end`). An operator who wants to see those endings has the metric `proxy_streams_ended_total{cause}` (`client_disconnect`, `upstream_eof`, `upstream_error`, and the re-check causes such as `token_expired`) and the proxy's log lines, which carry the server, the session's hash tag, the subject and the `chain_id` to match against the session's records. A token that does not verify is never recorded. A refused token exchange is a `deny` record when its subject token verified: tool `token.exchange`, kind `decision`, the parent's chain, and a reason such as `exchange_widening` or `exchange_actor_not_permitted` (the full list is in the [HTTP API reference](../reference/http-api.md#token)). A refused lease renewal is a `deny` record when its token verified: tool `lease.renew` (as for a successful renewal), kind `decision`, the token's chain, and the lease reason (`lease_revoked`, `lease_expired` or `lease_unknown`). Exchanges whose subject token does not verify, and renewals whose token does not, are not recorded. Because refusals are kind `decision`, find them by tool: `attenuo audit tail --tool token.exchange --decision deny` (or `--tool lease.renew`), then `attenuo audit show --id <decision_id>` with the id the error carried. `audit export --kind exchange` lists issued exchanges only; `audit export --tool token.exchange --decision deny` exports the refusals.
 
@@ -17,7 +18,7 @@ Requests that carry no decision, such as `tools/list` and `ping`, are not record
 
 A record names the agent chain and the originating user separately. That is the point: most logs cannot tell an agent action from a user action. A record also has:
 
-- a `kind`, one of `decision`, `tool_result`, `approval_request`, `approval_grant`, `exchange`, `root_token`, `lease_renew`, `lease_revoke` or `admin` (see [Kind and chain id](#kind-and-chain-id)),
+- a `kind`, one of `decision`, `tool_result`, `approval_request`, `approval_grant`, `exchange`, `root_token`, `lease_renew`, `lease_revoke`, `admin` or `search` (see [Kind and chain id](#kind-and-chain-id)),
 - a `chain_id`, the id of the delegation chain it belongs to (absent for admin actions),
 - a decision id, which the client sees in the `X-Attenuo-Decision-Id` header or in the error data of a denial,
 - the time, and allow or deny,
@@ -27,7 +28,9 @@ A record names the agent chain and the originating user separately. That is the 
 - a digest of the arguments,
 - the session id and the ids of the policies that decided,
 - for an allowed call that matched run limits, `budget.charged`: each counter it was charged against and what it held afterwards,
-- for a call to a destructive tool, `usage`: the run's calls, amount and whether the destination was seen before, as the policy saw them (when usage is tracked).
+- for a call to a destructive tool, `usage`: the run's calls, amount and whether the destination was seen before, as the policy saw them (when usage is tracked),
+- for an action search, `search`: how many candidate tools it evaluated and how many it returned,
+- for a root token minted under `[idps.id_jag_ceiling]`, `id_jag_ceiling`: the ID-JAG claims that narrowed the root grant and a digest of their values (see [The ID-JAG ceiling](#the-id-jag-ceiling)).
 
 The log stores a digest of the arguments, not the arguments. Secrets and personal data in tool inputs do not end up in the log.
 
@@ -48,6 +51,7 @@ Two top-level fields let you filter and join an export without reading anything 
 | `lease_renew` | a lease was renewed (a refused renewal is a `decision`) | `lease.renew` |
 | `lease_revoke` | a lease and its subtree were revoked with the admin bearer | `admin.lease.revoke` |
 | `admin` | any other admin action (policy reload, budget refund, dev root mint) | `admin.*` |
+| `search` | an AuthZEN action search was answered (one record per request; it decides nothing) | `authzen.search` |
 
 Checkpoints are not records, so they have no kind: they sit in their own table and appear as `checkpoint` lines in an export.
 
@@ -69,7 +73,7 @@ A `tool_result` record is written after every allowed mediated call that gets an
 
 The content is not stored. If the record cannot be written, the agent gets a `label_error` denial instead of the answer.
 
-An untrusted result taints the run (see [Writing policies](../guides/writing-policies.md#asking-for-approval-after-untrusted-output)). A decision record of a call on a tainted run has `labels: {tainted_by: [seq, ...]}`, the `seq` of the first `tool_result` record of each source, so an auditor can see what the run had read before a call. When an argument of the call copied a value or span of an untrusted result, `labels.untrusted_args: [{arg, seq, kind}]` names it, the `tool_result` record it matched and how (`leaf`, `entity`, `kgram`, or `unreadable` when the index could not be read; then without `seq`), at most 64 entries. A call charged against run limits records `budget: {charged: [{hop, cap, kind, arg, used_after, max}]}`, one entry per counter (`arg` absent for `calls`). `decision_id`, `result`, `labels`, `approval` and `budget` are omitted when absent, so records without them hash exactly as before.
+An untrusted result taints the run (see [Writing policies](../guides/writing-policies.md#asking-for-approval-after-untrusted-output)). A decision record of a call on a tainted run has `labels: {tainted_by: [seq, ...]}`, the `seq` of the first `tool_result` record of each source, so an auditor can see what the run had read before a call. When an argument of the call copied a value or span of an untrusted result, `labels.untrusted_args: [{arg, seq, kind}]` names it, the `tool_result` record it matched and how (`leaf`, `entity`, `kgram`, or `unreadable` when the index could not be read; then without `seq`), at most 64 entries. A call charged against run limits records `budget: {charged: [{hop, cap, kind, arg, used_after, max}]}`, one entry per counter (`arg` absent for `calls`). `decision_id`, `result`, `labels`, `approval`, `budget`, `search` and `id_jag_ceiling` are omitted when absent, so records without them hash exactly as before.
 
 ## Approvals
 
@@ -82,6 +86,32 @@ A call that a policy gates with `@obligation("approval")` gets a `decision` reco
 | the retry that used it | `decision` | `allow`, the policy's reason | `id`, `by` |
 
 A repeated gated call while its approval is still pending gets a new `decision` record but no new `approval_request`. The record of the retry and the consumption of the grant go together: the grant is given back if the retry is not allowed or its record cannot be written, so every used grant has exactly one allowed decision naming it. A test in `attenuo-audit` pins the hashes of these records and checks that records without them hash as before.
+
+## Action searches
+
+`POST /access/v1/search/action` ([AuthZEN](../reference/authzen.md#action-search)) asks which tools of one MCP server the run may call with the given arguments. The caller chooses the arguments, so a search can be used to try values against the policy. Each answered search writes one record, for the whole request:
+
+| Member | Value |
+| --- | --- |
+| `kind` | `search` |
+| `decision`, `reason` | `allow`, `search_answered` |
+| `server`, `tool` | the searched server, `authzen.search` |
+| `arguments_digest` | the digest of `context.input`, the same one an evaluation of that request records |
+| `session_id`, `dpop_bound` | as for an evaluation |
+| `search` | `{"evaluated": n, "permitted": m}`: the candidates this page evaluated and how many it returned |
+
+A `search` record is not a decision. It allows nothing, charges nothing and takes no approval, and `kind=decision` does not return it. A search refused before it evaluated anything (a 400, 401, 403 or a 429 from `[limits] authzen_search_requests_per_minute`) writes no record. If the record cannot be written, the search answers 500 and returns nothing.
+
+## The ID-JAG ceiling
+
+A root token minted from an ID-JAG under `[idps.id_jag_ceiling]` ([configuration](../reference/config.md#idpsidjagceiling)) has an `id_jag_ceiling` member:
+
+| Member | Value |
+| --- | --- |
+| `claims` | the ID-JAG claims that narrowed the root grant, in this order: `resource`, `scope`, `authorization_details`. These are the claims the ID-JAG carried with a value other than `null`. The list is empty when it carried none of them; the ceiling then kept the root grant as it is. |
+| `claims_digest` | SHA-256 (hex) of the RFC 8785 JSON of an object that maps each name in `claims` to its full value in the verified ID-JAG. With no claims, the digest of `{}`. |
+
+The values are not stored, only their digest. Whoever holds the ID-JAG can check it against the record. Without the option, and for an ID token, the record has no such member. A refused intake writes no record. The same claim names are also in the record's arguments, and so in its `arguments_digest`, as before.
 
 ## The hash chain
 

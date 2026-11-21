@@ -19,7 +19,7 @@ const FOLLOW_MS = 2000;
 // Follow mode keeps at most this many rows on screen.
 const FOLLOW_CAP = 500;
 
-export const KINDS = ['decision', 'exchange', 'root_token', 'lease_renew', 'lease_revoke', 'admin'];
+export const KINDS = ['decision', 'exchange', 'root_token', 'lease_renew', 'lease_revoke', 'admin', 'search'];
 const TEXT_FILTERS = [
   ['reason', 'Reason', 'policy_deny'],
   ['subject', 'Subject', 'alice'],

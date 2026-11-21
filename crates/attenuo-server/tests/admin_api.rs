@@ -127,6 +127,8 @@ impl Row {
             approval: None,
             budget: None,
             usage: None,
+            search: None,
+            id_jag_ceiling: None,
         }
     }
 }

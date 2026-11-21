@@ -119,8 +119,9 @@ class AuditEntry:
 
     @property
     def kind(self) -> str | None:
-        """``decision``, ``exchange``, ``root_token``, ``lease_renew``, ``lease_revoke`` or
-        ``admin``."""
+        """``decision``, ``tool_result``, ``approval_request``, ``approval_grant``,
+        ``exchange``, ``root_token``, ``lease_renew``, ``lease_revoke``, ``admin`` or ``search``
+        (one AuthZEN action search, not a decision)."""
         return self.record.get("kind")
 
     @property
@@ -175,8 +176,9 @@ class AuditFilter:
     """Filters for :meth:`AdminClient.audit_query`. Each is an exact match, never a pattern;
     the ones you set combine with AND.
 
-    ``kind`` is one kind or several (``decision``, ``exchange``, ``root_token``,
-    ``lease_renew``, ``lease_revoke``, ``admin``). ``agent`` and ``lease`` match one of the
+    ``kind`` is one kind or several (``decision``, ``tool_result``, ``approval_request``,
+    ``approval_grant``, ``exchange``, ``root_token``, ``lease_renew``, ``lease_revoke``,
+    ``admin``, ``search``). ``agent`` and ``lease`` match one of the
     record's ``agents`` / ``leases``. ``since`` and ``until`` bound ``at`` to
     ``[since, until)``: RFC 3339 strings or timezone-aware datetimes."""
 
@@ -1078,9 +1080,10 @@ class AdminClient:
         ``entry`` and ``checkpoint`` objects, each tagged with ``type``. Write the raw lines to
         a file and check it offline with :func:`attenuo.audit.verify_export`.
 
-        ``kind`` (``decision``, ``tool_result``, ``exchange``, ``root_token``, ``lease_renew``,
-        ``lease_revoke``, ``admin``), ``chain_id``, ``tool`` (for example ``token.exchange``)
-        and ``decision`` (``allow`` or ``deny``) keep only matching entries, combined with AND.
+        ``kind`` (``decision``, ``tool_result``, ``approval_request``, ``approval_grant``,
+        ``exchange``, ``root_token``, ``lease_renew``, ``lease_revoke``, ``admin``, ``search``),
+        ``chain_id``, ``tool`` (for example ``token.exchange``) and ``decision`` (``allow`` or
+        ``deny``) keep only matching entries, combined with AND.
         The header then carries a ``filter`` naming them and the file cannot be verified (its
         chain has gaps): verify an unfiltered export, then filter. An unknown kind or decision,
         or an empty value, is an ``ApiError`` (400)."""
