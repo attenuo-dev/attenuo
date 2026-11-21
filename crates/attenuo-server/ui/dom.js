@@ -106,7 +106,6 @@ export function decisionPill(decision, big = false) {
   return pill(decision || '?', decision === 'allow' ? 'allow' : decision === 'deny' ? 'deny' : '', big);
 }
 
-/** Kinds whose record is not a decision, though its `decision` member says `allow`. */
 // Records that always carry `allow` without deciding anything. Approval records
 // stay pills: a request is a deny, and a grant is an allow or a deny.
 const NOT_DECISIONS = new Set(['tool_result', 'search']);
