@@ -376,6 +376,43 @@ Notes:
 - **Read-only root.** The server only writes under the data directory and, when the key file is missing, to the key path. Keep the key file in the read-only mount, so a missing key is an error you see, not a new key you did not plan.
 - **Upstreams** must be reachable from the container. `127.0.0.1` in `[[upstreams]]` means the container itself. The proxy gives an upstream `[proxy] upstream_connect_timeout_seconds` (default 5) to accept a connection and `upstream_response_timeout_seconds` (default 120) to send response headers, or a JSON answer it must read; past that the agent gets `502 upstream_unreachable` or `504 upstream_timeout`. Raise the second for tools that answer in JSON after a long run. Streams (SSE) are not cut by it.
 
+## Kubernetes (Helm)
+
+The repository has a Helm chart in `deploy/helm/attenuo`. It is not published to a chart repository: install it from a checkout of the release you run. It runs one `attenuo-server` pod from the release image, and its values are explained in the chart's `values.yaml`.
+
+```sh
+kubectl create namespace attenuo
+kubectl -n attenuo create secret generic attenuo-admin \
+  --from-literal=admin-token="$(openssl rand -hex 32)"
+
+helm install attenuo deploy/helm/attenuo -n attenuo \
+  --set publicUrl=https://attenuo.example.com \
+  --set-file config=attenuo.toml \
+  --set-file policy=policy.cedar \
+  --set adminToken.existingSecret=attenuo-admin
+```
+
+What you give it:
+
+- `publicUrl` (required): the `https://` URL agents use. attenuo has no TLS of its own, so terminate TLS at an ingress or gateway (`ingress.enabled`, or your own). An `http://` URL is refused unless `allowInsecureHttp=true`.
+- `config` (required): your `attenuo.toml`, stored in a Secret. Leave out `[server] listen` and `public_url`, `[admin] listen`, `[policy] policies_path`, `[audit] sqlite_path` and `[issuer] private_key_pem_path`: the chart sets them through `ATTENUO__...` environment overrides, which win over the file. `existingConfigSecret` names a Secret you manage instead.
+- `policy` (required): your Cedar file, stored in a ConfigMap (`existingPolicyConfigMap` for your own).
+- `adminToken.existingSecret`: the Secret with the admin bearer. Do not put the token in `config`.
+- `issuerKey.existingSecret` (recommended): the Ed25519 issuer key from a Secret. Without it the server creates a key on the data volume on first start, and losing the volume then changes the key that every token and audit checkpoint is verified with.
+
+What the chart decides, and why:
+
+- **One replica, `strategy: Recreate`, a `ReadWriteOnce` volume.** One process may open the SQLite file ([One process per file](#one-process-per-file)). There is no replica count to set, and a rollout has a short gap in service.
+- **The data volume is kept.** The claim carries `helm.sh/resource-policy: keep`, so `helm uninstall` does not delete the audit log. Delete the claim yourself when you mean to.
+- **The admin API is not exposed.** It listens on port 9102 in the pod and no Service or Ingress points at it. Reach it with `kubectl -n attenuo port-forward deploy/attenuo 9102:9102`, then `attenuo --server http://127.0.0.1:9102 ...`. `admin.service.enabled=true` adds a ClusterIP Service for clients inside the cluster; guard it with a NetworkPolicy.
+- **The pod is locked down.** It runs as uid 10001 with a read-only root filesystem, no capabilities, no privilege escalation, the default seccomp profile and no service account token.
+- **Probes.** Liveness and startup ask `/healthz`, readiness asks `/readyz` ([Health and readiness](#health-and-readiness)).
+- **A config change restarts the pod.** The config is read at start. The policy is not: after changing it, wait for the ConfigMap to reach the pod (up to about a minute) and run `attenuo policy reload`.
+
+`metrics.enabled=true` opens the metrics listener on port 9100 in the pod for a scraper inside the cluster; it has no authentication, so restrict it with a NetworkPolicy.
+
+Tested by `scripts/helm-smoke.sh` (the CI job `helm chart`): template checks for the defaults, every optional part and every value the chart refuses, then an install into a kind cluster with the published 0.1.0 image, where a token is minted and exchanged, one call is allowed and one denied through the proxy, the pod is deleted and the new pod still verifies the old token and the audit chain, and a changed config rolls the pod. Not tested: a cloud provider's cluster, an ingress controller, and upgrades between chart versions.
+
 ## Health and readiness
 
 `GET /healthz` returns `{"status":"ok","version":"..."}` with HTTP 200. It is a liveness check only. It does not open the database, check disk space or contact an identity provider. A server whose SQLite file is read-only or full still answers `ok`, and then denies every call.

@@ -1,0 +1,125 @@
+# Values for the attenuo chart. The chart runs ONE attenuo-server pod: the audit log and
+# the lease registry live in one SQLite file that one process may open, so there is no
+# replica count to set (docs/guides/deploying.md, "One process per file").
+
+image:
+  repository: ghcr.io/attenuo-dev/attenuo
+  # Defaults to the chart's appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+# REQUIRED. The URL agents and MCP clients use to reach attenuo, for example
+# https://attenuo.example.com. attenuo has no TLS of its own: terminate TLS at an ingress
+# or gateway and give its https:// URL here.
+publicUrl: ""
+# Accept an http:// publicUrl on a host that is not loopback. Tokens and the admin bearer
+# then cross the network in cleartext. Only for a network you trust, or a test cluster.
+allowInsecureHttp: false
+
+# REQUIRED unless existingConfigSecret is set: the text of attenuo.toml. See
+# config/example.toml in the repository for every key.
+#
+# Leave these keys out; the chart sets them through environment overrides, and they win
+# over the file: [server] listen and public_url, [admin] listen, [policy] policies_path,
+# [audit] sqlite_path, [issuer] private_key_pem_path, and [metrics] when metrics.enabled.
+#
+# Do not put the admin token here. Use adminToken.existingSecret below.
+config: ""
+# A Secret you manage that holds the file under the key `config.toml`, in place of `config`.
+existingConfigSecret: ""
+
+# REQUIRED unless existingPolicyConfigMap is set: the text of the Cedar policy file.
+policy: ""
+# A ConfigMap you manage that holds the policy under the key `policy.cedar`. A change to
+# it reaches the pod within about a minute; then run `attenuo policy reload`.
+existingPolicyConfigMap: ""
+
+# The static admin bearer (ATTENUO_ADMIN_TOKEN), from a Secret you create, for example:
+#   kubectl create secret generic attenuo-admin --from-literal=admin-token="$(openssl rand -hex 32)"
+# Leave existingSecret empty only when the config has [[admin.operators]] entries.
+adminToken:
+  existingSecret: ""
+  key: admin-token
+
+# The Ed25519 issuer key (PKCS#8 PEM), from a Secret you create, mounted read-only:
+#   openssl genpkey -algorithm ed25519 -out issuer.pem
+#   kubectl create secret generic attenuo-issuer --from-file=issuer.pem
+# When existingSecret is empty the server creates a key on the data volume on first start.
+# That is fine for a trial; for anything else manage the key yourself, so that losing the
+# volume does not change the key every token and audit checkpoint is verified with.
+issuerKey:
+  existingSecret: ""
+  key: issuer.pem
+
+# The data volume: the SQLite file with the audit log and the lease registry. It must be a
+# volume one node mounts (ReadWriteOnce), never NFS or another network filesystem: the
+# server refuses to start on one.
+persistence:
+  enabled: true
+  size: 2Gi
+  # "" uses the cluster's default StorageClass.
+  storageClass: ""
+  accessModes:
+    - ReadWriteOnce
+  # Use a claim you created, in place of one from this chart.
+  existingClaim: ""
+  annotations: {}
+
+# The main listener: token exchange, the MCP proxy, AuthZEN, /healthz and /readyz.
+service:
+  type: ClusterIP
+  port: 8080
+  annotations: {}
+
+# The admin API has a listener of its own and is NOT exposed by default: reach it with
+#   kubectl port-forward deploy/<release>-attenuo 9102:9102
+# Enable the Service only for clients inside the cluster that you trust, and protect it
+# with a NetworkPolicy.
+admin:
+  port: 9102
+  service:
+    enabled: false
+    annotations: {}
+
+# Prometheus metrics on a listener of their own (GET /metrics, no authentication).
+metrics:
+  enabled: false
+  port: 9100
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  # hosts:
+  #   - host: attenuo.example.com
+  #     paths:
+  #       - path: /
+  #         pathType: Prefix
+  hosts: []
+  tls: []
+
+# "text" or "json" (one JSON object per log line).
+logFormat: json
+# RUST_LOG: what is logged.
+logLevel: info
+
+# Extra environment variables for the container, as a list of {name, value} or
+# {name, valueFrom}. ATTENUO__<SECTION>__<KEY> overrides one key of the config file.
+extraEnv: []
+
+resources: {}
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+priorityClassName: ""
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}

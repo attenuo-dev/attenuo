@@ -1,0 +1,43 @@
+# Config for the chart's cluster test (scripts/helm-smoke.sh). A DEMO: the development root
+# mint is on, and the agent secret is a published one. Never deploy this file.
+#
+# The keys the chart sets through the environment are left out: [server] listen and
+# public_url, [admin] listen, [policy] policies_path, [audit] sqlite_path and
+# [issuer] private_key_pem_path.
+
+[issuer]
+issuer = "http://attenuo.test"
+audience = "attenuo"
+
+[policy.catalog.github.read_file]
+readonly = true
+inputs = { repo = "string", path = "string" }
+
+[policy.catalog.github.create_issue]
+inputs = { repo = "string", title = "string" }
+
+[policy.catalog.github.delete_repo]
+sensitive = true
+inputs = { repo = "string" }
+
+[approvals]
+client_id = "demo-approval-page"
+
+[[upstreams]]
+name = "github"
+url = "http://fake-mcp:3001/mcp"
+
+[[root_grants]]
+subject = "alice"
+issuer = "https://idp.example"
+agent = "assistant"
+capabilities = ["github:*"]
+
+# The secret is "demo-coder-secret".
+[[agents]]
+id = "coder"
+secret_sha256 = "f0f962bada9d92c8a30f5c55a388ce47d1074ddff4bfdb099ef67ad43003baeb"
+
+[dev]
+allow_root_mint = true
+allow_root_mint_off_loopback = true

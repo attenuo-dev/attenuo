@@ -1,0 +1,187 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "attenuo.fullname" . }}
+  labels:
+    {{- include "attenuo.labels" . | nindent 4 }}
+spec:
+  # One process per database file: never more than one replica, and the old pod must be
+  # gone before the new one starts (a second server on the file refuses to start).
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "attenuo.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "attenuo.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        # The config is read at start only: a change to it restarts the pod. The policy
+        # is not listed: it is reloaded without a restart (`attenuo policy reload`).
+        {{- if .Values.config }}
+        checksum/config: {{ .Values.config | sha256sum }}
+        {{- end }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "attenuo.serviceAccountName" . }}
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if .Values.priorityClassName }}
+      priorityClassName: {{ .Values.priorityClassName | quote }}
+      {{- end }}
+      # The server drains for up to 10 s after SIGTERM.
+      terminationGracePeriodSeconds: 15
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: attenuo
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["--config", "/etc/attenuo/config/config.toml"]
+          env:
+            - name: RUST_LOG
+              value: {{ .Values.logLevel | quote }}
+            - name: ATTENUO_LOG_FORMAT
+              value: {{ .Values.logFormat | quote }}
+            - name: ATTENUO__SERVER__LISTEN
+              value: "0.0.0.0:8080"
+            - name: ATTENUO__SERVER__PUBLIC_URL
+              value: {{ .Values.publicUrl | quote }}
+            {{- if .Values.allowInsecureHttp }}
+            - name: ATTENUO__SERVER__ALLOW_INSECURE_HTTP
+              value: "true"
+            {{- end }}
+            - name: ATTENUO__ADMIN__LISTEN
+              value: "0.0.0.0:9102"
+            - name: ATTENUO__POLICY__POLICIES_PATH
+              value: /etc/attenuo/policy/policy.cedar
+            - name: ATTENUO__AUDIT__SQLITE_PATH
+              value: /var/lib/attenuo/data/attenuo.sqlite
+            - name: ATTENUO__ISSUER__PRIVATE_KEY_PEM_PATH
+              value: {{ if .Values.issuerKey.existingSecret }}/etc/attenuo/issuer/issuer.pem{{ else }}/var/lib/attenuo/data/issuer.pem{{ end }}
+            {{- if .Values.metrics.enabled }}
+            - name: ATTENUO__METRICS__ENABLED
+              value: "true"
+            - name: ATTENUO__METRICS__LISTEN
+              value: "0.0.0.0:9100"
+            - name: ATTENUO__METRICS__ALLOW_PUBLIC
+              value: "true"
+            {{- end }}
+            {{- if .Values.adminToken.existingSecret }}
+            - name: ATTENUO_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.adminToken.existingSecret | quote }}
+                  key: {{ .Values.adminToken.key | quote }}
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+            - name: admin
+              containerPort: 9102
+              protocol: TCP
+            {{- if .Values.metrics.enabled }}
+            - name: metrics
+              containerPort: 9100
+              protocol: TCP
+            {{- end }}
+          # /healthz: the process answers. /readyz: the audit log and the lease store
+          # answer and the last audit append succeeded (a full disk fails it).
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/attenuo/config
+              readOnly: true
+            - name: policy
+              mountPath: /etc/attenuo/policy
+              readOnly: true
+            {{- if .Values.issuerKey.existingSecret }}
+            - name: issuer
+              mountPath: /etc/attenuo/issuer
+              readOnly: true
+            {{- end }}
+            - name: data
+              mountPath: /var/lib/attenuo
+      volumes:
+        - name: config
+          secret:
+            secretName: {{ include "attenuo.configSecretName" . }}
+            defaultMode: 0440
+        - name: policy
+          configMap:
+            name: {{ include "attenuo.policyConfigMapName" . }}
+        {{- if .Values.issuerKey.existingSecret }}
+        - name: issuer
+          secret:
+            secretName: {{ .Values.issuerKey.existingSecret | quote }}
+            defaultMode: 0440
+            items:
+              - key: {{ .Values.issuerKey.key | quote }}
+                path: issuer.pem
+        {{- end }}
+        - name: data
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "attenuo.claimName" . }}
+          {{- else }}
+          # No persistence: the audit log and every lease are lost when the pod restarts.
+          emptyDir: {}
+          {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
