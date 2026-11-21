@@ -1,8 +1,9 @@
 /**
- * The TypeScript snippets of the READMEs, checked as code.
+ * The TypeScript snippets of the README and the walkthrough, checked as code.
  *
- * Every fenced `ts` block of `sdk/typescript/README.md` and of the repository README's
- * "TypeScript SDK" section is type-checked with the TypeScript compiler against the built SDK
+ * Every fenced `ts` block of `sdk/typescript/README.md` and of the
+ * "TypeScript SDK" section of `docs/guides/walkthrough.md` is type-checked with the TypeScript
+ * compiler against the built SDK
  * types (`dist/index.d.ts`, so `npm run build` first; `src/index.ts` when there is no build),
  * each snippet a module of its own, strict, with Node's globals and no DOM. A first pass finds the names a snippet uses without
  * declaring them; the second declares those (`ob` an `AttenuoClient`, `admin` an `AdminClient`,
@@ -16,7 +17,7 @@
  *
  * With `ATTENUO_INTEGRATION=1`, the self-contained snippets (no undeclared names, no local file,
  * no MCP SDK) also run, against a real `attenuo-server` started from `config/example.toml` with
- * `[dev] allow_root_mint = true`, as the repository README starts it, and the fake MCP upstream
+ * `[dev] allow_root_mint = true`, as the walkthrough starts it, and the fake MCP upstream
  * (binaries from `ATTENUO_BIN_DIR`, as in `integration.test.ts`).
  */
 
@@ -41,7 +42,8 @@ import * as sdk from "../src/index.js";
 
 const PKG = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const REPO = resolve(PKG, "../..");
-const PAGES = [join(PKG, "README.md"), join(REPO, "README.md")];
+const WALKTHROUGH = join(REPO, "docs", "guides", "walkthrough.md");
+const PAGES = [join(PKG, "README.md"), WALKTHROUGH];
 const KNOWN: Record<string, string> = {
   SERVER: "string",
   ob: "AttenuoClient",
@@ -65,10 +67,12 @@ function snippets(): Snippet[] {
   for (const page of PAGES) {
     let text = readFileSync(page, "utf8");
     let offset = 0;
-    if (page === join(REPO, "README.md")) {
-      // Only the repository README's TypeScript SDK section.
+    if (page === WALKTHROUGH) {
+      // Only the walkthrough's TypeScript SDK section.
       const start = text.indexOf("\n## TypeScript SDK\n");
-      const end = text.indexOf("\n## ", start + 1);
+      if (start < 0) throw new Error('the walkthrough has no "TypeScript SDK" section');
+      const next = text.indexOf("\n## ", start + 1);
+      const end = next < 0 ? text.length : next;
       offset = text.slice(0, start).split("\n").length - 1;
       text = text.slice(start, end);
     }
@@ -412,7 +416,7 @@ describe.skipIf(process.env.ATTENUO_INTEGRATION !== "1")(
     it("runs the self-contained snippets", async () => {
       const run = ALL.filter(runnable);
       // Both quick starts must stay self-contained, or nothing here runs them.
-      expect(run.some((s) => s.id.startsWith("README.md:"))).toBe(true);
+      expect(run.some((s) => s.id.startsWith("docs/guides/walkthrough.md:"))).toBe(true);
       expect(run.some((s) => s.id.startsWith("sdk/typescript/README.md:"))).toBe(true);
       process.env.ATTENUO_ADMIN_TOKEN = ADMIN_TOKEN;
       process.env.ATTENUO_CLIENT_SECRET = CODER_SECRET;

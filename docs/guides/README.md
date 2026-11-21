@@ -5,6 +5,7 @@ Task-oriented guides for people who want to run attenuo or build on it. They des
 | Guide | Read it when you want to |
 | --- | --- |
 | [Getting started](getting-started.md) | Build attenuo, run it in front of an MCP server, mint a token, make allowed and denied calls, revoke, and read the audit log |
+| [Walkthrough](walkthrough.md) | The example config and one delegation by hand: with `curl`, then with the `attenuo` CLI and the Python and TypeScript SDKs |
 | [Writing and testing policies](writing-policies.md) | Write Cedar policies for agents (server-scoped `Action::"<server>/<tool>"`), test them offline with `attenuo policy test`, lint them, and run both in CI |
 | [Deploying](deploying.md) | Put it somewhere other than your laptop: bind address, the admin listener, TLS, admin token, load limits, key rotation, SQLite backup, lease tuning, logs, Docker and environment overrides, monitoring, and the v0 limits |
 | [Integrating MCP clients](integrating-mcp-clients.md) | Write the agent side: send the bearer, exchange tokens hop to hop, handle denials, renew leases, call the AuthZEN endpoint from a non-MCP enforcement point |

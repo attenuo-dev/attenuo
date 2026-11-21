@@ -2,7 +2,7 @@
 # Local pre-push checks: fmt, clippy, tests, and the three scripted demos.
 #
 #   scripts/dev.sh            # everything
-#   scripts/dev.sh fmt|clippy|test|demo|guide|readme|snippets|policy|docs|deny|links|fuzz|lean   # one step
+#   scripts/dev.sh fmt|clippy|test|demo|guide|walkthrough|snippets|policy|docs|deny|links|fuzz|lean   # one step
 #
 # Mirrors .github/workflows/ci.yml. Steps whose tool is not installed (cargo-deny, Lean) are
 # skipped with a note rather than failing.
@@ -17,7 +17,7 @@ demo()   {
     && bash examples/idp-exchange-demo/run.sh
 }
 guide()  { bash scripts/check-getting-started.sh; }
-readme() { bash scripts/check-doc-commands.sh README.md; }
+walkthrough() { bash scripts/check-doc-commands.sh docs/guides/walkthrough.md; }
 # The SDK READMEs' snippets: compiled and type-checked (sdk/python/tests/test_readme_snippets.py,
 # sdk/typescript/test/readme.test.ts). Each half is skipped with a note when its tools are not
 # installed (pip install -e 'sdk/python[dev]'; npm ci in sdk/typescript).
@@ -53,11 +53,11 @@ run() {
 
 if [ "$#" -eq 0 ]; then
   for step in fmt clippy test demo; do run "$step"; done
-  printf '\nfmt, clippy, test and demo passed. CI also runs: guide readme snippets policy docs links deny fuzz lean\n'
+  printf '\nfmt, clippy, test and demo passed. CI also runs: guide walkthrough snippets policy docs links deny fuzz lean\n'
 else
   for step in "$@"; do
     case "$step" in
-      fmt|clippy|test|demo|guide|readme|snippets|policy|docs|links|deny|fuzz|lean) run "$step" ;;
+      fmt|clippy|test|demo|guide|walkthrough|snippets|policy|docs|links|deny|fuzz|lean) run "$step" ;;
       *) echo "unknown step: $step" >&2; exit 2 ;;
     esac
   done

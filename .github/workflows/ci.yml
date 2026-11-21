@@ -88,10 +88,10 @@ jobs:
             # the config and policy it mounts.
             quickstart:
               - "{examples/github-leak-demo/compose.image.yml,examples/github-leak-demo/run-docker.sh,examples/github-leak-demo/fake_github_mcp.py,examples/github-leak-demo/config.docker.toml,examples/github-leak-demo/policy.cedar,.github/workflows/ci.yml}"
-            # The getting-started guide and the README are documentation, which `rust` leaves
+            # The getting-started guide and the walkthrough are documentation, which `rust` leaves
             # out, but their commands are checked by running them (the `getting-started` job).
             guide:
-              - "{docs/guides/getting-started.md,README.md,scripts/check-getting-started.sh,scripts/check-doc-commands.sh}"
+              - "{docs/guides/getting-started.md,docs/guides/walkthrough.md,scripts/check-getting-started.sh,scripts/check-doc-commands.sh}"
             # The Lean proof of the covering rule, its checks, and the Rust code and test the
             # differential check runs against it.
             lean:
@@ -269,11 +269,11 @@ jobs:
 
   # Runs every command of docs/guides/getting-started.md in order, as a reader would, against
   # the debug binaries its step 1 builds, and checks the outputs the guide shows
-  # (scripts/check-getting-started.sh); then the same for the README's server, curl and CLI
-  # sections (scripts/check-doc-commands.sh README.md). On every pull request that can change
-  # Rust, and on one that changes only the guide, the README or the scripts.
+  # (scripts/check-getting-started.sh); then the same for the walkthrough's server, curl
+  # and CLI sections (scripts/check-doc-commands.sh docs/guides/walkthrough.md). On every pull
+  # request that can change Rust, and on one that changes only these pages or the scripts.
   getting-started:
-    name: getting-started guide and README
+    name: getting-started guide and walkthrough
     needs: changes
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.guide == 'true'
     runs-on: ubuntu-latest
@@ -286,7 +286,7 @@ jobs:
           shared-key: debug
           save-if: false
       - run: bash scripts/check-getting-started.sh
-      - run: bash scripts/check-doc-commands.sh README.md
+      - run: bash scripts/check-doc-commands.sh docs/guides/walkthrough.md
 
   # Builds the release and demo images and plays the leak demo through docker-compose.yml
   # (scripts/compose-smoke.sh): release image contents, `attenuo health` as the HEALTHCHECK, the
