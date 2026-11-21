@@ -93,10 +93,54 @@ pub const EVENT_ID_HEADER: &str = "x-attenuo-event-id";
 pub const MAX_WATCHED: usize = 10_000;
 
 /// Most lease ids a `lease.revoked` notice lists in `lease_ids`, and so in `chain_ids`. A
-/// selector revocation that matched more top leases than this sets `truncated`. 100 ids keep
-/// the body under about 8 KB; a receiver that needs every lease reads the tree from the admin
-/// API, or treats each chain it knows of the user as dead.
+/// selector revocation that matched more top leases than this sets `truncated`; a receiver
+/// that needs every lease reads the tree from the admin API.
+///
+/// With [`MAX_NOTICE_TEXT_BYTES`] this bounds the body: at most 200 ids of 36 bytes (about
+/// 8 KB with quotes and commas), plus `reason` and one selector string of at most 1024 bytes
+/// each before JSON escaping (at most 6 KB each after it, if every byte were a control
+/// character), plus the fixed fields, a session's chains (one per upstream it was opened
+/// with) and the operator's configured name. So under 21 KB, and about 10 KB for text
+/// without control characters.
 pub const MAX_LEASE_NOTICE_IDS: usize = 100;
+
+/// Most bytes of operator-typed text (`reason`, and the `user` or `chain_id` of `selector`)
+/// a `lease.revoked` notice carries. Longer text is cut at a character boundary and ends in
+/// [`CUT_MARKER`], within this many bytes. Only the notice is cut: the audit record and the
+/// HTTP response keep the full text.
+pub const MAX_NOTICE_TEXT_BYTES: usize = 1024;
+
+/// What ends text [`MAX_NOTICE_TEXT_BYTES`] cut.
+pub const CUT_MARKER: &str = "\u{2026}";
+
+/// `text` cut to at most [`MAX_NOTICE_TEXT_BYTES`] bytes at a character boundary, ending in
+/// [`CUT_MARKER`] when cut. Text that fits is returned as it is.
+pub fn cap_notice_text(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.len() <= MAX_NOTICE_TEXT_BYTES {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut end = MAX_NOTICE_TEXT_BYTES - CUT_MARKER.len();
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    std::borrow::Cow::Owned(format!("{}{CUT_MARKER}", &text[..end]))
+}
+
+/// `selector` with its `user` and `chain_id` strings cut by [`cap_notice_text`]. Other members
+/// (a session's tag and chains) are the server's own and are kept.
+fn cap_selector(selector: &Option<Value>) -> Option<Value> {
+    let mut out = selector.clone()?;
+    if let Some(obj) = out.as_object_mut() {
+        for key in ["user", "chain_id"] {
+            if let Some(Value::String(v)) = obj.get_mut(key) {
+                if let std::borrow::Cow::Owned(cut) = cap_notice_text(v) {
+                    *v = cut;
+                }
+            }
+        }
+    }
+    Some(out)
+}
 
 /// How long after `expires_at` the watcher looks, so the store agrees it has expired.
 const EXPIRY_GRACE: Duration = Duration::from_millis(250);
@@ -560,7 +604,11 @@ pub struct LeaseRevocation {
     /// matched lease whose parent this request did not revoke too (ordered by id). Every lease
     /// the request revoked is one of these or descends from one.
     pub lease_ids: Vec<LeaseId>,
-    /// The chain (root lease) of each of `lease_ids`, each once, in the same order.
+    /// The chains (root leases) of `lease_ids`, de-duplicated, in the order first reached. It
+    /// is not aligned with `lease_ids` by position: several tops can share one chain. A token
+    /// is revoked when its chain contains one of `lease_ids`; a chain listed here only says
+    /// which runs to ask about again (revoking a lease in the middle of a chain leaves its
+    /// root and other branches valid).
     pub chain_ids: Vec<LeaseId>,
     /// More top leases matched than `lease_ids` lists.
     pub truncated: bool,
@@ -581,21 +629,28 @@ pub struct LeaseRevocation {
     pub by: String,
     /// The operator's subject, as the audit record's `originating_subject` has it.
     pub by_subject: String,
+    /// A random value drawn once for this request. Only [`event_key`](Self::event_key) uses
+    /// it, and only when there is no audit record; it is never sent.
+    pub nonce: uuid::Uuid,
 }
 
 impl LeaseRevocation {
     /// What names this revocation for [`event_id_for`]: the audit record id, unique per
-    /// request; without a record, the top leases and the revocation time, which one request
-    /// fixes and another cannot repeat (a revoked lease is not revoked again).
+    /// request. Without a record: `revoked`, the top leases, the revocation time and
+    /// [`nonce`](Self::nonce), which is drawn once per request, so two requests never share
+    /// an id even with the same tops at the same instant. [`Notice::lease_revoked`] calls this
+    /// once and the outbox stores the result, so retries and restarts keep the id.
     pub fn event_key(&self) -> String {
         match &self.audit_record_id {
             Some(id) => id.to_string(),
             None => {
                 let leases: Vec<&str> = self.lease_ids.iter().map(|l| l.0.as_str()).collect();
                 format!(
-                    "{}@{}",
+                    "revoked={};{}@{};{}",
+                    self.revoked,
                     leases.join(","),
-                    self.revoked_at.unix_timestamp_nanos()
+                    self.revoked_at.unix_timestamp_nanos(),
+                    self.nonce
                 )
             }
         }
@@ -605,8 +660,13 @@ impl LeaseRevocation {
     /// the store returned them; `matched` ordered by id), with their chains, read from
     /// `store`. A matched lease is a top when its parent is not among `revoked`: then no
     /// other match of this request covers it. At most [`MAX_LEASE_NOTICE_IDS`] are listed;
-    /// the walk stops as soon as one more is found, and sets `truncated`. A lease or chain
-    /// that cannot be read is logged and left out; nothing here fails the revocation.
+    /// the walk stops as soon as one more is found, and sets `truncated`.
+    ///
+    /// Parents are read in batches ([`SqliteLeaseStore::parents`]), so `n` matches cost
+    /// about `n / 200` queries, and each chain root a few more per level of delegation for
+    /// all tops at once. It runs after the revocation committed and takes no write gate. A
+    /// lease or chain that cannot be read is logged and left out; nothing here fails the
+    /// revocation.
     pub fn tops(
         store: &SqliteLeaseStore,
         matched: &[LeaseId],
@@ -615,60 +675,88 @@ impl LeaseRevocation {
         let changed: HashSet<&LeaseId> = revoked.iter().collect();
         let mut tops = Vec::new();
         let mut truncated = false;
-        for m in matched {
-            let parent = match store.get(m) {
-                Ok(row) => row.and_then(|r| r.parent),
+        'walk: for chunk in matched.chunks(TOPS_PER_READ) {
+            let refs: Vec<&LeaseId> = chunk.iter().collect();
+            let parents = match store.parents(&refs) {
+                Ok(p) => p,
                 Err(e) => {
-                    tracing::warn!(lease = %m.0, error = %e, "[leases.notify] could not read a revoked lease: left out of the notice");
+                    tracing::warn!(error = %e, leases = chunk.len(), "[leases.notify] could not read revoked leases: left out of the notice");
                     continue;
                 }
             };
-            if parent.is_some_and(|p| changed.contains(&p)) {
-                continue;
-            }
-            if tops.len() == MAX_LEASE_NOTICE_IDS {
-                truncated = true;
-                break;
-            }
-            tops.push(m.clone());
-        }
-        let mut chains: Vec<LeaseId> = Vec::new();
-        for t in &tops {
-            if let Some(root) = chain_root(store, t) {
-                if !chains.contains(&root) {
-                    chains.push(root);
+            for m in chunk {
+                // A lease the store no longer knows counts as a top: nothing covers it.
+                let parent = parents.get(m).cloned().flatten();
+                if parent.is_some_and(|p| changed.contains(&p)) {
+                    continue;
                 }
+                if tops.len() == MAX_LEASE_NOTICE_IDS {
+                    truncated = true;
+                    break 'walk;
+                }
+                tops.push(m.clone());
             }
         }
+        let chains = chain_roots(store, &tops);
         (tops, chains, truncated)
     }
 }
 
-/// The root of the chain `lease` belongs to: its topmost ancestor, which is the audit
-/// records' `chain_id`. `None` when a row cannot be read (logged).
-fn chain_root(store: &SqliteLeaseStore, lease: &LeaseId) -> Option<LeaseId> {
-    let mut at = lease.clone();
-    let mut seen = HashSet::from([at.clone()]);
+/// Matches whose parents [`LeaseRevocation::tops`] reads per call to the store. A cap of
+/// [`MAX_LEASE_NOTICE_IDS`] tops seldom needs more than the first read.
+const TOPS_PER_READ: usize = 200;
+
+/// The root of the chain of each of `leases` (its topmost ancestor, which is the audit
+/// records' `chain_id`), each root once, in the order first reached. All leases climb one
+/// level per batched read ([`SqliteLeaseStore::parents`]), so the cost is the chain depth
+/// times a few queries, not one query per hop per lease. A lease whose chain cannot be read
+/// is logged and left out.
+fn chain_roots(store: &SqliteLeaseStore, leases: &[LeaseId]) -> Vec<LeaseId> {
+    // Each lease's current position on its way up, and the ids already passed (a cycle no
+    // real tree has stops where it closes).
+    let mut at: Vec<Option<LeaseId>> = leases.iter().cloned().map(Some).collect();
+    let mut seen: Vec<HashSet<LeaseId>> =
+        leases.iter().map(|l| HashSet::from([l.clone()])).collect();
+    let mut root: Vec<Option<LeaseId>> = vec![None; leases.len()];
     loop {
-        match store.get(&at) {
-            Ok(Some(row)) => match row.parent {
-                // A cycle no real tree has: stop where it closes.
-                Some(p) if seen.insert(p.clone()) => at = p,
-                _ => return Some(at),
-            },
-            // A parent the store no longer knows: the topmost lease reached.
-            Ok(None) => return Some(at),
+        let climbing: Vec<&LeaseId> = {
+            let mut set: Vec<&LeaseId> = at.iter().flatten().collect();
+            set.sort();
+            set.dedup();
+            set
+        };
+        if climbing.is_empty() {
+            break;
+        }
+        let parents = match store.parents(&climbing) {
+            Ok(p) => p,
             Err(e) => {
-                tracing::warn!(lease = %lease.0, error = %e, "[leases.notify] could not read a lease's chain: left out of the notice");
-                return None;
+                tracing::warn!(error = %e, "[leases.notify] could not read the chains of revoked leases: left out of the notice");
+                return Vec::new();
+            }
+        };
+        for i in 0..leases.len() {
+            let Some(cur) = at[i].take() else { continue };
+            match parents.get(&cur) {
+                Some(Some(p)) if seen[i].insert(p.clone()) => at[i] = Some(p.clone()),
+                // A root, a parent the store no longer knows, or a cycle: the top reached.
+                _ => root[i] = Some(cur),
             }
         }
     }
+    let mut chains: Vec<LeaseId> = Vec::new();
+    for r in root.into_iter().flatten() {
+        if !chains.contains(&r) {
+            chains.push(r);
+        }
+    }
+    chains
 }
 
 /// The `lease.revoked` document for `r`. Only lease ids, the selector as the audit record
 /// shows it, a count, the reason, a time, the record id and the operator: no token, no
-/// secret, no raw session id.
+/// secret, no raw session id. The reason and the selector's `user` and `chain_id` are cut by
+/// [`cap_notice_text`].
 pub fn lease_notice_json(event_id: &str, r: &LeaseRevocation) -> Value {
     json!({
         "type": NoticeKind::LeaseRevoked.as_str(),
@@ -676,9 +764,9 @@ pub fn lease_notice_json(event_id: &str, r: &LeaseRevocation) -> Value {
         "lease_ids": r.lease_ids,
         "chain_ids": r.chain_ids,
         "truncated": r.truncated,
-        "selector": r.selector,
+        "selector": cap_selector(&r.selector),
         "revoked": r.revoked,
-        "reason": r.reason,
+        "reason": cap_notice_text(&r.reason),
         "revoked_at": fmt(r.revoked_at),
         "audit_record_id": r.audit_record_id,
         "by": r.by,
@@ -1955,6 +2043,7 @@ mod tests {
             ),
             by: "alice".into(),
             by_subject: "urn:attenuo:admin:alice".into(),
+            nonce: uuid::Uuid::parse_str("44444444-4444-4444-8444-444444444444").unwrap(),
         }
     }
 
@@ -2019,14 +2108,29 @@ mod tests {
             assert_ne!(id, event_id_for(k, "33333333-3333-4333-8333-333333333333"));
             assert_eq!(k.stream(), NoticeStream::Approvals);
         }
-        // Without a record: the top leases and the time, still stable.
+        // Without a record: the count, the top leases, the time and the nonce, still stable
+        // for one revocation.
         let mut unrecorded = r.clone();
         unrecorded.audit_record_id = None;
-        assert_eq!(unrecorded.event_key(), "l1@1780000000000000000");
+        assert_eq!(
+            unrecorded.event_key(),
+            "revoked=3;l1@1780000000000000000;44444444-4444-4444-8444-444444444444"
+        );
         assert_eq!(
             Notice::lease_revoked(&unrecorded).event_id,
             Notice::lease_revoked(&unrecorded).event_id
         );
+        // Another request with the same tops at the same instant draws another nonce, and
+        // one that revoked another count differs too.
+        let mut twin = unrecorded.clone();
+        twin.nonce = uuid::Uuid::new_v4();
+        assert_ne!(
+            Notice::lease_revoked(&unrecorded).event_id,
+            Notice::lease_revoked(&twin).event_id
+        );
+        let mut more = unrecorded.clone();
+        more.revoked = 4;
+        assert_ne!(unrecorded.event_key(), more.event_key());
         assert_eq!(
             NoticeKind::parse("lease.revoked"),
             Some(NoticeKind::LeaseRevoked)
@@ -2104,6 +2208,114 @@ mod tests {
         assert_eq!(chains, tops);
         let (tops, _, cut) = LeaseRevocation::tops(&store, &roots[..MAX_LEASE_NOTICE_IDS], &roots);
         assert_eq!((tops.len(), cut), (MAX_LEASE_NOTICE_IDS, false));
+    }
+
+    /// Parents are read in batches, so a long chain and a wide tree give the right tops and
+    /// chains (no timing is asserted).
+    #[test]
+    fn tops_of_hundreds_of_delegated_leases_are_read_in_batches() {
+        use attenuo_audit::LeaseRegistry;
+        let store = SqliteLeaseStore::open_in_memory().unwrap();
+        let exp = OffsetDateTime::now_utc() + time::Duration::hours(1);
+        // A chain 450 deep: d0000 > d0001 > ... > d0449.
+        let deep: Vec<LeaseId> = (0..450).map(|i| LeaseId::new(format!("d{i:04}"))).collect();
+        for (i, l) in deep.iter().enumerate() {
+            let parent = i.checked_sub(1).map(|p| deep[p].clone());
+            store.register(l, parent.as_ref(), exp).unwrap();
+        }
+        // A root with 450 children, and 450 more roots.
+        let root = LeaseId::new("w");
+        store.register(&root, None, exp).unwrap();
+        let kids: Vec<LeaseId> = (0..450).map(|i| LeaseId::new(format!("w{i:04}"))).collect();
+        for k in &kids {
+            store.register(k, Some(&root), exp).unwrap();
+        }
+        // A user selector matching the whole deep chain: only its first lease is a top.
+        let (tops, chains, cut) = LeaseRevocation::tops(&store, &deep, &deep);
+        assert_eq!(
+            (tops, chains, cut),
+            (ids(&["d0000"]), ids(&["d0000"]), false)
+        );
+        // Matching the deep chain from the middle down, with nothing above revoked: the
+        // middle lease is the top and its chain is the root far above it.
+        let (tops, chains, cut) = LeaseRevocation::tops(&store, &deep[300..], &deep[300..]);
+        assert_eq!(
+            (tops, chains, cut),
+            (ids(&["d0300"]), ids(&["d0000"]), false)
+        );
+        // Matching the children but not the root: each child is a top, cut at the cap, and
+        // they share one chain.
+        let (tops, chains, cut) = LeaseRevocation::tops(&store, &kids, &kids);
+        assert!(cut);
+        assert_eq!(tops, kids[..MAX_LEASE_NOTICE_IDS].to_vec());
+        assert_eq!(chains, ids(&["w"]));
+        // Root and children matched together: the root alone is the top.
+        let mut all = vec![root.clone()];
+        all.extend(kids.iter().cloned());
+        let (tops, chains, cut) = LeaseRevocation::tops(&store, &all, &all);
+        assert_eq!((tops, chains, cut), (ids(&["w"]), ids(&["w"]), false));
+        let refs: Vec<&LeaseId> = deep.iter().chain(kids.iter()).collect();
+        let parents = store.parents(&refs).unwrap();
+        assert_eq!(parents.len(), 900);
+        assert_eq!(parents[&deep[0]], None);
+        assert_eq!(parents[&deep[449]], Some(deep[448].clone()));
+    }
+
+    /// Operator-typed text is cut in the notice only, at a character boundary, with a marker.
+    #[test]
+    fn operator_text_is_capped_in_the_notice_at_a_character_boundary() {
+        assert_eq!(cap_notice_text("short"), "short");
+        let exact = "x".repeat(MAX_NOTICE_TEXT_BYTES);
+        assert_eq!(
+            cap_notice_text(&exact),
+            exact.as_str(),
+            "a full 1024 is kept"
+        );
+        // A 3-byte character across the cut point is dropped whole.
+        let long = format!("{}{}", "a".repeat(1019), "\u{20ac}".repeat(10));
+        let cut = cap_notice_text(&long);
+        assert!(cut.len() <= MAX_NOTICE_TEXT_BYTES, "{}", cut.len());
+        assert!(cut.ends_with(CUT_MARKER));
+        assert_eq!(cut, format!("{}{CUT_MARKER}", "a".repeat(1019)));
+        let mut r = revocation();
+        r.reason = "r".repeat(5000);
+        r.selector = Some(json!({"user": "u".repeat(5000)}));
+        let v = lease_notice_json("e", &r);
+        let reason = v["reason"].as_str().unwrap();
+        assert_eq!(reason.len(), MAX_NOTICE_TEXT_BYTES);
+        assert!(reason.ends_with(CUT_MARKER));
+        assert_eq!(
+            v["selector"]["user"].as_str().unwrap().len(),
+            MAX_NOTICE_TEXT_BYTES
+        );
+        r.selector = Some(json!({"chain_id": "c".repeat(2000)}));
+        let v = lease_notice_json("e", &r);
+        assert!(v["selector"]["chain_id"]
+            .as_str()
+            .unwrap()
+            .ends_with(CUT_MARKER));
+        // The value itself is left whole for the audit record and the response.
+        assert_eq!(r.reason.len(), 5000);
+        // A session selector's own members are kept.
+        r.selector = Some(json!({"session_tag": "t", "chain_ids": ["c1"]}));
+        assert_eq!(
+            lease_notice_json("e", &r)["selector"],
+            json!({"session_tag": "t", "chain_ids": ["c1"]})
+        );
+    }
+
+    #[test]
+    fn one_secret_for_both_notifiers_is_a_warning_naming_the_variable() {
+        let a = NotifySection::new("https://hooks.example/approvals");
+        let mut l = LeaseNotifySection::with_url("https://hooks.example/revoked");
+        assert_eq!(crate::config::shared_notify_secret(&a, &l), None);
+        l.secret_env = a.secret_env.clone();
+        let w = crate::config::shared_notify_secret(&a, &l).unwrap();
+        assert!(w.contains("$ATTENUO_APPROVAL_NOTIFY_SECRET"), "{w}");
+        assert!(
+            w.contains("[leases.notify]") && w.contains("[approvals.notify]"),
+            "{w}"
+        );
     }
 
     #[test]

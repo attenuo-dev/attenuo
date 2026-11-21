@@ -302,9 +302,9 @@ maintenance_max_passes = 100
 
 # POST a signed JSON notice (lease.revoked) to a webhook you own after each revocation request
 # that revoked at least one lease, so an enforcement point outside the server (a gateway on
-# /access/v1/evaluation, an ext-authz adapter) can drop cached allows and close streams for the
-# chains it names. It is a hint, not enforcement: a PEP still learns of a revocation when it
-# asks, and a lease that expires sends nothing. Same keys, signature and delivery as
+# /access/v1/evaluation, an ext-authz adapter) can refuse tokens whose chain holds a lease it
+# names, and ask again about the chains it names. It is a hint, not enforcement: a PEP still
+# learns of a revocation when it asks, and a lease that expires sends nothing. Same keys, signature and delivery as
 # [approvals.notify]; use a secret of its own (at least 32 bytes, required).
 # [leases.notify]
 # url = "https://hooks.example.com/attenuo/revocations"

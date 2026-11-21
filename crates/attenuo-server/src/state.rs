@@ -189,6 +189,11 @@ impl AppState {
         config.approvals.check()?;
         if let Some(n) = &config.leases.notify {
             n.validate()?;
+            if let Some(a) = &config.approvals.notify {
+                if let Some(warning) = crate::config::shared_notify_secret(a, n) {
+                    tracing::warn!("{warning}");
+                }
+            }
         }
         let lease_maintenance = config.leases.maintenance()?;
         let user_window_retention = config.leases.user_window_retention()?;

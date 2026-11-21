@@ -1248,6 +1248,23 @@ impl NotifyTarget for ForLeases {
 /// `[approvals.notify]` with its own `secret_env` default ([`LEASE_NOTIFY_SECRET_ENV`]).
 pub type LeaseNotifySection = NotifySection<ForLeases>;
 
+/// The startup warning when `[approvals.notify]` and `[leases.notify]` read their signing
+/// secret from the same variable; `None` when they do not. Not an error: it works, but then a
+/// receiver of one kind of notice can sign notices of the other. Names the variable, never
+/// its value.
+pub fn shared_notify_secret(
+    approvals: &NotifySection<ForApprovals>,
+    leases: &LeaseNotifySection,
+) -> Option<String> {
+    (approvals.secret_env == leases.secret_env).then(|| {
+        format!(
+            "[approvals.notify] and [leases.notify] both sign with ${}: a receiver of one kind \
+             of notice can then sign the other; give [leases.notify] a secret_env of its own",
+            leases.secret_env
+        )
+    })
+}
+
 /// `[approvals.notify]`, and with `K` = [`ForLeases`] `[leases.notify]`: a notifier. For
 /// `[approvals.notify]`, every approval that becomes pending, and again when it is decided or
 /// expires; for `[leases.notify]`, every revocation request that revoked at least one lease.

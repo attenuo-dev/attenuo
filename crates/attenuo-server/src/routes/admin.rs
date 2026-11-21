@@ -258,6 +258,7 @@ fn notify_revoked(
         audit_record_id: audit_id,
         by: who.name.clone(),
         by_subject: who.subject(),
+        nonce: uuid::Uuid::new_v4(),
     });
 }
 
