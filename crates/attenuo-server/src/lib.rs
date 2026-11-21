@@ -651,8 +651,8 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
 ///
 /// When it returns, everything it started has finished and been dropped: the listeners are
 /// closed, their connections drained (or, past the drain timeout, abandoned), the timers stopped
-/// between ticks and awaited, `[audit.sink]` and `[approvals.notify]` stopped after their grace,
-/// and the WAL checkpointed. `run` drops its own reference to `state` last, so once the caller
+/// between ticks and awaited, `[audit.sink]`, `[approvals.notify]` and `[leases.notify]` stopped
+/// after their grace, and the WAL checkpointed. `run` drops its own reference to `state` last, so once the caller
 /// drops its references too the state goes, its stores close and the single-writer fence is
 /// released; [`AppState::released`] resolves at that point.
 ///
@@ -782,6 +782,16 @@ pub async fn run(
         let s = state.clone();
         let _ = tokio::task::spawn_blocking(move || {
             if let Some(n) = &s.approval_notifier {
+                n.shutdown(SINK_SHUTDOWN_GRACE);
+            }
+        })
+        .await;
+    }
+    // And revocation notices.
+    if state.lease_notifier.is_some() {
+        let s = state.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Some(n) = &s.lease_notifier {
                 n.shutdown(SINK_SHUTDOWN_GRACE);
             }
         })

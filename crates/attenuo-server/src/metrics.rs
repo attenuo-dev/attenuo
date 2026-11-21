@@ -187,12 +187,10 @@ pub struct Metrics {
     audit_sink_oldest_unix: AtomicU64,
     /// `[approvals.notify]`: notifications delivered, delivery attempts that failed,
     /// notifications dropped (queue full, every attempt failed, or too many approvals waiting
-    /// for their expiry), and the queue depth.
-    approval_notify_delivered: AtomicU64,
-    approval_notify_failures: AtomicU64,
-    approval_notify_dropped: AtomicU64,
-    approval_notify_queue_depth: AtomicU64,
-    approval_notify_outbox_rows: AtomicU64,
+    /// for their expiry), the queue depth and the open outbox rows.
+    approval_notify: NotifyCounters,
+    /// `[leases.notify]`: the same, for `lease.revoked` notices.
+    lease_notify: NotifyCounters,
     /// Time to decide one tool call.
     authorize: Histogram,
     /// Time for one audit append, lock wait and commit included.
@@ -271,11 +269,8 @@ impl Default for Metrics {
             audit_sink_dropped: AtomicU64::default(),
             audit_sink_queue_depth: AtomicU64::default(),
             audit_sink_oldest_unix: AtomicU64::default(),
-            approval_notify_delivered: AtomicU64::default(),
-            approval_notify_failures: AtomicU64::default(),
-            approval_notify_dropped: AtomicU64::default(),
-            approval_notify_queue_depth: AtomicU64::default(),
-            approval_notify_outbox_rows: AtomicU64::default(),
+            approval_notify: NotifyCounters::default(),
+            lease_notify: NotifyCounters::default(),
             authorize: Histogram::new(&BUCKETS),
             audit_append: Histogram::new(&BUCKETS),
             stages: std::array::from_fn(|_| Histogram::new(&STAGE_BUCKETS)),
@@ -631,53 +626,14 @@ impl Metrics {
             .store(oldest.map_or(0, unix_secs), Ordering::Relaxed);
     }
 
-    /// Count one approval notification delivered by `[approvals.notify]`.
-    pub fn approval_notify_delivered(&self) {
-        self.approval_notify_delivered
-            .fetch_add(1, Ordering::Relaxed);
+    /// The counters of `[approvals.notify]` (`attenuo_approval_notify_*`).
+    pub fn approval_notify(&self) -> &NotifyCounters {
+        &self.approval_notify
     }
 
-    /// Count one failed notification delivery attempt.
-    pub fn approval_notify_failure(&self) {
-        self.approval_notify_failures
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Count one approval notification that will not be delivered.
-    pub fn approval_notify_dropped(&self) {
-        self.approval_notify_dropped.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Set the notification queue depth gauge.
-    pub fn approval_notify_queue(&self, depth: u64) {
-        self.approval_notify_queue_depth
-            .store(depth, Ordering::Relaxed);
-    }
-
-    /// Set the open outbox rows gauge (at start, from the table).
-    pub fn approval_notify_outbox_rows(&self, rows: u64) {
-        self.approval_notify_outbox_rows
-            .store(rows, Ordering::Relaxed);
-    }
-
-    /// One notice stored in the outbox.
-    pub fn approval_notify_outbox_opened(&self) {
-        self.approval_notify_outbox_rows
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// One outbox row marked delivered or given up.
-    pub fn approval_notify_outbox_closed(&self) {
-        // A compare-and-swap loop that stops at zero (`fetch_update` is deprecated on newer
-        // toolchains, `try_update` is too new for the MSRV).
-        let rows = &self.approval_notify_outbox_rows;
-        let mut n = rows.load(Ordering::Relaxed);
-        while n > 0 {
-            match rows.compare_exchange_weak(n, n - 1, Ordering::Relaxed, Ordering::Relaxed) {
-                Ok(_) => break,
-                Err(now) => n = now,
-            }
-        }
+    /// The counters of `[leases.notify]` (`attenuo_lease_notify_*`).
+    pub fn lease_notify(&self) -> &NotifyCounters {
+        &self.lease_notify
     }
 
     /// Prometheus text exposition format (version 0.0.4).
@@ -838,36 +794,28 @@ impl Metrics {
             "Unix time the oldest undelivered checkpoint was queued; 0 when none.",
             &self.audit_sink_oldest_unix,
         );
-        simple_counter(
+        self.approval_notify.render(
             &mut out,
-            "approval_notify_delivered_total",
-            "Approval notifications delivered by [approvals.notify].",
-            &self.approval_notify_delivered,
+            "approval_notify",
+            [
+                "Approval notifications delivered by [approvals.notify].",
+                "Approval notification deliveries that failed (retried until max_attempts).",
+                "Approval notifications not delivered: queue full, every attempt failed, or too \
+                 many approvals waiting for their expiry.",
+                "Approval notifications waiting in the [approvals.notify] queue.",
+                "Approval notifications stored in the outbox and not yet delivered or given up.",
+            ],
         );
-        simple_counter(
+        self.lease_notify.render(
             &mut out,
-            "approval_notify_failures_total",
-            "Approval notification deliveries that failed (retried until max_attempts).",
-            &self.approval_notify_failures,
-        );
-        simple_counter(
-            &mut out,
-            "approval_notify_dropped_total",
-            "Approval notifications not delivered: queue full, every attempt failed, or too \
-             many approvals waiting for their expiry.",
-            &self.approval_notify_dropped,
-        );
-        simple_gauge(
-            &mut out,
-            "approval_notify_queue_depth",
-            "Approval notifications waiting in the [approvals.notify] queue.",
-            &self.approval_notify_queue_depth,
-        );
-        simple_gauge(
-            &mut out,
-            "approval_notify_outbox_rows",
-            "Approval notifications stored in the outbox and not yet delivered or given up.",
-            &self.approval_notify_outbox_rows,
+            "lease_notify",
+            [
+                "Revocation notices delivered by [leases.notify].",
+                "Revocation notice deliveries that failed (retried until max_attempts).",
+                "Revocation notices not delivered: queue full, or every attempt failed.",
+                "Revocation notices waiting in the [leases.notify] queue.",
+                "Revocation notices stored in the outbox and not yet delivered or given up.",
+            ],
         );
         header_lines(
             &mut out,
@@ -1160,6 +1108,84 @@ fn header_lines(out: &mut String, name: &str, help: &str, kind: &str) {
 /// The `kind` label values of `run_state_pruned_total`, in [`Metrics::run_state_pruned`]'s
 /// argument order, then `user_window` ([`Metrics::user_windows_pruned`]).
 pub const RUN_STATE_KINDS: [&str; 4] = ["counters", "charges", "approvals", "user_window"];
+
+/// The metrics of one notifier (`[approvals.notify]` or `[leases.notify]`): notices
+/// delivered, failed attempts, notices dropped, the queue depth, and the outbox rows still
+/// open.
+#[derive(Debug, Default)]
+pub struct NotifyCounters {
+    delivered: AtomicU64,
+    failures: AtomicU64,
+    dropped: AtomicU64,
+    queue_depth: AtomicU64,
+    outbox_rows: AtomicU64,
+}
+
+impl NotifyCounters {
+    /// Count one notice delivered.
+    pub fn delivered(&self) {
+        self.delivered.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count one failed delivery attempt.
+    pub fn failure(&self) {
+        self.failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count one notice that will not be delivered.
+    pub fn dropped(&self) {
+        self.dropped.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Set the queue depth gauge.
+    pub fn queue(&self, depth: u64) {
+        self.queue_depth.store(depth, Ordering::Relaxed);
+    }
+
+    /// Set the open outbox rows gauge (at start, from the table).
+    pub fn outbox_rows(&self, rows: u64) {
+        self.outbox_rows.store(rows, Ordering::Relaxed);
+    }
+
+    /// One notice stored in the outbox.
+    pub fn outbox_opened(&self) {
+        self.outbox_rows.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One outbox row marked delivered or given up.
+    pub fn outbox_closed(&self) {
+        // A compare-and-swap loop that stops at zero (`fetch_update` is deprecated on newer
+        // toolchains, `try_update` is too new for the MSRV).
+        let rows = &self.outbox_rows;
+        let mut n = rows.load(Ordering::Relaxed);
+        while n > 0 {
+            match rows.compare_exchange_weak(n, n - 1, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(now) => n = now,
+            }
+        }
+    }
+
+    /// `<name>_delivered_total`, `_failures_total`, `_dropped_total`, `_queue_depth` and
+    /// `_outbox_rows`, with these help lines in that order.
+    fn render(&self, out: &mut String, name: &str, help: [&str; 5]) {
+        let series = [
+            ("delivered_total", &self.delivered),
+            ("failures_total", &self.failures),
+            ("dropped_total", &self.dropped),
+            ("queue_depth", &self.queue_depth),
+            ("outbox_rows", &self.outbox_rows),
+        ];
+        for (i, ((suffix, value), help)) in series.into_iter().zip(help).enumerate() {
+            let full = format!("{name}_{suffix}");
+            if i < 3 {
+                simple_counter(out, &full, help, value);
+            } else {
+                simple_gauge(out, &full, help, value);
+            }
+        }
+    }
+}
 
 fn simple_counter(out: &mut String, name: &str, help: &str, c: &AtomicU64) {
     header_lines(out, name, help, "counter");

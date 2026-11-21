@@ -451,6 +451,7 @@ listen = "127.0.0.1:9100"
 | `audit_checkpoint_last_timestamp_seconds`, `audit_wal_last_complete_timestamp_seconds`, `audit_wal_checkpoints_total{result}`, `audit_wal_backstops_total` | Signed checkpoints and the SQLite WAL checkpointer keeping up. |
 | `audit_sink_dropped_total`, `audit_sink_oldest_undelivered_timestamp_seconds` | Checkpoints not leaving the host. |
 | `approval_notify_dropped_total`, `approval_notify_outbox_rows` | `[approvals.notify]` notices given up, and notices stored but not yet delivered. The outbox count staying up means the receiver is down; the notices survive a restart. |
+| `lease_notify_dropped_total`, `lease_notify_outbox_rows` | The same for `[leases.notify]` revocation notices. A dropped one costs only time: the PEP still learns of the revocation when it next asks. |
 
 Alert on any increase of `audit_append_errors_total`, on a rising share of `reason="lease_expired"`, on `audit_sink_dropped_total` and on `readyz` returning 503. Example Prometheus rules for the newer series; tune the thresholds to your traffic:
 
@@ -504,7 +505,7 @@ From the audit log (`GET /admin/audit`, `attenuo audit tail`):
 - `audit verify` on a schedule. It exits 2 on a broken chain or an invalid checkpoint, and 1 when it could not check (server unreachable, bad admin token).
 - The checkpoint `seq` should only grow. Compare each reading with the last.
 
-If you run a second system that needs to react to revocations, such as an AuthZEN PEP, remember it learns only by asking. There is no push channel in v0.
+If you run a second system that needs to react to revocations, such as an AuthZEN PEP, it learns of a revocation when it asks. To tell it sooner, set [`[leases.notify]`](../reference/config.md#leasesnotify): the server then `POST`s a signed `lease.revoked` notice to a webhook after each revocation. Give it its own secret in `ATTENUO_LEASE_NOTIFY_SECRET`. The notice is a hint. It can be late or lost, so the PEP should still ask, or cache an allow only briefly. See [Revocation notices](../reference/authzen.md#revocation-notices).
 
 ## Upgrades
 

@@ -1,14 +1,23 @@
-//! The approval notice outbox (`[approvals.notify]`): one row per notice the server's notifier
-//! is to deliver, kept in the lease store's database so that a restart neither loses a notice
-//! still queued nor forgets an approval still waiting for its expiry.
+//! The notice outbox (`[approvals.notify]`, `[leases.notify]`): one row per notice one of the
+//! server's notifiers is to deliver, kept in the lease store's database so that a restart
+//! neither loses a notice still queued nor forgets an approval still waiting for its expiry.
 //!
-//! The notifier (in `attenuo-server`) writes a row right after the approval change it
-//! describes was stored and recorded, delivers from its in-memory queue, and marks the row
-//! delivered or given up. On start it delivers the rows still open, in insertion order, reading
-//! them in batches no larger than half its queue ([`SqliteLeaseStore::outbox_open_between`]).
-//! `event_id` is unique: it is derived from the approval id and the notice type, so a second
-//! notice of one type for one approval (an `approval.expired` found again
-//! after a restart) is refused here instead of being sent twice.
+//! A notifier (in `attenuo-server`) writes a row right after the change it describes was
+//! stored and recorded, delivers from its in-memory queue, and marks the row delivered or given
+//! up. On start it delivers the rows still open, in insertion order, reading them in batches no
+//! larger than half its queue ([`SqliteLeaseStore::outbox_open_between_of`]). `event_id` is
+//! unique: it is derived from what the notice is about and its type, so a second notice of one
+//! type for one approval (an `approval.expired` found again after a restart) is refused here
+//! instead of being sent twice.
+//!
+//! **Two notifiers, one table.** The rows of the two notifiers are told apart by the namespace
+//! of their `kind`: `approval.*` for the approval notifier, `lease.*` for the revocation
+//! notifier. Each notifier reads, counts and prunes only the rows of its own namespace (the
+//! `_of` methods take the prefix, `approval.` or `lease.`), so that each keeps its own backlog,
+//! gauge and retention, and a notifier that is not configured leaves the other's rows alone.
+//! The table needed no change for this: rows written before it are all `approval.*`. The
+//! column `approval_id` holds what the notice is about: an approval id, or for `lease.revoked`
+//! the first lease the revocation named. The methods without a prefix see every row.
 //!
 //! Times are Unix milliseconds (`INTEGER`), so that the pruning cutoff is a plain comparison.
 
@@ -44,9 +53,10 @@ pub struct OutboxNotice {
     pub id: i64,
     /// Stable across retries and restarts; receivers deduplicate by it.
     pub event_id: String,
-    /// `approval.pending`, `approval.decided` or `approval.expired`.
+    /// `approval.pending`, `approval.decided`, `approval.expired` or `lease.revoked`.
     pub kind: String,
-    /// The approval the notice is about.
+    /// What the notice is about: the approval, or for `lease.revoked` the first lease the
+    /// revocation named.
     pub approval_id: String,
     /// The JSON document exactly as sent and signed.
     pub body: Vec<u8>,
@@ -61,7 +71,7 @@ pub struct NewNotice<'a> {
     pub event_id: &'a str,
     /// The event kind, as [`OutboxNotice::kind`].
     pub kind: &'a str,
-    /// The approval the notice is about.
+    /// What the notice is about, as [`OutboxNotice::approval_id`].
     pub approval_id: &'a str,
     /// The signed JSON document to send.
     pub body: &'a [u8],
@@ -84,6 +94,15 @@ fn outbox_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<OutboxNotice> {
 }
 
 const OPEN: &str = "delivered_at IS NULL AND given_up_at IS NULL";
+
+/// Rows whose `kind` starts with the bound parameter `?N` (an empty prefix matches every row).
+/// A plain comparison of the leading characters, so no character of the prefix is a wildcard.
+fn of_kind(n: u8) -> String {
+    format!("substr(kind, 1, length(?{n})) = ?{n}")
+}
+
+/// Every row: the prefix the methods without `_of` pass.
+const ALL_KINDS: &str = "";
 
 impl SqliteLeaseStore {
     /// Store a notice to deliver. `Ok(None)` when a notice with this `event_id` is already
@@ -142,13 +161,31 @@ impl SqliteLeaseStore {
         through: i64,
         limit: usize,
     ) -> Result<Vec<OutboxNotice>, AuditError> {
+        self.outbox_open_between_of(ALL_KINDS, after, through, limit)
+    }
+
+    /// [`outbox_open_between`](Self::outbox_open_between) for the rows whose `kind` starts
+    /// with `prefix` only (one notifier's rows, see the module docs).
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Poisoned`] when a writer panicked holding the store's lock, or
+    /// [`AuditError::Sqlite`] when the query fails or a row has the wrong shape.
+    pub fn outbox_open_between_of(
+        &self,
+        prefix: &str,
+        after: i64,
+        through: i64,
+        limit: usize,
+    ) -> Result<Vec<OutboxNotice>, AuditError> {
         let conn = self.conn.lock()?;
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let mut stmt = conn.prepare_cached(&format!(
             "SELECT id, event_id, kind, approval_id, body, attempts FROM notice_outbox \
-             WHERE {OPEN} AND id > ?1 AND id <= ?2 ORDER BY id LIMIT ?3"
+             WHERE {OPEN} AND id > ?1 AND id <= ?2 AND {} ORDER BY id LIMIT ?3",
+            of_kind(4)
         ))?;
-        let rows = stmt.query_map(params![after, through, limit], outbox_row)?;
+        let rows = stmt.query_map(params![after, through, limit, prefix], outbox_row)?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
@@ -161,10 +198,24 @@ impl SqliteLeaseStore {
     /// [`AuditError::Poisoned`] when a writer panicked holding the store's lock, or
     /// [`AuditError::Sqlite`] when the query fails.
     pub fn outbox_last_open_id(&self) -> Result<Option<i64>, AuditError> {
+        self.outbox_last_open_id_of(ALL_KINDS)
+    }
+
+    /// [`outbox_last_open_id`](Self::outbox_last_open_id) among the rows whose `kind` starts
+    /// with `prefix`.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Poisoned`] when a writer panicked holding the store's lock, or
+    /// [`AuditError::Sqlite`] when the query fails.
+    pub fn outbox_last_open_id_of(&self, prefix: &str) -> Result<Option<i64>, AuditError> {
         let conn = self.conn.lock()?;
         Ok(conn.query_row(
-            &format!("SELECT max(id) FROM notice_outbox WHERE {OPEN}"),
-            [],
+            &format!(
+                "SELECT max(id) FROM notice_outbox WHERE {OPEN} AND {}",
+                of_kind(1)
+            ),
+            [prefix],
             |r| r.get(0),
         )?)
     }
@@ -176,10 +227,23 @@ impl SqliteLeaseStore {
     /// [`AuditError::Poisoned`] when a writer panicked holding the store's lock, or
     /// [`AuditError::Sqlite`] when the query fails.
     pub fn outbox_open_count(&self) -> Result<u64, AuditError> {
+        self.outbox_open_count_of(ALL_KINDS)
+    }
+
+    /// How many notices whose `kind` starts with `prefix` are open.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Poisoned`] when a writer panicked holding the store's lock, or
+    /// [`AuditError::Sqlite`] when the query fails.
+    pub fn outbox_open_count_of(&self, prefix: &str) -> Result<u64, AuditError> {
         let conn = self.conn.lock()?;
         let n: i64 = conn.query_row(
-            &format!("SELECT count(*) FROM notice_outbox WHERE {OPEN}"),
-            [],
+            &format!(
+                "SELECT count(*) FROM notice_outbox WHERE {OPEN} AND {}",
+                of_kind(1)
+            ),
+            [prefix],
             |r| r.get(0),
         )?;
         Ok(u64::try_from(n).unwrap_or(0))
@@ -262,11 +326,25 @@ impl SqliteLeaseStore {
     /// [`AuditError::Poisoned`] when a writer panicked holding the store's lock, or
     /// [`AuditError::Sqlite`] when the delete fails.
     pub fn outbox_prune(&self, before: OffsetDateTime) -> Result<u64, AuditError> {
+        self.outbox_prune_of(ALL_KINDS, before)
+    }
+
+    /// [`outbox_prune`](Self::outbox_prune) for the rows whose `kind` starts with `prefix`,
+    /// so that each notifier applies its own `outbox_retention_seconds` to its own rows.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Poisoned`] when a writer panicked holding the store's lock, or
+    /// [`AuditError::Sqlite`] when the delete fails.
+    pub fn outbox_prune_of(&self, prefix: &str, before: OffsetDateTime) -> Result<u64, AuditError> {
         let _gate = self.gate.hold();
         let conn = self.conn.lock()?;
         let n = conn.execute(
-            "DELETE FROM notice_outbox WHERE coalesce(delivered_at, given_up_at) < ?1",
-            [ms(before)],
+            &format!(
+                "DELETE FROM notice_outbox WHERE coalesce(delivered_at, given_up_at) < ?1 AND {}",
+                of_kind(2)
+            ),
+            params![ms(before), prefix],
         )?;
         Ok(n as u64)
     }
@@ -401,5 +479,55 @@ mod tests {
             "open rows are never pruned"
         );
         assert_eq!(s.outbox_open_id("e3").unwrap(), Some(open));
+    }
+
+    /// The `_of` methods see the rows of one kind namespace only; the others see every row.
+    #[test]
+    fn each_notifier_sees_only_its_own_rows() {
+        let s = SqliteLeaseStore::open_in_memory().unwrap();
+        let t = OffsetDateTime::from_unix_timestamp(1_780_000_000).unwrap();
+        let row = |event: &str, kind: &str| {
+            s.outbox_insert(
+                NewNotice {
+                    event_id: event,
+                    kind,
+                    approval_id: "x",
+                    body: b"{}",
+                },
+                t,
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let a1 = row("a1", "approval.pending");
+        let l1 = row("l1", "lease.revoked");
+        let a2 = row("a2", "approval.decided");
+        let l2 = row("l2", "lease.revoked");
+        // A kind that only looks like the prefix: `_` and `%` are not wildcards here.
+        row("odd", "lease_revoked");
+        let ids = |rows: Vec<OutboxNotice>| rows.into_iter().map(|r| r.id).collect::<Vec<_>>();
+        assert_eq!(
+            ids(s
+                .outbox_open_between_of("approval.", 0, i64::MAX, 10)
+                .unwrap()),
+            vec![a1, a2]
+        );
+        assert_eq!(
+            ids(s.outbox_open_between_of("lease.", 0, i64::MAX, 10).unwrap()),
+            vec![l1, l2]
+        );
+        assert_eq!(s.outbox_last_open_id_of("approval.").unwrap(), Some(a2));
+        assert_eq!(s.outbox_last_open_id_of("lease.").unwrap(), Some(l2));
+        assert_eq!(s.outbox_last_open_id_of("none.").unwrap(), None);
+        assert_eq!(s.outbox_open_count_of("lease.").unwrap(), 2);
+        assert_eq!(s.outbox_open_count().unwrap(), 5);
+        for id in [a1, l1] {
+            assert!(s.outbox_delivered(id, t).unwrap());
+        }
+        let later = t + time::Duration::seconds(1);
+        assert_eq!(s.outbox_prune_of("lease.", later).unwrap(), 1);
+        assert_eq!(s.outbox_prune_of("lease.", later).unwrap(), 0);
+        assert_eq!(s.outbox_prune_of("approval.", later).unwrap(), 1);
+        assert_eq!(s.outbox_open_count().unwrap(), 3);
     }
 }

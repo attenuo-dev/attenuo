@@ -40,7 +40,8 @@ pub const AUDIT_APPEND_FAILURE_HOLD: std::time::Duration = std::time::Duration::
 /// With `[approvals.notify]` configured, `checks.approval_notifier` is `"ok"` or
 /// `"degraded"` on the same rule (queue full, or the oldest undelivered notification or the
 /// current run of failures older than its `max_lag_seconds`), and `"degraded"` is true when
-/// either is. A degraded notifier never fails readiness: notifications are best effort.
+/// either is. A degraded notifier never fails readiness: notifications are best effort. With
+/// `[leases.notify]` configured, `checks.lease_notifier` follows the same rule.
 ///
 /// Right after a quick restart, while the DPoP restart fence refuses every proof made now
 /// (`crate::dpop`, "Restart fence"; at most about 21 seconds with the defaults), the answer is
@@ -107,21 +108,32 @@ pub async fn readyz(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Val
         body["degraded"] = json!(status.degraded);
         body["checks"]["checkpoint_sink"] = json!(if status.degraded { "degraded" } else { "ok" });
     }
-    if let Some(n) = &state.approval_notifier {
-        let status = n.status();
+    let notifiers = [
+        (
+            "approval_notifier",
+            "[approvals.notify]",
+            state.approval_notifier.as_ref().map(|n| n.status()),
+        ),
+        (
+            "lease_notifier",
+            "[leases.notify]",
+            state.lease_notifier.as_ref().map(|n| n.status()),
+        ),
+    ];
+    for (check, section, status) in notifiers {
+        let Some(status) = status else { continue };
         if status.degraded {
             tracing::warn!(
                 queued = status.queued,
                 capacity = status.capacity,
                 lag_seconds = status.lag.as_secs(),
                 last_error = status.last_error.as_deref().unwrap_or(""),
-                "readiness: [approvals.notify] is degraded"
+                "readiness: {section} is degraded"
             );
         }
         let degraded = status.degraded || body["degraded"].as_bool().unwrap_or(false);
         body["degraded"] = json!(degraded);
-        body["checks"]["approval_notifier"] =
-            json!(if status.degraded { "degraded" } else { "ok" });
+        body["checks"][check] = json!(if status.degraded { "degraded" } else { "ok" });
     }
     let code = if ready {
         StatusCode::OK

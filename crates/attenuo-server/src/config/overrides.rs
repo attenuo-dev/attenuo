@@ -12,7 +12,8 @@
 //! - Only scalar keys (string, integer, float, bool, and the strings that stand for an
 //!   address, a path or a choice) can be set. Lists, tables of names (`[policy.catalog]`,
 //!   `headers`, ...), arrays of tables (`[[agents]]`, `[[upstreams]]`, ...) and optional
-//!   sections absent from the file (`[audit.sink]`, `[approvals.notify]`) cannot.
+//!   sections absent from the file (`[audit.sink]`, `[approvals.notify]`, `[leases.notify]`)
+//!   cannot.
 //! - The value is typed by the key it replaces: `true` or `false` for a bool, a decimal
 //!   integer for an integer, a number for a float, the text as is for a string.
 //! - `[dev]` keys are refused: the unverified root mint is switched on in the file, where a
@@ -41,6 +42,7 @@ const NAME_TABLES: &[&[&str]] = &[
     &["policy", "user_attributes"],
     &["telemetry", "resource_attributes"],
     &["approvals", "notify", "headers"],
+    &["leases", "notify", "headers"],
 ];
 
 /// One key that an environment variable set.
@@ -784,6 +786,27 @@ mod tests {
         );
     }
 
+    /// `[leases.notify]` is optional like `[approvals.notify]`: a variable cannot create it,
+    /// and it can change a scalar key of a section the file has.
+    #[test]
+    fn lease_notify_follows_the_optional_section_rules() {
+        let e = refused("", &[("ATTENUO__LEASES__NOTIFY__URL", "https://n.example")]);
+        assert!(
+            e.contains("[leases.notify] is not in the config file"),
+            "{e}"
+        );
+        let file = "[leases.notify]\nurl = \"https://n.example/hook\"\n";
+        let (cfg, _) = load(file, &[("ATTENUO__LEASES__NOTIFY__MAX_ATTEMPTS", "9")]).unwrap();
+        let n = cfg.leases.notify.unwrap();
+        assert_eq!(n.max_attempts, 9);
+        assert_eq!(n.secret_env, "ATTENUO_LEASE_NOTIFY_SECRET");
+        let e = refused(
+            file,
+            &[("ATTENUO__LEASES__NOTIFY__HEADERS__X", "ATTENUO_TEST_HEADER")],
+        );
+        assert!(!e.is_empty());
+    }
+
     #[test]
     fn an_empty_value_is_refused() {
         let e = refused(FILE, &[("ATTENUO__SERVER__PUBLIC_URL", "")]);
@@ -966,6 +989,9 @@ mod tests {
         let mut cfg = Config::default();
         cfg.audit.sink = Some(super::super::SinkSection::new(super::super::SinkKind::File));
         cfg.approvals.notify = Some(super::super::NotifySection::new("https://n.example"));
+        cfg.leases.notify = Some(super::super::LeaseNotifySection::with_url(
+            "https://n.example",
+        ));
         let schema = serde_json::to_value(&cfg).unwrap();
         fn walk(node: &Json, path: &mut Vec<String>, found: &mut Vec<Vec<String>>) {
             if let Json::Object(map) = node {

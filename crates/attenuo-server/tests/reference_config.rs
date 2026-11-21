@@ -43,6 +43,7 @@ const NAME_TABLES: &[(&str, Option<&str>)] = &[
     ("policy.user_attributes", None),
     ("telemetry.resource_attributes", None),
     ("approvals.notify.headers", None),
+    ("leases.notify.headers", None),
     ("idps.client_ids", None),
     ("idps.id_jag_ceiling.resources", None),
     ("idps.id_jag_ceiling.scopes", None),
@@ -108,6 +109,10 @@ client_id = "approver"
 
 [approvals.notify]
 url = "https://notify.example/hook"
+headers = { X-Team = "ops" }
+
+[leases.notify]
+url = "https://notify.example/revoked"
 headers = { X-Team = "ops" }
 
 [[upstreams]]
@@ -490,6 +495,9 @@ role = "viewer"
 
 [approvals.notify]
 url = "https://notify.example/hook"
+
+[leases.notify]
+url = "https://notify.example/revoked"
 
 [[upstreams]]
 name = "github"
