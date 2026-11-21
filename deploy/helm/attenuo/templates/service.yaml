@@ -1,0 +1,61 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "attenuo.fullname" . }}
+  labels:
+    {{- include "attenuo.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "attenuo.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
+{{- if .Values.metrics.enabled }}
+---
+# Metrics have no authentication, so they are never on the main Service, which may be a
+# LoadBalancer: this one is always ClusterIP.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "attenuo.fullname" . | trunc 55 | trimSuffix "-" }}-metrics
+  labels:
+    {{- include "attenuo.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "attenuo.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: metrics
+      port: {{ .Values.metrics.port }}
+      targetPort: metrics
+      protocol: TCP
+{{- end }}
+{{- if .Values.admin.service.enabled }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "attenuo.fullname" . | trunc 57 | trimSuffix "-" }}-admin
+  labels:
+    {{- include "attenuo.labels" . | nindent 4 }}
+  {{- with .Values.admin.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "attenuo.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: admin
+      port: {{ .Values.admin.service.port }}
+      targetPort: admin
+      protocol: TCP
+{{- end }}

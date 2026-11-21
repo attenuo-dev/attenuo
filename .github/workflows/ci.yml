@@ -60,6 +60,7 @@ jobs:
       guide: ${{ github.event_name != 'pull_request' || steps.filter.outputs.guide == 'true' }}
       lean: ${{ github.event_name != 'pull_request' || steps.filter.outputs.lean == 'true' }}
       install: ${{ github.event_name != 'pull_request' || steps.filter.outputs.install == 'true' }}
+      helm: ${{ github.event_name != 'pull_request' || steps.filter.outputs.helm == 'true' }}
     steps:
       - id: filter
         if: github.event_name == 'pull_request'
@@ -98,6 +99,9 @@ jobs:
             # The install script and its test.
             install:
               - "{scripts/install.sh,scripts/test-install.sh,.github/workflows/ci.yml}"
+            # The Helm chart, its test, and the fake upstream and policy the test deploys.
+            helm:
+              - "{deploy/helm/**,scripts/helm-smoke.sh,examples/github-leak-demo/fake_github_mcp.py,examples/github-leak-demo/policy.cedar,.github/workflows/ci.yml}"
 
   fmt:
     name: rustfmt
@@ -334,6 +338,29 @@ jobs:
           "$RUNNER_TEMP/bin/attenuo" --version
           "$RUNNER_TEMP/bin/attenuo-server" --version
 
+  # The Helm chart (deploy/helm/attenuo, scripts/helm-smoke.sh): template checks, then an
+  # install into a kind cluster with the published release image, a token minted and
+  # exchanged, one allowed and one denied call, a pod restart and a config change. The
+  # runner image ships kind, helm and kubectl. It runs the published image, not a server
+  # built from this commit, so it does not notice a config key renamed on main: the next
+  # release's chart bump does.
+  helm-chart:
+    name: helm chart
+    needs: changes
+    if: needs.changes.outputs.helm == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Versions
+        run: |
+          helm version --short
+          kind version
+          kubectl version --client
+      - name: Create the cluster
+        run: kind create cluster --wait 180s
+      - run: bash scripts/helm-smoke.sh
+
   # The admin console in headless Chromium: every page in both themes, with zero console
   # errors and CSP violations allowed (scripts/console-smoke.sh, tests/console/).
   console-browser:
@@ -512,7 +539,7 @@ jobs:
   ci-ok:
     name: ci-ok
     if: always()
-    needs: [changes, fmt, clippy, test, msrv, deny, audit, demo, getting-started, compose, docker-quickstart, install-script, console-browser, policy-tests, fuzz-check, fuzz-build, lean, docs]
+    needs: [changes, fmt, clippy, test, msrv, deny, audit, demo, getting-started, compose, docker-quickstart, install-script, helm-chart, console-browser, policy-tests, fuzz-check, fuzz-build, lean, docs]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

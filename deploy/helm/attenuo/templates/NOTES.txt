@@ -1,0 +1,33 @@
+attenuo {{ .Values.image.tag | default .Chart.AppVersion }} is starting as one pod (Deployment {{ include "attenuo.fullname" . }}).
+
+Agents and MCP clients use:   {{ .Values.publicUrl }}
+Inside the cluster:           http://{{ include "attenuo.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.port }}
+
+{{ if .Values.admin.service.enabled -}}
+The admin API listens on the pod's address, port 9102, and has a ClusterIP Service: every
+pod that the cluster's network policy lets through can reach it. From your machine:
+{{- else -}}
+The admin API listens on loopback inside the pod only. Reach it from your machine with:
+{{- end }}
+
+  kubectl -n {{ .Release.Namespace }} port-forward deploy/{{ include "attenuo.fullname" . }} 9102:9102
+  attenuo --server http://127.0.0.1:9102 lease show <ID>     # with ATTENUO_ADMIN_TOKEN set
+
+Check that it is ready:
+
+  kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "attenuo.fullname" . }}
+{{- if not .Values.issuerKey.existingSecret }}
+
+NOTE: no issuerKey.existingSecret is set, so the server created its signing key on the
+data volume. Manage the key yourself before relying on this deployment.
+{{- end }}
+{{- if not .Values.persistence.enabled }}
+
+WARNING: persistence is off. The audit log, every lease{{ if not .Values.issuerKey.existingSecret }} and the signing key{{ end }} are lost
+when the pod restarts.
+{{- end }}
+{{- if not .Values.adminToken.existingSecret }}
+
+NOTE: no adminToken.existingSecret is set. The server starts only if the config has
+[[admin.operators]] entries.
+{{- end }}
