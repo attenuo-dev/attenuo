@@ -28,6 +28,7 @@ use super::page;
 use super::{audit_admin, bearer_of, REASON_ADMIN_ACTION};
 use crate::error::ApiError;
 use crate::metrics::RefundSource;
+use crate::notify::LeaseRevocation;
 use crate::operators::{required_role, AdminIdentity, AuthFailure};
 use crate::state::AppState;
 use attenuo_core::Decision;
@@ -197,6 +198,18 @@ pub async fn revoke_lease(
             )
             .inspect_err(|e| tracing::error!(error = ?e.detail, "admin revoke was not audited"))
             .ok();
+            let named = std::slice::from_ref(&lease);
+            notify_revoked(
+                state,
+                &who,
+                named,
+                &[],
+                None,
+                revoked,
+                &reason,
+                now,
+                audit_id,
+            );
             Ok(Json(json!({
                 "lease_id": lease,
                 "revoked": revoked,
@@ -205,6 +218,48 @@ pub async fn revoke_lease(
             })))
         })
         .await
+}
+
+/// `[leases.notify]`: after a revocation that changed at least one lease, and its audit
+/// record (`audit_id`, `None` when it could not be written), store and queue one
+/// `lease.revoked` notice naming the top leases of what was revoked
+/// ([`LeaseRevocation::tops`] over `matched` and `revoked`; for a revocation by id `matched`
+/// is the lease and `revoked` is left empty) and their chains. Local reads and one outbox
+/// insert, never the network: a receiver that is slow or down cannot delay or fail the
+/// revocation. Nothing is sent when `revoked` is 0 or the notifier is unset.
+#[allow(clippy::too_many_arguments)]
+fn notify_revoked(
+    state: &AppState,
+    who: &AdminIdentity,
+    matched: &[LeaseId],
+    revoked_ids: &[LeaseId],
+    selector: Option<Value>,
+    revoked: u64,
+    reason: &str,
+    now: OffsetDateTime,
+    audit_id: Option<uuid::Uuid>,
+) {
+    let Some(n) = &state.lease_notifier else {
+        return;
+    };
+    if revoked == 0 {
+        return;
+    }
+    let (lease_ids, chain_ids, truncated) =
+        LeaseRevocation::tops(&state.leases, matched, revoked_ids);
+    n.revoked(&LeaseRevocation {
+        lease_ids,
+        chain_ids,
+        truncated,
+        selector,
+        revoked,
+        reason: reason.to_string(),
+        revoked_at: now,
+        audit_record_id: audit_id,
+        by: who.name.clone(),
+        by_subject: who.subject(),
+        nonce: uuid::Uuid::new_v4(),
+    });
 }
 
 /// Most lease ids `POST /admin/leases/revoke` lists in its response, per list (`matched`,
@@ -433,6 +488,17 @@ pub async fn revoke_by_selector(
             )
             .inspect_err(|e| tracing::error!(error = ?e.detail, "admin revoke was not audited"))
             .ok();
+            notify_revoked(
+                state,
+                &who,
+                &out.matched,
+                &out.revoked,
+                Some(shown.clone()),
+                revoked,
+                &reason,
+                now,
+                audit_id,
+            );
             Ok(selector_response(shown, &out, Some(&reason), audit_id))
         })
         .await

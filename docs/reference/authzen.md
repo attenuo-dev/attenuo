@@ -90,6 +90,19 @@ These are allowed by the specification (5.5.1 lets the answer's `context` hold a
 - **Side effects.** An evaluation is a real decision, the same as a call through the proxy. It is written to the audit log, an allowed evaluation is charged to the run's limits and counted in its usage, and a granted approval is used up. Use the admin dry run `POST /admin/policies/evaluate` to ask without these effects.
 - **Error bodies.** Refused requests answer with a JSON object, `{"error": "<error>", "code": "<code>", "detail": "<text>"}`, and add `error_description` on a 401; `code` is the stable code ([Errors](http-api.md#errors)). This differs from the specification's table; see [the open decision](#open-decision-error-bodies).
 
+## Revocation notices
+
+AuthZEN has no way for the PDP to tell a PEP that an answer it gave is no longer true. Attenuo adds one outside the protocol: with [`[leases.notify]`](config.md#leasesnotify) set, the server `POST`s a signed `lease.revoked` notice to a webhook after each revocation request that revoked at least one lease. A PEP that caches allows or holds long streams can use it to stop sooner. It is a hint, not enforcement. Without the notice, a PEP still learns of a revocation the next time it asks.
+
+What a PEP does with a notice:
+
+1. **Verify it.** Compute HMAC-SHA-256 under the shared secret over `<t>.` followed by the body exactly as received, where `t` is from `X-Attenuo-Signature: t=<t>,v1=<hex>`. Compare it with `v1` in constant time. Refuse a `t` older than about five minutes. Refuse anything that does not verify.
+2. **Deduplicate by `event_id`.** A notice can arrive twice.
+3. **Refuse what the notice revoked, and ask again about the rest.** A token is revoked when its chain contains a listed `lease_id`: one of the hops in `chain.hops` of the delegation token is that lease. Refuse such a token, drop its cached allows, and close streams opened with it. A listed `chain_id` is weaker. It is the root lease of a chain that held a revoked lease, which is `chain.hops[0].lease` in the delegation token and the `chain_id` audit records carry. Revoking a lease in the middle of a chain leaves the root and its other branches valid. So for a listed `chain_id`, drop cached allows for that run and ask on the next request. Do not close streams or refuse tokens on `chain_id` alone. A PEP may choose to, to fail closed, but it then refuses valid tokens of the chain's other branches until they ask again. When `truncated` is `true`, the lists are cut and some revoked leases are not named. Drop every cached allow the selector covers (of the user in `selector.user`, or of the chains in `selector.chain_id` or `selector.chain_ids`), or all cached allows, and ask again.
+4. **Still ask.** The notice can be late or lost, and a lease that expires sends none. A PEP that must be sure asks for each request, or caches an allow for no longer than it is willing to leave a revoked agent running. A lost notice loses nothing but time: the next evaluation answers `decision: false` with `reason` `lease_revoked`.
+
+Descendants of the leases named are not listed. Revoking a lease revokes everything delegated from it, so a token whose chain contains a listed lease is revoked, however far below it the token's own hop is. A token whose chain id is listed but whose chain holds no listed lease is not revoked by this notice. A PEP that needs the full list of revoked leases calls `GET /admin/leases/{lease_id}/tree`.
+
 ## Open decision: error bodies
 
 Section 10.1.2's table gives the body of a 400, 401, 403 and 500 as "an error message string". Attenuo answers every refused request on the AuthZEN routes as it does on every other REST route, with a JSON object (`Content-Type: application/json`):

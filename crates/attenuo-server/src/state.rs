@@ -112,6 +112,8 @@ pub struct AppState {
     pub approvals_client_id: Option<String>,
     /// `[approvals.notify]`: the approval notifier; `None` when unset.
     pub approval_notifier: Option<crate::notify::ApprovalNotifier>,
+    /// `[leases.notify]`: the revocation notifier; `None` when unset.
+    pub lease_notifier: Option<crate::notify::LeaseNotifier>,
     /// The time of every request check (token, lease and approval expiry, the embedded
     /// proxy's session TTL and record windows): the system clock, except in tests that step
     /// past a TTL with a [`attenuo_core::ManualClock`] ([`crate::build_with_clock`]).
@@ -185,6 +187,14 @@ impl AppState {
         config.token.check_dpop()?;
         config.token.check_client_assertion()?;
         config.approvals.check()?;
+        if let Some(n) = &config.leases.notify {
+            n.validate()?;
+            if let Some(a) = &config.approvals.notify {
+                if let Some(warning) = crate::config::shared_notify_secret(a, n) {
+                    tracing::warn!("{warning}");
+                }
+            }
+        }
         let lease_maintenance = config.leases.maintenance()?;
         let user_window_retention = config.leases.user_window_retention()?;
         let issuer = load_issuer(config)?;
@@ -249,6 +259,15 @@ impl AppState {
             crate::replay::ReplayCache::new(leases.clone(), crate::replay::DEFAULT_REPLAY_CAPACITY);
         let approval_notifier = match &config.approvals.notify {
             Some(cfg) => Some(crate::notify::ApprovalNotifier::start(
+                cfg,
+                metrics.clone(),
+                leases.clone(),
+                clock.clone(),
+            )?),
+            None => None,
+        };
+        let lease_notifier = match &config.leases.notify {
+            Some(cfg) => Some(crate::notify::LeaseNotifier::start(
                 cfg,
                 metrics.clone(),
                 leases.clone(),
@@ -401,6 +420,7 @@ impl AppState {
             sink_fails_readiness: config.audit.sink.as_ref().is_some_and(|s| s.fail_readiness),
             approvals_client_id: config.approvals.client_id.clone(),
             approval_notifier,
+            lease_notifier,
             clock,
             trace,
             limits: Arc::new(crate::limits::Limits::new(

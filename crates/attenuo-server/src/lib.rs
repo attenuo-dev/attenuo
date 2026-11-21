@@ -601,7 +601,9 @@ async fn maintenance_ticks(state: Arc<AppState>, stop: impl std::future::Future<
     }
 }
 
-/// How long `[audit.sink]` keeps delivering queued checkpoints after a shutdown signal.
+/// How long `[audit.sink]`, `[approvals.notify]` and `[leases.notify]` keep delivering what
+/// they have queued after a shutdown signal. The three share this one grace: [`run`] stops
+/// them side by side, by the same deadline.
 pub const SINK_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How long in-flight requests get to finish after a shutdown signal.
@@ -651,8 +653,8 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
 ///
 /// When it returns, everything it started has finished and been dropped: the listeners are
 /// closed, their connections drained (or, past the drain timeout, abandoned), the timers stopped
-/// between ticks and awaited, `[audit.sink]` and `[approvals.notify]` stopped after their grace,
-/// and the WAL checkpointed. `run` drops its own reference to `state` last, so once the caller
+/// between ticks and awaited, `[audit.sink]`, `[approvals.notify]` and `[leases.notify]` stopped
+/// side by side within one shared grace ([`SINK_SHUTDOWN_GRACE`]), and the WAL checkpointed. `run` drops its own reference to `state` last, so once the caller
 /// drops its references too the state goes, its stores close and the single-writer fence is
 /// released; [`AppState::released`] resolves at that point.
 ///
@@ -767,25 +769,38 @@ pub async fn run(
             Err(e) => tracing::warn!(error = %e, "{what} panicked"),
         }
     }
-    // Give checkpoints still queued for `[audit.sink]` a moment to leave the host.
+    // Give checkpoints still queued for `[audit.sink]`, and approval and revocation notices
+    // still queued, one shared moment to leave the host: the three queues stop side by side,
+    // each by the same deadline, so the wait is one grace (plus at most one request already
+    // in flight, cut by its own timeout), not one per queue.
+    let deadline = std::time::Instant::now() + SINK_SHUTDOWN_GRACE;
+    let mut stopping = Vec::new();
     if state.checkpoint_sink.is_some() {
         let s = state.clone();
-        let _ = tokio::task::spawn_blocking(move || {
+        stopping.push(tokio::task::spawn_blocking(move || {
             if let Some(sink) = &s.checkpoint_sink {
-                sink.shutdown(SINK_SHUTDOWN_GRACE);
+                sink.shutdown(deadline.saturating_duration_since(std::time::Instant::now()));
             }
-        })
-        .await;
+        }));
     }
-    // Give approval notifications still queued a moment to go out.
     if state.approval_notifier.is_some() {
         let s = state.clone();
-        let _ = tokio::task::spawn_blocking(move || {
+        stopping.push(tokio::task::spawn_blocking(move || {
             if let Some(n) = &s.approval_notifier {
-                n.shutdown(SINK_SHUTDOWN_GRACE);
+                n.shutdown(deadline.saturating_duration_since(std::time::Instant::now()));
             }
-        })
-        .await;
+        }));
+    }
+    if state.lease_notifier.is_some() {
+        let s = state.clone();
+        stopping.push(tokio::task::spawn_blocking(move || {
+            if let Some(n) = &s.lease_notifier {
+                n.shutdown(deadline.saturating_duration_since(std::time::Instant::now()));
+            }
+        }));
+    }
+    for task in stopping {
+        let _ = task.await;
     }
     // Requests have drained: fold the WAL into the database file before exiting.
     match state.blocking(|s| s.audit.checkpoint_wal()).await {

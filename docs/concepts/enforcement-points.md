@@ -50,13 +50,13 @@ Use AuthZEN when the thing that makes the call is not an MCP client you control,
 | Protocol | MCP over HTTP | AuthZEN evaluation |
 | Agent changes needed | Point at `/mcp/{server}` | None, but the PEP must call the endpoint |
 | If the PEP skips the call | Not possible when the upstream is private | Nothing stops the call |
-| Revocation | Seen on the next request | Seen only when the PEP asks |
+| Revocation | Seen on the next request | Seen when the PEP asks, or sooner from a `lease.revoked` notice (`[leases.notify]`) |
 
 Both paths write to the same audit log.
 
 ## Limits today
 
-- There is no push channel, so a PEP that caches decisions will not learn of a revocation.
+- A PEP that caches decisions learns of a revocation when it next asks. With `[leases.notify]` set, the server also sends a signed `lease.revoked` notice to a webhook, so the PEP can drop cached allows sooner. The notice is a hint: it can be late or lost, so the PEP should still not cache an allow for long. See [Revocation notices](../reference/authzen.md#revocation-notices).
 - Admin routes use static bearer tokens (`[admin] token`, or one per operator with a role and an optional expiry, [ADR-0016](../decisions/0016-admin-operators.md)) and should not be public. There is no operator login through an IdP.
 - AuthZEN conformance is checked by fixtures in `crates/attenuo-server/tests/fixtures/authzen/`; what is and is not implemented is in [AuthZEN conformance](../reference/authzen.md). Of the Search APIs only action search is served (`POST /access/v1/search/action`).
 

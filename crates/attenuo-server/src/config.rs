@@ -1209,20 +1209,75 @@ pub struct ApprovalsSection {
 /// Environment variable `[approvals.notify] secret_env` names by default.
 pub const NOTIFY_SECRET_ENV: &str = "ATTENUO_APPROVAL_NOTIFY_SECRET";
 
-/// Fewest bytes the `[approvals.notify]` signing secret may have.
+/// Environment variable `[leases.notify] secret_env` names by default.
+pub const LEASE_NOTIFY_SECRET_ENV: &str = "ATTENUO_LEASE_NOTIFY_SECRET";
+
+/// Fewest bytes the signing secret of `[approvals.notify]` or `[leases.notify]` may have.
 pub const NOTIFY_SECRET_MIN_LEN: usize = 32;
 
-/// `[approvals.notify]`: the approval notifier. Every approval that becomes pending, and
-/// again when it is decided or expires, is queued (bounded, never blocking a decision) and
-/// `POST`ed to `url` by a background thread with jittered retries, on the `[audit.sink]`
-/// queue ([`crate::sink::Queue`]). The body is signed with HMAC-SHA-256 under the secret in
-/// the environment variable `secret_env` (header `X-Attenuo-Signature`). Each notice is
-/// stored in the lease store's `notice_outbox` table first, so a restart delivers what was
-/// left undelivered ([`crate::notify`]). Best effort: a notification that fails `max_attempts`
+/// Which notifier a [`NotifySection`] configures: the section's name in messages and the
+/// default of its `secret_env`. Everything else the two sections share.
+pub trait NotifyTarget:
+    std::fmt::Debug + Clone + Copy + PartialEq + Eq + Default + Send + Sync + 'static
+{
+    /// The section, as messages name it (`[approvals.notify]`).
+    const SECTION: &'static str;
+    /// The default of `secret_env`.
+    const SECRET_ENV: &'static str;
+}
+
+/// [`NotifySection`] of `[approvals.notify]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ForApprovals;
+
+impl NotifyTarget for ForApprovals {
+    const SECTION: &'static str = "[approvals.notify]";
+    const SECRET_ENV: &'static str = NOTIFY_SECRET_ENV;
+}
+
+/// [`NotifySection`] of `[leases.notify]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ForLeases;
+
+impl NotifyTarget for ForLeases {
+    const SECTION: &'static str = "[leases.notify]";
+    const SECRET_ENV: &'static str = LEASE_NOTIFY_SECRET_ENV;
+}
+
+/// `[leases.notify]`: the revocation notifier's section, the same keys as
+/// `[approvals.notify]` with its own `secret_env` default ([`LEASE_NOTIFY_SECRET_ENV`]).
+pub type LeaseNotifySection = NotifySection<ForLeases>;
+
+/// The startup warning when `[approvals.notify]` and `[leases.notify]` read their signing
+/// secret from the same variable; `None` when they do not. Not an error: it works, but then a
+/// receiver of one kind of notice can sign notices of the other. Names the variable, never
+/// its value.
+pub fn shared_notify_secret(
+    approvals: &NotifySection<ForApprovals>,
+    leases: &LeaseNotifySection,
+) -> Option<String> {
+    (approvals.secret_env == leases.secret_env).then(|| {
+        format!(
+            "[approvals.notify] and [leases.notify] both sign with ${}: a receiver of one kind \
+             of notice can then sign the other; give [leases.notify] a secret_env of its own",
+            leases.secret_env
+        )
+    })
+}
+
+/// `[approvals.notify]`, and with `K` = [`ForLeases`] `[leases.notify]`: a notifier. For
+/// `[approvals.notify]`, every approval that becomes pending, and again when it is decided or
+/// expires; for `[leases.notify]`, every revocation request that revoked at least one lease.
+/// Each notice is queued (bounded, never blocking a decision or a revocation) and `POST`ed to
+/// `url` by a background thread with jittered retries, on the `[audit.sink]` queue
+/// ([`crate::sink::Queue`]). The body is signed with HMAC-SHA-256 under the secret in the
+/// environment variable `secret_env` (header `X-Attenuo-Signature`). Each notice is stored in
+/// the lease store's `notice_outbox` table first, so a restart delivers what was left
+/// undelivered ([`crate::notify`]). Best effort: a notification that fails `max_attempts`
 /// times is dropped and counted. See `docs/design/server.md` ("Approvals").
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct NotifySection {
+pub struct NotifySection<K: NotifyTarget = ForApprovals> {
     /// The URL to `POST` to (`https://` or `http://`, with a host and no user info or
     /// fragment). Any 2xx is success; redirects are not followed.
     pub url: String,
@@ -1233,14 +1288,16 @@ pub struct NotifySection {
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
     /// The environment variable holding the HMAC signing secret, at least
-    /// [`NOTIFY_SECRET_MIN_LEN`] bytes. Required at startup. Default [`NOTIFY_SECRET_ENV`].
-    #[serde(default = "default_notify_secret_env")]
+    /// [`NOTIFY_SECRET_MIN_LEN`] bytes. Required at startup. Default [`NOTIFY_SECRET_ENV`]
+    /// (`[approvals.notify]`) or [`LEASE_NOTIFY_SECRET_ENV`] (`[leases.notify]`).
+    #[serde(default = "default_notify_secret_env::<K>")]
     pub secret_env: String,
     /// Per-request timeout in seconds. Default 5.
     #[serde(default = "default_notify_timeout_seconds")]
     pub timeout_seconds: u64,
     /// Notifications waiting to be delivered, at most; when full, the oldest queued one is
-    /// dropped and `attenuo_approval_notify_dropped_total` counts it. Default 256.
+    /// dropped and `attenuo_approval_notify_dropped_total` (or
+    /// `attenuo_lease_notify_dropped_total`) counts it. Default 256.
     #[serde(default = "default_notify_queue_capacity")]
     pub queue_capacity: usize,
     /// Attempts per notification before it is dropped (and counted). Default 5.
@@ -1262,13 +1319,16 @@ pub struct NotifySection {
     /// get no `approval.expired` notice on start. Default 604800 (7 days).
     #[serde(default = "default_notify_outbox_retention_seconds")]
     pub outbox_retention_seconds: u64,
+    /// Which section this is; not a key.
+    #[serde(skip)]
+    pub target: std::marker::PhantomData<K>,
 }
 
 fn default_notify_outbox_retention_seconds() -> u64 {
     7 * 24 * 3600
 }
-fn default_notify_secret_env() -> String {
-    NOTIFY_SECRET_ENV.into()
+fn default_notify_secret_env<K: NotifyTarget>() -> String {
+    K::SECRET_ENV.into()
 }
 fn default_notify_timeout_seconds() -> u64 {
     5
@@ -1283,7 +1343,7 @@ fn default_notify_max_backoff_seconds() -> u64 {
     30
 }
 
-/// Request headers `[approvals.notify] headers` may not set.
+/// Request headers `[approvals.notify] headers` and `[leases.notify] headers` may not set.
 const NOTIFY_RESERVED_HEADERS: [&str; 4] = [
     "content-type",
     "content-length",
@@ -1292,12 +1352,20 @@ const NOTIFY_RESERVED_HEADERS: [&str; 4] = [
 ];
 
 impl NotifySection {
-    /// A section for `url` with every other field at its default.
+    /// An `[approvals.notify]` section for `url` with every other field at its default.
     pub fn new(url: impl Into<String>) -> Self {
+        Self::with_url(url)
+    }
+}
+
+impl<K: NotifyTarget> NotifySection<K> {
+    /// A section for `url` with every other field at its default (`secret_env` is the
+    /// section's own default).
+    pub fn with_url(url: impl Into<String>) -> Self {
         Self {
             url: url.into(),
             headers: BTreeMap::new(),
-            secret_env: default_notify_secret_env(),
+            secret_env: default_notify_secret_env::<K>(),
             timeout_seconds: default_notify_timeout_seconds(),
             queue_capacity: default_notify_queue_capacity(),
             max_attempts: default_notify_max_attempts(),
@@ -1305,7 +1373,13 @@ impl NotifySection {
             max_backoff_seconds: default_notify_max_backoff_seconds(),
             max_lag_seconds: default_sink_max_lag_seconds(),
             outbox_retention_seconds: default_notify_outbox_retention_seconds(),
+            target: std::marker::PhantomData,
         }
+    }
+
+    /// The section's name, as messages give it (`[approvals.notify]`, `[leases.notify]`).
+    pub fn section(&self) -> &'static str {
+        K::SECTION
     }
 
     /// Startup check of the file's values (the environment is read when the notifier
@@ -1318,45 +1392,46 @@ impl NotifySection {
     /// When `url` is not an `http(s)://` URL with a host, or carries user info or a fragment; when
     /// a header name is invalid, is one the server sets, or names no environment variable; when
     /// `secret_env` is empty; or when `queue_capacity`, `max_attempts`, a timeout, backoff, lag or
-    /// retention is 0.
+    /// retention is 0. The message starts with the section's name.
     pub fn validate(&self) -> anyhow::Result<()> {
+        let section = K::SECTION;
         let url = reqwest::Url::parse(&self.url)
-            .map_err(|e| anyhow::anyhow!("[approvals.notify] url is not a URL: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("{section} url is not a URL: {e}"))?;
         if !matches!(url.scheme(), "https" | "http") {
-            anyhow::bail!("[approvals.notify] url must start with https:// or http://");
+            anyhow::bail!("{section} url must start with https:// or http://");
         }
         if url.host_str().is_none_or(str::is_empty) {
-            anyhow::bail!("[approvals.notify] url needs a host");
+            anyhow::bail!("{section} url needs a host");
         }
         if !url.username().is_empty() || url.password().is_some() {
             anyhow::bail!(
-                "[approvals.notify] url must not carry user info; send credentials in `headers` \
+                "{section} url must not carry user info; send credentials in `headers` \
                  from an environment variable"
             );
         }
         if url.fragment().is_some() {
-            anyhow::bail!("[approvals.notify] url must not have a fragment");
+            anyhow::bail!("{section} url must not have a fragment");
         }
         for (name, env) in &self.headers {
             let lower = name.to_ascii_lowercase();
             if reqwest::header::HeaderName::from_bytes(name.as_bytes()).is_err() {
-                anyhow::bail!("[approvals.notify] headers: {name:?} is not a header name");
+                anyhow::bail!("{section} headers: {name:?} is not a header name");
             }
             if NOTIFY_RESERVED_HEADERS.contains(&lower.as_str()) || lower.starts_with("x-attenuo-")
             {
-                anyhow::bail!("[approvals.notify] headers: {name:?} is set by the server");
+                anyhow::bail!("{section} headers: {name:?} is set by the server");
             }
             if env.is_empty() {
                 anyhow::bail!(
-                    "[approvals.notify] headers: {name:?} needs the name of an environment variable"
+                    "{section} headers: {name:?} needs the name of an environment variable"
                 );
             }
         }
         if self.secret_env.is_empty() {
-            anyhow::bail!("[approvals.notify] secret_env must name an environment variable");
+            anyhow::bail!("{section} secret_env must name an environment variable");
         }
         if self.queue_capacity == 0 || self.max_attempts == 0 {
-            anyhow::bail!("[approvals.notify] queue_capacity and max_attempts must be at least 1");
+            anyhow::bail!("{section} queue_capacity and max_attempts must be at least 1");
         }
         if self.timeout_seconds == 0
             || self.initial_backoff_ms == 0
@@ -1365,7 +1440,7 @@ impl NotifySection {
             || self.outbox_retention_seconds == 0
         {
             anyhow::bail!(
-                "[approvals.notify] timeout_seconds, initial_backoff_ms, max_backoff_seconds, \
+                "{section} timeout_seconds, initial_backoff_ms, max_backoff_seconds, \
                  max_lag_seconds and outbox_retention_seconds must be positive"
             );
         }
@@ -1507,6 +1582,12 @@ pub struct LeasesSection {
     /// the next run. Default 100, between 1 and 10000.
     #[serde(default = "default_maintenance_max_passes")]
     pub maintenance_max_passes: u64,
+    /// `[leases.notify]`: `POST` a signed `lease.revoked` notice to a webhook after each
+    /// revocation request that revoked at least one lease, so that an enforcement point
+    /// outside the server learns of it without asking. Unset by default. A hint, not
+    /// enforcement ([`crate::notify`]).
+    #[serde(default)]
+    pub notify: Option<LeaseNotifySection>,
 }
 
 /// How the lease maintenance task runs: `[leases] maintenance_interval_seconds`,
@@ -1604,6 +1685,7 @@ impl Default for LeasesSection {
             maintenance_interval_seconds: default_maintenance_interval_seconds(),
             maintenance_batch_rows: default_maintenance_batch_rows(),
             maintenance_max_passes: default_maintenance_max_passes(),
+            notify: None,
         }
     }
 }

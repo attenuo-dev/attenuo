@@ -1,18 +1,29 @@
-//! The approval notifier (`[approvals.notify]`): tells a webhook the deployment owns that an
-//! approval is waiting, and again when it was decided or expired, so an operator does not have
-//! to watch the console.
+//! The two notifiers: the approval notifier (`[approvals.notify]`) tells a webhook the
+//! deployment owns that an approval is waiting, and again when it was decided or expired, so an
+//! operator does not have to watch the console; the revocation notifier (`[leases.notify]`)
+//! tells a webhook that leases were revoked, so an enforcement point outside the server learns
+//! of it without asking. Both run on the same code ([`NoticeStream`] says which one a notice
+//! belongs to) and differ only in what they send and when.
 //!
 //! Where: [`NotifierHandle::pending`] is called by the pipeline after a new pending approval
 //! and its `approval_request` record were written, and [`NotifierHandle::decided`] by the
-//! approval routes after the decision and its `approval_grant` record were. Both build a
-//! small JSON document, store it as one row of the lease store's `notice_outbox` table (one
-//! local insert, never the network) and queue it. Delivery runs on the `[audit.sink]` queue
-//! ([`crate::sink::Queue`], role [`QueueRole::ApprovalNotices`]): bounded, oldest dropped when
-//! full, one background thread, jittered exponential backoff, and given up after
-//! `max_attempts`. The queue's [`Settle`] hook ([`OutboxSettle`]) marks each row delivered or
-//! given up, and records the attempts and the next try of a failed one. Expiry has no request
-//! to hang on, so a watcher thread keeps the pending approvals by expiry time and, once one is
-//! due, reads it from the lease store and queues `approval.expired` if it is still pending.
+//! approval routes after the decision and its `approval_grant` record were.
+//! [`LeaseNotifier::revoked`] is called by the two revocation routes after the revocation and
+//! its `lease_revoke` record were written, once per request that revoked at least one lease.
+//! Each builds a small JSON document, stores it as one row of the lease store's
+//! `notice_outbox` table (one local insert, never the network) and queues it. Delivery runs
+//! on the `[audit.sink]` queue ([`crate::sink::Queue`], role [`QueueRole::ApprovalNotices`]
+//! or [`QueueRole::LeaseNotices`]): bounded, oldest dropped when full, one background thread
+//! per notifier, jittered exponential backoff, and given up after `max_attempts`. The queue's
+//! [`Settle`] hook ([`OutboxSettle`]) marks each row delivered or given up, and records the
+//! attempts and the next try of a failed one. Approval expiry has no request to hang on, so a
+//! watcher thread keeps the pending approvals by expiry time and, once one is due, reads it
+//! from the lease store and queues `approval.expired` if it is still pending. A lease that
+//! expires sends nothing: the enforcement point already knows its `exp`.
+//!
+//! The two notifiers share the outbox table and keep apart by the namespace of the row's type
+//! (`approval.` or `lease.`, [`NoticeStream::kind_prefix`]): each reads, counts and prunes only
+//! its own rows, so each has its own backlog, gauge and retention.
 //!
 //! Restarts: on start the rows still open (queued, or in flight, when the last process
 //! stopped) are delivered again, oldest first, with their attempts so far. The delivery thread
@@ -32,18 +43,21 @@
 //! that is not looked at on start, since its notice may already be gone from the table.
 //!
 //! Best effort: a notification can be late, dropped (counted in
-//! `attenuo_approval_notify_dropped_total`) or delivered twice: after a retry whose answer was
-//! lost, or when the process stopped between a delivery and the write marking it delivered.
-//! The receiver deduplicates by `event_id`. Nothing here can change a decision, and a receiver
-//! that is down or slow never holds up a request.
+//! `attenuo_approval_notify_dropped_total` or `attenuo_lease_notify_dropped_total`) or
+//! delivered twice: after a retry whose answer was lost, or when the process stopped between a
+//! delivery and the write marking it delivered. The receiver deduplicates by `event_id`.
+//! Nothing here can change a decision or a revocation, and a receiver that is down or slow
+//! never holds up a request. A `lease.revoked` notice is a hint: the revocation is in force
+//! in the server whether or not it arrives, and an enforcement point that must be sure still
+//! asks.
 //!
-//! The document carries no token and no arguments: only the call hash
-//! (`ToolCall::call_hash`, SHA-256 over server, tool and arguments) stands for the call. Each
-//! request is signed: `X-Attenuo-Signature: t=<unix seconds>,v1=<hex HMAC-SHA-256 of
-//! "<t>.<body>">` under the secret in the environment variable `secret_env`
-//! ([`signature`]).
+//! The documents carry no token and no arguments: an approval notice has only the call hash
+//! (`ToolCall::call_hash`, SHA-256 over server, tool and arguments) to stand for the call, a
+//! revocation notice only lease ids, names and times. Each request is signed:
+//! `X-Attenuo-Signature: t=<unix seconds>,v1=<hex HMAC-SHA-256 of "<t>.<body>">` under the
+//! secret in the environment variable `secret_env` ([`signature`]).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -52,13 +66,15 @@ use async_trait::async_trait;
 use attenuo_audit::{
     Approval, ApprovalState, ApprovalStore, NewNotice, OutboxNotice, SqliteLeaseStore,
 };
-use attenuo_core::Clock;
+use attenuo_core::{Clock, LeaseId};
 use serde_json::{json, Value};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
-use crate::config::{NotifySection, NOTIFY_SECRET_MIN_LEN};
-use crate::metrics::Metrics;
+use crate::config::{
+    ForApprovals, LeaseNotifySection, NotifySection, NotifyTarget, NOTIFY_SECRET_MIN_LEN,
+};
+use crate::metrics::{Metrics, NotifyCounters};
 use crate::sink::{
     Backoff, Deliver, Queue, QueueHandle, QueueItem, QueueRole, Settle, Settled, SinkLimits,
     SinkStatus,
@@ -66,7 +82,8 @@ use crate::sink::{
 
 /// The signature header: `t=<unix seconds>,v1=<hex HMAC-SHA-256 of "<t>.<body>">`.
 pub const SIGNATURE_HEADER: &str = "x-attenuo-signature";
-/// The event type (`approval.pending`, `approval.decided`, `approval.expired`).
+/// The event type (`approval.pending`, `approval.decided`, `approval.expired`,
+/// `lease.revoked`).
 pub const EVENT_HEADER: &str = "x-attenuo-event";
 /// The event id, the same on every retry of one notification.
 pub const EVENT_ID_HEADER: &str = "x-attenuo-event-id";
@@ -75,6 +92,56 @@ pub const EVENT_ID_HEADER: &str = "x-attenuo-event-id";
 /// `approval.expired` notice, and the miss is counted as a drop.
 pub const MAX_WATCHED: usize = 10_000;
 
+/// Most lease ids a `lease.revoked` notice lists in `lease_ids`, and so in `chain_ids`. A
+/// selector revocation that matched more top leases than this sets `truncated`; a receiver
+/// that needs every lease reads the tree from the admin API.
+///
+/// With [`MAX_NOTICE_TEXT_BYTES`] this bounds the body: at most 200 ids of 36 bytes (about
+/// 8 KB with quotes and commas), plus `reason` and one selector string of at most 1024 bytes
+/// each before JSON escaping (at most 6 KB each after it, if every byte were a control
+/// character), plus the fixed fields, a session's chains (one per upstream it was opened
+/// with) and the operator's configured name. So under 21 KB, and about 10 KB for text
+/// without control characters.
+pub const MAX_LEASE_NOTICE_IDS: usize = 100;
+
+/// Most bytes of operator-typed text (`reason`, and the `user` or `chain_id` of `selector`)
+/// a `lease.revoked` notice carries. Longer text is cut at a character boundary and ends in
+/// [`CUT_MARKER`], within this many bytes. Only the notice is cut: the audit record and the
+/// HTTP response keep the full text.
+pub const MAX_NOTICE_TEXT_BYTES: usize = 1024;
+
+/// What ends text [`MAX_NOTICE_TEXT_BYTES`] cut.
+pub const CUT_MARKER: &str = "\u{2026}";
+
+/// `text` cut to at most [`MAX_NOTICE_TEXT_BYTES`] bytes at a character boundary, ending in
+/// [`CUT_MARKER`] when cut. Text that fits is returned as it is.
+pub fn cap_notice_text(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.len() <= MAX_NOTICE_TEXT_BYTES {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut end = MAX_NOTICE_TEXT_BYTES - CUT_MARKER.len();
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    std::borrow::Cow::Owned(format!("{}{CUT_MARKER}", &text[..end]))
+}
+
+/// `selector` with its `user` and `chain_id` strings cut by [`cap_notice_text`]. Other members
+/// (a session's tag and chains) are the server's own and are kept.
+fn cap_selector(selector: &Option<Value>) -> Option<Value> {
+    let mut out = selector.clone()?;
+    if let Some(obj) = out.as_object_mut() {
+        for key in ["user", "chain_id"] {
+            if let Some(Value::String(v)) = obj.get_mut(key) {
+                if let std::borrow::Cow::Owned(cut) = cap_notice_text(v) {
+                    *v = cut;
+                }
+            }
+        }
+    }
+    Some(out)
+}
+
 /// How long after `expires_at` the watcher looks, so the store agrees it has expired.
 const EXPIRY_GRACE: Duration = Duration::from_millis(250);
 
@@ -82,7 +149,49 @@ const EXPIRY_GRACE: Duration = Duration::from_millis(250);
 /// It also does so once at start.
 pub const OUTBOX_PRUNE_PERIOD: Duration = Duration::from_secs(3600);
 
-/// What happened to the approval.
+/// Which notifier a notice belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoticeStream {
+    /// `[approvals.notify]`: `approval.*` notices.
+    Approvals,
+    /// `[leases.notify]`: `lease.*` notices.
+    Leases,
+}
+
+impl NoticeStream {
+    /// The config section, as log lines name it.
+    pub fn section(self) -> &'static str {
+        match self {
+            Self::Approvals => "[approvals.notify]",
+            Self::Leases => "[leases.notify]",
+        }
+    }
+
+    /// The start of the type of every notice of this notifier, which is how its rows of the
+    /// shared outbox table are told apart from the other's.
+    pub fn kind_prefix(self) -> &'static str {
+        match self {
+            Self::Approvals => "approval.",
+            Self::Leases => "lease.",
+        }
+    }
+
+    fn role(self, max_attempts: u32) -> QueueRole {
+        match self {
+            Self::Approvals => QueueRole::ApprovalNotices { max_attempts },
+            Self::Leases => QueueRole::LeaseNotices { max_attempts },
+        }
+    }
+
+    fn counters(self, m: &Metrics) -> &NotifyCounters {
+        match self {
+            Self::Approvals => m.approval_notify(),
+            Self::Leases => m.lease_notify(),
+        }
+    }
+}
+
+/// What a notice tells.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoticeKind {
     /// The call was gated and its approval is waiting (`approval.pending`).
@@ -91,6 +200,8 @@ pub enum NoticeKind {
     Decided,
     /// The approval expired undecided (`approval.expired`).
     Expired,
+    /// A revocation request revoked at least one lease (`lease.revoked`).
+    LeaseRevoked,
 }
 
 impl NoticeKind {
@@ -100,28 +211,47 @@ impl NoticeKind {
             Self::Pending => "approval.pending",
             Self::Decided => "approval.decided",
             Self::Expired => "approval.expired",
+            Self::LeaseRevoked => "lease.revoked",
         }
     }
 
     /// The kind [`as_str`](Self::as_str) names.
     pub fn parse(s: &str) -> Option<Self> {
-        [Self::Pending, Self::Decided, Self::Expired]
-            .into_iter()
-            .find(|k| k.as_str() == s)
+        [
+            Self::Pending,
+            Self::Decided,
+            Self::Expired,
+            Self::LeaseRevoked,
+        ]
+        .into_iter()
+        .find(|k| k.as_str() == s)
+    }
+
+    /// The notifier that sends this kind.
+    pub fn stream(self) -> NoticeStream {
+        match self {
+            Self::Pending | Self::Decided | Self::Expired => NoticeStream::Approvals,
+            Self::LeaseRevoked => NoticeStream::Leases,
+        }
     }
 }
 
-/// The `event_id` of the `kind` notice of approval `approval_id`: a UUID (version 8, RFC 9562)
-/// made of the first 16 bytes of SHA-256 over a label, the type and the approval id. An
-/// approval gets at most one notice of each type, so this names the notice, and it is the
-/// same on every attempt and after a restart.
-pub fn event_id_for(kind: NoticeKind, approval_id: &str) -> String {
+/// The `event_id` of the `kind` notice about `id`: a UUID (version 8, RFC 9562) made of the
+/// first 16 bytes of SHA-256 over a label, the type and the id. For an approval notice `id` is
+/// the approval id: an approval gets at most one notice of each type. For `lease.revoked` it
+/// is [`LeaseRevocation::event_key`], the id of the revocation's `lease_revoke` audit record:
+/// one notice per revocation request. Either way this names the notice, and it is the same on
+/// every attempt and after a restart.
+pub fn event_id_for(kind: NoticeKind, id: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
-    h.update(b"attenuo approval notice\0");
+    h.update(match kind.stream() {
+        NoticeStream::Approvals => b"attenuo approval notice\0".as_slice(),
+        NoticeStream::Leases => b"attenuo lease notice\0".as_slice(),
+    });
     h.update(kind.as_str().as_bytes());
     h.update(b"\0");
-    h.update(approval_id.as_bytes());
+    h.update(id.as_bytes());
     let mut b = [0u8; 16];
     b.copy_from_slice(&h.finalize()[..16]);
     b[6] = (b[6] & 0x0f) | 0x80;
@@ -132,10 +262,11 @@ pub fn event_id_for(kind: NoticeKind, approval_id: &str) -> String {
 /// One notification, its body fixed when it was first queued.
 #[derive(Debug, Clone)]
 pub struct Notice {
-    /// What happened to the approval.
+    /// What the notice tells.
     pub kind: NoticeKind,
-    /// Id of the approval the notice is about.
-    pub approval_id: String,
+    /// What it is about: the approval's id, or for `lease.revoked` the first lease the
+    /// revocation named. Kept in the outbox row and named in log lines.
+    pub about: String,
     /// The same on every attempt and after a restart ([`event_id_for`]).
     pub event_id: String,
     /// The JSON document, exactly as sent and signed.
@@ -153,7 +284,23 @@ impl Notice {
         let body = serde_json::to_vec(&notice_json(kind, &event_id, a)).unwrap_or_default();
         Self {
             kind,
-            approval_id: a.id.clone(),
+            about: a.id.clone(),
+            event_id,
+            body,
+            row: None,
+            attempts: 0,
+        }
+    }
+
+    /// The `lease.revoked` notice of revocation `r`, its body built and fixed now; not yet
+    /// stored.
+    pub fn lease_revoked(r: &LeaseRevocation) -> Self {
+        let kind = NoticeKind::LeaseRevoked;
+        let event_id = event_id_for(kind, &r.event_key());
+        let body = serde_json::to_vec(&lease_notice_json(&event_id, r)).unwrap_or_default();
+        Self {
+            kind,
+            about: r.lease_ids.first().map(|l| l.0.clone()).unwrap_or_default(),
             event_id,
             body,
             row: None,
@@ -165,7 +312,7 @@ impl Notice {
     pub fn from_outbox(r: OutboxNotice) -> Option<Self> {
         Some(Self {
             kind: NoticeKind::parse(&r.kind)?,
-            approval_id: r.approval_id,
+            about: r.approval_id,
             event_id: r.event_id,
             body: r.body,
             row: Some(r.id),
@@ -176,7 +323,7 @@ impl Notice {
 
 impl QueueItem for Notice {
     fn log_id(&self) -> String {
-        format!("{} {}", self.kind.as_str(), self.approval_id)
+        format!("{} {}", self.kind.as_str(), self.about)
     }
 
     fn attempts(&self) -> u32 {
@@ -191,8 +338,10 @@ impl QueueItem for Notice {
 /// It also hands the delivery thread the rows a restart left open, and those stored while it
 /// works through them (`Backlog`), a batch at a time whenever the queue runs empty, so that
 /// none is dropped for lack of room (SR-93) and they go out in the order they were stored.
+/// It reads only the rows of its own notifier ([`NoticeStream::kind_prefix`]).
 #[derive(Debug)]
 pub struct OutboxSettle {
+    stream: NoticeStream,
     store: Arc<SqliteLeaseStore>,
     metrics: Arc<Metrics>,
     backlog: Arc<Backlog>,
@@ -210,7 +359,8 @@ pub struct OutboxSettle {
 /// A notice stored during the drain gets a row id above `after`: SQLite gives a new row an id
 /// above every id in the table, and the row `after` names is the last of the batch being
 /// delivered, which stays open (so unpruned) until that batch is through; the next read
-/// follows as soon as the queue runs empty.
+/// follows as soon as the queue runs empty. The other notifier's rows in the same table do
+/// not change this: they only take ids in between, which this notifier's reads skip.
 #[derive(Debug, Default)]
 struct Backlog {
     after: Mutex<i64>,
@@ -232,12 +382,17 @@ impl OutboxSettle {
     /// version does not know is skipped. A read that finds nothing ends the backlog; one that
     /// fails ends it too, logged, and the rows left stay open for the next restart.
     fn next_backlog(&self, room: usize) -> Vec<Notice> {
+        let section = self.stream.section();
+        let prefix = self.stream.kind_prefix();
         let mut after = self.backlog.lock();
         while self.backlog.is_draining() && room > 0 {
-            let rows = match self.store.outbox_open_between(*after, i64::MAX, room) {
+            let rows = match self
+                .store
+                .outbox_open_between_of(prefix, *after, i64::MAX, room)
+            {
                 Ok(rows) => rows,
                 Err(e) => {
-                    tracing::error!(error = %e, "[approvals.notify] could not read the outbox: notices stored before the restart and not yet queued are left until the next one");
+                    tracing::error!(error = %e, "{section} could not read the outbox: notices stored before the restart and not yet queued are left until the next one");
                     self.backlog.draining.store(false, Ordering::Release);
                     break;
                 }
@@ -252,7 +407,7 @@ impl OutboxSettle {
                 .filter_map(|row| {
                     let n = Notice::from_outbox(row);
                     if n.is_none() {
-                        tracing::warn!("[approvals.notify] outbox row of an unknown type: skipped");
+                        tracing::warn!("{section} outbox row of an unknown type: skipped");
                     }
                     n
                 })
@@ -281,13 +436,13 @@ impl Settle<Notice> for OutboxSettle {
                 .map(|()| false),
         };
         match closed {
-            Ok(true) => self.metrics.approval_notify_outbox_closed(),
+            Ok(true) => self.stream.counters(&self.metrics).outbox_closed(),
             Ok(false) => {}
             Err(e) => tracing::warn!(
                 notice = %n.log_id(),
                 error = %e,
-                "[approvals.notify] could not update the outbox row: it may be delivered again \
-                 after a restart"
+                "{} could not update the outbox row: it may be delivered again after a restart",
+                self.stream.section()
             ),
         }
     }
@@ -302,6 +457,7 @@ impl Settle<Notice> for OutboxSettle {
 /// watcher.
 #[derive(Debug, Clone)]
 struct Emitter {
+    stream: NoticeStream,
     queue: QueueHandle<Notice>,
     store: Arc<SqliteLeaseStore>,
     metrics: Arc<Metrics>,
@@ -339,24 +495,29 @@ impl Emitter {
         let new = NewNotice {
             event_id: &n.event_id,
             kind: n.kind.as_str(),
-            approval_id: &n.approval_id,
+            approval_id: &n.about,
             body: &n.body,
         };
         match self.store.outbox_insert(new, self.clock.now_utc()) {
             Ok(Some(row)) => {
                 n.row = Some(row);
-                self.metrics.approval_notify_outbox_opened();
+                self.counters().outbox_opened();
             }
             // Stored before (an expiry found again after a restart): queued then, or done.
             Ok(None) => return false,
             Err(e) => tracing::warn!(
                 notice = %n.log_id(),
                 error = %e,
-                "[approvals.notify] could not store the notice in the outbox: queued in memory \
-                 only, so a restart before it is delivered loses it"
+                "{} could not store the notice in the outbox: queued in memory only, so a \
+                 restart before it is delivered loses it",
+                self.stream.section()
             ),
         }
         true
+    }
+
+    fn counters(&self) -> &NotifyCounters {
+        self.stream.counters(&self.metrics)
     }
 }
 
@@ -432,6 +593,187 @@ pub fn reason_summary(a: &Approval) -> String {
     s
 }
 
+/// What a `lease.revoked` notice says about one revocation request: the top leases of what it
+/// revoked, their chains, and the facts its `lease_revoke` audit record holds. Built by the
+/// revocation routes ([`LeaseRevocation::tops`]) after the revocation and its record were
+/// written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaseRevocation {
+    /// The tops of what was revoked, at most [`MAX_LEASE_NOTICE_IDS`]: for
+    /// `POST /admin/leases/{id}/revoke` the lease named, for `POST /admin/leases/revoke` each
+    /// matched lease whose parent this request did not revoke too (ordered by id). Every lease
+    /// the request revoked is one of these or descends from one.
+    pub lease_ids: Vec<LeaseId>,
+    /// The chains (root leases) of `lease_ids`, de-duplicated, in the order first reached. It
+    /// is not aligned with `lease_ids` by position: several tops can share one chain. A token
+    /// is revoked when its chain contains one of `lease_ids`; a chain listed here only says
+    /// which runs to ask about again (revoking a lease in the middle of a chain leaves its
+    /// root and other branches valid).
+    pub chain_ids: Vec<LeaseId>,
+    /// More top leases matched than `lease_ids` lists.
+    pub truncated: bool,
+    /// The selector of `POST /admin/leases/revoke`, as its response and audit record show it
+    /// (`{"user": ...}`, `{"chain_id": ...}`, `{"session_tag": ..., "chain_ids": [...]}`); `None`
+    /// for a revocation of one lease by id.
+    pub selector: Option<Value>,
+    /// How many leases changed from unrevoked to revoked, descendants included.
+    pub revoked: u64,
+    /// The reason stored with the revocation.
+    pub reason: String,
+    /// When the leases were revoked: the `at` of the audit record.
+    pub revoked_at: OffsetDateTime,
+    /// The id of the `lease_revoke` audit record; `None` when it could not be written (the
+    /// revocation stands, and the notice is still sent).
+    pub audit_record_id: Option<uuid::Uuid>,
+    /// The operator's name (`admin` for `[admin] token`).
+    pub by: String,
+    /// The operator's subject, as the audit record's `originating_subject` has it.
+    pub by_subject: String,
+    /// A random value drawn once for this request. Only [`event_key`](Self::event_key) uses
+    /// it, and only when there is no audit record; it is never sent.
+    pub nonce: uuid::Uuid,
+}
+
+impl LeaseRevocation {
+    /// What names this revocation for [`event_id_for`]: the audit record id, unique per
+    /// request. Without a record: `revoked`, the top leases, the revocation time and
+    /// [`nonce`](Self::nonce), which is drawn once per request, so two requests never share
+    /// an id even with the same tops at the same instant. [`Notice::lease_revoked`] calls this
+    /// once and the outbox stores the result, so retries and restarts keep the id.
+    pub fn event_key(&self) -> String {
+        match &self.audit_record_id {
+            Some(id) => id.to_string(),
+            None => {
+                let leases: Vec<&str> = self.lease_ids.iter().map(|l| l.0.as_str()).collect();
+                format!(
+                    "revoked={};{}@{};{}",
+                    self.revoked,
+                    leases.join(","),
+                    self.revoked_at.unix_timestamp_nanos(),
+                    self.nonce
+                )
+            }
+        }
+    }
+
+    /// The top leases of a revocation that changed `revoked` and matched `matched` (both as
+    /// the store returned them; `matched` ordered by id), with their chains, read from
+    /// `store`. A matched lease is a top when its parent is not among `revoked`: then no
+    /// other match of this request covers it. At most [`MAX_LEASE_NOTICE_IDS`] are listed;
+    /// the walk stops as soon as one more is found, and sets `truncated`.
+    ///
+    /// Parents are read in batches ([`SqliteLeaseStore::parents`]), so `n` matches cost
+    /// about `n / 200` queries, and each chain root a few more per level of delegation for
+    /// all tops at once. It runs after the revocation committed and takes no write gate. A
+    /// lease or chain that cannot be read is logged and left out; nothing here fails the
+    /// revocation.
+    pub fn tops(
+        store: &SqliteLeaseStore,
+        matched: &[LeaseId],
+        revoked: &[LeaseId],
+    ) -> (Vec<LeaseId>, Vec<LeaseId>, bool) {
+        let changed: HashSet<&LeaseId> = revoked.iter().collect();
+        let mut tops = Vec::new();
+        let mut truncated = false;
+        'walk: for chunk in matched.chunks(TOPS_PER_READ) {
+            let refs: Vec<&LeaseId> = chunk.iter().collect();
+            let parents = match store.parents(&refs) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(error = %e, leases = chunk.len(), "[leases.notify] could not read revoked leases: left out of the notice");
+                    continue;
+                }
+            };
+            for m in chunk {
+                // A lease the store no longer knows counts as a top: nothing covers it.
+                let parent = parents.get(m).cloned().flatten();
+                if parent.is_some_and(|p| changed.contains(&p)) {
+                    continue;
+                }
+                if tops.len() == MAX_LEASE_NOTICE_IDS {
+                    truncated = true;
+                    break 'walk;
+                }
+                tops.push(m.clone());
+            }
+        }
+        let chains = chain_roots(store, &tops);
+        (tops, chains, truncated)
+    }
+}
+
+/// Matches whose parents [`LeaseRevocation::tops`] reads per call to the store. A cap of
+/// [`MAX_LEASE_NOTICE_IDS`] tops seldom needs more than the first read.
+const TOPS_PER_READ: usize = 200;
+
+/// The root of the chain of each of `leases` (its topmost ancestor, which is the audit
+/// records' `chain_id`), each root once, in the order first reached. All leases climb one
+/// level per batched read ([`SqliteLeaseStore::parents`]), so the cost is the chain depth
+/// times a few queries, not one query per hop per lease. A lease whose chain cannot be read
+/// is logged and left out.
+fn chain_roots(store: &SqliteLeaseStore, leases: &[LeaseId]) -> Vec<LeaseId> {
+    // Each lease's current position on its way up, and the ids already passed (a cycle no
+    // real tree has stops where it closes).
+    let mut at: Vec<Option<LeaseId>> = leases.iter().cloned().map(Some).collect();
+    let mut seen: Vec<HashSet<LeaseId>> =
+        leases.iter().map(|l| HashSet::from([l.clone()])).collect();
+    let mut root: Vec<Option<LeaseId>> = vec![None; leases.len()];
+    loop {
+        let climbing: Vec<&LeaseId> = {
+            let mut set: Vec<&LeaseId> = at.iter().flatten().collect();
+            set.sort();
+            set.dedup();
+            set
+        };
+        if climbing.is_empty() {
+            break;
+        }
+        let parents = match store.parents(&climbing) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(error = %e, "[leases.notify] could not read the chains of revoked leases: left out of the notice");
+                return Vec::new();
+            }
+        };
+        for i in 0..leases.len() {
+            let Some(cur) = at[i].take() else { continue };
+            match parents.get(&cur) {
+                Some(Some(p)) if seen[i].insert(p.clone()) => at[i] = Some(p.clone()),
+                // A root, a parent the store no longer knows, or a cycle: the top reached.
+                _ => root[i] = Some(cur),
+            }
+        }
+    }
+    let mut chains: Vec<LeaseId> = Vec::new();
+    for r in root.into_iter().flatten() {
+        if !chains.contains(&r) {
+            chains.push(r);
+        }
+    }
+    chains
+}
+
+/// The `lease.revoked` document for `r`. Only lease ids, the selector as the audit record
+/// shows it, a count, the reason, a time, the record id and the operator: no token, no
+/// secret, no raw session id. The reason and the selector's `user` and `chain_id` are cut by
+/// [`cap_notice_text`].
+pub fn lease_notice_json(event_id: &str, r: &LeaseRevocation) -> Value {
+    json!({
+        "type": NoticeKind::LeaseRevoked.as_str(),
+        "event_id": event_id,
+        "lease_ids": r.lease_ids,
+        "chain_ids": r.chain_ids,
+        "truncated": r.truncated,
+        "selector": cap_selector(&r.selector),
+        "revoked": r.revoked,
+        "reason": cap_notice_text(&r.reason),
+        "revoked_at": fmt(r.revoked_at),
+        "audit_record_id": r.audit_record_id,
+        "by": r.by,
+        "by_subject": r.by_subject,
+    })
+}
+
 /// HMAC-SHA-256 of `msg` under `secret`, hex.
 pub fn hmac_hex(secret: &[u8], msg: &[u8]) -> String {
     let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret);
@@ -465,13 +807,29 @@ impl std::fmt::Debug for WebhookNotify {
 }
 
 impl WebhookNotify {
-    /// `headers` are name and value pairs, already read from the environment.
+    /// `headers` are name and value pairs, already read from the environment. For
+    /// `[approvals.notify]`; [`new_for`](Self::new_for) names another section in its errors.
     ///
     /// # Errors
     ///
     /// When `url` does not parse, when a header name or value is not valid in HTTP, or when the
     /// HTTP client cannot be built (its TLS backend fails to start).
     pub fn new(
+        url: &str,
+        headers: &[(String, String)],
+        secret: Vec<u8>,
+        timeout: Duration,
+    ) -> anyhow::Result<Self> {
+        Self::new_for(NoticeStream::Approvals, url, headers, secret, timeout)
+    }
+
+    /// [`new`](Self::new) for the notifier `stream`, whose section its errors name.
+    ///
+    /// # Errors
+    ///
+    /// As [`new`](Self::new).
+    pub fn new_for(
+        stream: NoticeStream,
         url: &str,
         headers: &[(String, String)],
         secret: Vec<u8>,
@@ -484,7 +842,8 @@ impl WebhookNotify {
             let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())?;
             let mut value = reqwest::header::HeaderValue::from_str(value).map_err(|_| {
                 anyhow::anyhow!(
-                    "[approvals.notify] headers: the value for {name} is not a valid header value"
+                    "{} headers: the value for {name} is not a valid header value",
+                    stream.section()
                 )
             })?;
             value.set_sensitive(true);
@@ -552,6 +911,116 @@ impl Deliver<Notice> for WebhookNotify {
     }
 }
 
+/// The deliverer and queue limits `cfg` sets for the notifier `stream`, its secret and header
+/// values read from the environment. Shared by both notifiers, so both start, and fail to
+/// start, the same way.
+///
+/// # Errors
+///
+/// When `cfg` does not validate, when the signing secret's variable is unset or holds fewer
+/// than `NOTIFY_SECRET_MIN_LEN` bytes, when a header's variable is unset, or when the webhook
+/// client cannot be built ([`WebhookNotify::new`]). The message names the section and the
+/// variable, never its value.
+fn webhook_from_config<K: NotifyTarget>(
+    stream: NoticeStream,
+    cfg: &NotifySection<K>,
+) -> anyhow::Result<(WebhookNotify, SinkLimits)> {
+    cfg.validate()?;
+    let section = stream.section();
+    let env = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+    let secret = env(&cfg.secret_env).ok_or_else(|| {
+        anyhow::anyhow!(
+            "{section} the signing secret is not set: put at least \
+             {NOTIFY_SECRET_MIN_LEN} bytes in the environment variable {}",
+            cfg.secret_env
+        )
+    })?;
+    if secret.len() < NOTIFY_SECRET_MIN_LEN {
+        anyhow::bail!(
+            "{section} the signing secret in {} is shorter than {NOTIFY_SECRET_MIN_LEN} bytes",
+            cfg.secret_env
+        );
+    }
+    let mut headers = Vec::new();
+    for (name, var) in &cfg.headers {
+        let value = env(var).ok_or_else(|| {
+            anyhow::anyhow!(
+                "{section} headers: {name} names the environment variable {var}, which is not set"
+            )
+        })?;
+        headers.push((name.clone(), value));
+    }
+    let deliver = WebhookNotify::new_for(
+        stream,
+        &cfg.url,
+        &headers,
+        secret.into_bytes(),
+        Duration::from_secs(cfg.timeout_seconds),
+    )?;
+    if plain_http_off_loopback(&cfg.url) {
+        tracing::warn!(
+            host = %deliver.host,
+            "{section} url is plain http to a host other than loopback: notifications travel \
+             unencrypted"
+        );
+    }
+    let limits = SinkLimits {
+        capacity: cfg.queue_capacity,
+        max_lag: Duration::from_secs(cfg.max_lag_seconds),
+        backoff: Backoff {
+            initial: Duration::from_millis(cfg.initial_backoff_ms),
+            max: Duration::from_secs(cfg.max_backoff_seconds),
+        },
+    };
+    Ok((deliver, limits))
+}
+
+/// One notifier's delivery: its queue, with the outbox hook, and the emitter that stores and
+/// queues its notices. Started with the backlog a restart left (see the module docs).
+#[derive(Debug)]
+struct Channel {
+    queue: Queue<Notice>,
+    emit: Emitter,
+}
+
+impl Channel {
+    fn start(
+        stream: NoticeStream,
+        deliver: Box<dyn Deliver<Notice>>,
+        limits: SinkLimits,
+        max_attempts: u32,
+        metrics: Arc<Metrics>,
+        store: Arc<SqliteLeaseStore>,
+        clock: Arc<dyn Clock>,
+    ) -> anyhow::Result<Self> {
+        let backlog = Arc::new(backlog_at_start(stream, &store));
+        let settle = OutboxSettle {
+            stream,
+            store: store.clone(),
+            metrics: metrics.clone(),
+            backlog: backlog.clone(),
+            clock: clock.clone(),
+        };
+        let queue = Queue::start_with(
+            deliver,
+            limits,
+            stream.role(max_attempts),
+            metrics.clone(),
+            Some(Box::new(settle)),
+        )?;
+        let emit = Emitter {
+            stream,
+            queue: queue.handle(),
+            store,
+            metrics,
+            clock,
+            backlog,
+        };
+        count_open(&emit);
+        Ok(Self { queue, emit })
+    }
+}
+
 /// Pending approvals by when they expire.
 #[derive(Debug, Default)]
 struct WatchState {
@@ -560,7 +1029,8 @@ struct WatchState {
     stop: bool,
 }
 
-/// The watched approvals, on `clock`: due times are its [`Clock::now`] instants.
+/// The watched approvals, on `clock`: due times are its [`Clock::now`] instants. The
+/// revocation notifier uses one with nothing in it, for its pruning loop and its stop.
 #[derive(Debug)]
 struct Watch {
     st: Mutex<WatchState>,
@@ -668,7 +1138,7 @@ impl NotifierHandle {
     pub fn pending(&self, a: &Approval) {
         self.emit.emit(Notice::new(NoticeKind::Pending, a));
         if !self.watch.add(&a.id, self.watch.due_at(a.expires_at)) {
-            self.emit.metrics.approval_notify_dropped();
+            self.emit.counters().dropped();
             tracing::warn!(
                 approval = %a.id,
                 max = MAX_WATCHED,
@@ -704,59 +1174,13 @@ impl ApprovalNotifier {
     /// client cannot be built ([`WebhookNotify::new`]), or as [`with_deliver`](Self::with_deliver).
     /// The message names the variable, never its value.
     pub fn start(
-        cfg: &NotifySection,
+        cfg: &NotifySection<ForApprovals>,
         metrics: Arc<Metrics>,
         leases: Arc<SqliteLeaseStore>,
         clock: Arc<dyn Clock>,
     ) -> anyhow::Result<Self> {
-        cfg.validate()?;
-        let env = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
-        let secret = env(&cfg.secret_env).ok_or_else(|| {
-            anyhow::anyhow!(
-                "[approvals.notify] the signing secret is not set: put at least \
-                 {NOTIFY_SECRET_MIN_LEN} bytes in the environment variable {}",
-                cfg.secret_env
-            )
-        })?;
-        if secret.len() < NOTIFY_SECRET_MIN_LEN {
-            anyhow::bail!(
-                "[approvals.notify] the signing secret in {} is shorter than \
-                 {NOTIFY_SECRET_MIN_LEN} bytes",
-                cfg.secret_env
-            );
-        }
-        let mut headers = Vec::new();
-        for (name, var) in &cfg.headers {
-            let value = env(var).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "[approvals.notify] headers: {name} names the environment variable {var}, \
-                     which is not set"
-                )
-            })?;
-            headers.push((name.clone(), value));
-        }
-        let deliver = WebhookNotify::new(
-            &cfg.url,
-            &headers,
-            secret.into_bytes(),
-            Duration::from_secs(cfg.timeout_seconds),
-        )?;
+        let (deliver, limits) = webhook_from_config(NoticeStream::Approvals, cfg)?;
         let host = deliver.host.clone();
-        if plain_http_off_loopback(&cfg.url) {
-            tracing::warn!(
-                host = %host,
-                "[approvals.notify] url is plain http to a host other than loopback: \
-                 notifications travel unencrypted"
-            );
-        }
-        let limits = SinkLimits {
-            capacity: cfg.queue_capacity,
-            max_lag: Duration::from_secs(cfg.max_lag_seconds),
-            backoff: Backoff {
-                initial: Duration::from_millis(cfg.initial_backoff_ms),
-                max: Duration::from_secs(cfg.max_backoff_seconds),
-            },
-        };
         let retention = Duration::from_secs(cfg.outbox_retention_seconds);
         let n = Self::with_deliver(
             Box::new(deliver),
@@ -786,33 +1210,21 @@ impl ApprovalNotifier {
         store: Arc<SqliteLeaseStore>,
         clock: Arc<dyn Clock>,
     ) -> anyhow::Result<Self> {
-        let backlog = Arc::new(backlog_at_start(&store));
-        let settle = OutboxSettle {
-            store: store.clone(),
-            metrics: metrics.clone(),
-            backlog: backlog.clone(),
-            clock: clock.clone(),
-        };
-        let queue = Queue::start_with(
+        let Channel { queue, emit } = Channel::start(
+            NoticeStream::Approvals,
             deliver,
             limits,
-            QueueRole::ApprovalNotices { max_attempts },
-            metrics.clone(),
-            Some(Box::new(settle)),
-        )?;
-        let emit = Emitter {
-            queue: queue.handle(),
-            store,
+            max_attempts,
             metrics,
-            clock: clock.clone(),
-            backlog,
-        };
+            store,
+            clock.clone(),
+        )?;
         let watch = Arc::new(Watch::new(clock));
-        recover(&emit, &watch, outbox_retention);
+        watch_pending(&emit, &watch, outbox_retention);
         let (w, e) = (watch.clone(), emit.clone());
         let watcher = std::thread::Builder::new()
             .name("attenuo-approval-expiry".into())
-            .spawn(move || watch_expiry(&w, &e, outbox_retention))?;
+            .spawn(move || maintain(&w, &e, outbox_retention, expire_if_pending))?;
         Ok(Self {
             queue,
             emit,
@@ -863,15 +1275,123 @@ impl Drop for ApprovalNotifier {
     }
 }
 
-/// Whether a restart left outbox rows open, for [`OutboxSettle`] to hand to the queue a batch
-/// at a time (SR-93), with new notices waiting behind them ([`Backlog`]). Read before the
-/// queue starts, so before any new notice is stored. A read that fails is logged and leaves
-/// the backlog empty: those rows wait for the next restart.
-fn backlog_at_start(store: &SqliteLeaseStore) -> Backlog {
-    let draining = match store.outbox_last_open_id() {
+/// A running revocation notifier (`[leases.notify]`): the queue, its delivery thread and a
+/// thread that prunes its outbox rows. The revocation routes call [`revoked`](Self::revoked).
+#[derive(Debug)]
+pub struct LeaseNotifier {
+    queue: Queue<Notice>,
+    emit: Emitter,
+    /// Never holds an id: its loop prunes the outbox and stops with it.
+    watch: Arc<Watch>,
+    pruner: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl LeaseNotifier {
+    /// Validate `cfg`, read its secret and headers from the environment, and start, as
+    /// [`ApprovalNotifier::start`] does.
+    ///
+    /// # Errors
+    ///
+    /// As [`ApprovalNotifier::start`], the messages naming `[leases.notify]`.
+    pub fn start(
+        cfg: &LeaseNotifySection,
+        metrics: Arc<Metrics>,
+        leases: Arc<SqliteLeaseStore>,
+        clock: Arc<dyn Clock>,
+    ) -> anyhow::Result<Self> {
+        let (deliver, limits) = webhook_from_config(NoticeStream::Leases, cfg)?;
+        let host = deliver.host.clone();
+        let retention = Duration::from_secs(cfg.outbox_retention_seconds);
+        let n = Self::with_deliver(
+            Box::new(deliver),
+            limits,
+            cfg.max_attempts,
+            retention,
+            metrics,
+            leases,
+            clock,
+        )?;
+        tracing::info!(host = %host, capacity = cfg.queue_capacity, "[leases.notify] notifying a webhook of lease revocations");
+        Ok(n)
+    }
+
+    /// Start with any deliverer (tests). Hands the delivery thread the outbox rows of this
+    /// notifier still open, then returns.
+    ///
+    /// # Errors
+    ///
+    /// When the delivery thread or the pruning thread cannot be spawned.
+    pub fn with_deliver(
+        deliver: Box<dyn Deliver<Notice>>,
+        limits: SinkLimits,
+        max_attempts: u32,
+        outbox_retention: Duration,
+        metrics: Arc<Metrics>,
+        store: Arc<SqliteLeaseStore>,
+        clock: Arc<dyn Clock>,
+    ) -> anyhow::Result<Self> {
+        let Channel { queue, emit } = Channel::start(
+            NoticeStream::Leases,
+            deliver,
+            limits,
+            max_attempts,
+            metrics,
+            store,
+            clock.clone(),
+        )?;
+        let watch = Arc::new(Watch::new(clock));
+        let (w, e) = (watch.clone(), emit.clone());
+        let pruner = std::thread::Builder::new()
+            .name("attenuo-lease-notify-prune".into())
+            .spawn(move || maintain(&w, &e, outbox_retention, |_, _, _| {}))?;
+        Ok(Self {
+            queue,
+            emit,
+            watch,
+            pruner: Mutex::new(Some(pruner)),
+        })
+    }
+
+    /// The revocation `r` was just written, with its audit record: store and queue its
+    /// `lease.revoked` notice. Writes one outbox row; never waits on the receiver. A
+    /// revocation that changed nothing is not one to tell (`r.revoked` is 0): nothing is sent.
+    pub fn revoked(&self, r: &LeaseRevocation) {
+        if r.revoked == 0 {
+            return;
+        }
+        self.emit.emit(Notice::lease_revoked(r));
+    }
+
+    /// Queue depth, lag and failures of delivery, which `/readyz` reports.
+    pub fn status(&self) -> SinkStatus {
+        self.queue.status()
+    }
+
+    /// Stop pruning, then deliver what is queued until `grace` has passed. Blocks.
+    pub fn shutdown(&self, grace: Duration) {
+        self.watch.stop();
+        if let Some(t) = self.pruner.lock().ok().and_then(|mut t| t.take()) {
+            let _ = t.join();
+        }
+        self.queue.shutdown(grace);
+    }
+}
+
+impl Drop for LeaseNotifier {
+    fn drop(&mut self) {
+        self.watch.stop();
+    }
+}
+
+/// Whether a restart left outbox rows of `stream` open, for [`OutboxSettle`] to hand to the
+/// queue a batch at a time (SR-93), with new notices waiting behind them ([`Backlog`]). Read
+/// before the queue starts, so before any new notice is stored. A read that fails is logged
+/// and leaves the backlog empty: those rows wait for the next restart.
+fn backlog_at_start(stream: NoticeStream, store: &SqliteLeaseStore) -> Backlog {
+    let draining = match store.outbox_last_open_id_of(stream.kind_prefix()) {
         Ok(last) => last.is_some(),
         Err(e) => {
-            tracing::error!(error = %e, "[approvals.notify] could not read the outbox: notices stored before the restart are not delivered now");
+            tracing::error!(error = %e, "{} could not read the outbox: notices stored before the restart are not delivered now", stream.section());
             false
         }
     };
@@ -881,26 +1401,30 @@ fn backlog_at_start(store: &SqliteLeaseStore) -> Backlog {
     }
 }
 
-/// What a restart left, besides the open outbox rows (which the delivery thread reads in
-/// batches, [`OutboxSettle`]): count those rows, and watch every approval still pending whose
-/// expiry is within `retention` (the watcher queues `approval.expired` at once for one that
-/// expired while the server was down). Errors are logged: the notifier starts anyway.
-fn recover(emit: &Emitter, watch: &Watch, retention: Duration) {
-    let store = &emit.store;
-    match store.outbox_open_count() {
+/// Count the outbox rows of the notifier a restart left open (the delivery thread reads them
+/// in batches, [`OutboxSettle`]). An error is logged: the notifier starts anyway.
+fn count_open(emit: &Emitter) {
+    let section = emit.stream.section();
+    match emit.store.outbox_open_count_of(emit.stream.kind_prefix()) {
         Ok(n) => {
-            emit.metrics.approval_notify_outbox_rows(n);
+            emit.counters().outbox_rows(n);
             if n > 0 {
                 tracing::info!(
                     notices = n,
-                    "[approvals.notify] delivering notices stored before the restart"
+                    "{section} delivering notices stored before the restart"
                 );
             }
         }
-        Err(e) => tracing::warn!(error = %e, "[approvals.notify] could not count the outbox"),
+        Err(e) => tracing::warn!(error = %e, "{section} could not count the outbox"),
     }
+}
+
+/// What a restart left besides the open outbox rows: watch every approval still pending whose
+/// expiry is within `retention` (the watcher queues `approval.expired` at once for one that
+/// expired while the server was down). Errors are logged: the notifier starts anyway.
+fn watch_pending(emit: &Emitter, watch: &Watch, retention: Duration) {
     let oldest = emit.clock.now_utc() - retention;
-    match store.pending_approvals(MAX_WATCHED) {
+    match emit.store.pending_approvals(MAX_WATCHED) {
         Ok(pending) => {
             for a in pending.iter().filter(|a| a.expires_at > oldest) {
                 watch.add(&a.id, watch.due_at(a.expires_at));
@@ -912,20 +1436,27 @@ fn recover(emit: &Emitter, watch: &Watch, retention: Duration) {
     }
 }
 
-/// Delete outbox rows settled longer than `retention` ago.
+/// Delete this notifier's outbox rows settled longer than `retention` ago.
 fn prune_outbox(emit: &Emitter, retention: Duration) {
-    match emit.store.outbox_prune(emit.clock.now_utc() - retention) {
+    let section = emit.stream.section();
+    match emit
+        .store
+        .outbox_prune_of(emit.stream.kind_prefix(), emit.clock.now_utc() - retention)
+    {
         Ok(0) => {}
-        Ok(n) => tracing::debug!(rows = n, "[approvals.notify] pruned the outbox"),
-        Err(e) => tracing::warn!(error = %e, "[approvals.notify] pruning the outbox failed"),
+        Ok(n) => tracing::debug!(rows = n, "{section} pruned the outbox"),
+        Err(e) => tracing::warn!(error = %e, "{section} pruning the outbox failed"),
     }
 }
 
-/// The expiry watcher: queue `approval.expired` for each watched approval still pending once
-/// its expiry has passed, and prune the outbox every [`OUTBOX_PRUNE_PERIOD`].
-fn watch_expiry(watch: &Watch, emit: &Emitter, retention: Duration) {
-    let leases: &dyn ApprovalStore = emit.store.as_ref();
-    let metrics = &emit.metrics;
+/// A notifier's background loop: prune its outbox every [`OUTBOX_PRUNE_PERIOD`] (and once at
+/// start), and hand each id of `watch` that comes due to `on_due`, until stopped.
+fn maintain(
+    watch: &Watch,
+    emit: &Emitter,
+    retention: Duration,
+    on_due: impl Fn(&Watch, &Emitter, String),
+) {
     let clock = &emit.clock;
     let mut prune_at = clock.now();
     loop {
@@ -933,29 +1464,36 @@ fn watch_expiry(watch: &Watch, emit: &Emitter, retention: Duration) {
             prune_outbox(emit, retention);
             prune_at = clock.now() + OUTBOX_PRUNE_PERIOD;
         }
-        let id = match watch.next_due(prune_at) {
-            Next::Due(id) => id,
-            Next::Timeout => continue,
+        match watch.next_due(prune_at) {
+            Next::Due(id) => on_due(watch, emit, id),
+            Next::Timeout => {}
             Next::Stop => return,
-        };
-        match leases.approval(&id) {
-            Ok(Some(a)) if a.state == ApprovalState::Pending => {
-                if a.is_expired(clock.now_utc()) {
-                    emit.emit(Notice::new(NoticeKind::Expired, &a));
-                } else {
-                    // The clocks disagree by a little: look again.
-                    watch.add(
-                        &a.id,
-                        watch.due_at(a.expires_at).max(clock.now() + EXPIRY_GRACE),
-                    );
-                }
+        }
+    }
+}
+
+/// The expiry watcher's step for a due approval: queue `approval.expired` if it is still
+/// pending once its expiry has passed.
+fn expire_if_pending(watch: &Watch, emit: &Emitter, id: String) {
+    let leases: &dyn ApprovalStore = emit.store.as_ref();
+    let clock = &emit.clock;
+    match leases.approval(&id) {
+        Ok(Some(a)) if a.state == ApprovalState::Pending => {
+            if a.is_expired(clock.now_utc()) {
+                emit.emit(Notice::new(NoticeKind::Expired, &a));
+            } else {
+                // The clocks disagree by a little: look again.
+                watch.add(
+                    &a.id,
+                    watch.due_at(a.expires_at).max(clock.now() + EXPIRY_GRACE),
+                );
             }
-            // Decided, used, or gone (pruned, or dropped after a failed audit append).
-            Ok(_) => {}
-            Err(e) => {
-                metrics.approval_notify_dropped();
-                tracing::warn!(approval = %id, error = %e, "[approvals.notify] approval unreadable at its expiry: no approval.expired notice");
-            }
+        }
+        // Decided, used, or gone (pruned, or dropped after a failed audit append).
+        Ok(_) => {}
+        Err(e) => {
+            emit.counters().dropped();
+            tracing::warn!(approval = %id, error = %e, "[approvals.notify] approval unreadable at its expiry: no approval.expired notice");
         }
     }
 }
@@ -1249,7 +1787,7 @@ mod tests {
             let new = NewNotice {
                 event_id: &notice.event_id,
                 kind: notice.kind.as_str(),
-                approval_id: &notice.approval_id,
+                approval_id: &notice.about,
                 body: &notice.body,
             };
             store.outbox_insert(new, now).unwrap().unwrap();
@@ -1489,5 +2027,406 @@ mod tests {
         assert_eq!(w.next_due(clock.now()), Next::Timeout);
         w.stop();
         assert_eq!(w.next_due(later), Next::Stop);
+    }
+
+    fn revocation() -> LeaseRevocation {
+        LeaseRevocation {
+            lease_ids: vec![LeaseId::new("l1")],
+            chain_ids: vec![LeaseId::new("l0")],
+            truncated: false,
+            selector: None,
+            revoked: 3,
+            reason: "revoked by alice".into(),
+            revoked_at: OffsetDateTime::from_unix_timestamp(1_780_000_000).unwrap(),
+            audit_record_id: Some(
+                uuid::Uuid::parse_str("33333333-3333-4333-8333-333333333333").unwrap(),
+            ),
+            by: "alice".into(),
+            by_subject: "urn:attenuo:admin:alice".into(),
+            nonce: uuid::Uuid::parse_str("44444444-4444-4444-8444-444444444444").unwrap(),
+        }
+    }
+
+    #[test]
+    fn lease_notice_has_the_fields_and_nothing_else() {
+        let r = revocation();
+        assert_eq!(
+            lease_notice_json("e1", &r),
+            json!({
+                "type": "lease.revoked",
+                "event_id": "e1",
+                "lease_ids": ["l1"],
+                "chain_ids": ["l0"],
+                "truncated": false,
+                "selector": null,
+                "revoked": 3,
+                "reason": "revoked by alice",
+                "revoked_at": "2026-05-28T20:26:40Z",
+                "audit_record_id": "33333333-3333-4333-8333-333333333333",
+                "by": "alice",
+                "by_subject": "urn:attenuo:admin:alice",
+            })
+        );
+        let mut sel = r.clone();
+        sel.selector = Some(json!({"user": "bob"}));
+        sel.audit_record_id = None;
+        let v = lease_notice_json("e2", &sel);
+        assert_eq!(v["selector"], json!({"user": "bob"}));
+        assert_eq!(v["audit_record_id"], Value::Null);
+        let n = Notice::lease_revoked(&r);
+        assert_eq!(n.kind, NoticeKind::LeaseRevoked);
+        assert_eq!(n.about, "l1");
+        assert_eq!(n.log_id(), "lease.revoked l1");
+        let body: Value = serde_json::from_slice(&n.body).unwrap();
+        assert_eq!(body["event_id"], n.event_id);
+    }
+
+    #[test]
+    fn lease_event_id_is_stable_per_revocation_and_apart_from_approval_ids() {
+        let r = revocation();
+        let id = Notice::lease_revoked(&r).event_id;
+        assert_eq!(id, Notice::lease_revoked(&r).event_id, "stable");
+        assert_eq!(
+            id,
+            event_id_for(
+                NoticeKind::LeaseRevoked,
+                "33333333-3333-4333-8333-333333333333"
+            ),
+            "derived from the audit record id"
+        );
+        let u = uuid::Uuid::parse_str(&id).unwrap();
+        assert_eq!(u.get_version_num(), 8);
+        // Another request, another record: another id. Same key, approval type: another id.
+        let mut other = r.clone();
+        other.audit_record_id = Some(uuid::Uuid::new_v4());
+        assert_ne!(id, Notice::lease_revoked(&other).event_id);
+        for k in [
+            NoticeKind::Pending,
+            NoticeKind::Decided,
+            NoticeKind::Expired,
+        ] {
+            assert_ne!(id, event_id_for(k, "33333333-3333-4333-8333-333333333333"));
+            assert_eq!(k.stream(), NoticeStream::Approvals);
+        }
+        // Without a record: the count, the top leases, the time and the nonce, still stable
+        // for one revocation.
+        let mut unrecorded = r.clone();
+        unrecorded.audit_record_id = None;
+        assert_eq!(
+            unrecorded.event_key(),
+            "revoked=3;l1@1780000000000000000;44444444-4444-4444-8444-444444444444"
+        );
+        assert_eq!(
+            Notice::lease_revoked(&unrecorded).event_id,
+            Notice::lease_revoked(&unrecorded).event_id
+        );
+        // Another request with the same tops at the same instant draws another nonce, and
+        // one that revoked another count differs too.
+        let mut twin = unrecorded.clone();
+        twin.nonce = uuid::Uuid::new_v4();
+        assert_ne!(
+            Notice::lease_revoked(&unrecorded).event_id,
+            Notice::lease_revoked(&twin).event_id
+        );
+        let mut more = unrecorded.clone();
+        more.revoked = 4;
+        assert_ne!(unrecorded.event_key(), more.event_key());
+        assert_eq!(
+            NoticeKind::parse("lease.revoked"),
+            Some(NoticeKind::LeaseRevoked)
+        );
+        assert_eq!(NoticeKind::LeaseRevoked.stream(), NoticeStream::Leases);
+        assert_eq!(NoticeStream::Leases.kind_prefix(), "lease.");
+    }
+
+    /// A store with the chain `r > a > (a1, a2)` and `r > b`, and a second chain `s`.
+    fn tree() -> SqliteLeaseStore {
+        use attenuo_audit::LeaseRegistry;
+        let store = SqliteLeaseStore::open_in_memory().unwrap();
+        let exp = OffsetDateTime::now_utc() + time::Duration::hours(1);
+        for (id, parent) in [
+            ("r", None),
+            ("a", Some("r")),
+            ("a1", Some("a")),
+            ("a2", Some("a")),
+            ("b", Some("r")),
+            ("s", None),
+        ] {
+            store
+                .register(&LeaseId::new(id), parent.map(LeaseId::new).as_ref(), exp)
+                .unwrap();
+        }
+        store
+    }
+
+    fn ids(v: &[&str]) -> Vec<LeaseId> {
+        v.iter().map(|s| LeaseId::new(*s)).collect()
+    }
+
+    /// The tops of a revocation are the matches whose parent it did not revoke, and their
+    /// chains are named once each.
+    #[test]
+    fn tops_are_the_matches_not_covered_by_another_and_name_their_chains() {
+        let store = tree();
+        // By id: the lease named, whatever was revoked under it.
+        let (tops, chains, cut) = LeaseRevocation::tops(&store, &ids(&["a"]), &[]);
+        assert_eq!((tops, chains, cut), (ids(&["a"]), ids(&["r"]), false));
+        // A user selector matching a, a1 and s: a1 is under a, so a and s are the tops.
+        let (tops, chains, cut) = LeaseRevocation::tops(
+            &store,
+            &ids(&["a", "a1", "s"]),
+            &ids(&["a", "a1", "s", "a2"]),
+        );
+        assert_eq!(
+            (tops, chains, cut),
+            (ids(&["a", "s"]), ids(&["r", "s"]), false)
+        );
+        // Two matches of one chain whose parent was revoked before: both tops, one chain.
+        let (tops, chains, _) =
+            LeaseRevocation::tops(&store, &ids(&["a1", "a2"]), &ids(&["a1", "a2"]));
+        assert_eq!((tops, chains), (ids(&["a1", "a2"]), ids(&["r"])));
+        // An unknown lease is a top of its own chain.
+        let (tops, chains, _) = LeaseRevocation::tops(&store, &ids(&["gone"]), &[]);
+        assert_eq!((tops, chains), (ids(&["gone"]), ids(&["gone"])));
+    }
+
+    #[test]
+    fn tops_are_cut_at_the_cap_and_say_so() {
+        use attenuo_audit::LeaseRegistry;
+        let store = SqliteLeaseStore::open_in_memory().unwrap();
+        let exp = OffsetDateTime::now_utc() + time::Duration::hours(1);
+        let roots: Vec<LeaseId> = (0..MAX_LEASE_NOTICE_IDS + 5)
+            .map(|i| LeaseId::new(format!("root-{i:04}")))
+            .collect();
+        for r in &roots {
+            store.register(r, None, exp).unwrap();
+        }
+        let (tops, chains, cut) = LeaseRevocation::tops(&store, &roots, &roots);
+        assert!(cut);
+        assert_eq!(tops.len(), MAX_LEASE_NOTICE_IDS);
+        assert_eq!(tops, roots[..MAX_LEASE_NOTICE_IDS].to_vec());
+        assert_eq!(chains, tops);
+        let (tops, _, cut) = LeaseRevocation::tops(&store, &roots[..MAX_LEASE_NOTICE_IDS], &roots);
+        assert_eq!((tops.len(), cut), (MAX_LEASE_NOTICE_IDS, false));
+    }
+
+    /// Parents are read in batches, so a long chain and a wide tree give the right tops and
+    /// chains (no timing is asserted).
+    #[test]
+    fn tops_of_hundreds_of_delegated_leases_are_read_in_batches() {
+        use attenuo_audit::LeaseRegistry;
+        let store = SqliteLeaseStore::open_in_memory().unwrap();
+        let exp = OffsetDateTime::now_utc() + time::Duration::hours(1);
+        // A chain 450 deep: d0000 > d0001 > ... > d0449.
+        let deep: Vec<LeaseId> = (0..450).map(|i| LeaseId::new(format!("d{i:04}"))).collect();
+        for (i, l) in deep.iter().enumerate() {
+            let parent = i.checked_sub(1).map(|p| deep[p].clone());
+            store.register(l, parent.as_ref(), exp).unwrap();
+        }
+        // A root with 450 children, and 450 more roots.
+        let root = LeaseId::new("w");
+        store.register(&root, None, exp).unwrap();
+        let kids: Vec<LeaseId> = (0..450).map(|i| LeaseId::new(format!("w{i:04}"))).collect();
+        for k in &kids {
+            store.register(k, Some(&root), exp).unwrap();
+        }
+        // A user selector matching the whole deep chain: only its first lease is a top.
+        let (tops, chains, cut) = LeaseRevocation::tops(&store, &deep, &deep);
+        assert_eq!(
+            (tops, chains, cut),
+            (ids(&["d0000"]), ids(&["d0000"]), false)
+        );
+        // Matching the deep chain from the middle down, with nothing above revoked: the
+        // middle lease is the top and its chain is the root far above it.
+        let (tops, chains, cut) = LeaseRevocation::tops(&store, &deep[300..], &deep[300..]);
+        assert_eq!(
+            (tops, chains, cut),
+            (ids(&["d0300"]), ids(&["d0000"]), false)
+        );
+        // Matching the children but not the root: each child is a top, cut at the cap, and
+        // they share one chain.
+        let (tops, chains, cut) = LeaseRevocation::tops(&store, &kids, &kids);
+        assert!(cut);
+        assert_eq!(tops, kids[..MAX_LEASE_NOTICE_IDS].to_vec());
+        assert_eq!(chains, ids(&["w"]));
+        // Root and children matched together: the root alone is the top.
+        let mut all = vec![root.clone()];
+        all.extend(kids.iter().cloned());
+        let (tops, chains, cut) = LeaseRevocation::tops(&store, &all, &all);
+        assert_eq!((tops, chains, cut), (ids(&["w"]), ids(&["w"]), false));
+        let refs: Vec<&LeaseId> = deep.iter().chain(kids.iter()).collect();
+        let parents = store.parents(&refs).unwrap();
+        assert_eq!(parents.len(), 900);
+        assert_eq!(parents[&deep[0]], None);
+        assert_eq!(parents[&deep[449]], Some(deep[448].clone()));
+    }
+
+    /// Operator-typed text is cut in the notice only, at a character boundary, with a marker.
+    #[test]
+    fn operator_text_is_capped_in_the_notice_at_a_character_boundary() {
+        assert_eq!(cap_notice_text("short"), "short");
+        let exact = "x".repeat(MAX_NOTICE_TEXT_BYTES);
+        assert_eq!(
+            cap_notice_text(&exact),
+            exact.as_str(),
+            "a full 1024 is kept"
+        );
+        // A 3-byte character across the cut point is dropped whole.
+        let long = format!("{}{}", "a".repeat(1019), "\u{20ac}".repeat(10));
+        let cut = cap_notice_text(&long);
+        assert!(cut.len() <= MAX_NOTICE_TEXT_BYTES, "{}", cut.len());
+        assert!(cut.ends_with(CUT_MARKER));
+        assert_eq!(cut, format!("{}{CUT_MARKER}", "a".repeat(1019)));
+        let mut r = revocation();
+        r.reason = "r".repeat(5000);
+        r.selector = Some(json!({"user": "u".repeat(5000)}));
+        let v = lease_notice_json("e", &r);
+        let reason = v["reason"].as_str().unwrap();
+        assert_eq!(reason.len(), MAX_NOTICE_TEXT_BYTES);
+        assert!(reason.ends_with(CUT_MARKER));
+        assert_eq!(
+            v["selector"]["user"].as_str().unwrap().len(),
+            MAX_NOTICE_TEXT_BYTES
+        );
+        r.selector = Some(json!({"chain_id": "c".repeat(2000)}));
+        let v = lease_notice_json("e", &r);
+        assert!(v["selector"]["chain_id"]
+            .as_str()
+            .unwrap()
+            .ends_with(CUT_MARKER));
+        // The value itself is left whole for the audit record and the response.
+        assert_eq!(r.reason.len(), 5000);
+        // A session selector's own members are kept.
+        r.selector = Some(json!({"session_tag": "t", "chain_ids": ["c1"]}));
+        assert_eq!(
+            lease_notice_json("e", &r)["selector"],
+            json!({"session_tag": "t", "chain_ids": ["c1"]})
+        );
+    }
+
+    #[test]
+    fn one_secret_for_both_notifiers_is_a_warning_naming_the_variable() {
+        let a = NotifySection::new("https://hooks.example/approvals");
+        let mut l = LeaseNotifySection::with_url("https://hooks.example/revoked");
+        assert_eq!(crate::config::shared_notify_secret(&a, &l), None);
+        l.secret_env = a.secret_env.clone();
+        let w = crate::config::shared_notify_secret(&a, &l).unwrap();
+        assert!(w.contains("$ATTENUO_APPROVAL_NOTIFY_SECRET"), "{w}");
+        assert!(
+            w.contains("[leases.notify]") && w.contains("[approvals.notify]"),
+            "{w}"
+        );
+    }
+
+    #[test]
+    fn lease_config_validation_names_its_section_and_its_secret() {
+        let mut c = LeaseNotifySection::with_url("https://hooks.example/revoked");
+        c.validate().unwrap();
+        assert_eq!(c.secret_env, "ATTENUO_LEASE_NOTIFY_SECRET");
+        assert_eq!(c.section(), "[leases.notify]");
+        for bad in ["ftp://hooks.example/", "https://user:pw@hooks.example/"] {
+            c.url = bad.into();
+            let e = c.validate().unwrap_err().to_string();
+            assert!(e.starts_with("[leases.notify] url"), "{e}");
+        }
+        c.url = "https://hooks.example/".into();
+        c.headers.insert("X-Attenuo-Event".into(), "E".into());
+        assert!(c.validate().is_err());
+        c.headers.clear();
+        c.queue_capacity = 0;
+        let e = c.validate().unwrap_err().to_string();
+        assert!(e.starts_with("[leases.notify] queue_capacity"), "{e}");
+        c.queue_capacity = 1;
+        c.outbox_retention_seconds = 0;
+        assert!(c.validate().is_err());
+        // The approval section keeps its own default and name.
+        let a = NotifySection::new("https://hooks.example/");
+        assert_eq!(a.secret_env, "ATTENUO_APPROVAL_NOTIFY_SECRET");
+        assert_eq!(a.section(), "[approvals.notify]");
+    }
+
+    /// The two notifiers share the outbox and keep apart: each delivers only its own backlog
+    /// after a restart, counts only its own rows, and a revocation that changed nothing sends
+    /// nothing.
+    #[test]
+    fn each_notifier_delivers_only_its_own_rows_from_a_shared_outbox() {
+        let (store, approval_events) = store_with_open_rows(3);
+        let r = revocation();
+        let lease_notice = Notice::lease_revoked(&r);
+        let now = OffsetDateTime::now_utc();
+        store
+            .outbox_insert(
+                NewNotice {
+                    event_id: &lease_notice.event_id,
+                    kind: lease_notice.kind.as_str(),
+                    approval_id: &lease_notice.about,
+                    body: &lease_notice.body,
+                },
+                now,
+            )
+            .unwrap()
+            .unwrap();
+        let limits = SinkLimits {
+            capacity: 8,
+            max_lag: Duration::from_secs(3600),
+            backoff: Backoff {
+                initial: Duration::from_millis(1),
+                max: Duration::from_millis(5),
+            },
+        };
+        let metrics = Metrics::new();
+        let leases_got = Arc::new(Recorder::default());
+        let ln = LeaseNotifier::with_deliver(
+            Box::new(RecorderRef(leases_got.clone())),
+            limits,
+            3,
+            Duration::from_secs(3600),
+            metrics.clone(),
+            store.clone(),
+            attenuo_core::clock::system_clock(),
+        )
+        .unwrap();
+        wait_until(|| !leases_got.got.lock().unwrap().is_empty());
+        // Changed nothing: nothing to tell.
+        let mut nothing = r.clone();
+        nothing.revoked = 0;
+        nothing.audit_record_id = Some(uuid::Uuid::new_v4());
+        ln.revoked(&nothing);
+        // A fresh revocation is queued as stored.
+        let mut fresh = r.clone();
+        fresh.audit_record_id = Some(uuid::Uuid::new_v4());
+        ln.revoked(&fresh);
+        wait_until(|| leases_got.got.lock().unwrap().len() == 2);
+        ln.shutdown(Duration::from_secs(5));
+        assert_eq!(
+            *leases_got.got.lock().unwrap(),
+            vec![
+                lease_notice.event_id.clone(),
+                Notice::lease_revoked(&fresh).event_id
+            ]
+        );
+        // The approval rows were left alone.
+        assert_eq!(store.outbox_open_count_of("approval.").unwrap(), 3);
+        assert_eq!(store.outbox_open_count_of("lease.").unwrap(), 0);
+        let text = metrics.render();
+        assert!(
+            text.contains("attenuo_lease_notify_delivered_total 2\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("attenuo_lease_notify_outbox_rows 0\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("attenuo_approval_notify_delivered_total 0\n"),
+            "{text}"
+        );
+        // And the approval notifier, started on the same store, delivers only its own.
+        let approvals_got = Arc::new(Recorder::default());
+        let (an, _) = start(&store, &approvals_got, 8);
+        wait_until(|| approvals_got.got.lock().unwrap().len() >= approval_events.len());
+        an.shutdown(Duration::from_secs(5));
+        assert_eq!(*approvals_got.got.lock().unwrap(), approval_events);
+        assert_eq!(store.outbox_open_count().unwrap(), 0);
     }
 }

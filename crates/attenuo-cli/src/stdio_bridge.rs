@@ -67,8 +67,8 @@ const STOP_GRACE: Duration = Duration::from_secs(2);
 /// Prefix of the variables removed from the child's environment: attenuo's own credentials
 /// and settings (the CLI's `ATTENUO_ADMIN_TOKEN`, `ATTENUO_TOKEN`, `ATTENUO_CLIENT_SECRET` and
 /// `ATTENUO_DPOP_KEY`, the server's `ATTENUO_AUDIT_SINK_TOKEN`,
-/// `ATTENUO_APPROVAL_NOTIFY_SECRET` and `ATTENUO__*` overrides such as
-/// `ATTENUO__ADMIN__TOKEN`). The STDIO server is an upstream, and upstreams are not trusted
+/// `ATTENUO_APPROVAL_NOTIFY_SECRET`, `ATTENUO_LEASE_NOTIFY_SECRET` and `ATTENUO__*`
+/// overrides such as `ATTENUO__ADMIN__TOKEN`). The STDIO server is an upstream, and upstreams are not trusted
 /// with them (SR-134).
 const SECRET_ENV_PREFIX: &str = "ATTENUO_";
 

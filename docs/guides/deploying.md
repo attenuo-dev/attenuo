@@ -372,7 +372,7 @@ Matching settings in `attenuo.toml`: `policies_path = "/etc/attenuo/policy.cedar
 
 Notes:
 
-- **Signals.** The server shuts down gracefully on SIGTERM (what `docker stop` and Kubernetes send) and on SIGINT. It stops accepting connections, gives in-flight requests up to 10 seconds to finish (on the admin API, admin console and metrics listeners too), stops its timers, closes the database and releases its lock, then exits; it logs `shutdown signal received; draining`, `shutdown complete` and `single-writer fence released`. Set `stop_grace_period` (or `terminationGracePeriodSeconds`) above 10 seconds. No `stop_signal` override is needed. SQLite writes are transactional, so even a kill does not corrupt the log.
+- **Signals.** The server shuts down gracefully on SIGTERM (what `docker stop` and Kubernetes send) and on SIGINT. It stops accepting connections, gives in-flight requests up to 10 seconds to finish (on the admin API, admin console and metrics listeners too), stops its timers, closes the database and releases its lock, then exits; it logs `shutdown signal received; draining`, `shutdown complete` and `single-writer fence released`. Set `stop_grace_period` (or `terminationGracePeriodSeconds`) above 10 seconds. The 15 seconds in the examples fit the drain. With `[audit.sink]`, `[approvals.notify]` or `[leases.notify]` set, the server then gives what they still have queued 5 more seconds, shared by all three, and a request already in flight can run to its own `timeout_seconds`. With `[telemetry]` set, spans get up to 5 seconds after that. So the worst case is 10 + 5 + the longest `timeout_seconds` + 5 + 2 seconds, which is 32 seconds with the default timeouts. A grace shorter than that only cuts this tail: approval and revocation notices still queued stay in the outbox and are sent at the next start. No `stop_signal` override is needed. SQLite writes are transactional, so even a kill does not corrupt the log.
 - **Read-only root.** The server only writes under the data directory and, when the key file is missing, to the key path. Keep the key file in the read-only mount, so a missing key is an error you see, not a new key you did not plan.
 - **Upstreams** must be reachable from the container. `127.0.0.1` in `[[upstreams]]` means the container itself. The proxy gives an upstream `[proxy] upstream_connect_timeout_seconds` (default 5) to accept a connection and `upstream_response_timeout_seconds` (default 120) to send response headers, or a JSON answer it must read; past that the agent gets `502 upstream_unreachable` or `504 upstream_timeout`. Raise the second for tools that answer in JSON after a long run. Streams (SSE) are not cut by it.
 
@@ -451,6 +451,7 @@ listen = "127.0.0.1:9100"
 | `audit_checkpoint_last_timestamp_seconds`, `audit_wal_last_complete_timestamp_seconds`, `audit_wal_checkpoints_total{result}`, `audit_wal_backstops_total` | Signed checkpoints and the SQLite WAL checkpointer keeping up. |
 | `audit_sink_dropped_total`, `audit_sink_oldest_undelivered_timestamp_seconds` | Checkpoints not leaving the host. |
 | `approval_notify_dropped_total`, `approval_notify_outbox_rows` | `[approvals.notify]` notices given up, and notices stored but not yet delivered. The outbox count staying up means the receiver is down; the notices survive a restart. |
+| `lease_notify_dropped_total`, `lease_notify_outbox_rows` | The same for `[leases.notify]` revocation notices. A dropped one costs only time: the PEP still learns of the revocation when it next asks. |
 
 Alert on any increase of `audit_append_errors_total`, on a rising share of `reason="lease_expired"`, on `audit_sink_dropped_total` and on `readyz` returning 503. Example Prometheus rules for the newer series; tune the thresholds to your traffic:
 
@@ -504,7 +505,7 @@ From the audit log (`GET /admin/audit`, `attenuo audit tail`):
 - `audit verify` on a schedule. It exits 2 on a broken chain or an invalid checkpoint, and 1 when it could not check (server unreachable, bad admin token).
 - The checkpoint `seq` should only grow. Compare each reading with the last.
 
-If you run a second system that needs to react to revocations, such as an AuthZEN PEP, remember it learns only by asking. There is no push channel in v0.
+If you run a second system that needs to react to revocations, such as an AuthZEN PEP, it learns of a revocation when it asks. To tell it sooner, set [`[leases.notify]`](../reference/config.md#leasesnotify): the server then `POST`s a signed `lease.revoked` notice to a webhook after each revocation. Give it its own secret in `ATTENUO_LEASE_NOTIFY_SECRET`. The notice is a hint. It can be late or lost, so the PEP should still ask, or cache an allow only briefly. See [Revocation notices](../reference/authzen.md#revocation-notices).
 
 ## Upgrades
 

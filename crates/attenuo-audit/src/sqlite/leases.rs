@@ -243,6 +243,42 @@ impl SqliteLeaseStore {
         get_in(&conn, lease)
     }
 
+    /// The parent of each known lease in `leases` (`None` for a root), read with one
+    /// `SELECT id, parent ... WHERE id IN (...)` per 200 leases, so `n` leases cost about
+    /// `n / 200` queries. Unknown ids are absent from the
+    /// result. The store's lock is taken per query, and the write gate not at all, so a
+    /// long list does not hold writers back.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Poisoned`] when a writer panicked holding the store's lock, or
+    /// [`AuditError::Sqlite`] from a query.
+    pub fn parents(
+        &self,
+        leases: &[&LeaseId],
+    ) -> Result<BTreeMap<LeaseId, Option<LeaseId>>, AuditError> {
+        let mut out = BTreeMap::new();
+        for chunk in leases.chunks(PARENTS_PER_QUERY) {
+            let conn = self.conn.lock()?;
+            // One cached statement per chunk length.
+            let sql = format!(
+                "SELECT id, parent FROM leases WHERE id IN ({})",
+                vec!["?"; chunk.len()].join(",")
+            );
+            let mut stmt = conn.prepare_cached(&sql)?;
+            let mut rows = stmt.query(rusqlite::params_from_iter(
+                chunk.iter().map(|l| l.0.as_str()),
+            ))?;
+            while let Some(row) = rows.next()? {
+                out.insert(
+                    LeaseId(row.get::<_, String>(0)?),
+                    row.get::<_, Option<String>>(1)?.map(LeaseId),
+                );
+            }
+        }
+        Ok(out)
+    }
+
     /// What revoking `lease` would touch, without changing anything; `None` for an unknown
     /// lease. A dry run of [`revoke`](LeaseRegistry::revoke): it reads the subtree through the
     /// same recursive query over `leases_parent_idx`, so `would_revoke` is the count a
@@ -677,6 +713,10 @@ fn binding_in(conn: &Connection, lease: &LeaseId) -> Result<Option<String>, Audi
 /// Leases read per `IN (...)` query. SQLite allows 32766 parameters; chains are capped far
 /// below this, but a longer list still works, in chunks.
 const LEASES_PER_QUERY: usize = 64;
+
+/// Leases read per query by [`SqliteLeaseStore::parents`]. Well under SQLite's parameter
+/// limit; the statement cache holds the few chunk lengths a call uses.
+const PARENTS_PER_QUERY: usize = 200;
 
 /// `SELECT ... WHERE id IN (?,...,?)` with `n` placeholders, built once per `n`.
 fn leases_in_sql(n: usize) -> &'static str {

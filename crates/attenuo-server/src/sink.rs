@@ -27,9 +27,10 @@
 //! the S3 credentials are read once at start too, and nothing refreshes them.
 //!
 //! The queue itself ([`Queue`]) is generic over what it carries, so the approval notifier
-//! (`[approvals.notify]`, [`crate::notify`]) runs on the same code with its own metrics and
-//! one difference: a notification is given up after `max_attempts` ([`QueueRole::give_up`]),
-//! where a checkpoint never is.
+//! (`[approvals.notify]`) and the revocation notifier (`[leases.notify]`), both in
+//! [`crate::notify`], run on the same code with their own metrics and one difference: a
+//! notification is given up after `max_attempts` ([`QueueRole::give_up`]), where a checkpoint
+//! never is.
 
 use std::collections::VecDeque;
 use std::io::Write as _;
@@ -121,6 +122,11 @@ pub enum QueueRole {
         /// The `[approvals.notify]` attempt limit; 0 counts as 1.
         max_attempts: u32,
     },
+    /// `[leases.notify]`: given up after this many failed attempts (at least 1).
+    LeaseNotices {
+        /// The `[leases.notify]` attempt limit; 0 counts as 1.
+        max_attempts: u32,
+    },
 }
 
 impl QueueRole {
@@ -129,6 +135,7 @@ impl QueueRole {
         match self {
             Self::Checkpoints => "[audit.sink]",
             Self::ApprovalNotices { .. } => "[approvals.notify]",
+            Self::LeaseNotices { .. } => "[leases.notify]",
         }
     }
 
@@ -136,6 +143,7 @@ impl QueueRole {
         match self {
             Self::Checkpoints => "attenuo-ckpt-sink",
             Self::ApprovalNotices { .. } => "attenuo-approval-notify",
+            Self::LeaseNotices { .. } => "attenuo-lease-notify",
         }
     }
 
@@ -143,35 +151,46 @@ impl QueueRole {
     pub fn give_up(self) -> Option<u32> {
         match self {
             Self::Checkpoints => None,
-            Self::ApprovalNotices { max_attempts } => Some(max_attempts.max(1)),
+            Self::ApprovalNotices { max_attempts } | Self::LeaseNotices { max_attempts } => {
+                Some(max_attempts.max(1))
+            }
+        }
+    }
+
+    /// The counters of a notifier's queue; `None` for the checkpoint sink.
+    fn notify(self, m: &Metrics) -> Option<&crate::metrics::NotifyCounters> {
+        match self {
+            Self::Checkpoints => None,
+            Self::ApprovalNotices { .. } => Some(m.approval_notify()),
+            Self::LeaseNotices { .. } => Some(m.lease_notify()),
         }
     }
 
     fn delivered(self, m: &Metrics) {
-        match self {
-            Self::Checkpoints => m.audit_sink_delivered(),
-            Self::ApprovalNotices { .. } => m.approval_notify_delivered(),
+        match self.notify(m) {
+            None => m.audit_sink_delivered(),
+            Some(n) => n.delivered(),
         }
     }
 
     fn failed(self, m: &Metrics) {
-        match self {
-            Self::Checkpoints => m.audit_sink_failure(),
-            Self::ApprovalNotices { .. } => m.approval_notify_failure(),
+        match self.notify(m) {
+            None => m.audit_sink_failure(),
+            Some(n) => n.failure(),
         }
     }
 
     fn dropped(self, m: &Metrics) {
-        match self {
-            Self::Checkpoints => m.audit_sink_dropped(),
-            Self::ApprovalNotices { .. } => m.approval_notify_dropped(),
+        match self.notify(m) {
+            None => m.audit_sink_dropped(),
+            Some(n) => n.dropped(),
         }
     }
 
     fn gauges(self, m: &Metrics, depth: u64, oldest: Option<SystemTime>) {
-        match self {
-            Self::Checkpoints => m.audit_sink_queue(depth, oldest),
-            Self::ApprovalNotices { .. } => m.approval_notify_queue(depth),
+        match self.notify(m) {
+            None => m.audit_sink_queue(depth, oldest),
+            Some(n) => n.queue(depth),
         }
     }
 }
