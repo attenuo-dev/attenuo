@@ -25,6 +25,8 @@ The server gets the bridge's environment, so pass its API keys there (`GITHUB_TO
 
 If the server cannot be started, or exits later, the bridge exits with status 1. It does not restart the server. Run it under a supervisor (a systemd unit with `Restart=on-failure`, a container restart policy) if you want that. Ctrl-C or SIGTERM stops the bridge and the server with it: the bridge closes the server's stdin, waits up to two seconds, then kills it. Then it stops what the server started: the server runs in a process group of its own, and whatever is left of the group gets SIGTERM, up to two seconds, then SIGKILL. So when the command is a launcher (`npx`, `uvx`, a shell script), the real server behind it is stopped too (SR-135). A process that moved itself to another process group or session is not reached; a supervisor that stops a whole cgroup, such as a systemd unit, covers that. On Windows only the process the bridge started is killed.
 
+Two things follow from the server's own process group. Stopping can take up to about four seconds (two for the server, two for what it started), so give a supervisor's kill timeout more than that. And the server is not in the terminal's foreground group: Ctrl-C, Ctrl-\\ and a closing terminal reach the bridge, which then stops the server, and a server or wrapper that reads from the terminal (a password or MFA prompt) is stopped by the terminal instead of being answered. Give such a wrapper what it needs before starting the bridge. In a container, run the bridge under an init (`docker run --init`, tini), which collects the stopped processes.
+
 ## 2. Add the upstream
 
 In the server's config, point an `[[upstreams]]` entry at the bridge, and put the server's tools in the catalog like any other upstream's:

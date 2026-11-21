@@ -445,21 +445,42 @@ async fn sigterm_stops_the_bridge_and_its_child() {
 #[tokio::test(flavor = "multi_thread")]
 async fn stopping_the_bridge_stops_what_the_child_started_sr135() {
     use std::ffi::OsStr;
-    // Running, by `ps`: a process that was killed and not yet reaped by its new parent
-    // (a zombie, state Z) still answers `kill -0`, and it is not running.
+    // Running: not gone and not a zombie. A process that was killed and not yet reaped by
+    // its new parent still answers `kill -0`, and it is not running.
     let alive = |pid: &str| {
-        let out = Command::new("ps")
-            .args(["-o", "stat=", "-p", pid])
-            .output()
-            .unwrap();
-        let state = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        !state.is_empty() && !state.starts_with('Z')
+        #[cfg(target_os = "linux")]
+        {
+            // The state is the field after the `)` that closes the command name.
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|s| s.rsplit_once(") ").map(|(_, rest)| rest.to_string()))
+                .is_some_and(|rest| !rest.starts_with('Z') && !rest.starts_with('X'))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let out = Command::new("ps")
+                .args(["-o", "stat=", "-p", pid])
+                .output()
+                .unwrap();
+            let state = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            !state.is_empty() && !state.starts_with('Z')
+        }
     };
+    // Kills the `sleep` if an assertion fails before the bridge did.
+    struct Reap(String);
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            let _ = Command::new("kill")
+                .args(["-KILL", &self.0])
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
     // Each script starts a `sleep` in the background, prints its pid on stderr, and then:
     // exits when its input ends; or ignores SIGTERM (the `sleep` inherits that) and stays.
     for script in [
-        "sleep 4242 & echo \"grandchild $!\" >&2; cat >/dev/null",
-        "trap '' TERM; sleep 4243 & echo \"grandchild $!\" >&2; wait",
+        "sleep 61 & echo \"grandchild $!\" >&2; cat >/dev/null",
+        "trap '' TERM; sleep 62 & echo \"grandchild $!\" >&2; wait",
     ] {
         let mut b = bridge_running(
             &[],
@@ -478,6 +499,7 @@ async fn stopping_the_bridge_stops_what_the_child_started_sr135() {
             assert!(Instant::now() < end, "no pid from the script: {err}");
             std::thread::sleep(Duration::from_millis(20));
         };
+        let _reap = Reap(pid.clone());
         assert!(alive(&pid), "{script}");
         let status = Command::new("kill")
             .args(["-TERM", &b.child.id().to_string()])
@@ -485,6 +507,11 @@ async fn stopping_the_bridge_stops_what_the_child_started_sr135() {
             .unwrap();
         assert!(status.success());
         assert_eq!(b.wait_exit().code(), Some(0), "{}", b.stderr());
+        // A killed process may take a moment to leave the table.
+        let end = Instant::now() + Duration::from_secs(2);
+        while alive(&pid) && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(20));
+        }
         assert!(
             !alive(&pid),
             "the grandchild {pid} outlived the bridge: {script}"
