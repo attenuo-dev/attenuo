@@ -107,7 +107,9 @@ export function decisionPill(decision, big = false) {
 }
 
 /** Kinds whose record is not a decision, though its `decision` member says `allow`. */
-const NOT_DECISIONS = new Set(['tool_result', 'approval_request', 'approval_grant', 'search']);
+// Records that always carry `allow` without deciding anything. Approval records
+// stay pills: a request is a deny, and a grant is an allow or a deny.
+const NOT_DECISIONS = new Set(['tool_result', 'search']);
 
 /** The decision cell of an audit row: a pill for a decision, a dash for a record that is none. */
 export function recordPill(record, big = false) {
