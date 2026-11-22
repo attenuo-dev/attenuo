@@ -9,7 +9,7 @@ import {
   h, append, replace, link, mono, short, time, recordPill, table, empty, loading,
   explainReason,
 } from './dom.js';
-import { api, download, qs } from './api.js';
+import { api, download, qs, newestPrune } from './api.js';
 
 const PAGE = 100;
 // A filtered page reads at most 50,000 seqs and may come back short; keep following the
@@ -85,7 +85,7 @@ async function fetchOlder(filters, start) {
     cursor = page.next_cursor;
   }
   const older = last.next_cursor === null ? null : { to: start.to, cursor: last.next_cursor };
-  return { entries, older, head: first.head };
+  return { entries, older, head: first.head, first: retainedFrom(first) };
 }
 
 /**
@@ -104,13 +104,35 @@ async function fetchNewer(filters, start, limit = PAGE) {
     cursor = page.next_cursor;
   }
   const newer = last.next_cursor === null ? null : { from: start.from, cursor: last.next_cursor };
-  return { entries, newer, head: last.head };
+  return { entries, newer, head: last.head, first: retainedFrom(last) };
 }
 
-/** How to read below the lowest of these (newest-first) entries: `to` just under it. */
-function olderThan(entries) {
+/** The first retained seq of a page: 1, or one above a prune's boundary. */
+function retainedFrom(page) {
+  return Number.isInteger(page.first) && page.first > 1 ? page.first : 1;
+}
+
+/**
+ * How to read below the lowest of these (newest-first) entries: `to` just under it, or null
+ * when the lowest is the first retained entry (seq 1, or the first one after a prune).
+ */
+function olderThan(entries, first) {
   const lowest = entries[entries.length - 1].seq;
-  return lowest > 1 ? { to: lowest - 1 } : null;
+  return lowest > first ? { to: lowest - 1 } : null;
+}
+
+/**
+ * The quiet line above the table of a pruned log: "Entries before seq N were pruned", with a
+ * link to the prune's record once `newestPrune` has found it (`prune`, or null).
+ */
+function prunedLine(first, prune) {
+  if (first <= 1) return null;
+  return h('p', { class: 'small muted', id: 'audit-pruned' },
+    `Entries before seq ${first} were pruned`,
+    prune
+      ? [' by the ', link(['entry', prune.prune_seq], `prune recorded at seq ${prune.prune_seq}`), '.']
+      : '.',
+    ' Their archive is kept outside the server.');
 }
 
 // ---- rendering ----------------------------------------------------------------------------
@@ -193,12 +215,16 @@ export async function auditView(root, params) {
     older: null, // how fetchOlder reads the entries below the page; null at seq 1
     newer: null, // how fetchNewer reads the entries above it; null when it reaches the head
     head: 0,
+    first: 1, // the first retained seq: 1, or one above a prune's boundary
+    prune: null, // { first, found }: the newest prune looked up for that `first` (found or null)
+    pruneLookup: null, // the `first` a lookup is running for, or null
     timer: null,
     polling: false,
     fresh: new Set(),
   };
 
   const tableBox = h('div', null, loading());
+  const prunedBox = h('div');
   const info = h('span', { class: 'muted small' });
   const olderBtn = h('button', { type: 'button', on: { click: () => load('older') } }, 'Older');
   const newerBtn = h('button', { type: 'button', on: { click: () => load('newer') } }, 'Newer');
@@ -213,6 +239,7 @@ export async function auditView(root, params) {
       h('summary', null, active ? `Filters (${active} active)` : 'Filters'),
       filterForm(filters)),
     h('div', { class: 'pager' }, newestBtn, newerBtn, olderBtn, followBtn, h('span', { class: 'spacer' }), info, exportBtn),
+    prunedBox,
     tableBox,
   ]);
 
@@ -220,7 +247,12 @@ export async function auditView(root, params) {
     goWithFilters({ ...filters, chain_id: id });
   }
 
+  function knownPrune() {
+    return state.prune && state.prune.first === state.first ? state.prune.found : null;
+  }
+
   function render() {
+    replace(prunedBox, prunedLine(state.first, knownPrune()));
     olderBtn.disabled = state.older === null;
     newerBtn.disabled = state.newer === null;
     newestBtn.disabled = state.newer === null;
@@ -247,8 +279,9 @@ export async function auditView(root, params) {
         if (res.entries.length === 0) return load('newest');
         state.entries = res.entries.slice().reverse();
         state.head = res.head;
+        state.first = res.first;
         state.newer = res.newer && { from: state.entries[0].seq + 1 };
-        state.older = olderThan(state.entries);
+        state.older = olderThan(state.entries, state.first);
       } else {
         // The entries above the page being left are what "Newer" brings back.
         const shownLowest = state.entries.length ? state.entries[state.entries.length - 1].seq : null;
@@ -256,15 +289,33 @@ export async function auditView(root, params) {
         state.entries = res.entries;
         state.older = res.older;
         state.head = res.head;
+        state.first = res.first;
         if (which !== 'older') state.newer = null;
         else if (shownLowest !== null) state.newer = { from: shownLowest };
       }
       state.fresh.clear();
       render();
+      lookupPrune();
     } catch (e) {
       replace(tableBox, empty(`Could not load the log: ${e.message}`));
       if (e.status === 401) throw e;
     }
+  }
+
+  // Finds the newest prune's record once the log shows a prune, after the page is drawn, and
+  // then fills in the link of the line only. Again when `first` moves (a newer prune), and
+  // after a failure on the next load. A failed lookup leaves the line without its link; a 401
+  // has already logged out.
+  function lookupPrune() {
+    const first = state.first;
+    if (first <= 1 || knownPrune() || state.pruneLookup === first) return;
+    state.pruneLookup = first;
+    newestPrune(first).then((found) => {
+      state.prune = { first, found };
+      if (state.first === first) replace(prunedBox, prunedLine(first, found));
+    }, () => {}).finally(() => {
+      if (state.pruneLookup === first) state.pruneLookup = null;
+    });
   }
 
   // ---- follow ---------------------------------------------------------------------------
@@ -300,9 +351,18 @@ export async function auditView(root, params) {
         if (res.entries.length) {
           for (const e of res.entries) state.fresh.add(e.seq);
           state.entries = res.entries.slice().reverse().concat(state.entries).slice(0, FOLLOW_CAP);
-          state.older = olderThan(state.entries);
+          state.older = olderThan(state.entries, state.first);
+        }
+        // A prune that committed while following: drop the rows it removed. Nothing is
+        // retained below them, so Older then has nothing to read.
+        if (res.first > state.first) {
+          state.first = res.first;
+          const kept = state.entries.filter((e) => e.seq >= state.first);
+          if (kept.length < state.entries.length) state.older = null;
+          state.entries = kept;
         }
         render();
+        lookupPrune();
       }
     } catch {
       stopFollow();

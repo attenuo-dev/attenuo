@@ -64,13 +64,15 @@ export function needsRole(btn, min) {
 
 /**
  * An error answer from the admin API: status, the API's stable `code` (its `error` for a server
- * that sends no `code`) and its human-readable message.
+ * that sends no `code`), its human-readable message, and the answer's JSON object (`body`, or
+ * null), for the codes that carry more members (a 410 `audit_pruned` names the boundary).
  */
 export class ApiError extends Error {
-  constructor(status, code, message) {
+  constructor(status, code, message, body = null) {
     super(message);
     this.status = status;
     this.code = code;
+    this.body = body;
   }
 }
 
@@ -83,9 +85,11 @@ function headers(extra = {}) {
 async function errorFrom(resp) {
   let code = `http_${resp.status}`;
   let message = resp.statusText || `HTTP ${resp.status}`;
+  let obj = null;
   try {
     const body = await resp.json();
     if (body && typeof body === 'object') {
+      obj = body;
       // `code` is the stable machine code; `detail` is text for people. `error_description`
       // is a deprecated copy of the code, read only from a server that sends neither.
       code = body.code || body.error_description || body.error || code;
@@ -94,7 +98,7 @@ async function errorFrom(resp) {
   } catch {
     // Not JSON: keep the status text.
   }
-  return new ApiError(resp.status, code, message);
+  return new ApiError(resp.status, code, message, obj);
 }
 
 /**
@@ -161,6 +165,31 @@ export async function download(path, filename) {
   a.remove();
   // Give the browser a moment to start the download before the URL is released.
   setTimeout(() => URL.revokeObjectURL(url), 10_000);
+}
+
+// ---- audit retention -----------------------------------------------------------------
+
+/** The tool of a prune's own audit record. */
+export const PRUNE_TOOL = 'admin.audit.prune';
+
+/**
+ * The newest prune of a log whose first retained seq is `first`: `{pruned_through, prune_seq,
+ * first}`, or null when it cannot be read. One request: the entry at `first - 1` is at the
+ * newest prune's boundary, so the server answers it with 410 `audit_pruned` and those members.
+ * Quiet: a failure puts nothing in the status line (a 401 still logs out, and is thrown).
+ */
+export async function newestPrune(first) {
+  if (!Number.isInteger(first) || first <= 1) return null;
+  try {
+    await api(`/admin/audit/entries/${first - 1}`, { quiet: [400, 404, 410, 429, 500, 502, 503, 504] });
+  } catch (e) {
+    if (e.status === 401) throw e;
+    const b = e.body;
+    if (e.status === 410 && e.code === 'audit_pruned' && b && Number.isInteger(b.prune_seq) && Number.isInteger(b.pruned_through)) {
+      return { pruned_through: b.pruned_through, prune_seq: b.prune_seq, first: Number.isInteger(b.first) ? b.first : first };
+    }
+  }
+  return null;
 }
 
 /** Build a query string from an object, skipping empty values. */

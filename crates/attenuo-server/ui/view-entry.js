@@ -7,7 +7,7 @@ import {
   h, append, replace, link, mono, short, time, recordPill, leaseStatePill, table,
   empty, loading, kv, explainReason, jsonTree,
 } from './dom.js';
-import { api, qs } from './api.js';
+import { api, qs, newestPrune, PRUNE_TOOL } from './api.js';
 import { loadPolicies } from './view-policy.js';
 
 const TIMELINE_LIMIT = 200;
@@ -19,9 +19,13 @@ export async function entryView(root, { seq, id }) {
   append(root, loading());
   let view;
   try {
-    view = await api(path, { quiet: [404, 400] });
+    view = await api(path, { quiet: [404, 400, 410] });
   } catch (e) {
     if (e.status === 401) throw e;
+    if (e.status === 410 && e.code === 'audit_pruned') {
+      replace(root, prunedPanel(seq, e.body || {}));
+      return;
+    }
     replace(root, h('section', { class: 'panel' },
       h('h1', null, seq !== undefined ? `No entry at seq ${seq}` : 'No such record'),
       h('p', null, e.message),
@@ -40,9 +44,62 @@ export async function entryView(root, { seq, id }) {
     notLoggedPanel());
 }
 
+// A seq at or below a prune's boundary (410 `audit_pruned`): the entry is no longer on the
+// server. The answer names the boundary (`pruned_through`), the prune's own record
+// (`prune_seq`) and the first retained seq (`first`).
+function prunedPanel(seq, body) {
+  const num = (v) => (Number.isInteger(v) ? v : null);
+  const through = num(body.pruned_through);
+  const pruneSeq = num(body.prune_seq);
+  const first = num(body.first);
+  return h('section', { class: 'panel', 'aria-labelledby': 'pruned-title' },
+    h('header', null,
+      h('h1', { id: 'pruned-title' }, seq !== undefined ? ['Entry ', mono(`#${seq}`), ' was pruned'] : 'This record was pruned'),
+      h('a', { href: '#/audit' }, 'Audit log')),
+    h('p', { class: 'callout warn' },
+      'This entry was pruned: the server deleted the start of the audit log',
+      through !== null ? [' through seq ', mono(through)] : null,
+      ', after it was archived. The entry is in that archive, not on the server.'),
+    kv([
+      ['Pruned through', through !== null ? mono(through) : undefined],
+      ['Prune record', pruneSeq !== null ? link(['entry', pruneSeq], `seq ${pruneSeq}`) : undefined],
+      ['First retained seq', first !== null ? link(['entry', first], `seq ${first}`) : undefined],
+    ]),
+    h('p', { class: 'small muted' }, 'To read it, verify the archive with ', mono('attenuo audit verify --file <archive>'), ' and look it up there.'));
+}
+
+// A prune's own record (`admin`, tool `admin.audit.prune`). Its arguments are only a digest,
+// like every record's; the boundary, its hash and the archive digest are in the signed anchor.
+// The newest prune is found exactly: the entry just below the first retained seq answers 410
+// `audit_pruned` naming it. Anything else says where the boundary is, nothing more.
+function pruneRecordInfo(entry) {
+  const box = h('span', { class: 'muted' }, 'looking up the boundary…');
+  const inAnchor = () => h('span', null, 'the boundary is in its signed anchor (', mono('attenuo audit verify'), ' checks every anchor)');
+  api('/admin/audit?order=desc&limit=1', { quiet: [400, 404, 429, 500, 502, 503, 504] })
+    .then((top) => newestPrune(top.first))
+    .then((newest) => {
+      if (newest && newest.prune_seq === entry.seq) {
+        replace(box, h('span', null, `the newest prune: entries through seq ${newest.pruned_through} were pruned; the log now starts at `,
+          link(['entry', newest.first], `seq ${newest.first}`)));
+      } else if (newest) {
+        replace(box, h('span', null, 'an earlier prune (the newest is recorded at ', link(['entry', newest.prune_seq], `seq ${newest.prune_seq}`), '); ', inAnchor()));
+      } else {
+        replace(box, inAnchor());
+      }
+    })
+    .catch(() => replace(box, inAnchor()));
+  return box;
+}
+
+const PRUNE_EXPLAIN = 'A prune of the start of the audit log, made by an admin: the entries up to the boundary were archived, then deleted. The boundary, its hash and the archive’s SHA-256 are in the prune’s signed anchor.';
+
+function isPruneRecord(r) {
+  return r.kind === 'admin' && r.tool === PRUNE_TOOL;
+}
+
 function verdict(entry) {
   const r = entry.record;
-  const why = explainReason(r.reason);
+  const why = isPruneRecord(r) ? PRUNE_EXPLAIN : explainReason(r.reason);
   return h('section', { class: 'panel', 'aria-labelledby': 'entry-title' },
     h('header', null,
       h('h1', { id: 'entry-title' }, `Entry `, mono(`#${entry.seq}`)),
@@ -62,6 +119,7 @@ function verdict(entry) {
       ['Untrusted arguments', untrustedArgs(r.labels && r.labels.untrusted_args)],
       ['Action search', searchCounts(r.search)],
       ['ID-JAG ceiling', ceilingClaims(r.id_jag_ceiling)],
+      ['Prune', isPruneRecord(r) ? pruneRecordInfo(entry) : undefined],
     ]));
 }
 

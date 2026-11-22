@@ -54,6 +54,7 @@ The log, newest first, 100 entries a page: seq, local time (hover for UTC), kind
 - **Older**, **Newer**, **Newest** page through the log. A filtered page can come back shorter than 100 entries; the server stops reading after 50,000 entries per request, and the console keeps asking until it has a page or reaches the end.
 - **Follow** checks every 2 seconds whether the log grew and adds new entries at the top. It reads the head only; it never signs a checkpoint.
 - A chain id narrows the view to that chain. A lease id opens its lease tree. A seq opens the decision.
+- After a prune (`attenuo audit prune`, [Bounding the audit log](deploying.md#bounding-the-audit-log)), one line above the table says `Entries before seq N were pruned`. The link to the prune's own record is filled in a moment later: the console reads the entry just below the first retained seq, which the server answers with the newest prune (410 `audit_pruned`, naming its boundary and its record). If that read fails, the line shows without the link. **Older** stops at the first retained entry. The console cannot prune: there is no button for it, and the retention routes are not served on the console listener.
 - **Export this range** downloads the entries between the oldest and newest seq on screen, unfiltered, with the checkpoints in that range, as `attenuo-audit-{from}-{to}.ndjson`. Check it offline with `attenuo audit verify --file`. That check refuses entries newer than the last checkpoint in the file (exit 2), so press **Sign head now** on the Verify page before exporting, or pass `--allow-unsigned-tail` to accept them as covered by the hash chain only.
 
 ### Decision
@@ -67,6 +68,8 @@ Open from a seq (`#/entry/42`) or from the `decision_id` a denial returns (`#/re
 - for a call that drew on run limits, **Run limits and usage**: each limit it was charged against (hop and lease, capability index, kind, argument, what the counter held afterwards, the maximum and what was left; for `distinct` the counter is the number of values seen, and a host-derived argument shows as `url#host`), from the record's `budget` member; and for a destructive tool, the run's usage of it before the call (`usage`: calls, amount, whether the destination was seen before);
 - the hash fields (`seq`, `prev_hash`, `entry_hash`, `chain_digest`, `arguments_digest`) and the signed checkpoint that covers the entry, or "not yet covered by a signed checkpoint";
 - every other record of the same chain, oldest first.
+
+A seq that was pruned shows `Entry #N was pruned` instead, with the boundary (`pruned_through`), a link to the prune's record and the first retained seq; the entry is in the archive the prune wrote, which `attenuo audit verify --file` checks. A prune's own record (`admin.audit.prune`) says it is a prune made by an admin. For the newest prune it names the boundary and the first retained seq; for an earlier prune, or when the lookup fails, it says the boundary is in its signed anchor.
 
 What it cannot show: the tool arguments and the capabilities each hop held. The log stores only their digests. If you have the token, **Decode a token locally** shows its header and claims, decoded in the browser tab. The token is not sent to the server or anywhere else, and its signature is not checked there.
 
@@ -93,6 +96,7 @@ What it cannot show: the tool arguments and the capabilities each hop held. The 
 
 - The head of the log and the newest stored checkpoints.
 - **Verify now** walks the whole hash chain and checks every checkpoint signature against the server's keys: `ok`, the first bad seq, the last signed seq, how many newest entries no signature covers yet, and any checkpoint that failed. On a large log this takes a while.
+- On a pruned log, the head panel shows the first retained seq, and the verification shows `Pruned through` (the boundary of the newest prune; the walk starts at its signed anchor and `Entries` counts the retained entries only), the number of anchors checked, and any anchor that failed, in red with its reason, as a failed checkpoint is. A log never pruned shows `not pruned`. When the log does not start at seq 1, or has anchors, but no anchor verified (a newest anchor that fails, the case a tampered log shows), `Pruned through` shows `none verified (walked from the first retained entry)` in red with a warning, never `not pruned`.
 - **Sign head now** stores a signed checkpoint of the current head, after a confirmation. It is the only button on this page that writes, and it changes no audit entry.
 
 ## Writes and `allow_write`

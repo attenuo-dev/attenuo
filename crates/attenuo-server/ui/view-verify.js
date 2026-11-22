@@ -14,7 +14,9 @@ export async function verifyView(root) {
   // browser logs as a console error).
   const readyBox = h('p', { class: 'small muted' }, 'Readiness (', mono('/readyz'), ') is served on the main listener, not on the console’s.');
 
-  const verifyBtn = h('button', { type: 'button', class: 'primary', on: { click: () => runVerify(verifyBtn, verifyOut) } }, 'Verify now');
+  // The first retained seq the head panel shows, so the verification agrees with it.
+  let first = 1;
+  const verifyBtn = h('button', { type: 'button', class: 'primary', on: { click: () => runVerify(verifyBtn, verifyOut, first) } }, 'Verify now');
   const signBtn = h('button', { type: 'button', on: { click: () => confirmSign(refresh) } }, 'Sign head now…');
 
   append(root, [
@@ -33,6 +35,7 @@ export async function verifyView(root) {
       api('/admin/audit/checkpoints?limit=20'),
     ]);
     const newest = top.entries[0];
+    first = Number.isInteger(top.first) && top.first > 1 ? top.first : 1;
     const signed = cps.checkpoints[0];
     replace(headBox, kv([
       ['Head seq', newest ? link(['entry', newest.seq], mono(newest.seq)) : mono(0)],
@@ -40,6 +43,9 @@ export async function verifyView(root) {
       ['Newest entry', newest ? time(newest.record.at) : null],
       ['Newest checkpoint', signed ? h('span', null, mono(`seq ${signed.seq}`), ' · ', time(signed.at)) : h('span', { class: 'muted' }, 'none yet')],
       ['Unsigned entries', mono(String((top.head || 0) - (signed ? signed.seq : 0)))],
+      ['First retained seq', first > 1
+        ? h('span', null, mono(first), ' ', h('span', { class: 'muted small' }, 'entries before it were pruned'))
+        : h('span', null, mono(1), ' ', h('span', { class: 'muted small' }, 'not pruned'))],
     ]));
     if (!cps.checkpoints.length) {
       replace(cpBox, empty('No checkpoints are stored yet. The server signs them on its schedule, or use Sign head now.'));
@@ -56,12 +62,19 @@ export async function verifyView(root) {
   await refresh();
 }
 
-async function runVerify(btn, out) {
+// `first` is the first retained seq the head panel read. A log with an anchor, or with a
+// first retained seq above 1, whose report has no `pruned_through` was walked from the first
+// retained entry: no anchor verified (a bad newest anchor is the tamper case), so it says so
+// rather than "not pruned".
+async function runVerify(btn, out, first) {
   btn.disabled = true;
   replace(out, loading());
   try {
     const r = await api('/admin/audit/verify');
     const bad = r.bad_checkpoints || [];
+    const badAnchors = r.bad_anchors || [];
+    const pruned = r.pruned_through !== null && r.pruned_through !== undefined;
+    const unverified = !pruned && ((r.anchors ?? 0) > 0 || first > 1);
     replace(out,
       h('div', { class: 'row' },
         pill(r.ok ? 'chain ok' : 'chain broken', r.ok ? 'ok' : 'bad', true),
@@ -73,9 +86,25 @@ async function runVerify(btn, out) {
         ['Last signed seq', r.last_signed_seq !== null && r.last_signed_seq !== undefined ? mono(r.last_signed_seq) : h('span', { class: 'muted' }, 'none')],
         ['Unsigned tail', mono(r.unsigned_tail)],
         ['Bad checkpoints', bad.length ? h('span', null, pill(String(bad.length), 'bad')) : h('span', { class: 'muted' }, 'none')],
+        ['Pruned through', pruned
+          ? mono(r.pruned_through)
+          : unverified
+            ? h('span', null, pill('none verified', 'bad'), ' (walked from the first retained entry)')
+            : h('span', { class: 'muted' }, 'not pruned')],
+        ['Anchors', mono(r.anchors ?? 0)],
+        ['Bad anchors', badAnchors.length ? h('span', null, pill(String(badAnchors.length), 'bad')) : h('span', { class: 'muted' }, 'none')],
       ]),
       bad.length
         ? table(['Checkpoint seq', 'Problem'], bad.map((b) => h('tr', null, h('td', { class: 'num' }, mono(b.seq)), h('td', { class: 'wrap' }, b.reason))), { short: true })
+        : null,
+      badAnchors.length
+        ? table(['Anchor through seq', 'Problem'], badAnchors.map((b) => h('tr', null, h('td', { class: 'num' }, mono(b.through_seq)), h('td', { class: 'wrap' }, b.reason))), { short: true })
+        : null,
+      pruned
+        ? h('p', { class: 'small muted' }, `Entries counts the retained entries only. The walk started at the prune anchor through seq ${r.pruned_through}, whose signature was checked; the pruned entries are in the archives.`)
+        : null,
+      unverified
+        ? h('p', { class: 'callout bad' }, 'The log does not start at seq 1, but no prune anchor verified, so the walk started at the first retained entry with nothing to vouch for the entries before it. Check the bad anchors above, and the archives with ', h('span', { class: 'mono' }, 'attenuo audit verify --file'), '.')
         : null,
       r.unsigned_tail > 0
         ? h('p', { class: 'callout warn' }, `${r.unsigned_tail} newest entr${r.unsigned_tail === 1 ? 'y is' : 'ies are'} not covered by a signature yet.`)
