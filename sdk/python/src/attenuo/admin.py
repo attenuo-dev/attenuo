@@ -260,11 +260,45 @@ class PruneGuards:
 
 
 @dataclass(frozen=True)
+class AutoPruneRun:
+    """One run of the automatic prune (``[audit.retention] prune = "auto"``). ``outcome`` is
+    ``pruned``, ``skipped`` or ``failed``; ``reason`` is ``ok`` for a prune, the guard code that
+    stopped a skipped run (``prune_too_recent``, ``sink_behind``, ...), ``nothing_to_prune`` or
+    ``concurrent_prune``, or ``verify_failed``, ``archive_write_failed``, ``archive_exists``,
+    ``archive_verify_failed``, ``error`` or ``panic`` for a failure. ``through`` is the
+    boundary it pruned or tried, ``prune_seq`` the prune record's seq, ``archive`` the name of
+    the archive file in ``archive_dir`` when the run got that far."""
+
+    at: str
+    outcome: str
+    reason: str
+    through: int | None
+    prune_seq: int | None
+    detail: str | None
+    archive: str | None = None
+
+
+@dataclass(frozen=True)
+class AutoPrune:
+    """The automatic prune's settings and the last run the server made since it started
+    (``last_run`` is ``None`` before the first). ``archive_dir`` is the directory the server
+    writes each pruned prefix to, ``None`` when it keeps no copy. ``max_entries_per_run`` is
+    ``None`` from a server that does not report it."""
+
+    keep_seconds: int
+    interval_seconds: int
+    last_run: AutoPruneRun | None
+    max_entries_per_run: int | None = None
+    archive_dir: str | None = None
+
+
+@dataclass(frozen=True)
 class PrunePlan:
     """The largest boundary the guards allow (``GET /admin/audit/prune/plan``). ``through`` is
     ``None`` when nothing can be pruned. The archive of a prune through ``through`` is the export
     ``from_..through`` (``from_`` is the log's first retained seq). ``checkpoint`` is the stored
-    checkpoint at ``through``, ``at`` the time of that entry, ``anchor`` the newest anchor."""
+    checkpoint at ``through``, ``at`` the time of that entry, ``anchor`` the newest anchor.
+    ``auto`` is ``None`` unless the server runs with ``prune = "auto"``."""
 
     from_: int
     through: int | None
@@ -273,6 +307,7 @@ class PrunePlan:
     at: str | None
     guards: PruneGuards
     anchor: AuditAnchor | None
+    auto: AutoPrune | None = None
 
 
 @dataclass(frozen=True)
@@ -1017,6 +1052,30 @@ def _prune_plan(b: Any) -> PrunePlan:
             limited_by=_opt_str(g.get("limited_by")),
         ),
         anchor=_anchor(anchor) if isinstance(anchor, dict) else None,
+        auto=_auto_prune(b.get("auto")),
+    )
+
+
+def _auto_prune(v: Any) -> AutoPrune | None:
+    if not isinstance(v, dict):
+        return None
+    r = v.get("last_run")
+    return AutoPrune(
+        keep_seconds=int(v.get("keep_seconds", 0)),
+        interval_seconds=int(v.get("interval_seconds", 0)),
+        max_entries_per_run=_opt_int(v.get("max_entries_per_run")),
+        archive_dir=_opt_str(v.get("archive_dir")),
+        last_run=AutoPruneRun(
+            at=str(r.get("at", "")),
+            outcome=str(r.get("outcome", "")),
+            reason=str(r.get("reason", "")),
+            through=_opt_int(r.get("through")),
+            prune_seq=_opt_int(r.get("prune_seq")),
+            detail=_opt_str(r.get("detail")),
+            archive=_opt_str(r.get("archive")),
+        )
+        if isinstance(r, dict)
+        else None,
     )
 
 

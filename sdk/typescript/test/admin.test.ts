@@ -560,7 +560,58 @@ describe("AdminClient", () => {
       }),
     );
     const p = await new AdminClient(URL_, "adm", { fetch: empty.fetch }).auditPrunePlan();
-    expect([p.through, p.checkpoint, p.anchor]).toEqual([undefined, undefined, undefined]);
+    expect([p.through, p.checkpoint, p.anchor, p.auto]).toEqual([
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+    ]);
+    // With prune = "auto": the settings and the last run.
+    const auto = mockFetch(() =>
+      jsonResponse({
+        ...plan,
+        auto: {
+          keep_seconds: 7776000,
+          interval_seconds: 3600,
+          max_entries_per_run: 1000000,
+          archive_dir: "/var/lib/attenuo/audit-archive",
+          last_run: {
+            at: "2026-11-22T10:00:00Z",
+            outcome: "pruned",
+            reason: "ok",
+            through: 1000,
+            prune_seq: 1041,
+            detail: null,
+            archive: "audit-00000000000000000001-00000000000000001000.jsonl",
+          },
+        },
+      }),
+    );
+    const a = await new AdminClient(URL_, "adm", { fetch: auto.fetch }).auditPrunePlan();
+    expect(a.auto).toEqual({
+      keepSeconds: 7776000,
+      intervalSeconds: 3600,
+      maxEntriesPerRun: 1000000,
+      archiveDir: "/var/lib/attenuo/audit-archive",
+      lastRun: {
+        at: "2026-11-22T10:00:00Z",
+        outcome: "pruned",
+        reason: "ok",
+        through: 1000,
+        pruneSeq: 1041,
+        detail: undefined,
+        archive: "audit-00000000000000000001-00000000000000001000.jsonl",
+      },
+    });
+    const never = mockFetch(() =>
+      jsonResponse({
+        ...plan,
+        auto: { keep_seconds: 7776000, interval_seconds: 3600, last_run: null },
+      }),
+    );
+    const n = await new AdminClient(URL_, "adm", { fetch: never.fetch }).auditPrunePlan();
+    expect(n.auto?.lastRun).toBeUndefined();
+    expect([n.auto?.maxEntriesPerRun, n.auto?.archiveDir]).toEqual([undefined, undefined]);
   });
 
   it("prunes, sending the archive's description only when given", async () => {

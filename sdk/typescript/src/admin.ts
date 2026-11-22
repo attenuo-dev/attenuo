@@ -286,10 +286,44 @@ export interface PruneGuards {
 }
 
 /**
+ * One run of the automatic prune (`[audit.retention] prune = "auto"`). `outcome` is `pruned`,
+ * `skipped` or `failed`; `reason` is `ok` for a prune, the guard code that stopped a skipped run
+ * (`prune_too_recent`, `sink_behind`, ...), `nothing_to_prune` or `concurrent_prune`, or
+ * `verify_failed`, `archive_write_failed`, `archive_exists`, `archive_verify_failed`, `error`
+ * or `panic` for a failure. `through` is the boundary it pruned or tried, `pruneSeq` the prune
+ * record's seq, `archive` the name of the archive file in `archiveDir` when the run got that
+ * far.
+ */
+export interface AutoPruneRun {
+  at: string;
+  outcome: string;
+  reason: string;
+  through: number | undefined;
+  pruneSeq: number | undefined;
+  detail: string | undefined;
+  archive: string | undefined;
+}
+
+/**
+ * The automatic prune's settings and the last run the server made since it started (`lastRun`
+ * is undefined before the first). `archiveDir` is the directory the server writes each pruned
+ * prefix to, undefined when it keeps no copy; `maxEntriesPerRun` is undefined from a server
+ * that does not report it.
+ */
+export interface AutoPrune {
+  keepSeconds: number;
+  intervalSeconds: number;
+  maxEntriesPerRun: number | undefined;
+  archiveDir: string | undefined;
+  lastRun: AutoPruneRun | undefined;
+}
+
+/**
  * The largest boundary the guards allow (`GET /admin/audit/prune/plan`). `through` is undefined
  * when nothing can be pruned. The archive of a prune through `through` is the export
  * `from`..`through`; `checkpoint` is the stored checkpoint at `through`, `at` the time of that
- * entry, `anchor` the newest anchor.
+ * entry, `anchor` the newest anchor. `auto` is undefined unless the server runs with
+ * `prune = "auto"`.
  */
 export interface PrunePlan {
   from: number;
@@ -299,6 +333,7 @@ export interface PrunePlan {
   at: string | undefined;
   guards: PruneGuards;
   anchor: AuditAnchor | undefined;
+  auto: AutoPrune | undefined;
 }
 
 /**
@@ -871,6 +906,31 @@ function prunePlanOf(b: Json): PrunePlan {
       limitedBy: optString(g.limited_by),
     },
     anchor: obj(b.anchor) === undefined ? undefined : anchorOf(b.anchor),
+    auto: autoPruneOf(b.auto),
+  };
+}
+
+function autoPruneOf(v: unknown): AutoPrune | undefined {
+  const a = obj(v);
+  if (a === undefined) return undefined;
+  const r = obj(a.last_run);
+  return {
+    keepSeconds: Number(a.keep_seconds ?? 0),
+    intervalSeconds: Number(a.interval_seconds ?? 0),
+    maxEntriesPerRun: optNumber(a.max_entries_per_run),
+    archiveDir: optString(a.archive_dir),
+    lastRun:
+      r === undefined
+        ? undefined
+        : {
+            at: String(r.at ?? ""),
+            outcome: String(r.outcome ?? ""),
+            reason: String(r.reason ?? ""),
+            through: optNumber(r.through),
+            pruneSeq: optNumber(r.prune_seq),
+            detail: optString(r.detail),
+            archive: optString(r.archive),
+          },
   };
 }
 

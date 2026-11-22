@@ -76,6 +76,8 @@ export type {
   ApprovalPage,
   AuditPage,
   AuditQuery,
+  AutoPrune,
+  AutoPruneRun,
   BudgetLimit,
   BudgetRefund,
   CheckpointPage,
