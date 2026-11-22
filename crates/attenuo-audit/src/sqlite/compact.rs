@@ -18,21 +18,25 @@
 //!    transaction. A connection that was opened but has not read anything yet holds no lock
 //!    and cannot be seen; once this lock is taken it cannot read until it is released. The
 //!    lock is held to the end.
-//! 4. Record the state before ([`CompactState`]): `PRAGMA integrity_check` (refused unless
+//! 4. Refuse a file that is not in WAL mode: the server always leaves its file in WAL mode,
+//!    and the lock check of step 3 relies on it.
+//! 5. Record the state before ([`CompactState`]): `PRAGMA integrity_check` (refused unless
 //!    `ok`), the schema version (refused unless [`SCHEMA_VERSION`]; nothing is migrated
 //!    here), the size and the free pages, the entry count, the chain head, the prune marker
 //!    and newest anchor, the hash chain walked from its stored start (refused when it does
 //!    not verify: `VACUUM` erases freed pages that may hold what an investigation needs), and
 //!    a SHA-256 of every row of every table, rowid included, and of the schema text.
-//! 5. Refuse a table whose rowids `VACUUM` may renumber: a rowid table with neither an
-//!    `INTEGER PRIMARY KEY` nor any index. None of attenuo's tables is one today.
-//! 6. Refuse when the free space is clearly too small: `VACUUM` builds a copy of the live data
+//! 6. Refuse a table whose rowids `VACUUM` may renumber: a rowid table with neither an
+//!    `INTEGER PRIMARY KEY` nor any index, or whose columns hide every name of its rowid.
+//!    None of attenuo's tables is one today.
+//! 7. Refuse when the free space is clearly too small: `VACUUM` builds a copy of the live data
 //!    in SQLite's temporary directory and writes it again into the WAL next to the file.
-//! 7. With [`CompactOptions::dry_run`], stop here.
-//! 8. `VACUUM`, then `PRAGMA wal_checkpoint(TRUNCATE)`.
-//! 9. Record the state again and compare everything but the size and the free pages. A
-//!    difference is [`CompactError::PostCheck`]: the file was rewritten and must not be used;
-//!    restore the backup.
+//! 8. With [`CompactOptions::dry_run`], stop here.
+//! 9. `VACUUM`, then `PRAGMA wal_checkpoint(TRUNCATE)`, which must copy every WAL frame.
+//! 10. Record the state again and compare everything but the size and the free pages. A
+//!     difference is [`CompactError::PostCheck`], and any failure once `VACUUM` committed is
+//!     [`CompactError::Unverified`]: the file was rewritten and must not be used; restore the
+//!     backup.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -66,6 +70,16 @@ type FreeSpaceProbe = Box<dyn Fn(&Path) -> std::io::Result<u64>>;
 #[cfg(any(test, feature = "testing"))]
 type AfterVacuum = Box<dyn FnOnce(&Connection) -> rusqlite::Result<()>>;
 
+/// The steps after `VACUUM`, in order (a failure at any of them is
+/// [`CompactError::Unverified`]); tests inject a fault at one
+/// ([`CompactOptions::fail_after_vacuum_at`]).
+pub const AFTER_VACUUM_STEPS: &[&str] = &[
+    "reading the journal mode",
+    "the WAL checkpoint",
+    "the integrity check",
+    "reading the state after",
+];
+
 /// How [`compact`] runs.
 pub struct CompactOptions {
     dry_run: bool,
@@ -73,6 +87,8 @@ pub struct CompactOptions {
     free_space: FreeSpaceProbe,
     #[cfg(any(test, feature = "testing"))]
     after_vacuum: Option<AfterVacuum>,
+    #[cfg(any(test, feature = "testing"))]
+    fail_at: Option<&'static str>,
 }
 
 impl Default for CompactOptions {
@@ -83,6 +99,8 @@ impl Default for CompactOptions {
             free_space: Box::new(available_bytes),
             #[cfg(any(test, feature = "testing"))]
             after_vacuum: None,
+            #[cfg(any(test, feature = "testing"))]
+            fail_at: None,
         }
     }
 }
@@ -136,6 +154,16 @@ impl CompactOptions {
         self.after_vacuum = Some(Box::new(f));
         self
     }
+
+    /// Tests: fail the step after `VACUUM` named `step` (one of [`AFTER_VACUUM_STEPS`]).
+    #[cfg(any(test, feature = "testing"))]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn fail_after_vacuum_at(mut self, step: &'static str) -> Self {
+        assert!(AFTER_VACUUM_STEPS.contains(&step), "unknown step {step}");
+        self.fail_at = Some(step);
+        self
+    }
 }
 
 /// The SHA-256 of one table's rows, in rowid (or primary key) order.
@@ -157,6 +185,14 @@ pub struct CompactState {
     pub schema_version: u32,
     /// `PRAGMA page_size`.
     pub page_size: u64,
+    /// `PRAGMA application_id`.
+    pub application_id: i64,
+    /// `PRAGMA auto_vacuum` (0 none, 1 full, 2 incremental).
+    pub auto_vacuum: i64,
+    /// `PRAGMA encoding`.
+    pub encoding: String,
+    /// `PRAGMA journal_mode`: always `wal`, or the file is refused.
+    pub journal_mode: String,
     /// `page_count * page_size`: the database as SQLite sees it, WAL included.
     pub file_bytes: u64,
     /// `freelist_count * page_size`: the pages a `DELETE` freed.
@@ -211,6 +247,8 @@ pub struct CompactReport {
     pub disk_bytes_before: u64,
     /// The same after (the same as before for a dry run).
     pub disk_bytes_after: u64,
+    /// The `-wal` file on disk before, in bytes; part of `disk_bytes_before`.
+    pub wal_bytes_before: u64,
     /// The state before.
     pub before: CompactState,
     /// The state after `VACUUM`; `None` for a dry run.
@@ -232,8 +270,8 @@ pub enum CompactError {
     /// A check before `VACUUM` refused: the file was not changed.
     #[error("{detail}")]
     Refused {
-        /// A stable code: `in_use`, `network_filesystem`, `integrity`, `schema_version`,
-        /// `not_attenuo`, `rowid_unsafe`, `chain_broken` or `disk_space`.
+        /// A stable code: `in_use`, `network_filesystem`, `not_wal`, `integrity`,
+        /// `schema_version`, `not_attenuo`, `rowid_unsafe`, `chain_broken` or `disk_space`.
         code: &'static str,
         /// For people.
         detail: String,
@@ -249,7 +287,20 @@ pub enum CompactError {
         /// What differs, one item each.
         mismatches: Vec<String>,
     },
-    /// Anything else (the file cannot be opened, a query failed).
+    /// `VACUUM` committed, and a later step failed, so the rewritten file could not be
+    /// checked. The file must not be used: restore the backup.
+    #[error(
+        "VACUUM rewrote the file, then {step} failed ({error}), so the file could not be \
+         checked. Do not start the server on it; restore the backup taken before compacting"
+    )]
+    Unverified {
+        /// The step that failed.
+        step: &'static str,
+        /// Its error.
+        error: String,
+    },
+    /// Anything else before `VACUUM` committed (the file cannot be opened, a query failed, or
+    /// `VACUUM` itself failed, which SQLite rolls back).
     #[error(transparent)]
     Failed(#[from] AuditError),
 }
@@ -316,7 +367,8 @@ pub fn compact(path: &Path, options: CompactOptions) -> Result<CompactReport, Co
     };
     let wal = wal_path(&path);
     let wal_had_frames = file_len(&wal) > 0;
-    let disk_bytes_before = file_len(&path) + file_len(&wal);
+    let wal_bytes_before = file_len(&wal);
+    let disk_bytes_before = file_len(&path) + wal_bytes_before;
 
     let conn = Connection::open_with_flags(
         &path,
@@ -336,6 +388,17 @@ pub fn compact(path: &Path, options: CompactOptions) -> Result<CompactReport, Co
     }
     lock_exclusive(&conn, options.busy_timeout)?;
     conn.pragma_update(None, "synchronous", "FULL")?;
+    let journal: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
+    if !journal.eq_ignore_ascii_case("wal") {
+        return Err(refuse(
+            "not_wal",
+            format!(
+                "the file is in journal mode `{journal}`, not `wal`. The server always leaves \
+                 its file in WAL mode, and the in-use check relies on it; this is not a file \
+                 the server left"
+            ),
+        ));
+    }
 
     integrity(&conn, "before")?;
     let found = user_version(&conn)?;
@@ -392,6 +455,7 @@ pub fn compact(path: &Path, options: CompactOptions) -> Result<CompactReport, Co
             path,
             dry_run: true,
             disk_bytes_before,
+            wal_bytes_before,
             before,
             after: None,
             space,
@@ -402,28 +466,61 @@ pub fn compact(path: &Path, options: CompactOptions) -> Result<CompactReport, Co
         no_checkpoint_on_close(false)?;
     }
     conn.execute_batch("VACUUM")?;
-    let journal: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
-    if journal.eq_ignore_ascii_case("wal") {
-        let busy: i64 = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))?;
-        if busy != 0 {
-            return Err(AuditError::Storage(
-                "the WAL could not be checkpointed after VACUUM (busy); the compacted data is \
-                 in the WAL and the next start copies it"
-                    .into(),
-            )
-            .into());
+    // From here on the file is rewritten: every failure says so and asks for the backup.
+    #[cfg(any(test, feature = "testing"))]
+    let fail_at = options.fail_at;
+    #[cfg(not(any(test, feature = "testing")))]
+    let fail_at: Option<&'static str> = None;
+    let unverified = |step: &'static str, error: String| CompactError::Unverified { step, error };
+    let fault = |step: &'static str| -> Result<(), CompactError> {
+        if fail_at == Some(step) {
+            return Err(unverified(step, "injected fault".into()));
         }
+        Ok(())
+    };
+    let step = AFTER_VACUUM_STEPS[0];
+    fault(step)?;
+    let journal: String = conn
+        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+        .map_err(|e| unverified(step, e.to_string()))?;
+    if !journal.eq_ignore_ascii_case("wal") {
+        return Err(unverified(
+            step,
+            format!("the journal mode is `{journal}`, not `wal`"),
+        ));
+    }
+    let step = AFTER_VACUUM_STEPS[1];
+    fault(step)?;
+    let (busy, log, done): (i64, i64, i64) = conn
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .map_err(|e| unverified(step, e.to_string()))?;
+    if busy != 0 || log != done {
+        return Err(unverified(
+            step,
+            format!(
+                "busy {busy}, {done} of {log} WAL frames copied into the file; the WAL still \
+                 holds the rest"
+            ),
+        ));
     }
     #[cfg(any(test, feature = "testing"))]
     if let Some(f) = options.after_vacuum {
-        f(&conn)?;
+        f(&conn).map_err(|e| unverified("the test hook", e.to_string()))?;
     }
 
     let mut mismatches = Vec::new();
-    if let Err(e) = integrity(&conn, "after") {
-        mismatches.push(e.to_string());
+    let step = AFTER_VACUUM_STEPS[2];
+    fault(step)?;
+    match integrity(&conn, "after") {
+        Ok(()) => {}
+        Err(CompactError::Refused { detail, .. }) => mismatches.push(detail),
+        Err(e) => return Err(unverified(step, e.to_string())),
     }
-    let after = state(&conn)?;
+    let step = AFTER_VACUUM_STEPS[3];
+    fault(step)?;
+    let after = state(&conn).map_err(|e| unverified(step, e.to_string()))?;
     mismatches.extend(differences(&before, &after));
     drop(conn);
     if !mismatches.is_empty() {
@@ -434,6 +531,7 @@ pub fn compact(path: &Path, options: CompactOptions) -> Result<CompactReport, Co
         path,
         dry_run: false,
         disk_bytes_before,
+        wal_bytes_before,
         before,
         after: Some(after),
         space,
@@ -537,6 +635,10 @@ fn rowid_unsafe_tables(conn: &Connection) -> Result<Vec<String>, CompactError> {
             .prepare("SELECT type, pk FROM pragma_table_info(?1) WHERE pk > 0")?
             .query_map([&name], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<Result<_, _>>()?;
+        if rowid_alias(conn, &name)?.is_none() {
+            out.push(format!("{name} (its columns hide every name of the rowid)"));
+            continue;
+        }
         let integer_pk = pk.len() == 1 && pk[0].0.eq_ignore_ascii_case("INTEGER");
         let indexes: i64 =
             conn.query_row("SELECT count(*) FROM pragma_index_list(?1)", [&name], |r| {
@@ -547,6 +649,19 @@ fn rowid_unsafe_tables(conn: &Connection) -> Result<Vec<String>, CompactError> {
         }
     }
     Ok(out)
+}
+
+/// A name that reads the rowid of `table`: the first of `_rowid_`, `rowid` and `oid` that is
+/// not also the name of a column (a column of that name hides the rowid). `None` when all
+/// three are columns.
+fn rowid_alias(conn: &Connection, table: &str) -> Result<Option<&'static str>, CompactError> {
+    let columns: Vec<String> = conn
+        .prepare("SELECT name FROM pragma_table_info(?1)")?
+        .query_map([table], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
+    Ok(["_rowid_", "rowid", "oid"]
+        .into_iter()
+        .find(|a| !columns.iter().any(|c| c.eq_ignore_ascii_case(a))))
 }
 
 /// Every table of the main database but the schema table, by name, and whether it is a
@@ -592,9 +707,19 @@ fn state(conn: &Connection) -> Result<CompactState, CompactError> {
         tables_out.push(table_digest(conn, &name, without_rowid)?);
     }
     let newest_anchor = anchors.last().cloned();
+    let text = |pragma: &str| -> rusqlite::Result<String> {
+        conn.query_row(&format!("PRAGMA {pragma}"), [], |r| r.get(0))
+    };
+    let int = |pragma: &str| -> rusqlite::Result<i64> {
+        conn.query_row(&format!("PRAGMA {pragma}"), [], |r| r.get(0))
+    };
     Ok(CompactState {
         schema_version: user_version(conn)?,
         page_size,
+        application_id: int("application_id")?,
+        auto_vacuum: int("auto_vacuum")?,
+        encoding: text("encoding")?,
+        journal_mode: text("journal_mode")?.to_ascii_lowercase(),
         file_bytes: pragma_u64(conn, "page_count")?.saturating_mul(page_size),
         free_bytes: pragma_u64(conn, "freelist_count")?.saturating_mul(page_size),
         entries: u64_of(entries),
@@ -694,7 +819,13 @@ fn table_digest(
             order.join(", ")
         )
     } else {
-        format!("SELECT _rowid_, * FROM {} ORDER BY _rowid_", quoted(name))
+        // `rowid_unsafe_tables` refused a table with no alias left before this runs.
+        let alias = rowid_alias(conn, name)?.ok_or_else(|| {
+            AuditError::Storage(format!(
+                "cannot read the rowid of {name}: every alias is a column"
+            ))
+        })?;
+        format!("SELECT {alias}, * FROM {} ORDER BY {alias}", quoted(name))
     };
     let mut stmt = conn.prepare(&sql)?;
     let width = stmt.column_count();
@@ -748,6 +879,22 @@ fn differences(before: &CompactState, after: &CompactState) -> Vec<String> {
         "page size",
         before.page_size.to_string(),
         after.page_size.to_string(),
+    );
+    cmp(
+        "application_id",
+        before.application_id.to_string(),
+        after.application_id.to_string(),
+    );
+    cmp(
+        "auto_vacuum",
+        before.auto_vacuum.to_string(),
+        after.auto_vacuum.to_string(),
+    );
+    cmp("encoding", before.encoding.clone(), after.encoding.clone());
+    cmp(
+        "journal_mode",
+        before.journal_mode.clone(),
+        after.journal_mode.clone(),
     );
     cmp(
         "entry count",

@@ -42,7 +42,7 @@ mod wal;
 use approvals::{approval_from_row, APPROVAL_COLUMNS};
 pub use compact::{
     compact, CompactError, CompactOptions, CompactReport, CompactState, SpaceCheck, SpacePlace,
-    TableDigest, COMPACT_BUSY_TIMEOUT,
+    TableDigest, AFTER_VACUUM_STEPS, COMPACT_BUSY_TIMEOUT,
 };
 pub use connection::Durability;
 pub use fence::WriterFence;

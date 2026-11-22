@@ -13,7 +13,7 @@ use attenuo_audit::{
     compact, Approval, ApprovalState, ApprovalStore, AuditSink, CheckpointKeys, CompactError,
     CompactOptions, EntryFilter, LeaseRegistry, NewNotice, Order, PruneLimits, ReplayOutcome,
     ReplayStore, RunLabel, RunLimits, RunState, SqliteAudit, SqliteLeaseStore, WriterFence,
-    PRUNE_TOOL,
+    AFTER_VACUUM_STEPS, PRUNE_TOOL,
 };
 use attenuo_core::fingerprint::{Fingerprint, FingerprintKind};
 use attenuo_core::windows::window_charges;
@@ -887,4 +887,102 @@ fn a_change_after_vacuum_fails_the_check() {
         let text = err.to_string();
         assert!(text.contains("restore the backup"), "{text}");
     }
+}
+
+/// A rowid that moved is a difference, not only a changed value: the digest reads every rowid.
+#[test]
+fn a_moved_rowid_fails_the_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = small_file(dir.path(), &issuer());
+    let err = compact(
+        &path,
+        options().after_vacuum(|c| c.execute_batch("UPDATE budget_meta SET rowid = rowid + 100")),
+    )
+    .unwrap_err();
+    let CompactError::PostCheck { mismatches } = &err else {
+        panic!("expected a post-check failure, got {err:?}");
+    };
+    assert!(
+        mismatches.iter().any(|m| m.contains("table budget_meta")),
+        "{mismatches:?}"
+    );
+}
+
+/// A failure at any step once `VACUUM` committed is `Unverified`, which names the step and
+/// asks for the backup: the file was rewritten and could not be checked.
+#[test]
+fn a_failure_after_vacuum_is_unverified() {
+    let issuer = issuer();
+    for step in AFTER_VACUUM_STEPS {
+        let dir = tempfile::tempdir().unwrap();
+        let path = small_file(dir.path(), &issuer);
+        let err = compact(&path, options().fail_after_vacuum_at(step)).unwrap_err();
+        let CompactError::Unverified { step: at, .. } = &err else {
+            panic!("{step}: expected Unverified, got {err:?}");
+        };
+        assert_eq!(at, step);
+        let text = err.to_string();
+        assert!(text.contains("VACUUM rewrote the file"), "{text}");
+        assert!(text.contains("restore the backup"), "{text}");
+    }
+}
+
+/// A file not in WAL mode is refused before anything else: the server never leaves one, and
+/// the in-use check relies on WAL mode.
+#[test]
+fn refused_when_not_in_wal_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = small_file(dir.path(), &issuer());
+    let mode: String = Connection::open(&path)
+        .unwrap()
+        .query_row("PRAGMA journal_mode=DELETE", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(mode, "delete");
+    let was = std::fs::read(&path).unwrap();
+    let (code, detail) = refused(compact(&path, options()));
+    assert_eq!(code, "not_wal");
+    assert!(detail.contains("journal mode `delete`"), "{detail}");
+    assert_eq!(std::fs::read(&path).unwrap(), was);
+}
+
+/// A column named like the rowid hides that name; the digest reads the rowid through a name
+/// that is not hidden, and a table whose columns hide all three is refused.
+#[test]
+fn a_column_named_like_the_rowid() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = small_file(dir.path(), &issuer());
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE shadow (_rowid_ TEXT, note TEXT);
+             CREATE INDEX shadow_idx ON shadow(note);
+             INSERT INTO shadow VALUES ('a', 'x'), ('b', 'y');",
+        )
+        .unwrap();
+    // `rowid` still reads the rowid: a moved one is caught.
+    let err = compact(
+        &path,
+        options().after_vacuum(|c| c.execute_batch("UPDATE shadow SET rowid = rowid + 100")),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&err, CompactError::PostCheck { mismatches } if mismatches.iter().any(|m| m.contains("table shadow"))),
+        "{err:?}"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = small_file(dir.path(), &issuer());
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE hidden (_rowid_ TEXT, rowid TEXT, oid TEXT);
+             CREATE INDEX hidden_idx ON hidden(oid);",
+        )
+        .unwrap();
+    let (code, detail) = refused(compact(&path, options()));
+    assert_eq!(code, "rowid_unsafe");
+    assert!(
+        detail.contains("hidden (its columns hide every name of the rowid)"),
+        "{detail}"
+    );
 }
