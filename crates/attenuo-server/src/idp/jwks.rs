@@ -89,10 +89,10 @@ pub(crate) fn read_ca_pem(path: &std::path::Path) -> Result<Vec<reqwest::Certifi
     ca_pem_certs(&read_ca_file(path)?)
 }
 
-/// Largest `ca_pem_path` file read, as for a key file
-/// ([`crate::issuer_keys::MAX_KEY_FILE_BYTES`]): room for dozens of CA certificates. The
-/// file adds roots to the built-in ones, so it needs only the private CAs.
-pub(crate) const MAX_CA_FILE_BYTES: u64 = 64 * 1024;
+/// Largest `ca_pem_path` file read: 1 MiB. The file adds roots to the built-in ones, so it
+/// needs only the private CAs, but a whole system bundle (about 250 KiB) still fits, so a
+/// file that worked before this limit keeps working.
+pub(crate) const MAX_CA_FILE_BYTES: u64 = 1024 * 1024;
 
 /// The bytes of a `ca_pem_path` file: a regular file of at most [`MAX_CA_FILE_BYTES`],
 /// checked before reading and again while reading, in case it grows in between.
@@ -105,9 +105,9 @@ fn read_ca_file(path: &std::path::Path) -> Result<Vec<u8>, String> {
     let unreadable = |e: std::io::Error| format!("cannot read the file ({e})");
     let too_big = || {
         format!(
-            "the file is larger than {} KiB; list only the private CA certificates (the \
+            "the file is larger than {} MiB; list only the private CA certificates (the \
              built-in web PKI roots are trusted already)",
-            MAX_CA_FILE_BYTES / 1024
+            MAX_CA_FILE_BYTES / (1024 * 1024)
         )
     };
     let file = std::fs::File::open(path).map_err(unreadable)?;
@@ -1446,7 +1446,7 @@ mod tests {
         assert!(msg.contains("stopped"), "{msg}");
     }
 
-    /// A `ca_pem_path` file over 64 KiB, or one that is not a regular file, is refused with
+    /// A `ca_pem_path` file over 1 MiB, or one that is not a regular file, is refused with
     /// a message that says why; one at the limit is read.
     #[test]
     fn the_ca_file_read_is_bounded() {
@@ -1455,11 +1455,11 @@ mod tests {
         let limit = usize::try_from(MAX_CA_FILE_BYTES).unwrap();
         std::fs::write(&path, vec![b' '; limit + 1]).unwrap();
         let e = read_ca_pem(&path).unwrap_err();
-        assert!(e.contains("larger than 64 KiB"), "{e}");
+        assert!(e.contains("larger than 1 MiB"), "{e}");
         let shared = reqwest::Client::new();
         let e = entry_client(&shared, Some(&path), Duration::from_secs(1)).unwrap_err();
         assert!(
-            e.contains("ca.pem") && e.contains("larger than 64 KiB"),
+            e.contains("ca.pem") && e.contains("larger than 1 MiB"),
             "{e}"
         );
         // At the limit the size is not the problem: an empty (all-space) file is.
