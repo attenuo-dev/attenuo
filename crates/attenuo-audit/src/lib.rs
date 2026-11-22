@@ -30,6 +30,7 @@ pub mod budget;
 pub mod checkpoint;
 pub mod error;
 pub mod export;
+pub mod fsutil;
 pub mod lease;
 pub mod log;
 pub mod memory;

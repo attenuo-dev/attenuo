@@ -533,15 +533,15 @@ pub struct ExportFileReport {
 
 /// [`verify_export_with`] on a JSON Lines export file, without loading its entries into
 /// memory: one pass reads the header and the checkpoints, takes the SHA-256 of the bytes and
-/// notes what the checks need of the entries, and a second pass walks the entries. Only the
-/// checkpoints are held. The header must be the first line (as every export this crate and
+/// notes what the checks need of the entries, and a second pass walks the entries and takes
+/// the SHA-256 again. Only the checkpoints are held. The header must be the first line (as every export this crate and
 /// the server write has it); the single-object JSON form is not read here.
 ///
 /// # Errors
 ///
 /// [`AuditError::Storage`] when the file cannot be read; [`AuditError::Export`] when a line
-/// does not parse (as for [`parse_export`]), the first line is not a header, or the header
-/// carries a `filter`.
+/// does not parse (as for [`parse_export`]), the first line is not a header, the header
+/// carries a `filter`, or the two passes read different bytes.
 pub fn verify_export_file(
     path: &std::path::Path,
     keys: &CheckpointKeys,
@@ -605,16 +605,19 @@ pub fn verify_export_file(
     let sha256 = hex::encode(hasher.finalize());
     let last_entry_hash = facts.last.as_ref().map(|(_, h)| h.clone());
     let entries = facts.count;
-    // Pass 2: the entries, one at a time.
+    // Pass 2: the entries, one at a time, hashing the bytes again: the file must not change
+    // between the passes.
     let mut reader = open()?;
     let mut n = 0usize;
-    let walk = std::iter::from_fn(move || loop {
+    let second = std::cell::RefCell::new(Sha256::new());
+    let walk = std::iter::from_fn(|| loop {
         line.clear();
         match reader.read_line(&mut line) {
             Ok(0) => return None,
             Ok(_) => {}
             Err(e) => return Some(Err(io(e))),
         }
+        second.borrow_mut().update(line.as_bytes());
         n += 1;
         if line.trim().is_empty() {
             continue;
@@ -629,6 +632,18 @@ pub fn verify_export_file(
         }
     });
     let report = verify_parts(&header, facts, walk, &checkpoints, keys, options)?;
+    // The walk may stop early (a broken chain): read the rest for the digest.
+    let mut second = second.into_inner();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line).map_err(io)? == 0 {
+            break;
+        }
+        second.update(line.as_bytes());
+    }
+    if hex::encode(second.finalize()) != sha256 {
+        return Err(bad(format!("{} changed while it was read", path.display())));
+    }
     Ok(ExportFileReport {
         report,
         header,

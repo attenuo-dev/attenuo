@@ -1092,6 +1092,8 @@ impl SqliteAudit {
         let all = crate::RecordFilter::default();
         let mut next = from;
         let mut written = 0u64;
+        #[cfg(any(test, feature = "testing"))]
+        self.run_export_page_hook();
         while next <= through {
             let want = usize::try_from(through - next + 1)
                 .unwrap_or(PAGE)
