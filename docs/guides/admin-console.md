@@ -1,6 +1,6 @@
 # Admin console
 
-The admin console is a set of pages built into `attenuo-server` for reading what the server decided and why: the audit log, one decision with its delegation chain and policies, a lease and everything delegated from it, the loaded policies, and the signatures over the log. With writes allowed, it can also revoke a lease and reload the policy file.
+The admin console is a set of pages built into `attenuo-server` for reading what the server decided and why: the audit log, one decision with its delegation chain and policies, a lease and everything delegated from it, the loaded policies, and the signatures over the log. With writes allowed, it can also revoke a lease, decide an approval, and reload the policy file, the admin operators, the agents and PEPs, and the issuer keys.
 
 It calls the same admin API as the `attenuo` CLI, with the same admin token. Everything it shows, you can also get with `curl`; the [HTTP reference](../reference/http-api.md#admin) has the routes.
 
@@ -33,7 +33,7 @@ Then open `http://127.0.0.1:9101/` on your laptop. The page and the API it calls
 
 ## Log in
 
-The login screen asks for an admin token: the value of `[admin] token`, or an operator's token from `attenuo admin operator new` ([admin operators](deploying.md#admin-operators)). The console checks it with `GET /admin/whoami` and keeps it only if the server accepts it. The header then shows the operator's name and role (`alice · operator`; `admin · admin` for `[admin] token`), followed by `expires <date>` when the token has an `expires_at` (an expired token is refused at login with "That token has expired."), and the buttons the role cannot use are disabled: revoking and deciding approvals need `operator`, reloading the policy needs `admin`. The server checks the role on every request either way; a disabled button only saves a refused request.
+The login screen asks for an admin token: the value of `[admin] token`, or an operator's token from `attenuo admin operator new` ([admin operators](deploying.md#admin-operators)). The console checks it with `GET /admin/whoami` and keeps it only if the server accepts it. The header then shows the operator's name and role (`alice · operator`; `admin · admin` for `[admin] token`), followed by `expires <date>` when the token has an `expires_at` (an expired token is refused at login with "That token has expired."), and the buttons the role cannot use are disabled: revoking and deciding approvals need `operator`, every reload needs `admin`. Some parts are not shown at all to a role that cannot read them: the automatic prune on the Verify page is for `admin` only. The server checks the role on every request either way; a disabled button only saves a refused request.
 
 The token stays in the memory of that browser tab. It is not written to `localStorage`, `sessionStorage`, a cookie or the URL. It is forgotten when you:
 
@@ -54,7 +54,7 @@ The log, newest first, 100 entries a page: seq, local time (hover for UTC), kind
 - **Older**, **Newer**, **Newest** page through the log. A filtered page can come back shorter than 100 entries; the server stops reading after 50,000 entries per request, and the console keeps asking until it has a page or reaches the end.
 - **Follow** checks every 2 seconds whether the log grew and adds new entries at the top. It reads the head only; it never signs a checkpoint.
 - A chain id narrows the view to that chain. A lease id opens its lease tree. A seq opens the decision.
-- After a prune (`attenuo audit prune`, or the server's own with `prune = "auto"`; [Bounding the audit log](deploying.md#bounding-the-audit-log)), one line above the table says `Entries before seq N were pruned`. The link to the prune's own record is filled in a moment later: the console reads the entry just below the first retained seq, which the server answers with the newest prune (410 `audit_pruned`, naming its boundary and its record). If that read fails, the line shows without the link. **Older** stops at the first retained entry. The console cannot prune: there is no button for it, and the retention routes are not served on the console listener.
+- After a prune (`attenuo audit prune`, or the server's own with `prune = "auto"`; [Bounding the audit log](deploying.md#bounding-the-audit-log)), one line above the table says `Entries before seq N were pruned`. The link to the prune's own record is filled in a moment later: the console reads the entry just below the first retained seq, which the server answers with the newest prune (410 `audit_pruned`, naming its boundary and its record). If that read fails, the line shows without the link. **Older** stops at the first retained entry. The console cannot prune: there is no button for it, and `POST /admin/audit/prune` is not served on the console listener. The state of the automatic prune is on the Verify page.
 - **Export this range** downloads the entries between the oldest and newest seq on screen, unfiltered, with the checkpoints in that range, as `attenuo-audit-{from}-{to}.ndjson`. Check it offline with `attenuo audit verify --file`. That check refuses entries newer than the last checkpoint in the file (exit 2), so press **Sign head now** on the Verify page before exporting, or pass `--allow-unsigned-tail` to accept them as covered by the hash chain only.
 
 ### Decision
@@ -89,8 +89,26 @@ What it cannot show: the tool arguments and the capabilities each hop held. The 
 
 - The loaded policies: file path, its SHA-256, when it was loaded, warnings, and the text of each policy.
 - **Check file on disk** lints the file as it is on disk now against the running schema: errors and warnings with line and column, and whether the file differs from what is loaded. It loads nothing.
-- **Reload** becomes available after a check with no errors (see writes below).
+- **Reload…** becomes available after a check with no errors (see writes below). It opens a confirmation that says what a reload does. After the reload the panel shows the policy ids, the file's SHA-256, any warnings and a link to the audit record. A file that does not load is refused with its code (`policy_invalid`) and message, and the old policies stay in force.
 - **Evaluate this call** is a dry run: give a delegation token (an expired one works) or a chain as JSON, a server, a tool and the arguments, and the console shows what the loaded policies decide, the reason, the policy ids and any diagnostics. It skips the lease check and writes no audit record. The token is sent to this server only. Four sections, closed until opened, state what the dry run would otherwise read from the store or leave out: **Budget** (the run-limit counters), **Run labels** (the run's taint and untrusted arguments), **Run usage** (`context.usage`) and **Approval** (decide the call as a retry that carries an approval granted by `user`, `operator` or `policy`). A section left empty sends nothing. The answer shows the budget, labels, usage and approval the call was decided with, each marked as stated in the request or read from the store (an approval is never read: without one stated, there is none).
+
+### Reload
+
+`#/reload` puts an edited config file in force without a restart. Each panel reloads one part of the server's config file (the file it was started with) and nothing else:
+
+- **Admin operators** reads the `[[admin.operators]]` entries. `[admin] token` is never reloaded. A list that would leave no admin is refused.
+- **Agents and PEPs** reads `[[agents]]` and `[[peps]]`. Tokens and leases already issued are not revoked.
+- **Issuer keys** reads `[issuer] private_key_pem_path` and `previous_key_paths` and the key files they name. To rotate without breaking tokens, keep the current key file in `previous_key_paths`.
+- **Policies** links to the Policy page, where the policy file is checked and then reloaded.
+
+Each button opens a confirmation that says what the reload does. The agents and keys reloads have safety checks you can turn off there, each with one line on what it guards against. They all start off, so a reload is refused unless you tick one:
+
+- `allow_empty` (agents and PEPs): accept a file with no `[[agents]]` or no `[[peps]]` while the server has some.
+- `allow_mismatch` (agents and PEPs, keys): accept a file whose `[issuer]` or `[audit]` differs from the running config, which may be another server's file. Only the lists, or the keys, are applied.
+- `allow_drop_current` (keys): accept a new signing key while the current one is not kept. Every token it signed stops working at once.
+- `allow_drop_audit_key` (keys): accept verifying keys that leave out a key that signed audit checkpoints or prune anchors. `attenuo audit verify` then reports those as signed by an unknown key.
+
+After a reload the panel shows what the server answered: the operators added, removed and changed; for agents and PEPs, each list's count, SHA-256 and the ids added, removed and changed; for keys, the signing key, the previous one, the verifying keys, the key ids added and removed, the key that signs the audit log, what stays until a restart. It also shows the sections of the file that differ and need a restart, any warnings, and a link to the audit record. A refusal stays in the confirmation with the server's code and message (for example `config_file_mismatch` or `keys_reload_drops_current`), and nothing changes. The CLI does the same with `attenuo admin operator reload`, `attenuo admin agent reload` and `attenuo admin key reload` ([CLI reference](../reference/cli.md#admin-agent-reload)).
 
 ### Verify
 
@@ -98,10 +116,11 @@ What it cannot show: the tool arguments and the capabilities each hop held. The 
 - **Verify now** walks the whole hash chain and checks every checkpoint signature against the server's keys: `ok`, the first bad seq, the last signed seq, how many newest entries no signature covers yet, and any checkpoint that failed. On a large log this takes a while.
 - On a pruned log, the head panel shows the first retained seq, and the verification shows `Pruned through` (the boundary of the newest prune; the walk starts at its signed anchor and `Entries` counts the retained entries only), the number of anchors checked, and any anchor that failed, in red with its reason, as a failed checkpoint is. A log never pruned shows `not pruned`. When the log does not start at seq 1, or has anchors, but no anchor verified (a newest anchor that fails, the case a tampered log shows), `Pruned through` shows `none verified (walked from the first retained entry)` in red with a warning, never `not pruned`.
 - **Sign head now** stores a signed checkpoint of the current head, after a confirmation. It is the only button on this page that writes, and it changes no audit entry.
+- **Automatic prune**, when `[audit.retention] prune = "auto"` and only for the `admin` role: that the server prunes on its own, how long it keeps entries (`keep_seconds`) and how often it checks (`interval_seconds`), in days, hours, minutes or seconds, the most entries one run prunes, and the archive directory. Without `archive_dir` a warning says that each prune deletes the entries it removes and keeps no copy. Below that, the last run since the server started: its time, outcome (`pruned`, `skipped` or `failed`), reason code with one line on what it means, the boundary it pruned through or tried, the prune record and the archive file's name. The server keeps only the last run, and forgets it at a restart. The data comes from `GET /admin/audit/prune/plan`, which needs the `admin` role, so viewers and operators do not see the section and the console does not ask for it. With `prune = "off"` or `"manual"` nothing is shown.
 
 ## Writes and `allow_write`
 
-By default the console listener is read-only: `POST /admin/leases/{id}/revoke`, `POST /admin/policies/reload`, `POST /admin/approvals/{id}` and `POST /admin/budgets/refund` are not mounted there (404), and `POST /admin/leases/revoke` answers only its `?preview=true` dry run. The console still shows **Revoke…**, **Reload**, **Grant** and **Decline**; pressing them explains that writes are disabled on this listener. Use the CLI against the main listener instead, or set:
+By default the console listener is read-only: `POST /admin/leases/{id}/revoke`, `POST /admin/policies/reload`, `POST /admin/operators/reload`, `POST /admin/agents/reload`, `POST /admin/keys/reload`, `POST /admin/approvals/{id}` and `POST /admin/budgets/refund` are not mounted there (404), and `POST /admin/leases/revoke` answers only its `?preview=true` dry run. The console learns this at login (the console listener's `GET /admin/whoami` says `"console": {"allow_write": false, ...}`): the reloads are not offered (the Reload page and the Policy page say why), while **Revoke…**, **Grant** and **Decline** are still shown and pressing them explains that writes are disabled on this listener. Use the CLI against the main listener instead, or set:
 
 ```toml
 [admin_ui]
@@ -111,7 +130,8 @@ allow_write = true
 With writes on:
 
 - **Revoke** shows how many leases a revoke would change and which active agents hold them, asks for a reason (recorded in the audit log) and the last 6 characters of the lease id, then revokes. It reports the server's count next to the preview's. It cannot be undone.
-- **Reload** swaps in the policy file. If the file does not load, the old policies stay in force and the console shows the error.
+- **Reload…** swaps in the policy file, after a confirmation. If the file does not load, the old policies stay in force and the console shows the error.
+- The **Reload** page reloads the admin operators, the agents and PEPs, and the issuer keys, each after a confirmation (above).
 - **Grant** lets the agent's identical retry run once; **Decline** ends the approval. Both are recorded in the audit log as `approval_grant` records.
 
 One action writes even when `allow_write` is off, because it changes no lease, policy or audit entry: **Sign head now** (`GET /admin/audit/checkpoint`, which stores a checkpoint). Evaluate, check and the other reads write nothing.
