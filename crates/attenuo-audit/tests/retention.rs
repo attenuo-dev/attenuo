@@ -1318,6 +1318,7 @@ fn measure_the_live_run_lookup() {
 
 /// Two archives and the retained export, as the CLI writes them, for the tests below.
 struct ThreeFiles {
+    issuer: Issuer,
     keys: CheckpointKeys,
     texts: [String; 3],
     anchors: [attenuo_audit::Anchor; 2],
@@ -1344,6 +1345,7 @@ fn three_files() -> ThreeFiles {
     let head = log.head().unwrap().unwrap().seq;
     let retained = export(&log, 41, head, Some(second.clone()));
     ThreeFiles {
+        issuer,
         keys,
         texts: [a1, a2, retained],
         anchors: [first, second],
@@ -1476,4 +1478,164 @@ fn the_shipped_anchors_are_cross_checked() {
             .any(|m| m.reason.contains("anchor_sha256")),
         "{r:?}"
     );
+}
+
+/// The ways two files fail to link, each with its reason.
+#[test]
+fn link_problems_name_their_reason() {
+    let f = three_files();
+    let parsed: Vec<_> = f.texts.iter().map(|t| parse_export(t).unwrap()).collect();
+    let reasons = |files: &[&attenuo_audit::Export]| -> Vec<String> {
+        attenuo_audit::link_exports(files)
+            .into_iter()
+            .map(|p| p.reason)
+            .collect()
+    };
+    // Out of order.
+    let r = reasons(&[&parsed[1], &parsed[0]]);
+    assert!(
+        r.iter().any(|x| x
+            == "the seqs are not contiguous: the earlier file ends at seq 40, the later one \
+                starts at seq 1"),
+        "{r:?}"
+    );
+    // The same file twice.
+    let r = reasons(&[&parsed[0], &parsed[0]]);
+    assert!(r[0].contains("not contiguous"), "{r:?}");
+    // An empty earlier or later file.
+    let mut empty = parsed[1].clone();
+    empty.entries.clear();
+    assert_eq!(
+        reasons(&[&empty, &parsed[2]]),
+        vec!["the earlier file holds no entries".to_string()]
+    );
+    assert_eq!(
+        reasons(&[&parsed[0], &empty]),
+        vec!["the later file holds no entries".to_string()]
+    );
+    // A final checkpoint that names another hash than the last entry.
+    let mut other = parsed[0].clone();
+    other
+        .checkpoints
+        .iter_mut()
+        .find(|c| c.seq == 20)
+        .unwrap()
+        .head_hash = "e".repeat(64);
+    let r = reasons(&[&other, &parsed[1]]);
+    assert!(
+        r.iter()
+            .any(|x| x.contains("checkpoint at its last seq 20 names another hash")),
+        "{r:?}"
+    );
+    // Seqs and hashes link, but the later header's anchor is for another boundary.
+    let mut later = parsed[1].clone();
+    later.header.as_mut().unwrap().anchor = Some(f.anchors[1].clone());
+    assert_eq!(
+        reasons(&[&parsed[0], &later]),
+        vec![
+            "the later file's header anchor is through seq 40, not the earlier file's end at \
+             seq 20 and its hash"
+                .to_string()
+        ]
+    );
+}
+
+/// More of the shipped-anchor cross-check: two different valid anchors for one boundary, a
+/// retried delivery (passes), an envelope whose kid differs, a header anchor not shipped while
+/// another is, and an export taken before a prune whose boundary lies inside it.
+#[test]
+fn shipped_anchor_duplicates_envelopes_and_stale_exports() {
+    let f = three_files();
+    let parsed: Vec<_> = f.texts.iter().map(|t| parse_export(t).unwrap()).collect();
+    let line = |a: &attenuo_audit::Anchor| ShippedAnchor::new(a, None).to_line();
+    let parse = |text: String| attenuo_audit::parse_shipped_anchors(&text).unwrap();
+
+    // A retry: the same anchor twice is counted once and passes.
+    let retried = parse(line(&f.anchors[0]) + &line(&f.anchors[0]) + &line(&f.anchors[1]));
+    let r = attenuo_audit::cross_check_anchors(&parsed[2], &retried, &f.keys);
+    assert!(r.ok, "{r:?}");
+
+    // Two valid anchors for one boundary (signed with the server's key both times).
+    let a = &f.anchors[0];
+    let twin = attenuo_audit::Anchor::sign(
+        &f.issuer.detached_signer(),
+        a.through_seq,
+        &a.through_hash,
+        a.prune_seq,
+        &a.prune_entry_hash,
+        a.previous_through_seq,
+        Some("f".repeat(64)),
+        OffsetDateTime::now_utc(),
+    )
+    .unwrap();
+    let twins = parse(line(a) + &line(&twin) + &line(&f.anchors[1]));
+    let r = attenuo_audit::cross_check_anchors(&parsed[2], &twins, &f.keys);
+    assert!(
+        r.mismatches
+            .iter()
+            .any(|m| m.seq == 20 && m.reason.contains("two different anchors")),
+        "{r:?}"
+    );
+
+    // An envelope whose kid is not the anchor's.
+    let mut env = ShippedAnchor::new(&f.anchors[0], None);
+    env.kid = "other".into();
+    let r = attenuo_audit::cross_check_anchors(&parsed[2], &[(1, env)], &f.keys);
+    assert!(
+        r.mismatches
+            .iter()
+            .any(|m| m.reason.contains("`kid` or `signature` differs")),
+        "{r:?}"
+    );
+
+    // The middle archive's header anchor (the first prune) is not shipped; the second is.
+    let only_second = parse(line(&f.anchors[1]));
+    let r = attenuo_audit::cross_check_anchors(&parsed[1], &only_second, &f.keys);
+    assert!(
+        r.mismatches
+            .iter()
+            .any(|m| m.seq == 20 && m.reason.contains("not in the shipped file")),
+        "{r:?}"
+    );
+
+    // An export of 21..=45 taken before the second prune (through 40, record at 47): the
+    // shipped boundary lies inside it.
+    let mut stale = parsed[1].clone();
+    stale
+        .entries
+        .extend(parsed[2].entries.iter().filter(|e| e.seq <= 45).cloned());
+    stale.header.as_mut().unwrap().to = 45;
+    let all = parse(line(&f.anchors[0]) + &line(&f.anchors[1]));
+    let r = attenuo_audit::cross_check_anchors(&stale, &all, &f.keys);
+    assert!(!r.ok);
+    assert!(
+        r.mismatches
+            .iter()
+            .any(|m| m.seq == 40 && m.reason.contains("has its boundary inside this export")),
+        "{r:?}"
+    );
+    // The archive that ends at that boundary is fine.
+    assert!(attenuo_audit::cross_check_anchors(&parsed[1], &all, &f.keys).ok);
+}
+
+/// S3 objects (canonical JSON, no newline) joined with `cat` are one line of several objects:
+/// both parsers read every object of it.
+#[test]
+fn s3_objects_joined_without_newlines_parse() {
+    let f = three_files();
+    let log = parse_export(&f.texts[2]).unwrap();
+    let mut joined = Vec::new();
+    for cp in &log.checkpoints {
+        joined.extend(attenuo_audit::ShippedCheckpoint::new(cp, None).to_canonical_json());
+    }
+    for a in &f.anchors {
+        joined.extend(ShippedAnchor::new(a, None).to_canonical_json());
+    }
+    let text = String::from_utf8(joined).unwrap();
+    assert_eq!(text.lines().count(), 1);
+    let cps = attenuo_audit::parse_shipped(&text).unwrap();
+    assert_eq!(cps.len(), log.checkpoints.len());
+    let anchors = attenuo_audit::parse_shipped_anchors(&text).unwrap();
+    assert_eq!(anchors.len(), 2);
+    assert!(attenuo_audit::cross_check_anchors(&log, &anchors, &f.keys).ok);
 }

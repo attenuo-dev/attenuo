@@ -296,7 +296,7 @@ async fn a_prune_through_the_cli_end_to_end() {
         0,
     );
     for want in [
-        "files link: 2 files hold seq 1..36 as one log",
+        "files link: 2 files hold seq 1..36 as one log, from genesis",
         "all files: OK",
         "the file continues a pruned log",
         "shipped prune anchors: OK",
@@ -309,6 +309,10 @@ async fn a_prune_through_the_cli_end_to_end() {
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["ok"], true);
     assert_eq!(v["links"], json!([]));
+    assert_eq!(
+        (&v["from_genesis"], &v["first_seq"]),
+        (&json!(true), &json!(1))
+    );
     assert_eq!(v["files"][1]["from_anchor"], true);
     // Out of order, the files do not link, and the message names both.
     let t = assert_exit(&verify(&s, &[&retained, &archive], &[]).await, 2);
@@ -406,6 +410,35 @@ async fn two_prunes_in_a_row_leave_three_files_that_link() {
     .await;
     let t = assert_exit(&out, 0);
     assert!(t.contains("files link: 3 files hold seq 1.."), "{t}");
+    assert!(t.contains("as one log, from genesis"), "{t}");
+    // Without the first archive, the set starts after a prune, and says so.
+    let t = assert_exit(&verify(&s, &[&a2, &retained], &[]).await, 0);
+    assert!(
+        t.contains("starting right after the prune through seq 20"),
+        "{t}"
+    );
+    // A middle file past its last checkpoint fails, even with --allow-unsigned-tail, which
+    // is for the last file only; and the set is not called one log.
+    let tail = s.path("a2-tail.jsonl");
+    let text = std::fs::read_to_string(&a2).unwrap();
+    let kept: Vec<&str> = text.lines().collect();
+    let last_cp = kept
+        .iter()
+        .rposition(|l| l.contains("\"type\":\"checkpoint\""))
+        .unwrap();
+    let cut: String = kept
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != last_cp)
+        .map(|(_, l)| format!("{l}\n"))
+        .collect();
+    std::fs::write(&tail, cut).unwrap();
+    let t = assert_exit(
+        &verify(&s, &[&a1, &tail, &retained], &["--allow-unsigned-tail"]).await,
+        2,
+    );
+    assert!(t.contains("export REJECTED"), "{t}");
+    assert!(!t.contains("files link:"), "{t}");
     // Without the middle archive, the gap is named.
     let t = assert_exit(&verify(&s, &[&a1, &retained], &[]).await, 2);
     assert!(t.contains("the seqs are not contiguous"), "{t}");

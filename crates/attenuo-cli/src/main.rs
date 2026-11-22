@@ -1778,6 +1778,16 @@ async fn audit_verify_files(
         return Ok(if ok { Outcome::Ok } else { Outcome::No });
     }
     let name = |i: usize| files[i].display().to_string();
+    // Where the set starts: at genesis, right after a prune whose earlier files are not given,
+    // or in the middle of the log.
+    let head = reports.first().cloned().unwrap_or(Value::Null);
+    let start = if head["from_genesis"] == true {
+        "genesis"
+    } else if head["from_anchor"] == true {
+        "anchor"
+    } else {
+        "window"
+    };
     if json {
         let files_json: Vec<Value> = reports
             .iter()
@@ -1798,7 +1808,15 @@ async fn audit_verify_files(
                 })
             })
             .collect();
-        print_json(&json!({"ok": ok, "files": files_json, "links": links_json}))?;
+        print_json(&json!({
+            "ok": ok,
+            "from_genesis": start == "genesis",
+            "from_anchor": start == "anchor",
+            "first_seq": head["first_seq"],
+            "last_seq": reports.last().map_or(Value::Null, |v| v["last_seq"].clone()),
+            "files": files_json,
+            "links": links_json,
+        }))?;
     } else {
         for (v, f) in reports.iter().zip(files) {
             outln!("{}:", render::escape_controls(&f.display().to_string()))?;
@@ -1814,15 +1832,24 @@ async fn audit_verify_files(
                 l.reason
             )?;
         }
-        if links.is_empty() {
-            let first = reports.first().and_then(|v| v["first_seq"].as_u64());
-            let last = reports.last().and_then(|v| v["last_seq"].as_u64());
-            if let (Some(f), Some(l)) = (first, last) {
-                outln!(
-                    "files link: {} files hold seq {f}..{l} as one log",
-                    reports.len()
-                )?;
-            }
+        let first = head["first_seq"].as_u64();
+        let last = reports.last().and_then(|v| v["last_seq"].as_u64());
+        if let (true, Some(f), Some(l)) = (ok, first, last) {
+            let from = match start {
+                "genesis" => "from genesis".to_string(),
+                "anchor" => format!(
+                    "starting right after the prune through seq {} (the archives before it are \
+                     not among the files)",
+                    f - 1
+                ),
+                _ => format!(
+                    "starting at seq {f}, not at genesis: entries before it are not covered"
+                ),
+            };
+            outln!(
+                "files link: {} files hold seq {f}..{l} as one log, {from}",
+                reports.len()
+            )?;
         }
         outln!(
             "{}",
@@ -1865,9 +1892,10 @@ fn shipped_lines(v: &Value) -> Vec<String> {
     }
     if let Some(n) = v["beyond_range"].as_u64().filter(|n| *n > 0) {
         out.push(format!(
-            "note: {n} shipped checkpoints lie past the export's range and were not checked; if \
-             the export runs to the head of the log, the log is shorter than what was shipped \
-             (last shipped seq {})",
+            "note: {n} shipped checkpoints are newer than this export (past its range, last \
+             shipped seq {}) and were not checked; if this file should run to the head of the \
+             log (the retained export, or the last file of a set), it is cut short or the log \
+             is shorter than what was shipped",
             v["last_shipped_seq"]
         ));
     }
