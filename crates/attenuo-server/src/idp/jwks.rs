@@ -408,6 +408,10 @@ impl<K: Clone + Send + Sync + 'static> JwksCache<K> {
         // The fetch this call waits for: one it started or joined.
         let mut waiting_for: Option<u64> = None;
         loop {
+            // A fetch this call is to start, once the lock is released: never spawned under
+            // it, as a runtime that is shutting down drops a new task on the spot, and the
+            // task's guard then takes the lock to end its fetch.
+            let mut start: Option<StartFetch<K>> = None;
             let mut done = {
                 let mut st = inner.lock();
                 if let Some(n) = waiting_for {
@@ -436,7 +440,7 @@ impl<K: Clone + Send + Sync + 'static> JwksCache<K> {
                             }
                             st.last_forced = Some(Instant::now());
                             tracing::info!(issuer = %inner.issuer, kid = ?kid, "unknown kid; refetching JWKS");
-                            self.start_fetch(&mut st, true);
+                            start = Some(self.begin_fetch(&mut st, true));
                         }
                     } else if !st.fetching {
                         if let Some((at, e)) = &st.failed {
@@ -444,25 +448,48 @@ impl<K: Clone + Send + Sync + 'static> JwksCache<K> {
                                 return Err(e.clone());
                             }
                         }
-                        self.start_fetch(&mut st, false);
+                        start = Some(self.begin_fetch(&mut st, false));
                     }
                     waiting_for = Some(st.started);
                 }
                 // Subscribed under the lock, so the end of the running fetch is not missed.
                 inner.done.subscribe()
             };
+            if let Some(start) = start {
+                start.spawn();
+            }
             // The sender lives in `inner`, which `self` keeps: this ends when a fetch does.
             let _ = done.changed().await;
         }
     }
 
-    /// Start a fetch in a task of its own. The caller holds the lock and saw none running.
-    /// `forced`: a refetch for an unknown `kid`, while the cached keys are fresh.
-    fn start_fetch(&self, st: &mut CacheState<K>, forced: bool) {
+    /// Mark a fetch as running, under the lock, which the caller holds after seeing none
+    /// running; [`StartFetch::spawn`] starts it once the lock is released. `forced`: a
+    /// refetch for an unknown `kid`, while the cached keys are fresh.
+    fn begin_fetch(&self, st: &mut CacheState<K>, forced: bool) -> StartFetch<K> {
         st.fetching = true;
         st.started += 1;
-        let discovered = st.jwks_uri.clone();
-        let guard = FetchGuard(Some((Arc::clone(&self.inner), forced)));
+        StartFetch {
+            discovered: st.jwks_uri.clone(),
+            guard: FetchGuard(Some((Arc::clone(&self.inner), forced))),
+        }
+    }
+}
+
+/// A fetch marked as running and not yet started ([`JwksCache::begin_fetch`]). Dropped
+/// without [`spawn`](Self::spawn), its guard ends the fetch as failed.
+struct StartFetch<K> {
+    discovered: Option<String>,
+    guard: FetchGuard<K>,
+}
+
+impl<K: Send + Sync + 'static> StartFetch<K> {
+    /// Run the fetch in a task of its own. The state lock must not be held: if the runtime is
+    /// shutting down, the task is dropped here, and its guard takes the lock.
+    fn spawn(self) {
+        let Self { discovered, guard } = self;
+        #[cfg(test)]
+        let inner = guard.0.as_ref().map(|(inner, _)| Arc::clone(inner));
         let _task = tokio::spawn(async move {
             let Some((inner, _)) = guard.0.as_ref() else {
                 return;
@@ -471,8 +498,8 @@ impl<K: Clone + Send + Sync + 'static> JwksCache<K> {
             guard.finish(outcome);
         });
         #[cfg(test)]
-        {
-            st.task = Some(_task.abort_handle());
+        if let Some(inner) = inner {
+            inner.lock().task = Some(_task.abort_handle());
         }
     }
 }
@@ -1272,6 +1299,49 @@ mod tests {
         steps.send(keys(&["a"])).unwrap();
         assert_eq!(lookup(&cache, "a").await, Ok("a"));
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// A fetch started while the runtime shuts down: tokio drops the new task where it is
+    /// spawned, and the task's guard takes the state lock to end the fetch. Were the task
+    /// spawned under that lock, this thread would hang on it; instead the fetch ends as failed
+    /// and `find` answers. The runtime here is shut down before the call, so every spawn is
+    /// dropped at once; the lookup is polled by hand, since no runtime runs it.
+    #[test]
+    fn a_fetch_started_while_the_runtime_shuts_down_does_not_hang() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let handle = rt.handle().clone();
+        drop(rt);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _entered = handle.enter();
+            let (cache, _, _steps) = scripted(Duration::from_secs(300), CLIENT);
+            let mut lookup = std::pin::pin!(lookup(&cache, "a"));
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let out = loop {
+                if let std::task::Poll::Ready(out) =
+                    std::future::Future::poll(lookup.as_mut(), &mut cx)
+                {
+                    break Some(out);
+                }
+                if Instant::now() > deadline {
+                    break None;
+                }
+                std::thread::yield_now();
+            };
+            let _ = tx.send(out);
+        });
+        let out = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the lookup hung: the fetch task was dropped under the state lock")
+            .expect("the lookup never ended");
+        let Err(JwksError::Unavailable(msg)) = out else {
+            panic!("a fetch the runtime dropped must fail: {out:?}");
+        };
+        assert!(msg.contains("stopped"), "{msg}");
     }
 
     #[test]
