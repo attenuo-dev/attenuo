@@ -338,6 +338,20 @@ pub(crate) enum AdminCmd {
     /// Named admin operators (`[[admin.operators]]`).
     #[command(subcommand)]
     Operator(OperatorCmd),
+    /// The agents and PEPs of the server's config (`[[agents]]`, `[[peps]]`).
+    #[command(subcommand)]
+    Agent(AgentCmd),
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum AgentCmd {
+    /// Ask the server to re-read `[[agents]]` and `[[peps]]` from its config file and put them
+    /// in force without a restart (`POST /admin/agents/reload`, role `admin`). Prints the
+    /// agents and PEPs added, removed and changed, and the other sections of the file that
+    /// differ from the ones in force and need a restart. On a refusal (a file that does not
+    /// parse, or lists that break a startup rule) the lists in force are unchanged. Tokens
+    /// already issued are not revoked: use `attenuo lease revoke` for that.
+    Reload,
 }
 
 #[derive(Debug, Subcommand)]

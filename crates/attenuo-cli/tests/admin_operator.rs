@@ -1,6 +1,7 @@
 //! `attenuo admin operator new` and `admin operator hash` (ADR-0016): the output shape, that
 //! nothing needs a server, and that a server configured with the printed entry accepts the
-//! printed token as that operator with that role.
+//! printed token as that operator with that role. Also `admin operator reload` and
+//! `admin agent reload` against a running server.
 
 mod common;
 
@@ -261,4 +262,98 @@ async fn new_with_an_expiry_then_reload_puts_it_in_force() {
         text(&out.stderr)
     );
     assert_eq!(whoami(token).await.0, 200);
+}
+
+/// `admin agent reload` puts a changed `[[agents]]` list in force on a running server, prints
+/// the ids and the sections that need a restart, `--json` prints the answer, and a refusal
+/// exits 1 with the code and changes nothing.
+#[tokio::test]
+async fn agent_reload_prints_the_changes() {
+    const LEGACY: &str = "legacy-admin-token-0123456789abcdef";
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("attenuo.toml");
+    let base_file = format!(
+        "[issuer]\nprivate_key_pem_path = \"{}\"\n\n[audit]\nsqlite_path = \"{}\"\n\n[admin]\n\
+         token = \"{LEGACY}\"\n\n",
+        dir.path().join("keys/issuer.pem").display(),
+        dir.path().join("audit.sqlite").display(),
+    );
+    let agent = |id: &str| {
+        format!(
+            "[[agents]]\nid = \"{id}\"\nsecret_sha256 = \"{}\"\n",
+            sha256_hex(&format!("{id}-secret"))
+        )
+    };
+    std::fs::write(&path, format!("{base_file}{}", agent("planner"))).unwrap();
+    let cfg = Config::load(&path).unwrap();
+    let (router, _state) = attenuo_server::build(&cfg).unwrap();
+    let server = spawn_router(router).await.unwrap();
+    let url = server.url("");
+    let reload = |url: String, json: bool| {
+        let mut cmd = attenuo();
+        cmd.args(["--server", &url]);
+        if json {
+            cmd.arg("--json");
+        }
+        cmd.args(["admin", "agent", "reload"])
+            .env("ATTENUO_ADMIN_TOKEN", LEGACY)
+            .output()
+            .unwrap()
+    };
+
+    std::fs::write(
+        &path,
+        format!(
+            "[server]\nlisten = \"127.0.0.1:9999\"\n\n{base_file}{}",
+            agent("coder")
+        ),
+    )
+    .unwrap();
+    let u = url.clone();
+    let out = tokio::task::spawn_blocking(move || reload(u, false))
+        .await
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stdout),
+        "agents: 1 in force, 1 added, 1 removed, 0 changed\n\
+         peps: 0 in force, 0 added, 0 removed, 0 changed\n  \
+         added    agent coder\n  \
+         removed  agent planner\n\
+         not reloaded, differ from the running config (restart to apply): [server]\n"
+    );
+    let u = url.clone();
+    let out = tokio::task::spawn_blocking(move || reload(u, true))
+        .await
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["agents"]["count"], 1, "{v}");
+    assert_eq!(v["agents"]["added"], serde_json::json!([]), "{v}");
+    assert_eq!(v["restart_needed"], serde_json::json!(["[server]"]), "{v}");
+
+    // A refusal: exit status 1, the code on stderr, nothing changed.
+    std::fs::write(
+        &path,
+        format!("{base_file}{}{}", agent("coder"), agent("coder")),
+    )
+    .unwrap();
+    let u = url.clone();
+    let out = tokio::task::spawn_blocking(move || reload(u, false))
+        .await
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    assert!(
+        text(&out.stderr).contains("agents_invalid"),
+        "{}",
+        text(&out.stderr)
+    );
+    std::fs::write(&path, format!("{base_file}{}", agent("coder"))).unwrap();
+    let u = url.clone();
+    let out = tokio::task::spawn_blocking(move || reload(u, true))
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["agents"]["added"], serde_json::json!([]), "{v}");
+    assert_eq!(v["agents"]["removed"], serde_json::json!([]), "{v}");
 }

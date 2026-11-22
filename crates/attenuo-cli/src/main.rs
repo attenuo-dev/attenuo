@@ -49,8 +49,8 @@ use serde_json::{json, Map, Value};
 use time::OffsetDateTime;
 
 use cli::{
-    AdminCmd, ApprovalCmd, AuditCmd, AuthzenCmd, BudgetCmd, Cli, Command, ExportFormat, Field,
-    HealthArgs, KeyCmd, LeaseCmd, OperatorCmd, PolicyCmd, TokenCmd,
+    AdminCmd, AgentCmd, ApprovalCmd, AuditCmd, AuthzenCmd, BudgetCmd, Cli, Command, ExportFormat,
+    Field, HealthArgs, KeyCmd, LeaseCmd, OperatorCmd, PolicyCmd, TokenCmd,
 };
 use client::{query_escape, Client};
 use prune_cmd::{audit_prune, PruneArgs};
@@ -835,6 +835,17 @@ async fn run(cli: Cli) -> Result<Outcome> {
             } else {
                 Outcome::No
             })
+        }
+        Command::Admin(AdminCmd::Agent(AgentCmd::Reload)) => {
+            let resp = client?
+                .admin_post("/admin/agents/reload", &json!({}))
+                .await?;
+            if json {
+                print_json(&resp)?;
+            } else {
+                out!("{}", render::render_agents_reload(&resp))?;
+            }
+            Ok(Outcome::Ok)
         }
         Command::Admin(AdminCmd::Operator(OperatorCmd::Reload)) => {
             let resp = client?
