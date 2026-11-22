@@ -16,7 +16,7 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 
 ### Fixed
 
-- Docker image build: each target architecture now has its own cargo registry and target caches. The multi-arch release build runs amd64 and arm64 at once, and with shared caches the two could unpack the same crate at the same time (the build failed with "File exists"), or one could overwrite the other's binaries before they were copied out.
+- Docker image build: each target architecture now has its own cargo registry and target caches. The multi-arch release build runs amd64 and arm64 at once, and with shared caches the two could unpack the same crate at the same time (the build failed with "File exists"). The target directory was shared too.
 
 ## [0.2.0] - 2026-11-22
 

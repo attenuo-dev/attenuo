@@ -25,8 +25,8 @@ COPY . .
 # inside the same RUN because the target mount does not survive it.
 # Each target architecture gets its own caches (BuildKit sets TARGETARCH). A multi-arch build
 # runs both architectures at once: sharing one registry made the two unpack the same crate
-# and fail with "File exists", and sharing one target dir would let one architecture's
-# binaries overwrite the other's between the build and the copy.
+# and fail with "File exists" (cargo's unpack lock lives outside the mount). The target dir
+# was shared too; it now is not.
 ARG TARGETARCH
 RUN --mount=type=cache,id=attenuo-cargo-registry-${TARGETARCH},sharing=locked,target=/usr/local/cargo/registry \
     --mount=type=cache,id=attenuo-target-${TARGETARCH},sharing=locked,target=/src/target \
