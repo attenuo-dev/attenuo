@@ -558,3 +558,21 @@ dialog .buttons { display: flex; justify-content: flex-end; gap: var(--s2); flex
   .page { padding-block: var(--s3) var(--s5); }
   .panel { padding: var(--s3); }
 }
+
+/* ---- reload --------------------------------------------------------------------------- */
+
+.reload-options {
+  margin: 0;
+  padding: var(--s2) var(--s3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  display: flex;
+  flex-direction: column;
+  gap: var(--s3);
+  min-width: 0;
+}
+.reload-options legend { font-size: var(--t-xs); color: var(--muted); padding: 0 var(--s1); }
+.reload-option { display: flex; flex-direction: column; gap: 2px; }
+.reload-option .check { flex-wrap: wrap; }
+.callout p, .callout li { overflow-wrap: anywhere; }
+.callout ul { margin: var(--s1) 0 0; padding-left: var(--s4); }

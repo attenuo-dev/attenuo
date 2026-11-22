@@ -150,17 +150,15 @@ async fn every_route_answers_each_role_as_the_table_says_console_listener() {
     let console = spawn_router(attenuo_server::admin_ui::router(state, &cfg))
         .await
         .unwrap();
-    // The console never mounts the root mint, and does not mount the audit retention routes.
+    // The console never mounts the root mint, the prune itself or the anchors; of the audit
+    // retention routes it mounts the plan only (a read, role `admin`).
     let on_console = |p: &str| {
-        p != "/admin/root-token"
-            && !p.starts_with("/admin/audit/prune")
-            && p != "/admin/audit/anchors"
+        p != "/admin/root-token" && p != "/admin/audit/prune" && p != "/admin/audit/anchors"
     };
     check_every_route(&console.url(""), |_, p| on_console(p)).await;
     // The routes left out are not there at all, for any credential.
     let client = reqwest::Client::new();
     for (method, path) in [
-        ("GET", "/admin/audit/prune/plan"),
         ("POST", "/admin/audit/prune"),
         ("GET", "/admin/audit/anchors"),
     ] {
@@ -185,19 +183,31 @@ async fn whoami_names_the_credential() {
         .await
         .unwrap();
     let client = reqwest::Client::new();
-    for base in [server.url(""), console.url("")] {
+    // The console listener's answer adds its own settings ([admin_ui] allow_write is off here,
+    // and nothing is pruned); the main listener's has no such member.
+    let console_settings = json!({"allow_write": false, "audit_prune": "off"});
+    for (base, extra) in [
+        (server.url(""), None),
+        (console.url(""), Some(&console_settings)),
+    ] {
+        let with = |mut v: Value| {
+            if let Some(extra) = extra {
+                v["console"] = extra.clone();
+            }
+            v
+        };
         let (status, v) = send(&client, &base, "GET", "/admin/whoami", Some(LEGACY)).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
             v,
-            json!({"name": "admin", "role": "admin", "expires_at": null})
+            with(json!({"name": "admin", "role": "admin", "expires_at": null}))
         );
         for (name, token, role) in OPERATORS {
             let (status, v) = send(&client, &base, "GET", "/admin/whoami", Some(token)).await;
             assert_eq!(status, StatusCode::OK);
             assert_eq!(
                 v,
-                json!({"name": name, "role": role.as_str(), "expires_at": null})
+                with(json!({"name": name, "role": role.as_str(), "expires_at": null}))
             );
         }
     }

@@ -1,6 +1,7 @@
 // Entry point: the shell, login, idle lock, theme toggle and the hash router.
 //
-// Routes: #/audit[?filters], #/entry/{seq}, #/record/{id}, #/lease/{id}, #/policy, #/verify.
+// Routes: #/audit[?filters], #/entry/{seq}, #/record/{id}, #/lease/{id}, #/policy, #/reload,
+// #/verify, #/approvals[?filters], #/approval/{id}.
 // Each view is a function (main, params) => Promise that fills `main` and may return a cleanup
 // function, which the router calls before the next view (the audit view uses it to stop
 // following the log).
@@ -16,6 +17,7 @@ import { auditView } from './view-audit.js';
 import { entryView } from './view-entry.js';
 import { leaseView } from './view-lease.js';
 import { policyView, forgetPolicyCache } from './view-policy.js';
+import { reloadView } from './view-reload.js';
 import { verifyView } from './view-verify.js';
 
 const IDLE_MS = 15 * 60 * 1000;
@@ -205,12 +207,13 @@ const ROUTES = {
   record: (m, s) => entryView(m, { id: s[1] }),
   lease: (m, s) => leaseView(m, s[1]),
   policy: (m) => policyView(m),
+  reload: (m) => reloadView(m),
   verify: (m) => verifyView(m),
   approvals: (m, s, p) => approvalsView(m, p),
   approval: (m, s) => approvalView(m, s[1]),
 };
 
-const NAV_FOR = { audit: 'audit', entry: 'audit', record: 'audit', lease: 'audit', policy: 'policy', verify: 'verify', approvals: 'approvals', approval: 'approvals' };
+const NAV_FOR = { audit: 'audit', entry: 'audit', record: 'audit', lease: 'audit', policy: 'policy', reload: 'reload', verify: 'verify', approvals: 'approvals', approval: 'approvals' };
 
 async function route() {
   if (!hasToken()) return;
@@ -225,7 +228,7 @@ async function route() {
     if (a.dataset.page === NAV_FOR[name]) a.setAttribute('aria-current', 'page');
     else a.removeAttribute('aria-current');
   }
-  if (!view || (name !== 'audit' && name !== 'policy' && name !== 'verify' && name !== 'approvals' && !segments[1])) {
+  if (!view || (name !== 'audit' && name !== 'policy' && name !== 'reload' && name !== 'verify' && name !== 'approvals' && !segments[1])) {
     replace(main, h('section', { class: 'panel' }, h('h1', null, 'Not found'),
       h('p', null, 'There is no such page. '), h('a', { href: '#/audit' }, 'Go to the audit log')));
     return;

@@ -6,7 +6,7 @@
 'use strict';
 
 import {
-  h, append, replace, link, mono, time, leaseState, leaseStatePill, empty, loading, kv, table,
+  h, append, replace, link, mono, time, leaseState, leaseStatePill, empty, loading, kv, table, modal,
 } from './dom.js';
 import { api, qs, showNotice, needsRole } from './api.js';
 
@@ -271,23 +271,6 @@ async function loadRenewals(box, leaseId, root) {
 /** A subject cut to SUBJECT_CHARS for a button label. */
 function clip(text) {
   return text.length > SUBJECT_CHARS ? `${text.slice(0, SUBJECT_CHARS)}…` : text;
-}
-
-/**
- * Open a modal dialog on <body>, labelled by the element with id `labelledBy`, holding
- * `content`. Escape removes it, and so does leaving the page (the router removes every
- * dialog, so a dialog never acts for a page that is gone). Returns {dialog, close}.
- */
-function modal(labelledBy, content) {
-  const dialog = h('dialog', { 'aria-labelledby': labelledBy }, content);
-  const close = () => {
-    if (dialog.open) dialog.close();
-    dialog.remove();
-  };
-  dialog.addEventListener('cancel', () => dialog.remove());
-  document.body.append(dialog);
-  dialog.showModal();
-  return { dialog, close };
 }
 
 function openRevoke(leaseId, tree, done) {

@@ -4,9 +4,10 @@
 'use strict';
 
 import {
-  h, append, replace, mono, time, pill, decisionPill, table, empty, loading, kv, explainReason, jsonTree,
+  h, append, replace, mono, time, pill, decisionPill, table, empty, loading, kv, explainReason, jsonTree, modal,
 } from './dom.js';
-import { api, showNotice, roleAllows } from './api.js';
+import { api, showNotice, roleAllows, writesAllowed } from './api.js';
+import { refusal, auditLink } from './view-reload.js';
 
 // GET /admin/policies, fetched once per login. Lock forgets it with the token.
 let cached = null;
@@ -61,18 +62,32 @@ async function showLoaded(box) {
 
 function checkPanel(afterReload) {
   const out = h('div', { class: 'stack' });
-  const reloadNote = h('span', { class: 'small muted' }, roleAllows('admin')
-    ? 'Reload is enabled after a check with no errors.'
-    : 'Reloading needs the admin role.');
-  const reloadBtn = h('button', { type: 'button', class: 'primary', disabled: true, on: { click: reload } }, 'Reload');
+  const result = h('div', { class: 'stack', id: 'policy-reload-result' });
+  const writes = writesAllowed();
+  const reloadNote = h('span', { class: 'small muted' }, writes === false
+    ? 'Writes are disabled on this listener ([admin_ui] allow_write is off), so the console does not offer Reload. Reload with the attenuo CLI against the admin API.'
+    : roleAllows('admin')
+      ? 'Reload is enabled after a check with no errors.'
+      : 'Reloading needs the admin role.');
+  const reloadBtn = writes === false
+    ? null
+    : h('button', { type: 'button', class: 'primary', disabled: true, on: { click: () => confirmReload(checked, done) } }, 'Reload…');
   const checkBtn = h('button', { type: 'button', on: { click: check } }, 'Check file on disk');
+  // The answer of the last check, which the confirmation shows.
+  let checked = null;
+
+  function done(r) {
+    replace(result, h('h3', null, 'Last reload'), reloadResult(r));
+    afterReload();
+  }
 
   async function check() {
     checkBtn.disabled = true;
-    reloadBtn.disabled = true;
+    if (reloadBtn) reloadBtn.disabled = true;
     replace(out, loading());
     try {
       const c = await api('/admin/policies/check', { quiet: [409] });
+      checked = c;
       const issues = c.issues.map((i) => h('tr', null,
         h('td', null, pill(i.severity, i.severity === 'error' ? 'error' : 'warning')),
         h('td', { class: 'num' }, mono(i.line ?? '—')),
@@ -89,7 +104,7 @@ function checkPanel(afterReload) {
             : pill('same as loaded', '')),
         kv([['File', mono(c.path)], ['sha256 on disk', mono(c.sha256)], ['sha256 loaded', c.loaded_sha256 ? mono(c.loaded_sha256) : null]]),
         issues.length ? table(['Severity', 'Line', 'Col', 'Policy', 'Stage', 'Message'], issues, { short: true }) : null);
-      reloadBtn.disabled = !c.ok || !roleAllows('admin');
+      if (reloadBtn) reloadBtn.disabled = !c.ok || !roleAllows('admin');
     } catch (e) {
       if (e.status === 401) return;
       replace(out, h('p', { class: 'callout' }, e.status === 409
@@ -100,26 +115,64 @@ function checkPanel(afterReload) {
     }
   }
 
-  async function reload() {
-    reloadBtn.disabled = true;
-    try {
-      const r = await api('/admin/policies/reload', { method: 'POST', body: {}, quiet: [404, 422] });
-      showNotice(`Reloaded: ${r.policy_ids.length} polic${r.policy_ids.length === 1 ? 'y' : 'ies'}, sha256 ${r.sha256.slice(0, 12)}…`);
-      afterReload();
-    } catch (e) {
-      if (e.status === 401) return;
-      if (e.status === 404) {
-        reloadNote.textContent = 'Writes are disabled on this listener ([admin_ui] allow_write). Reload with the CLI against the main listener.';
-      } else {
-        reloadNote.textContent = `The reload was refused and the old policies stay in force: ${e.message}`;
-      }
-    }
-  }
-
   return h('section', { class: 'panel' },
     h('header', null, h('h2', null, 'Check and reload'), checkBtn, reloadBtn),
     reloadNote,
-    out);
+    out,
+    result);
+}
+
+/** The confirmation of a policy reload, after a clean check (`c`), then the reload itself. */
+function confirmReload(c, done) {
+  const err = h('div', { class: 'callout bad', role: 'alert', id: 'policy-reload-error' });
+  err.hidden = true;
+  const go = h('button', { type: 'submit', class: 'primary' }, 'Reload');
+  let close = () => {};
+  let dialog = null;
+  const form = h('form', {
+    on: {
+      submit: async (ev) => {
+        ev.preventDefault();
+        go.disabled = true;
+        err.hidden = true;
+        let r;
+        try {
+          r = await api('/admin/policies/reload', { method: 'POST', body: {}, quiet: [403, 404, 409, 422, 500] });
+        } catch (e) {
+          if (e.status === 401 || !dialog.isConnected) return;
+          replace(err, refusal(e));
+          if (e.code === 'policy_invalid') append(err, [h('p', { class: 'small' }, 'The old policies stay in force.')]);
+          err.hidden = false;
+          go.disabled = false;
+          return;
+        }
+        close();
+        showNotice(`Reloaded: ${r.policy_ids.length} polic${r.policy_ids.length === 1 ? 'y' : 'ies'}, sha256 ${r.sha256.slice(0, 12)}…`);
+        done(r);
+      },
+    },
+  },
+  h('h2', { id: 'policy-reload-title' }, 'Reload the policy file?'),
+  h('p', null, 'Reads the policy file again and, if it parses and validates against the running schema, puts the new policies in force at once for every later decision. If it does not load, the old policies stay in force. The reload is recorded in the audit log.'),
+  c ? kv([['File', mono(c.path)], ['sha256 checked', mono(c.sha256)]]) : null,
+  h('p', { class: 'small muted' }, 'The server reads the file again when you press Reload: if it changed after the check, the new content is what loads.'),
+  err,
+  h('div', { class: 'buttons' }, h('button', { type: 'button', on: { click: () => close() } }, 'Cancel'), go));
+  ({ dialog, close } = modal('policy-reload-title', form));
+  go.focus();
+}
+
+/** What a policy reload answered: the policy ids, the file's digest, warnings, the record. */
+function reloadResult(r) {
+  return h('div', { class: 'stack' },
+    kv([
+      ['Policies', h('span', null, `${r.policy_ids.length}: `, r.policy_ids.map((id, i) => [i ? ', ' : '', mono(id)]))],
+      ['sha256', mono(r.sha256)],
+      ['Audit record', auditLink(r.audit_id)],
+    ]),
+    r.warnings && r.warnings.length
+      ? h('div', { class: 'callout warn' }, h('p', null, 'Validation warnings:'), h('ul', null, r.warnings.map((w) => h('li', null, String(w)))))
+      : null);
 }
 
 // ---- dry-run evaluation -----------------------------------------------------------------
