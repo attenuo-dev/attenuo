@@ -83,6 +83,15 @@ export interface ExportsReport {
   files: ExportReport[];
   /** Each pair of neighbouring files that does not link. */
   links: LinkProblem[];
+  /** The first file starts at seq 1 with the genesis `prev_hash`. */
+  fromGenesis: boolean;
+  /**
+   * The first file starts right after the valid prune anchor in its header: the archives of the
+   * earlier prunes are not among the files.
+   */
+  fromAnchor: boolean;
+  /** The first file's anchor `through_seq` when `fromAnchor` is set. */
+  prunedThrough: number | undefined;
 }
 
 /** The verdict on an export (the fields of the Rust `ExportReport`). */
@@ -260,16 +269,33 @@ export async function verifyExport(
  * Each file is verified strictly on its own (`allowUnsignedTail` applies to the last file
  * only), then each file and the next must link: both hold entries, the seqs are contiguous, the
  * later file's first `prev_hash` is the earlier file's last entry hash, the earlier file has a
- * checkpoint at its last seq naming that hash, and an anchor in the later file's header names
- * the earlier file's end.
+ * checkpoint at its last seq naming that hash, and an anchor in the later file's header, if
+ * present, names the earlier file's end. `fromGenesis` and `fromAnchor` say where the set
+ * starts: neither is set when the first file starts at a later seq without an anchor, so
+ * entries before it are not covered.
+ *
+ * Throws `ExportError` for an empty list, and for a bare string or `Uint8Array` (pass an array
+ * of sources).
  */
 export async function verifyExports(
   sources: Iterable<ExportSource>,
   opts: VerifyExportOptions,
 ): Promise<ExportsReport> {
+  const given: unknown = sources;
+  if (
+    typeof given === "string" ||
+    given instanceof Uint8Array ||
+    typeof given !== "object" ||
+    given === null ||
+    !(Symbol.iterator in given)
+  ) {
+    throw new ExportError("verifyExports takes an array of exports, not one export");
+  }
+  const list = [...sources];
+  if (list.length === 0) throw new ExportError("verifyExports needs at least one export");
   const keys = loadKeys(opts.checkpointPublicKeys);
   const parsed: Parsed[] = [];
-  for (const src of sources) parsed.push(parse(await readText(src)));
+  for (const src of list) parsed.push(parse(await readText(src)));
   const files: ExportReport[] = [];
   for (const [i, p] of parsed.entries()) {
     files.push(
@@ -277,7 +303,15 @@ export async function verifyExports(
     );
   }
   const links = linkProblems(parsed);
-  return { ok: files.every((f) => f.ok) && links.length === 0, files, links };
+  const first = files[0] as ExportReport;
+  return {
+    ok: files.every((f) => f.ok) && links.length === 0,
+    files,
+    links,
+    fromGenesis: first.fromGenesis,
+    fromAnchor: first.fromAnchor,
+    prunedThrough: first.prunedThrough,
+  };
 }
 
 function linkProblems(parsed: Parsed[]): LinkProblem[] {

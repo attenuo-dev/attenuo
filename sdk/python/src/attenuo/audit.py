@@ -183,6 +183,13 @@ class ExportsReport:
     files: tuple[ExportReport, ...]
     #: Each pair of neighbouring files that does not link.
     links: tuple[LinkProblem, ...]
+    #: The first file starts at seq 1 with the genesis ``prev_hash``.
+    from_genesis: bool = False
+    #: The first file starts right after the valid prune anchor in its header: the archives of
+    #: the earlier prunes are not among the files.
+    from_anchor: bool = False
+    #: The first file's anchor ``through_seq`` when ``from_anchor`` is set.
+    pruned_through: int | None = None
 
 
 @dataclass(frozen=True)
@@ -283,16 +290,34 @@ def verify_exports(
     (``allow_unsigned_tail`` applies to the last file only), then each file and the next must
     link: both hold entries, the seqs are contiguous, the later file's first ``prev_hash`` is
     the earlier file's last entry hash, the earlier file has a checkpoint at its last seq naming
-    that hash, and an anchor in the later file's header names the earlier file's end.
+    that hash, and an anchor in the later file's header, if present, names the earlier file's
+    end. ``from_genesis`` and ``from_anchor`` say where the set starts: neither is set when the
+    first file starts at a later seq without an anchor, so entries before it are not covered.
+
+    Raises :class:`ExportError` for an empty list or a bare string or bytes (pass a list of
+    paths).
     """
+    if isinstance(paths_or_lines, (str, bytes, os.PathLike)):
+        raise ExportError("verify_exports takes a list of files, not one path or string")
+    sources = list(paths_or_lines)
+    if not sources:
+        raise ExportError("verify_exports needs at least one file")
     keys = _load_keys(checkpoint_public_keys)
-    parsed = [_parse(_read_text(src)) for src in paths_or_lines]
+    parsed = [_parse(_read_text(src)) for src in sources]
     files = tuple(
         _verify_parsed(p, keys, allow_unsigned_tail=allow_unsigned_tail and i == len(parsed) - 1)
         for i, p in enumerate(parsed)
     )
     links = tuple(_link(parsed))
-    return ExportsReport(ok=all(f.ok for f in files) and not links, files=files, links=links)
+    first = files[0]
+    return ExportsReport(
+        ok=all(f.ok for f in files) and not links,
+        files=files,
+        links=links,
+        from_genesis=first.from_genesis,
+        from_anchor=first.from_anchor,
+        pruned_through=first.pruned_through,
+    )
 
 
 def _link(

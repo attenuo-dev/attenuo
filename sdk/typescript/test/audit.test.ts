@@ -1,4 +1,6 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeAll, describe, expect, it } from "vitest";
@@ -766,5 +768,79 @@ describe("a pruned log", () => {
         p.reason.includes("header anchor is through seq 10, not the earlier file's end at seq 9"),
       ),
     ).toBe(true);
+  });
+});
+
+describe("verifyExports input", () => {
+  it("throws on an empty list and on one export given alone", async () => {
+    const o = { checkpointPublicKeys: jwks };
+    await expect(verifyExports([], o)).rejects.toThrow("at least one export");
+    const { archive } = await prunedLog();
+    const text = lines(archive).join("");
+    await expect(verifyExports(text as never, o)).rejects.toThrow(ExportError);
+    await expect(verifyExports(new TextEncoder().encode(text) as never, o)).rejects.toThrow(
+      "not one export",
+    );
+    await expect(verifyExports({ path: "a.jsonl" } as never, o)).rejects.toThrow("not one export");
+  });
+});
+
+const GOLDEN = fileURLToPath(new URL("../../../testdata/audit-retention/", import.meta.url));
+
+describe.skipIf(!existsSync(GOLDEN))("the golden files written by the Rust code", () => {
+  // Written by `cargo test -p attenuo-audit --test retention write_golden_files -- --ignored`
+  // with a fixed key: the anchors here are signed by the server code, not by this test.
+  const read = (n: string): string => readFileSync(join(GOLDEN, n), "utf8");
+  const names = ["archive-1.jsonl", "archive-2.jsonl", "retained.jsonl"];
+
+  it("verify as one log from genesis", async () => {
+    const o: VerifyExportOptions = {
+      checkpointPublicKeys: JSON.parse(read("jwks.json")) as { keys: unknown[] },
+    };
+    const r = await verifyExports(
+      names.map((n) => ({ path: join(GOLDEN, n) })),
+      o,
+    );
+    expect(r.ok).toBe(true);
+    expect(r.links).toEqual([]);
+    expect([r.fromGenesis, r.fromAnchor, r.prunedThrough]).toEqual([true, false, undefined]);
+    expect(r.files.map((f) => f.prunedThrough)).toEqual([undefined, 5, 10]);
+    expect(r.files.map((f) => f.fromAnchor)).toEqual([false, true, true]);
+    // Each anchor signs the digest of the archive that holds the entries it pruned.
+    for (const [archive, later] of [
+      ["archive-1.jsonl", "archive-2.jsonl"],
+      ["archive-2.jsonl", "retained.jsonl"],
+    ] as const) {
+      const header = JSON.parse(read(later).split("\n")[0] as string) as {
+        anchor: { archive_sha256: string };
+      };
+      const digest = createHash("sha256")
+        .update(readFileSync(join(GOLDEN, archive)))
+        .digest("hex");
+      expect(header.anchor.archive_sha256).toBe(digest);
+    }
+    const alone = await verifyExports([{ path: join(GOLDEN, "retained.jsonl") }], o);
+    expect([alone.ok, alone.fromGenesis, alone.fromAnchor, alone.prunedThrough]).toEqual([
+      true,
+      false,
+      true,
+      10,
+    ]);
+    for (const n of names) {
+      const c = await crossCheck(
+        { path: join(GOLDEN, n) },
+        { path: join(GOLDEN, "shipped.jsonl") },
+        o,
+      );
+      expect(c.ok).toBe(true);
+    }
+    // One changed member of a signed anchor is caught.
+    const text = read("retained.jsonl").split("\n");
+    const header = JSON.parse(text[0] as string) as { anchor: { through_hash: string } };
+    header.anchor.through_hash = "0".repeat(64);
+    const bad = [JSON.stringify(header), ...text.slice(1)].join("\n");
+    const r2 = await verifyExports([{ path: join(GOLDEN, "archive-2.jsonl") }, bad], o);
+    expect(r2.ok).toBe(false);
+    expect(r2.files[1]?.badAnchors.length).toBe(1);
   });
 });

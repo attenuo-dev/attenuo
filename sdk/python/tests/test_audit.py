@@ -714,3 +714,49 @@ def test_a_header_anchor_that_does_not_name_the_earlier_file_end_is_a_link_probl
     assert any(
         "header anchor is through seq 10, not the earlier file's end at seq 9" in x for x in reasons
     ), reasons
+
+
+GOLDEN = Path(__file__).resolve().parents[3] / "testdata" / "audit-retention"
+
+
+@pytest.mark.skipif(not GOLDEN.is_dir(), reason="the repository's testdata is not here")
+def test_the_golden_files_written_by_the_rust_code_verify() -> None:
+    # Written by `cargo test -p attenuo-audit --test retention write_golden_files -- --ignored`
+    # with a fixed key: the anchors here are signed by the server code, not by this test.
+    jwks = json.loads((GOLDEN / "jwks.json").read_text())
+    names = ["archive-1.jsonl", "archive-2.jsonl", "retained.jsonl"]
+    r = verify_exports([GOLDEN / n for n in names], checkpoint_public_keys=jwks)
+    assert r.ok and r.links == (), r
+    assert r.from_genesis and not r.from_anchor and r.pruned_through is None
+    assert [f.pruned_through for f in r.files] == [None, 5, 10]
+    assert not r.files[0].from_anchor and r.files[1].from_anchor and r.files[2].from_anchor
+    # Each anchor signs the digest of the archive that holds the entries it pruned.
+    for archive, later in (
+        ("archive-1.jsonl", "archive-2.jsonl"),
+        ("archive-2.jsonl", "retained.jsonl"),
+    ):
+        header = json.loads((GOLDEN / later).read_text().splitlines()[0])
+        digest = hashlib.sha256((GOLDEN / archive).read_bytes()).hexdigest()
+        assert header["anchor"]["archive_sha256"] == digest
+    # The retained file alone starts at its anchor.
+    r = verify_exports([GOLDEN / "retained.jsonl"], checkpoint_public_keys=jwks)
+    assert r.ok and r.from_anchor and r.pruned_through == 10 and not r.from_genesis
+    # The checkpoints shipped off the host agree with each file.
+    for n in names:
+        c = cross_check(GOLDEN / n, GOLDEN / "shipped.jsonl", checkpoint_public_keys=jwks)
+        assert isinstance(c, CrossCheckReport) and c.ok, (n, c)
+    # One changed byte of a signed anchor is caught.
+    text = (GOLDEN / "retained.jsonl").read_text().splitlines(keepends=True)
+    header = json.loads(text[0])
+    header["anchor"]["through_hash"] = "0" * 64
+    bad = [json.dumps(header) + "\n", *text[1:]]
+    r = verify_exports([GOLDEN / "archive-2.jsonl", bad], checkpoint_public_keys=jwks)
+    assert not r.ok and r.files[1].bad_anchors, r
+
+
+def test_verify_exports_needs_a_list_of_files() -> None:
+    with pytest.raises(ExportError, match="at least one file"):
+        verify_exports([], checkpoint_public_keys=JWKS)
+    for one in ("archive.jsonl", b"archive.jsonl", Path("archive.jsonl")):
+        with pytest.raises(ExportError, match="not one path"):
+            verify_exports(one, checkpoint_public_keys=JWKS)  # type: ignore[arg-type]
