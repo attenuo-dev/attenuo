@@ -365,6 +365,297 @@ describe("AdminClient", () => {
     ).rejects.toBeInstanceOf(ApiError);
   });
 
+  const agentsReloadAnswer = {
+    agents: {
+      count: 3,
+      sha256: "aa".repeat(32),
+      added: ["tester"],
+      removed: ["coder"],
+      changed: ["reviewer"],
+    },
+    peps: { count: 1, sha256: "bb".repeat(32), added: [], removed: [], changed: [] },
+    restart_needed: ["[[root_grants]]"],
+    warnings: ["w"],
+    restart_warnings: [],
+    audit_id: "a1",
+    later_member: { ignored: true },
+  };
+
+  it("reloads agents, sending only the overrides that are set", async () => {
+    const ok = mockFetch(() => jsonResponse(agentsReloadAnswer));
+    const admin = new AdminClient(URL_, "adm", { fetch: ok.fetch });
+    expect(await admin.agentsReload()).toEqual({
+      agents: {
+        count: 3,
+        sha256: "aa".repeat(32),
+        added: ["tester"],
+        removed: ["coder"],
+        changed: ["reviewer"],
+      },
+      peps: { count: 1, sha256: "bb".repeat(32), added: [], removed: [], changed: [] },
+      restartNeeded: ["[[root_grants]]"],
+      warnings: ["w"],
+      restartWarnings: [],
+      auditId: "a1",
+    });
+    expect([ok.calls[0]!.method, ok.calls[0]!.url.pathname]).toEqual([
+      "POST",
+      "/admin/agents/reload",
+    ]);
+    expect(ok.calls[0]!.body).toEqual({});
+    await admin.agentsReload({ allowEmpty: true });
+    expect(ok.calls[1]!.body).toEqual({ allow_empty: true });
+    await admin.agentsReload({ allowEmpty: true, allowMismatch: true });
+    expect(ok.calls[2]!.body).toEqual({ allow_empty: true, allow_mismatch: true });
+    await admin.agentsReload({ allowEmpty: false });
+    expect(ok.calls[3]!.body).toEqual({});
+    const noAudit = mockFetch(() => jsonResponse({ ...agentsReloadAnswer, audit_id: null }));
+    const r = await new AdminClient(URL_, "adm", { fetch: noAudit.fetch }).agentsReload();
+    expect(r.auditId).toBeUndefined();
+  });
+
+  it.each(["agents_reload_empties", "config_file_mismatch", "agents_invalid"])(
+    "surfaces the agents reload refusal %s with its code",
+    async (code) => {
+      const bad = mockFetch(() => jsonResponse({ error: code, code, detail: "unchanged" }, 422));
+      const err = await new AdminClient(URL_, "adm", { fetch: bad.fetch })
+        .agentsReload()
+        .catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(ApiError);
+      expect([(err as ApiError).status, (err as ApiError).code]).toEqual([422, code]);
+    },
+  );
+
+  const keysReloadAnswer = {
+    signing_kid: "new",
+    previous_signing_kid: "old",
+    changed: true,
+    verifying_kids: ["new", "old"],
+    added: ["new"],
+    removed: [],
+    audit_signing_kid: "new",
+    kept_until_restart: ["[token] dpop_nonce"],
+    restart_needed: [],
+    warnings: [],
+    audit_id: "a2",
+    later_member: 1,
+  };
+
+  it("reloads keys, sending only the overrides that are set", async () => {
+    const ok = mockFetch(() => jsonResponse(keysReloadAnswer));
+    const admin = new AdminClient(URL_, "adm", { fetch: ok.fetch });
+    expect(await admin.keysReload()).toEqual({
+      signingKid: "new",
+      previousSigningKid: "old",
+      changed: true,
+      verifyingKids: ["new", "old"],
+      added: ["new"],
+      removed: [],
+      auditSigningKid: "new",
+      keptUntilRestart: ["[token] dpop_nonce"],
+      restartNeeded: [],
+      warnings: [],
+      auditId: "a2",
+    });
+    expect([ok.calls[0]!.method, ok.calls[0]!.url.pathname]).toEqual([
+      "POST",
+      "/admin/keys/reload",
+    ]);
+    expect(ok.calls[0]!.body).toEqual({});
+    await admin.keysReload({ allowDropCurrent: true, allowDropAuditKey: true });
+    expect(ok.calls[1]!.body).toEqual({ allow_drop_current: true, allow_drop_audit_key: true });
+    await admin.keysReload({ allowMismatch: true });
+    expect(ok.calls[2]!.body).toEqual({ allow_mismatch: true });
+  });
+
+  it.each(["keys_reload_drops_current", "keys_reload_drops_audit_key", "key_file_invalid"])(
+    "surfaces the keys reload refusal %s with its code",
+    async (code) => {
+      const bad = mockFetch(() => jsonResponse({ error: code, code, detail: "unchanged" }, 422));
+      const err = await new AdminClient(URL_, "adm", { fetch: bad.fetch })
+        .keysReload()
+        .catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(ApiError);
+      expect([(err as ApiError).status, (err as ApiError).code]).toEqual([422, code]);
+    },
+  );
+
+  const anchor = {
+    through_seq: 1000,
+    through_hash: "cd".repeat(32),
+    prune_seq: 1041,
+    prune_entry_hash: "ef".repeat(32),
+    previous_through_seq: null,
+    archive_sha256: "ab".repeat(32),
+    at: "2026-11-01T00:00:00Z",
+    kid: "k1",
+    signature: "sig",
+  };
+  const checkpoint = { seq: 1000, head_hash: "cd".repeat(32), at: "t", kid: "k1", signature: "s" };
+  const plan = {
+    from: 1,
+    through: 1000,
+    entries: 1000,
+    checkpoint,
+    at: "2026-07-30T23:59:58Z",
+    guards: {
+      requested: 1150,
+      before: null,
+      min_age_cutoff: "2026-08-24T12:00:00Z",
+      live_run_seq: 1123,
+      sink_delivered_through: 1100,
+      sink_degraded: false,
+      in_progress: false,
+      anchor_undelivered: false,
+      limited_by: "prune_not_at_checkpoint",
+      later_guard: 3,
+    },
+    anchor: { ...anchor, state: "done", shipped_at: "2026-11-01T00:00:01Z" },
+  };
+
+  it("reads a prune plan", async () => {
+    const ok = mockFetch(() => jsonResponse(plan));
+    const admin = new AdminClient(URL_, "adm", { fetch: ok.fetch });
+    expect(await admin.auditPrunePlan({ through: 1150 })).toEqual({
+      from: 1,
+      through: 1000,
+      entries: 1000,
+      checkpoint,
+      at: "2026-07-30T23:59:58Z",
+      guards: {
+        requested: 1150,
+        before: undefined,
+        minAgeCutoff: "2026-08-24T12:00:00Z",
+        liveRunSeq: 1123,
+        sinkDeliveredThrough: 1100,
+        sinkDegraded: false,
+        inProgress: false,
+        anchorUndelivered: false,
+        limitedBy: "prune_not_at_checkpoint",
+      },
+      anchor: { ...anchor, state: "done", shipped_at: "2026-11-01T00:00:01Z" },
+    });
+    expect([ok.calls[0]!.method, ok.calls[0]!.url.pathname]).toEqual([
+      "GET",
+      "/admin/audit/prune/plan",
+    ]);
+    expect(Object.fromEntries(ok.calls[0]!.url.searchParams)).toEqual({ through: "1150" });
+    await admin.auditPrunePlan({ before: new Date("2026-08-01T00:00:00Z") });
+    expect(Object.fromEntries(ok.calls[1]!.url.searchParams)).toEqual({
+      before: "2026-08-01T00:00:00.000Z",
+    });
+    await admin.auditPrunePlan();
+    expect(Object.fromEntries(ok.calls[2]!.url.searchParams)).toEqual({});
+    await expect(
+      admin.auditPrunePlan({ through: 1, before: "2026-08-01T00:00:00Z" }),
+    ).rejects.toThrow("not both");
+    const empty = mockFetch(() =>
+      jsonResponse({
+        ...plan,
+        through: null,
+        entries: 0,
+        checkpoint: null,
+        at: null,
+        anchor: null,
+      }),
+    );
+    const p = await new AdminClient(URL_, "adm", { fetch: empty.fetch }).auditPrunePlan();
+    expect([p.through, p.checkpoint, p.anchor]).toEqual([undefined, undefined, undefined]);
+  });
+
+  it("prunes, sending the archive's description only when given", async () => {
+    const answer = {
+      prune_seq: 1041,
+      pruned_through: 1000,
+      anchor,
+      checkpoint_before: { ...checkpoint, seq: 1040 },
+      checkpoint_after: { ...checkpoint, seq: 1041 },
+      deleting: true,
+      shipped: {
+        queued: true,
+        delivered_through: 1000,
+        anchor_shipped_at: null,
+        anchor_pending: true,
+      },
+      already: false,
+    };
+    const ok = mockFetch(() => jsonResponse(answer));
+    const admin = new AdminClient(URL_, "adm", { fetch: ok.fetch });
+    const r = await admin.auditPrune(1000, {
+      archiveSha256: "ab".repeat(32),
+      from: 1,
+      throughHash: "cd".repeat(32),
+    });
+    expect([ok.calls[0]!.method, ok.calls[0]!.url.pathname]).toEqual([
+      "POST",
+      "/admin/audit/prune",
+    ]);
+    expect(ok.calls[0]!.body).toEqual({
+      through: 1000,
+      archive_sha256: "ab".repeat(32),
+      from: 1,
+      through_hash: "cd".repeat(32),
+    });
+    expect(r).toEqual({
+      pruneSeq: 1041,
+      prunedThrough: 1000,
+      anchor,
+      checkpointBefore: { ...checkpoint, seq: 1040 },
+      checkpointAfter: { ...checkpoint, seq: 1041 },
+      deleting: true,
+      shipped: {
+        queued: true,
+        deliveredThrough: 1000,
+        anchorShippedAt: undefined,
+        anchorPending: true,
+      },
+      already: false,
+    });
+    await admin.auditPrune(1000);
+    expect(ok.calls[1]!.body).toEqual({ through: 1000 });
+    const again = mockFetch(() => jsonResponse({ ...answer, shipped: null, already: true }));
+    const r2 = await new AdminClient(URL_, "adm", { fetch: again.fetch }).auditPrune(1000);
+    expect([r2.shipped, r2.already]).toEqual([undefined, true]);
+  });
+
+  it.each([
+    [409, { error: "prune_archive_mismatch", code: "prune_archive_mismatch" }],
+    [409, { error: "prune_disabled", code: "prune_disabled" }],
+    [410, { error: "audit_pruned", pruned_through: 1000, prune_seq: 1041, first: 1001 }],
+  ] as const)("surfaces the prune refusal %i %j with its code", async (status, body) => {
+    const bad = mockFetch(() => jsonResponse({ ...body, detail: "x" }, status));
+    const admin = new AdminClient(URL_, "adm", { fetch: bad.fetch });
+    for (const call of [
+      () => admin.auditPrune(5, { from: 1, throughHash: "cd".repeat(32) }),
+      () => admin.auditPrunePlan(),
+    ]) {
+      const err = await call().catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(ApiError);
+      expect([(err as ApiError).status, (err as ApiError).code]).toEqual([status, body.error]);
+    }
+  });
+
+  it("lists the prune anchors", async () => {
+    const stored = { ...anchor, state: "deleting", shipped_at: null };
+    const ok = mockFetch(() => jsonResponse({ anchors: [stored], next_cursor: "c2" }));
+    const admin = new AdminClient(URL_, "adm", { fetch: ok.fetch });
+    expect(await admin.auditAnchors()).toEqual({ anchors: [stored], nextCursor: "c2" });
+    expect([ok.calls[0]!.method, ok.calls[0]!.url.pathname]).toEqual([
+      "GET",
+      "/admin/audit/anchors",
+    ]);
+    await admin.auditAnchors({ cursor: "c2", limit: 10 });
+    expect(Object.fromEntries(ok.calls[1]!.url.searchParams)).toEqual({
+      cursor: "c2",
+      limit: "10",
+    });
+    const empty = mockFetch(() => jsonResponse({ anchors: [], next_cursor: null }));
+    expect(await new AdminClient(URL_, "adm", { fetch: empty.fetch }).auditAnchors()).toEqual({
+      anchors: [],
+      nextCursor: undefined,
+    });
+  });
+
   it("mints a dev root token", async () => {
     const { fetch, calls } = mockFetch(() => jsonResponse(tokenResponse(rootJwt, "lease-0")));
     const admin = new AdminClient(URL_, "adm", { fetch });

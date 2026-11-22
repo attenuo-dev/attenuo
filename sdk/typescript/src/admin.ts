@@ -181,6 +181,172 @@ export interface OperatorsReload {
 }
 
 /**
+ * One list's part of `AgentsReload` (`[[agents]]` or `[[peps]]`): `count` entries in force now,
+ * `sha256` of the list's canonical form, and the ids `added`, `removed` and `changed` (another
+ * `secret_sha256` or `jwks`).
+ */
+export interface ClientListChanges {
+  count: number;
+  sha256: string;
+  added: string[];
+  removed: string[];
+  changed: string[];
+}
+
+/**
+ * What `POST /admin/agents/reload` put in force. `restartNeeded` names the other sections of the
+ * file that differ from the running config (not applied); `warnings` are the startup warnings of
+ * the new lists; `restartWarnings` say what the file's own settings would refuse after a restart.
+ */
+export interface AgentsReload {
+  agents: ClientListChanges;
+  peps: ClientListChanges;
+  restartNeeded: string[];
+  warnings: string[];
+  restartWarnings: string[];
+  /** The id of the `admin.agents.reload` audit record, undefined when it was not written. */
+  auditId: string | undefined;
+}
+
+/** Overrides of `agentsReload`'s refusals; each is sent only when true. */
+export interface AgentsReloadOptions {
+  /** Accept a file that leaves `[[agents]]` or `[[peps]]` empty (`agents_reload_empties`). */
+  allowEmpty?: boolean;
+  /** Accept a file whose `[issuer]` or `[audit]` differs (`config_file_mismatch`). */
+  allowMismatch?: boolean;
+}
+
+/**
+ * What `POST /admin/keys/reload` put in force, by key id (`kid`) only. `changed` is false when
+ * the file names the keys in force (nothing was swapped). `verifyingKids` is the set the JWKS
+ * lists now, the signing key first; `added` and `removed` compare it with the set before.
+ * `auditSigningKid` signs audit checkpoints and prune anchors from now on. `keptUntilRestart`
+ * names what stays keyed by the startup key.
+ */
+export interface KeysReload {
+  signingKid: string;
+  previousSigningKid: string;
+  changed: boolean;
+  verifyingKids: string[];
+  added: string[];
+  removed: string[];
+  auditSigningKid: string | undefined;
+  keptUntilRestart: string[];
+  restartNeeded: string[];
+  warnings: string[];
+  /** The id of the `admin.keys.reload` audit record, undefined when it was not written. */
+  auditId: string | undefined;
+}
+
+/** Overrides of `keysReload`'s refusals; each is sent only when true. */
+export interface KeysReloadOptions {
+  /** Accept a new signing key that drops the current one (`keys_reload_drops_current`). */
+  allowDropCurrent?: boolean;
+  /** Accept dropping a key that signed audit checkpoints or anchors (`keys_reload_drops_audit_key`). */
+  allowDropAuditKey?: boolean;
+  /** Accept a file whose `[issuer]` or `[audit]` differs (`config_file_mismatch`). */
+  allowMismatch?: boolean;
+}
+
+/**
+ * A signed prune anchor, as the server sends it (not verified here). `state` (`deleting` or
+ * `done`) and `shipped_at` (when `[audit.sink]` delivered it, null until then) come with a
+ * stored anchor (`auditAnchors`, `auditPrunePlan`), not with the answer of a prune.
+ */
+export interface AuditAnchor {
+  through_seq: number;
+  through_hash: string;
+  prune_seq: number;
+  prune_entry_hash: string;
+  previous_through_seq: number | null;
+  archive_sha256: string | null;
+  at: string;
+  kid: string;
+  signature: string;
+  state?: string;
+  shipped_at?: string | null;
+  [key: string]: unknown;
+}
+
+/**
+ * The bound each prune guard sets (`auditPrunePlan`). `limitedBy` is the refusal code of the
+ * guard that set `through` below `requested`, or `"before"`, or undefined when `through` is the
+ * request.
+ */
+export interface PruneGuards {
+  requested: number;
+  before: string | undefined;
+  minAgeCutoff: string;
+  liveRunSeq: number | undefined;
+  sinkDeliveredThrough: number | undefined;
+  sinkDegraded: boolean;
+  inProgress: boolean;
+  anchorUndelivered: boolean;
+  limitedBy: string | undefined;
+}
+
+/**
+ * The largest boundary the guards allow (`GET /admin/audit/prune/plan`). `through` is undefined
+ * when nothing can be pruned. The archive of a prune through `through` is the export
+ * `from`..`through`; `checkpoint` is the stored checkpoint at `through`, `at` the time of that
+ * entry, `anchor` the newest anchor.
+ */
+export interface PrunePlan {
+  from: number;
+  through: number | undefined;
+  entries: number;
+  checkpoint: StoredCheckpoint | undefined;
+  at: string | undefined;
+  guards: PruneGuards;
+  anchor: AuditAnchor | undefined;
+}
+
+/**
+ * What `[audit.sink]` did with a prune's anchor: `queued` by this call, the highest checkpoint
+ * seq the sink has `deliveredThrough`, when it delivered the anchor (`anchorShippedAt`) and
+ * whether it is still queued (`anchorPending`).
+ */
+export interface PruneShipped {
+  queued: boolean;
+  deliveredThrough: number | undefined;
+  anchorShippedAt: string | undefined;
+  anchorPending: boolean;
+}
+
+/**
+ * The answer of `POST /admin/audit/prune`. `deleting` is true while the maintenance task deletes
+ * the rows; `shipped` is undefined without `[audit.sink]`; `already` is true for a repeat of a
+ * prune that succeeded (nothing was written).
+ */
+export interface PruneResult {
+  pruneSeq: number;
+  prunedThrough: number;
+  anchor: AuditAnchor;
+  checkpointBefore: StoredCheckpoint | undefined;
+  checkpointAfter: StoredCheckpoint | undefined;
+  deleting: boolean;
+  shipped: PruneShipped | undefined;
+  already: boolean;
+}
+
+/** What `auditPrune` sends besides `through`: describe the archive, so the server can check it. */
+export interface PruneOptions {
+  /** SHA-256 (64 lower-case hex) of the archive file's bytes, signed into the anchor. */
+  archiveSha256?: string;
+  /** The archive's first seq: the prune is refused unless it is the first retained seq. */
+  from?: number;
+  /** The archive's last entry hash: the prune is refused unless it is the entry hash at `through`. */
+  throughHash?: string;
+}
+
+/** Prune anchors, newest first (`GET /admin/audit/anchors`). */
+export interface AnchorPage {
+  anchors: AuditAnchor[];
+  /** The opaque cursor of the next (older) page, undefined after the oldest. */
+  nextCursor: string | undefined;
+}
+
+/**
  * Filters and paging for `auditQuery` / `auditIter`. Each filter is an exact match, never a
  * pattern; the ones you set combine with AND.
  */
@@ -646,6 +812,90 @@ function strs(v: unknown): string[] {
   return Array.isArray(v) ? (v as string[]) : [];
 }
 
+function names(v: unknown): string[] {
+  return Array.isArray(v) ? v.map(String) : [];
+}
+
+function optNumber(v: unknown): number | undefined {
+  return v === null || v === undefined ? undefined : Number(v);
+}
+
+function optString(v: unknown): string | undefined {
+  return v === null || v === undefined ? undefined : String(v);
+}
+
+/** The body of a reload: the overrides that are set, `{}` for none. */
+function flags(f: Record<string, boolean | undefined>): Record<string, true> {
+  const out: Record<string, true> = {};
+  for (const [k, v] of Object.entries(f)) if (v === true) out[k] = true;
+  return out;
+}
+
+function clientChangesOf(v: unknown): ClientListChanges {
+  const b = obj(v) ?? {};
+  return {
+    count: Number(b.count ?? 0),
+    sha256: String(b.sha256 ?? ""),
+    added: names(b.added),
+    removed: names(b.removed),
+    changed: names(b.changed),
+  };
+}
+
+function anchorOf(v: unknown): AuditAnchor {
+  return { ...w.asObject(v, "anchor") } as AuditAnchor;
+}
+
+function storedCheckpointOf(v: unknown): StoredCheckpoint | undefined {
+  const b = obj(v);
+  return b === undefined ? undefined : ({ ...b } as StoredCheckpoint);
+}
+
+function prunePlanOf(b: Json): PrunePlan {
+  const g = obj(b.guards) ?? {};
+  return {
+    from: Number(b.from ?? 1),
+    through: optNumber(b.through),
+    entries: Number(b.entries ?? 0),
+    checkpoint: storedCheckpointOf(b.checkpoint),
+    at: optString(b.at),
+    guards: {
+      requested: Number(g.requested ?? 0),
+      before: optString(g.before),
+      minAgeCutoff: String(g.min_age_cutoff ?? ""),
+      liveRunSeq: optNumber(g.live_run_seq),
+      sinkDeliveredThrough: optNumber(g.sink_delivered_through),
+      sinkDegraded: g.sink_degraded === true,
+      inProgress: g.in_progress === true,
+      anchorUndelivered: g.anchor_undelivered === true,
+      limitedBy: optString(g.limited_by),
+    },
+    anchor: obj(b.anchor) === undefined ? undefined : anchorOf(b.anchor),
+  };
+}
+
+function pruneResultOf(b: Json): PruneResult {
+  const sh = obj(b.shipped);
+  return {
+    pruneSeq: Number(b.prune_seq),
+    prunedThrough: Number(b.pruned_through),
+    anchor: anchorOf(b.anchor),
+    checkpointBefore: storedCheckpointOf(b.checkpoint_before),
+    checkpointAfter: storedCheckpointOf(b.checkpoint_after),
+    deleting: b.deleting === true,
+    shipped:
+      sh === undefined
+        ? undefined
+        : {
+            queued: sh.queued === true,
+            deliveredThrough: optNumber(sh.delivered_through),
+            anchorShippedAt: optString(sh.anchor_shipped_at),
+            anchorPending: sh.anchor_pending === true,
+          },
+    already: b.already === true,
+  };
+}
+
 function entryDetailOf(b: Json): AuditEntryDetail {
   const [entry] = entriesOf({ entries: [w.asObject(b.entry, "audit entry")] });
   const states = Array.isArray(b.lease_states) ? (b.lease_states as Json[]) : [];
@@ -1071,8 +1321,113 @@ export class AdminClient {
   async operatorsReload(): Promise<OperatorsReload> {
     const res = await this.http.post("/admin/operators/reload", { json: {} });
     const b = w.asObject(await w.jsonBody(res), "operators reload");
-    const names = (v: unknown): string[] => (Array.isArray(v) ? v.map(String) : []);
     return { added: names(b.added), removed: names(b.removed), changed: names(b.changed) };
+  }
+
+  /**
+   * Re-read `[[agents]]` and `[[peps]]` from the server's config file and put both in force at
+   * once (role `admin`). Tokens already issued are not revoked. A file that does not parse or
+   * breaks a startup rule throws `ApiError` 422 `agents_invalid`; one that leaves a list empty,
+   * `agents_reload_empties` unless `allowEmpty`; one whose `[issuer]` or `[audit]` differs,
+   * `config_file_mismatch` unless `allowMismatch`. On every refusal the lists in force stay as
+   * they were.
+   */
+  async agentsReload(opts: AgentsReloadOptions = {}): Promise<AgentsReload> {
+    const json = flags({ allow_empty: opts.allowEmpty, allow_mismatch: opts.allowMismatch });
+    const res = await this.http.post("/admin/agents/reload", { json });
+    const b = w.asObject(await w.jsonBody(res), "agents reload");
+    return {
+      agents: clientChangesOf(b.agents),
+      peps: clientChangesOf(b.peps),
+      restartNeeded: names(b.restart_needed),
+      warnings: names(b.warnings),
+      restartWarnings: names(b.restart_warnings),
+      auditId: optString(b.audit_id),
+    };
+  }
+
+  /**
+   * Re-read the key files `[issuer] private_key_pem_path` and `previous_key_paths` name in the
+   * server's config file and put the new signing key and verifying keys in force at once (role
+   * `admin`). A new signing key that drops the current one throws `ApiError` 422
+   * `keys_reload_drops_current` unless `allowDropCurrent`; dropping a key that signed audit
+   * checkpoints or anchors, `keys_reload_drops_audit_key` unless `allowDropAuditKey`; another
+   * server's file, `config_file_mismatch` unless `allowMismatch`. On every refusal the keys in
+   * force stay as they were.
+   */
+  async keysReload(opts: KeysReloadOptions = {}): Promise<KeysReload> {
+    const json = flags({
+      allow_drop_current: opts.allowDropCurrent,
+      allow_drop_audit_key: opts.allowDropAuditKey,
+      allow_mismatch: opts.allowMismatch,
+    });
+    const res = await this.http.post("/admin/keys/reload", { json });
+    const b = w.asObject(await w.jsonBody(res), "keys reload");
+    return {
+      signingKid: String(b.signing_kid ?? ""),
+      previousSigningKid: String(b.previous_signing_kid ?? ""),
+      changed: b.changed === true,
+      verifyingKids: names(b.verifying_kids),
+      added: names(b.added),
+      removed: names(b.removed),
+      auditSigningKid: optString(b.audit_signing_kid),
+      keptUntilRestart: names(b.kept_until_restart),
+      restartNeeded: names(b.restart_needed),
+      warnings: names(b.warnings),
+      auditId: optString(b.audit_id),
+    };
+  }
+
+  /**
+   * `GET /admin/audit/prune/plan`: the largest boundary the guards allow at or below `through`
+   * (a seq), or for entries older than `before` (RFC 3339 or a `Date`), the head when neither is
+   * given; a `TypeError` for both. Reads only. `ApiError` 409 `prune_disabled` with
+   * `[audit.retention] prune = "off"`.
+   */
+  async auditPrunePlan(
+    opts: { through?: number; before?: string | Date } = {},
+  ): Promise<PrunePlan> {
+    if (opts.through !== undefined && opts.before !== undefined) {
+      throw new TypeError("give `through` or `before`, not both");
+    }
+    const query: Record<string, string | number> = {};
+    if (opts.through !== undefined) query.through = opts.through;
+    if (opts.before !== undefined) query.before = rfc3339(opts.before);
+    const res = await this.http.get("/admin/audit/prune/plan", { query });
+    return prunePlanOf(w.asObject(await w.jsonBody(res), "prune plan"));
+  }
+
+  /**
+   * `POST /admin/audit/prune`: prune the log through seq `through`. Export `from`..`through`
+   * first, verify it and keep it off the host; then pass the SHA-256 of its bytes as
+   * `archiveSha256`, its first seq as `from` and its last entry hash as `throughHash`, so the
+   * server refuses (409 `prune_archive_mismatch`) unless the archive covers what it prunes. A
+   * guard that refuses throws `ApiError` 409 with its code (`prune_not_at_checkpoint`,
+   * `prune_too_recent`, `sink_behind`, ...); a `through` below the boundary, 410
+   * `audit_pruned`. A repeat of a prune that succeeded answers `already: true`.
+   */
+  async auditPrune(through: number, opts: PruneOptions = {}): Promise<PruneResult> {
+    const json: Record<string, string | number> = { through };
+    if (opts.archiveSha256 !== undefined) json.archive_sha256 = opts.archiveSha256;
+    if (opts.from !== undefined) json.from = opts.from;
+    if (opts.throughHash !== undefined) json.through_hash = opts.throughHash;
+    const res = await this.http.post("/admin/audit/prune", { json });
+    return pruneResultOf(w.asObject(await w.jsonBody(res), "prune"));
+  }
+
+  /**
+   * The signed anchors of past prunes, newest first, each with its `state` and `shipped_at`;
+   * `cursor` is the `nextCursor` of the previous page (server default page 50, at most 500).
+   * Empty for a log never pruned.
+   */
+  async auditAnchors(opts: { cursor?: string; limit?: number } = {}): Promise<AnchorPage> {
+    const query: Record<string, string | number> = {};
+    if (opts.cursor !== undefined) query.cursor = opts.cursor;
+    if (opts.limit !== undefined) query.limit = opts.limit;
+    const res = await this.http.get("/admin/audit/anchors", { query });
+    const b = w.asObject(await w.jsonBody(res), "anchors");
+    const list = Array.isArray(b.anchors) ? b.anchors.filter((a) => obj(a) !== undefined) : [];
+    return { anchors: list.map(anchorOf), nextCursor: nextCursorOf(b) };
   }
 
   /**

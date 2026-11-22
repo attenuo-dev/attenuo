@@ -11,6 +11,7 @@
  */
 
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
+import { createHash, generateKeyPairSync } from "node:crypto";
 import {
   copyFileSync,
   existsSync,
@@ -1538,5 +1539,95 @@ describe.skipIf(!enabled)("a client assertion across the load retry", () => {
       clientAssertion: await clientKey.clientAssertion("signer", url),
     });
     expect(rec.sent.map((x) => x.status)).toEqual([429, 200]);
+  });
+});
+
+/** A new Ed25519 private key, PKCS #8 PEM, written to `path`. */
+function writeKey(path: string): void {
+  const { privateKey } = generateKeyPairSync("ed25519");
+  writeFileSync(path, privateKey.export({ type: "pkcs8", format: "pem" }), { mode: 0o600 });
+}
+
+describe.skipIf(!enabled)("agents and keys reload against the real server", () => {
+  // The issuer key is a file of the stack's own, and each test edits the config file.
+  let stack = { url: "", work: "", procs: [] as ChildProcess[] };
+
+  beforeAll(async () => {
+    stack = await startStack("", [], {
+      edits: { "[issuer]\n": '[issuer]\nprivate_key_pem_path = "{work}/issuer.pem"\n' },
+    });
+  });
+
+  afterAll(async () => {
+    await stopStack(stack.procs, stack.work);
+  });
+
+  it("adds an agent and refuses a file that empties the list", async () => {
+    const config = join(stack.work, "config.toml");
+    const text = readFileSync(config, "utf8");
+    const admin = new AdminClient(stack.url, ADMIN_TOKEN);
+    const same = await admin.agentsReload();
+    expect([same.agents.count, same.agents.added, same.agents.removed]).toEqual([2, [], []]);
+    expect([same.peps.count, same.restartNeeded]).toEqual([0, []]);
+    expect(same.auditId).toBeTruthy();
+    expect(same.agents.sha256).toHaveLength(64);
+
+    const digest = createHash("sha256").update("demo-auditor-secret").digest("hex");
+    writeFileSync(config, `${text}\n[[agents]]\nid = "auditor"\nsecret_sha256 = "${digest}"\n`);
+    const added = await admin.agentsReload();
+    expect([added.agents.count, added.agents.added]).toEqual([3, ["auditor"]]);
+    expect(added.agents.sha256).not.toBe(same.agents.sha256);
+
+    // A file cut short before its [[agents]]: refused, and nothing changes.
+    writeFileSync(config, text.split("[[agents]]")[0]!);
+    const err = await admin.agentsReload().catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect([(err as ApiError).status, (err as ApiError).code]).toEqual([
+      422,
+      "agents_reload_empties",
+    ]);
+    writeFileSync(config, text);
+    const back = await admin.agentsReload();
+    expect([back.agents.removed, back.agents.count]).toEqual([["auditor"], 2]);
+  });
+
+  it("rotates the signing key, and refuses to drop the current one", async () => {
+    const config = join(stack.work, "config.toml");
+    const text = readFileSync(config, "utf8");
+    const oldPem = join(stack.work, "issuer.pem");
+    const newPem = join(stack.work, "issuer-2.pem");
+    writeKey(newPem);
+    const admin = new AdminClient(stack.url, ADMIN_TOKEN);
+    const same = await admin.keysReload();
+    expect([same.changed, same.signingKid]).toEqual([false, same.previousSigningKid]);
+    expect(same.verifyingKids).toEqual([same.signingKid]);
+    const oldKid = same.signingKid;
+
+    writeFileSync(config, text.replace(oldPem, newPem));
+    const err = await admin.keysReload().catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect([(err as ApiError).status, (err as ApiError).code]).toEqual([
+      422,
+      "keys_reload_drops_current",
+    ]);
+
+    writeFileSync(
+      config,
+      text.replace(
+        `private_key_pem_path = "${oldPem}"`,
+        `private_key_pem_path = "${newPem}"\nprevious_key_paths = ["${oldPem}"]`,
+      ),
+    );
+    const rotated = await admin.keysReload();
+    expect([rotated.changed, rotated.previousSigningKid]).toEqual([true, oldKid]);
+    expect(rotated.signingKid).not.toBe(oldKid);
+    expect(rotated.added).toEqual([rotated.signingKid]);
+    expect(rotated.verifyingKids).toEqual([rotated.signingKid, oldKid]);
+    expect(rotated.auditSigningKid).toBe(rotated.signingKid);
+    const jwks = (await (await fetch(`${stack.url}/.well-known/jwks.json`)).json()) as {
+      keys: { kid: string }[];
+    };
+    expect(jwks.keys.map((k) => k.kid)).toEqual(rotated.verifyingKids);
+    expect((await admin.keysReload()).changed).toBe(false);
   });
 });

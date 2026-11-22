@@ -172,6 +172,147 @@ class OperatorsReload:
 
 
 @dataclass(frozen=True)
+class ClientListChanges:
+    """One list's part of :class:`AgentsReload` (``[[agents]]`` or ``[[peps]]``): ``count``
+    entries in force now, ``sha256`` of the list's canonical form, and the ids ``added``,
+    ``removed`` and ``changed`` (another ``secret_sha256`` or ``jwks``)."""
+
+    count: int
+    sha256: str
+    added: list[str]
+    removed: list[str]
+    changed: list[str]
+
+
+@dataclass(frozen=True)
+class AgentsReload:
+    """What ``POST /admin/agents/reload`` put in force. ``restart_needed`` names the other
+    sections of the file that differ from the running config (not applied); ``warnings`` are the
+    startup warnings of the new lists; ``restart_warnings`` say what the file's own settings
+    would refuse after a restart. ``audit_id`` is the id of the audit record, when written."""
+
+    agents: ClientListChanges
+    peps: ClientListChanges
+    restart_needed: list[str]
+    warnings: list[str]
+    restart_warnings: list[str]
+    audit_id: str | None = None
+
+
+@dataclass(frozen=True)
+class KeysReload:
+    """What ``POST /admin/keys/reload`` put in force, by key id (``kid``) only.
+
+    ``changed`` is false when the file names the keys in force (nothing was swapped).
+    ``verifying_kids`` is the set the JWKS lists now, the signing key first; ``added`` and
+    ``removed`` compare it with the set before. ``audit_signing_kid`` signs audit checkpoints
+    and prune anchors from now on. ``kept_until_restart`` names what stays keyed by the startup
+    key."""
+
+    signing_kid: str
+    previous_signing_kid: str
+    changed: bool
+    verifying_kids: list[str]
+    added: list[str]
+    removed: list[str]
+    audit_signing_kid: str | None
+    kept_until_restart: list[str]
+    restart_needed: list[str]
+    warnings: list[str]
+    audit_id: str | None = None
+
+
+@dataclass(frozen=True)
+class AuditAnchor:
+    """A signed prune anchor. ``state`` (``deleting`` or ``done``) and ``shipped_at`` (when
+    ``[audit.sink]`` delivered it) are set when the server lists it as stored, ``None`` in the
+    answer of a prune. ``raw`` is the anchor as the server sent it."""
+
+    through_seq: int
+    through_hash: str
+    prune_seq: int
+    prune_entry_hash: str
+    previous_through_seq: int | None
+    archive_sha256: str | None
+    at: str
+    kid: str
+    signature: str
+    state: str | None = None
+    shipped_at: str | None = None
+    raw: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
+
+
+@dataclass(frozen=True)
+class PruneGuards:
+    """The bound each prune guard sets (``GET /admin/audit/prune/plan``). ``limited_by`` is the
+    refusal code of the guard that set ``through`` below ``requested``, or ``"before"``, or
+    ``None`` when ``through`` is the request."""
+
+    requested: int
+    before: str | None
+    min_age_cutoff: str
+    live_run_seq: int | None
+    sink_delivered_through: int | None
+    sink_degraded: bool
+    in_progress: bool
+    anchor_undelivered: bool
+    limited_by: str | None
+
+
+@dataclass(frozen=True)
+class PrunePlan:
+    """The largest boundary the guards allow (``GET /admin/audit/prune/plan``). ``through`` is
+    ``None`` when nothing can be pruned. The archive of a prune through ``through`` is the export
+    ``from_..through`` (``from_`` is the log's first retained seq). ``checkpoint`` is the stored
+    checkpoint at ``through``, ``at`` the time of that entry, ``anchor`` the newest anchor."""
+
+    from_: int
+    through: int | None
+    entries: int
+    checkpoint: dict[str, Any] | None
+    at: str | None
+    guards: PruneGuards
+    anchor: AuditAnchor | None
+
+
+@dataclass(frozen=True)
+class PruneShipped:
+    """What ``[audit.sink]`` did with a prune's anchor: ``queued`` by this call, the highest
+    checkpoint seq the sink has ``delivered_through``, when it delivered the anchor
+    (``anchor_shipped_at``) and whether it is still queued (``anchor_pending``)."""
+
+    queued: bool
+    delivered_through: int | None
+    anchor_shipped_at: str | None
+    anchor_pending: bool
+
+
+@dataclass(frozen=True)
+class PruneResult:
+    """The answer of ``POST /admin/audit/prune``. ``deleting`` is true while the maintenance
+    task deletes the rows; ``shipped`` is ``None`` without ``[audit.sink]``; ``already`` is true
+    for a repeat of a prune that succeeded (nothing was written)."""
+
+    prune_seq: int
+    pruned_through: int
+    anchor: AuditAnchor
+    checkpoint_before: dict[str, Any] | None
+    checkpoint_after: dict[str, Any] | None
+    deleting: bool
+    shipped: PruneShipped | None
+    already: bool
+
+
+@dataclass(frozen=True)
+class AnchorPage:
+    """Prune anchors, newest first (``GET /admin/audit/anchors``); ``next_cursor`` fetches the
+    next (older) page, ``None`` after the oldest."""
+
+    anchors: list[AuditAnchor]
+    next_cursor: str | None
+
+
+@dataclass(frozen=True)
 class AuditFilter:
     """Filters for :meth:`AdminClient.audit_query`. Each is an exact match, never a pattern;
     the ones you set combine with AND.
@@ -769,6 +910,156 @@ def _operators_reload(b: Any) -> OperatorsReload:
     )
 
 
+def _strs(v: Any) -> list[str]:
+    return [str(x) for x in v] if isinstance(v, list) else []
+
+
+def _opt_str(v: Any) -> str | None:
+    return None if v is None else str(v)
+
+
+def _opt_int(v: Any) -> int | None:
+    return None if v is None else int(v)
+
+
+def _flags(**flags: bool) -> dict[str, Any]:
+    """The body of a reload: the overrides that are set, ``{}`` for none."""
+    return {k: True for k, v in flags.items() if v}
+
+
+def _client_changes(v: Any) -> ClientListChanges:
+    b = v if isinstance(v, dict) else {}
+    return ClientListChanges(
+        count=int(b.get("count", 0)),
+        sha256=str(b.get("sha256", "")),
+        added=_strs(b.get("added")),
+        removed=_strs(b.get("removed")),
+        changed=_strs(b.get("changed")),
+    )
+
+
+def _agents_reload(b: Any) -> AgentsReload:
+    return AgentsReload(
+        agents=_client_changes(b.get("agents")),
+        peps=_client_changes(b.get("peps")),
+        restart_needed=_strs(b.get("restart_needed")),
+        warnings=_strs(b.get("warnings")),
+        restart_warnings=_strs(b.get("restart_warnings")),
+        audit_id=_opt_str(b.get("audit_id")),
+    )
+
+
+def _keys_reload(b: Any) -> KeysReload:
+    return KeysReload(
+        signing_kid=str(b.get("signing_kid", "")),
+        previous_signing_kid=str(b.get("previous_signing_kid", "")),
+        changed=b.get("changed") is True,
+        verifying_kids=_strs(b.get("verifying_kids")),
+        added=_strs(b.get("added")),
+        removed=_strs(b.get("removed")),
+        audit_signing_kid=_opt_str(b.get("audit_signing_kid")),
+        kept_until_restart=_strs(b.get("kept_until_restart")),
+        restart_needed=_strs(b.get("restart_needed")),
+        warnings=_strs(b.get("warnings")),
+        audit_id=_opt_str(b.get("audit_id")),
+    )
+
+
+def _anchor(v: Any) -> AuditAnchor:
+    return AuditAnchor(
+        through_seq=int(v["through_seq"]),
+        through_hash=str(v["through_hash"]),
+        prune_seq=int(v["prune_seq"]),
+        prune_entry_hash=str(v["prune_entry_hash"]),
+        previous_through_seq=_opt_int(v.get("previous_through_seq")),
+        archive_sha256=_opt_str(v.get("archive_sha256")),
+        at=str(v["at"]),
+        kid=str(v["kid"]),
+        signature=str(v["signature"]),
+        state=_opt_str(v.get("state")),
+        shipped_at=_opt_str(v.get("shipped_at")),
+        raw=dict(v),
+    )
+
+
+def _opt_obj(v: Any) -> dict[str, Any] | None:
+    return dict(v) if isinstance(v, dict) else None
+
+
+def _prune_plan_params(through: int | None, before: str | datetime | None) -> dict[str, Any]:
+    if through is not None and before is not None:
+        raise ValueError("give `through` or `before`, not both")
+    if through is not None:
+        return {"through": int(through)}
+    if before is not None:
+        return {"before": _rfc3339(before)}
+    return {}
+
+
+def _prune_plan(b: Any) -> PrunePlan:
+    g = b.get("guards") if isinstance(b.get("guards"), dict) else {}
+    anchor = b.get("anchor")
+    return PrunePlan(
+        from_=int(b.get("from", 1)),
+        through=_opt_int(b.get("through")),
+        entries=int(b.get("entries", 0)),
+        checkpoint=_opt_obj(b.get("checkpoint")),
+        at=_opt_str(b.get("at")),
+        guards=PruneGuards(
+            requested=int(g.get("requested", 0)),
+            before=_opt_str(g.get("before")),
+            min_age_cutoff=str(g.get("min_age_cutoff", "")),
+            live_run_seq=_opt_int(g.get("live_run_seq")),
+            sink_delivered_through=_opt_int(g.get("sink_delivered_through")),
+            sink_degraded=g.get("sink_degraded") is True,
+            in_progress=g.get("in_progress") is True,
+            anchor_undelivered=g.get("anchor_undelivered") is True,
+            limited_by=_opt_str(g.get("limited_by")),
+        ),
+        anchor=_anchor(anchor) if isinstance(anchor, dict) else None,
+    )
+
+
+def _prune_body(
+    through: int, archive_sha256: str | None, from_: int | None, through_hash: str | None
+) -> dict[str, Any]:
+    body: dict[str, Any] = {"through": int(through)}
+    if archive_sha256 is not None:
+        body["archive_sha256"] = archive_sha256
+    if from_ is not None:
+        body["from"] = int(from_)
+    if through_hash is not None:
+        body["through_hash"] = through_hash
+    return body
+
+
+def _prune_result(b: Any) -> PruneResult:
+    sh = b.get("shipped")
+    return PruneResult(
+        prune_seq=int(b["prune_seq"]),
+        pruned_through=int(b["pruned_through"]),
+        anchor=_anchor(b["anchor"]),
+        checkpoint_before=_opt_obj(b.get("checkpoint_before")),
+        checkpoint_after=_opt_obj(b.get("checkpoint_after")),
+        deleting=b.get("deleting") is True,
+        shipped=PruneShipped(
+            queued=sh.get("queued") is True,
+            delivered_through=_opt_int(sh.get("delivered_through")),
+            anchor_shipped_at=_opt_str(sh.get("anchor_shipped_at")),
+            anchor_pending=sh.get("anchor_pending") is True,
+        )
+        if isinstance(sh, dict)
+        else None,
+        already=b.get("already") is True,
+    )
+
+
+def _anchor_page(b: Any) -> AnchorPage:
+    return AnchorPage(
+        [_anchor(a) for a in b.get("anchors") or [] if isinstance(a, dict)], _next_cursor(b)
+    )
+
+
 def _policy_set(b: Any) -> PolicySet:
     return PolicySet(
         path=b.get("path"),
@@ -1111,6 +1402,73 @@ class AdminClient:
         (role ``admin``). A list that does not parse, breaks a rule or would leave no ``admin``
         raises ``ApiError`` (422) and the operators in force stay as they were."""
         return _operators_reload(w.json_body(self._http.post("/admin/operators/reload", json={})))
+
+    def agents_reload(
+        self, allow_empty: bool = False, allow_mismatch: bool = False
+    ) -> AgentsReload:
+        """Re-read ``[[agents]]`` and ``[[peps]]`` from the server's config file and put both in
+        force at once (role ``admin``). Tokens already issued are not revoked. A file that does
+        not parse or breaks a startup rule raises ``ApiError`` 422 ``agents_invalid``; one that
+        leaves a list empty, ``agents_reload_empties`` unless ``allow_empty``; one whose
+        ``[issuer]`` or ``[audit]`` differs, ``config_file_mismatch`` unless ``allow_mismatch``.
+        On every refusal the lists in force stay as they were."""
+        body = _flags(allow_empty=allow_empty, allow_mismatch=allow_mismatch)
+        return _agents_reload(w.json_body(self._http.post("/admin/agents/reload", json=body)))
+
+    def keys_reload(
+        self,
+        allow_drop_current: bool = False,
+        allow_drop_audit_key: bool = False,
+        allow_mismatch: bool = False,
+    ) -> KeysReload:
+        """Re-read the key files ``[issuer] private_key_pem_path`` and ``previous_key_paths``
+        name in the server's config file and put the new signing key and verifying keys in force
+        at once (role ``admin``). A new signing key that drops the current one raises
+        ``ApiError`` 422 ``keys_reload_drops_current`` unless ``allow_drop_current``; dropping a
+        key that signed audit checkpoints or anchors, ``keys_reload_drops_audit_key`` unless
+        ``allow_drop_audit_key``; another server's file, ``config_file_mismatch`` unless
+        ``allow_mismatch``. On every refusal the keys in force stay as they were."""
+        body = _flags(
+            allow_drop_current=allow_drop_current,
+            allow_drop_audit_key=allow_drop_audit_key,
+            allow_mismatch=allow_mismatch,
+        )
+        return _keys_reload(w.json_body(self._http.post("/admin/keys/reload", json=body)))
+
+    def audit_prune_plan(
+        self, through: int | None = None, before: str | datetime | None = None
+    ) -> PrunePlan:
+        """``GET /admin/audit/prune/plan``: the largest boundary the guards allow at or below
+        ``through`` (a seq), or for entries older than ``before`` (RFC 3339 or an aware
+        datetime), the head when neither is given; ``ValueError`` for both. Reads only.
+        ``ApiError`` 409 ``prune_disabled`` with ``[audit.retention] prune = "off"``."""
+        params = _prune_plan_params(through, before)
+        return _prune_plan(w.json_body(self._http.get("/admin/audit/prune/plan", params=params)))
+
+    def audit_prune(
+        self,
+        through: int,
+        archive_sha256: str | None = None,
+        from_: int | None = None,
+        through_hash: str | None = None,
+    ) -> PruneResult:
+        """``POST /admin/audit/prune``: prune the log through seq ``through``. Export
+        ``from_..through`` first, verify it and keep it off the host; then pass the SHA-256 of
+        its bytes as ``archive_sha256``, its first seq as ``from_`` and its last entry hash as
+        ``through_hash``, so the server refuses (409 ``prune_archive_mismatch``) unless the
+        archive covers what it prunes. A guard that refuses raises ``ApiError`` 409 with its
+        code (``prune_not_at_checkpoint``, ``prune_too_recent``, ``sink_behind``, ...); a
+        ``through`` below the boundary, 410 ``audit_pruned``. A repeat of a prune that succeeded
+        answers ``already=True``."""
+        body = _prune_body(through, archive_sha256, from_, through_hash)
+        return _prune_result(w.json_body(self._http.post("/admin/audit/prune", json=body)))
+
+    def audit_anchors(self, cursor: str | None = None, limit: int | None = None) -> AnchorPage:
+        """The signed anchors of past prunes, newest first, each with its ``state`` and
+        ``shipped_at``; ``cursor`` is the ``next_cursor`` of the previous page (server default
+        page 50, at most 500). Empty for a log never pruned."""
+        params = _checkpoint_params(cursor, limit)
+        return _anchor_page(w.json_body(self._http.get("/admin/audit/anchors", params=params)))
 
     def lease_tree(self, lease_id: str, max_nodes: int | None = None) -> LeaseTree:
         """The lease, its descendants and ancestors, and how many leases a revoke would change
@@ -1458,6 +1816,51 @@ class AsyncAdminClient:
     async def operators_reload(self) -> OperatorsReload:
         b = w.json_body(await self._http.post("/admin/operators/reload", json={}))
         return _operators_reload(b)
+
+    async def agents_reload(
+        self, allow_empty: bool = False, allow_mismatch: bool = False
+    ) -> AgentsReload:
+        body = _flags(allow_empty=allow_empty, allow_mismatch=allow_mismatch)
+        b = w.json_body(await self._http.post("/admin/agents/reload", json=body))
+        return _agents_reload(b)
+
+    async def keys_reload(
+        self,
+        allow_drop_current: bool = False,
+        allow_drop_audit_key: bool = False,
+        allow_mismatch: bool = False,
+    ) -> KeysReload:
+        body = _flags(
+            allow_drop_current=allow_drop_current,
+            allow_drop_audit_key=allow_drop_audit_key,
+            allow_mismatch=allow_mismatch,
+        )
+        b = w.json_body(await self._http.post("/admin/keys/reload", json=body))
+        return _keys_reload(b)
+
+    async def audit_prune_plan(
+        self, through: int | None = None, before: str | datetime | None = None
+    ) -> PrunePlan:
+        params = _prune_plan_params(through, before)
+        b = w.json_body(await self._http.get("/admin/audit/prune/plan", params=params))
+        return _prune_plan(b)
+
+    async def audit_prune(
+        self,
+        through: int,
+        archive_sha256: str | None = None,
+        from_: int | None = None,
+        through_hash: str | None = None,
+    ) -> PruneResult:
+        body = _prune_body(through, archive_sha256, from_, through_hash)
+        return _prune_result(w.json_body(await self._http.post("/admin/audit/prune", json=body)))
+
+    async def audit_anchors(
+        self, cursor: str | None = None, limit: int | None = None
+    ) -> AnchorPage:
+        params = _checkpoint_params(cursor, limit)
+        b = w.json_body(await self._http.get("/admin/audit/anchors", params=params))
+        return _anchor_page(b)
 
     async def lease_tree(self, lease_id: str, max_nodes: int | None = None) -> LeaseTree:
         params = {} if max_nodes is None else {"max_nodes": max_nodes}
