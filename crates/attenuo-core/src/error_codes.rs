@@ -244,6 +244,7 @@ pub const ERROR_CODES: &[ErrorCode] = &[
     d("policy_deny", NONE, DENY, "The Cedar policy denies the call."),
     d("policy_error", NONE, DENY, "The call could not be evaluated safely (fail closed)."),
     e("policy_invalid", &[r(422, "policy_invalid")], NO_RPC, "The policy set does not parse or validate."),
+    e("prune_archive_mismatch", &[r(409, "prune_archive_mismatch")], NO_RPC, "The archive a prune request describes (`from`, `through_hash`) is not the prefix the prune removes, or not the one a repeated prune was made with."),
     e("prune_conflict", &[r(409, "prune_conflict")], NO_RPC, "The log was already pruned through this seq with another archive digest."),
     e("prune_disabled", &[r(409, "prune_disabled")], NO_RPC, "`[audit.retention] prune` is `\"off\"`: the audit log is not pruned."),
     e("prune_in_progress", &[r(409, "prune_in_progress")], NO_RPC, "The rows of an earlier prune are still being deleted."),

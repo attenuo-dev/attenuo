@@ -175,6 +175,7 @@ The table is generated from `attenuo_core::error_codes::ERROR_CODES`, the one pl
 | `policy_deny` |  | `-32003` (200) | yes | The Cedar policy denies the call. |
 | `policy_error` |  | `-32003` (200) | yes | The call could not be evaluated safely (fail closed). |
 | `policy_invalid` | 422 |  |  | The policy set does not parse or validate. |
+| `prune_archive_mismatch` | 409 |  |  | The archive a prune request describes (`from`, `through_hash`) is not the prefix the prune removes, or not the one a repeated prune was made with. |
 | `prune_conflict` | 409 |  |  | The log was already pruned through this seq with another archive digest. |
 | `prune_disabled` | 409 |  |  | `[audit.retention] prune` is `"off"`: the audit log is not pruned. |
 | `prune_in_progress` | 409 |  |  | The rows of an earlier prune are still being deleted. |
@@ -711,7 +712,7 @@ With `[audit.retention] prune = "manual"` ([config](config.md#auditretention), [
 
 `through` is null when nothing can be pruned. `limited_by` says what set `through` below the request: the refusal code of a guard (see the table below), or `"before"` when it was the `before` time asked for, which is not a refusal. `anchor_undelivered` is true while `[audit.sink]` has not delivered the anchor of the previous prune, which holds the next one (`sink_behind`). The archive of that prune is the export `from..=through`: export it, verify it with `attenuo audit verify --file`, and keep it off the host before pruning.
 
-`POST /admin/audit/prune` with `{"through": B, "archive_sha256": "<64 hex>"}` (`archive_sha256` optional, the SHA-256 of the archive file's bytes) commits the prune in one transaction: the signed checkpoint of the head (if it has none), the prune record (`admin`, tool `admin.audit.prune`, its arguments `{through_seq, through_hash, previous_through_seq, archive_sha256}`), the signed anchor, and the checkpoint of the prune record. With `[audit.sink]` the two checkpoints and the anchor are queued for shipping. It answers:
+`POST /admin/audit/prune` with `{"through": B, "archive_sha256": "<64 hex>", "from": F, "through_hash": "<64 hex>"}` commits the prune in one transaction: the signed checkpoint of the head (if it has none), the prune record (`admin`, tool `admin.audit.prune`, its arguments `{through_seq, through_hash, previous_through_seq, archive_sha256}`), the signed anchor, and the checkpoint of the prune record. With `[audit.sink]` the two checkpoints and the anchor are queued for shipping. The members after `through` are optional, for compatibility, but a client should always send them: `archive_sha256` is the SHA-256 of the archive file's bytes, signed into the anchor; `from` is the archive's first seq and `through_hash` its last entry hash. Only with `from` and `through_hash` does the server know that the archive covers what it prunes: the transaction refuses with `prune_archive_mismatch` unless `from` is the log's first retained seq at that moment and `through_hash` the entry hash at B. Without them, an archive of `1001..=2000` with `through: 2000` would prune `1..=1000` archived nowhere. `attenuo audit prune` sends all three. It answers:
 
 ```json
 {"prune_seq": 1041231, "pruned_through": 1000000, "anchor": {...},
@@ -723,7 +724,7 @@ With `[audit.retention] prune = "manual"` ([config](config.md#auditretention), [
 
 `shipped` is null without `[audit.sink]`. `queued` says whether this call queued the anchor (and, for a new prune, the two checkpoints); `delivered_through` is the highest checkpoint seq the sink has delivered since the server started; `anchor_shipped_at` is when the sink delivered the anchor (null until then), and `anchor_pending` whether it is queued and not yet delivered. The anchor is never dropped from a full queue, and it is queued again at start-up while `anchor_shipped_at` is null. A repeated request for a prune whose anchor is neither delivered nor queued queues it again.
 
-From then on every read starts at B + 1. The rows at or below B are deleted afterwards, in transactions of `[audit.retention] batch_rows`, by the maintenance task; a restart resumes them, and the anchor's `state` goes from `deleting` to `done`. Repeating a request that succeeded answers 200 with the stored anchor and `"already": true`. The guards, each a 409 with nothing written:
+From then on every read starts at B + 1. The rows at or below B are deleted afterwards, in transactions of `[audit.retention] batch_rows`, by the maintenance task; a restart resumes them, and the anchor's `state` goes from `deleting` to `done`. Repeating a request that succeeded (the same `archive_sha256`, and `from` and `through_hash` that match the stored anchor when given) answers 200 with the stored anchor and `"already": true`. The guards, each a 409 with nothing written:
 
 | Code | Refused when |
 | --- | --- |
@@ -733,6 +734,7 @@ From then on every read starts at B + 1. The rows at or below B are deleted afte
 | `sink_behind` | `[audit.sink]` is degraded, has not delivered the checkpoint at B or a later one since the server started, or has not delivered the anchor of the previous prune |
 | `prune_in_progress` | the rows of an earlier prune are still being deleted |
 | `prune_conflict` | B was already pruned with another `archive_sha256` |
+| `prune_archive_mismatch` | `from` is not the first retained seq, or `through_hash` is not the entry hash at B; for a repeat of a prune that succeeded, they differ from the stored anchor (`previous_through_seq + 1`, or 1, and `through_hash`) |
 
 A `through` below the current boundary is 410 `audit_pruned`, with `pruned_through`, `prune_seq` and `first` as on every other 410 `audit_pruned`; 400 `invalid_request` for a malformed body, a `through` of 0 or an `archive_sha256` that is not 64 lower-case hex digits.
 

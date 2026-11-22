@@ -129,10 +129,10 @@ pub fn parse_shipped_anchors(text: &str) -> Result<Vec<(usize, ShippedAnchor)>, 
         if line.trim().is_empty() {
             continue;
         }
-        let Ok(v) = serde_json::from_str::<Value>(line) else {
+        let Ok(values) = line_values(line) else {
             continue;
         };
-        if v.get("anchor").is_some() {
+        for v in values.into_iter().filter(|v| v.get("anchor").is_some()) {
             let a: ShippedAnchor = serde_json::from_value(v)
                 .map_err(|e| AuditError::Export(format!("shipped anchors, line {}: {e}", n + 1)))?;
             out.push((n + 1, a));
@@ -214,36 +214,46 @@ pub fn parse_shipped(text: &str) -> Result<Vec<ShippedLine>, AuditError> {
         }
         let at =
             |e: String| AuditError::Export(format!("shipped checkpoints, line {}: {e}", n + 1));
-        let mut v: Value = serde_json::from_str(line).map_err(|e| at(e.to_string()))?;
-        if v.get("anchor").is_some()
-            && v.get("format").and_then(Value::as_str) == Some(SHIPPED_ANCHOR_FORMAT)
-        {
-            continue;
-        }
-        let parsed = if v.get("checkpoint").is_some() {
-            let s: ShippedCheckpoint = serde_json::from_value(v).map_err(|e| at(e.to_string()))?;
-            ShippedLine {
-                line: n + 1,
-                inconsistency: s.inconsistency(),
-                checkpoint: s.checkpoint,
+        for mut v in line_values(line).map_err(|e| at(e.to_string()))? {
+            if v.get("anchor").is_some()
+                && v.get("format").and_then(Value::as_str) == Some(SHIPPED_ANCHOR_FORMAT)
+            {
+                continue;
             }
-        } else {
-            if let Some(obj) = v.as_object_mut() {
-                match obj.remove("type") {
-                    None => {}
-                    Some(Value::String(t)) if t == "checkpoint" => {}
-                    Some(t) => return Err(at(format!("not a checkpoint line (type {t})"))),
+            let parsed = if v.get("checkpoint").is_some() {
+                let s: ShippedCheckpoint =
+                    serde_json::from_value(v).map_err(|e| at(e.to_string()))?;
+                ShippedLine {
+                    line: n + 1,
+                    inconsistency: s.inconsistency(),
+                    checkpoint: s.checkpoint,
                 }
-            }
-            ShippedLine {
-                line: n + 1,
-                checkpoint: serde_json::from_value(v).map_err(|e| at(e.to_string()))?,
-                inconsistency: None,
-            }
-        };
-        out.push(parsed);
+            } else {
+                if let Some(obj) = v.as_object_mut() {
+                    match obj.remove("type") {
+                        None => {}
+                        Some(Value::String(t)) if t == "checkpoint" => {}
+                        Some(t) => return Err(at(format!("not a checkpoint line (type {t})"))),
+                    }
+                }
+                ShippedLine {
+                    line: n + 1,
+                    checkpoint: serde_json::from_value(v).map_err(|e| at(e.to_string()))?,
+                    inconsistency: None,
+                }
+            };
+            out.push(parsed);
+        }
     }
     Ok(out)
+}
+
+/// The JSON values of one line: usually one, or several objects written back to back (S3
+/// objects joined with `cat`, which adds no newline between them).
+fn line_values(line: &str) -> Result<Vec<Value>, serde_json::Error> {
+    serde_json::Deserializer::from_str(line)
+        .into_iter::<Value>()
+        .collect()
 }
 
 /// A shipped checkpoint the export disagrees with, or one that is unusable.
@@ -460,5 +470,179 @@ mod tests {
         assert_eq!(parse_shipped(bare).unwrap()[0].checkpoint, cp(1));
         assert!(parse_shipped("{\"type\":\"entry\",\"seq\":1}").is_err());
         assert!(parse_shipped("not json").is_err());
+    }
+}
+
+/// Result of [`cross_check_anchors`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnchorCheckReport {
+    /// Anchor lines in the shipped file.
+    pub shipped: u64,
+    /// Shipped anchors whose prune record lies at or before the export's end: the export was
+    /// taken after that prune, so it must account for it (checked).
+    pub checked: u64,
+    /// Of those, the ones the export accounts for.
+    pub matched: u64,
+    /// Shipped anchors whose prune record is past the export's end (an archive, or an export
+    /// taken before that prune): not checked.
+    pub beyond_range: u64,
+    /// Each shipped anchor the export does not account for, or that is unusable; `seq` is the
+    /// anchor's `through_seq`. Also the export header's own anchor when the shipped file holds
+    /// no anchor for its boundary or another one.
+    pub mismatches: Vec<ShippedMismatch>,
+    /// No mismatches.
+    pub ok: bool,
+}
+
+/// Compare `export` with the prune anchors shipped off the host (ADR-0015), the anchors that
+/// [`parse_shipped_anchors`] reads from the same file as the checkpoints.
+///
+/// Each shipped anchor must verify against `keys`, and its envelope must agree with it. Then,
+/// for an anchor whose prune record (`prune_seq`) is at or before the export's last seq (the
+/// export was taken after that prune):
+///
+/// - an anchor for a boundary below the export's start (`through_seq < from - 1`) is an older
+///   prune, accounted for;
+/// - the anchor of the boundary right before the export's start (`through_seq == from - 1`)
+///   must be the export header's anchor, member for member;
+/// - an anchor whose boundary is at or past the export's start says entries the export holds
+///   were pruned: the log was **rewound** to before that prune (a restored backup, or the
+///   anchor row removed), and it is reported.
+///
+/// An anchor whose prune record is past the export's end is not checked (an archive, or an
+/// export taken before that prune), except when its boundary lies inside the export and is
+/// not its last entry: the export then holds entries a later prune removed, so it is older
+/// than that prune or the log was rewound, and it is reported.
+///
+/// An export whose header carries an anchor needs that anchor in the shipped file: none, or
+/// another one for the same boundary, is a mismatch. With no anchor line in the shipped file
+/// at all and no anchor in the header, the report is empty and `ok`.
+pub fn cross_check_anchors(
+    export: &Export,
+    shipped: &[(usize, ShippedAnchor)],
+    keys: &CheckpointKeys,
+) -> AnchorCheckReport {
+    let (from, to) = export.header.as_ref().map_or((1, 0), |h| (h.from, h.to));
+    let last = export.entries.last().map_or(to, |e| e.seq.max(to));
+    let header_anchor = export.header.as_ref().and_then(|h| h.anchor.as_ref());
+    let mut mismatches = Vec::new();
+    let (mut checked, mut matched, mut beyond) = (0u64, 0u64, 0u64);
+    let mut first_by_through: BTreeMap<u64, (usize, &Anchor)> = BTreeMap::new();
+    let mut header_seen = false;
+    for (line, s) in shipped {
+        let a = &s.anchor;
+        let mut fail = |reason: String| {
+            mismatches.push(ShippedMismatch {
+                seq: a.through_seq,
+                line: *line,
+                reason,
+            })
+        };
+        let canonical = attenuo_core::jcs::to_vec(a).expect("anchors have a canonical form");
+        if s.format != SHIPPED_ANCHOR_FORMAT {
+            fail(format!(
+                "shipped envelope is inconsistent: unsupported format `{}`",
+                s.format
+            ));
+            continue;
+        }
+        if s.kid != a.kid || s.signature != a.signature {
+            fail(
+                "shipped envelope is inconsistent: `kid` or `signature` differs from the \
+                 anchor's own"
+                    .to_string(),
+            );
+            continue;
+        }
+        if s.anchor_sha256 != hex::encode(Sha256::digest(&canonical)) {
+            fail(
+                "shipped envelope is inconsistent: `anchor_sha256` does not match the anchor"
+                    .to_string(),
+            );
+            continue;
+        }
+        if let Err(reason) = keys.verify_anchor(a) {
+            fail(format!("shipped anchor does not verify: {reason}"));
+            continue;
+        }
+        match first_by_through.get(&a.through_seq) {
+            Some((prev, p)) if *p != a => {
+                fail(format!(
+                    "the sink holds two different anchors for this boundary (lines {prev} and \
+                     {line}): the log was pruned through this seq twice"
+                ));
+                continue;
+            }
+            Some(_) => continue, // a retried delivery: same content, counted once
+            None => {
+                first_by_through.insert(a.through_seq, (*line, a));
+            }
+        }
+        // The boundary right before the export's start: its header's anchor, wherever the
+        // export ends.
+        let at_start = a.through_seq.saturating_add(1) == from;
+        if a.prune_seq > last && !at_start {
+            // An archive ends at its prune's boundary; a boundary strictly inside the export
+            // says the export holds entries that a later prune removed.
+            let end = export.entries.last().map(|e| e.seq);
+            if a.through_seq >= from && a.through_seq <= last && Some(a.through_seq) != end {
+                checked += 1;
+                fail(format!(
+                    "the shipped prune through seq {} (its record at seq {} is past this \
+                     export's end at seq {last}) has its boundary inside this export: the \
+                     export was taken before that prune, or the log was rewound to before it; \
+                     check an export taken now",
+                    a.through_seq, a.prune_seq
+                ));
+                continue;
+            }
+            beyond += 1;
+            continue;
+        }
+        checked += 1;
+        if a.through_seq.saturating_add(1) < from {
+            matched += 1;
+        } else if at_start {
+            header_seen = true;
+            match header_anchor {
+                Some(h) if h == a => matched += 1,
+                Some(_) => fail(
+                    "the export's header carries another anchor for this boundary than the \
+                     one shipped"
+                        .to_string(),
+                ),
+                None => fail(
+                    "the export starts right after this shipped anchor's boundary, but its \
+                     header carries no anchor"
+                        .to_string(),
+                ),
+            }
+        } else {
+            fail(format!(
+                "REWOUND: the shipped anchor says the log was pruned through seq {}, but the \
+                 export holds entries from seq {from} (a restored backup, or the anchor row \
+                 removed)",
+                a.through_seq
+            ));
+        }
+    }
+    if let Some(h) = header_anchor {
+        if !header_seen {
+            mismatches.push(ShippedMismatch {
+                seq: h.through_seq,
+                line: 0,
+                reason: "the export's header anchor is not in the shipped file (it was not \
+                         shipped, or the file is incomplete)"
+                    .to_string(),
+            });
+        }
+    }
+    AnchorCheckReport {
+        shipped: shipped.len() as u64,
+        checked,
+        matched,
+        beyond_range: beyond,
+        ok: mismatches.is_empty(),
+        mismatches,
     }
 }

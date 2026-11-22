@@ -51,9 +51,9 @@ pub use checkpoint::{
 };
 pub use error::AuditError;
 pub use export::{
-    checkpoint_line, entry_line, header_line, parse_export, to_json_form, verify_export,
-    verify_export_with, Export, ExportHeader, ExportReport, RecordFilter, VerifyOptions,
-    EXPORT_FORMAT,
+    checkpoint_line, entry_line, header_line, link_exports, parse_export, to_json_form,
+    verify_export, verify_export_with, Export, ExportHeader, ExportReport, LinkProblem,
+    RecordFilter, VerifyOptions, EXPORT_FORMAT,
 };
 pub use lease::{
     approval_last_touched, lease_end, run_state_prunable, session_prunable, tree_prunable,
@@ -68,14 +68,14 @@ pub use memory::MemoryAudit;
 pub use query::{EntryFilter, Order};
 pub use replay::{ReplayOutcome, ReplayStore, REPLAY_PRUNE_BATCH};
 pub use shipped::{
-    checkpoint_sha256, cross_check, parse_shipped, parse_shipped_anchors, CrossCheckReport,
-    ShippedAnchor, ShippedCheckpoint, ShippedLine, ShippedMismatch, SHIPPED_ANCHOR_FORMAT,
-    SHIPPED_FORMAT,
+    checkpoint_sha256, cross_check, cross_check_anchors, parse_shipped, parse_shipped_anchors,
+    AnchorCheckReport, CrossCheckReport, ShippedAnchor, ShippedCheckpoint, ShippedLine,
+    ShippedMismatch, SHIPPED_ANCHOR_FORMAT, SHIPPED_FORMAT,
 };
 pub use spans::{SpanHit, MAX_SEQS_PER_PROBE, MAX_SPANS_PER_RUN};
 pub use sqlite::{
-    AnchorState, PlanBound, PlanGuards, PruneGuard, PruneLimits, PruneOutcome, PrunePlan,
-    PruneStep, SinkProgress, StoredAnchor,
+    AnchorState, PlanBound, PlanGuards, PruneExpect, PruneGuard, PruneLimits, PruneOutcome,
+    PrunePlan, PruneStep, SinkProgress, StoredAnchor,
 };
 pub use sqlite::{
     AppendStats, Durability, Filesystem, NewNotice, OutboxNotice, SchemaState, SqliteAudit,

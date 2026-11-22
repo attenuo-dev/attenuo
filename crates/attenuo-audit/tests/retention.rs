@@ -1313,3 +1313,464 @@ fn measure_the_live_run_lookup() {
         started.elapsed() / rounds
     );
 }
+
+// --- several files, and the shipped anchors -------------------------------------------------
+
+/// Two archives and the retained export, as the CLI writes them, for the tests below.
+struct ThreeFiles {
+    issuer: Issuer,
+    keys: CheckpointKeys,
+    texts: [String; 3],
+    anchors: [attenuo_audit::Anchor; 2],
+}
+
+fn three_files() -> ThreeFiles {
+    let issuer = issuer();
+    let keys = keys(&issuer);
+    let log = log_of(&issuer, 10, 45);
+    let export = |log: &SqliteAudit, from: u64, to: u64, anchor: Option<attenuo_audit::Anchor>| {
+        let header = ExportHeader::new(from, to, "2027-01-01T00:00:00Z".into()).with_anchor(anchor);
+        export_text(
+            &header,
+            &range(log, from, to),
+            &log.checkpoints_between(from, to).unwrap(),
+        )
+    };
+    let a1 = export(&log, 1, 20, None);
+    let first = prune(&log, 20, None).unwrap().anchor.anchor;
+    finish(&log, 100);
+    let a2 = export(&log, 21, 40, Some(first.clone()));
+    let second = prune(&log, 40, None).unwrap().anchor.anchor;
+    finish(&log, 100);
+    let head = log.head().unwrap().unwrap().seq;
+    let retained = export(&log, 41, head, Some(second.clone()));
+    ThreeFiles {
+        issuer,
+        keys,
+        texts: [a1, a2, retained],
+        anchors: [first, second],
+    }
+}
+
+/// The two archives and the retained export link, in order; out of order, with a file left
+/// out, or with a file that does not end at a checkpoint, the pair that does not link is named.
+#[test]
+fn archives_and_the_retained_export_link_as_one_log() {
+    let f = three_files();
+    let parsed: Vec<_> = f.texts.iter().map(|t| parse_export(t).unwrap()).collect();
+    for (i, p) in parsed.iter().enumerate() {
+        let r = verify_export(p, &f.keys).unwrap();
+        assert!(r.report.ok, "file {i}: {r:?}");
+    }
+    let all: Vec<_> = parsed.iter().collect();
+    assert!(attenuo_audit::link_exports(&all).is_empty());
+    // The middle archive left out: the seqs jump from 20 to 41.
+    let gap = attenuo_audit::link_exports(&[&parsed[0], &parsed[2]]);
+    assert_eq!((gap[0].earlier, gap[0].later), (0, 1));
+    assert!(gap[0].reason.contains("not contiguous"), "{gap:?}");
+    assert!(
+        gap.iter()
+            .any(|p| p.reason.contains("header anchor is through seq 40")),
+        "{gap:?}"
+    );
+    // Out of order.
+    let swapped = attenuo_audit::link_exports(&[&parsed[1], &parsed[0]]);
+    assert!(!swapped.is_empty());
+    // An archive cut one entry short of its checkpoint, and its next file starting after it.
+    let mut short = parsed[0].clone();
+    short.entries.pop();
+    short.checkpoints.retain(|c| c.seq != 20);
+    let mut next = parsed[1].clone();
+    next.header.as_mut().unwrap().anchor = None;
+    next.entries
+        .insert(0, parsed[0].entries.last().unwrap().clone());
+    let p = attenuo_audit::link_exports(&[&short, &next]);
+    assert!(
+        p.iter()
+            .any(|p| p.reason.contains("does not end at a checkpoint")),
+        "{p:?}"
+    );
+    // Two files whose seqs follow but whose hashes do not.
+    let mut forged = parsed[1].clone();
+    forged.entries[0].prev_hash = "e".repeat(64);
+    let p = attenuo_audit::link_exports(&[&parsed[0], &forged]);
+    assert!(
+        p.iter().any(|p| p.reason.contains("does not link")),
+        "{p:?}"
+    );
+}
+
+/// The shipped anchors: each file accounts for them; a retained export whose header anchor was
+/// not shipped, or differs from the shipped one, fails; an export that holds entries a shipped
+/// anchor says were pruned (a rewind) fails; a shipped anchor that does not verify fails.
+#[test]
+fn the_shipped_anchors_are_cross_checked() {
+    let f = three_files();
+    let shipped_text: String = f
+        .anchors
+        .iter()
+        .map(|a| ShippedAnchor::new(a, None).to_line())
+        .collect();
+    let shipped = attenuo_audit::parse_shipped_anchors(&shipped_text).unwrap();
+    let parsed: Vec<_> = f.texts.iter().map(|t| parse_export(t).unwrap()).collect();
+    for (i, p) in parsed.iter().enumerate() {
+        let r = attenuo_audit::cross_check_anchors(p, &shipped, &f.keys);
+        assert!(r.ok, "file {i}: {r:?}");
+    }
+    // The archives are not checked against the prunes that came after them.
+    let r = attenuo_audit::cross_check_anchors(&parsed[0], &shipped, &f.keys);
+    assert_eq!((r.checked, r.beyond_range), (0, 2));
+    let r = attenuo_audit::cross_check_anchors(&parsed[2], &shipped, &f.keys);
+    assert_eq!((r.checked, r.matched), (2, 2));
+
+    // The second anchor never shipped.
+    let only_first = &shipped[..1];
+    let r = attenuo_audit::cross_check_anchors(&parsed[2], only_first, &f.keys);
+    assert!(!r.ok);
+    assert!(
+        r.mismatches[0].reason.contains("not in the shipped file"),
+        "{r:?}"
+    );
+
+    // A rewind: the log restored to before the second prune; the export from 21 holds seqs
+    // the shipped second anchor says were pruned.
+    let mut rewound = parsed[1].clone();
+    rewound.entries.extend(parsed[2].entries.iter().cloned());
+    rewound.header.as_mut().unwrap().to = rewound.entries.last().unwrap().seq;
+    let r = attenuo_audit::cross_check_anchors(&rewound, &shipped, &f.keys);
+    assert!(!r.ok);
+    assert!(
+        r.mismatches
+            .iter()
+            .any(|m| m.seq == 40 && m.reason.contains("REWOUND")),
+        "{r:?}"
+    );
+
+    // Another anchor in the header than the one shipped (re-signed after shipping).
+    let other = issuer();
+    let mut swapped = parsed[2].clone();
+    let mut a = f.anchors[1].clone();
+    a.at = "2027-02-02T00:00:00Z".into();
+    swapped.header.as_mut().unwrap().anchor = Some(a);
+    let r = attenuo_audit::cross_check_anchors(&swapped, &shipped, &f.keys);
+    assert!(
+        r.mismatches
+            .iter()
+            .any(|m| m.reason.contains("another anchor for this boundary")),
+        "{r:?}"
+    );
+
+    // A shipped anchor that does not verify (another key), and an inconsistent envelope.
+    let r = attenuo_audit::cross_check_anchors(&parsed[2], &shipped, &keys(&other));
+    assert!(
+        r.mismatches
+            .iter()
+            .any(|m| m.reason.contains("does not verify")),
+        "{r:?}"
+    );
+    let mut env = ShippedAnchor::new(&f.anchors[0], None);
+    env.anchor_sha256 = "0".repeat(64);
+    let bad = vec![(1, env), shipped[1].clone()];
+    let r = attenuo_audit::cross_check_anchors(&parsed[2], &bad, &f.keys);
+    assert!(
+        r.mismatches
+            .iter()
+            .any(|m| m.reason.contains("anchor_sha256")),
+        "{r:?}"
+    );
+}
+
+/// The ways two files fail to link, each with its reason.
+#[test]
+fn link_problems_name_their_reason() {
+    let f = three_files();
+    let parsed: Vec<_> = f.texts.iter().map(|t| parse_export(t).unwrap()).collect();
+    let reasons = |files: &[&attenuo_audit::Export]| -> Vec<String> {
+        attenuo_audit::link_exports(files)
+            .into_iter()
+            .map(|p| p.reason)
+            .collect()
+    };
+    // Out of order.
+    let r = reasons(&[&parsed[1], &parsed[0]]);
+    assert!(
+        r.iter().any(|x| x
+            == "the seqs are not contiguous: the earlier file ends at seq 40, the later one \
+                starts at seq 1"),
+        "{r:?}"
+    );
+    // The same file twice.
+    let r = reasons(&[&parsed[0], &parsed[0]]);
+    assert!(r[0].contains("not contiguous"), "{r:?}");
+    // An empty earlier or later file.
+    let mut empty = parsed[1].clone();
+    empty.entries.clear();
+    assert_eq!(
+        reasons(&[&empty, &parsed[2]]),
+        vec!["the earlier file holds no entries".to_string()]
+    );
+    assert_eq!(
+        reasons(&[&parsed[0], &empty]),
+        vec!["the later file holds no entries".to_string()]
+    );
+    // A final checkpoint that names another hash than the last entry.
+    let mut other = parsed[0].clone();
+    other
+        .checkpoints
+        .iter_mut()
+        .find(|c| c.seq == 20)
+        .unwrap()
+        .head_hash = "e".repeat(64);
+    let r = reasons(&[&other, &parsed[1]]);
+    assert!(
+        r.iter()
+            .any(|x| x.contains("checkpoint at its last seq 20 names another hash")),
+        "{r:?}"
+    );
+    // Seqs and hashes link, but the later header's anchor is for another boundary.
+    let mut later = parsed[1].clone();
+    later.header.as_mut().unwrap().anchor = Some(f.anchors[1].clone());
+    assert_eq!(
+        reasons(&[&parsed[0], &later]),
+        vec![
+            "the later file's header anchor is through seq 40, not the earlier file's end at \
+             seq 20 and its hash"
+                .to_string()
+        ]
+    );
+}
+
+/// More of the shipped-anchor cross-check: two different valid anchors for one boundary, a
+/// retried delivery (passes), an envelope whose kid differs, a header anchor not shipped while
+/// another is, and an export taken before a prune whose boundary lies inside it.
+#[test]
+fn shipped_anchor_duplicates_envelopes_and_stale_exports() {
+    let f = three_files();
+    let parsed: Vec<_> = f.texts.iter().map(|t| parse_export(t).unwrap()).collect();
+    let line = |a: &attenuo_audit::Anchor| ShippedAnchor::new(a, None).to_line();
+    let parse = |text: String| attenuo_audit::parse_shipped_anchors(&text).unwrap();
+
+    // A retry: the same anchor twice is counted once and passes.
+    let retried = parse(line(&f.anchors[0]) + &line(&f.anchors[0]) + &line(&f.anchors[1]));
+    let r = attenuo_audit::cross_check_anchors(&parsed[2], &retried, &f.keys);
+    assert!(r.ok, "{r:?}");
+
+    // Two valid anchors for one boundary (signed with the server's key both times).
+    let a = &f.anchors[0];
+    let twin = attenuo_audit::Anchor::sign(
+        &f.issuer.detached_signer(),
+        a.through_seq,
+        &a.through_hash,
+        a.prune_seq,
+        &a.prune_entry_hash,
+        a.previous_through_seq,
+        Some("f".repeat(64)),
+        OffsetDateTime::now_utc(),
+    )
+    .unwrap();
+    let twins = parse(line(a) + &line(&twin) + &line(&f.anchors[1]));
+    let r = attenuo_audit::cross_check_anchors(&parsed[2], &twins, &f.keys);
+    assert!(
+        r.mismatches
+            .iter()
+            .any(|m| m.seq == 20 && m.reason.contains("two different anchors")),
+        "{r:?}"
+    );
+
+    // An envelope whose kid is not the anchor's.
+    let mut env = ShippedAnchor::new(&f.anchors[0], None);
+    env.kid = "other".into();
+    let r = attenuo_audit::cross_check_anchors(&parsed[2], &[(1, env)], &f.keys);
+    assert!(
+        r.mismatches
+            .iter()
+            .any(|m| m.reason.contains("`kid` or `signature` differs")),
+        "{r:?}"
+    );
+
+    // The middle archive's header anchor (the first prune) is not shipped; the second is.
+    let only_second = parse(line(&f.anchors[1]));
+    let r = attenuo_audit::cross_check_anchors(&parsed[1], &only_second, &f.keys);
+    assert!(
+        r.mismatches
+            .iter()
+            .any(|m| m.seq == 20 && m.reason.contains("not in the shipped file")),
+        "{r:?}"
+    );
+
+    // An export of 21..=45 taken before the second prune (through 40, record at 47): the
+    // shipped boundary lies inside it.
+    let mut stale = parsed[1].clone();
+    stale
+        .entries
+        .extend(parsed[2].entries.iter().filter(|e| e.seq <= 45).cloned());
+    stale.header.as_mut().unwrap().to = 45;
+    let all = parse(line(&f.anchors[0]) + &line(&f.anchors[1]));
+    let r = attenuo_audit::cross_check_anchors(&stale, &all, &f.keys);
+    assert!(!r.ok);
+    assert!(
+        r.mismatches
+            .iter()
+            .any(|m| m.seq == 40 && m.reason.contains("has its boundary inside this export")),
+        "{r:?}"
+    );
+    // The archive that ends at that boundary is fine.
+    assert!(attenuo_audit::cross_check_anchors(&parsed[1], &all, &f.keys).ok);
+}
+
+/// S3 objects (canonical JSON, no newline) joined with `cat` are one line of several objects:
+/// both parsers read every object of it.
+#[test]
+fn s3_objects_joined_without_newlines_parse() {
+    let f = three_files();
+    let log = parse_export(&f.texts[2]).unwrap();
+    let mut joined = Vec::new();
+    for cp in &log.checkpoints {
+        joined.extend(attenuo_audit::ShippedCheckpoint::new(cp, None).to_canonical_json());
+    }
+    for a in &f.anchors {
+        joined.extend(ShippedAnchor::new(a, None).to_canonical_json());
+    }
+    let text = String::from_utf8(joined).unwrap();
+    assert_eq!(text.lines().count(), 1);
+    let cps = attenuo_audit::parse_shipped(&text).unwrap();
+    assert_eq!(cps.len(), log.checkpoints.len());
+    let anchors = attenuo_audit::parse_shipped_anchors(&text).unwrap();
+    assert_eq!(anchors.len(), 2);
+    assert!(attenuo_audit::cross_check_anchors(&log, &anchors, &f.keys).ok);
+}
+
+// --- golden files, shared with the Python and TypeScript verifiers ------------------------
+
+/// Where the golden files of a pruned log live, for the Rust, Python and TypeScript suites.
+fn golden_dir() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/audit-retention")
+}
+
+/// A test key from a fixed seed, so a rewrite of the golden files keeps the same `kid`. It
+/// signs nothing outside these files.
+fn golden_issuer() -> Issuer {
+    let mut der = hex::decode("302e020100300506032b657004220420").unwrap();
+    der.extend([7u8; 32]);
+    let pem = format!(
+        "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
+        STANDARD.encode(der)
+    );
+    Issuer::from_pem(
+        IssuerConfig {
+            issuer: "https://attenuo.test".into(),
+            audience: "attenuo".into(),
+            max_depth: 4,
+            default_ttl: Duration::minutes(5),
+        },
+        &pem,
+    )
+    .unwrap()
+}
+
+/// Writes `testdata/audit-retention/`: a log of 12 entries with a checkpoint every 5, pruned
+/// through 5 and then through 10, as the two archives (`archive-1.jsonl`, 1..=5;
+/// `archive-2.jsonl`, 6..=10, its header carrying the first anchor), the retained export
+/// (`retained.jsonl`, 11..=14, with the second anchor and both prune records), what the sink
+/// shipped (`shipped.jsonl`) and the JWKS. Each archive's digest is signed into its anchor.
+/// Run it with `cargo test -p attenuo-audit --test retention write_golden_files -- --ignored`
+/// after a change of the formats, then commit the files.
+#[test]
+#[ignore = "writes the golden files; run by hand"]
+fn write_golden_files() {
+    use sha2::Digest;
+    let issuer = golden_issuer();
+    let log = log_of(&issuer, 5, 12);
+    let export = |from: u64, to: u64, anchor: Option<attenuo_audit::Anchor>| {
+        let header = ExportHeader::new(from, to, "2027-01-01T00:00:00Z".into()).with_anchor(anchor);
+        export_text(
+            &header,
+            &range(&log, from, to),
+            &log.checkpoints_between(from, to).unwrap(),
+        )
+    };
+    let sha = |t: &str| hex::encode(sha2::Sha256::digest(t.as_bytes()));
+    let a1 = export(1, 5, None);
+    let first = prune(&log, 5, Some(&sha(&a1))).unwrap().anchor.anchor;
+    finish(&log, 100);
+    let a2 = export(6, 10, Some(first.clone()));
+    let second = prune(&log, 10, Some(&sha(&a2))).unwrap().anchor.anchor;
+    finish(&log, 100);
+    let head = log.head().unwrap().unwrap().seq;
+    let retained = export(11, head, Some(second.clone()));
+    let mut shipped: String = log
+        .checkpoints_between(0, head)
+        .unwrap()
+        .iter()
+        .map(|c| ShippedCheckpoint::new(c, None).to_line())
+        .collect();
+    for a in [&first, &second] {
+        shipped.push_str(&ShippedAnchor::new(a, None).to_line());
+    }
+    let jwks: Vec<Value> = issuer
+        .trusted_public_keys()
+        .into_iter()
+        .map(|(kid, pem)| {
+            let b64: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
+            let der = STANDARD.decode(b64).unwrap();
+            json!({"kty": "OKP", "crv": "Ed25519", "alg": "EdDSA", "use": "sig",
+                   "kid": kid, "x": URL_SAFE_NO_PAD.encode(&der[der.len() - 32..])})
+        })
+        .collect();
+    let dir = golden_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    for (name, text) in [
+        ("archive-1.jsonl", a1),
+        ("archive-2.jsonl", a2),
+        ("retained.jsonl", retained),
+        ("shipped.jsonl", shipped),
+        (
+            "jwks.json",
+            serde_json::to_string_pretty(&json!({ "keys": jwks })).unwrap() + "\n",
+        ),
+    ] {
+        std::fs::write(dir.join(name), text).unwrap();
+    }
+}
+
+/// The committed golden files verify: each strictly, as one log from genesis, against the
+/// shipped checkpoints and anchors, and each anchor names its archive's digest.
+#[test]
+fn the_golden_files_verify() {
+    use sha2::Digest;
+    let dir = golden_dir();
+    let read = |n: &str| std::fs::read_to_string(dir.join(n)).unwrap();
+    let keys =
+        CheckpointKeys::from_jwks(&serde_json::from_str::<Value>(&read("jwks.json")).unwrap())
+            .unwrap();
+    let names = ["archive-1.jsonl", "archive-2.jsonl", "retained.jsonl"];
+    let parsed: Vec<_> = names
+        .iter()
+        .map(|n| parse_export(&read(n)).unwrap())
+        .collect();
+    for (n, p) in names.iter().zip(&parsed) {
+        let r = verify_export(p, &keys).unwrap();
+        assert!(r.report.ok, "{n}: {r:?}");
+    }
+    let r1 = verify_export(&parsed[0], &keys).unwrap();
+    let r2 = verify_export(&parsed[1], &keys).unwrap();
+    let r3 = verify_export(&parsed[2], &keys).unwrap();
+    assert!(r1.from_genesis && !r1.from_anchor);
+    assert_eq!((r2.from_anchor, r2.report.pruned_through), (true, Some(5)));
+    assert_eq!((r3.from_anchor, r3.report.pruned_through), (true, Some(10)));
+    let all: Vec<_> = parsed.iter().collect();
+    assert!(attenuo_audit::link_exports(&all).is_empty());
+    let shipped = read("shipped.jsonl");
+    let cps = parse_shipped(&shipped).unwrap();
+    let anchors = attenuo_audit::parse_shipped_anchors(&shipped).unwrap();
+    for p in &parsed {
+        assert!(cross_check(p, &cps, &keys).ok);
+        assert!(attenuo_audit::cross_check_anchors(p, &anchors, &keys).ok);
+    }
+    // Each anchor signs its archive's digest.
+    for (archive, a) in [(names[0], &parsed[1]), (names[1], &parsed[2])] {
+        let digest = hex::encode(sha2::Sha256::digest(read(archive).as_bytes()));
+        let anchor = a.header.as_ref().unwrap().anchor.as_ref().unwrap();
+        assert_eq!(anchor.archive_sha256.as_deref(), Some(digest.as_str()));
+    }
+}

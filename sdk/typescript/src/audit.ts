@@ -13,6 +13,13 @@
  * different shipped copies for one seq, and a shipped copy that does not verify are reported
  * with the same `seq` and reason in both.
  *
+ * An export taken after a prune starts at the first retained entry, and its header carries the
+ * prune's signed `anchor`. `verifyExport` checks the anchor's signature, that the file starts
+ * right after it, and the prune record when it is in the file, then reports `fromAnchor` and
+ * `prunedThrough`, as the Rust check does. `verifyExports` verifies several files, oldest first
+ * (the archives of the prunes, then the retained export), and checks that they link into one
+ * log, as `attenuo audit verify --file a --file b` does.
+ *
  * A file that fails verification gives a report with `ok: false`; a file that cannot be read as
  * an export at all (no header, the wrong format, a filtered export, a line that is not JSON)
  * throws `ExportError`.
@@ -34,12 +41,15 @@ export const GENESIS_HASH = "0".repeat(64);
 export const EXPORT_FORMAT = "attenuo-audit-export-v2";
 /** Value of a shipped checkpoint's `format` member. */
 export const SHIPPED_FORMAT = "attenuo-shipped-checkpoint-v1";
+/** The tool of a prune's own audit record. */
+export const PRUNE_TOOL = "admin.audit.prune";
 /**
  * The envelope of a prune's signed anchor, shipped through the same sink (ADR-0015). Skipped by
- * `parseShipped`: this package does not check anchors yet.
+ * `parseShipped`: this package checks the anchor in an export's header, not shipped ones.
  */
 const SHIPPED_ANCHOR_FORMAT = "attenuo-shipped-anchor-v1";
 const CHECKPOINT_CONTEXT = "attenuo-checkpoint-v1";
+const ANCHOR_CONTEXT = "attenuo-audit-anchor-v1";
 
 /** The input is not an audit export this version can verify. */
 export class ExportError extends AttenuoError {}
@@ -47,6 +57,41 @@ export class ExportError extends AttenuoError {}
 export interface BadCheckpoint {
   seq: number;
   reason: string;
+}
+
+/** A prune anchor that failed verification. */
+export interface BadAnchor {
+  /** The `through_seq` the anchor claims. */
+  throughSeq: number;
+  reason: string;
+}
+
+/** Why two files given in a row to `verifyExports` do not form one log. */
+export interface LinkProblem {
+  /** Index of the earlier file, from 0, in the order given. */
+  earlier: number;
+  /** Index of the later file (`earlier + 1`). */
+  later: number;
+  reason: string;
+}
+
+/** The verdict of `verifyExports`. */
+export interface ExportsReport {
+  /** Every file verifies and every pair of neighbours links. */
+  ok: boolean;
+  /** Each file's own report, in the order given. */
+  files: ExportReport[];
+  /** Each pair of neighbouring files that does not link. */
+  links: LinkProblem[];
+  /** The first file starts at seq 1 with the genesis `prev_hash`. */
+  fromGenesis: boolean;
+  /**
+   * The first file starts right after the valid prune anchor in its header: the archives of the
+   * earlier prunes are not among the files.
+   */
+  fromAnchor: boolean;
+  /** The first file's anchor `through_seq` when `fromAnchor` is set. */
+  prunedThrough: number | undefined;
 }
 
 /** The verdict on an export (the fields of the Rust `ExportReport`). */
@@ -75,6 +120,18 @@ export interface ExportReport {
   outsideRange: number;
   /** Failed only because of an unsigned tail that `allowUnsignedTail` did not accept. */
   unsignedTailRejected: boolean;
+  /**
+   * The header carries a prune anchor whose signature verifies, and the file starts right after
+   * it (its first entry is `through_seq + 1` with `prev_hash` equal to `through_hash`): the
+   * entries before were pruned through the server.
+   */
+  fromAnchor: boolean;
+  /** The anchor's `through_seq` when the walk started from a valid header anchor. */
+  prunedThrough: number | undefined;
+  /** Anchors in the header (0 or 1). */
+  anchors: number;
+  /** The header's anchor, when it does not verify or does not fit the file. */
+  badAnchors: BadAnchor[];
 }
 
 /** One parsed line of a shipped-checkpoint file. */
@@ -162,6 +219,22 @@ interface Checkpoint extends Obj {
   kid: string;
   signature: string;
 }
+interface Anchor extends Obj {
+  through_seq: number;
+  through_hash: string;
+  prune_seq: number;
+  prune_entry_hash: string;
+  previous_through_seq: number | null;
+  archive_sha256: string | null;
+  at: string;
+  kid: string;
+  signature: string;
+}
+interface Parsed {
+  header: Obj;
+  entries: Entry[];
+  checkpoints: Checkpoint[];
+}
 
 const enc = new TextEncoder();
 
@@ -188,7 +261,114 @@ export async function verifyExport(
   opts: VerifyExportOptions,
 ): Promise<ExportReport> {
   const keys = loadKeys(opts.checkpointPublicKeys);
-  const { header, entries, checkpoints: cps } = parse(await readText(source));
+  return verifyParsed(parse(await readText(source)), keys, opts.allowUnsignedTail === true);
+}
+
+/**
+ * Verify several exports, oldest first, as one log: `attenuo audit verify --file a --file b`.
+ * Each file is verified strictly on its own (`allowUnsignedTail` applies to the last file
+ * only), then each file and the next must link: both hold entries, the seqs are contiguous, the
+ * later file's first `prev_hash` is the earlier file's last entry hash, the earlier file has a
+ * checkpoint at its last seq naming that hash, and an anchor in the later file's header, if
+ * present, names the earlier file's end. `fromGenesis` and `fromAnchor` say where the set
+ * starts: neither is set when the first file starts at a later seq without an anchor, so
+ * entries before it are not covered.
+ *
+ * Throws `ExportError` for an empty list, and for a bare string or `Uint8Array` (pass an array
+ * of sources).
+ */
+export async function verifyExports(
+  sources: Iterable<ExportSource>,
+  opts: VerifyExportOptions,
+): Promise<ExportsReport> {
+  const given: unknown = sources;
+  if (
+    typeof given === "string" ||
+    given instanceof Uint8Array ||
+    typeof given !== "object" ||
+    given === null ||
+    !(Symbol.iterator in given)
+  ) {
+    throw new ExportError("verifyExports takes an array of exports, not one export");
+  }
+  const list = [...sources];
+  if (list.length === 0) throw new ExportError("verifyExports needs at least one export");
+  const keys = loadKeys(opts.checkpointPublicKeys);
+  const parsed: Parsed[] = [];
+  for (const src of list) parsed.push(parse(await readText(src)));
+  const files: ExportReport[] = [];
+  for (const [i, p] of parsed.entries()) {
+    files.push(
+      await verifyParsed(p, keys, opts.allowUnsignedTail === true && i === parsed.length - 1),
+    );
+  }
+  const links = linkProblems(parsed);
+  const first = files[0] as ExportReport;
+  return {
+    ok: files.every((f) => f.ok) && links.length === 0,
+    files,
+    links,
+    fromGenesis: first.fromGenesis,
+    fromAnchor: first.fromAnchor,
+    prunedThrough: first.prunedThrough,
+  };
+}
+
+function linkProblems(parsed: Parsed[]): LinkProblem[] {
+  const out: LinkProblem[] = [];
+  for (let i = 0; i + 1 < parsed.length; i++) {
+    const a = parsed[i] as Parsed;
+    const b = parsed[i + 1] as Parsed;
+    const fail = (reason: string): void => {
+      out.push({ earlier: i, later: i + 1, reason });
+    };
+    const last = a.entries[a.entries.length - 1];
+    const first = b.entries[0];
+    if (last === undefined || first === undefined) {
+      fail(
+        last === undefined
+          ? "the earlier file holds no entries"
+          : "the later file holds no entries",
+      );
+      continue;
+    }
+    if (last.seq + 1 !== first.seq) {
+      fail(
+        `the seqs are not contiguous: the earlier file ends at seq ${last.seq}, the later one ` +
+          `starts at seq ${first.seq}`,
+      );
+    } else if (first.prev_hash !== last.entry_hash) {
+      fail(
+        `the later file's first entry (seq ${first.seq}) does not link to the earlier file's ` +
+          `last (its prev_hash is not the entry hash at seq ${last.seq})`,
+      );
+    }
+    const cp = a.checkpoints.find((c) => c.seq === last.seq);
+    if (cp === undefined) {
+      fail(`the earlier file does not end at a checkpoint: none at its last seq ${last.seq}`);
+    } else if (cp.head_hash !== last.entry_hash) {
+      fail(
+        `the earlier file's checkpoint at its last seq ${last.seq} names another hash than ` +
+          "its entry",
+      );
+    }
+    const an = b.header.anchor as Anchor | undefined | null;
+    if (an && (an.through_seq !== last.seq || an.through_hash !== last.entry_hash)) {
+      fail(
+        `the later file's header anchor is through seq ${an.through_seq}, not the earlier ` +
+          `file's end at seq ${last.seq} and its hash`,
+      );
+    }
+  }
+  return out;
+}
+
+async function verifyParsed(
+  parsed: Parsed,
+  keys: Map<string, Uint8Array>,
+  allowUnsignedTail: boolean,
+): Promise<ExportReport> {
+  const { header, entries, checkpoints: cps } = parsed;
   const from = header.from as number;
   const to = header.to as number;
 
@@ -197,7 +377,29 @@ export async function verifyExport(
   const firstSeq = first?.seq;
   const lastSeq = lastEntry?.seq;
   const fromGenesis = firstSeq === 1 && first?.prev_hash === GENESIS_HASH;
-  const anchored = firstSeq === 1;
+  // An anchor in the header: checked here, and the walk starts where it says.
+  const anchor = (header.anchor ?? undefined) as Anchor | undefined;
+  const badAnchors: BadAnchor[] = [];
+  if (anchor !== undefined) {
+    let reason = await verifyAnchor(anchor, keys);
+    if (reason === undefined && anchor.through_seq + 1 !== from) {
+      reason =
+        `the header's anchor is through seq ${anchor.through_seq}, but the export starts at ` +
+        `${from}`;
+    }
+    if (reason === undefined) {
+      const rec = entries.find((e) => e.seq === anchor.prune_seq);
+      if (rec !== undefined) reason = await checkPruneRecord(anchor, rec);
+    }
+    if (reason !== undefined) badAnchors.push({ throughSeq: anchor.through_seq, reason });
+  }
+  const startAnchor = badAnchors.length === 0 ? anchor : undefined;
+  const genesis = startAnchor === undefined && firstSeq === 1;
+  const fromAnchor =
+    startAnchor !== undefined &&
+    first !== undefined &&
+    first.seq === startAnchor.through_seq + 1 &&
+    first.prev_hash === startAnchor.through_hash;
   const lo = firstSeq ?? 0;
   const hi = lastSeq ?? 0;
   const inside = cps.filter((c) => c.seq >= lo && c.seq <= hi);
@@ -209,11 +411,11 @@ export async function verifyExport(
   let okCount = 0;
   let lastOk: number | undefined;
   let firstBad: number | undefined;
-  let expectedSeq = 1;
-  let expectedPrev = GENESIS_HASH;
+  let expectedSeq = startAnchor === undefined ? 1 : startAnchor.through_seq + 1;
+  let expectedPrev = startAnchor === undefined ? GENESIS_HASH : startAnchor.through_hash;
   for (const [i, e] of entries.entries()) {
     count++;
-    if (i === 0 && !anchored) {
+    if (i === 0 && !genesis && startAnchor === undefined) {
       expectedSeq = e.seq;
       expectedPrev = e.prev_hash;
     }
@@ -239,7 +441,7 @@ export async function verifyExport(
       bad.push({ seq: cp.seq, reason });
       continue;
     }
-    const actual = cp.seq === 0 ? (anchored ? GENESIS_HASH : undefined) : okHashes.get(cp.seq);
+    const actual = cp.seq === 0 ? (genesis ? GENESIS_HASH : undefined) : okHashes.get(cp.seq);
     if (actual !== undefined && actual === cp.head_hash) {
       lastSigned = lastSigned === undefined ? cp.seq : Math.max(lastSigned, cp.seq);
     } else if (actual !== undefined) {
@@ -268,9 +470,14 @@ export async function verifyExport(
       ? firstSeq !== from || lastSeq < to
       : to >= from && to > 0;
   const outsideRange = entries.filter((e) => e.seq < from || e.seq > to).length;
-  const unsignedTailRejected = unsignedTail > 0 && !opts.allowUnsignedTail;
+  const unsignedTailRejected = unsignedTail > 0 && !allowUnsignedTail;
   const ok =
-    chainOk && bad.length === 0 && !truncated && outsideRange === 0 && !unsignedTailRejected;
+    chainOk &&
+    bad.length === 0 &&
+    badAnchors.length === 0 &&
+    !truncated &&
+    outsideRange === 0 &&
+    !unsignedTailRejected;
   return {
     ok,
     entries: count,
@@ -285,6 +492,10 @@ export async function verifyExport(
     truncated,
     outsideRange,
     unsignedTailRejected,
+    fromAnchor,
+    prunedThrough: startAnchor?.through_seq,
+    anchors: anchor === undefined ? 0 : 1,
+    badAnchors,
   };
 }
 
@@ -512,7 +723,7 @@ function parseLine(text: string, where: string): JsonValue {
   }
 }
 
-function parse(text: string): { header: Obj; entries: Entry[]; checkpoints: Checkpoint[] } {
+function parse(text: string): Parsed {
   let header: Obj | undefined;
   const entries: Entry[] = [];
   const checkpoints: Checkpoint[] = [];
@@ -583,7 +794,32 @@ function checkHeader(h: unknown): Obj {
         "or decision filters, then filter that",
     );
   }
+  if (h.anchor !== undefined && h.anchor !== null) checkAnchor(h.anchor);
   return h;
+}
+
+function checkAnchor(a: unknown): void {
+  if (!isObj(a)) throw new ExportError("header: `anchor` must be an object");
+  const where = "header anchor";
+  need(a, where, {
+    through_seq: "uint",
+    through_hash: "str",
+    prune_seq: "uint",
+    prune_entry_hash: "str",
+    at: "str",
+    kid: "str",
+    signature: "str",
+  });
+  const prev = a.previous_through_seq;
+  if (prev !== undefined && prev !== null && !isUint(prev)) {
+    throw new ExportError(
+      `${where}: \`previous_through_seq\` must be a non-negative integer or null`,
+    );
+  }
+  const digest = a.archive_sha256;
+  if (digest !== undefined && digest !== null && typeof digest !== "string") {
+    throw new ExportError(`${where}: \`archive_sha256\` must be a string or null`);
+  }
 }
 
 function toEntry(e: unknown, where: string): Entry {
@@ -642,16 +878,78 @@ function loadKeys(src: VerifyExportOptions["checkpointPublicKeys"]): Map<string,
 }
 
 /** Undefined when the signature verifies, else why not. */
-async function verifyCheckpoint(
+function verifyCheckpoint(
   cp: CheckpointFields,
   keys: Map<string, Uint8Array>,
 ): Promise<string | undefined> {
-  const key = keys.get(cp.kid);
-  if (key === undefined) return `unknown signing key \`${cp.kid}\``;
-  const sig = b64urlStrict(cp.signature);
+  const payload = canonicalize([cp.seq, cp.head_hash, cp.at, cp.kid]);
+  return verifySigned(cp.kid, CHECKPOINT_CONTEXT, payload, cp.signature, keys);
+}
+
+/**
+ * The anchor's signature: over the RFC 8785 JSON of `[through_seq, through_hash, prune_seq,
+ * prune_entry_hash, previous_through_seq, archive_sha256, at, kid]`, framed with the anchor
+ * context.
+ */
+function verifyAnchor(a: Anchor, keys: Map<string, Uint8Array>): Promise<string | undefined> {
+  const payload = canonicalize([
+    a.through_seq,
+    a.through_hash,
+    a.prune_seq,
+    a.prune_entry_hash,
+    a.previous_through_seq ?? null,
+    a.archive_sha256 ?? null,
+    a.at,
+    a.kid,
+  ]);
+  return verifySigned(a.kid, ANCHOR_CONTEXT, payload, a.signature, keys);
+}
+
+/**
+ * `undefined` when `e` is the anchor's prune record: at `prune_seq`, hashing to
+ * `prune_entry_hash`, an allowed admin record of `PRUNE_TOOL` by the server, whose
+ * `arguments_digest` is that of the anchor's values.
+ */
+async function checkPruneRecord(a: Anchor, e: Entry): Promise<string | undefined> {
+  const r = e.record;
+  if (e.seq !== a.prune_seq || e.entry_hash !== a.prune_entry_hash) {
+    return "the entry at prune_seq does not hash to prune_entry_hash";
+  }
+  if (
+    r.kind !== "admin" ||
+    r.tool !== PRUNE_TOOL ||
+    r.server !== "attenuo" ||
+    r.decision !== "allow"
+  ) {
+    return `the entry at prune_seq is not an allowed \`${PRUNE_TOOL}\` admin record`;
+  }
+  const digest = await sha256Hex(
+    canonicalize({
+      through_seq: a.through_seq,
+      through_hash: a.through_hash,
+      previous_through_seq: a.previous_through_seq ?? null,
+      archive_sha256: a.archive_sha256 ?? null,
+    }),
+  );
+  if (r.arguments_digest !== digest) {
+    return "the prune record's arguments digest does not match the anchor";
+  }
+  return undefined;
+}
+
+async function verifySigned(
+  kid: string,
+  context: string,
+  payloadText: string,
+  signature: string,
+  keys: Map<string, Uint8Array>,
+): Promise<string | undefined> {
+  const key = keys.get(kid);
+  if (key === undefined) return `unknown signing key \`${kid}\``;
+  const sig = b64urlStrict(signature);
   if (sig === undefined) return "signature does not verify";
-  const ctx = enc.encode(CHECKPOINT_CONTEXT);
-  const payload = enc.encode(canonicalize([cp.seq, cp.head_hash, cp.at, cp.kid]));
+  const ctx = enc.encode(context);
+  const payload = enc.encode(payloadText);
   const msg = new Uint8Array(4 + ctx.length + payload.length);
   new DataView(msg.buffer).setUint32(0, ctx.length);
   msg.set(ctx, 4);

@@ -118,9 +118,20 @@ pub struct PruneBody {
     /// anchor. The server never sees the archive and cannot check it.
     #[serde(default)]
     pub archive_sha256: Option<String>,
+    /// The archive's first seq. When given, the prune is refused (409
+    /// `prune_archive_mismatch`) unless it is the log's first retained seq, so the archive
+    /// covers every entry the prune removes. Optional for older clients; send it.
+    #[serde(default)]
+    pub from: Option<u64>,
+    /// The archive's last entry hash. When given, the prune is refused (409
+    /// `prune_archive_mismatch`) unless it is the entry hash at `through`. Optional for older
+    /// clients; send it.
+    #[serde(default)]
+    pub through_hash: Option<String>,
 }
 
-/// `POST /admin/audit/prune` with `{"through": B, "archive_sha256": "..."}`: prune the log
+/// `POST /admin/audit/prune` with `{"through": B, "archive_sha256": "...", "from": F,
+/// "through_hash": "..."}`: prune the log
 /// through seq B. Answers `{prune_seq, anchor, checkpoint_before, checkpoint_after,
 /// pruned_through, deleting, shipped, already}` once the prune is committed; the rows are
 /// deleted afterwards, in batches of `[audit.retention] batch_rows`, by the maintenance task
@@ -130,6 +141,11 @@ pub struct PruneBody {
 /// the sink has delivered, when the sink delivered the anchor (null until it has), and
 /// whether the anchor is queued and not yet delivered.
 ///
+/// `from` (the archive's first seq) and `through_hash` (its last entry hash) are optional;
+/// when given, the transaction refuses unless they are the first retained seq and the entry
+/// hash at B, so the archive covers what is pruned. A repeat compares them with the stored
+/// anchor.
+///
 /// Repeating a request that succeeded answers 200 with the stored anchor and
 /// `"already": true`, and writes nothing.
 ///
@@ -138,8 +154,8 @@ pub struct PruneBody {
 /// 400 `invalid_request` for a body that is not the expected JSON, a `through` of 0 or an
 /// `archive_sha256` that is not 64 lower-case hex digits; 409 `prune_disabled`,
 /// `prune_not_at_checkpoint`, `prune_too_recent`, `prune_live_run`, `sink_behind`,
-/// `prune_in_progress` or `prune_conflict` (the same `through` was pruned with another
-/// digest); 410 `audit_pruned` when `through` is below the current boundary; 500
+/// `prune_in_progress`, `prune_conflict` (the same `through` was pruned with another
+/// digest) or `prune_archive_mismatch` (`from` or `through_hash` do not match); 410 `audit_pruned` when `through` is below the current boundary; 500
 /// `server_error` when the audit log fails (nothing is written).
 pub async fn prune(
     State(state): State<Arc<AppState>>,
@@ -162,13 +178,34 @@ pub async fn prune(
             ));
         }
     }
+    if let Some(h) = &body.through_hash {
+        if h.len() != 64 || !h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+            return Err(ApiError::bad_request(
+                "invalid_request",
+                "`through_hash` must be 64 lower-case hex digits",
+            ));
+        }
+    }
+    if body.from == Some(0) {
+        return Err(ApiError::bad_request(
+            "invalid_request",
+            "`from` must be at least 1",
+        ));
+    }
+    let expect = attenuo_audit::PruneExpect {
+        from: body.from,
+        through_hash: body.through_hash.clone(),
+    };
     let limits = limits(&state);
     let now = limits.now;
     let out = state
         .blocking(move |s| {
-            let done = s
-                .audit
-                .prune_through(body.through, body.archive_sha256, &limits, |args| {
+            let done = s.audit.prune_through_expecting(
+                body.through,
+                body.archive_sha256,
+                &expect,
+                &limits,
+                |args| {
                     admin_record(
                         &who,
                         PRUNE_TOOL,
@@ -178,7 +215,8 @@ pub async fn prune(
                         args.clone(),
                         now,
                     )
-                });
+                },
+            );
             // Below the boundary: answer with it, as every other 410 `audit_pruned` does.
             Ok::<_, AuditError>(match done {
                 Err(AuditError::PruneRefused {

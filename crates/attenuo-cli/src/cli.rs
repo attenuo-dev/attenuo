@@ -1095,27 +1095,88 @@ pub(crate) enum AuditCmd {
     /// instead (it needs only the issuer's JWKS, no admin token); that check is strict: it
     /// also fails if the file holds entries outside the range its header declares, or entries
     /// after its last valid checkpoint (unless `--allow-unsigned-tail`). Add `--checkpoints`
-    /// to cross-check the export against checkpoints shipped off the host.
+    /// to cross-check the export against checkpoints and prune anchors shipped off the host.
+    /// Give `--file` several times, oldest first, to check archives and the retained export
+    /// as one log: each file must verify, and each must link to the next (contiguous seqs,
+    /// the next file's first `prev_hash` is this file's last entry hash, this file ends at a
+    /// checkpoint, and a header anchor in the next file, if present, names this file's end).
+    /// It reports where the set starts: from genesis, right after a prune, or at a later seq
+    /// whose earlier entries are not covered.
     Verify {
-        /// An export made with `audit export` (JSON Lines, or the `--format json` object).
+        /// An export made with `audit export` or `audit prune` (JSON Lines, or the `--format
+        /// json` object). Repeat it, oldest file first, to verify several files as one log.
         #[arg(long)]
-        file: Option<std::path::PathBuf>,
+        file: Vec<std::path::PathBuf>,
         /// JWKS file holding the issuer keys; with `--file` and without this, the JWKS is
-        /// fetched from `<server>/.well-known/jwks.json`.
+        /// fetched from `<server>/.well-known/jwks.json`, and the check then only shows that
+        /// the file is consistent with the keys the server publishes. Pass keys you saved
+        /// yourself for a stronger check.
         #[arg(long, requires = "file")]
         jwks: Option<std::path::PathBuf>,
         /// With `--file`: accept entries after the export's last valid checkpoint, which only
         /// the hash chain covers (an export taken while the log was ahead of its newest
-        /// checkpoint). They are still reported as `unsigned_tail`.
+        /// checkpoint). They are still reported as `unsigned_tail`. With several files it
+        /// applies to the last one only; every earlier file must end at a checkpoint.
         #[arg(long, requires = "file")]
         allow_unsigned_tail: bool,
         /// With `--file`: checkpoints shipped off the host by `[audit.sink]` (the file sink's
         /// JSON Lines, webhook bodies one per line, or bare checkpoint lines). Every shipped
         /// checkpoint inside the export's range must match the export's checkpoint at that
         /// seq exactly, and the export's entry there must hash to its `head_hash`; one that
-        /// differs was signed again after it was shipped (SR-21). Exits 2 on any mismatch.
+        /// differs was signed again after it was shipped (SR-21). Shipped prune anchors are
+        /// checked too: the anchor of the boundary right before the export's start must be the
+        /// export header's anchor, and an anchor that says entries the export holds were
+        /// pruned means the log was rewound. Exits 2 on any mismatch. With several files,
+        /// each file is checked against it.
         #[arg(long, requires = "file")]
         checkpoints: Option<std::path::PathBuf>,
+    },
+    /// Prune the start of the audit log through a checkpoint, after archiving it. Needs
+    /// `[audit.retention] prune = "manual"` on the server.
+    ///
+    /// The steps: ask the server for the plan (the largest boundary its guards allow at or
+    /// below `--through`, or for entries older than `--before`); export `from..=through` to a
+    /// temporary file next to `--archive` (mode 0600 on Unix), flushed to disk; verify it
+    /// strictly with the JWKS (`--jwks`, else the server's `/.well-known/jwks.json`) and check
+    /// it is the plan's range; move it to `--archive` (never over an existing file); take the
+    /// SHA-256 of its bytes; and `POST /admin/audit/prune` with the archive's first seq and
+    /// last entry hash, which the server checks before it signs that digest into the prune
+    /// anchor. Nothing on the server changes before that last request, so a failure or a
+    /// crash at any earlier step leaves the log as it was (a temporary `.<name>.partial-*`
+    /// file may be left). The anchor the server answers is checked against the archive.
+    ///
+    /// If the request fails after the archive was written, the archive is kept: repeat with
+    /// `--reuse-archive`, which verifies the file again, checks that it starts where the log
+    /// now starts, and sends the same digest. A request that already succeeded answers with
+    /// the same anchor. Exits 2 when the server refuses (a guard, printed with its code),
+    /// nothing can be pruned, the archive does not fit, or the answered anchor does not match
+    /// the archive (the prune was committed); 1 on an error.
+    Prune {
+        /// Prune entries older than this RFC 3339 time (up to the newest checkpoint that is).
+        #[arg(long, value_parser = parse_rfc3339, required_unless_present_any = ["through", "reuse_archive"], conflicts_with = "through")]
+        before: Option<String>,
+        /// Prune at most through this seq; the boundary is the newest checkpoint the guards
+        /// allow at or below it.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        through: Option<u64>,
+        /// Where to write the archive, the export of the pruned entries (mode 0600 on Unix).
+        /// Refused if the file exists. Keep it off the host: it is the only copy of those
+        /// entries.
+        #[arg(long, value_name = "PATH", required_unless_present = "dry_run")]
+        archive: Option<std::path::PathBuf>,
+        /// JWKS file holding the issuer keys to verify the archive with; without it the JWKS
+        /// is fetched from `<server>/.well-known/jwks.json`, which only shows that the archive
+        /// is consistent with the keys the server publishes.
+        #[arg(long)]
+        jwks: Option<std::path::PathBuf>,
+        /// Print the plan and stop. Changes nothing.
+        #[arg(long, conflicts_with = "reuse_archive")]
+        dry_run: bool,
+        /// The archive already exists from an earlier run whose request failed: verify it
+        /// again, take its digest and send the prune for its last seq (which `--through`, if
+        /// given, must equal).
+        #[arg(long, conflicts_with = "before", requires = "archive")]
+        reuse_archive: bool,
     },
     /// Export entries `--from` to `--to` (inclusive) and the checkpoints inside that range.
     /// Defaults to the whole log. Writes to stdout unless `--out` is given.
@@ -1130,7 +1191,10 @@ pub(crate) enum AuditCmd {
         /// `jsonl` streams one object per line; `json` writes a single object.
         #[arg(long, value_enum, default_value_t = ExportFormat::Jsonl)]
         format: ExportFormat,
-        /// Write here instead of stdout.
+        /// Write here instead of stdout. A regular file (or a new one) is written through a
+        /// temporary file and replaced only when the export ended cleanly, keeping the old
+        /// file's mode; a symlink, FIFO, device or path under /dev or /proc is written
+        /// directly.
         #[arg(long)]
         out: Option<std::path::PathBuf>,
         /// Keep only records of this kind: decision, tool_result, approval_request,

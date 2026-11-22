@@ -341,6 +341,9 @@ impl From<attenuo_audit::AuditError> for ApiError {
                         ApiError::new(StatusCode::CONFLICT, "prune_in_progress", detail)
                     }
                     G::Conflict => ApiError::new(StatusCode::CONFLICT, "prune_conflict", detail),
+                    G::ArchiveMismatch => {
+                        ApiError::new(StatusCode::CONFLICT, "prune_archive_mismatch", detail)
+                    }
                     G::AlreadyPruned => ApiError::new(StatusCode::GONE, "audit_pruned", detail),
                 }
             }

@@ -456,3 +456,84 @@ pub fn verify_export_with(
         unsigned_tail_rejected,
     })
 }
+
+/// Why two files given in a row do not form one log ([`link_exports`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinkProblem {
+    /// Index of the earlier file, from 0, in the order given.
+    pub earlier: usize,
+    /// Index of the later file (`earlier + 1`).
+    pub later: usize,
+    /// What does not link.
+    pub reason: String,
+}
+
+/// Check that `exports`, in the order given (oldest first: the archives of the prunes, then
+/// the retained export), form one log: for each file and the next,
+///
+/// - both hold entries;
+/// - the later file's first seq is one above the earlier file's last;
+/// - the later file's first `prev_hash` is the earlier file's last entry hash;
+/// - the earlier file has a checkpoint at its last seq that names that hash (an archive ends
+///   at the checkpoint its prune was made at);
+/// - an anchor in the later file's header names the earlier file's end (`through_seq` and
+///   `through_hash`).
+///
+/// It checks only how the files join. Verify each one with [`verify_export_with`] as well: a
+/// file whose own chain or checkpoints fail is reported there, at its seq.
+pub fn link_exports(exports: &[&Export]) -> Vec<LinkProblem> {
+    let mut out = Vec::new();
+    for (i, pair) in exports.windows(2).enumerate() {
+        let (a, b) = (pair[0], pair[1]);
+        let mut fail = |reason: String| {
+            out.push(LinkProblem {
+                earlier: i,
+                later: i + 1,
+                reason,
+            });
+        };
+        let (Some(last), Some(first)) = (a.entries.last(), b.entries.first()) else {
+            fail(if a.entries.is_empty() {
+                "the earlier file holds no entries".to_string()
+            } else {
+                "the later file holds no entries".to_string()
+            });
+            continue;
+        };
+        if last.seq.checked_add(1) != Some(first.seq) {
+            fail(format!(
+                "the seqs are not contiguous: the earlier file ends at seq {}, the later one \
+                 starts at seq {}",
+                last.seq, first.seq
+            ));
+        } else if first.prev_hash != last.entry_hash {
+            fail(format!(
+                "the later file's first entry (seq {}) does not link to the earlier file's last \
+                 (its prev_hash is not the entry hash at seq {})",
+                first.seq, last.seq
+            ));
+        }
+        match a.checkpoints.iter().find(|c| c.seq == last.seq) {
+            Some(c) if c.head_hash == last.entry_hash => {}
+            Some(_) => fail(format!(
+                "the earlier file's checkpoint at its last seq {} names another hash than its \
+                 entry",
+                last.seq
+            )),
+            None => fail(format!(
+                "the earlier file does not end at a checkpoint: none at its last seq {}",
+                last.seq
+            )),
+        }
+        if let Some(an) = b.header.as_ref().and_then(|h| h.anchor.as_ref()) {
+            if an.through_seq != last.seq || an.through_hash != last.entry_hash {
+                fail(format!(
+                    "the later file's header anchor is through seq {}, not the earlier file's \
+                     end at seq {} and its hash",
+                    an.through_seq, last.seq
+                ));
+            }
+        }
+    }
+    out
+}
