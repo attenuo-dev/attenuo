@@ -104,6 +104,15 @@ impl std::fmt::Debug for Issuer {
     }
 }
 
+/// The public half of a `PRIVATE KEY` PEM, or the key of a `PUBLIC KEY` PEM.
+fn previous_public_key(pem: &str) -> Result<PublicKey, TokenError> {
+    if pem.contains("-----BEGIN PRIVATE KEY-----") {
+        Ok(SigningKey::from_pem(pem)?.public_key())
+    } else {
+        PublicKey::from_pem(pem)
+    }
+}
+
 impl Issuer {
     /// Create an issuer with a fresh random Ed25519 key pair.
     ///
@@ -145,15 +154,21 @@ impl Issuer {
     /// [`TokenError::Key`] when `pem` is neither a parseable Ed25519 `PRIVATE KEY` nor a
     /// `PUBLIC KEY` block holding an Ed25519 SubjectPublicKeyInfo.
     pub fn trust_previous_key(&mut self, pem: &str) -> Result<(), TokenError> {
-        let key = if pem.contains("-----BEGIN PRIVATE KEY-----") {
-            SigningKey::from_pem(pem)?.public_key()
-        } else {
-            PublicKey::from_pem(pem)?
-        };
+        let key = previous_public_key(pem)?;
         if key != self.key.public_key() && !self.previous.contains(&key) {
             self.previous.push(key);
         }
         Ok(())
+    }
+
+    /// The `kid` a key given to [`Issuer::trust_previous_key`] (a `PUBLIC KEY` or `PRIVATE
+    /// KEY` PEM) would have, without trusting it: to find two files that hold the same key.
+    ///
+    /// # Errors
+    ///
+    /// As [`Issuer::trust_previous_key`].
+    pub fn previous_key_id(pem: &str) -> Result<String, TokenError> {
+        Ok(previous_public_key(pem)?.kid())
     }
 
     /// `kid` of the current signing key, as put in every token's header.
