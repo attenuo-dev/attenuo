@@ -289,17 +289,19 @@ async fn agent_reload_prints_the_changes() {
     let (router, _state) = attenuo_server::build(&cfg).unwrap();
     let server = spawn_router(router).await.unwrap();
     let url = server.url("");
-    let reload = |url: String, json: bool| {
+    let run = |url: String, json: bool, flags: &[&str]| {
         let mut cmd = attenuo();
         cmd.args(["--server", &url]);
         if json {
             cmd.arg("--json");
         }
         cmd.args(["admin", "agent", "reload"])
+            .args(flags)
             .env("ATTENUO_ADMIN_TOKEN", LEGACY)
             .output()
             .unwrap()
     };
+    let reload = move |url: String, json: bool| run(url, json, &[]);
 
     std::fs::write(
         &path,
@@ -356,4 +358,30 @@ async fn agent_reload_prints_the_changes() {
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["agents"]["added"], serde_json::json!([]), "{v}");
     assert_eq!(v["agents"]["removed"], serde_json::json!([]), "{v}");
+
+    // A file with no agents: refused without --allow-empty...
+    std::fs::write(&path, &base_file).unwrap();
+    let u = url.clone();
+    let out = tokio::task::spawn_blocking(move || reload(u, false))
+        .await
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    assert!(
+        text(&out.stderr).contains("agents_reload_empties"),
+        "{}",
+        text(&out.stderr)
+    );
+    // ...done with it: exit 0, the startup warning on stderr, not stdout.
+    let u = url.clone();
+    let out = tokio::task::spawn_blocking(move || run(u, false, &["--allow-empty"]))
+        .await
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    assert_eq!(
+        text(&out.stderr),
+        "warning: [[agents]] and [[actor_trust]] are empty and [token] require_actor_auth = \
+         true: every token exchange will be rejected\n"
+    );
+    assert!(text(&out.stdout).starts_with("agents: 0 in force, 0 added, 1 removed"));
+    assert!(!text(&out.stdout).contains("warning"));
 }

@@ -836,15 +836,19 @@ async fn run(cli: Cli) -> Result<Outcome> {
                 Outcome::No
             })
         }
-        Command::Admin(AdminCmd::Agent(AgentCmd::Reload)) => {
-            let resp = client?
-                .admin_post("/admin/agents/reload", &json!({}))
-                .await?;
+        Command::Admin(AdminCmd::Agent(AgentCmd::Reload {
+            allow_empty,
+            allow_mismatch,
+        })) => {
+            let body = json!({"allow_empty": allow_empty, "allow_mismatch": allow_mismatch});
+            let resp = client?.admin_post("/admin/agents/reload", &body).await?;
             if json {
                 print_json(&resp)?;
             } else {
                 out!("{}", render::render_agents_reload(&resp))?;
             }
+            // The reload happened: exit 0, with each warning on stderr, in both modes.
+            err!("{}", render::agents_reload_warnings(&resp));
             Ok(Outcome::Ok)
         }
         Command::Admin(AdminCmd::Operator(OperatorCmd::Reload)) => {

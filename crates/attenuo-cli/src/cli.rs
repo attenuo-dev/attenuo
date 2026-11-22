@@ -348,10 +348,20 @@ pub(crate) enum AgentCmd {
     /// Ask the server to re-read `[[agents]]` and `[[peps]]` from its config file and put them
     /// in force without a restart (`POST /admin/agents/reload`, role `admin`). Prints the
     /// agents and PEPs added, removed and changed, and the other sections of the file that
-    /// differ from the ones in force and need a restart. On a refusal (a file that does not
-    /// parse, or lists that break a startup rule) the lists in force are unchanged. Tokens
-    /// already issued are not revoked: use `attenuo lease revoke` for that.
-    Reload,
+    /// differ from the ones in force and need a restart; warnings go to stderr, and the exit
+    /// status stays 0. On a refusal (a file that does not parse, lists that break a startup
+    /// rule, a file that empties a list or looks like another server's) the lists in force are
+    /// unchanged. Tokens already issued are not revoked: use `attenuo lease revoke` for that.
+    Reload {
+        /// Accept a file that leaves `[[agents]]` or `[[peps]]` empty while the server has
+        /// entries in force. Refused without it, as an empty or cut-off file reads that way.
+        #[arg(long)]
+        allow_empty: bool,
+        /// Accept a file whose `[issuer]` or `[audit]` differs from the running config.
+        /// Refused without it, as such a file may be another server's.
+        #[arg(long)]
+        allow_mismatch: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]

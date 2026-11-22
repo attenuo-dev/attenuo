@@ -883,8 +883,8 @@ pub(crate) fn render_evaluation(v: &Value) -> String {
 }
 
 /// The answer of `POST /admin/agents/reload` (`attenuo admin agent reload`): a summary line
-/// per list, each id added, removed or changed, the sections that need a restart, and the
-/// warnings.
+/// per list, each id added, removed or changed, and the sections that need a restart. The
+/// warnings go to stderr ([`agents_reload_warnings`]).
 pub(crate) fn render_agents_reload(v: &Value) -> String {
     let ids = |list: &Value, key: &str| -> Vec<String> {
         list[key]
@@ -933,7 +933,18 @@ pub(crate) fn render_agents_reload(v: &Value) -> String {
             restart.join(", ")
         ));
     }
-    for w in v["warnings"].as_array().into_iter().flatten() {
+    out
+}
+
+/// The warnings of an agents reload, one `warning:` line each, for stderr: those about the
+/// lists now in force (`warnings`), then those about the file's own settings, which a restart
+/// would apply (`restart_warnings`). Empty when there are none.
+pub(crate) fn agents_reload_warnings(v: &Value) -> String {
+    let mut out = String::new();
+    for w in ["warnings", "restart_warnings"]
+        .iter()
+        .flat_map(|k| v[*k].as_array().into_iter().flatten())
+    {
         out.push_str(&format!(
             "warning: {}\n",
             escape_controls(w.as_str().unwrap_or_default())
@@ -1644,9 +1655,15 @@ would revoke 1 lease(s) if revoked now
              \x20 changed  agent planner\n\
              \x20 changed  pep   gw\n\
              not reloaded, differ from the running config (restart to apply): \
-             [[root_grants]], [server]\n\
-             warning: w1\n"
+             [[root_grants]], [server]\n"
         );
+        assert_eq!(
+            super::agents_reload_warnings(&json!({
+                "warnings": ["w1", "id `a\nb`"], "restart_warnings": ["r1"],
+            })),
+            "warning: w1\nwarning: id `a\\nb`\nwarning: r1\n"
+        );
+        assert_eq!(super::agents_reload_warnings(&json!({"warnings": []})), "");
         let quiet = super::render_agents_reload(&json!({
             "agents": {"count": 0, "added": [], "removed": [], "changed": []},
             "peps": {"count": 0, "added": [], "removed": [], "changed": []},
