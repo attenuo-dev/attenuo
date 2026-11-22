@@ -23,9 +23,9 @@ The MCP upstream a subcommand talks to (`call`, `tools`, `authzen eval`, `policy
 
 | Status | Meaning |
 | --- | --- |
-| 0 | Success; for a command that asks a question (`call`, `tools`, `token inspect --verify`, `policy evaluate`, `authzen eval`, `policy test`, `policy lint`, `policy check`, `audit verify`, `approval verify`), the answer was yes; for `audit prune`, the prune committed (or was already committed with that archive), or the dry run printed its plan. |
+| 0 | Success; for a command that asks a question (`call`, `tools`, `token inspect --verify`, `policy evaluate`, `authzen eval`, `policy test`, `policy lint`, `policy check`, `audit verify`, `approval verify`), the answer was yes; for `audit prune`, the prune committed (or was already committed with that archive), or the dry run printed its plan; for `audit compact`, the file was compacted, or the dry run passed its checks. |
 | 1 | An error: the server could not be reached or answered with an error, a file could not be read, a test file could not be run, or the command line could not be parsed (unknown flag, missing argument). The message goes to stderr as `error: ...`; for a command line, it is clap's usage message. `--help` and `--version` exit 0. `health` exits 1, not 2, when the server answers but is not healthy or ready. |
-| 2 | The answer was no: a denial or `APPROVAL REQUIRED`, a JSON-RPC error from `tools`, a token that fails `--verify`, a failed test case, policy errors, a broken audit chain or invalid checkpoint, audit files that do not link, an invalid approval token; for `budget refund`, nothing to refund; for `audit prune`, a refusal, nothing to prune, an archive that does not verify or does not fit the log, or a committed prune whose anchor does not match the archive. |
+| 2 | The answer was no: a denial or `APPROVAL REQUIRED`, a JSON-RPC error from `tools`, a token that fails `--verify`, a failed test case, policy errors, a broken audit chain or invalid checkpoint, audit files that do not link, an invalid approval token; for `budget refund`, nothing to refund; for `audit prune`, a refusal, nothing to prune, an archive that does not verify or does not fit the log, or a committed prune whose anchor does not match the archive; for `audit compact`, a refusal (the file was not changed). |
 | 3, 4 | `budget refund` only: already refunded, charge pruned (see [`budget refund`](#budget-refund-id---reason-text)). |
 
 A refusal from a REST route reads `error: server answered <status>: <error> (<code>): <detail>`: the OAuth-style `error`, then the stable `code` in parentheses, then the server's `detail`, for example `error: server answered 400 Bad Request: invalid_grant (replayed): this credential was already used; present a fresh one`. Match on the code, which is never reworded ([Errors](http-api.md#errors)); the detail is for people. The ` (<code>)` is left out when the code is the `error` itself or the whole `detail` (`unauthorized: token_expired`), and so is `: <detail>` when there is none. A body that is not an error object is printed as it came. Control characters in any of these strings are printed escaped (`\u{1b}`), so an answer cannot drive the terminal (SR-118). `--json` does not change this: an error is always this text on stderr, never JSON on stdout. The one exception is `audit prune`, whose refusals are answers (exit 2) and print a JSON object on stdout with `--json` (see [`audit prune`](#audit-prune)).
@@ -583,7 +583,36 @@ With `--json` every answer is one object on stdout with `ok`:
 - an archive that does not verify or does not fit: `{ok: false, archive_problems: [...]}` (with `plan` when there was one);
 - a committed prune whose anchor does not match: `{ok: false, committed: true, anchor_problems: [...], archive, prune}`.
 
-The database file does not shrink after a prune: SQLite reuses the freed pages for new entries. See [Bounding the audit log](../guides/deploying.md#bounding-the-audit-log).
+The database file does not shrink after a prune: SQLite reuses the freed pages for new entries. To make it smaller, stop the server and run [`audit compact`](#audit-compact---db-path). See [Bounding the audit log](../guides/deploying.md#bounding-the-audit-log).
+
+### `audit compact --db <PATH>`
+
+```sh
+attenuo audit compact --db /var/lib/attenuo/attenuo.sqlite --dry-run
+attenuo audit compact --db /var/lib/attenuo/attenuo.sqlite
+```
+
+Shrink the server's SQLite file after a prune. Offline: stop the server first and take a backup. It works on the file named by `--db` (the server's `[audit] sqlite_path`), talks to no server and needs no token. Use the same attenuo version as the server.
+
+The steps:
+
+1. Refuse a file on a network filesystem. Take the server's lock file (`<PATH>.lock`) and SQLite's exclusive lock on the file, waiting at most 2 seconds. Either one held elsewhere is a refusal: `the database is in use; stop the server first`. A running server holds the lock file even when idle. In WAL mode, which the server always leaves the file in, any other connection that has read the file holds a SQLite lock until it closes, so a `sqlite3` shell with the file open is seen too. A connection that was opened but has read nothing yet holds no lock and is not seen.
+2. Check the file: `PRAGMA integrity_check` must answer `ok`, the schema version must be the one this attenuo reads (nothing is migrated here), the hash chain must verify (walked from the newest anchor without keys, as the server's unsigned verify does), and no table may be one whose rowids `VACUUM` could change. Record the size, the free pages, the entry count, the chain head, the prune marker, the newest anchor and a SHA-256 of every row of every table and of the schema.
+3. Check the free space. `VACUUM` writes a copy of the live data (the file less its free pages) in SQLite's temporary directory (`SQLITE_TMPDIR`, else `TMPDIR`, else `/var/tmp`, `/usr/tmp` or `/tmp`) and again into the WAL next to the file. Each needs that much plus 2% and 16 MiB, twice that when both are on one filesystem.
+4. With `--dry-run`, print what would be freed and stop. The file and its WAL are not changed.
+5. Run `VACUUM`, then `PRAGMA wal_checkpoint(TRUNCATE)`, so the size on disk drops.
+6. Check again: everything recorded in step 2, except the size and the free pages, must be the same.
+
+| Flag | Meaning |
+|---|---|
+| `--db <PATH>` | Required. The database file. It is never created. |
+| `--dry-run` | Steps 1 to 4 only. Changes nothing. |
+
+It prints the size before and after, the bytes given back, the entry count and the head seq, and the free space it asked for. With `--json`: `{ok: true, dry_run, path, size_before, size_after, bytes_returned, free_bytes_before, free_bytes_after, entries, head_seq, head_hash, pruned_through, schema_version, space}`, sizes in bytes (the database file and its `-wal`), `free_bytes_after` null for a dry run.
+
+Exit status: 0 on success. 2 on a refusal, printed as `compact refused: <code>: <detail>` on stderr (with `--json`, `{ok: false, refused: {code, detail}}` on stdout); the file was not changed. The codes are `in_use`, `network_filesystem`, `integrity`, `schema_version`, `not_attenuo`, `rowid_unsafe`, `chain_broken` and `disk_space`. 3 when the check after `VACUUM` found a difference, printed as `COMPACTED, BUT THE CHECK AFTER VACUUM FAILED:` and the differences (with `--json`, `{ok: false, post_check_failed: [...]}`): do not start the server on the file, restore the backup. 1 on any other error, such as a missing file.
+
+It writes no audit entry: it changes no row, and the server is not running to write one. The archive, the checkpoints and the anchors are not affected.
 
 ### `policy reload`
 

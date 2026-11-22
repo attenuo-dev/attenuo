@@ -21,6 +21,7 @@ mod out;
 mod cli;
 mod client;
 mod client_key;
+mod compact_cmd;
 mod connect;
 mod dpop_key;
 mod health;
@@ -655,6 +656,10 @@ async fn run(cli: Cli) -> Result<Outcome> {
                 reuse_archive,
             };
             audit_prune(&client?, &args, json).await
+        }
+        // Offline: works on the file, talks to no server.
+        Command::Audit(AuditCmd::Compact { db, dry_run }) => {
+            compact_cmd::audit_compact(&db, dry_run, json)
         }
         Command::Audit(AuditCmd::Export {
             from,

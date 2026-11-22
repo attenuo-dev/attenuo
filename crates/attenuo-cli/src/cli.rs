@@ -1231,6 +1231,27 @@ pub(crate) enum AuditCmd {
         #[arg(long, conflicts_with = "before", requires = "archive")]
         reuse_archive: bool,
     },
+    /// Shrink the server's SQLite file after a prune, offline, with the server stopped. Talks
+    /// to no server and needs no token. Take a backup first.
+    ///
+    /// A prune frees pages inside the file but the file does not get smaller. This runs
+    /// SQLite's `VACUUM` on the file in place and truncates its write-ahead log, between
+    /// checks. It refuses, and changes nothing, when the file is in use (the server's
+    /// `<db>.lock` is held, or SQLite's exclusive lock cannot be taken within 2 seconds),
+    /// when `PRAGMA integrity_check` is not `ok`, when the schema version is not the one this
+    /// attenuo reads, when the hash chain does not verify, or when there is not enough free
+    /// space for `VACUUM`'s copy. After `VACUUM` it checks that the integrity check, the schema
+    /// version, the entry count, the chain head, the prune marker, the newest anchor and every
+    /// row of every table are as before. It writes no audit entry. Exits 2 on a refusal, 3
+    /// when the check after `VACUUM` fails (restore the backup), 1 on an error.
+    Compact {
+        /// The database file: the server's `[audit] sqlite_path`.
+        #[arg(long, value_name = "PATH")]
+        db: std::path::PathBuf,
+        /// Run the checks before `VACUUM` and print what would be freed. Changes nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Export entries `--from` to `--to` (inclusive) and the checkpoints inside that range.
     /// Defaults to the whole log. Writes to stdout unless `--out` is given.
     Export {
