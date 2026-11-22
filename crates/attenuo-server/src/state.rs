@@ -13,7 +13,7 @@ use time::{Duration, OffsetDateTime};
 
 use crate::actor::ActorTrustRegistry;
 use crate::authz::Pipeline;
-use crate::clientauth::{AssertionPolicy, Clients};
+use crate::clientauth::{ClientRules, SharedClients};
 use crate::config::{ActorAuth, Config, RootGrant};
 use crate::idp::IdpRegistry;
 use crate::metrics::Metrics;
@@ -66,16 +66,27 @@ pub struct AppState {
     /// reloads cannot cross.
     pub operators_reload: tokio::sync::Mutex<()>,
     /// The config file the server was started with ([`Config::source_path`]), which
-    /// `POST /admin/operators/reload` re-reads; `None` when the config was not read from a
-    /// file.
+    /// `POST /admin/operators/reload` and `POST /admin/agents/reload` re-read; `None` when the
+    /// config was not read from a file.
     pub config_path: Option<PathBuf>,
+    /// Held by `POST /admin/agents/reload` from reading the file to the swap, so two reloads
+    /// cannot cross.
+    pub agents_reload: tokio::sync::Mutex<()>,
+    /// What the check of `[[agents]]` and `[[peps]]` reads from the rest of the config in
+    /// force: startup and `POST /admin/agents/reload` check the lists with it.
+    pub(crate) client_rules: ClientRules,
+    /// A digest of each section of the config in force but the reloadable lists, which
+    /// `POST /admin/agents/reload` compares the file with to say what needs a restart.
+    pub config_sections: crate::config::SectionDigests,
     /// `[[root_grants]]`, the ceilings of root tokens.
     pub root_grants: Vec<RootGrant>,
     /// Trusted IdPs for hop-0 intake.
     pub idps: IdpRegistry,
-    /// Agents allowed to present IdP credentials (`[[agents]]`, validated, with their
-    /// `private_key_jwt` keys).
-    pub agents: Clients,
+    /// The agents allowed to authenticate at `POST /token` (`[[agents]]`) and the PEPs allowed
+    /// to send unsigned chains or see diagnostics at AuthZEN (`[[peps]]`), validated, with
+    /// their `private_key_jwt` keys. `POST /admin/agents/reload` swaps both at once; a request
+    /// takes one snapshot.
+    pub clients: SharedClients,
     /// `[dev] allow_root_mint`.
     pub dev_allow_root_mint: bool,
     /// `[token] require_actor_auth`.
@@ -90,8 +101,6 @@ pub struct AppState {
     pub authzen_max_batch: usize,
     /// `[authzen] diagnostics`.
     pub authzen_diagnostics: crate::config::AuthzenDiagnostics,
-    /// PEPs allowed to send unsigned chains (`[[peps]]`, validated, with their keys).
-    pub peps: Clients,
     /// `[server] public_url`.
     pub public_url: Option<String>,
     /// `[issuer] lease_interval_seconds`: lifetime of a lease after issuance or renewal.
@@ -309,24 +318,6 @@ impl AppState {
         }
         let pipeline = Arc::new(pipeline);
         let idps = IdpRegistry::from_config(&config.idps, &config.issuer.issuer)?;
-        let assertion_policy = AssertionPolicy::from_config(config);
-        let agents = Clients::agents(&config.agents, assertion_policy.clone())?;
-        let peps = Clients::peps(&config.peps, assertion_policy)?;
-        for idp in &config.idps {
-            for agent in agents
-                .iter()
-                .filter(|a| !idp.client_ids.contains_key(&a.id))
-            {
-                tracing::warn!(
-                    idp = ?idp.issuer,
-                    agent = ?agent.id,
-                    "[[idps]] client_ids has no entry for this agent: its ID tokens must carry \
-                     aud = `{0}` (the agent id). Set client_ids.{0} = \"<client id at the IdP>\" \
-                     to bind ID tokens to the agent explicitly (SR-37)",
-                    agent.id
-                );
-            }
-        }
         let actor_trust = ActorTrustRegistry::from_config(&config.actor_trust)?;
         let actor_auth = config.token.actor_auth;
         if actor_auth == ActorAuth::ActorToken && actor_trust.is_empty() {
@@ -334,11 +325,11 @@ impl AppState {
                 "[token] actor_auth = \"actor_token\" needs at least one [[actor_trust]] entry"
             );
         }
-        if actor_auth == ActorAuth::ActorToken && agents.iter().any(|a| a.has_keys()) {
-            tracing::warn!(
-                "[[agents]] entries have jwks but [token] actor_auth = \"actor_token\": client \
-                 assertions, like client secrets, are refused"
-            );
+        // `[[agents]]` and `[[peps]]`, with the check `POST /admin/agents/reload` makes too.
+        let client_rules = ClientRules::from_config(config, &actor_trust);
+        let (clients, warnings) = client_rules.check(&config.agents, &config.peps)?;
+        for warning in warnings {
+            tracing::warn!("{warning}");
         }
         if actor_auth == ActorAuth::Secret && !actor_trust.is_empty() {
             tracing::warn!(
@@ -352,28 +343,14 @@ impl AppState {
                  without authenticating it, so agent identity in policies and audit records is \
                  only asserted"
             );
-        } else if agents.is_empty() && actor_trust.is_empty() {
-            tracing::warn!(
-                "[[agents]] and [[actor_trust]] are empty and [token] require_actor_auth = \
-                 true: every token exchange will be rejected"
-            );
         }
         if config.authzen.allow_unsigned_chain {
-            if peps.is_empty() {
-                anyhow::bail!(
-                    "[authzen] allow_unsigned_chain = true needs at least one [[peps]] entry"
-                );
-            }
             tracing::warn!(
                 "[authzen] allow_unsigned_chain = true: authenticated [[peps]] may send \
                  delegation chains without the signed token"
             );
         }
-        if !idps.is_empty() && agents.is_empty() {
-            tracing::warn!(
-                "[[idps]] are configured but [[agents]] is empty; IdP intake rejects every request"
-            );
-        }
+        let config_sections = config.section_digests()?;
         if config.leases.retention_seconds > 0
             && config.leases.retention_seconds < config.issuer.default_ttl_seconds
         {
@@ -406,9 +383,12 @@ impl AppState {
             admin_credentials: crate::operators::SharedAdminCredentials::new(admin_credentials),
             operators_reload: tokio::sync::Mutex::new(()),
             config_path: config.source_path.clone(),
+            agents_reload: tokio::sync::Mutex::new(()),
+            client_rules,
+            config_sections,
             root_grants: config.root_grants.clone(),
             idps,
-            agents,
+            clients: SharedClients::new(clients),
             dev_allow_root_mint: config.dev.allow_root_mint,
             authzen_allow_unsigned_chain: config.authzen.allow_unsigned_chain,
             authzen_max_batch: config.authzen.max_batch,
@@ -416,7 +396,6 @@ impl AppState {
             require_actor_auth: config.token.require_actor_auth,
             actor_auth,
             actor_trust,
-            peps,
             public_url: config.server.public_url.clone(),
             lease_interval: lease_interval(config)?,
             jwks,

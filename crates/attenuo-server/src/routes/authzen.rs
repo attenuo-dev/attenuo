@@ -633,7 +633,7 @@ fn pep_assertion(
     };
     let field = |k: &str| obj.get(k).and_then(Value::as_str);
     let now = state.now();
-    let pep = state.peps.authenticate(
+    let pep = state.clients.snapshot().peps.authenticate(
         headers,
         field("pep_id"),
         field("pep_secret"),
@@ -750,6 +750,8 @@ fn admit(
                 (Some(pep), _) => Some(pep.to_owned()),
                 (None, Some(secret)) => Some(
                     state
+                        .clients
+                        .snapshot()
                         .peps
                         .authenticate(headers, pep_id.as_deref(), Some(secret), None, now)?
                         .commit(&state.replay, now)?,
@@ -769,6 +771,8 @@ fn admit(
             let id = match pep_by_assertion {
                 Some(pep) => pep.to_owned(),
                 None => state
+                    .clients
+                    .snapshot()
                     .peps
                     .authenticate(headers, pep_id.as_deref(), pep_secret.as_deref(), None, now)?
                     .commit(&state.replay, now)?,

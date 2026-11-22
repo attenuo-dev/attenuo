@@ -231,16 +231,9 @@ pub fn check_operators(ops: &[AdminOperator], legacy: Option<[u8; 32]>) -> anyho
 pub fn operators_from_toml(text: &str) -> anyhow::Result<Vec<AdminOperator>> {
     // Only the error's message and line: its default rendering quotes the line, which can be
     // `[admin] token = "..."`.
-    let mut file: toml::Table = text.parse().map_err(|e: toml::de::Error| {
-        let line = e
-            .span()
-            .and_then(|s| text.get(..s.start))
-            .map_or(0, |before| before.matches('\n').count() + 1);
-        anyhow::anyhow!(
-            "the config file is not valid TOML (line {line}): {}",
-            e.message()
-        )
-    })?;
+    let mut file: toml::Table = text
+        .parse()
+        .map_err(|e: toml::de::Error| anyhow::anyhow!(crate::config::toml_error_text(text, &e)))?;
     let Some(admin) = file.remove("admin") else {
         return Ok(Vec::new());
     };
@@ -534,8 +527,9 @@ fn ct_eq32(a: &[u8; 32], b: &[u8; 32]) -> bool {
 ///   dry run (writes nothing);
 /// - operator: revoking leases (by id or by selector, the `?preview=true` dry run included)
 ///   and deciding approvals;
-/// - admin: everything else (policy reload, operators reload, budget refunds, the dev root
-///   mint, and the audit retention routes: the prune plan, the prune and the anchors).
+/// - admin: everything else (policy reload, operators reload, agents reload, budget refunds,
+///   the dev root mint, and the audit retention routes: the prune plan, the prune and the
+///   anchors).
 pub const ROUTE_ROLES: &[(&str, &str, AdminRole)] = &[
     ("GET", "/admin/whoami", AdminRole::Viewer),
     ("GET", "/admin/leases/{lease_id}", AdminRole::Viewer),
@@ -562,6 +556,7 @@ pub const ROUTE_ROLES: &[(&str, &str, AdminRole)] = &[
     ("POST", "/admin/budgets/refund", AdminRole::Admin),
     ("POST", "/admin/policies/reload", AdminRole::Admin),
     ("POST", "/admin/operators/reload", AdminRole::Admin),
+    ("POST", "/admin/agents/reload", AdminRole::Admin),
     ("POST", "/admin/root-token", AdminRole::Admin),
     ("GET", "/admin/audit/prune/plan", AdminRole::Admin),
     ("POST", "/admin/audit/prune", AdminRole::Admin),

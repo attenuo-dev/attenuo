@@ -142,6 +142,7 @@ pub const ERROR_CODES: &[ErrorCode] = &[
     e("admin_disabled", &[r(403, "admin_disabled")], NO_RPC, "The admin API is turned off."),
     e("admin_role_insufficient", &[r(403, "admin_role_insufficient")], NO_RPC, "The admin credential's role is below the one the route needs; the message names the role needed."),
     e("agent_token_refused", &[r(403, "agent_token_refused")], NO_RPC, "A delegation token cannot decide an approval."),
+    e("agents_invalid", &[r(422, "agents_invalid")], NO_RPC, "The reloaded config file does not parse, or its `[[agents]]` or `[[peps]]` break a startup rule; the agents and peps in force are unchanged."),
     e("already_refunded", &[r(409, "already_refunded")], NO_RPC, "The budget charge was already refunded."),
     e("approval_expired", &[r(409, "approval_expired")], NO_RPC, "The approval, or the lease it is bound to, has expired."),
     d("approval_invalid", NONE, DENY, "A presented approval token does not verify, is for another call, or names an approval that is no longer granted."),
