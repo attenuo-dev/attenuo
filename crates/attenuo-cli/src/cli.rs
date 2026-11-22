@@ -1099,14 +1099,18 @@ pub(crate) enum AuditCmd {
     /// Give `--file` several times, oldest first, to check archives and the retained export
     /// as one log: each file must verify, and each must link to the next (contiguous seqs,
     /// the next file's first `prev_hash` is this file's last entry hash, this file ends at a
-    /// checkpoint, and a header anchor in the next file names this file's end).
+    /// checkpoint, and a header anchor in the next file, if present, names this file's end).
+    /// It reports where the set starts: from genesis, right after a prune, or at a later seq
+    /// whose earlier entries are not covered.
     Verify {
         /// An export made with `audit export` or `audit prune` (JSON Lines, or the `--format
         /// json` object). Repeat it, oldest file first, to verify several files as one log.
         #[arg(long)]
         file: Vec<std::path::PathBuf>,
         /// JWKS file holding the issuer keys; with `--file` and without this, the JWKS is
-        /// fetched from `<server>/.well-known/jwks.json`.
+        /// fetched from `<server>/.well-known/jwks.json`, and the check then only shows that
+        /// the file is consistent with the keys the server publishes. Pass keys you saved
+        /// yourself for a stronger check.
         #[arg(long, requires = "file")]
         jwks: Option<std::path::PathBuf>,
         /// With `--file`: accept entries after the export's last valid checkpoint, which only
@@ -1132,17 +1136,21 @@ pub(crate) enum AuditCmd {
     ///
     /// The steps: ask the server for the plan (the largest boundary its guards allow at or
     /// below `--through`, or for entries older than `--before`); export `from..=through` to a
-    /// temporary file next to `--archive`, flushed to disk; verify it strictly with the JWKS
-    /// (`--jwks`, else the server's `/.well-known/jwks.json`); move it to `--archive` (never
-    /// over an existing file); take the SHA-256 of its bytes; and `POST
-    /// /admin/audit/prune`, which signs that digest into the prune anchor. Nothing on the
-    /// server changes before that last request, so a failure or a crash at any earlier step
-    /// leaves the log as it was (a temporary `.<name>.partial-<pid>` file may be left).
+    /// temporary file next to `--archive` (mode 0600 on Unix), flushed to disk; verify it
+    /// strictly with the JWKS (`--jwks`, else the server's `/.well-known/jwks.json`) and check
+    /// it is the plan's range; move it to `--archive` (never over an existing file); take the
+    /// SHA-256 of its bytes; and `POST /admin/audit/prune` with the archive's first seq and
+    /// last entry hash, which the server checks before it signs that digest into the prune
+    /// anchor. Nothing on the server changes before that last request, so a failure or a
+    /// crash at any earlier step leaves the log as it was (a temporary `.<name>.partial-*`
+    /// file may be left). The anchor the server answers is checked against the archive.
     ///
     /// If the request fails after the archive was written, the archive is kept: repeat with
-    /// `--reuse-archive`, which verifies the file again and sends the same digest. A request
-    /// that already succeeded answers with the same anchor. Exits 2 when the server refuses
-    /// (a guard, printed with its code) or nothing can be pruned, 1 on an error.
+    /// `--reuse-archive`, which verifies the file again, checks that it starts where the log
+    /// now starts, and sends the same digest. A request that already succeeded answers with
+    /// the same anchor. Exits 2 when the server refuses (a guard, printed with its code),
+    /// nothing can be pruned, the archive does not fit, or the answered anchor does not match
+    /// the archive (the prune was committed); 1 on an error.
     Prune {
         /// Prune entries older than this RFC 3339 time (up to the newest checkpoint that is).
         #[arg(long, value_parser = parse_rfc3339, required_unless_present_any = ["through", "reuse_archive"], conflicts_with = "through")]
@@ -1151,12 +1159,14 @@ pub(crate) enum AuditCmd {
         /// allow at or below it.
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
         through: Option<u64>,
-        /// Where to write the archive, the export of the pruned entries. Refused if the file
-        /// exists. Keep it off the host: it is the only copy of those entries.
+        /// Where to write the archive, the export of the pruned entries (mode 0600 on Unix).
+        /// Refused if the file exists. Keep it off the host: it is the only copy of those
+        /// entries.
         #[arg(long, value_name = "PATH", required_unless_present = "dry_run")]
         archive: Option<std::path::PathBuf>,
         /// JWKS file holding the issuer keys to verify the archive with; without it the JWKS
-        /// is fetched from `<server>/.well-known/jwks.json`.
+        /// is fetched from `<server>/.well-known/jwks.json`, which only shows that the archive
+        /// is consistent with the keys the server publishes.
         #[arg(long)]
         jwks: Option<std::path::PathBuf>,
         /// Print the plan and stop. Changes nothing.
@@ -1181,7 +1191,10 @@ pub(crate) enum AuditCmd {
         /// `jsonl` streams one object per line; `json` writes a single object.
         #[arg(long, value_enum, default_value_t = ExportFormat::Jsonl)]
         format: ExportFormat,
-        /// Write here instead of stdout.
+        /// Write here instead of stdout. A regular file (or a new one) is written through a
+        /// temporary file and replaced only when the export ended cleanly, keeping the old
+        /// file's mode; a symlink, FIFO, device or path under /dev or /proc is written
+        /// directly.
         #[arg(long)]
         out: Option<std::path::PathBuf>,
         /// Keep only records of this kind: decision, tool_result, approval_request,
