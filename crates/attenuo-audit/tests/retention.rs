@@ -1639,3 +1639,138 @@ fn s3_objects_joined_without_newlines_parse() {
     assert_eq!(anchors.len(), 2);
     assert!(attenuo_audit::cross_check_anchors(&log, &anchors, &f.keys).ok);
 }
+
+// --- golden files, shared with the Python and TypeScript verifiers ------------------------
+
+/// Where the golden files of a pruned log live, for the Rust, Python and TypeScript suites.
+fn golden_dir() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/audit-retention")
+}
+
+/// A test key from a fixed seed, so a rewrite of the golden files keeps the same `kid`. It
+/// signs nothing outside these files.
+fn golden_issuer() -> Issuer {
+    let mut der = hex::decode("302e020100300506032b657004220420").unwrap();
+    der.extend([7u8; 32]);
+    let pem = format!(
+        "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
+        STANDARD.encode(der)
+    );
+    Issuer::from_pem(
+        IssuerConfig {
+            issuer: "https://attenuo.test".into(),
+            audience: "attenuo".into(),
+            max_depth: 4,
+            default_ttl: Duration::minutes(5),
+        },
+        &pem,
+    )
+    .unwrap()
+}
+
+/// Writes `testdata/audit-retention/`: a log of 12 entries with a checkpoint every 5, pruned
+/// through 5 and then through 10, as the two archives (`archive-1.jsonl`, 1..=5;
+/// `archive-2.jsonl`, 6..=10, its header carrying the first anchor), the retained export
+/// (`retained.jsonl`, 11..=14, with the second anchor and both prune records), what the sink
+/// shipped (`shipped.jsonl`) and the JWKS. Each archive's digest is signed into its anchor.
+/// Run it with `cargo test -p attenuo-audit --test retention write_golden_files -- --ignored`
+/// after a change of the formats, then commit the files.
+#[test]
+#[ignore = "writes the golden files; run by hand"]
+fn write_golden_files() {
+    use sha2::Digest;
+    let issuer = golden_issuer();
+    let log = log_of(&issuer, 5, 12);
+    let export = |from: u64, to: u64, anchor: Option<attenuo_audit::Anchor>| {
+        let header = ExportHeader::new(from, to, "2027-01-01T00:00:00Z".into()).with_anchor(anchor);
+        export_text(
+            &header,
+            &range(&log, from, to),
+            &log.checkpoints_between(from, to).unwrap(),
+        )
+    };
+    let sha = |t: &str| hex::encode(sha2::Sha256::digest(t.as_bytes()));
+    let a1 = export(1, 5, None);
+    let first = prune(&log, 5, Some(&sha(&a1))).unwrap().anchor.anchor;
+    finish(&log, 100);
+    let a2 = export(6, 10, Some(first.clone()));
+    let second = prune(&log, 10, Some(&sha(&a2))).unwrap().anchor.anchor;
+    finish(&log, 100);
+    let head = log.head().unwrap().unwrap().seq;
+    let retained = export(11, head, Some(second.clone()));
+    let mut shipped: String = log
+        .checkpoints_between(0, head)
+        .unwrap()
+        .iter()
+        .map(|c| ShippedCheckpoint::new(c, None).to_line())
+        .collect();
+    for a in [&first, &second] {
+        shipped.push_str(&ShippedAnchor::new(a, None).to_line());
+    }
+    let jwks: Vec<Value> = issuer
+        .trusted_public_keys()
+        .into_iter()
+        .map(|(kid, pem)| {
+            let b64: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
+            let der = STANDARD.decode(b64).unwrap();
+            json!({"kty": "OKP", "crv": "Ed25519", "alg": "EdDSA", "use": "sig",
+                   "kid": kid, "x": URL_SAFE_NO_PAD.encode(&der[der.len() - 32..])})
+        })
+        .collect();
+    let dir = golden_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    for (name, text) in [
+        ("archive-1.jsonl", a1),
+        ("archive-2.jsonl", a2),
+        ("retained.jsonl", retained),
+        ("shipped.jsonl", shipped),
+        (
+            "jwks.json",
+            serde_json::to_string_pretty(&json!({ "keys": jwks })).unwrap() + "\n",
+        ),
+    ] {
+        std::fs::write(dir.join(name), text).unwrap();
+    }
+}
+
+/// The committed golden files verify: each strictly, as one log from genesis, against the
+/// shipped checkpoints and anchors, and each anchor names its archive's digest.
+#[test]
+fn the_golden_files_verify() {
+    use sha2::Digest;
+    let dir = golden_dir();
+    let read = |n: &str| std::fs::read_to_string(dir.join(n)).unwrap();
+    let keys =
+        CheckpointKeys::from_jwks(&serde_json::from_str::<Value>(&read("jwks.json")).unwrap())
+            .unwrap();
+    let names = ["archive-1.jsonl", "archive-2.jsonl", "retained.jsonl"];
+    let parsed: Vec<_> = names
+        .iter()
+        .map(|n| parse_export(&read(n)).unwrap())
+        .collect();
+    for (n, p) in names.iter().zip(&parsed) {
+        let r = verify_export(p, &keys).unwrap();
+        assert!(r.report.ok, "{n}: {r:?}");
+    }
+    let r1 = verify_export(&parsed[0], &keys).unwrap();
+    let r2 = verify_export(&parsed[1], &keys).unwrap();
+    let r3 = verify_export(&parsed[2], &keys).unwrap();
+    assert!(r1.from_genesis && !r1.from_anchor);
+    assert_eq!((r2.from_anchor, r2.report.pruned_through), (true, Some(5)));
+    assert_eq!((r3.from_anchor, r3.report.pruned_through), (true, Some(10)));
+    let all: Vec<_> = parsed.iter().collect();
+    assert!(attenuo_audit::link_exports(&all).is_empty());
+    let shipped = read("shipped.jsonl");
+    let cps = parse_shipped(&shipped).unwrap();
+    let anchors = attenuo_audit::parse_shipped_anchors(&shipped).unwrap();
+    for p in &parsed {
+        assert!(cross_check(p, &cps, &keys).ok);
+        assert!(attenuo_audit::cross_check_anchors(p, &anchors, &keys).ok);
+    }
+    // Each anchor signs its archive's digest.
+    for (archive, a) in [(names[0], &parsed[1]), (names[1], &parsed[2])] {
+        let digest = hex::encode(sha2::Sha256::digest(read(archive).as_bytes()));
+        let anchor = a.header.as_ref().unwrap().anchor.as_ref().unwrap();
+        assert_eq!(anchor.archive_sha256.as_deref(), Some(digest.as_str()));
+    }
+}
