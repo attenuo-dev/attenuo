@@ -28,6 +28,7 @@ mod init_cmd;
 mod jwt;
 mod operator_cmd;
 mod policy_cmd;
+mod prune_cmd;
 mod render;
 mod secrets;
 mod sse;
@@ -52,6 +53,7 @@ use cli::{
     HealthArgs, KeyCmd, LeaseCmd, OperatorCmd, PolicyCmd, TokenCmd,
 };
 use client::{query_escape, Client};
+use prune_cmd::{audit_prune, PruneArgs};
 use render::fmt_audit_entry;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -621,23 +623,38 @@ async fn run(cli: Cli) -> Result<Outcome> {
             Ok(Outcome::Ok)
         }
         Command::Audit(AuditCmd::Verify {
-            file: Some(file),
+            file,
             jwks,
             allow_unsigned_tail,
             checkpoints,
-        }) => {
-            let options = attenuo_audit::VerifyOptions {
-                allow_unsigned_tail,
-            };
-            audit_verify_file(
+        }) if !file.is_empty() => {
+            audit_verify_files(
                 client,
                 &file,
                 jwks.as_deref(),
                 checkpoints.as_deref(),
-                options,
+                allow_unsigned_tail,
                 json,
             )
             .await
+        }
+        Command::Audit(AuditCmd::Prune {
+            before,
+            through,
+            archive,
+            jwks,
+            dry_run,
+            reuse_archive,
+        }) => {
+            let args = PruneArgs {
+                before,
+                through,
+                archive,
+                jwks,
+                dry_run,
+                reuse_archive,
+            };
+            audit_prune(&client?, &args, json).await
         }
         Command::Audit(AuditCmd::Export {
             from,
@@ -1516,6 +1533,10 @@ fn export_path(from: Option<u64>, to: Option<u64>, filter: &attenuo_audit::Recor
 
 /// `audit export`: stream the server's JSON Lines to `out` (or stdout), or collect them into
 /// one JSON object for `--format json`.
+///
+/// With `out`, the export goes to a temporary file next to it, flushed to disk, and is renamed
+/// to `out` only once the server's body ended without an error: an export the server cut short
+/// (a prune that committed while it streamed) leaves no file that looks complete.
 async fn audit_export(
     client: &Client,
     from: Option<u64>,
@@ -1527,17 +1548,46 @@ async fn audit_export(
     use std::io::Write;
 
     let path = export_path(from, to, filter);
-    let mut resp = client.admin_get_stream(&path).await?;
-    let mut sink: Box<dyn Write> = match out {
-        Some(p) => Box::new(std::io::BufWriter::new(
-            std::fs::File::create(p).with_context(|| format!("creating {}", p.display()))?,
-        )),
-        None => Box::new(std::io::BufWriter::new(out::Stdout)),
+    let resp = client.admin_get_stream(&path).await?;
+    let Some(out) = out else {
+        let mut sink = std::io::BufWriter::new(out::Stdout);
+        write_export(resp, format, &mut sink).await?;
+        sink.flush()?;
+        return Ok(Outcome::Ok);
     };
+    let tmp = partial_path(out);
+    let file = create_partial(&tmp)?;
+    let written = async {
+        let mut sink = std::io::BufWriter::new(file);
+        write_export(resp, format, &mut sink).await?;
+        let file = sink.into_inner().map_err(|e| e.into_error())?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, out).with_context(|| format!("renaming to {}", out.display()))?;
+        sync_parent(out);
+        anyhow::Ok(())
+    }
+    .await;
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.context(format!("the export was not written to {}", out.display())));
+    }
+    Ok(Outcome::Ok)
+}
+
+/// Copy an export body to `sink`: the JSON Lines as they come, or one JSON object.
+async fn write_export(
+    mut resp: reqwest::Response,
+    format: ExportFormat,
+    sink: &mut impl std::io::Write,
+) -> Result<()> {
     match format {
         ExportFormat::Jsonl => {
             // Stop reading once the reader of stdout has gone (`audit export | head`).
-            while let Some(chunk) = resp.chunk().await? {
+            while let Some(chunk) = resp
+                .chunk()
+                .await
+                .context("the server ended the export early")?
+            {
                 sink.write_all(&chunk)?;
                 if out::closed() {
                     break;
@@ -1545,29 +1595,53 @@ async fn audit_export(
             }
         }
         ExportFormat::Json => {
-            let text = resp.text().await?;
+            let text = resp
+                .text()
+                .await
+                .context("the server ended the export early")?;
             let export = attenuo_audit::parse_export(&text)?;
-            serde_json::to_writer_pretty(&mut sink, &attenuo_audit::to_json_form(&export))?;
+            serde_json::to_writer_pretty(&mut *sink, &attenuo_audit::to_json_form(&export))?;
             writeln!(sink)?;
         }
     }
-    sink.flush()?;
-    Ok(Outcome::Ok)
+    Ok(())
 }
 
-/// `audit verify --file`: check an export with nothing but the issuer's JWKS.
-async fn audit_verify_file(
-    client: Result<Client>,
-    file: &std::path::Path,
+/// The temporary name an export to `out` is written under first: `.<name>.partial-<pid>` in
+/// the same directory, so the final rename or link stays on one file system.
+fn partial_path(out: &std::path::Path) -> std::path::PathBuf {
+    let name = out
+        .file_name()
+        .map_or_else(|| "export".into(), |n| n.to_string_lossy().into_owned());
+    out.with_file_name(format!(".{name}.partial-{}", std::process::id()))
+}
+
+/// Create `tmp` for writing, failing if it exists.
+fn create_partial(tmp: &std::path::Path) -> Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(tmp)
+        .with_context(|| format!("creating {}", tmp.display()))
+}
+
+/// Flush the directory holding `path`, so a rename or link into it survives a crash. Best
+/// effort: not every platform can open a directory.
+fn sync_parent(path: &std::path::Path) {
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => std::path::Path::new("."),
+    };
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+}
+
+/// The issuer keys, from `jwks` when given, else from the server's `/.well-known/jwks.json`.
+async fn issuer_keys(
+    client: Result<&Client>,
     jwks: Option<&std::path::Path>,
-    shipped: Option<&std::path::Path>,
-    options: attenuo_audit::VerifyOptions,
-    json: bool,
-) -> Result<Outcome> {
-    let text =
-        std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
-    let export = attenuo_audit::parse_export(&text)
-        .with_context(|| format!("parsing {}", file.display()))?;
+) -> Result<attenuo_audit::CheckpointKeys> {
     let jwks: Value = match jwks {
         Some(p) => serde_json::from_str(
             &std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?,
@@ -1578,40 +1652,155 @@ async fn audit_verify_file(
             .await
             .context("fetching the JWKS (or pass --jwks <file>)")?,
     };
-    let keys = attenuo_audit::CheckpointKeys::from_jwks(&jwks)?;
-    let report = attenuo_audit::verify_export_with(&export, &keys, options)?;
-    let mut v = serde_json::to_value(&report)?;
-    let mut ok = report.report.ok;
-    if let Some(p) = shipped {
-        let text =
-            std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?;
-        let lines = attenuo_audit::parse_shipped(&text)
-            .with_context(|| format!("parsing {}", p.display()))?;
-        let cross = attenuo_audit::cross_check(&export, &lines, &keys);
-        ok &= cross.ok;
-        v["shipped"] = serde_json::to_value(&cross)?;
-        v["ok"] = json!(ok);
-    }
-    if json {
-        print_json(&v)?;
-    } else {
-        for line in export_lines(&v) {
-            outln!("{line}")?;
+    Ok(attenuo_audit::CheckpointKeys::from_jwks(&jwks)?)
+}
+
+/// Read and parse an export file.
+fn read_export(file: &std::path::Path) -> Result<attenuo_audit::Export> {
+    let text =
+        std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
+    attenuo_audit::parse_export(&text).with_context(|| format!("parsing {}", file.display()))
+}
+
+/// `audit verify --file ...`: check one export, or several as one log, with nothing but the
+/// issuer's JWKS. With one file the report is the file's; with several it is `{ok, files,
+/// links}`, where `links` lists each pair of neighbouring files that does not link.
+async fn audit_verify_files(
+    client: Result<Client>,
+    files: &[std::path::PathBuf],
+    jwks: Option<&std::path::Path>,
+    shipped: Option<&std::path::Path>,
+    allow_unsigned_tail: bool,
+    json: bool,
+) -> Result<Outcome> {
+    let exports = files
+        .iter()
+        .map(|f| read_export(f))
+        .collect::<Result<Vec<_>>>()?;
+    let keys = issuer_keys(client.as_ref().map_err(|e| anyhow::anyhow!("{e:#}")), jwks).await?;
+    let shipped = match shipped {
+        Some(p) => {
+            let text =
+                std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?;
+            let checkpoints = attenuo_audit::parse_shipped(&text)
+                .with_context(|| format!("parsing {}", p.display()))?;
+            let anchors = attenuo_audit::parse_shipped_anchors(&text)
+                .with_context(|| format!("parsing {}", p.display()))?;
+            Some((checkpoints, anchors))
         }
-        if v.get("shipped").is_some() {
-            for line in shipped_lines(&v["shipped"]) {
+        None => None,
+    };
+    let mut ok = true;
+    let mut reports = Vec::new();
+    for (i, export) in exports.iter().enumerate() {
+        // Only the newest file may run past its last checkpoint.
+        let options = attenuo_audit::VerifyOptions {
+            allow_unsigned_tail: allow_unsigned_tail && i + 1 == exports.len(),
+        };
+        let report = attenuo_audit::verify_export_with(export, &keys, options)?;
+        let mut v = serde_json::to_value(&report)?;
+        let mut file_ok = report.report.ok;
+        if let Some((checkpoints, anchors)) = &shipped {
+            let cross = attenuo_audit::cross_check(export, checkpoints, &keys);
+            let anchors = attenuo_audit::cross_check_anchors(export, anchors, &keys);
+            file_ok &= cross.ok && anchors.ok;
+            v["shipped"] = serde_json::to_value(&cross)?;
+            v["shipped_anchors"] = serde_json::to_value(&anchors)?;
+            v["ok"] = json!(file_ok);
+        }
+        ok &= file_ok;
+        reports.push(v);
+    }
+    let refs: Vec<&attenuo_audit::Export> = exports.iter().collect();
+    let links = attenuo_audit::link_exports(&refs);
+    ok &= links.is_empty();
+    if let [v] = reports.as_slice() {
+        if json {
+            print_json(v)?;
+        } else {
+            for line in file_report_lines(v) {
                 outln!("{line}")?;
             }
         }
+        return Ok(if ok { Outcome::Ok } else { Outcome::No });
+    }
+    let name = |i: usize| files[i].display().to_string();
+    if json {
+        let files_json: Vec<Value> = reports
+            .iter()
+            .zip(files)
+            .map(|(v, f)| {
+                let mut v = v.clone();
+                v["file"] = json!(f.display().to_string());
+                v
+            })
+            .collect();
+        let links_json: Vec<Value> = links
+            .iter()
+            .map(|l| {
+                json!({
+                    "earlier": name(l.earlier),
+                    "later": name(l.later),
+                    "reason": l.reason,
+                })
+            })
+            .collect();
+        print_json(&json!({"ok": ok, "files": files_json, "links": links_json}))?;
+    } else {
+        for (v, f) in reports.iter().zip(files) {
+            outln!("{}:", render::escape_controls(&f.display().to_string()))?;
+            for line in file_report_lines(v) {
+                outln!("  {line}")?;
+            }
+        }
+        for l in &links {
+            outln!(
+                "files do NOT link: {} then {}: {}",
+                render::escape_controls(&name(l.earlier)),
+                render::escape_controls(&name(l.later)),
+                l.reason
+            )?;
+        }
+        if links.is_empty() {
+            let first = reports.first().and_then(|v| v["first_seq"].as_u64());
+            let last = reports.last().and_then(|v| v["last_seq"].as_u64());
+            if let (Some(f), Some(l)) = (first, last) {
+                outln!(
+                    "files link: {} files hold seq {f}..{l} as one log",
+                    reports.len()
+                )?;
+            }
+        }
+        outln!(
+            "{}",
+            if ok {
+                "all files: OK"
+            } else {
+                "all files: FAILED"
+            }
+        )?;
     }
     Ok(if ok { Outcome::Ok } else { Outcome::No })
+}
+
+/// The text of one file's verification, with the shipped cross-checks when they ran.
+fn file_report_lines(v: &Value) -> Vec<String> {
+    let mut out = export_lines(v);
+    if v.get("shipped").is_some() {
+        out.extend(shipped_lines(&v["shipped"]));
+    }
+    if v.get("shipped_anchors").is_some() {
+        out.extend(shipped_anchor_lines(&v["shipped_anchors"]));
+    }
+    out
 }
 
 /// Text for the cross-check against shipped checkpoints (`--checkpoints`).
 fn shipped_lines(v: &Value) -> Vec<String> {
     let mut out = vec![format!(
-        "shipped checkpoints: {} in the file, {} inside the export's range, {} match",
-        v["shipped"], v["in_range"], v["matched"]
+        "shipped checkpoints: {} in the file, {} inside the export's range, {} match, {} below \
+         it (pruned or archived)",
+        v["shipped"], v["in_range"], v["matched"], v["below_range"]
     )];
     for m in v["mismatches"].as_array().into_iter().flatten() {
         out.push(format!(
@@ -1636,6 +1825,32 @@ fn shipped_lines(v: &Value) -> Vec<String> {
             "shipped checkpoints: FAILED (signed again after shipping, or deleted)".to_string(),
         );
     }
+    out
+}
+
+/// Text for the cross-check against shipped prune anchors (`--checkpoints`).
+fn shipped_anchor_lines(v: &Value) -> Vec<String> {
+    if v["shipped"] == 0 && v["mismatches"].as_array().is_none_or(Vec::is_empty) {
+        return Vec::new();
+    }
+    let mut out = vec![format!(
+        "shipped prune anchors: {} in the file, {} the export must account for, {} accounted \
+         for, {} past its end",
+        v["shipped"], v["checked"], v["matched"], v["beyond_range"]
+    )];
+    for m in v["mismatches"].as_array().into_iter().flatten() {
+        out.push(format!(
+            "shipped anchor through seq {} (line {}) MISMATCH: {}",
+            m["seq"],
+            m["line"],
+            m["reason"].as_str().unwrap_or_default()
+        ));
+    }
+    out.push(if v["ok"] == true {
+        "shipped prune anchors: OK".to_string()
+    } else {
+        "shipped prune anchors: FAILED".to_string()
+    });
     out
 }
 

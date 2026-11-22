@@ -769,3 +769,82 @@ async fn the_deletes_resume_after_a_restart() {
     );
     running.stop(state).await;
 }
+
+/// An export that a prune overtakes: the body was read up to seq 500 when a prune through
+/// 1000 committed, so the pages still to come would skip the pruned rows. The body ends with
+/// an error instead of a file with a gap. The router is driven directly, so the export only
+/// reads a page when the test asks for the next frame (no socket buffer reads ahead).
+#[tokio::test]
+async fn an_export_overtaken_by_a_prune_ends_with_an_error() {
+    use futures_util::StreamExt as _;
+    use tower::ServiceExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config(&dir, PruneMode::Manual);
+    let (router, state) = attenuo_server::build(&cfg).unwrap();
+    for i in 0..1200 {
+        state.audit.append(record(i, old())).unwrap();
+    }
+    let sink = state.checkpoint_sink.as_ref().unwrap();
+    wait_for(|| sink.delivered_through() >= Some(1200)).await;
+
+    let req = |method: &str, path: &str, body: Option<Value>| {
+        axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("authorization", format!("Bearer {ADMIN}"))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                body.map(|b| b.to_string()).unwrap_or_default(),
+            ))
+            .unwrap()
+    };
+    let resp = router
+        .clone()
+        .oneshot(req("GET", "/admin/audit/export?from=1&to=1200", None))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let mut body = resp.into_body().into_data_stream();
+    let mut text = String::new();
+    // The header, then the first page (seq 1 to 500).
+    while !text.contains("\"seq\":500,") {
+        let frame = body.next().await.expect("more frames").unwrap();
+        text.push_str(std::str::from_utf8(&frame).unwrap());
+    }
+    assert!(!text.contains("\"seq\":501,"), "the export read ahead");
+
+    let resp = router
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/admin/audit/prune",
+            Some(json!({"through": 1000})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let mut error = None;
+    while let Some(frame) = body.next().await {
+        match frame {
+            Ok(b) => text.push_str(std::str::from_utf8(&b).unwrap()),
+            Err(e) => {
+                error = Some(e.to_string());
+                break;
+            }
+        }
+    }
+    let error = error.expect("the body ends with an error");
+    assert!(
+        error.contains("pruned through seq 1000 during the export"),
+        "{error}"
+    );
+    // Nothing after the first page reached the body, and no checkpoint lines: the reader has
+    // a file that does not verify as complete.
+    assert!(!text.contains("\"seq\":501,"));
+    assert!(parse_export(&text)
+        .map(|e| verify_export(&e, &state.checkpoint_keys)
+            .map_or(true, |r| !r.report.ok || r.truncated))
+        .unwrap_or(true));
+}
