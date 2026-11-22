@@ -2,11 +2,14 @@
 //! server to prune it (design note `docs/design/audit-retention.md`, section 6.1).
 //!
 //! Nothing on the server changes before the last step, the `POST`: a failure or a crash while
-//! planning, exporting, verifying or hashing leaves the log as it was.
+//! planning, exporting, verifying or hashing leaves the log as it was. The `POST` names the
+//! archive's first seq and last entry hash, so the server refuses a prune the archive does not
+//! cover, and the anchor it answers is checked against the archive before success is printed.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use attenuo_audit::{Anchor, CheckpointKeys, Export};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -36,8 +39,12 @@ const REFUSALS: &[&str] = &[
     "sink_behind",
     "prune_in_progress",
     "prune_conflict",
+    "prune_archive_mismatch",
     "audit_pruned",
 ];
+
+/// Refusals that repeating the same request with the same archive can never get past.
+const FINAL: &[&str] = &["prune_conflict", "prune_archive_mismatch", "audit_pruned"];
 
 /// The server's refusal in `e`, as `(code, detail)`, when it is one of [`REFUSALS`].
 fn refusal(e: &anyhow::Error) -> Option<(String, String)> {
@@ -49,11 +56,27 @@ fn refusal(e: &anyhow::Error) -> Option<(String, String)> {
     ))
 }
 
+/// A "no" answer: the text on stderr, or with `--json` an object on stdout that says why.
+fn no(json: bool, body: Value, lines: &[String]) -> Result<Outcome> {
+    if json {
+        let mut v = json!({"ok": false});
+        if let (Some(v), Some(b)) = (v.as_object_mut(), body.as_object()) {
+            v.extend(b.clone());
+        }
+        print_json(&v)?;
+    } else {
+        for line in lines {
+            errln!("{line}");
+        }
+    }
+    Ok(Outcome::No)
+}
+
 /// `audit prune`.
 pub(crate) async fn audit_prune(client: &Client, args: &PruneArgs, json: bool) -> Result<Outcome> {
     if args.reuse_archive {
         let archive = args.archive.as_deref().expect("clap requires --archive");
-        return prune_with_archive(client, archive, args, None, json).await;
+        return prune_with_archive(client, archive, args, json).await;
     }
     let query = match (&args.before, args.through) {
         (Some(b), _) => format!("before={}", query_escape(b)),
@@ -67,15 +90,18 @@ pub(crate) async fn audit_prune(client: &Client, args: &PruneArgs, json: bool) -
         Ok(plan) => plan,
         Err(e) => {
             if let Some((code, detail)) = refusal(&e) {
-                errln!("prune refused: {code}: {detail}");
-                return Ok(Outcome::No);
+                return no(
+                    json,
+                    json!({"refused": {"code": code, "detail": detail}}),
+                    &[format!("prune refused: {code}: {detail}")],
+                );
             }
             return Err(e);
         }
     };
     let Some(through) = plan["through"].as_u64() else {
         if json {
-            print_json(&json!({"plan": plan}))?;
+            print_json(&json!({"ok": false, "plan": plan}))?;
         } else {
             for line in plan_lines(&plan) {
                 outln!("{line}")?;
@@ -85,7 +111,7 @@ pub(crate) async fn audit_prune(client: &Client, args: &PruneArgs, json: bool) -
     };
     if args.dry_run {
         if json {
-            print_json(&json!({"plan": plan}))?;
+            print_json(&json!({"ok": true, "plan": plan}))?;
         } else {
             for line in plan_lines(&plan) {
                 outln!("{line}")?;
@@ -106,6 +132,20 @@ pub(crate) async fn audit_prune(client: &Client, args: &PruneArgs, json: bool) -
     // The keys first: a JWKS that cannot be read stops the prune before any export.
     let keys = issuer_keys(Ok(client), args.jwks.as_deref()).await?;
     let from = plan["from"].as_u64().context("the plan has no `from`")?;
+    let Some(through_hash) = plan["checkpoint"]["head_hash"].as_str() else {
+        anyhow::bail!(
+            "the plan names no checkpoint hash at seq {through}; nothing was exported and the \
+             server was not changed"
+        );
+    };
+    let server_anchor = stored_anchor(&plan["anchor"])?;
+    let expect = Expect {
+        from,
+        through: Some(through),
+        through_hash: Some(through_hash.to_string()),
+        anchor: server_anchor,
+        anchor_boundary_only: false,
+    };
 
     // Step 2: export `from..=through` to a temporary file, flushed to disk.
     let tmp = partial_path(archive);
@@ -114,27 +154,29 @@ pub(crate) async fn audit_prune(client: &Client, args: &PruneArgs, json: bool) -
         return Err(e.context("the archive was not written; the server was not changed"));
     }
     // Step 3: verify it strictly, and check that it is the range the plan named.
-    let checked = std::fs::read(&tmp)
-        .with_context(|| format!("reading {}", tmp.display()))
-        .and_then(|bytes| check_archive(&bytes, &keys, Some((from, &plan))).map(|r| (bytes, r)));
-    let (bytes, report) = match checked {
-        Ok((bytes, Ok(report))) => (bytes, report),
-        Ok((_, Err(lines))) => {
+    let checked = read_archive(&tmp).and_then(|(export, digest)| {
+        check_archive(&export, &keys, &expect).map(|r| (export, digest, r))
+    });
+    let (export, digest, report) = match checked {
+        Ok((export, digest, Ok(report))) => (export, digest, report),
+        Ok((_, _, Err(lines))) => {
             let _ = std::fs::remove_file(&tmp);
-            for line in lines {
-                errln!("{line}");
-            }
-            errln!("the archive did not verify; it was removed and the server was not changed");
-            return Ok(Outcome::No);
+            let mut text = lines.clone();
+            text.push(
+                "the archive did not verify; it was removed and the server was not changed".into(),
+            );
+            return no(
+                json,
+                json!({"archive_problems": lines, "plan": plan}),
+                &text,
+            );
         }
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);
             return Err(e.context("the server was not changed"));
         }
     };
-    // Step 4: the digest of the file's bytes.
-    let digest = hex::encode(Sha256::digest(&bytes));
-    // Into place, never over a file that appeared meanwhile.
+    // Into place, never over a file that appeared meanwhile, and the directory flushed.
     if let Err(e) = place(&tmp, archive) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e.context("the server was not changed"));
@@ -149,8 +191,9 @@ pub(crate) async fn audit_prune(client: &Client, args: &PruneArgs, json: bool) -
     post_prune(
         client,
         archive,
-        through,
+        &export,
         &digest,
+        &keys,
         Some(&plan),
         &report,
         json,
@@ -158,37 +201,108 @@ pub(crate) async fn audit_prune(client: &Client, args: &PruneArgs, json: bool) -
     .await
 }
 
-/// `audit prune --reuse-archive`: verify the archive an earlier run wrote, and send the prune
-/// for its last seq with its digest again.
+/// What the archive must be: its first seq, its last seq and hash when known, and the anchor
+/// its header must carry (the server's newest, for an archive that does not start at 1).
+struct Expect {
+    from: u64,
+    through: Option<u64>,
+    through_hash: Option<String>,
+    anchor: Option<Anchor>,
+    /// Compare only the header anchor's boundary (`from - 1`), not the whole anchor: for the
+    /// repeat of a prune, whose archive starts after an older prune.
+    anchor_boundary_only: bool,
+}
+
+/// The signed anchor of a stored anchor (`{...anchor, state, shipped_at}`), or `None` for null.
+fn stored_anchor(v: &Value) -> Result<Option<Anchor>> {
+    if v.is_null() {
+        return Ok(None);
+    }
+    Ok(Some(
+        serde_json::from_value(v.clone()).context("the server's anchor is malformed")?,
+    ))
+}
+
+/// `audit prune --reuse-archive`: verify the archive an earlier run wrote against the log as
+/// it is now, and send the prune for its last seq with its digest again.
 async fn prune_with_archive(
     client: &Client,
     archive: &Path,
     args: &PruneArgs,
-    plan: Option<&Value>,
     json: bool,
 ) -> Result<Outcome> {
     let keys = issuer_keys(Ok(client), args.jwks.as_deref()).await?;
-    let bytes = std::fs::read(archive).with_context(|| format!("reading {}", archive.display()))?;
-    let report = match check_archive(&bytes, &keys, None)? {
-        Ok(report) => report,
-        Err(lines) => {
-            for line in lines {
-                errln!("{line}");
-            }
-            errln!("the archive did not verify; nothing was sent to the server");
-            return Ok(Outcome::No);
-        }
+    let (export, digest) = read_archive(archive)?;
+    let (Some(first), Some(last)) = (export.entries.first(), export.entries.last()) else {
+        anyhow::bail!("the archive holds no entries; nothing was sent to the server");
     };
-    let through = report["last_seq"]
-        .as_u64()
-        .context("the archive holds no entries")?;
+    let _ = first;
+    let (through, last_hash) = (last.seq, last.entry_hash.clone());
     if let Some(t) = args.through.filter(|t| *t != through) {
         anyhow::bail!(
             "the archive ends at seq {through}, not at --through {t}; nothing was sent to the \
              server"
         );
     }
-    let digest = hex::encode(Sha256::digest(&bytes));
+    // The log as it is now: its newest anchor says where it starts.
+    let page = client.admin_get("/admin/audit/anchors?limit=1").await?;
+    let newest = stored_anchor(&page["anchors"][0])?;
+    let already = newest.as_ref().filter(|a| a.through_seq == through);
+    let expect = match already {
+        // A repeat of a prune that succeeded: the anchor must be this archive's.
+        Some(a) => {
+            let mut problems = Vec::new();
+            if a.through_hash != last_hash {
+                problems.push(format!(
+                    "the log was pruned through seq {through} with another hash there ({}), not \
+                     this archive's last entry hash",
+                    a.through_hash
+                ));
+            }
+            if a.archive_sha256.as_deref() != Some(digest.as_str()) {
+                problems.push(format!(
+                    "the log was pruned through seq {through} with another archive digest ({})",
+                    a.archive_sha256.as_deref().unwrap_or("none")
+                ));
+            }
+            if !problems.is_empty() {
+                problems.push("nothing was sent to the server".into());
+                return no(json, json!({"archive_problems": problems}), &problems);
+            }
+            Expect {
+                from: a.previous_through_seq.map_or(1, |p| p + 1),
+                through: Some(through),
+                through_hash: Some(last_hash.clone()),
+                anchor: None,
+                anchor_boundary_only: true,
+            }
+        }
+        None if newest.as_ref().is_some_and(|a| a.through_seq > through) => {
+            let lines = vec![
+                format!(
+                    "the log is already pruned through seq {}, past this archive's end at seq {through}; nothing was sent to the server",
+                    newest.as_ref().map_or(0, |a| a.through_seq)
+                ),
+            ];
+            return no(json, json!({"archive_problems": lines}), &lines);
+        }
+        _ => Expect {
+            from: newest.as_ref().map_or(1, |a| a.through_seq + 1),
+            through: Some(through),
+            through_hash: None,
+            anchor: newest.clone(),
+            anchor_boundary_only: false,
+        },
+    };
+    // For the repeat the header anchor is the previous prune's, which the store keeps; the
+    // signature and the `from` it implies are what can be checked here.
+    let report = match check_archive(&export, &keys, &expect)? {
+        Ok(report) => report,
+        Err(mut lines) => {
+            lines.push("the archive does not match the log; nothing was sent to the server".into());
+            return no(json, json!({"archive_problems": lines}), &lines);
+        }
+    };
     if !json {
         outln!(
             "archive {}: seq {}..{through}, {} entries, verified, sha256 {digest}",
@@ -197,14 +311,18 @@ async fn prune_with_archive(
             report["entries"]
         )?;
     }
-    post_prune(client, archive, through, &digest, plan, &report, json).await
+    post_prune(
+        client, archive, &export, &digest, &keys, None, &report, json,
+    )
+    .await
 }
 
-/// Stream the export `from..=through` into `tmp` (created new) and flush it to disk.
+/// Stream the export `from..=through` into `tmp` (created new, mode 0600 on Unix) and flush
+/// it to disk.
 async fn export_archive(client: &Client, from: u64, through: u64, tmp: &Path) -> Result<()> {
     use std::io::Write;
 
-    let file = create_partial(tmp)?;
+    let file = create_partial(tmp, true)?;
     let path = crate::export_path(
         Some(from),
         Some(through),
@@ -219,18 +337,41 @@ async fn export_archive(client: &Client, from: u64, through: u64, tmp: &Path) ->
     Ok(())
 }
 
-/// Verify an archive's bytes strictly and check that it is a whole prefix ending at a
-/// checkpoint: entries from its header's `from` to its `to`, every one signed, the last at a
-/// checkpoint. With `plan`, also that it is `from..=through` of that plan and ends at the
-/// plan's checkpoint hash. `Ok(Err(lines))` says why it does not pass.
+/// Parse the archive at `path` and take the SHA-256 of its bytes, read in pieces (the text is
+/// dropped once parsed).
+fn read_archive(path: &Path) -> Result<(Export, String)> {
+    use std::io::Read;
+
+    let mut f = std::fs::File::open(path).with_context(|| format!("reading {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1 << 16];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let digest = hex::encode(hasher.finalize());
+    let export = {
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        attenuo_audit::parse_export(&text).context("parsing the archive")?
+    };
+    Ok((export, digest))
+}
+
+/// Verify an archive strictly and check that it is the whole prefix `expect` names: entries
+/// from `expect.from` to its last seq, every one signed, the last at a checkpoint; that last
+/// entry is `expect.through` with hash `expect.through_hash` when known; and an archive that
+/// does not start at 1 carries `expect.anchor` in its header. `Ok(Err(lines))` says why it
+/// does not pass.
 fn check_archive(
-    bytes: &[u8],
-    keys: &attenuo_audit::CheckpointKeys,
-    plan: Option<(u64, &Value)>,
+    export: &Export,
+    keys: &CheckpointKeys,
+    expect: &Expect,
 ) -> Result<std::result::Result<Value, Vec<String>>> {
-    let text = std::str::from_utf8(bytes).context("the archive is not UTF-8")?;
-    let export = attenuo_audit::parse_export(text).context("parsing the archive")?;
-    let report = attenuo_audit::verify_export(&export, keys)?;
+    let report = attenuo_audit::verify_export(export, keys)?;
     let v = serde_json::to_value(&report)?;
     let mut problems = Vec::new();
     if !report.report.ok {
@@ -250,23 +391,39 @@ fn check_archive(
     if report.report.last_signed_seq != report.last_seq {
         problems.push("the archive does not end at a checkpoint".to_string());
     }
-    if let Some((from, plan)) = plan {
-        let through = plan["through"].as_u64();
-        if header.from != from || Some(header.to) != through {
-            problems.push(format!(
-                "the server exported seq {}..{}, not the plan's {from}..{}",
-                header.from,
-                header.to,
-                through.map_or_else(|| "?".to_string(), |t| t.to_string())
-            ));
+    if header.from != expect.from {
+        problems.push(format!(
+            "the archive starts at seq {}, but the log starts at seq {}: the entries before \
+             seq {} would be pruned without being archived",
+            header.from, expect.from, header.from
+        ));
+    }
+    if let Some(t) = expect.through.filter(|t| Some(*t) != report.last_seq) {
+        problems.push(format!(
+            "the archive ends at seq {}, not at seq {t}",
+            report
+                .last_seq
+                .map_or_else(|| "?".to_string(), |s| s.to_string())
+        ));
+    }
+    if let Some(h) = &expect.through_hash {
+        if last.map(|e| &e.entry_hash) != Some(h) {
+            problems.push(
+                "the archive's last entry is not the one the server's checkpoint signs".to_string(),
+            );
         }
-        if let Some(h) = plan["checkpoint"]["head_hash"].as_str() {
-            if last.map(|e| e.entry_hash.as_str()) != Some(h) {
-                problems.push(
-                    "the archive's last entry is not the one the plan's checkpoint signs"
-                        .to_string(),
-                );
-            }
+    }
+    if header.from > 1 {
+        match (&header.anchor, &expect.anchor) {
+            (Some(a), _) if expect.anchor_boundary_only && a.through_seq + 1 == header.from => {}
+            (Some(a), Some(b)) if a == b => {}
+            (None, _) => problems.push(
+                "the archive does not start at seq 1 and its header carries no anchor".into(),
+            ),
+            (Some(a), _) => problems.push(format!(
+                "the archive's header anchor (through seq {}) is not the log's newest anchor",
+                a.through_seq
+            )),
         }
     }
     Ok(if problems.is_empty() {
@@ -278,73 +435,184 @@ fn check_archive(
 
 /// Move the verified `tmp` to `archive`, refusing if `archive` exists by now: a hard link,
 /// which fails on an existing name, then the temporary name is removed. On a file system
-/// without hard links, a rename after one more check.
+/// without hard links, a rename that refuses to replace (Linux `RENAME_NOREPLACE`), or else
+/// an error. Then the directory is flushed; a failure there is an error too, before anything
+/// is sent.
 fn place(tmp: &Path, archive: &Path) -> Result<()> {
+    let exists = || {
+        anyhow::anyhow!(
+            "{} appeared while the archive was written; refusing to overwrite it",
+            archive.display()
+        )
+    };
     match std::fs::hard_link(tmp, archive) {
         Ok(()) => {
             let _ = std::fs::remove_file(tmp);
         }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            anyhow::bail!(
-                "{} appeared while the archive was written; refusing to overwrite it",
-                archive.display()
-            );
-        }
-        Err(_) => {
-            if std::fs::symlink_metadata(archive).is_ok() {
-                anyhow::bail!(
-                    "{} appeared while the archive was written; refusing to overwrite it",
-                    archive.display()
-                );
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Err(exists()),
+        Err(link_err) => rename_noreplace(tmp, archive).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                exists()
+            } else {
+                anyhow::anyhow!(
+                    "could not move the archive to {} without risking an overwrite (hard link: \
+                     {link_err}; rename without replace: {e}); the verified file is kept at {}",
+                    archive.display(),
+                    tmp.display()
+                )
             }
-            std::fs::rename(tmp, archive)
-                .with_context(|| format!("moving the archive to {}", archive.display()))?;
-        }
+        })?,
     }
-    sync_parent(archive);
+    sync_parent(archive)
+        .with_context(|| format!("flushing the directory of {} to disk", archive.display()))?;
     Ok(())
 }
 
-/// Step 5 and 6: send the prune and print what the server committed. The archive is kept
-/// whatever the answer.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use rustix::fs::{renameat_with, RenameFlags, CWD};
+    renameat_with(CWD, from, CWD, to, RenameFlags::NOREPLACE).map_err(std::io::Error::from)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn rename_noreplace(_from: &Path, _to: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "no rename that refuses to replace on this platform",
+    ))
+}
+
+/// Check the anchor the server answered against the archive: its signature, its boundary and
+/// hash (the archive's last entry), its digest (the archive's), and its previous boundary (the
+/// archive header's anchor, or none for an archive from seq 1).
+fn anchor_problems(
+    resp: &Value,
+    export: &Export,
+    digest: &str,
+    keys: &CheckpointKeys,
+) -> Vec<String> {
+    let a: Anchor = match serde_json::from_value(resp["anchor"].clone()) {
+        Ok(a) => a,
+        Err(e) => return vec![format!("the answer's anchor is malformed: {e}")],
+    };
+    let mut out = Vec::new();
+    if let Err(why) = keys.verify_anchor(&a) {
+        out.push(format!("the anchor's signature: {why}"));
+    }
+    let last = export.entries.last();
+    if Some(a.through_seq) != last.map(|e| e.seq) {
+        out.push(format!(
+            "the anchor is through seq {}, the archive ends at seq {}",
+            a.through_seq,
+            last.map_or(0, |e| e.seq)
+        ));
+    }
+    if Some(&a.through_hash) != last.map(|e| &e.entry_hash) {
+        out.push("the anchor's through_hash is not the archive's last entry hash".into());
+    }
+    if a.archive_sha256.as_deref() != Some(digest) {
+        out.push(format!(
+            "the anchor's archive_sha256 is {}, not the archive's {digest}",
+            a.archive_sha256.as_deref().unwrap_or("none")
+        ));
+    }
+    let header = export.header.as_ref();
+    let want_prev = header
+        .filter(|h| h.from > 1)
+        .and_then(|h| h.anchor.as_ref())
+        .map(|p| p.through_seq);
+    if a.previous_through_seq != want_prev {
+        out.push(format!(
+            "the anchor's previous boundary is {:?}, the archive says {:?}",
+            a.previous_through_seq, want_prev
+        ));
+    }
+    out
+}
+
+/// Step 5 and 6: send the prune (with the archive's first seq and last hash, so the server
+/// refuses one the archive does not cover), check the anchor it answers, and print what the
+/// server committed. The archive is kept whatever the answer.
+#[allow(clippy::too_many_arguments)]
 async fn post_prune(
     client: &Client,
     archive: &Path,
-    through: u64,
+    export: &Export,
     digest: &str,
+    keys: &CheckpointKeys,
     plan: Option<&Value>,
     report: &Value,
     json: bool,
 ) -> Result<Outcome> {
+    let (Some(first), Some(last)) = (export.entries.first(), export.entries.last()) else {
+        anyhow::bail!("the archive holds no entries");
+    };
     let repeat = format!(
         "the archive {} is kept; once the cause is fixed, repeat with `attenuo audit prune \
          --archive {} --reuse-archive` (the same digest makes the request safe to repeat)",
         archive.display(),
         archive.display()
     );
-    let body = json!({"through": through, "archive_sha256": digest});
+    let body = json!({
+        "through": last.seq,
+        "archive_sha256": digest,
+        "from": first.seq,
+        "through_hash": last.entry_hash,
+    });
     let resp = match client.admin_post("/admin/audit/prune", &body).await {
         Ok(resp) => resp,
         Err(e) => {
             if let Some((code, detail)) = refusal(&e) {
-                errln!("prune refused: {code}: {detail}");
-                errln!("{}", render::escape_controls(&repeat));
-                return Ok(Outcome::No);
+                let mut lines = vec![format!("prune refused: {code}: {detail}")];
+                if FINAL.contains(&code.as_str()) {
+                    lines.push(format!(
+                        "the archive {} is kept; the same request would be refused again",
+                        archive.display()
+                    ));
+                } else {
+                    lines.push(repeat.clone());
+                }
+                let lines: Vec<String> = lines.iter().map(|l| render::escape_controls(l)).collect();
+                return no(
+                    json,
+                    json!({"refused": {"code": code, "detail": detail}}),
+                    &lines,
+                );
             }
             errln!("{}", render::escape_controls(&repeat));
             return Err(e.context("the prune request failed"));
         }
     };
+    let problems = anchor_problems(&resp, export, digest, keys);
+    let archive_json = json!({
+        "path": archive.display().to_string(),
+        "sha256": digest,
+        "entries": report["entries"],
+        "from": report["first_seq"],
+        "through": report["last_seq"],
+    });
+    if !problems.is_empty() {
+        let mut lines =
+            vec!["PRUNE COMMITTED, BUT THE ANCHOR DOES NOT MATCH THE ARCHIVE".to_string()];
+        lines.extend(problems.iter().cloned());
+        lines.push(format!(
+            "the server pruned through seq {}; keep the archive {} and the server's answer, and \
+             check the log with `attenuo audit verify` and `audit verify --file`",
+            resp["pruned_through"],
+            archive.display()
+        ));
+        return no(
+            json,
+            json!({"committed": true, "anchor_problems": problems, "archive": archive_json,
+                   "prune": resp}),
+            &lines,
+        );
+    }
     if json {
         print_json(&json!({
+            "ok": true,
             "plan": plan,
-            "archive": {
-                "path": archive.display().to_string(),
-                "sha256": digest,
-                "entries": report["entries"],
-                "from": report["first_seq"],
-                "through": report["last_seq"],
-            },
+            "archive": archive_json,
             "prune": resp,
         }))?;
     } else {

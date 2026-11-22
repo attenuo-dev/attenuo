@@ -83,6 +83,10 @@ pub enum PruneGuard {
     InProgress,
     /// A prune through this boundary was already made with another archive digest.
     Conflict,
+    /// The archive the request describes ([`PruneExpect`]) is not the prefix the prune
+    /// removes: it does not start at the first retained seq, or its last entry is not the
+    /// entry at the boundary. For a repeat, it does not match the stored anchor.
+    ArchiveMismatch,
     /// The boundary is at or below the log's first retained seq already.
     AlreadyPruned,
 }
@@ -97,6 +101,7 @@ impl PruneGuard {
             Self::SinkBehind => "sink_behind",
             Self::InProgress => "prune_in_progress",
             Self::Conflict => "prune_conflict",
+            Self::ArchiveMismatch => "prune_archive_mismatch",
             Self::AlreadyPruned => "audit_pruned",
         }
     }
@@ -128,6 +133,19 @@ pub struct PruneLimits {
     pub sink: Option<SinkProgress>,
     /// The time the guards are checked at, and the prune record's and signatures' time.
     pub now: OffsetDateTime,
+}
+
+/// What the request says about the archive it kept, checked inside the prune's transaction
+/// (both optional, for clients that send only `through` and `archive_sha256`). Without them
+/// nothing ties the digest to the entries the prune removes: an archive of `1001..=2000`
+/// would let a prune through 2000 remove `1..=1000` archived nowhere.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PruneExpect {
+    /// The archive's first seq: must be the log's first retained seq (1, or the previous
+    /// boundary + 1).
+    pub from: Option<u64>,
+    /// The archive's last entry hash: must be the entry hash at `through`.
+    pub through_hash: Option<String>,
 }
 
 /// A committed prune: the anchor, the two checkpoints around the prune record, and whether
@@ -369,6 +387,36 @@ fn fmt_utc(t: OffsetDateTime) -> String {
 
 /// Check every guard on `through` that the file decides, plus the sink, inside the caller's
 /// transaction. `Ok` carries the checkpoint at `through`.
+/// Refuse with [`PruneGuard::ArchiveMismatch`] when `expect` names another first seq than
+/// `first` or another hash at `through` than `hash`; `what` names what was compared.
+fn check_expect(
+    expect: &PruneExpect,
+    first: u64,
+    through: u64,
+    hash: &str,
+    what: &str,
+) -> Result<(), AuditError> {
+    if let Some(from) = expect.from.filter(|f| *f != first) {
+        return Err(refused(
+            PruneGuard::ArchiveMismatch,
+            format!(
+                "the archive starts at seq {from}, but {what} starts at seq {first}: the \
+                 entries before seq {from} would be pruned without being archived"
+            ),
+        ));
+    }
+    if let Some(h) = expect.through_hash.as_deref().filter(|h| *h != hash) {
+        return Err(refused(
+            PruneGuard::ArchiveMismatch,
+            format!(
+                "the archive's last entry hash {h} is not the entry hash at seq {through} in \
+                 {what} ({hash})"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn check_guards(
     conn: &Connection,
     through: u64,
@@ -795,6 +843,33 @@ impl SqliteAudit {
         limits: &PruneLimits,
         record: impl FnOnce(&Value) -> DecisionRecord,
     ) -> Result<PruneOutcome, AuditError> {
+        self.prune_through_expecting(
+            through,
+            archive_sha256,
+            &PruneExpect::default(),
+            limits,
+            record,
+        )
+    }
+
+    /// [`Self::prune_through`], refusing with [`PruneGuard::ArchiveMismatch`] unless the
+    /// archive `expect` describes is the prefix the prune removes: `expect.from` is the first
+    /// retained seq and `expect.through_hash` the entry hash at `through`, both checked inside
+    /// the transaction. A repeat of a request that succeeded compares them with the stored
+    /// anchor (`previous_through_seq + 1`, or 1, and `through_hash`).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::prune_through`], and [`AuditError::PruneRefused`] with
+    /// [`PruneGuard::ArchiveMismatch`].
+    pub fn prune_through_expecting(
+        &self,
+        through: u64,
+        archive_sha256: Option<String>,
+        expect: &PruneExpect,
+        limits: &PruneLimits,
+        record: impl FnOnce(&Value) -> DecisionRecord,
+    ) -> Result<PruneOutcome, AuditError> {
         let c = self
             .inner
             .checkpointing
@@ -807,6 +882,14 @@ impl SqliteAudit {
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             // A repeat of a request that succeeded.
             if let Some(existing) = anchor_at(&tx, through)? {
+                let a = &existing.anchor;
+                check_expect(
+                    expect,
+                    a.previous_through_seq.map_or(1, |p| p + 1),
+                    through,
+                    &a.through_hash,
+                    "the stored prune through this seq",
+                )?;
                 if existing.anchor.archive_sha256 == archive_sha256 {
                     let p = existing.anchor.prune_seq;
                     let out = PruneOutcome {
@@ -828,6 +911,13 @@ impl SqliteAudit {
             // 1. The guards, again, inside the transaction.
             let previous = newest_anchor(&tx)?.map(|a| a.anchor.through_seq);
             let cp_b = check_guards(&tx, through, previous.unwrap_or(0), limits)?;
+            check_expect(
+                expect,
+                previous.map_or(1, |p| p + 1),
+                through,
+                &cp_b.head_hash,
+                "the log",
+            )?;
             self.fail_prune_at(1)?;
             // 2. The "before" checkpoint of the head, if it has none.
             let (head, head_hash) = head_link(&tx)?;

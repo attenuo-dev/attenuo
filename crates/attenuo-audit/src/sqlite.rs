@@ -47,8 +47,8 @@ pub use log::{AppendStats, SqliteAudit, DEFAULT_APPEND_QUEUE, DEFAULT_APPEND_TIM
 pub use migrations::{SchemaState, SCHEMA_VERSION};
 pub use outbox::{NewNotice, OutboxNotice};
 pub use retention::{
-    AnchorState, PlanBound, PlanGuards, PruneGuard, PruneLimits, PruneOutcome, PrunePlan,
-    PruneStep, SinkProgress, StoredAnchor,
+    AnchorState, PlanBound, PlanGuards, PruneExpect, PruneGuard, PruneLimits, PruneOutcome,
+    PrunePlan, PruneStep, SinkProgress, StoredAnchor,
 };
 pub use wal::{
     WalCheckpoint, WalStats, CHECKPOINT_PRESYNC_LEAD, DEFAULT_WAL_CHECKPOINT_INTERVAL,

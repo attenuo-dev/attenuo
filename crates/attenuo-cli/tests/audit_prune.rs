@@ -252,6 +252,12 @@ async fn a_prune_through_the_cli_end_to_end() {
     }
     assert_eq!(s.first_retained(), 21);
     no_partial_files(s.dir.path());
+    // Only the owner can read the archive (M7).
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&archive).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
     // The digest signed into the anchor is the archive's.
     let bytes = std::fs::read(&archive).unwrap();
     let digest = common::sha256_hex(std::str::from_utf8(&bytes).unwrap());
@@ -474,9 +480,8 @@ async fn refusals_leave_the_server_as_it_was() {
     assert!(t.contains("limited by: prune_in_progress"), "{t}");
     assert!(!a2.exists());
 
-    // A guard refusal of the POST itself: the same boundary with another digest (the archive
-    // with one more blank line still verifies, but its bytes differ). The code and detail are
-    // printed, with how to repeat.
+    // The same boundary with another digest (the archive with one more blank line still
+    // verifies, but its bytes differ): the CLI sees the stored anchor and sends nothing.
     let changed = s.path("archive-changed.jsonl");
     let mut bytes = std::fs::read(&archive).unwrap();
     bytes.extend_from_slice(b"\n");
@@ -487,8 +492,25 @@ async fn refusals_leave_the_server_as_it_was() {
     )
     .await;
     let t = assert_exit(&out, 2);
-    assert!(t.contains("prune refused: prune_conflict: "), "{t}");
-    assert!(t.contains("--reuse-archive"), "{t}");
+    assert!(t.contains("with another archive digest"), "{t}");
+    assert!(t.contains("nothing was sent to the server"), "{t}");
+    let out = prune(
+        &s,
+        &[
+            "--archive",
+            changed.to_str().unwrap(),
+            "--reuse-archive",
+            "--json",
+        ],
+    )
+    .await;
+    assert_exit(&out, 2);
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], false);
+    assert!(v["archive_problems"][0]
+        .as_str()
+        .unwrap()
+        .contains("another archive digest"));
 
     // `--through` must match the archive's end.
     let out = prune(
@@ -508,8 +530,7 @@ async fn refusals_leave_the_server_as_it_was() {
         "{t}"
     );
 
-    // After a later prune, the first request repeated still answers its own anchor, and
-    // another digest for that old boundary is still a conflict.
+    // After a later prune, the first archive lies wholly below the log's start.
     s.settle().await;
     s.fill(10).await;
     let out = prune(&s, &["--through", "30", "--archive", a2.to_str().unwrap()]).await;
@@ -519,18 +540,39 @@ async fn refusals_leave_the_server_as_it_was() {
         &["--archive", archive.to_str().unwrap(), "--reuse-archive"],
     )
     .await;
-    let t = assert_exit(&out, 0);
+    let t = assert_exit(&out, 2);
     assert!(
-        t.contains("already pruned through seq 20 with this archive"),
+        t.contains("already pruned through seq 30, past this archive's end at seq 20"),
         "{t}"
     );
+}
+
+/// I1: an archive of a window of the log (11..=20 on a log that starts at 1) must not prune
+/// 1..=20: the CLI refuses it before it sends anything.
+#[tokio::test]
+async fn a_window_archive_is_refused_before_anything_is_sent() {
+    let s = Server::start(PruneMode::Manual).await;
+    s.fill(35).await;
+    let window = s.path("window.jsonl");
+    let mut c = s.cli();
+    c.args(["audit", "export", "--from", "11", "--to", "20", "--out"])
+        .arg(&window);
+    assert_exit(&run(c).await, 0);
+    // It verifies on its own, as a window.
+    assert_exit(&verify(&s, &[&window], &[]).await, 0);
     let out = prune(
         &s,
-        &["--archive", changed.to_str().unwrap(), "--reuse-archive"],
+        &["--archive", window.to_str().unwrap(), "--reuse-archive"],
     )
     .await;
     let t = assert_exit(&out, 2);
-    assert!(t.contains("prune refused: prune_conflict: "), "{t}");
+    assert!(
+        t.contains("the archive starts at seq 11, but the log starts at seq 1"),
+        "{t}"
+    );
+    assert!(t.contains("nothing was sent to the server"), "{t}");
+    assert_eq!(s.first_retained(), 1);
+    assert!(s.state.audit.newest_anchor().unwrap().is_none());
 }
 
 #[tokio::test]
@@ -548,9 +590,18 @@ async fn prune_off_is_refused_before_anything_is_written() {
     assert!(!archive.exists());
 }
 
-/// A scripted server whose export body is cut off after the header: the plan is answered,
-/// the export ends without its last chunk, and a `POST` is counted.
-fn cut_short_server() -> (String, Arc<AtomicUsize>) {
+/// An answer of a scripted server: 200 with a JSON body, or with `status`.
+fn http(status: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+         connection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+/// A scripted server: each request gets the raw answer of the first route whose needle is in
+/// its request line (a 500 when none is), and every `POST` is counted.
+fn scripted(routes: Vec<(&'static str, String)>) -> (String, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let posts = Arc::new(AtomicUsize::new(0));
@@ -567,48 +618,60 @@ fn cut_short_server() -> (String, Arc<AtomicUsize>) {
                 head.push(byte[0]);
             }
             let head = String::from_utf8_lossy(&head).into_owned();
-            if head.starts_with("POST") {
+            let first = head.lines().next().unwrap_or_default().to_string();
+            if first.starts_with("POST") {
                 seen.fetch_add(1, Ordering::SeqCst);
             }
-            if head.contains("/admin/audit/prune/plan") {
-                let body = json!({
-                    "from": 1, "through": 20, "entries": 20,
-                    "checkpoint": {"seq": 20, "head_hash": "00"}, "at": "2026-01-01T00:00:00Z",
-                    "guards": {"limited_by": null}, "anchor": null,
-                })
-                .to_string();
-                let _ = write!(
-                    stream,
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: \
-                     {}\r\nconnection: close\r\n\r\n{body}",
-                    body.len()
+            let answer = routes
+                .iter()
+                .find(|(needle, _)| first.contains(needle))
+                .map_or_else(
+                    || http("500 Internal Server Error", "{}"),
+                    |(_, a)| a.clone(),
                 );
-            } else if head.contains("/admin/audit/export") {
-                let line = "{\"format\":\"attenuo-audit-export-v1\",\"from\":1,\"to\":20,\
-                            \"exported_at\":\"2026-01-01T00:00:00Z\"}\n";
-                let _ = write!(
-                    stream,
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\n\
-                     transfer-encoding: chunked\r\nconnection: close\r\n\r\n{:x}\r\n{line}\r\n",
-                    line.len()
-                );
-                // No terminating chunk: the body ends with an error.
-            } else {
-                let _ = write!(
-                    stream,
-                    "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: \
-                     close\r\n\r\n"
-                );
-            }
+            let _ = stream.write_all(answer.as_bytes());
             let _ = stream.flush();
         }
     });
     (url, posts)
 }
 
+/// A plan answer for `from..=through` whose checkpoint names `hash`.
+fn plan_body(from: u64, through: u64, hash: &str) -> String {
+    json!({
+        "from": from, "through": through, "entries": through - from + 1,
+        "checkpoint": {"seq": through, "head_hash": hash}, "at": "2026-01-01T00:00:00Z",
+        "guards": {"limited_by": null}, "anchor": null,
+    })
+    .to_string()
+}
+
+/// The CLI against `url`, run off the runtime.
+async fn run_at(url: &str, args: &[&str]) -> Output {
+    let mut c = attenuo();
+    c.env("ATTENUO_ADMIN_TOKEN", ADMIN)
+        .args(["--server", url])
+        .args(args);
+    run(c).await
+}
+
 #[test]
 fn an_export_cut_short_leaves_no_file_and_sends_no_prune() {
-    let (url, posts) = cut_short_server();
+    // A header that parses, then the body ends without its last chunk.
+    let line = "{\"type\":\"header\",\"format\":\"attenuo-audit-export-v2\",\"from\":1,\"to\":20,\
+                \"exported_at\":\"2026-01-01T00:00:00Z\"}\n";
+    let cut = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\ntransfer-encoding: chunked\r\n\
+         connection: close\r\n\r\n{:x}\r\n{line}\r\n",
+        line.len()
+    );
+    let (url, posts) = scripted(vec![
+        (
+            "/admin/audit/prune/plan",
+            http("200 OK", &plan_body(1, 20, &"00".repeat(32))),
+        ),
+        ("/admin/audit/export", cut),
+    ]);
     let dir = tempfile::tempdir().unwrap();
     let jwks = dir.path().join("jwks.json");
     other_jwks(&jwks);
@@ -643,8 +706,282 @@ fn an_export_cut_short_leaves_no_file_and_sends_no_prune() {
         .output()
         .unwrap();
     let t = assert_exit(&out, 1);
-    assert!(t.contains("the server was not changed"), "{t}");
+    assert!(
+        t.contains("the archive was not written; the server was not changed"),
+        "{t}"
+    );
+    assert!(t.contains("the server ended the export early"), "{t}");
     assert!(!archive.exists());
     no_partial_files(dir.path());
     assert_eq!(posts.load(Ordering::SeqCst), 0);
+}
+
+/// A real archive of 1..=20 and the JWKS that signed it, from a real server.
+async fn real_archive(s: &Server) -> (String, PathBuf) {
+    let file = s.path("real.jsonl");
+    let mut c = s.cli();
+    c.args(["audit", "export", "--from", "1", "--to", "20", "--out"])
+        .arg(&file);
+    assert_exit(&run(c).await, 0);
+    let jwks = s.path("jwks.json");
+    let body = reqwest::get(s.server.url("/.well-known/jwks.json"))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    std::fs::write(&jwks, body).unwrap();
+    (std::fs::read_to_string(&file).unwrap(), jwks)
+}
+
+fn ndjson(body: &str) -> String {
+    format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\ncontent-length: {}\r\n\
+         connection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+/// The archive the server streamed is checked against the plan: another range or another
+/// last hash stops the prune before anything is sent, and the file is removed.
+#[tokio::test]
+async fn an_archive_that_is_not_the_plan_is_refused() {
+    let s = Server::start(PruneMode::Manual).await;
+    s.fill(35).await;
+    let (text, jwks) = real_archive(&s).await;
+    let hash20 = s.state.audit.entry_at(20).unwrap().unwrap().entry_hash;
+    let j = jwks.to_str().unwrap();
+    for (plan, want) in [
+        (
+            plan_body(1, 30, &hash20),
+            "the archive ends at seq 20, not at seq 30",
+        ),
+        (
+            plan_body(1, 20, &"00".repeat(32)),
+            "the archive's last entry is not the one the server's checkpoint signs",
+        ),
+        (
+            plan_body(5, 20, &hash20),
+            "the archive starts at seq 1, but the log starts at seq 5",
+        ),
+    ] {
+        let (url, posts) = scripted(vec![
+            ("/admin/audit/prune/plan", http("200 OK", &plan)),
+            ("/admin/audit/export", ndjson(&text)),
+        ]);
+        let archive = s.path("scripted.jsonl");
+        let a = archive.to_str().unwrap();
+        let out = run_at(
+            &url,
+            &[
+                "audit",
+                "prune",
+                "--through",
+                "20",
+                "--archive",
+                a,
+                "--jwks",
+                j,
+            ],
+        )
+        .await;
+        let t = assert_exit(&out, 2);
+        assert!(t.contains(want), "{want} not in {t}");
+        assert!(
+            t.contains("it was removed and the server was not changed"),
+            "{t}"
+        );
+        assert!(!archive.exists());
+        no_partial_files(s.dir.path());
+        assert_eq!(posts.load(Ordering::SeqCst), 0);
+        // With --json, the same answer as an object on stdout.
+        let out = run_at(
+            &url,
+            &[
+                "audit",
+                "prune",
+                "--through",
+                "20",
+                "--archive",
+                a,
+                "--jwks",
+                j,
+                "--json",
+            ],
+        )
+        .await;
+        assert_exit(&out, 2);
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(v["ok"], false);
+        assert!(
+            v["archive_problems"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p.as_str().unwrap().contains(want)),
+            "{v}"
+        );
+    }
+}
+
+/// A refusal of the POST itself, with --json, and an answer whose anchor does not match the
+/// archive: the prune was committed, which the CLI says loudly, exit 2.
+#[tokio::test]
+async fn the_answer_of_the_prune_is_checked_against_the_archive() {
+    let s = Server::start(PruneMode::Manual).await;
+    s.fill(35).await;
+    let (text, jwks) = real_archive(&s).await;
+    let archive = s.path("kept.jsonl");
+    std::fs::write(&archive, &text).unwrap();
+    let a = archive.to_str().unwrap();
+    let j = jwks.to_str().unwrap();
+    let anchors = http("200 OK", r#"{"anchors":[],"next_cursor":null}"#);
+
+    let refused = http(
+        "409 Conflict",
+        r#"{"error":"conflict","code":"prune_in_progress","detail":"still deleting"}"#,
+    );
+    let (url, posts) = scripted(vec![
+        ("/admin/audit/anchors", anchors.clone()),
+        ("/admin/audit/prune", refused),
+    ]);
+    let out = run_at(
+        &url,
+        &[
+            "audit",
+            "prune",
+            "--archive",
+            a,
+            "--reuse-archive",
+            "--jwks",
+            j,
+        ],
+    )
+    .await;
+    let t = assert_exit(&out, 2);
+    assert!(
+        t.contains("prune refused: prune_in_progress: still deleting"),
+        "{t}"
+    );
+    assert!(t.contains("--reuse-archive"), "{t}");
+    let out = run_at(
+        &url,
+        &[
+            "audit",
+            "prune",
+            "--archive",
+            a,
+            "--reuse-archive",
+            "--jwks",
+            j,
+            "--json",
+        ],
+    )
+    .await;
+    assert_exit(&out, 2);
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["refused"]["code"], "prune_in_progress");
+    assert_eq!(posts.load(Ordering::SeqCst), 2);
+    // The request names the archive's first seq and last hash: checked by the real server
+    // in `a_prune_through_the_cli_end_to_end`.
+
+    // A committed prune whose anchor is not this archive's.
+    let bogus = json!({
+        "prune_seq": 36, "pruned_through": 20, "deleting": true, "already": false,
+        "anchor": {"through_seq": 20, "through_hash": "00".repeat(32), "prune_seq": 36,
+                   "prune_entry_hash": "11".repeat(32), "previous_through_seq": null,
+                   "archive_sha256": "22".repeat(32), "at": "2026-01-01T00:00:00Z",
+                   "kid": "nope", "signature": "AA"},
+        "checkpoint_before": null, "checkpoint_after": null, "shipped": null,
+    })
+    .to_string();
+    let (url, _) = scripted(vec![
+        ("/admin/audit/anchors", anchors),
+        ("/admin/audit/prune", http("200 OK", &bogus)),
+    ]);
+    let out = run_at(
+        &url,
+        &[
+            "audit",
+            "prune",
+            "--archive",
+            a,
+            "--reuse-archive",
+            "--jwks",
+            j,
+        ],
+    )
+    .await;
+    let t = assert_exit(&out, 2);
+    for want in [
+        "PRUNE COMMITTED, BUT THE ANCHOR DOES NOT MATCH THE ARCHIVE",
+        "unknown signing key `nope`",
+        "through_hash is not the archive's last entry hash",
+        "archive_sha256 is 2222",
+    ] {
+        assert!(t.contains(want), "{want} not in {t}");
+    }
+    let out = run_at(
+        &url,
+        &[
+            "audit",
+            "prune",
+            "--archive",
+            a,
+            "--reuse-archive",
+            "--jwks",
+            j,
+            "--json",
+        ],
+    )
+    .await;
+    assert_exit(&out, 2);
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!((&v["ok"], &v["committed"]), (&json!(false), &json!(true)));
+    assert!(!v["anchor_problems"].as_array().unwrap().is_empty());
+}
+
+/// `audit export --out` writes a symbolic link's target and a device directly, as before; a
+/// regular file it replaces keeps its mode.
+#[tokio::test]
+async fn export_out_writes_links_and_devices_directly() {
+    let s = Server::start(PruneMode::Manual).await;
+    s.fill(10).await;
+    let target = s.path("target.jsonl");
+    std::fs::write(&target, "old").unwrap();
+    let link = s.path("link.jsonl");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let mut c = s.cli();
+    c.args(["audit", "export", "--to", "10", "--out"])
+        .arg(&link);
+    assert_exit(&run(c).await, 0);
+    assert!(std::fs::symlink_metadata(&link)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert!(std::fs::read_to_string(&target)
+        .unwrap()
+        .contains("\"seq\":10,"));
+
+    let mut c = s.cli();
+    c.args(["audit", "export", "--to", "10", "--out", "/dev/stdout"]);
+    let out = run(c).await;
+    assert_exit(&out, 0);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("\"seq\":10,"));
+
+    use std::os::unix::fs::PermissionsExt;
+    let plain = s.path("plain.jsonl");
+    std::fs::write(&plain, "old").unwrap();
+    std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o640)).unwrap();
+    let mut c = s.cli();
+    c.args(["audit", "export", "--to", "10", "--out"])
+        .arg(&plain);
+    assert_exit(&run(c).await, 0);
+    let m = std::fs::metadata(&plain).unwrap();
+    assert_eq!(m.permissions().mode() & 0o777, 0o640);
+    assert!(std::fs::read_to_string(&plain)
+        .unwrap()
+        .contains("\"seq\":10,"));
+    no_partial_files(s.dir.path());
 }

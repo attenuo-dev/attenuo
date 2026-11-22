@@ -74,8 +74,8 @@ pub use shipped::{
 };
 pub use spans::{SpanHit, MAX_SEQS_PER_PROBE, MAX_SPANS_PER_RUN};
 pub use sqlite::{
-    AnchorState, PlanBound, PlanGuards, PruneGuard, PruneLimits, PruneOutcome, PrunePlan,
-    PruneStep, SinkProgress, StoredAnchor,
+    AnchorState, PlanBound, PlanGuards, PruneExpect, PruneGuard, PruneLimits, PruneOutcome,
+    PrunePlan, PruneStep, SinkProgress, StoredAnchor,
 };
 pub use sqlite::{
     AppendStats, Durability, Filesystem, NewNotice, OutboxNotice, SchemaState, SqliteAudit,

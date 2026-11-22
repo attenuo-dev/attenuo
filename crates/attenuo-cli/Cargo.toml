@@ -36,7 +36,7 @@ tokio = { workspace = true }
 # Signalling the STDIO server's process group (stdio-bridge) without `unsafe`. Already in the
 # lock file through tokio's and tempfile's dependencies.
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1", default-features = false, features = ["std", "process"] }
+rustix = { version = "1", default-features = false, features = ["std", "process", "fs"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

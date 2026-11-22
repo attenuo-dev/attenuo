@@ -1534,9 +1534,12 @@ fn export_path(from: Option<u64>, to: Option<u64>, filter: &attenuo_audit::Recor
 /// `audit export`: stream the server's JSON Lines to `out` (or stdout), or collect them into
 /// one JSON object for `--format json`.
 ///
-/// With `out`, the export goes to a temporary file next to it, flushed to disk, and is renamed
-/// to `out` only once the server's body ended without an error: an export the server cut short
-/// (a prune that committed while it streamed) leaves no file that looks complete.
+/// With `out` a regular file (or a name not taken yet), the export goes to a temporary file
+/// next to it, flushed to disk, and is renamed to `out` only once the server's body ended
+/// without an error: an export the server cut short (a prune that committed while it
+/// streamed) leaves no file that looks complete. A file it replaces keeps its mode. Any other
+/// `out` (a symbolic link, `/dev/stdout`, a FIFO, a process substitution, anything under
+/// `/dev` or `/proc`) is written directly, as before.
 async fn audit_export(
     client: &Client,
     from: Option<u64>,
@@ -1555,15 +1558,42 @@ async fn audit_export(
         sink.flush()?;
         return Ok(Outcome::Ok);
     };
+    let existing = match std::fs::symlink_metadata(out) {
+        Ok(m) => Some(m),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e).with_context(|| format!("reading {}", out.display())),
+    };
+    let special_dir = {
+        let dir = out.parent().unwrap_or(std::path::Path::new(""));
+        let dir = std::fs::canonicalize(if dir.as_os_str().is_empty() {
+            std::path::Path::new(".")
+        } else {
+            dir
+        })
+        .unwrap_or_else(|_| dir.to_path_buf());
+        dir.starts_with("/dev") || dir.starts_with("/proc")
+    };
+    if special_dir || existing.as_ref().is_some_and(|m| !m.file_type().is_file()) {
+        let file =
+            std::fs::File::create(out).with_context(|| format!("creating {}", out.display()))?;
+        let mut sink = std::io::BufWriter::new(file);
+        write_export(resp, format, &mut sink).await?;
+        sink.flush()?;
+        return Ok(Outcome::Ok);
+    }
     let tmp = partial_path(out);
-    let file = create_partial(&tmp)?;
+    let file = create_partial(&tmp, false)?;
     let written = async {
         let mut sink = std::io::BufWriter::new(file);
         write_export(resp, format, &mut sink).await?;
         let file = sink.into_inner().map_err(|e| e.into_error())?;
+        if let Some(m) = &existing {
+            file.set_permissions(m.permissions())?;
+        }
         file.sync_all()?;
         std::fs::rename(&tmp, out).with_context(|| format!("renaming to {}", out.display()))?;
-        sync_parent(out);
+        // Best effort for an export: the file is complete either way.
+        let _ = sync_parent(out);
         anyhow::Ok(())
     }
     .await;
@@ -1607,33 +1637,56 @@ async fn write_export(
     Ok(())
 }
 
-/// The temporary name an export to `out` is written under first: `.<name>.partial-<pid>` in
-/// the same directory, so the final rename or link stays on one file system.
+/// The temporary name an export to `out` is written under first:
+/// `.<name>.partial-<pid>-<random>` in the same directory, so the final rename or link stays
+/// on one file system and two runs never pick the same name.
 fn partial_path(out: &std::path::Path) -> std::path::PathBuf {
+    use ring::rand::SecureRandom;
+
     let name = out
         .file_name()
         .map_or_else(|| "export".into(), |n| n.to_string_lossy().into_owned());
-    out.with_file_name(format!(".{name}.partial-{}", std::process::id()))
+    let mut r = [0u8; 6];
+    // Without randomness the pid alone still names it; `create_new` refuses a clash.
+    let _ = ring::rand::SystemRandom::new().fill(&mut r);
+    out.with_file_name(format!(
+        ".{name}.partial-{}-{}",
+        std::process::id(),
+        hex::encode(r)
+    ))
 }
 
-/// Create `tmp` for writing, failing if it exists.
-fn create_partial(tmp: &std::path::Path) -> Result<std::fs::File> {
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(tmp)
+/// Create `tmp` for writing, failing if it exists; with `private`, readable and writable by
+/// the owner only (mode 0600 on Unix).
+fn create_partial(tmp: &std::path::Path, private: bool) -> Result<std::fs::File> {
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    if private {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600);
+    }
+    #[cfg(not(unix))]
+    let _ = private;
+    o.open(tmp)
         .with_context(|| format!("creating {}", tmp.display()))
 }
 
-/// Flush the directory holding `path`, so a rename or link into it survives a crash. Best
-/// effort: not every platform can open a directory.
-fn sync_parent(path: &std::path::Path) {
+/// Flush the directory holding `path`, so a rename or link into it survives a crash. On a
+/// platform that cannot open a directory (Windows) there is nothing to flush.
+fn sync_parent(path: &std::path::Path) -> std::io::Result<()> {
     let dir = match path.parent() {
         Some(d) if !d.as_os_str().is_empty() => d,
         _ => std::path::Path::new("."),
     };
-    if let Ok(d) = std::fs::File::open(dir) {
-        let _ = d.sync_all();
+    #[cfg(unix)]
+    {
+        std::fs::File::open(dir)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(())
     }
 }
 

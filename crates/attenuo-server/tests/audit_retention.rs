@@ -848,3 +848,116 @@ async fn an_export_overtaken_by_a_prune_ends_with_an_error() {
             .map_or(true, |r| !r.report.ok || r.truncated))
         .unwrap_or(true));
 }
+
+/// `from` and `through_hash` tie a prune to the archive it was made after: an archive that
+/// does not start at the first retained seq, or whose last entry is not the entry at the
+/// boundary, is refused with `prune_archive_mismatch` and nothing is written. A repeat is
+/// compared with the stored anchor.
+#[tokio::test]
+async fn a_prune_is_refused_when_its_archive_is_not_the_pruned_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config(&dir, PruneMode::Manual);
+    let h = start(dir, cfg).await;
+    h.fill(35).await;
+    let hash_at = |seq: u64| h.state.audit.entry_at(seq).unwrap().unwrap().entry_hash;
+    let digest = "ab".repeat(32);
+    let head = h.state.audit.head().unwrap().unwrap().seq;
+
+    // An archive of 11..=20 on a log that starts at 1.
+    let (status, body) = h
+        .post(
+            "/admin/audit/prune",
+            json!({"through": 20, "archive_sha256": digest, "from": 11, "through_hash": hash_at(20)}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "prune_archive_mismatch");
+    assert!(
+        body["detail"]
+            .as_str()
+            .unwrap()
+            .contains("starts at seq 11"),
+        "{body}"
+    );
+    // An archive that ends at another entry.
+    let (status, body) = h
+        .post(
+            "/admin/audit/prune",
+            json!({"through": 20, "archive_sha256": digest, "from": 1, "through_hash": hash_at(19)}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "prune_archive_mismatch");
+    // Malformed values are 400s.
+    for bad in [
+        json!({"through": 20, "from": 0}),
+        json!({"through": 20, "through_hash": "AB"}),
+    ] {
+        let (status, _) = h.post("/admin/audit/prune", bad).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+    // Nothing was written.
+    assert_eq!(h.state.audit.head().unwrap().unwrap().seq, head);
+    assert!(h.state.audit.newest_anchor().unwrap().is_none());
+
+    // The right archive prunes; its repeat answers `already`, and a repeat that names another
+    // start or hash is refused.
+    let good =
+        json!({"through": 20, "archive_sha256": digest, "from": 1, "through_hash": hash_at(20)});
+    let (status, body) = h.post("/admin/audit/prune", good.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = h.post("/admin/audit/prune", good).await;
+    assert_eq!(
+        (status, &body["already"]),
+        (StatusCode::OK, &json!(true)),
+        "{body}"
+    );
+    let (status, body) = h
+        .post(
+            "/admin/audit/prune",
+            json!({"through": 20, "archive_sha256": digest, "from": 5}),
+        )
+        .await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (StatusCode::CONFLICT, Some("prune_archive_mismatch")),
+        "{body}"
+    );
+    let (status, body) = h
+        .post(
+            "/admin/audit/prune",
+            json!({"through": 20, "archive_sha256": digest, "through_hash": "00".repeat(32)}),
+        )
+        .await;
+    assert_eq!(body["code"], "prune_archive_mismatch", "{status} {body}");
+
+    // After the deletes, the next prune's archive must start at 21.
+    attenuo_server::prune_audit_log(&h.state).await;
+    let s = h.state.clone();
+    wait_for(move || {
+        s.audit
+            .newest_anchor()
+            .ok()
+            .flatten()
+            .is_some_and(|a| a.shipped_at.is_some())
+    })
+    .await;
+    let sink = h.state.checkpoint_sink.as_ref().unwrap();
+    let head = h.state.audit.head().unwrap().unwrap().seq;
+    wait_for(|| sink.delivered_through() >= Some(head)).await;
+    let (status, body) = h
+        .post(
+            "/admin/audit/prune",
+            json!({"through": 30, "from": 1, "through_hash": hash_at(30)}),
+        )
+        .await;
+    assert_eq!(body["code"], "prune_archive_mismatch", "{status} {body}");
+    let (status, body) = h
+        .post(
+            "/admin/audit/prune",
+            json!({"through": 30, "from": 21, "through_hash": hash_at(30)}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["anchor"]["previous_through_seq"], 20);
+}
