@@ -21,6 +21,7 @@
 //! Sending a secret and an assertion together is `multiple_client_auth`.
 
 use std::str::FromStr;
+use std::sync::{Arc, PoisonError, RwLock};
 
 use axum::http::{header, HeaderMap, StatusCode};
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
@@ -33,7 +34,7 @@ use time::OffsetDateTime;
 
 pub(crate) use attenuo_token::client_assertion::CLIENT_ASSERTION_TYPE;
 
-use crate::config::{AgentConfig, CLIENT_ASSERTION_ALGS};
+use crate::config::{ActorAuth, AgentConfig, CLIENT_ASSERTION_ALGS};
 use crate::error::ApiError;
 use crate::replay::{ReplayCache, ReplayRefusal};
 use crate::routes::admin::constant_time_eq;
@@ -644,6 +645,338 @@ impl Clients {
             ),
             replay_until: exp.saturating_add(skew),
         })
+    }
+}
+
+/// The `[[agents]]` and `[[peps]]` in force, validated, with the entries they were built from
+/// (so that a reload can tell what it changed). Built at startup and by
+/// `POST /admin/agents/reload`, both through [`ClientRules::check`]; the set in force is a
+/// [`SharedClients`].
+pub struct ClientSets {
+    /// `[[agents]]`.
+    pub agents: Clients,
+    /// `[[peps]]`.
+    pub peps: Clients,
+    agent_entries: Vec<AgentConfig>,
+    pep_entries: Vec<AgentConfig>,
+    agents_sha256: String,
+    peps_sha256: String,
+}
+
+impl std::fmt::Debug for ClientSets {
+    /// Ids and what each entry holds, never a digest or a key.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientSets")
+            .field("agents", &self.agents)
+            .field("peps", &self.peps)
+            .finish_non_exhaustive()
+    }
+}
+
+/// What an agents reload changed in one list, by id (never a digest or a key).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClientChanges {
+    /// Ids in the new list and not in the old one.
+    pub added: Vec<String>,
+    /// Ids in the old list and not in the new one: their credentials stop working.
+    pub removed: Vec<String>,
+    /// Ids in both whose `secret_sha256` or `jwks` differs.
+    pub changed: Vec<String>,
+}
+
+impl ClientSets {
+    /// The [`list_sha256`] of `[[agents]]` and of `[[peps]]`.
+    pub fn sha256(&self) -> (&str, &str) {
+        (&self.agents_sha256, &self.peps_sha256)
+    }
+
+    /// What changed from `self` to `new`: `(agents, peps)`.
+    pub fn changes_to(&self, new: &Self) -> (ClientChanges, ClientChanges) {
+        (
+            entry_changes(&self.agent_entries, &new.agent_entries),
+            entry_changes(&self.pep_entries, &new.pep_entries),
+        )
+    }
+}
+
+/// The changes from `old` to `new`, each list sorted. A digest is compared without regard to
+/// case and a `jwks` as JSON, so rewriting the same value differently is not a change.
+fn entry_changes(old: &[AgentConfig], new: &[AgentConfig]) -> ClientChanges {
+    let digest = |a: &AgentConfig| a.secret_sha256.as_deref().map(str::to_ascii_lowercase);
+    let keys = |a: &AgentConfig| {
+        a.jwks
+            .as_deref()
+            .map(|t| serde_json::from_str::<Value>(t).unwrap_or_else(|_| Value::from(t)))
+    };
+    let mut out = ClientChanges::default();
+    for n in new {
+        match old.iter().find(|o| o.id == n.id) {
+            None => out.added.push(n.id.clone()),
+            Some(o) if digest(o) != digest(n) || keys(o) != keys(n) => {
+                out.changed.push(n.id.clone());
+            }
+            Some(_) => {}
+        }
+    }
+    for o in old {
+        if !new.iter().any(|n| n.id == o.id) {
+            out.removed.push(o.id.clone());
+        }
+    }
+    out.added.sort();
+    out.removed.sort();
+    out.changed.sort();
+    out
+}
+
+/// What the check of `[[agents]]` and `[[peps]]` reads from the rest of the config: the
+/// assertion policy and the settings it cross-checks the two lists against. Taken from the
+/// config at startup and kept, so that `POST /admin/agents/reload` checks new lists against
+/// the settings in force (which it does not reload), with the same rules as startup. A reload
+/// also builds one from the file it read, to say whether the file as written would accept its
+/// own lists after a restart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClientRules {
+    policy: AssertionPolicy,
+    /// `[[idps]]`: each issuer and the agent ids its `client_ids` names.
+    idps: Vec<(String, Vec<String>)>,
+    actor_auth: ActorAuth,
+    require_actor_auth: bool,
+    /// What agent ids each `[[actor_trust]]` entry can turn a workload's `sub` into: `None`
+    /// for an entry that maps `sub` (or a SPIFFE path) itself, so any id, else the ids of its
+    /// table.
+    actor_trust: Vec<Option<Vec<String>>>,
+    allow_unsigned_chain: bool,
+}
+
+/// An id as it is written into a warning or a refusal: escaped, so that one with a newline or
+/// another control character cannot forge a log line.
+pub(crate) fn shown(id: &str) -> String {
+    id.escape_debug().to_string()
+}
+
+impl ClientRules {
+    /// The rules of `config`. `[[actor_trust]]` is read from the config, as the registry
+    /// startup builds from it holds one entry per config entry.
+    pub(crate) fn from_config(config: &crate::config::Config) -> Self {
+        use crate::config::SubjectToAgent;
+        Self {
+            policy: AssertionPolicy::from_config(config),
+            idps: config
+                .idps
+                .iter()
+                .map(|i| (i.issuer.clone(), i.client_ids.keys().cloned().collect()))
+                .collect(),
+            actor_auth: config.token.actor_auth,
+            require_actor_auth: config.token.require_actor_auth,
+            actor_trust: config
+                .actor_trust
+                .iter()
+                .map(|t| match &t.subject_to_agent {
+                    SubjectToAgent::Map(m) => Some(m.values().cloned().collect()),
+                    SubjectToAgent::Sub | SubjectToAgent::SpiffePath => None,
+                })
+                .collect(),
+            allow_unsigned_chain: config.authzen.allow_unsigned_chain,
+        }
+    }
+
+    /// Check `agents` and `peps` as startup does and build them: the reserved id
+    /// ([`crate::config::check_reserved_client_ids`]), each list ([`Clients::from_config`]),
+    /// and the cross-checks with the other settings. Returns the lists and the warnings to log
+    /// (startup logs them; a reload logs them and answers them too). Ids in a warning are
+    /// escaped ([`shown`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`crate::config::check_reserved_client_ids`] and [`Clients::from_config`], and when
+    /// `[authzen] allow_unsigned_chain = true` and `peps` is empty. The message is the one
+    /// startup fails with.
+    pub(crate) fn check(
+        &self,
+        agents: &[AgentConfig],
+        peps: &[AgentConfig],
+    ) -> anyhow::Result<(ClientSets, Vec<String>)> {
+        crate::config::check_reserved_client_ids(agents, peps)?;
+        let agent_list = Clients::agents(agents, self.policy.clone())?;
+        let pep_list = Clients::peps(peps, self.policy.clone())?;
+        let mut warnings = Vec::new();
+        for (issuer, client_ids) in &self.idps {
+            for agent in agent_list.iter().filter(|a| !client_ids.contains(&a.id)) {
+                warnings.push(format!(
+                    "[[idps]] `{}`: client_ids has no entry for the agent `{1}`: its ID \
+                     tokens must carry aud = `{1}` (the agent id). Set client_ids.{1} = \
+                     \"<client id at the IdP>\" to bind ID tokens to the agent explicitly (SR-37)",
+                    shown(issuer),
+                    shown(&agent.id)
+                ));
+            }
+        }
+        if self.actor_auth == ActorAuth::ActorToken && agent_list.iter().any(Client::has_keys) {
+            warnings.push(
+                "[[agents]] entries have jwks but [token] actor_auth = \"actor_token\": client \
+                 assertions, like client secrets, are refused"
+                    .into(),
+            );
+        }
+        if self.require_actor_auth && agent_list.is_empty() && self.actor_trust.is_empty() {
+            warnings.push(
+                "[[agents]] and [[actor_trust]] are empty and [token] require_actor_auth = \
+                 true: every token exchange will be rejected"
+                    .into(),
+            );
+        }
+        if self.allow_unsigned_chain && pep_list.is_empty() {
+            anyhow::bail!(
+                "[authzen] allow_unsigned_chain = true needs at least one [[peps]] entry"
+            );
+        }
+        if !self.idps.is_empty() && agent_list.is_empty() {
+            warnings.push(
+                "[[idps]] are configured but [[agents]] is empty; IdP intake rejects every \
+                 request"
+                    .into(),
+            );
+        }
+        let agents_sha256 = list_sha256(agents);
+        let peps_sha256 = list_sha256(peps);
+        Ok((
+            ClientSets {
+                agents: agent_list,
+                peps: pep_list,
+                agent_entries: agents.to_vec(),
+                pep_entries: peps.to_vec(),
+                agents_sha256,
+                peps_sha256,
+            },
+            warnings,
+        ))
+    }
+
+    /// Warnings for agents a reload removed that can still be the agent of a new token under
+    /// these settings: by name alone when `[token] require_actor_auth = false` (an exchange's
+    /// `actor` is then not authenticated), and with a workload token when an `[[actor_trust]]`
+    /// entry can map to the id and `[token] actor_auth` accepts actor tokens. Neither setting
+    /// is reloaded.
+    pub(crate) fn removed_agent_warnings(&self, removed: &[String]) -> Vec<String> {
+        let mut out = Vec::new();
+        let actor_tokens = self.actor_auth != ActorAuth::Secret;
+        for id in removed {
+            if !self.require_actor_auth {
+                out.push(format!(
+                    "the removed agent `{}` can still be named as the actor of an exchange: \
+                     [token] require_actor_auth = false does not authenticate it (a restart \
+                     with require_actor_auth = true stops that)",
+                    shown(id)
+                ));
+            }
+            let mapped = self
+                .actor_trust
+                .iter()
+                .any(|ids| ids.as_ref().is_none_or(|ids| ids.contains(id)));
+            if actor_tokens && mapped {
+                out.push(format!(
+                    "the removed agent `{}` may still authenticate with an actor_token: an \
+                     [[actor_trust]] entry can map a workload to this id, and removing that \
+                     takes a restart",
+                    shown(id)
+                ));
+            }
+        }
+        out
+    }
+}
+
+/// The SHA-256 (lowercase hex) of a list's canonical form: the compact JSON array of
+/// `[id, secret_sha256, thumbprints]` per entry, sorted by id, where `secret_sha256` is the
+/// lowercase digest or `null` and `thumbprints` the sorted RFC 7638 SHA-256 thumbprints
+/// (base64url) of the entry's `jwks` keys. Recorded in the reload's audit record, so that a
+/// config file can be shown to hold the lists that were put in force; no secret or key
+/// material goes into it beyond digests and thumbprints.
+pub(crate) fn list_sha256(entries: &[AgentConfig]) -> String {
+    let mut rows: Vec<Value> = entries
+        .iter()
+        .map(|a| {
+            let mut thumbprints: Vec<String> = a
+                .jwks
+                .as_deref()
+                .and_then(|t| serde_json::from_str::<Value>(t).ok())
+                .and_then(|v| v.get("keys").and_then(Value::as_array).cloned())
+                .unwrap_or_default()
+                .iter()
+                .map(jwk_thumbprint)
+                .collect();
+            thumbprints.sort();
+            Value::Array(vec![
+                Value::from(a.id.clone()),
+                a.secret_sha256
+                    .as_deref()
+                    .map_or(Value::Null, |d| Value::from(d.to_ascii_lowercase())),
+                Value::from(thumbprints),
+            ])
+        })
+        .collect();
+    rows.sort_by(|x, y| x[0].as_str().cmp(&y[0].as_str()));
+    hex::encode(Sha256::digest(Value::Array(rows).to_string().as_bytes()))
+}
+
+/// The RFC 7638 SHA-256 thumbprint (base64url) of a public JWK: the required members of its
+/// `kty` (`RSA`: `e`, `kty`, `n`; `EC`: `crv`, `kty`, `x`, `y`; `OKP`: `crv`, `kty`, `x`), in
+/// that order, as compact JSON. A key the list check accepted always has them; anything else
+/// gives an empty string.
+fn jwk_thumbprint(jwk: &Value) -> String {
+    let member = |k: &str| jwk.get(k).and_then(Value::as_str);
+    let members: &[&str] = match member("kty") {
+        Some("RSA") => &["e", "kty", "n"],
+        Some("EC") => &["crv", "kty", "x", "y"],
+        Some("OKP") => &["crv", "kty", "x"],
+        _ => return String::new(),
+    };
+    let mut canonical = String::from("{");
+    for (i, k) in members.iter().enumerate() {
+        let Some(v) = member(k) else {
+            return String::new();
+        };
+        if i > 0 {
+            canonical.push(',');
+        }
+        canonical.push_str(&format!("{}:{}", Value::from(*k), Value::from(v)));
+    }
+    canonical.push('}');
+    URL_SAFE_NO_PAD.encode(Sha256::digest(canonical.as_bytes()))
+}
+
+/// The `[[agents]]` and `[[peps]]` in force, swapped whole by `POST /admin/agents/reload`, the
+/// way [`crate::operators::SharedAdminCredentials`] holds the admin credentials. A request
+/// takes one [`snapshot`](Self::snapshot) and authenticates against it; a reload builds the new
+/// lists with no lock held and [`swap`](Self::swap)s them in. The lock is held only to copy or
+/// replace the pointer, never across an `await`, so a request sees the old lists or the new
+/// ones, never a mix, and agents and PEPs change together.
+///
+/// The lock guards a single `Arc` replaced in one store, so a panic cannot leave it
+/// half-written: poisoning is ignored.
+#[derive(Debug)]
+pub struct SharedClients {
+    current: RwLock<Arc<ClientSets>>,
+}
+
+impl SharedClients {
+    /// Put `sets` in force.
+    pub fn new(sets: ClientSets) -> Self {
+        Self {
+            current: RwLock::new(Arc::new(sets)),
+        }
+    }
+
+    /// The lists in force now. They stay usable, unchanged, after a later swap.
+    pub fn snapshot(&self) -> Arc<ClientSets> {
+        Arc::clone(&self.current.read().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// Put `sets` in force and return the lists they replace.
+    pub fn swap(&self, sets: Arc<ClientSets>) -> Arc<ClientSets> {
+        let mut current = self.current.write().unwrap_or_else(PoisonError::into_inner);
+        std::mem::replace(&mut *current, sets)
     }
 }
 

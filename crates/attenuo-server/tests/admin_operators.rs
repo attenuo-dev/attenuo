@@ -722,9 +722,20 @@ async fn an_invalid_file_leaves_the_operators_in_force() {
             good_rest.clone() + &entry("Eve", "eve-token", "viewer", None),
             "a-z",
         ),
+        // An unknown role and a value of the wrong type are named by key, never repeated.
         (
-            good_rest.clone() + &entry("eve", "eve-token", "root", None),
-            "root",
+            good_rest.clone() + &entry("eve", "eve-token", "hunter2-role-value", None),
+            "key `role` in [[admin.operators]]): unknown variant `…`, expected one of",
+        ),
+        (
+            good_rest.clone()
+                + "[[admin.operators]]\nname = \"eve\"\ntoken_sha256 = 7\nrole = \"viewer\"\n",
+            "key `token_sha256` in [[admin.operators]]): invalid type: integer",
+        ),
+        (
+            good_rest.clone()
+                + "[[admin.operators]]\nname = [\"hunter2-array-value\"]\ntoken_sha256 = \"x\"\nrole = \"viewer\"\n",
+            "key `name` in [[admin.operators]]): invalid type: sequence",
         ),
     ] {
         write_config(dir.path(), Some(LEGACY), &operators);
@@ -734,6 +745,7 @@ async fn an_invalid_file_leaves_the_operators_in_force() {
         let detail = v["detail"].as_str().unwrap();
         assert!(detail.contains(want), "{want}: {detail}");
         assert!(!detail.contains(LEGACY), "{detail}");
+        assert!(!detail.contains("hunter2"), "{detail}");
         assert_eq!(whoami(&client, &base, "bob-token").await.1["role"], "operator");
     }
     // A file that is gone: 500 with its own code, the path in the log only.

@@ -143,7 +143,7 @@ pub(crate) async fn handle(
         None => None,
     };
     let (agent, agent_auth, client) = authenticate_agent(
-        &state.agents,
+        &state.clients.snapshot().agents,
         state.actor_auth,
         headers,
         &req,

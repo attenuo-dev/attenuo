@@ -32,6 +32,7 @@
 //! | `GET /admin/audit/anchors` | admin | the signed anchors of past prunes, newest first (read-only) |
 //! | `POST /admin/policies/reload` | admin | hot-reload the Cedar policy file |
 //! | `POST /admin/operators/reload` | admin | re-read `[[admin.operators]]` from the config file and swap them in ([`routes::admin::reload_operators`]) |
+//! | `POST /admin/agents/reload` | admin | re-read `[[agents]]` and `[[peps]]` from the config file, check them as startup does and swap both in at once; tokens already issued are not revoked ([`routes::admin::reload_agents`]) |
 //! | `GET /admin/policies` | admin | the policy set in force: ids, text, file digest, load time ([`routes::policies`]) |
 //! | `GET /admin/policies/check` | admin | lint the policy file on disk against the running schema; swaps nothing |
 //! | `POST /admin/policies/evaluate` | admin | dry run: what the loaded policies say about one call, optionally with a stated run-limit state (`budget`); no lease check, no charge, no audit |
@@ -339,6 +340,7 @@ fn admin_routes(state: &Arc<AppState>) -> Router<Arc<AppState>> {
         )
         .route("/admin/policies/reload", post(admin::reload_policies))
         .route("/admin/operators/reload", post(admin::reload_operators))
+        .route("/admin/agents/reload", post(admin::reload_agents))
         .route("/admin/approvals", get(approvals::admin_list))
         .route(
             "/admin/approvals/{id}",

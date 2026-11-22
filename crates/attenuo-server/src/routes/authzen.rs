@@ -124,6 +124,9 @@ pub async fn evaluations(
 pub const BATCH_TOO_LARGE: &str = "batch_too_large";
 
 fn evaluate_batch(state: &AppState, headers: &HeaderMap, body: &Bytes) -> Result<Value, ApiError> {
+    // One snapshot of `[[peps]]` for the whole request: a reload during a batch does not admit
+    // the PEP for some entries and refuse it for others.
+    let clients = state.clients.snapshot();
     let mut raw: Value = parse_json(body)?;
     let Some(obj) = raw.as_object_mut() else {
         return Err(ApiError::bad_request(
@@ -146,8 +149,15 @@ fn evaluate_batch(state: &AppState, headers: &HeaderMap, body: &Bytes) -> Result
         // as a single Access Evaluation request, and so does its answer.
         obj.remove("options");
         let bearer = bearer_auth(state, headers, "/access/v1/evaluations")?;
-        let pep = pep_assertion(state, headers, &mut raw)?;
-        let r = evaluate_value(state, headers, bearer.as_ref(), pep.as_deref(), raw)?;
+        let pep = pep_assertion(state, &clients.peps, headers, &mut raw)?;
+        let r = evaluate_value(
+            state,
+            &clients.peps,
+            headers,
+            bearer.as_ref(),
+            pep.as_deref(),
+            raw,
+        )?;
         return serde_json::to_value(r).map_err(ApiError::internal);
     }
     // Refuse before any evaluation runs, so an oversized batch writes nothing to the audit log.
@@ -166,7 +176,7 @@ fn evaluate_batch(state: &AppState, headers: &HeaderMap, body: &Bytes) -> Result
     let bearer = bearer_auth(state, headers, "/access/v1/evaluations")?;
     // A PEP's client assertion authenticates the whole request once, like the bearer: its
     // `jti` can be used only once, so the entries cannot each check it.
-    let pep = pep_assertion(state, headers, &mut raw)?;
+    let pep = pep_assertion(state, &clients.peps, headers, &mut raw)?;
     let Some(obj) = raw.as_object_mut() else {
         return Err(ApiError::internal("request body is no longer an object"));
     };
@@ -190,6 +200,7 @@ fn evaluate_batch(state: &AppState, headers: &HeaderMap, body: &Bytes) -> Result
         }
         let decision = match evaluate_value(
             state,
+            &clients.peps,
             headers,
             bearer.as_ref(),
             pep.as_deref(),
@@ -385,6 +396,7 @@ fn search_server(resource: Option<&Value>) -> Result<String, ApiError> {
 }
 
 fn search_actions(state: &AppState, headers: &HeaderMap, body: &Bytes) -> Result<Value, ApiError> {
+    let clients = state.clients.snapshot();
     let mut raw: Value = parse_json(body)?;
     let Some(obj) = raw.as_object_mut() else {
         return Err(ApiError::bad_request(
@@ -402,8 +414,15 @@ fn search_actions(state: &AppState, headers: &HeaderMap, body: &Bytes) -> Result
         json!({ "name": "", "properties": { "server": server } }),
     );
     let bearer = bearer_auth(state, headers, SEARCH_ACTION_PATH)?;
-    let pep = pep_assertion(state, headers, &mut raw)?;
-    let a = admit(state, headers, bearer.as_ref(), pep.as_deref(), raw)?;
+    let pep = pep_assertion(state, &clients.peps, headers, &mut raw)?;
+    let a = admit(
+        state,
+        &clients.peps,
+        headers,
+        bearer.as_ref(),
+        pep.as_deref(),
+        raw,
+    )?;
     // `[limits] authzen_search_requests_per_minute`, per run (the root lease of the bearer's
     // chain, or of a PEP's issued unsigned chain): only once the caller has authenticated, so
     // a caller without the credentials cannot use up a run's searches, and before any
@@ -609,10 +628,18 @@ fn evaluate(
     headers: &HeaderMap,
     body: &Bytes,
 ) -> Result<EvaluationResponse, ApiError> {
+    let clients = state.clients.snapshot();
     let mut value = parse_json(body)?;
     let bearer = bearer_auth(state, headers, "/access/v1/evaluation")?;
-    let pep = pep_assertion(state, headers, &mut value)?;
-    evaluate_value(state, headers, bearer.as_ref(), pep.as_deref(), value)
+    let pep = pep_assertion(state, &clients.peps, headers, &mut value)?;
+    evaluate_value(
+        state,
+        &clients.peps,
+        headers,
+        bearer.as_ref(),
+        pep.as_deref(),
+        value,
+    )
 }
 
 /// A PEP's `private_key_jwt` client assertion (`client_assertion_type` and
@@ -622,6 +649,7 @@ fn evaluate(
 /// Basic credentials alongside it are `multiple_client_auth`.
 fn pep_assertion(
     state: &AppState,
+    peps: &clientauth::Clients,
     headers: &HeaderMap,
     body: &mut Value,
 ) -> Result<Option<String>, ApiError> {
@@ -633,7 +661,7 @@ fn pep_assertion(
     };
     let field = |k: &str| obj.get(k).and_then(Value::as_str);
     let now = state.now();
-    let pep = state.peps.authenticate(
+    let pep = peps.authenticate(
         headers,
         field("pep_id"),
         field("pep_secret"),
@@ -715,6 +743,7 @@ struct Admitted {
 /// the three admit exactly the same callers.
 fn admit(
     state: &AppState,
+    peps: &clientauth::Clients,
     headers: &HeaderMap,
     bearer: Option<&Bearer>,
     pep_by_assertion: Option<&str>,
@@ -749,9 +778,7 @@ fn admit(
             let pep = match (pep_by_assertion, pep_secret.as_deref()) {
                 (Some(pep), _) => Some(pep.to_owned()),
                 (None, Some(secret)) => Some(
-                    state
-                        .peps
-                        .authenticate(headers, pep_id.as_deref(), Some(secret), None, now)?
+                    peps.authenticate(headers, pep_id.as_deref(), Some(secret), None, now)?
                         .commit(&state.replay, now)?,
                 ),
                 (None, None) => None,
@@ -768,8 +795,7 @@ fn admit(
             }
             let id = match pep_by_assertion {
                 Some(pep) => pep.to_owned(),
-                None => state
-                    .peps
+                None => peps
                     .authenticate(headers, pep_id.as_deref(), pep_secret.as_deref(), None, now)?
                     .commit(&state.replay, now)?,
             };
@@ -805,6 +831,7 @@ fn admit(
 /// Decide one evaluation: [`admit`], then the pipeline's decision.
 fn evaluate_value(
     state: &AppState,
+    peps: &clientauth::Clients,
     headers: &HeaderMap,
     bearer: Option<&Bearer>,
     pep_by_assertion: Option<&str>,
@@ -816,7 +843,7 @@ fn evaluate_value(
         call,
         pep_authenticated,
         now,
-    } = admit(state, headers, bearer, pep_by_assertion, raw)?;
+    } = admit(state, peps, headers, bearer, pep_by_assertion, raw)?;
     let approval_token = match req.context.as_ref().and_then(|c| c.get("approval_token")) {
         None | Some(Value::Null) => None,
         Some(Value::String(t)) => Some(t.clone()),

@@ -3827,6 +3827,13 @@ async fn every_refusal_names_its_specific_reason_in_code() {
         Some("reload_unavailable"),
     )
     .await;
+    a.rest(
+        "admin: agents reload without a config file",
+        h.admin_post("/admin/agents/reload", json!({})).await,
+        StatusCode::CONFLICT,
+        Some("reload_unavailable"),
+    )
+    .await;
     // Named operators (one expired) and a config file to reload them from.
     let ops_dir = tempfile::tempdir().unwrap();
     let ops_path = ops_dir.path().join("attenuo.toml");
@@ -3884,6 +3891,18 @@ async fn every_refusal_names_its_specific_reason_in_code() {
         reload_as("ada-token").await.unwrap(),
         StatusCode::UNPROCESSABLE_ENTITY,
         Some("operators_invalid"),
+    )
+    .await;
+    a.rest(
+        "admin: agents reload of a file that is not TOML",
+        h2.client
+            .post(h2.url("/admin/agents/reload"))
+            .bearer_auth("ada-token")
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Some("agents_invalid"),
     )
     .await;
     std::fs::write(&ops_path, op_entry("ada", "ada-token", "viewer", "")).unwrap();

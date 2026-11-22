@@ -84,7 +84,7 @@ You do not need to write much of it. Before Cedar runs, a capability check in pl
 
 Point `private_key_pem_path` at a new key, list the old one in `previous_key_paths`, and restart. Tokens signed with the old key keep verifying (they carry a `kid`, and the JWKS lists both keys) until you remove it. The steps are in [Deploying](guides/deploying.md#key-rotation).
 
-Rotating the signing key does not touch the audit log, which is not signed with it. Rotating `[admin] token`, agent secrets or agent client keys also means editing the config and restarting. A named operator's token can be replaced without a restart: edit its `[[admin.operators]]` entry and call `POST /admin/operators/reload` (`attenuo admin operator reload`).
+Rotating the signing key does not touch the audit log, which is not signed with it. Rotating `[admin] token` also means editing the config and restarting. A named operator's token can be replaced without a restart: edit its `[[admin.operators]]` entry and call `POST /admin/operators/reload` (`attenuo admin operator reload`). So can an agent's or a PEP's secret or client keys: edit its `[[agents]]` or `[[peps]]` entry and call `POST /admin/agents/reload` (`attenuo admin agent reload`).
 
 ## How is the audit log tamper-evident?
 

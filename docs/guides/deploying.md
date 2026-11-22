@@ -126,7 +126,7 @@ token_sha256 = "<64 lowercase hex characters>"
 role = "operator"
 ```
 
-Then run `attenuo admin operator reload` (role `admin`): the server re-reads `[[admin.operators]]` from its config file and puts them in force without a restart (a restart works too). Hand the token to alice over a secure channel; the file keeps only its SHA-256. `viewer` reads (the audit log, its export, leases, policies, approvals), `operator` also revokes leases and decides approvals, `admin` does everything (policy and operators reload, budget refunds, the dev root mint). A role too low gets 403 `admin_role_insufficient`. `GET /admin/whoami` (and the console's header) says which operator a token is. In the audit log, each admin action and operator approval names `urn:attenuo:admin:<name>`.
+Then run `attenuo admin operator reload` (role `admin`): the server re-reads `[[admin.operators]]` from its config file and puts them in force without a restart (a restart works too). Hand the token to alice over a secure channel; the file keeps only its SHA-256. `viewer` reads (the audit log, its export, leases, policies, approvals), `operator` also revokes leases and decides approvals, `admin` does everything (policy, operators and agents reload, budget refunds, the dev root mint). A role too low gets 403 `admin_role_insufficient`. `GET /admin/whoami` (and the console's header) says which operator a token is. In the audit log, each admin action and operator approval names `urn:attenuo:admin:<name>`.
 
 - Every token is compared, as a SHA-256 digest, in constant time against every credential; with no credential configured `/admin` answers 403 rather than opening.
 - `[admin] token` still works as before: it is the operator `admin` with role `admin`, recorded as `urn:attenuo:admin`, so its records do not say which person used it. It sits in the config file in clear text (or comes from `ATTENUO_ADMIN_TOKEN`). Treat the file as a secret either way: mode 0600, not in the image, not in the repository, not in a CI log. In Docker or Kubernetes, mount the whole file from a secret. Once everyone has an operator entry, remove `[admin] token`.
@@ -137,6 +137,22 @@ Then run `attenuo admin operator reload` (role `admin`): the server re-reads `[[
 - A reload that would leave no working `admin` credential (no `[admin] token` and no unexpired operator with role `admin`) is refused, and so is a file that does not parse or breaks a rule; the operators in force stay as they were. A server started without a config file (one that builds its configuration in code) has nothing to reload.
 - Do not hand an admin token to agents. Even a `viewer` token reads every audit entry. Agents use delegation tokens only.
 - Whoever can edit the config file, or set `ATTENUO_ADMIN_TOKEN` in the server's environment, can make themselves an admin. There is no login, no second factor and no per-operator rate limit; the [threat model](../spec/threat-model.md) (A8) lists what is and is not covered.
+
+## Adding or rotating an agent without a restart
+
+`[[agents]]` and `[[peps]]` can change while the server runs. Edit the config file the server was started with, then run:
+
+```sh
+attenuo admin agent reload
+```
+
+(role `admin`; `POST /admin/agents/reload`). The server re-reads both lists, checks them as it does at startup and puts them in force at once. Each request authenticates against one snapshot: the old lists or the new ones, never a mix. The answer lists the ids added, removed and changed, with a SHA-256 of each new list. The `admin.agents.reload` audit record names the operator who reloaded; of its arguments (the path, the ids, the list digests and `restart_needed`) it keeps only a digest, so keep the command's output, or the server log, if you need the ids later. A file that does not parse, or a list that breaks a startup rule, is refused with the startup message (`agents_invalid`), and nothing changes.
+
+Two more refusals guard against reloading the wrong file. A file that leaves `[[agents]]` or `[[peps]]` empty while the server has entries is refused (`agents_reload_empties`), because an empty or cut-off file reads that way; pass `--allow-empty` when you mean it. A file whose `[issuer]` or `[audit]` differs from the running config is refused (`config_file_mismatch`), because it may be another server's file; pass `--allow-mismatch` to reload its lists anyway. Warnings go to stderr and the command still exits 0, so read them.
+
+- **Add an agent:** add its entry and reload. It can authenticate with its next request. If it also needs a `[[root_grants]]` entry or a `client_ids` key in `[[idps]]`, those take a restart: the reload does not apply other sections, and its answer names each one that differs from the running config in `restart_needed`.
+- **Rotate a secret:** put the new `secret_sha256` in the entry and reload. The old secret is refused from the next request on, so update the agent first or right after. For a key (`jwks`), there is no gap: add the new key with a new `kid`, reload, move the agent to it, then remove the old key and reload again.
+- **Remove a compromised agent:** delete its entry and reload. It can no longer authenticate with its secret or key. That does not always stop new tokens: with `[token] require_actor_auth = false` an exchange can still name it as the actor without credentials, and an `[[actor_trust]]` entry that maps a workload to its id still lets it in with an actor token. Changing either takes a restart, and the reload warns about both. Tokens it already has are not revoked by the reload and keep working, and renewing, until they expire. So revoke them too: `attenuo lease revoke --user <SUB>` or `--chain-id <ID>`, or `attenuo lease revoke <LEASE>` for one chain (see [Revoking during an incident](#revoking-during-an-incident)).
 
 ## Key rotation
 

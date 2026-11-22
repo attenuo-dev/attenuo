@@ -1795,11 +1795,13 @@ pub async fn reload_policies(
     })))
 }
 
-/// Audit a refused operators reload as a `deny` whose reason is the refusal's code, then
-/// hand the refusal back. A failure to audit is logged; the refusal is answered either way.
+/// Audit a refused reload (`tool` is `admin.operators.reload` or `admin.agents.reload`) as a
+/// `deny` whose reason is the refusal's code, then hand the refusal back. A failure to audit
+/// is logged; the refusal is answered either way.
 async fn audited_refusal(
     state: &Arc<AppState>,
     who: AdminIdentity,
+    tool: &'static str,
     path: &std::path::Path,
     refusal: ApiError,
     now: OffsetDateTime,
@@ -1811,7 +1813,7 @@ async fn audited_refusal(
             audit_admin(
                 state,
                 &who,
-                "admin.operators.reload",
+                tool,
                 Decision::Deny,
                 &reason,
                 Vec::new(),
@@ -1872,7 +1874,15 @@ pub async fn reload_operators(
                 "operators_invalid",
                 format!("{e:#}; the operators in force are unchanged"),
             );
-            return Err(audited_refusal(&state, who, &path, refusal, now).await);
+            return Err(audited_refusal(
+                &state,
+                who,
+                "admin.operators.reload",
+                &path,
+                refusal,
+                now,
+            )
+            .await);
         }
     };
     if !new.has_live_admin(now) {
@@ -1882,7 +1892,9 @@ pub async fn reload_operators(
             "the reloaded list leaves no unexpired credential with role `admin` (no [admin] \
              token and no such operator); the operators in force are unchanged",
         );
-        return Err(audited_refusal(&state, who, &path, refusal, now).await);
+        return Err(
+            audited_refusal(&state, who, "admin.operators.reload", &path, refusal, now).await,
+        );
     }
     let changes = current.changes_to(&new);
     new.warn_expired(now, "by the reload");
@@ -1919,6 +1931,239 @@ pub async fn reload_operators(
         "added": changes.added,
         "removed": changes.removed,
         "changed": changes.changed,
+        "audit_id": audit_id,
+    })))
+}
+
+/// One list's part of the answer and of the audit record of an agents reload: how many
+/// entries are in force now, the SHA-256 of the list's canonical form
+/// ([`crate::clientauth::list_sha256`]), and the ids added, removed and changed.
+fn client_changes_json(count: usize, sha256: &str, c: &crate::clientauth::ClientChanges) -> Value {
+    json!({
+        "count": count,
+        "sha256": sha256,
+        "added": c.added,
+        "removed": c.removed,
+        "changed": c.changed,
+    })
+}
+
+/// The body of `POST /admin/agents/reload`: empty, or overrides of two refusals.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentsReloadBody {
+    /// Accept a file that leaves `[[agents]]` or `[[peps]]` empty when the list in force is
+    /// not: without it that is refused (`agents_reload_empties`), since an empty or cut-off
+    /// file parses with no entries.
+    #[serde(default)]
+    pub allow_empty: bool,
+    /// Accept a file whose `[issuer]` or `[audit]` differs from the config in force: without
+    /// it that is refused (`config_file_mismatch`), since it is most likely another server's
+    /// file.
+    #[serde(default)]
+    pub allow_mismatch: bool,
+}
+
+/// The two sections whose difference makes a file look like another server's.
+const IDENTITY_SECTIONS: [&str; 2] = ["[audit]", "[issuer]"];
+
+/// `POST /admin/agents/reload`: re-read `[[agents]]` and `[[peps]]` from the config file the
+/// server was started with, check them as startup does (the same function, against the other
+/// settings in force, which are not reloaded) and swap both lists in one step. Answers, for
+/// each list, the number of entries now in force, the SHA-256 of its canonical form and the
+/// ids `added`, `removed` and `changed` (`secret_sha256` or `jwks`), never a secret digest or a
+/// key; `restart_needed`, the other sections of the file that differ from the ones in force
+/// (applied only by a restart); the startup `warnings` the new lists raise, and those for a
+/// removed agent that can still get tokens another way; `restart_warnings`, what the file's
+/// own settings would refuse after a restart; and the id of the audit record.
+///
+/// Each HTTP request authenticates against one snapshot: it sees both old lists or both new
+/// ones. A removed agent, or an old secret or key, is refused from the next request on.
+/// Tokens and leases already issued are not touched: revoking them is
+/// `POST /admin/leases/{id}/revoke` or `/admin/leases/revoke`.
+///
+/// # Errors
+///
+/// Nothing changes on any error. 409 `reload_unavailable` when the server was not started
+/// from a config file; 500 `config_unreadable` when the file cannot be read (the cause is in
+/// the log); 400 `invalid_request` for a body that is not the expected JSON; 422
+/// `agents_invalid` when the file does not parse as the server's config or the lists break a
+/// startup rule, with the message startup would give (a TOML error names its line and never
+/// quotes a value); 422 `config_file_mismatch` when the file's `[issuer]` or `[audit]` differs
+/// from the running config, without `allow_mismatch`; 422 `agents_reload_empties` when the
+/// file leaves a list empty that is not empty now, without `allow_empty`. The 422s are audited
+/// as a `deny`; the 400, 409 and 500 are not.
+pub async fn reload_agents(
+    State(state): State<Arc<AppState>>,
+    Extension(who): Extension<AdminIdentity>,
+    Body(body): Body,
+) -> Result<Json<Value>, ApiError> {
+    const TOOL: &str = "admin.agents.reload";
+    let opts: AgentsReloadBody = if body.is_empty() {
+        AgentsReloadBody::default()
+    } else {
+        super::parse_json(&body)?
+    };
+    let path = state.config_path.clone().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::CONFLICT,
+            "reload_unavailable",
+            "the server was not started from a config file; there is nothing to reload",
+        )
+    })?;
+    // One reload at a time, from reading the file to the swap.
+    let _reloading = state.agents_reload.lock().await;
+    let text = tokio::fs::read_to_string(&path).await.map_err(|e| {
+        ApiError::internal(format!("reading {}: {e}", path.display()))
+            .with_code("config_unreadable")
+    })?;
+    let now = state.now();
+    let unchanged = "the agents and peps in force are unchanged";
+    let file = match crate::config::Config::reparse(&text, std::env::vars_os()) {
+        Ok(file) => file,
+        Err(e) => {
+            let refusal = ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "agents_invalid",
+                format!("{e:#}; {unchanged}"),
+            );
+            return Err(audited_refusal(&state, who, TOOL, &path, refusal, now).await);
+        }
+    };
+    // An empty or cut-off file parses, with no entries: refuse emptying a list unasked.
+    let current = state.clients.snapshot();
+    if !opts.allow_empty {
+        let emptied: Vec<&str> = [
+            (
+                "[[agents]]",
+                current.agents.is_empty(),
+                file.agents.is_empty(),
+            ),
+            ("[[peps]]", current.peps.is_empty(), file.peps.is_empty()),
+        ]
+        .into_iter()
+        .filter(|(_, was_empty, now_empty)| !was_empty && *now_empty)
+        .map(|(name, _, _)| name)
+        .collect();
+        if !emptied.is_empty() {
+            let refusal = ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "agents_reload_empties",
+                format!(
+                    "the file has no {} entries, and the server has some in force: an empty or \
+                     cut-off file reads that way. Send {{\"allow_empty\": true}} (attenuo admin \
+                     agent reload --allow-empty) to empty them; {unchanged}",
+                    emptied.join(" and no ")
+                ),
+            );
+            return Err(audited_refusal(&state, who, TOOL, &path, refusal, now).await);
+        }
+    }
+    let restart_needed = match file.section_digests() {
+        Ok(sections) => state.config_sections.differing(&sections),
+        // Not expected: the config serialized at startup. Say that nothing was compared
+        // rather than that nothing differs.
+        Err(e) => {
+            tracing::error!(error = %e, "the reloaded config could not be compared");
+            vec!["(the other sections could not be compared)".to_string()]
+        }
+    };
+    let foreign: Vec<&str> = IDENTITY_SECTIONS
+        .into_iter()
+        .filter(|s| restart_needed.iter().any(|r| r == s))
+        .collect();
+    if !foreign.is_empty() && !opts.allow_mismatch {
+        let refusal = ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "config_file_mismatch",
+            format!(
+                "the file's {} differs from the running config: it may be another server's \
+                 file. Send {{\"allow_mismatch\": true}} (attenuo admin agent reload \
+                 --allow-mismatch) to reload its lists anyway; {unchanged}",
+                foreign.join(" and ")
+            ),
+        );
+        return Err(audited_refusal(&state, who, TOOL, &path, refusal, now).await);
+    }
+    // The file's lists under its own settings: would they be accepted after a restart?
+    let own_rules = crate::clientauth::ClientRules::from_config(&file);
+    let own_check = (own_rules != state.client_rules)
+        .then(|| own_rules.check(&file.agents, &file.peps).map(|_| ()));
+    let (new, mut warnings) = match state.client_rules.check(&file.agents, &file.peps) {
+        Ok(checked) => checked,
+        Err(e) => {
+            // A rule in force that the file changes: say so, as only a restart applies it.
+            let note = if matches!(own_check, Some(Ok(()))) {
+                " (a rule in force; the file changes it, which needs a restart)"
+            } else {
+                ""
+            };
+            let refusal = ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "agents_invalid",
+                format!("{e:#}{note}; {unchanged}"),
+            );
+            return Err(audited_refusal(&state, who, TOOL, &path, refusal, now).await);
+        }
+    };
+    let restart_warnings: Vec<String> = match own_check {
+        Some(Err(e)) => vec![format!(
+            "after a restart with this file, its settings would refuse these lists: {e:#}"
+        )],
+        _ => Vec::new(),
+    };
+    let new = Arc::new(new);
+    let old = state.clients.swap(Arc::clone(&new));
+    let (agents, peps) = old.changes_to(&new);
+    warnings.extend(state.client_rules.removed_agent_warnings(&agents.removed));
+    for w in warnings.iter().chain(&restart_warnings) {
+        tracing::warn!(warning = ?w, "agents reload");
+    }
+    let (agents_sha256, peps_sha256) = new.sha256();
+    tracing::info!(
+        agents = new.agents.iter().count(),
+        peps = new.peps.iter().count(),
+        agents_added = ?agents.added,
+        agents_removed = ?agents.removed,
+        agents_changed = ?agents.changed,
+        peps_added = ?peps.added,
+        peps_removed = ?peps.removed,
+        peps_changed = ?peps.changed,
+        agents_sha256,
+        peps_sha256,
+        restart_needed = ?restart_needed,
+        "agents and peps reloaded"
+    );
+    let agents = client_changes_json(new.agents.iter().count(), agents_sha256, &agents);
+    let peps = client_changes_json(new.peps.iter().count(), peps_sha256, &peps);
+    let args = json!({
+        "path": path,
+        "agents": agents,
+        "peps": peps,
+        "restart_needed": restart_needed,
+    });
+    let audit_id = state
+        .blocking(move |state| {
+            audit_admin(
+                state,
+                &who,
+                TOOL,
+                Decision::Allow,
+                REASON_ADMIN_ACTION,
+                Vec::new(),
+                args,
+                now,
+            )
+        })
+        .await
+        .inspect_err(|e| tracing::error!(error = ?e.detail, "agents reload was not audited"))
+        .ok();
+    Ok(Json(json!({
+        "agents": agents,
+        "peps": peps,
+        "restart_needed": restart_needed,
+        "warnings": warnings,
+        "restart_warnings": restart_warnings,
         "audit_id": audit_id,
     })))
 }

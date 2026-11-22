@@ -882,6 +882,77 @@ pub(crate) fn render_evaluation(v: &Value) -> String {
     out
 }
 
+/// The answer of `POST /admin/agents/reload` (`attenuo admin agent reload`): a summary line
+/// per list, each id added, removed or changed, and the sections that need a restart. The
+/// warnings go to stderr ([`agents_reload_warnings`]).
+pub(crate) fn render_agents_reload(v: &Value) -> String {
+    let ids = |list: &Value, key: &str| -> Vec<String> {
+        list[key]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str().map(escape_controls))
+            .collect()
+    };
+    let mut out = String::new();
+    let mut lines = String::new();
+    for (key, what) in [("agents", "agent"), ("peps", "pep")] {
+        let list = &v[key];
+        let (added, removed, changed) = (
+            ids(list, "added"),
+            ids(list, "removed"),
+            ids(list, "changed"),
+        );
+        out.push_str(&format!(
+            "{key}: {} in force, {} added, {} removed, {} changed\n",
+            list["count"].as_u64().unwrap_or_default(),
+            added.len(),
+            removed.len(),
+            changed.len()
+        ));
+        for (verb, list) in [
+            ("added", &added),
+            ("removed", &removed),
+            ("changed", &changed),
+        ] {
+            for id in list {
+                lines.push_str(&format!("  {verb:<8} {what:<5} {id}\n"));
+            }
+        }
+    }
+    out.push_str(&lines);
+    let restart: Vec<String> = v["restart_needed"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|s| s.as_str().map(escape_controls))
+        .collect();
+    if !restart.is_empty() {
+        out.push_str(&format!(
+            "not reloaded, differ from the running config (restart to apply): {}\n",
+            restart.join(", ")
+        ));
+    }
+    out
+}
+
+/// The warnings of an agents reload, one `warning:` line each, for stderr: those about the
+/// lists now in force (`warnings`), then those about the file's own settings, which a restart
+/// would apply (`restart_warnings`). Empty when there are none.
+pub(crate) fn agents_reload_warnings(v: &Value) -> String {
+    let mut out = String::new();
+    for w in ["warnings", "restart_warnings"]
+        .iter()
+        .flat_map(|k| v[*k].as_array().into_iter().flatten())
+    {
+        out.push_str(&format!(
+            "warning: {}\n",
+            escape_controls(w.as_str().unwrap_or_default())
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     /// An entry as `GET /admin/audit` returns it, with `extra` merged into the record.
@@ -1564,5 +1635,44 @@ would revoke 1 lease(s) if revoked now
             r" --x 'it'\''s a b'"
         );
         assert_eq!(repeat_flags(&[("--x", Some(String::new()))]), " --x ''");
+    }
+
+    #[test]
+    fn agents_reload_lists_the_ids_and_the_restart_note() {
+        let out = super::render_agents_reload(&json!({
+            "agents": {"count": 2, "added": ["coder"], "removed": ["old"], "changed": ["planner"]},
+            "peps": {"count": 1, "added": [], "removed": [], "changed": ["gw"]},
+            "restart_needed": ["[[root_grants]]", "[server]"],
+            "warnings": ["w1"],
+            "audit_id": "x",
+        }));
+        assert_eq!(
+            out,
+            "agents: 2 in force, 1 added, 1 removed, 1 changed\n\
+             peps: 1 in force, 0 added, 0 removed, 1 changed\n\
+             \x20 added    agent coder\n\
+             \x20 removed  agent old\n\
+             \x20 changed  agent planner\n\
+             \x20 changed  pep   gw\n\
+             not reloaded, differ from the running config (restart to apply): \
+             [[root_grants]], [server]\n"
+        );
+        assert_eq!(
+            super::agents_reload_warnings(&json!({
+                "warnings": ["w1", "id `a\nb`"], "restart_warnings": ["r1"],
+            })),
+            "warning: w1\nwarning: id `a\\nb`\nwarning: r1\n"
+        );
+        assert_eq!(super::agents_reload_warnings(&json!({"warnings": []})), "");
+        let quiet = super::render_agents_reload(&json!({
+            "agents": {"count": 0, "added": [], "removed": [], "changed": []},
+            "peps": {"count": 0, "added": [], "removed": [], "changed": []},
+            "restart_needed": [], "warnings": [],
+        }));
+        assert_eq!(
+            quiet,
+            "agents: 0 in force, 0 added, 0 removed, 0 changed\n\
+             peps: 0 in force, 0 added, 0 removed, 0 changed\n"
+        );
     }
 }

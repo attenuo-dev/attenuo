@@ -73,6 +73,8 @@ The table is generated from `attenuo_core::error_codes::ERROR_CODES`, the one pl
 | `admin_disabled` | 403 |  |  | The admin API is turned off. |
 | `admin_role_insufficient` | 403 |  |  | The admin credential's role is below the one the route needs; the message names the role needed. |
 | `agent_token_refused` | 403 |  |  | A delegation token cannot decide an approval. |
+| `agents_invalid` | 422 |  |  | The reloaded config file does not parse, or its `[[agents]]` or `[[peps]]` break a startup rule; the agents and peps in force are unchanged. |
+| `agents_reload_empties` | 422 |  |  | The reloaded config file has no `[[agents]]` (or no `[[peps]]`) while some are in force, as an empty or cut-off file has; refused unless `allow_empty` is sent. The agents and peps in force are unchanged. |
 | `already_refunded` | 409 |  |  | The budget charge was already refunded. |
 | `approval_expired` | 409 |  |  | The approval, or the lease it is bound to, has expired. |
 | `approval_invalid` |  | `-32003` (200) | yes | A presented approval token does not verify, is for another call, or names an approval that is no longer granted. |
@@ -109,7 +111,8 @@ The table is generated from `attenuo_core::error_codes::ERROR_CODES`, the one pl
 | `client_auth_not_accepted` | 400 `invalid_request` |  |  | `[token] actor_auth` does not accept client credentials. |
 | `client_authentication_failed` | 401 `invalid_client` |  |  | The client id or secret is wrong, the client has no credential of the kind sent, or a client assertion is not signed by one of the client's keys (unknown client, unknown `kid`, a key of another algorithm, a bad signature: one answer). |
 | `client_id_mismatch` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The credential was issued to another client. |
-| `config_unreadable` | 500 `server_error` |  |  | The config file the server was started with cannot be read, so the operators were not reloaded; the cause is in the server log only. |
+| `config_file_mismatch` | 422 |  |  | The reloaded config file's `[issuer]` or `[audit]` differs from the running config, so it may be another server's file; refused unless `allow_mismatch` is sent. The agents and peps in force are unchanged. |
+| `config_unreadable` | 500 `server_error` |  |  | The config file the server was started with cannot be read, so the operators, or the agents and peps, were not reloaded; the cause is in the server log only. |
 | `credential_audience_mismatch` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The ID token was not issued to the presenting agent: its `aud` or `azp` names another client. |
 | `credential_expired` | 400 `invalid_grant` |  |  | The hop-0 credential expires before the token could be issued. |
 | `credential_pop_mismatch` | 400 `invalid_grant` |  |  | The DPoP proof is by another key than the one the ID-JAG is bound to (`cnf.jkt`). |
@@ -183,7 +186,7 @@ The table is generated from `attenuo_core::error_codes::ERROR_CODES`, the one pl
 | `prune_not_at_checkpoint` | 409 |  |  | The requested boundary is not a signed checkpoint that matches the log. |
 | `prune_too_recent` | 409 |  |  | The entry at the requested boundary is younger than `[audit.retention] min_age_seconds`. |
 | `rate_limited` | 429 | `-32007` (429) |  | A rate limit is used up; retry after `Retry-After`. |
-| `reload_unavailable` | 409 |  |  | The policy, or the admin operators, cannot be reloaded in this configuration (no policy file; a server not started from a config file). |
+| `reload_unavailable` | 409 |  |  | The policy, the admin operators, or the agents and peps cannot be reloaded in this configuration (no policy file; a server not started from a config file). |
 | `replay_cache_full` | 503 `temporarily_unavailable` |  |  | Too many single-use credentials are in flight; retry later. |
 | `replay_store_unavailable` | 503 `temporarily_unavailable` |  |  | The use of a single-use credential could not be recorded, so it is refused (fail closed); retry later. |
 | `replayed` | 400 `invalid_grant` |  |  | The credential or delegation was already used. |
@@ -493,7 +496,7 @@ Each route needs at least one role; a role includes the ones below it. The table
 | --- | --- |
 | `viewer` | `GET /admin/whoami`, `GET /admin/leases/{lease_id}`, `GET /admin/leases/{lease_id}/tree`, `GET /admin/audit`, `GET /admin/audit/verify`, `GET /admin/audit/entries/{seq}`, `GET /admin/audit/records/{id}`, `GET /admin/audit/checkpoints`, `GET /admin/audit/checkpoint` (it signs a checkpoint of the head when there is none, which records no new fact), `GET /admin/audit/export`, `GET /admin/policies`, `GET /admin/policies/check`, `POST /admin/policies/evaluate` (a dry run that writes nothing), `GET /admin/approvals`, `GET /admin/approvals/{id}` |
 | `operator` | `POST /admin/leases/{lease_id}/revoke`, `POST /admin/leases/revoke` (its `?preview=true` dry run included), `POST /admin/approvals/{id}` |
-| `admin` | `POST /admin/budgets/refund`, `POST /admin/policies/reload`, `POST /admin/operators/reload`, `POST /admin/root-token`, and the audit retention routes `GET /admin/audit/prune/plan`, `POST /admin/audit/prune` and `GET /admin/audit/anchors` |
+| `admin` | `POST /admin/budgets/refund`, `POST /admin/policies/reload`, `POST /admin/operators/reload`, `POST /admin/agents/reload`, `POST /admin/root-token`, and the audit retention routes `GET /admin/audit/prune/plan`, `POST /admin/audit/prune` and `GET /admin/audit/anchors` |
 
 `[admin] token` is the operator `admin` with role `admin`. The audit log records an admin action with `originating_subject` `urn:attenuo:admin` for `[admin] token`, as before operators existed, and `urn:attenuo:admin:<name>` for a named operator; an approval decided by an operator has that subject as `approver.subject` and as the approval token's `sub`.
 
@@ -518,6 +521,7 @@ Where they are served: on the main listener by default; with `[admin] listen` se
 | `GET /admin/audit/anchors?limit&cursor` | The signed anchors of past prunes, newest first, `{anchors, next_cursor}`, each `{through_seq, through_hash, prune_seq, prune_entry_hash, previous_through_seq, archive_sha256, at, kid, signature, state}`. Paged as in [Paging](#paging): `limit` default 50, at most 500. Empty for a log never pruned, whatever `prune` is. |
 | `POST /admin/policies/reload` | Re-read the policy file. On failure the old policy stays. |
 | `POST /admin/operators/reload` | Re-read `[[admin.operators]]`, and nothing else, from the config file the server was started with, and swap them in at once. See [Operators reload](#operators-reload). Also on the console listener with `[admin_ui] allow_write = true`. |
+| `POST /admin/agents/reload` | Re-read `[[agents]]` and `[[peps]]` from the config file the server was started with, check them as startup does, and swap both in at once. Tokens already issued are not revoked. Body `{}`, or `allow_empty` / `allow_mismatch`. See [Agents reload](#agents-reload). Also on the console listener with `[admin_ui] allow_write = true`. |
 | `GET /admin/policies` | The policy set in force: file path, its `sha256` and `loaded_at` (startup or last successful reload), `policy_ids`, validation `warnings`, and `policies: [{id, text}]`. |
 | `GET /admin/policies/check` | Lint the policy file as it is on disk now against the running schema, with line and column for each issue, and say whether it differs from the loaded one. Loads nothing, audits nothing. 409 `check_unavailable` without `policy.policies_path`. |
 | `POST /admin/policies/evaluate` | Dry run: what the loaded policies decide for one call, given a token or a chain, and optionally the run-limit state to assume (`budget`). No lease check, no charge, no audit record, no decision metric. |
@@ -549,6 +553,48 @@ It answers `{"added": [...], "removed": [...], "changed": [...], "audit_id": "<u
 - 500 `config_unreadable`: the file cannot be read; the cause is in the server log only.
 
 On every refusal the operators in force are unchanged. An entry whose `expires_at` has already passed is accepted, with a warning naming it, and its token is refused.
+
+### Agents reload
+
+`POST /admin/agents/reload` (role `admin`) re-reads the config file the server was started with (`--config` or `ATTENUO_CONFIG`), parses it as startup does (with the `ATTENUO__...` [environment overrides](config.md#environment-overrides)), checks `[[agents]]` and `[[peps]]` with the startup rules ([config](config.md#agents)) against the other settings in force, and puts both lists in force in one step. Only these two lists are applied. Reloads run one at a time.
+
+The body is empty, `{}`, or overrides of two refusals: `{"allow_empty": true}` accepts a file that leaves a list empty while the server has entries in it, and `{"allow_mismatch": true}` accepts a file whose `[issuer]` or `[audit]` differs from the running config. An unknown field is a 400.
+
+It answers:
+
+```json
+{
+  "agents": {"count": 3, "sha256": "<64 hex>", "added": ["tester"], "removed": ["coder"], "changed": ["reviewer"]},
+  "peps": {"count": 1, "sha256": "<64 hex>", "added": [], "removed": [], "changed": []},
+  "restart_needed": ["[[root_grants]]"],
+  "warnings": [],
+  "restart_warnings": [],
+  "audit_id": "<uuid>"
+}
+```
+
+- `count` is the number of entries now in force. `added`, `removed` and `changed` are ids; `changed` means a different `secret_sha256` or `jwks`.
+- `sha256` is the SHA-256 (lowercase hex) of the list's canonical form: a JSON array with one `[id, secret_sha256, thumbprints]` array per entry, sorted by id, written compactly (no spaces). `secret_sha256` is the entry's digest in lowercase, or `null`; `thumbprints` is the sorted list of the RFC 7638 SHA-256 thumbprints (base64url) of the entry's `jwks` keys, `[]` without keys. It holds no secret and no key, and lets you show later which lists a reload put in force, by computing it from a copy of the file.
+- `restart_needed` names each other section of the file (`[server]`, `[[root_grants]]`, ...) whose values differ from the ones in force. They are not applied; a restart applies them. `[[admin.operators]]` is not compared: `POST /admin/operators/reload` reloads it. An empty list means the file matches the running config apart from the two lists.
+- `warnings` are the startup warnings the new lists raise, such as an `[[idps]]` entry with no `client_ids` entry for a new agent, or no agents at all, and one for each removed agent that can still get a new token another way: by name when `[token] require_actor_auth = false`, or with an actor token when an `[[actor_trust]]` entry can map a workload to its id. Changing either setting takes a restart. Ids in a warning are escaped, so a control character cannot forge a log line.
+- `restart_warnings` say that the file's own settings, which a restart would apply, would refuse these lists (for example `[authzen] allow_unsigned_chain = true` with no `[[peps]]`). The lists were checked against the settings in force and put in force anyway.
+- The `admin.agents.reload` audit record names the caller as `originating_subject` and has `{path, agents, peps, restart_needed}` as its arguments, the middle two as in the answer, `sha256` included. Like every record, it keeps the arguments only as their digest. A 422 refusal is recorded as a `deny` whose `reason` is the refusal's code; the 400 `invalid_request`, 409 `reload_unavailable` and 500 `config_unreadable` are not audited.
+
+What changes when:
+
+- Each request authenticates against one snapshot: it sees both old lists or both new ones, never a mix. A request admitted before the swap completes with the lists it was admitted with.
+- From the next request on, a removed agent or PEP, an old secret and an old key are refused (401 `invalid_client` / `client_authentication_failed`), and an added one, a new secret and a new key are accepted. A removed agent may still get new tokens through the routes the warnings name.
+- Tokens and leases already issued are not revoked. A token issued to a removed agent keeps working, and `POST /token/renew` keeps renewing it, until it expires or its lease is revoked: `POST /admin/leases/{lease_id}/revoke` or `POST /admin/leases/revoke` (`attenuo lease revoke`). To contain a compromised agent, reload and revoke.
+- The per-agent `[limits] token_requests_per_minute` window and the record of used client assertions (`jti`) are kept by id, so a rotation resets neither.
+
+Refusals (on every one, both lists in force are unchanged):
+
+- 422 `agents_invalid`: the file does not parse as the server's config (not TOML, an unknown key, a wrong type), or a list breaks a startup rule (an empty or duplicate id, the reserved id `attenuo`, a `secret_sha256` that is not 64 hex characters, an entry with neither a secret nor keys, a `jwks` the server refuses, or no `[[peps]]` while `[authzen] allow_unsigned_chain = true`). `detail` is the message startup would give, followed by `; the agents and peps in force are unchanged`. When the rule is one in force that the file changes, the message adds `(a rule in force; the file changes it, which needs a restart)`. A TOML error names its line, and its key and table when it can, but never quotes the file or a value from it.
+- 422 `agents_reload_empties`: the file has no `[[agents]]` or no `[[peps]]` while the server has some in force, as an empty or cut-off file has. Checked first. Send `allow_empty` to empty them.
+- 422 `config_file_mismatch`: the file's `[issuer]` or `[audit]` differs from the running config, so it may be another server's file. Send `allow_mismatch` to reload its lists anyway; the two sections are still not applied.
+- 400 `invalid_request`: the body is not the JSON object above.
+- 409 `reload_unavailable`: the server was not started from a config file.
+- 500 `config_unreadable`: the file cannot be read; the cause is in the server log only.
 
 ### Budget refund
 

@@ -3150,7 +3150,211 @@ pub fn check_server_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Refuse the agent id `attenuo` in `section` (SR-34): an agent of that name would put its own
+/// name next to the server's in audit records (`agents` beside `server = "attenuo"`).
+fn reserved_agent_id(section: &str, id: &str) -> anyhow::Result<()> {
+    if id == crate::routes::AUDIT_SERVER {
+        anyhow::bail!("{section}: agent id `{id}` is reserved for the server's own records");
+    }
+    Ok(())
+}
+
+/// Refuse the reserved agent id `attenuo` in `[[agents]]` and `[[peps]]`. Part of
+/// [`Config::check_server_names`], and of the check startup and `POST /admin/agents/reload`
+/// share.
+///
+/// # Errors
+///
+/// When an entry's id is `attenuo`; the message names the section.
+pub fn check_reserved_client_ids(agents: &[AgentConfig], peps: &[PepConfig]) -> anyhow::Result<()> {
+    for a in agents {
+        reserved_agent_id("[[agents]]", &a.id)?;
+    }
+    for p in peps {
+        reserved_agent_id("[[peps]]", &p.id)?;
+    }
+    Ok(())
+}
+
+/// The message of a TOML error in `text`, with its line and, when the line names one, its key
+/// and table, and without any value of the file. The default rendering quotes the line, and a
+/// deserializer's message may repeat the value it refused (`invalid type: string "...",
+/// expected u64`, `unknown variant `...``); either can be `[admin] token = "..."` or another
+/// secret. So the line is never quoted, every double-quoted string in the message is replaced
+/// by `"…"`, and so is every other occurrence of the refused value (the text the error points
+/// at). What the reloads answer (`POST /admin/operators/reload`, `POST /admin/agents/reload`).
+pub(crate) fn toml_error_text(text: &str, e: &toml::de::Error) -> String {
+    let span = e.span();
+    let start = span.as_ref().map(|s| s.start).filter(|&s| s <= text.len());
+    let line = start
+        .and_then(|s| text.get(..s))
+        .map_or(0, |before| before.matches('\n').count() + 1);
+    let mut message = e.message().to_string();
+    // The refused value as written, without its quotes: every backquoted or bare copy of it
+    // in the message goes.
+    if let Some(value) = span
+        .as_ref()
+        .and_then(|s| text.get(s.clone()))
+        .map(|v| v.trim().trim_matches(|c| c == '"' || c == '\''))
+        .filter(|v| !v.is_empty())
+    {
+        message = message.replace(&format!("`{value}`"), "`…`");
+        message = message.replace(&format!("'{value}'"), "'…'");
+    }
+    let message = redact_quoted(&message);
+    let place = start.map(|s| toml_place(text, s)).unwrap_or_default();
+    format!("the config file is not valid TOML (line {line}{place}): {message}")
+}
+
+/// `message` with the content of each double-quoted string (escapes included) replaced by
+/// `…`. A deserializer's message quotes values that way, never a type or a key.
+fn redact_quoted(message: &str) -> String {
+    let mut out = String::with_capacity(message.len());
+    let mut chars = message.chars();
+    while let Some(c) = chars.next() {
+        out.push(c);
+        if c != '"' {
+            continue;
+        }
+        out.push('…');
+        let mut escaped = false;
+        for c in chars.by_ref() {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                out.push('"');
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// `, key `k` in [table]` for the error at byte `at` of `text`: the bare key before `=` on its
+/// line and the last table header above it, each only when it is made of the characters a bare
+/// key or a header holds (nothing that could be a value). Empty when neither is found.
+fn toml_place(text: &str, at: usize) -> String {
+    let bare = |s: &str, extra: &[char]| {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "_-.".contains(c) || extra.contains(&c))
+    };
+    let before = text.get(..at).unwrap_or_default();
+    let line_start = before.rfind('\n').map_or(0, |i| i + 1);
+    let line = text.get(line_start..).unwrap_or_default();
+    let line = line.split('\n').next().unwrap_or_default();
+    let key = line
+        .split_once('=')
+        .map(|(k, _)| k.trim())
+        .filter(|k| bare(k, &[]));
+    let table = before
+        .get(..line_start)
+        .unwrap_or_default()
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| l.starts_with('['))
+        .filter(|h| bare(h, &['[', ']']));
+    match (key, table) {
+        (Some(k), Some(t)) => format!(", key `{k}` in {t}"),
+        (Some(k), None) => format!(", key `{k}`"),
+        (None, Some(t)) => format!(", in {t}"),
+        (None, None) => String::new(),
+    }
+}
+
+/// A digest of each top-level section of a config, but `[[agents]]`, `[[peps]]` and
+/// `[[admin.operators]]` (which have reloads of their own): what `POST /admin/agents/reload`
+/// compares the file with, to say which sections differ from the ones in force and so need a
+/// restart. Only digests are kept, no value of the config.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct SectionDigests(BTreeMap<String, [u8; 32]>);
+
+impl std::fmt::Debug for SectionDigests {
+    /// The section names only: a digest of a section with few possible values (one that holds
+    /// a short token, say) could be guessed from it.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_set().entries(self.0.keys()).finish()
+    }
+}
+
+impl SectionDigests {
+    /// The sections (`[server]`, `[[upstreams]]`) whose digest differs between `self` and
+    /// `other`, or that only one of them has, in name order.
+    pub fn differing(&self, other: &Self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .0
+            .iter()
+            .filter(|(k, v)| other.0.get(*k) != Some(*v))
+            .map(|(k, _)| k.clone())
+            .chain(other.0.keys().filter(|k| !self.0.contains_key(*k)).cloned())
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+}
+
 impl Config {
+    /// The [`SectionDigests`] of this config: each top-level key of its serialization, but
+    /// `agents`, `peps` and `admin.operators`, as `[name]` for a table and `[[name]]` for an
+    /// array of tables, with the SHA-256 of its JSON form. Defaults are serialized too, so a
+    /// section left out of the file and one written with its default values compare equal.
+    ///
+    /// # Errors
+    ///
+    /// When the config cannot be serialized to JSON, which the types do not allow in practice.
+    pub fn section_digests(&self) -> anyhow::Result<SectionDigests> {
+        use anyhow::Context as _;
+        use sha2::Digest as _;
+        let value = serde_json::to_value(self).context("serializing the config")?;
+        let serde_json::Value::Object(map) = value else {
+            anyhow::bail!("the config does not serialize to an object");
+        };
+        let mut out = BTreeMap::new();
+        for (key, mut v) in map {
+            if key == "agents" || key == "peps" {
+                continue;
+            }
+            if key == "admin" {
+                if let Some(admin) = v.as_object_mut() {
+                    admin.remove("operators");
+                }
+            }
+            let name = if v.is_array() {
+                format!("[[{key}]]")
+            } else {
+                format!("[{key}]")
+            };
+            let bytes = serde_json::to_vec(&v).context("serializing the config")?;
+            out.insert(name, sha2::Sha256::digest(&bytes).into());
+        }
+        Ok(SectionDigests(out))
+    }
+
+    /// Parse the text of the config file as the server does at startup (the file, then the
+    /// `ATTENUO__<SECTION>__<KEY>` overrides in `env`, then [`apply_env`](Self::apply_env)),
+    /// for a reload: a TOML error names its line and never quotes it.
+    ///
+    /// # Errors
+    ///
+    /// As [`from_toml_with_env`](Self::from_toml_with_env).
+    pub fn reparse<I, K, V>(text: &str, env: I) -> anyhow::Result<Self>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<std::ffi::OsString>,
+        V: Into<std::ffi::OsString>,
+    {
+        let quiet = |e: toml::de::Error| anyhow::anyhow!(toml_error_text(text, &e));
+        let base: Self = toml::from_str(text).map_err(quiet)?;
+        let file: toml::Table = text.parse().map_err(quiet)?;
+        let (mut config, _) = overrides::apply(file, base, env)?;
+        config.apply_env();
+        Ok(config)
+    }
+
     /// Check `[[ext_authz]]`: each `server` a valid server name ([`check_server_name`]) named
     /// once, each `secret_sha256` 64 hex digits, and each `dpop_url` an absolute `http` or
     /// `https` URL with a host and no query or fragment.
@@ -3217,22 +3421,7 @@ impl Config {
         catalog
             .validate()
             .map_err(|e| anyhow::anyhow!("[policy] catalog: {e}"))?;
-        // An agent called `attenuo` would put its own name next to the server's in audit
-        // records (`agents` beside `server = "attenuo"`); refuse it with the server names.
-        let reserved_agent = |section: &str, id: &str| {
-            if id == crate::routes::AUDIT_SERVER {
-                anyhow::bail!(
-                    "{section}: agent id `{id}` is reserved for the server's own records"
-                );
-            }
-            Ok(())
-        };
-        for a in &self.agents {
-            reserved_agent("[[agents]]", &a.id)?;
-        }
-        for p in &self.peps {
-            reserved_agent("[[peps]]", &p.id)?;
-        }
+        check_reserved_client_ids(&self.agents, &self.peps)?;
         for (index, g) in self.root_grants.iter().enumerate() {
             // Every refusal names the entry: its index from 0 in file order, issuer, agent
             // and subject, since several entries may share an agent or an issuer.
@@ -3240,7 +3429,7 @@ impl Config {
                 "[[root_grants]] entry {index} ({})",
                 g.describe(self.logging.redact_subjects)
             );
-            reserved_agent(&entry, &g.agent)?;
+            reserved_agent_id(&entry, &g.agent)?;
             let caps =
                 capability_set(&g.capabilities).map_err(|e| anyhow::anyhow!("{entry}: {e}"))?;
             // A request is attenuated against the grant at a cost of the product (SR-123).
@@ -3995,6 +4184,112 @@ mod tests {
         )
         .unwrap();
         edges.limits.check().unwrap();
+    }
+
+    /// The section digests an agents reload compares: the example (every section in use)
+    /// serializes; a config compares equal to itself; a change in a section names that section
+    /// only; the lists that have reloads of their own are left out; a section the file leaves
+    /// out compares equal to one written with its defaults.
+    #[test]
+    fn section_digests_name_the_sections_that_differ() {
+        let text = include_str!("../../../config/example.toml");
+        let cfg = Config::from_toml(text).unwrap();
+        let base = cfg.section_digests().unwrap();
+        assert!(base
+            .differing(&cfg.clone().section_digests().unwrap())
+            .is_empty());
+        let mut other = cfg.clone();
+        other
+            .agents
+            .push(AgentConfig::with_secret_sha256("x", "0".repeat(64)));
+        other.peps.clear();
+        other.admin.operators.clear();
+        assert!(base.differing(&other.section_digests().unwrap()).is_empty());
+        other.server.public_url = Some("https://other.example".into());
+        other.root_grants.clear();
+        other.admin.token = Some("another".into());
+        assert_eq!(
+            base.differing(&other.section_digests().unwrap()),
+            ["[[root_grants]]", "[admin]", "[server]"]
+        );
+        let empty = Config::from_toml("").unwrap().section_digests().unwrap();
+        let spelled = Config::from_toml("[limits]\n[leases]\n").unwrap();
+        assert!(empty
+            .differing(&spelled.section_digests().unwrap())
+            .is_empty());
+    }
+
+    /// A reload's parse names the line of a TOML error and never quotes it.
+    #[test]
+    fn reparse_does_not_quote_the_file() {
+        let text = "[admin]\ntoken = \"a-secret-token-0123456789abcdef\"\n[[agents]\n";
+        let err = format!(
+            "{:#}",
+            Config::reparse(text, std::iter::empty::<(String, String)>()).unwrap_err()
+        );
+        assert!(err.contains("line 3"), "{err}");
+        assert!(!err.contains("a-secret-token"), "{err}");
+        let shape = "[admin]\ntoken = \"a-secret-token-0123456789abcdef\"\n[[agents]]\nid = 1\n";
+        let err = format!(
+            "{:#}",
+            Config::reparse(shape, std::iter::empty::<(String, String)>()).unwrap_err()
+        );
+        assert!(err.contains("line 4"), "{err}");
+        assert!(!err.contains("a-secret-token"), "{err}");
+    }
+
+    /// A value the deserializer refused is never repeated: not a string of the wrong type, not
+    /// an unknown variant, not a string inside a list. The key, the table and the expected type
+    /// stay.
+    #[test]
+    fn toml_error_text_never_repeats_a_value() {
+        let parse = |text: &str| {
+            format!(
+                "{:#}",
+                Config::reparse(text, std::iter::empty::<(String, String)>()).unwrap_err()
+            )
+        };
+        for (text, want) in [
+            (
+                "[limits]\nmax_in_flight = \"s3cret-hunter2-wrong-type\"\n",
+                "(line 2, key `max_in_flight` in [limits]): invalid type: string \"…\", expected",
+            ),
+            (
+                "[token]\nactor_auth = \"s3cret-hunter2-variant\"\n",
+                "(line 2, key `actor_auth` in [token]): unknown variant `…`, expected one of",
+            ),
+            (
+                "[server]\nlisten = [\"s3cret-hunter2-in-a-list\"]\n",
+                "(line 2, key `listen` in [server]): invalid type: sequence",
+            ),
+            (
+                "[server]\nlisten = 's3cret-hunter2-literal'\n",
+                "(line 2, key `listen` in [server]):",
+            ),
+        ] {
+            let err = parse(text);
+            assert!(err.contains(want), "{want}: {err}");
+            assert!(!err.contains("hunter2"), "{err}");
+        }
+    }
+
+    #[test]
+    fn redact_quoted_blanks_each_string() {
+        assert_eq!(
+            redact_quoted(r#"invalid type: string "a\"b", expected "c" or `d`"#),
+            r#"invalid type: string "…", expected "…" or `d`"#
+        );
+        assert_eq!(redact_quoted("no quotes"), "no quotes");
+        assert_eq!(redact_quoted("open \"never closed"), "open \"…");
+    }
+
+    /// `SectionDigests` prints its section names, never a digest.
+    #[test]
+    fn section_digests_debug_names_only() {
+        let cfg = Config::from_toml("[admin]\ntoken = \"t-0123456789abcdef0123456789\"\n").unwrap();
+        let shown = format!("{:?}", cfg.section_digests().unwrap());
+        assert!(shown.contains("admin"), "{shown}");
+        assert!(!shown.chars().any(|c| c.is_ascii_digit()), "{shown}");
     }
 
     #[test]

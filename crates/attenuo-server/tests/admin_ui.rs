@@ -499,6 +499,7 @@ async fn write_routes_are_absent_without_allow_write() {
         "/admin/leases/x/revoke",
         "/admin/policies/reload",
         "/admin/operators/reload",
+        "/admin/agents/reload",
         "/admin/budgets/refund",
         // GET on this path is a read route; a decision is still 404, not 405, so the console
         // says writes are disabled.

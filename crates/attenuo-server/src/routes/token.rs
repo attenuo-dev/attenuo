@@ -347,7 +347,7 @@ fn exchange_sync(
                 format!("an actor_token (actor_token_type `{ACTOR_TOKEN_TYPE}`) is required"),
             ));
         }
-        let client = state.agents.authenticate(
+        let client = state.clients.snapshot().agents.authenticate(
             headers,
             client_id.as_deref(),
             client_secret.as_deref(),
