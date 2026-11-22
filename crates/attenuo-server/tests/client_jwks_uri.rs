@@ -6,8 +6,9 @@
 //! of made-up `kid`s, and a failed refetch that keeps the keys in force; no redirects; key
 //! sets that are too large, not JSON or hold a private key, and keys for other uses that are
 //! skipped; `ca_pem_path`; `jwks` and `jwks_url` together refused at startup and at a reload;
-//! a reload that moves the URL; no PEP key fetch before the AuthZEN bearer check; the SR-110
-//! comparison of refusals; and single use of an assertion.
+//! a reload that moves the URL; no PEP key fetch before the AuthZEN bearer check, and what
+//! AuthZEN answers with no bearer or a bad one; the SR-110 comparison of refusals; and single
+//! use of an assertion.
 //!
 //! The mock key server counts the requests of each path, so the tests can say when the
 //! server fetched and when it did not.
@@ -931,6 +932,286 @@ async fn no_pep_key_is_fetched_before_the_authzen_bearer_check() {
         assert_eq!(good.status(), StatusCode::OK, "{path}");
     }
     assert_eq!(keys.hits("gateway"), 1);
+}
+
+// --- AuthZEN: the bearer is checked first -------------------------------------------------
+
+/// An AuthZEN request body for `path` (`/access/v1/evaluation`, `/evaluations` or
+/// `/search/action`): the evaluation `base`, with one entry for a batch, and `auth` (the
+/// PEP's fields) at the top level.
+fn authzen_body(path: &str, base: &Value, auth: &Value) -> Value {
+    let mut body = base.clone();
+    if path.ends_with("/evaluations") {
+        body["evaluations"] = json!([{}]);
+    }
+    for (k, v) in auth.as_object().unwrap() {
+        body[k] = v.clone();
+    }
+    body
+}
+
+/// An evaluation whose chain comes from the bearer: an empty subject.
+fn bearer_evaluation() -> Value {
+    json!({
+        "subject": {"type": "agent", "id": ""},
+        "action": {"name": "read_file"},
+        "resource": {"type": "tool", "id": "github/read_file", "properties": {"server": "github"}},
+        "context": {"input": {}},
+    })
+}
+
+/// The three AuthZEN endpoints.
+const AUTHZEN: [&str; 3] = [
+    "/access/v1/evaluation",
+    "/access/v1/evaluations",
+    "/access/v1/search/action",
+];
+
+impl Harness {
+    /// POST `body` to an AuthZEN `path`, with `bearer` if given: the status and the body.
+    async fn authzen(&self, path: &str, body: &Value, bearer: Option<&str>) -> (StatusCode, Value) {
+        let mut req = self.client.post(self.server.url(path)).json(body);
+        if let Some(b) = bearer {
+            req = req.bearer_auth(b);
+        }
+        let resp = req.send().await.unwrap();
+        let status = resp.status();
+        (status, resp.json().await.unwrap_or(Value::Null))
+    }
+
+    /// An unsigned evaluation of `read_file` for the chain of a fresh root token, as a PEP
+    /// sends it under `[authzen] allow_unsigned_chain`.
+    async fn unsigned_evaluation(&self) -> Value {
+        let root = mint_root(&self.client, &self.server).await;
+        let chain = self
+            .state
+            .keys()
+            .verifier
+            .verify(&root, time::OffsetDateTime::now_utc())
+            .unwrap()
+            .chain;
+        let read = attenuo_core::ToolCall::new("github", "read_file", json!({}));
+        serde_json::to_value(attenuo_policy::authzen::to_request(&chain, &read)).unwrap()
+    }
+}
+
+/// An inline-key `[[peps]]` entry holding `key`.
+fn inline_pep(id: &str, key: &Key) -> String {
+    format!(
+        "[[peps]]\nid = \"{id}\"\njwks = '''{}'''\n",
+        jwk_set(&[key])
+    )
+}
+
+/// The PEPs of the AuthZEN tests: `gateway` (keys at a URL), `gw-inline` (inline keys) and
+/// `gw-secret` (secret `g`).
+fn authzen_peps(keys: &KeyServer, inline: &Key) -> String {
+    agent_secret("planner", "p")
+        + &remote("peps", "gateway", &keys.url("gateway"), "")
+        + &inline_pep("gw-inline", inline)
+        + "[[peps]]\nid = \"gw-secret\"\nsecret_sha256 = \""
+        + &sha256_hex("g")
+        + "\"\n"
+}
+
+const MISSING_TOKEN: (StatusCode, &str) = (StatusCode::UNAUTHORIZED, "missing_token");
+
+fn code_of(got: &(StatusCode, Value)) -> (StatusCode, &str) {
+    (
+        got.0,
+        got.1["error_description"].as_str().unwrap_or_default(),
+    )
+}
+
+/// With no bearer and `[authzen] allow_unsigned_chain` off, the PEP's credentials are not
+/// looked at: every such request is 401 `missing_token`, also those that used to fail on the
+/// PEP's fields first (400 `multiple_client_auth` or `malformed_request`, a body that is not an
+/// evaluation request, 401 `invalid_client`) and the batches whose entries used to be answered
+/// one by one (a non-object entry, `deny_on_first_deny`). A valid assertion is not spent, so
+/// it still works with a bearer afterwards, and no PEP key is fetched.
+#[tokio::test]
+async fn without_a_bearer_the_pep_is_not_looked_at_and_its_assertion_stays_unspent() {
+    let keys = KeyServer::start().await;
+    let (gateway, inline) = (Key::new("gw"), Key::new("in"));
+    keys.serve_keys("gateway", &[&gateway]);
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::start(&write_config(
+        dir.path(),
+        &keys,
+        &authzen_peps(&keys, &inline),
+    ))
+    .await;
+    let base = bearer_evaluation();
+    let at = |path: &str, auth: Value| authzen_body(path, &base, &auth);
+    let valid = [
+        fields(&gateway.assertion("gateway")),
+        fields(&inline.assertion("gw-inline")),
+    ];
+    for path in AUTHZEN {
+        for auth in &valid {
+            let got = h.authzen(path, &at(path, auth.clone()), None).await;
+            assert_eq!(code_of(&got), MISSING_TOKEN, "{path}: {:?}", got.1);
+        }
+    }
+    let mut both = fields(&inline.assertion("gw-inline"));
+    both["pep_secret"] = "g".into();
+    let mut bad_type = fields(&inline.assertion("gw-inline"));
+    bad_type["client_assertion_type"] = "urn:example:other".into();
+    let mut not_a_request = at(
+        "/access/v1/evaluation",
+        fields(&inline.assertion("gw-inline")),
+    );
+    not_a_request["subject"] = json!(5);
+    let mut non_object = at(
+        "/access/v1/evaluations",
+        fields(&inline.assertion("gw-inline")),
+    );
+    // On main: each entry its own `decision: false`, a 200.
+    non_object["evaluations"] = json!(["not an object", 5]);
+    let mut deny_first = at(
+        "/access/v1/evaluations",
+        fields(&inline.assertion("gw-inline")),
+    );
+    // On main: the first entry fails before the bearer check of `admit` and stops the
+    // batch, a 200.
+    deny_first["evaluations"] = json!([{"resource": 5}, {}]);
+    deny_first["options"] = json!({"evaluations_semantic": "deny_on_first_deny"});
+    let wrong_secret = json!({"pep_id": "gw-secret", "pep_secret": "wrong"});
+    let cases = [
+        ("/access/v1/evaluation", at("/access/v1/evaluation", both)),
+        (
+            "/access/v1/evaluation",
+            at("/access/v1/evaluation", bad_type),
+        ),
+        ("/access/v1/evaluation", not_a_request),
+        (
+            "/access/v1/evaluation",
+            at("/access/v1/evaluation", wrong_secret),
+        ),
+        ("/access/v1/evaluations", non_object),
+        ("/access/v1/evaluations", deny_first),
+    ];
+    for (path, body) in &cases {
+        let got = h.authzen(path, body, None).await;
+        assert_eq!(code_of(&got), MISSING_TOKEN, "{path} {body}: {:?}", got.1);
+    }
+    assert_eq!(keys.hits("gateway"), 0, "a PEP key was fetched");
+    // Unspent: the same assertions authenticate with a bearer.
+    for auth in &valid {
+        let path = "/access/v1/evaluation";
+        let got = h
+            .authzen(path, &at(path, auth.clone()), Some(&h.root))
+            .await;
+        assert_eq!(got.0, StatusCode::OK, "{:?}", got.1);
+        assert!(got.1["context"]["decision_id"].is_string(), "{:?}", got.1);
+    }
+}
+
+/// With `[authzen] allow_unsigned_chain` on, a PEP whose keys are at a URL authenticates with
+/// no bearer at all three endpoints; its set is fetched once.
+#[tokio::test]
+async fn with_unsigned_chains_a_url_pep_authenticates_without_a_bearer() {
+    let keys = KeyServer::start().await;
+    let (gateway, inline) = (Key::new("gw"), Key::new("in"));
+    keys.serve_keys("gateway", &[&gateway]);
+    let dir = tempfile::tempdir().unwrap();
+    let lists = authzen_peps(&keys, &inline) + "[authzen]\nallow_unsigned_chain = true\n";
+    let h = Harness::start(&write_config(dir.path(), &keys, &lists)).await;
+    for path in AUTHZEN {
+        let base = h.unsigned_evaluation().await;
+        let body = authzen_body(path, &base, &fields(&gateway.assertion("gateway")));
+        let got = h.authzen(path, &body, None).await;
+        assert_eq!(got.0, StatusCode::OK, "{path}: {:?}", got.1);
+        match path {
+            "/access/v1/evaluation" => {
+                assert!(got.1["context"]["decision_id"].is_string(), "{:?}", got.1);
+            }
+            "/access/v1/evaluations" => {
+                assert_eq!(
+                    got.1["evaluations"].as_array().map(Vec::len),
+                    Some(1),
+                    "{:?}",
+                    got.1
+                );
+            }
+            _ => assert!(got.1["results"].is_array(), "{:?}", got.1),
+        }
+    }
+    assert_eq!(keys.hits("gateway"), 1);
+    // Without the assertion, the PEP is not authenticated.
+    let base = h.unsigned_evaluation().await;
+    let got = h.authzen("/access/v1/evaluation", &base, None).await;
+    assert_eq!(got.0, StatusCode::UNAUTHORIZED, "{:?}", got.1);
+}
+
+/// Action search takes the assertion of a PEP with inline keys, as evaluation does, and
+/// spends it.
+#[tokio::test]
+async fn action_search_takes_an_inline_key_pep_assertion() {
+    let keys = KeyServer::start().await;
+    let (gateway, inline) = (Key::new("gw"), Key::new("in"));
+    keys.serve_keys("gateway", &[&gateway]);
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::start(&write_config(
+        dir.path(),
+        &keys,
+        &authzen_peps(&keys, &inline),
+    ))
+    .await;
+    let path = "/access/v1/search/action";
+    let body = authzen_body(
+        path,
+        &bearer_evaluation(),
+        &fields(&inline.assertion("gw-inline")),
+    );
+    let got = h.authzen(path, &body, Some(&h.root)).await;
+    assert_eq!(got.0, StatusCode::OK, "{:?}", got.1);
+    assert!(got.1["results"].is_array(), "{:?}", got.1);
+    let got = h.authzen(path, &body, Some(&h.root)).await;
+    assert_eq!(
+        code_of(&got),
+        (StatusCode::UNAUTHORIZED, "client_assertion_replayed"),
+        "{:?}",
+        got.1
+    );
+    assert_eq!(keys.hits("gateway"), 0);
+}
+
+/// A bad bearer is refused (401 `invalid_token`) before a PEP's secret or inline-key
+/// assertion is looked at, at the batch and search endpoints; the assertion stays unspent.
+#[tokio::test]
+async fn a_bad_bearer_is_refused_before_a_secret_or_inline_key_pep() {
+    let keys = KeyServer::start().await;
+    let (gateway, inline) = (Key::new("gw"), Key::new("in"));
+    keys.serve_keys("gateway", &[&gateway]);
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::start(&write_config(
+        dir.path(),
+        &keys,
+        &authzen_peps(&keys, &inline),
+    ))
+    .await;
+    let base = bearer_evaluation();
+    let assertion = inline.assertion("gw-inline");
+    for path in ["/access/v1/evaluations", "/access/v1/search/action"] {
+        for auth in [
+            json!({"pep_id": "gw-secret", "pep_secret": "g"}),
+            fields(&assertion),
+        ] {
+            let body = authzen_body(path, &base, &auth);
+            let got = h.authzen(path, &body, Some("not-a-token")).await;
+            assert_eq!(
+                code_of(&got),
+                (StatusCode::UNAUTHORIZED, "invalid_token"),
+                "{path} {auth}: {:?}",
+                got.1
+            );
+        }
+    }
+    let path = "/access/v1/search/action";
+    let body = authzen_body(path, &base, &fields(&assertion));
+    let got = h.authzen(path, &body, Some(&h.root)).await;
+    assert_eq!(got.0, StatusCode::OK, "{:?}", got.1);
 }
 
 /// `bytes` as base64url without padding.
