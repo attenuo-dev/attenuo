@@ -226,7 +226,7 @@ async fn metrics_endpoint_reports_pipeline_and_token_activity() {
 
     // Two decisions through the shared pipeline (no policies are loaded, so both deny).
     let now = time::OffsetDateTime::now_utc();
-    let chain = h.state.verifier.verify(&token, now).unwrap().chain;
+    let chain = h.state.keys().verifier.verify(&token, now).unwrap().chain;
     let call = ToolCall::new("github", "read_file", json!({}));
     h.state.pipeline.decide(&chain, &call, now);
     h.state.pipeline.decide(&chain, &call, now);
@@ -335,7 +335,7 @@ async fn metrics_report_the_wal_checkpointer_and_presync() {
         .await;
     let token = root["access_token"].as_str().unwrap().to_string();
     let now = time::OffsetDateTime::now_utc();
-    let chain = h.state.verifier.verify(&token, now).unwrap().chain;
+    let chain = h.state.keys().verifier.verify(&token, now).unwrap().chain;
     let call = ToolCall::new("github", "read_file", json!({}));
     // Past seq 40: one presync on the way, then a signed checkpoint.
     for _ in 0..40 {
@@ -426,16 +426,16 @@ async fn rotation_keeps_old_tokens_valid_and_publishes_both_keys() {
     let (old_router, old_state) = server_with_keys(dir.path(), "old.pem", &[]);
     let old_server = spawn_router(old_router).await.unwrap();
     let old_token = mint_root(&old_server).await;
-    let old_kid = old_state.issuer.key_id();
+    let old_kid = old_state.keys().issuer.key_id();
 
     // Rotate: a new signing key, the old one verify-only.
     let (new_router, new_state) = server_with_keys(dir.path(), "new.pem", &["old.pem"]);
     let new_server = spawn_router(new_router).await.unwrap();
-    assert_ne!(new_state.issuer.key_id(), old_kid);
+    assert_ne!(new_state.keys().issuer.key_id(), old_kid);
 
     // Same issuer/audience defaults, so the new server verifies the old token.
     let now = time::OffsetDateTime::now_utc();
-    assert!(new_state.verifier.verify(&old_token, now).is_ok());
+    assert!(new_state.keys().verifier.verify(&old_token, now).is_ok());
 
     // And it can be exchanged for a child, which is signed with the new key.
     let child: Value = reqwest::Client::new()
@@ -475,11 +475,11 @@ async fn rotation_keeps_old_tokens_valid_and_publishes_both_keys() {
         .iter()
         .map(|k| k["kid"].as_str().unwrap())
         .collect();
-    assert_eq!(kids, [new_state.issuer.key_id(), old_kid.clone()]);
+    assert_eq!(kids, [new_state.keys().issuer.key_id(), old_kid.clone()]);
 
     // Without previous_key_paths the old token is rejected by kid.
     let (_r, solo) = server_with_keys(dir.path(), "new.pem", &[]);
-    let err = solo.verifier.verify(&old_token, now).unwrap_err();
+    let err = solo.keys().verifier.verify(&old_token, now).unwrap_err();
     assert!(
         matches!(err, attenuo_token::TokenError::UnknownKeyId(ref k) if *k == old_kid),
         "{err}"

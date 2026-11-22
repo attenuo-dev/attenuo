@@ -268,7 +268,7 @@ pub(crate) async fn handle(
     let requested_ttl = req
         .requested_ttl_seconds
         .map(|s| Duration::seconds(i64::try_from(s).unwrap_or(i64::MAX)))
-        .unwrap_or(state.issuer.config().default_ttl);
+        .unwrap_or(state.keys().issuer.config().default_ttl);
     let remaining = Duration::seconds(verified.expires_at - now.unix_timestamp());
     if remaining < Duration::seconds(1) {
         return Err(ApiError::bad_request(
@@ -305,7 +305,9 @@ pub(crate) async fn handle(
     // Everything from here on touches SQLite; run it on the blocking pool.
     let issued = state
         .blocking(move |state| {
-            let issued = state
+            // One snapshot of the issuer's keys to sign and register the token with.
+            let issuer_keys = state.keys();
+            let issued = issuer_keys
                 .issuer
                 .issue_root_with(
                     user,
@@ -331,6 +333,7 @@ pub(crate) async fn handle(
             state.replay.use_all_once(&keys, now)?;
             register_issued(
                 state,
+                &issuer_keys.verifier,
                 &issued.token,
                 &issued.lease,
                 None,

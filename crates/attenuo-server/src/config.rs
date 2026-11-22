@@ -3265,10 +3265,11 @@ fn toml_place(text: &str, at: usize) -> String {
     }
 }
 
-/// A digest of each top-level section of a config, but `[[agents]]`, `[[peps]]` and
-/// `[[admin.operators]]` (which have reloads of their own): what `POST /admin/agents/reload`
-/// compares the file with, to say which sections differ from the ones in force and so need a
-/// restart. Only digests are kept, no value of the config.
+/// A digest of each top-level section of a config, but `[[agents]]`, `[[peps]]`,
+/// `[[admin.operators]]` and the key files of `[issuer]` (`private_key_pem_path`,
+/// `previous_key_paths`), which have reloads of their own: what `POST /admin/agents/reload`
+/// and `POST /admin/keys/reload` compare the file with, to say which sections differ from the
+/// ones in force and so need a restart. Only digests are kept, no value of the config.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct SectionDigests(BTreeMap<String, [u8; 32]>);
 
@@ -3299,7 +3300,7 @@ impl SectionDigests {
 
 impl Config {
     /// The [`SectionDigests`] of this config: each top-level key of its serialization, but
-    /// `agents`, `peps` and `admin.operators`, as `[name]` for a table and `[[name]]` for an
+    /// `agents`, `peps`, `admin.operators` and the key files of `issuer`, as `[name]` for a table and `[[name]]` for an
     /// array of tables, with the SHA-256 of its JSON form. Defaults are serialized too, so a
     /// section left out of the file and one written with its default values compare equal.
     ///
@@ -3321,6 +3322,13 @@ impl Config {
             if key == "admin" {
                 if let Some(admin) = v.as_object_mut() {
                     admin.remove("operators");
+                }
+            }
+            // The key files, which `POST /admin/keys/reload` reads.
+            if key == "issuer" {
+                if let Some(issuer) = v.as_object_mut() {
+                    issuer.remove("private_key_pem_path");
+                    issuer.remove("previous_key_paths");
                 }
             }
             let name = if v.is_array() {
@@ -3347,12 +3355,30 @@ impl Config {
         K: Into<std::ffi::OsString>,
         V: Into<std::ffi::OsString>,
     {
+        Ok(Self::reparse_with_overrides(text, env)?.0)
+    }
+
+    /// As [`reparse`](Self::reparse), and the keys an environment variable set (a value there
+    /// wins over the file's, at a reload as at startup).
+    ///
+    /// # Errors
+    ///
+    /// As [`reparse`](Self::reparse).
+    pub fn reparse_with_overrides<I, K, V>(
+        text: &str,
+        env: I,
+    ) -> anyhow::Result<(Self, Vec<EnvOverride>)>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<std::ffi::OsString>,
+        V: Into<std::ffi::OsString>,
+    {
         let quiet = |e: toml::de::Error| anyhow::anyhow!(toml_error_text(text, &e));
         let base: Self = toml::from_str(text).map_err(quiet)?;
         let file: toml::Table = text.parse().map_err(quiet)?;
-        let (mut config, _) = overrides::apply(file, base, env)?;
+        let (mut config, set) = overrides::apply(file, base, env)?;
         config.apply_env();
-        Ok(config)
+        Ok((config, set))
     }
 
     /// Check `[[ext_authz]]`: each `server` a valid server name ([`check_server_name`]) named
@@ -4204,6 +4230,8 @@ mod tests {
             .push(AgentConfig::with_secret_sha256("x", "0".repeat(64)));
         other.peps.clear();
         other.admin.operators.clear();
+        other.issuer.private_key_pem_path = Some("/elsewhere/issuer.pem".into());
+        other.issuer.previous_key_paths = vec!["/elsewhere/old.pem".into()];
         assert!(base.differing(&other.section_digests().unwrap()).is_empty());
         other.server.public_url = Some("https://other.example".into());
         other.root_grants.clear();

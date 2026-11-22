@@ -1470,3 +1470,76 @@ fn the_live_run_lookup_is_one_index_search_per_root_lease() {
     })
     .unwrap();
 }
+
+/// The JWKS-shaped key set of `issuers`, as the server publishes it.
+fn checkpoint_keys(issuers: &[&attenuo_token::Issuer]) -> crate::checkpoint::CheckpointKeys {
+    use base64::Engine as _;
+    let keys: Vec<serde_json::Value> = issuers
+        .iter()
+        .map(|i| {
+            let pem = i.public_key_pem();
+            let b64: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
+            let der = base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .unwrap();
+            serde_json::json!({
+                "kty": "OKP",
+                "crv": "Ed25519",
+                "kid": i.key_id(),
+                "x": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&der[12..]),
+            })
+        })
+        .collect();
+    crate::checkpoint::CheckpointKeys::from_jwks(&serde_json::json!({ "keys": keys })).unwrap()
+}
+
+/// A swapped signer signs what comes after it; what was signed before keeps its `kid` and
+/// verifies while that key stays in the set. `signing_kids` names both keys.
+#[test]
+fn a_swapped_checkpoint_signer_signs_from_then_on() {
+    let (old, new) = (issuer(), issuer());
+    let log = SqliteAudit::open_in_memory()
+        .unwrap()
+        .with_checkpointing(old.detached_signer(), 2);
+    assert!(log.signing_kids().unwrap().is_empty());
+    for i in 0..2 {
+        log.append(record(i)).unwrap();
+    }
+    assert_eq!(log.checkpoint_signer_kid(), Some(old.key_id()));
+    assert_eq!(
+        log.set_checkpoint_signer(new.detached_signer()).unwrap(),
+        old.key_id()
+    );
+    assert_eq!(log.checkpoint_signer_kid(), Some(new.key_id()));
+    for i in 2..4 {
+        log.append(record(i)).unwrap();
+    }
+    let kids: Vec<String> = log
+        .checkpoints_between(0, 10)
+        .unwrap()
+        .into_iter()
+        .map(|cp| cp.kid)
+        .collect();
+    assert_eq!(kids, [old.key_id(), new.key_id()]);
+    assert_eq!(
+        log.signing_kids().unwrap(),
+        [old.key_id(), new.key_id()].into_iter().collect()
+    );
+    assert!(
+        log.verify_chain_signed(&checkpoint_keys(&[&new, &old]))
+            .unwrap()
+            .ok
+    );
+    // Without the old key, its checkpoint is reported.
+    assert!(
+        !log.verify_chain_signed(&checkpoint_keys(&[&new]))
+            .unwrap()
+            .ok
+    );
+    let no_signer = SqliteAudit::open_in_memory().unwrap();
+    assert!(matches!(
+        no_signer.set_checkpoint_signer(new.detached_signer()),
+        Err(AuditError::NoCheckpointSigner)
+    ));
+    assert_eq!(no_signer.checkpoint_signer_kid(), None);
+}

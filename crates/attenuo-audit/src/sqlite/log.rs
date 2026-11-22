@@ -278,11 +278,23 @@ type AnchorHook = Arc<dyn Fn(&crate::checkpoint::Anchor) + Send + Sync>;
 /// transaction commits with `synchronous=FULL` whatever the store's durability, before the
 /// `on_created` hook sees the checkpoint (SR-50).
 pub(super) struct Checkpointing {
-    pub(super) signer: attenuo_token::DetachedSigner,
+    /// Swapped in whole by [`SqliteAudit::set_checkpoint_signer`]; each signing step reads it
+    /// once.
+    pub(super) signer: std::sync::RwLock<attenuo_token::DetachedSigner>,
     pub(super) every: u64,
     pub(super) on_created: Option<CheckpointHook>,
     /// Called once for every prune anchor this log signs, after its commit (synced).
     pub(super) on_anchor: Option<AnchorHook>,
+}
+
+impl Checkpointing {
+    /// The signer in force now (a cheap handle on its key).
+    pub(super) fn signer(&self) -> attenuo_token::DetachedSigner {
+        self.signer
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
 }
 
 /// Most appends committed in one transaction by the writer thread.
@@ -816,7 +828,7 @@ impl Inner {
                 if let Some(c) = self.checkpointing.as_ref().filter(|c| c.every > 0) {
                     if entry.seq.is_multiple_of(c.every) {
                         let cp = Checkpoint::sign(
-                            &c.signer,
+                            &c.signer(),
                             entry.seq,
                             &entry.entry_hash,
                             entry.record.at,
@@ -1270,12 +1282,63 @@ impl SqliteAudit {
     /// [`checkpoint_if_new`](Self::checkpoint_if_new) are asked for.
     pub fn with_checkpointing(mut self, signer: attenuo_token::DetachedSigner, every: u64) -> Self {
         self.inner_mut().checkpointing = Some(Checkpointing {
-            signer,
+            signer: std::sync::RwLock::new(signer),
             every,
             on_created: None,
             on_anchor: None,
         });
         self
+    }
+
+    /// Sign the checkpoints and anchors made from now on with `signer` instead of the one
+    /// given to [`with_checkpointing`](Self::with_checkpointing) (a key rotation). What is
+    /// already signed is kept as it is: each checkpoint and anchor names its own `kid`, so the
+    /// old ones verify as long as their key stays in the verifying set. A signing step that is
+    /// under way finishes with the key it started with. Returns the `kid` of the signer it
+    /// replaces.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::NoCheckpointSigner`] when [`with_checkpointing`](Self::with_checkpointing)
+    /// was not called.
+    pub fn set_checkpoint_signer(
+        &self,
+        signer: attenuo_token::DetachedSigner,
+    ) -> Result<String, AuditError> {
+        let c = self
+            .inner
+            .checkpointing
+            .as_ref()
+            .ok_or(AuditError::NoCheckpointSigner)?;
+        let mut current = c
+            .signer
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(std::mem::replace(&mut *current, signer).kid())
+    }
+
+    /// The `kid` of the key that signs checkpoints and anchors now; `None` without
+    /// [`with_checkpointing`](Self::with_checkpointing).
+    pub fn checkpoint_signer_kid(&self) -> Option<String> {
+        self.inner.checkpointing.as_ref().map(|c| c.signer().kid())
+    }
+
+    /// The `kid`s that signed a checkpoint or an anchor this log still holds (a checkpoint
+    /// pruned with its entries is not counted), in order. A key whose `kid` is listed must stay
+    /// in the verifying set (the JWKS) for `audit verify` to pass.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Poisoned`] when a writer panicked holding the log's lock, or
+    /// [`AuditError::Sqlite`] when the query fails.
+    pub fn signing_kids(&self) -> Result<std::collections::BTreeSet<String>, AuditError> {
+        let conn = self.read_conn()?;
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT kid FROM checkpoints WHERE {RETAINED_CHECKPOINT} \
+             UNION SELECT kid FROM audit_anchors"
+        ))?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
     /// Call `hook` once for every checkpoint this log creates (not for repeat requests that
@@ -1343,7 +1406,7 @@ impl SqliteAudit {
                     detail: "a stored checkpoint disagrees with the log at its seq".into(),
                 });
             }
-            let cp = Checkpoint::sign(&c.signer, seq, &hash, now)?;
+            let cp = Checkpoint::sign(&c.signer(), seq, &hash, now)?;
             insert_checkpoint(&tx, &cp)?;
             #[cfg(test)]
             self.inner.probe_commit(&tx, format!("checkpoint {seq}"));

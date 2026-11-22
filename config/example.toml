@@ -36,7 +36,8 @@ lease_interval_seconds = 300
 # logged and served at /.well-known/jwks.json. Omit to use an ephemeral key.
 private_key_pem_path = "data/issuer.pem"
 # Key rotation: keep retired keys (PEM, private or public) trusted for verification and in the
-# JWKS until their tokens expire. They never sign. See docs/guides/deploying.md.
+# JWKS until their tokens expire. They never sign. POST /admin/keys/reload (attenuo admin key
+# reload) re-reads these two keys and their files without a restart. See docs/guides/deploying.md.
 # previous_key_paths = ["data/issuer-old.pem"]
 
 [policy]

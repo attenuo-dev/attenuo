@@ -712,6 +712,7 @@ async fn revoked_lease_kills_pending_and_granted_approvals() {
     let pending = h.gated(&token, "alice/other").await;
     let chain = h
         .state
+        .keys()
         .verifier
         .verify(&token, OffsetDateTime::now_utc())
         .unwrap()
@@ -915,6 +916,7 @@ async fn operator_grant_on_the_admin_listener() {
     let g = h.gated(&token, "alice/site").await;
     let chain_id = h
         .state
+        .keys()
         .verifier
         .verify(&token, OffsetDateTime::now_utc())
         .unwrap()
@@ -1203,6 +1205,7 @@ impl Harness {
     fn run_of(&self, token: &str) -> (String, String) {
         let chain = self
             .state
+            .keys()
             .verifier
             .verify(token, OffsetDateTime::now_utc())
             .unwrap()
@@ -1261,7 +1264,7 @@ async fn approval_token_is_issued_with_the_grant_and_used_once() {
     assert_eq!(header.typ.as_deref(), Some("attenuo-approval+jwt"));
     assert_eq!(
         header.kid.as_deref(),
-        Some(h.state.issuer.key_id().as_str())
+        Some(h.state.keys().issuer.key_id().as_str())
     );
     let jwks: Value = h
         .client
@@ -1272,9 +1275,13 @@ async fn approval_token_is_issued_with_the_grant_and_used_once() {
         .json()
         .await
         .unwrap();
-    assert_eq!(jwks["keys"][0]["kid"], h.state.issuer.key_id().as_str());
+    assert_eq!(
+        jwks["keys"][0]["kid"],
+        h.state.keys().issuer.key_id().as_str()
+    );
     let claims = h
         .state
+        .keys()
         .verifier
         .verify_approval(approval_token, OffsetDateTime::now_utc())
         .unwrap();
@@ -1284,8 +1291,8 @@ async fn approval_token_is_issued_with_the_grant_and_used_once() {
     assert_eq!(claims.lease, lease);
     assert_eq!(claims.sub, "alice");
     assert_eq!(claims.by, "user");
-    assert_eq!(claims.iss, h.state.issuer.config().issuer);
-    assert_eq!(claims.aud, h.state.issuer.config().audience);
+    assert_eq!(claims.iss, h.state.keys().issuer.config().issuer);
+    assert_eq!(claims.aud, h.state.keys().issuer.config().audience);
     assert!(claims.cnf.is_none());
     let expires = OffsetDateTime::parse(
         &g.expires_at,
@@ -1407,6 +1414,7 @@ async fn approval_token_for_a_declined_approval_is_refused() {
     let now = OffsetDateTime::now_utc();
     let forged = h
         .state
+        .keys()
         .issuer
         .issue_approval(&attenuo_token::ApprovalGrant {
             approval_id: &g.approval_id,
@@ -1442,6 +1450,7 @@ async fn approval_token_of_a_sibling_hop_is_refused() {
     let (_, coder_lease) = h.run_of(&coder);
     let claims = h
         .state
+        .keys()
         .verifier
         .verify_approval(approval_token, OffsetDateTime::now_utc())
         .unwrap();
@@ -1478,6 +1487,7 @@ async fn approval_token_of_a_dpop_bound_hop_is_bound_to_its_key() {
     let approval_token = granted["approval_token"].as_str().unwrap();
     let claims = h
         .state
+        .keys()
         .verifier
         .verify_approval(approval_token, OffsetDateTime::now_utc())
         .unwrap();
@@ -1489,6 +1499,7 @@ async fn approval_token_of_a_dpop_bound_hop_is_bound_to_its_key() {
     let now = OffsetDateTime::now_utc();
     let mint = |jkt: Option<&str>| {
         h.state
+            .keys()
             .issuer
             .issue_approval(&attenuo_token::ApprovalGrant {
                 approval_id: &g.approval_id,

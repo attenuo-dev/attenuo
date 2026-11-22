@@ -26,6 +26,8 @@ The names reserved for the server's own audit records are refused at start: `att
 | `private_key_pem_path` | ephemeral key | Ed25519 PKCS#8 key. Created with mode 0600 on first start if missing. |
 | `previous_key_paths` | none | Retired keys (PEM) that stay trusted for verification and in the JWKS. They never sign. |
 
+`POST /admin/keys/reload` (`attenuo admin key reload`) re-reads these two keys from the config file and the key files they name, and swaps in the new signing key and verifying keys without a restart. The other keys of `[issuer]` take a restart. A reload is stricter than startup: it never generates a key, so `private_key_pem_path` must be set and the file must exist, and each key may be listed once. It refuses to drop the current signing key, or a key that signed the audit log, unless asked. See [Keys reload](http-api.md#keys-reload) and [Key rotation](../guides/deploying.md#key-rotation).
+
 ## `[policy]`
 
 | Key | Default | Meaning |

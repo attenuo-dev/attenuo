@@ -220,7 +220,7 @@ pub async fn evaluate_policies(
 
     let (chain, call, source, token_expired) = match token {
         Some(token) => {
-            let (v, expired) = verify_allowing_expiry(&state.verifier, &token, now)
+            let (v, expired) = verify_allowing_expiry(&state.keys().verifier, &token, now)
                 .map_err(|e| ApiError::bad_request("invalid_token", e.to_string()))?;
             super::authzen::attach_chain(&mut req, &v.chain)?;
             let (chain, call) = chain_and_call(&req)?;
@@ -230,7 +230,7 @@ pub async fn evaluate_policies(
         None => {
             let (chain, call) = chain_and_call(&req)?;
             chain
-                .validate_at(now, state.verifier.max_depth())
+                .validate_at(now, state.keys().verifier.max_depth())
                 .map_err(|e| ApiError::bad_request("invalid_chain", e.to_string()))?;
             (chain, call, CHAIN_SOURCE_ADMIN, false)
         }

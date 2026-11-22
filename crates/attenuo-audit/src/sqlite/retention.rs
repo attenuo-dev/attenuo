@@ -877,6 +877,9 @@ impl SqliteAudit {
             .ok_or(AuditError::NoCheckpointSigner)?;
         let mut conn = self.inner.conn.lock()?;
         let gate = self.inner.gate.hold();
+        // One key for the prune's two checkpoints and its anchor, even if the key is swapped
+        // meanwhile ([`SqliteAudit::set_checkpoint_signer`]).
+        let signer = c.signer();
         let now = limits.now;
         let done = with_full_sync(&mut conn, self.inner.relaxed_sync, |conn| {
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -930,7 +933,7 @@ impl SqliteAudit {
                     })
                 }
                 None => {
-                    let cp = Checkpoint::sign(&c.signer, head, &head_hash, now)?;
+                    let cp = Checkpoint::sign(&signer, head, &head_hash, now)?;
                     insert_checkpoint(&tx, &cp)?;
                     (cp, true)
                 }
@@ -956,7 +959,7 @@ impl SqliteAudit {
             self.fail_prune_at(3)?;
             // 4. The anchor, naming P and its hash.
             let anchor = Anchor::sign(
-                &c.signer,
+                &signer,
                 through,
                 &cp_b.head_hash,
                 prune_seq,
@@ -972,7 +975,7 @@ impl SqliteAudit {
             }
             self.fail_prune_at(4)?;
             // 5. The "after" checkpoint at P.
-            let after = Checkpoint::sign(&c.signer, prune_seq, &entry.entry_hash, now)?;
+            let after = Checkpoint::sign(&signer, prune_seq, &entry.entry_hash, now)?;
             insert_checkpoint(&tx, &after)?;
             self.fail_prune_at(5)?;
             // 6. The anchor row, deleting.

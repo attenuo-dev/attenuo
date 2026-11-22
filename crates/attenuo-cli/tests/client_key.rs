@@ -114,6 +114,7 @@ async fn a_generated_client_key_authenticates_exchanges() {
         let parent = r["access_token"].as_str().unwrap().to_owned();
         let child: Value = serde_json::from_str(&ok(&run(exchange(&parent, extra)).await)).unwrap();
         let child = state
+            .keys()
             .verifier
             .verify(
                 child["access_token"].as_str().unwrap(),
@@ -257,6 +258,7 @@ async fn an_exchange_with_a_client_assertion_survives_the_nonce_retry() {
             .arg(&dpop_key);
         let child: Value = serde_json::from_str(&ok(&run(c).await)).unwrap();
         let child = state
+            .keys()
             .verifier
             .verify(
                 child["access_token"].as_str().unwrap(),

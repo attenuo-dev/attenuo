@@ -99,6 +99,7 @@ fn build() -> Server {
         distinct: Some(ArgLimit::new("url", 1_000_000).derived(Derive::Host)),
     };
     let issued = state
+        .keys()
         .issuer
         .issue_root(
             OriginatingUser {
@@ -290,6 +291,7 @@ fn approval_token_for<'a>(state: &'a AppState, chain: &Value) -> impl Fn(&str) -
     move |id: &str| {
         let now = OffsetDateTime::now_utc();
         state
+            .keys()
             .issuer
             .issue_approval(&ApprovalGrant {
                 approval_id: id,

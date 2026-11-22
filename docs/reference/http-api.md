@@ -111,8 +111,8 @@ The table is generated from `attenuo_core::error_codes::ERROR_CODES`, the one pl
 | `client_auth_not_accepted` | 400 `invalid_request` |  |  | `[token] actor_auth` does not accept client credentials. |
 | `client_authentication_failed` | 401 `invalid_client` |  |  | The client id or secret is wrong, the client has no credential of the kind sent, or a client assertion is not signed by one of the client's keys (unknown client, unknown `kid`, a key of another algorithm, a bad signature: one answer). |
 | `client_id_mismatch` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The credential was issued to another client. |
-| `config_file_mismatch` | 422 |  |  | The reloaded config file's `[issuer]` or `[audit]` differs from the running config, so it may be another server's file; refused unless `allow_mismatch` is sent. The agents and peps in force are unchanged. |
-| `config_unreadable` | 500 `server_error` |  |  | The config file the server was started with cannot be read, so the operators, or the agents and peps, were not reloaded; the cause is in the server log only. |
+| `config_file_mismatch` | 422 |  |  | The reloaded config file's `[issuer]` (its key files aside) or `[audit]` differs from the running config, so it may be another server's file; refused unless `allow_mismatch` is sent. The agents and peps, or the keys, in force are unchanged. |
+| `config_unreadable` | 500 `server_error` |  |  | The config file the server was started with cannot be read, so the operators, the agents and peps, or the keys were not reloaded; the cause is in the server log only. |
 | `credential_audience_mismatch` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The ID token was not issued to the presenting agent: its `aud` or `azp` names another client. |
 | `credential_expired` | 400 `invalid_grant` |  |  | The hop-0 credential expires before the token could be issued. |
 | `credential_pop_mismatch` | 400 `invalid_grant` |  |  | The DPoP proof is by another key than the one the ID-JAG is bound to (`cnf.jkt`). |
@@ -147,6 +147,12 @@ The table is generated from `attenuo_core::error_codes::ERROR_CODES`, the one pl
 | `invalid_subject` | 400 `invalid_grant` |  |  | The user subject of the root token to mint is empty. |
 | `invalid_token` | 401 `unauthorized`, 400 | `-32001` (401) |  | The token is malformed, not issued here, or does not verify. |
 | `jwks_unavailable` | 503 `temporarily_unavailable`, 401 `invalid_token` |  |  | The issuer's keys cannot be fetched; retry later. |
+| `key_duplicate` | 422 |  |  | A keys reload: two of the key files hold the same key (the signing key listed in `previous_key_paths` too, or a retired key twice); the message names both files and the `kid`. The keys in force are unchanged. |
+| `key_file_invalid` | 422 |  |  | A keys reload: a key file holds no Ed25519 key of the kind wanted (a key of another type or curve, a public key as the signing key, no PEM block, a damaged one); the message names the file, never its content. The keys in force are unchanged. |
+| `key_file_unreadable` | 422 |  |  | A keys reload: a key file named in `[issuer]` cannot be read (missing, no permission, not text); the message names the file. The keys in force are unchanged. |
+| `keys_config_invalid` | 422 |  |  | A keys reload: the config file does not parse, or sets no `[issuer] private_key_pem_path` (a reload never generates a key). The keys in force are unchanged. |
+| `keys_reload_drops_audit_key` | 422 |  |  | A keys reload would leave out of the verifying keys a key that signed an audit checkpoint or anchor the log holds, or that signs them now, so `audit verify` would fail; refused unless `allow_drop_audit_key` is sent. The keys in force are unchanged. |
+| `keys_reload_drops_current` | 422 |  |  | A keys reload names a new signing key and leaves the current one out of `previous_key_paths`, so every token it signed would stop verifying at once; refused unless `allow_drop_current` is sent. The keys in force are unchanged. |
 | `label_error` |  | `-32003` (200) | yes | The call's result could not be recorded, so it is withheld. |
 | `lease_error` |  | `-32001` (401), `-32003` (200) | yes | The lease store could not be read (fail closed). |
 | `lease_expired` | 400 `invalid_grant` | `-32001` (401), `-32001` (200), `-32003` (200) | yes | A lease of the chain has expired (at `POST /token` and `POST /token/renew`, an ancestor lease of the token). |
@@ -186,7 +192,7 @@ The table is generated from `attenuo_core::error_codes::ERROR_CODES`, the one pl
 | `prune_not_at_checkpoint` | 409 |  |  | The requested boundary is not a signed checkpoint that matches the log. |
 | `prune_too_recent` | 409 |  |  | The entry at the requested boundary is younger than `[audit.retention] min_age_seconds`. |
 | `rate_limited` | 429 | `-32007` (429) |  | A rate limit is used up; retry after `Retry-After`. |
-| `reload_unavailable` | 409 |  |  | The policy, the admin operators, or the agents and peps cannot be reloaded in this configuration (no policy file; a server not started from a config file). |
+| `reload_unavailable` | 409 |  |  | The policy, the admin operators, the agents and peps, or the issuer keys cannot be reloaded in this configuration (no policy file; a server not started from a config file). |
 | `replay_cache_full` | 503 `temporarily_unavailable` |  |  | Too many single-use credentials are in flight; retry later. |
 | `replay_store_unavailable` | 503 `temporarily_unavailable` |  |  | The use of a single-use credential could not be recorded, so it is refused (fail closed); retry later. |
 | `replayed` | 400 `invalid_grant` |  |  | The credential or delegation was already used. |
@@ -496,7 +502,7 @@ Each route needs at least one role; a role includes the ones below it. The table
 | --- | --- |
 | `viewer` | `GET /admin/whoami`, `GET /admin/leases/{lease_id}`, `GET /admin/leases/{lease_id}/tree`, `GET /admin/audit`, `GET /admin/audit/verify`, `GET /admin/audit/entries/{seq}`, `GET /admin/audit/records/{id}`, `GET /admin/audit/checkpoints`, `GET /admin/audit/checkpoint` (it signs a checkpoint of the head when there is none, which records no new fact), `GET /admin/audit/export`, `GET /admin/policies`, `GET /admin/policies/check`, `POST /admin/policies/evaluate` (a dry run that writes nothing), `GET /admin/approvals`, `GET /admin/approvals/{id}` |
 | `operator` | `POST /admin/leases/{lease_id}/revoke`, `POST /admin/leases/revoke` (its `?preview=true` dry run included), `POST /admin/approvals/{id}` |
-| `admin` | `POST /admin/budgets/refund`, `POST /admin/policies/reload`, `POST /admin/operators/reload`, `POST /admin/agents/reload`, `POST /admin/root-token`, and the audit retention routes `GET /admin/audit/prune/plan`, `POST /admin/audit/prune` and `GET /admin/audit/anchors` |
+| `admin` | `POST /admin/budgets/refund`, `POST /admin/policies/reload`, `POST /admin/operators/reload`, `POST /admin/agents/reload`, `POST /admin/keys/reload`, `POST /admin/root-token`, and the audit retention routes `GET /admin/audit/prune/plan`, `POST /admin/audit/prune` and `GET /admin/audit/anchors` |
 
 `[admin] token` is the operator `admin` with role `admin`. The audit log records an admin action with `originating_subject` `urn:attenuo:admin` for `[admin] token`, as before operators existed, and `urn:attenuo:admin:<name>` for a named operator; an approval decided by an operator has that subject as `approver.subject` and as the approval token's `sub`.
 
@@ -522,6 +528,7 @@ Where they are served: on the main listener by default; with `[admin] listen` se
 | `POST /admin/policies/reload` | Re-read the policy file. On failure the old policy stays. |
 | `POST /admin/operators/reload` | Re-read `[[admin.operators]]`, and nothing else, from the config file the server was started with, and swap them in at once. See [Operators reload](#operators-reload). Also on the console listener with `[admin_ui] allow_write = true`. |
 | `POST /admin/agents/reload` | Re-read `[[agents]]` and `[[peps]]` from the config file the server was started with, check them as startup does, and swap both in at once. Tokens already issued are not revoked. Body `{}`, or `allow_empty` / `allow_mismatch`. See [Agents reload](#agents-reload). Also on the console listener with `[admin_ui] allow_write = true`. |
+| `POST /admin/keys/reload` | Re-read the key files named by `[issuer] private_key_pem_path` and `previous_key_paths` in the config file, and swap in the new signing key and verifying keys at once. Body `{}`, or `allow_drop_current` / `allow_drop_audit_key` / `allow_mismatch`. See [Keys reload](#keys-reload). Also on the console listener with `[admin_ui] allow_write = true`. |
 | `GET /admin/policies` | The policy set in force: file path, its `sha256` and `loaded_at` (startup or last successful reload), `policy_ids`, validation `warnings`, and `policies: [{id, text}]`. |
 | `GET /admin/policies/check` | Lint the policy file as it is on disk now against the running schema, with line and column for each issue, and say whether it differs from the loaded one. Loads nothing, audits nothing. 409 `check_unavailable` without `policy.policies_path`. |
 | `POST /admin/policies/evaluate` | Dry run: what the loaded policies decide for one call, given a token or a chain, and optionally the run-limit state to assume (`budget`). No lease check, no charge, no audit record, no decision metric. |
@@ -575,8 +582,8 @@ It answers:
 
 - `count` is the number of entries now in force. `added`, `removed` and `changed` are ids; `changed` means a different `secret_sha256` or `jwks`.
 - `sha256` is the SHA-256 (lowercase hex) of the list's canonical form: a JSON array with one `[id, secret_sha256, thumbprints]` array per entry, sorted by id, written compactly (no spaces). `secret_sha256` is the entry's digest in lowercase, or `null`; `thumbprints` is the sorted list of the RFC 7638 SHA-256 thumbprints (base64url) of the entry's `jwks` keys, `[]` without keys. It holds no secret and no key, and lets you show later which lists a reload put in force, by computing it from a copy of the file.
-- `restart_needed` names each other section of the file (`[server]`, `[[root_grants]]`, ...) whose values differ from the ones in force. They are not applied; a restart applies them. `[[admin.operators]]` is not compared: `POST /admin/operators/reload` reloads it. An empty list means the file matches the running config apart from the two lists.
-- `warnings` are the startup warnings the new lists raise, such as an `[[idps]]` entry with no `client_ids` entry for a new agent, or no agents at all, and one for each removed agent that can still get a new token another way: by name when `[token] require_actor_auth = false`, or with an actor token when an `[[actor_trust]]` entry can map a workload to its id. Changing either setting takes a restart. Ids in a warning are escaped, so a control character cannot forge a log line.
+- `restart_needed` names each other section of the file (`[server]`, `[[root_grants]]`, ...) whose values differ from the ones in force. They are not applied; a restart applies them. `[[admin.operators]]` and the key files of `[issuer]` (`private_key_pem_path`, `previous_key_paths`) are not compared: `POST /admin/operators/reload` and `POST /admin/keys/reload` reload them. An empty list means the file matches the running config apart from the two lists.
+- `warnings` are the startup warnings the new lists raise, such as an `[[idps]]` entry with no `client_ids` entry for a new agent, or no agents at all, and one for each removed agent that can still get a new token another way: by name when `[token] require_actor_auth = false`, or with an actor token when an `[[actor_trust]]` entry can map a workload to its id. Changing either setting takes a restart. One more warning says when the file's `[issuer] private_key_pem_path` or `previous_key_paths` differ from the key files in force: this reload does not apply them, a keys reload does. Ids in a warning are escaped, so a control character cannot forge a log line.
 - `restart_warnings` say that the file's own settings, which a restart would apply, would refuse these lists (for example `[authzen] allow_unsigned_chain = true` with no `[[peps]]`). The lists were checked against the settings in force and put in force anyway.
 - The `admin.agents.reload` audit record names the caller as `originating_subject` and has `{path, agents, peps, restart_needed}` as its arguments, the middle two as in the answer, `sha256` included. Like every record, it keeps the arguments only as their digest. A 422 refusal is recorded as a `deny` whose `reason` is the refusal's code; the 400 `invalid_request`, 409 `reload_unavailable` and 500 `config_unreadable` are not audited.
 
@@ -591,10 +598,68 @@ Refusals (on every one, both lists in force are unchanged):
 
 - 422 `agents_invalid`: the file does not parse as the server's config (not TOML, an unknown key, a wrong type), or a list breaks a startup rule (an empty or duplicate id, the reserved id `attenuo`, a `secret_sha256` that is not 64 hex characters, an entry with neither a secret nor keys, a `jwks` the server refuses, or no `[[peps]]` while `[authzen] allow_unsigned_chain = true`). `detail` is the message startup would give, followed by `; the agents and peps in force are unchanged`. When the rule is one in force that the file changes, the message adds `(a rule in force; the file changes it, which needs a restart)`. A TOML error names its line, and its key and table when it can, but never quotes the file or a value from it.
 - 422 `agents_reload_empties`: the file has no `[[agents]]` or no `[[peps]]` while the server has some in force, as an empty or cut-off file has. Checked first. Send `allow_empty` to empty them.
-- 422 `config_file_mismatch`: the file's `[issuer]` or `[audit]` differs from the running config, so it may be another server's file. Send `allow_mismatch` to reload its lists anyway; the two sections are still not applied.
+- 422 `config_file_mismatch`: the file's `[issuer]` (its key files aside) or `[audit]` differs from the running config, so it may be another server's file. Send `allow_mismatch` to reload its lists anyway; the two sections are still not applied.
 - 400 `invalid_request`: the body is not the JSON object above.
 - 409 `reload_unavailable`: the server was not started from a config file.
 - 500 `config_unreadable`: the file cannot be read; the cause is in the server log only.
+- 500 `server_error`: the file could not be compared with the config in force. This is not expected; nothing is applied, since the mismatch check could not be made.
+
+### Keys reload
+
+`POST /admin/keys/reload` (role `admin`) rotates the token signing key without a restart. It re-reads the config file the server was started with, as the agents reload does, and takes from it only `[issuer] private_key_pem_path` and `previous_key_paths`: the paths as the file on disk gives them now. An environment variable still wins over the file, as at startup: while `ATTENUO__ISSUER__PRIVATE_KEY_PEM_PATH` is set, editing that line in the file does nothing, and `warnings` says so. It reads those key files and puts the new signing key and the new set of verifying keys in force in one step. Reloads run one at a time.
+
+A reload reads key files more strictly than startup. It never generates a key, so the file must set `private_key_pem_path` and the file must exist. Each key file must be a regular file (a link to one is fine) of at most 64 KiB. Each key may be listed once: the signing key listed in `previous_key_paths` too, or one retired key in two files (a private and a public one), is refused.
+
+The body is empty, `{}`, or overrides of three refusals: `{"allow_drop_current": true}`, `{"allow_drop_audit_key": true}` and `{"allow_mismatch": true}`. An unknown field is a 400.
+
+It answers key ids (`kid`) only, never a key or a file's content:
+
+```json
+{
+  "signing_kid": "<new kid>",
+  "previous_signing_kid": "<old kid>",
+  "changed": true,
+  "verifying_kids": ["<new kid>", "<old kid>"],
+  "added": ["<new kid>"],
+  "removed": [],
+  "audit_signing_kid": "<new kid>",
+  "kept_until_restart": [],
+  "restart_needed": [],
+  "warnings": [],
+  "audit_id": "<uuid>"
+}
+```
+
+- `changed` is false when the file names the same keys as before. Nothing is swapped then.
+- `verifying_kids` is the set the JWKS now lists: the signing key first, then the retired keys in file order. `added` and `removed` compare it with the set before.
+- `audit_signing_kid` is the key that signs audit checkpoints and prune anchors from now on: the new signing key.
+- `kept_until_restart` names what stays keyed by the key the server started with, once the signing key is another one: `[token] dpop_nonce` (the DPoP nonces) and the subject digests of `[telemetry]` and `[logging] redact_subjects`, each only when it is on. A restart re-keys them.
+- `restart_needed` names each other section of the file whose values differ from the ones in force, as for the agents reload. They are not applied. The other keys of `[issuer]` (`issuer`, `audience`, `max_depth`, the lifetimes) are part of `[issuer]` here and are never changed by this reload.
+- `warnings` say what was dropped: tokens signed by each key in `removed`, or rooted under it (their `ou_kid` names it), no longer verify; and, when `allow_drop_audit_key` was needed, audit checkpoints and anchors of a dropped key no longer verify against the JWKS. One more warning says when an environment variable set a key path, so the file's line was not used.
+- The `admin.keys.reload` audit record has `{path, signing_kid, previous_signing_kid, changed, verifying_kids, added, removed, restart_needed}` as its arguments, kept as their digest. A 422 refusal is recorded as a `deny` whose `reason` is the refusal's code, with `path` and, for the two drop refusals, the kids involved. The 400, 409 and 500 are not audited.
+
+What follows the reload:
+
+- Every request takes one snapshot of the keys and uses it to the end. A token exchange verifies the parent, signs the child and reads it back with the same keys, even if a reload runs meanwhile.
+- New tokens, children of an exchange and approval tokens are signed with the new key and carry its `kid`. Tokens signed by a key in `verifying_kids` keep verifying, as long as the key their `ou_kid` names is there too, at `POST /token`, `POST /token/renew`, the MCP proxy, AuthZEN and the approval routes. The proxy's cache of verified tokens is tied to the keys that verified them, so it never answers for a key that was dropped. A child token keeps the `ou_kid` of its root (the key that signed the user block at the root). So dropping a retired key also ends the children signed by a kept key but rooted under the dropped one.
+- `GET /.well-known/jwks.json` lists `verifying_kids` at once.
+- Audit checkpoints and prune anchors signed from now on carry the new `kid`. Those signed before keep theirs and verify as long as their key stays in `previous_key_paths`. `GET /admin/audit/verify`, `attenuo audit verify --jwks` and the shipped envelopes of `[audit.sink]` all check by `kid`. The `keys_reload_drops_audit_key` check below only sees the checkpoints and anchors the live log still holds. Archives (`attenuo audit prune --archive`), exports and checkpoints already shipped to `[audit.sink]` can be signed by older keys it does not see. Save a copy of `GET /.well-known/jwks.json` with each archive or export, or keep the old public key in `previous_key_paths`, so they can still be checked.
+- Not reloaded: the DPoP nonce key and the subject digest key (see `kept_until_restart`). They are never published or checked by anyone else. Rekeying them on a reload would refuse every nonce already handed out and break the join of logs and traces by digest. After a key compromise, restart to re-key them too. The `[leases.notify]` and `[approvals.notify]` webhook signatures use their own secrets, not the issuer key.
+- With several replicas, each one reloads its own keys: send the request to each.
+
+Refusals (on every one, the keys in force are unchanged):
+
+- 422 `keys_config_invalid`: the file does not parse as the server's config, or it sets no `[issuer] private_key_pem_path`. A TOML error names its line but never quotes the file.
+- 422 `config_file_mismatch`: the file's `[issuer]` (its key files aside) or `[audit]` differs from the running config, so it may be another server's file. Send `allow_mismatch` to reload its keys anyway.
+- 422 `key_file_unreadable`: a key file cannot be read (missing, no permission, not UTF-8 text). The message names the file.
+- 422 `key_file_invalid`: a key file is not a regular file, is larger than 64 KiB, or holds no Ed25519 key of the kind wanted: a key of another type or curve, a public key as the signing key, an encrypted or OpenSSH key, a certificate, no PEM block, or a damaged one. The message names the file and the kind of fault, with the parser's reason when there is one (such as `invalid PEM base64`), never the content.
+- 422 `key_duplicate`: two files hold the same key. The message names both files and the `kid`.
+- 422 `keys_reload_drops_current`: the new signing key differs from the current one, and the current one is not in `previous_key_paths`. Every live token would stop verifying at once. List the current key file in `previous_key_paths`, or send `allow_drop_current` (for a key compromise).
+- 422 `keys_reload_drops_audit_key`: the new verifying keys leave out a key that signed an audit checkpoint or prune anchor the log still holds, or the key that signs them now. `audit verify` would then report them as signed by an unknown key. Keep its file in `previous_key_paths`, or send `allow_drop_audit_key`. Dropping the current key always needs both overrides: the current key is the one that signs audit checkpoints now.
+- 400 `invalid_request`: the body is not the JSON object above.
+- 409 `reload_unavailable`: the server was not started from a config file.
+- 500 `config_unreadable`: the config file cannot be read; the cause is in the server log only.
+- 500 `server_error`: the file could not be compared with the config in force. This is not expected; nothing is applied, since the mismatch check could not be made.
 
 ### Budget refund
 

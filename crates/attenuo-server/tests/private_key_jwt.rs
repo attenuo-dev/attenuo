@@ -324,6 +324,7 @@ async fn hop_0_with_a_client_assertion() {
     assert_eq!(status, StatusCode::OK, "{v}");
     let root = h
         .state
+        .keys()
         .verifier
         .verify(v["access_token"].as_str().unwrap(), now())
         .unwrap();
@@ -432,6 +433,7 @@ async fn exchange_with_a_client_assertion_and_a_rotated_key() {
         assert_eq!(status, StatusCode::OK, "{v}");
         let child = h
             .state
+            .keys()
             .verifier
             .verify(v["access_token"].as_str().unwrap(), now())
             .unwrap();
@@ -530,7 +532,7 @@ async fn exchange_with_a_client_assertion_and_a_rotated_key() {
 async fn a_pep_authenticates_to_authzen_with_a_client_assertion() {
     let h = Harness::start(|_| {}).await;
     let (root, _) = h.root().await;
-    let chain = h.state.verifier.verify(&root, now()).unwrap().chain;
+    let chain = h.state.keys().verifier.verify(&root, now()).unwrap().chain;
     let read = attenuo_core::ToolCall::new("github", "read_file", json!({"repo": "alice/site"}));
     let request = serde_json::to_value(attenuo_policy::authzen::to_request(&chain, &read)).unwrap();
     let with = |assertion: &str| {

@@ -5,6 +5,7 @@ pub mod approvals;
 pub mod authzen;
 pub mod dev_root;
 pub mod extract;
+pub mod keys;
 pub mod ops;
 pub mod page;
 pub mod policies;
@@ -67,21 +68,22 @@ pub(crate) fn no_store(headers: &mut HeaderMap) {
 
 /// Register the lease of a token this server just minted, bind it to the token's chain, and
 /// record the chain's originating user (`LeaseRegistry::record_subject`) so the lease can be
-/// revoked by user.
+/// revoked by user. `verifier` is that of the keys the token was signed with (the request's
+/// snapshot, [`AppState::keys`]), so a key reload meanwhile cannot make it fail.
 ///
 /// The lease expiry is [`AppState::initial_lease_expiry`]. The binding is the digest of the
 /// chain exactly as the signed token carries it (`LeaseRegistry::bind`), so an AuthZEN body chain
 /// can later be matched against what was issued (SR-08).
 pub(crate) fn register_issued(
     state: &AppState,
+    verifier: &attenuo_token::Verifier,
     token: &str,
     lease: &LeaseId,
     parent: Option<&LeaseId>,
     token_exp: OffsetDateTime,
     now: OffsetDateTime,
 ) -> Result<(), ApiError> {
-    let chain = state
-        .verifier
+    let chain = verifier
         .verify(token, now)
         .map_err(|e| ApiError::internal(format!("cannot re-verify an issued token: {e}")))?
         .chain;

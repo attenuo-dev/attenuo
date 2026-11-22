@@ -21,7 +21,6 @@ use attenuo_policy::{
     SessionLabels, UsageContext,
 };
 use attenuo_proxy::{otel_int, ApprovalTicket, CallContext, Stage};
-use attenuo_token::Verifier;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -111,7 +110,7 @@ pub struct Pipeline {
     approval_ttl: time::Duration,
     /// Checks presented approval tokens: the issuer's public keys, `iss` and `aud`. `None`
     /// refuses every presented token (`approval_invalid`).
-    approval_verifier: Option<Verifier>,
+    approval_verifier: Option<crate::issuer_keys::VerifierSource>,
     /// The lease store and the audit log are the same database file, so the synced append of
     /// a decision also makes its `sum` charge durable: the charge leaves its sync to the
     /// append (one `fsync` per call instead of a synced charge then an append, and under load
@@ -319,9 +318,13 @@ impl Pipeline {
     }
 
     /// Accept signed approval tokens that verify under `verifier` (the issuer's own verifier:
-    /// its public keys, `iss` and `aud`). Without this every presented token is refused.
-    pub fn with_approval_verifier(mut self, verifier: Verifier) -> Self {
-        self.approval_verifier = Some(verifier);
+    /// its public keys, `iss` and `aud`; or the server's [`crate::issuer_keys::SharedKeys`],
+    /// whose keys in force check each token). Without this every presented token is refused.
+    pub fn with_approval_verifier(
+        mut self,
+        verifier: impl Into<crate::issuer_keys::VerifierSource>,
+    ) -> Self {
+        self.approval_verifier = Some(verifier.into());
         self
     }
 
@@ -876,7 +879,8 @@ impl Pipeline {
         let verifier = self
             .approval_verifier
             .as_ref()
-            .ok_or("approval tokens are not accepted here (no issuer key to check them with)")?;
+            .ok_or("approval tokens are not accepted here (no issuer key to check them with)")?
+            .current();
         let claims = verifier
             .verify_approval(token, now)
             .map_err(|e| format!("approval token refused: {e}"))?;

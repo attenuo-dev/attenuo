@@ -916,6 +916,7 @@ async fn authzen_matches_proxy_decisions() {
     // Without a bearer the endpoint refuses by default, even for a genuine chain (SR-08).
     let chain = h
         .state
+        .keys()
         .verifier
         .verify(&child.token, time::OffsetDateTime::now_utc())
         .unwrap()
@@ -987,6 +988,7 @@ async fn unsigned_authzen_chains_need_a_pep_and_an_issued_chain() {
         .await;
     let chain = h
         .state
+        .keys()
         .verifier
         .verify(&child.token, time::OffsetDateTime::now_utc())
         .unwrap()
@@ -1127,6 +1129,7 @@ async fn unsigned_authzen_chains_can_search_actions_from_a_pep() {
         .await;
     let chain = h
         .state
+        .keys()
         .verifier
         .verify(&child.token, time::OffsetDateTime::now_utc())
         .unwrap()
@@ -2317,6 +2320,7 @@ async fn may_act_on_the_parent_limits_who_may_exchange_it() {
     let root = root["access_token"].as_str().unwrap();
     let claims = h
         .state
+        .keys()
         .verifier
         .verify(root, time::OffsetDateTime::now_utc())
         .unwrap()
@@ -2607,6 +2611,7 @@ async fn root_mint_with_an_empty_may_act_is_exchangeable_by_nobody() {
         let root = root["access_token"].as_str().unwrap();
         let claims = h
             .state
+            .keys()
             .verifier
             .verify(root, time::OffsetDateTime::now_utc())
             .unwrap()
@@ -3834,6 +3839,13 @@ async fn every_refusal_names_its_specific_reason_in_code() {
         Some("reload_unavailable"),
     )
     .await;
+    a.rest(
+        "admin: keys reload without a config file",
+        h.admin_post("/admin/keys/reload", json!({})).await,
+        StatusCode::CONFLICT,
+        Some("reload_unavailable"),
+    )
+    .await;
     // Named operators (one expired) and a config file to reload them from.
     let ops_dir = tempfile::tempdir().unwrap();
     let ops_path = ops_dir.path().join("attenuo.toml");
@@ -3903,6 +3915,18 @@ async fn every_refusal_names_its_specific_reason_in_code() {
             .unwrap(),
         StatusCode::UNPROCESSABLE_ENTITY,
         Some("agents_invalid"),
+    )
+    .await;
+    a.rest(
+        "admin: keys reload of a file that is not TOML",
+        h2.client
+            .post(h2.url("/admin/keys/reload"))
+            .bearer_auth("ada-token")
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Some("keys_config_invalid"),
     )
     .await;
     std::fs::write(&ops_path, op_entry("ada", "ada-token", "viewer", "")).unwrap();
@@ -4080,6 +4104,7 @@ async fn grant_and_body_chain_refusals_name_their_reason_in_code() {
     let root = h.mint_root("alice", "planner", &["github:read_file"]).await;
     let chain = h
         .state
+        .keys()
         .verifier
         .verify(&root.token, time::OffsetDateTime::now_utc())
         .unwrap()

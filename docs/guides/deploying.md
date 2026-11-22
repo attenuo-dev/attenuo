@@ -148,7 +148,7 @@ attenuo admin agent reload
 
 (role `admin`; `POST /admin/agents/reload`). The server re-reads both lists, checks them as it does at startup and puts them in force at once. Each request authenticates against one snapshot: the old lists or the new ones, never a mix. The answer lists the ids added, removed and changed, with a SHA-256 of each new list. The `admin.agents.reload` audit record names the operator who reloaded; of its arguments (the path, the ids, the list digests and `restart_needed`) it keeps only a digest, so keep the command's output, or the server log, if you need the ids later. A file that does not parse, or a list that breaks a startup rule, is refused with the startup message (`agents_invalid`), and nothing changes.
 
-Two more refusals guard against reloading the wrong file. A file that leaves `[[agents]]` or `[[peps]]` empty while the server has entries is refused (`agents_reload_empties`), because an empty or cut-off file reads that way; pass `--allow-empty` when you mean it. A file whose `[issuer]` or `[audit]` differs from the running config is refused (`config_file_mismatch`), because it may be another server's file; pass `--allow-mismatch` to reload its lists anyway. Warnings go to stderr and the command still exits 0, so read them.
+Two more refusals guard against reloading the wrong file. A file that leaves `[[agents]]` or `[[peps]]` empty while the server has entries is refused (`agents_reload_empties`), because an empty or cut-off file reads that way; pass `--allow-empty` when you mean it. A file whose `[issuer]` (its key files aside) or `[audit]` differs from the running config is refused (`config_file_mismatch`), because it may be another server's file; pass `--allow-mismatch` to reload its lists anyway. Warnings go to stderr and the command still exits 0, so read them.
 
 - **Add an agent:** add its entry and reload. It can authenticate with its next request. If it also needs a `[[root_grants]]` entry or a `client_ids` key in `[[idps]]`, those take a restart: the reload does not apply other sections, and its answer names each one that differs from the running config in `restart_needed`.
 - **Rotate a secret:** put the new `secret_sha256` in the entry and reload. The old secret is refused from the next request on, so update the agent first or right after. For a key (`jwks`), there is no gap: add the new key with a new `kid`, reload, move the agent to it, then remove the old key and reload again.
@@ -168,20 +168,46 @@ previous_key_paths   = ["/etc/attenuo/issuer-1.pem"]        # verify only
 
 To rotate:
 
-1. Generate the new key: `openssl genpkey -algorithm ed25519 -out /etc/attenuo/issuer-2.pem`, then `chmod 600` it. (The server also generates a key if the path does not exist.)
+1. Generate the new key: `openssl genpkey -algorithm ed25519 -out /etc/attenuo/issuer-2.pem`, then `chmod 600` it. (At startup the server also generates a key if the path does not exist. A reload does not.)
 2. Edit the config: point `private_key_pem_path` at the new file and add the old file to `previous_key_paths`. A previous key file may be the old private key or just its public key (`openssl pkey -in issuer-1.pem -pubout -out issuer-1.pub`); only the public half is used, so prefer the public file and archive the private one.
-3. Restart the server. It logs the new `kid` and how many previous keys it trusts. Check `/.well-known/jwks.json` lists both.
-4. Wait at least the longest token lifetime (`default_ttl_seconds`, or the largest `ttl_seconds` you allow) plus `clock_skew`. By then every token signed by the old key has expired.
-5. Remove `previous_key_paths`, restart, and destroy the old private key.
+3. Run `attenuo admin key reload` (role `admin`; `POST /admin/keys/reload`), or restart the server. The reload prints the old and new `kid` and the verifying keys. Check `/.well-known/jwks.json` lists both. With several replicas, or verifiers that cache the JWKS, use the two steps below instead.
+4. Wait at least the longest token lifetime (`default_ttl_seconds`, or the largest `ttl_seconds` you allow) plus `clock_skew`. By then every token signed by the old key has expired, and so has every child rooted under it.
+5. Keep the old public key in `previous_key_paths`. Then destroy the old private key. Keeping the public key costs nothing, and the old audit checkpoints and anchors keep verifying.
+
+You can remove the old key from `previous_key_paths` only when nothing you keep was signed by it: the reload refuses while the live audit log holds a checkpoint or anchor it signed (`keys_reload_drops_audit_key`). In practice that is after `attenuo audit prune` has removed every entry from its time and a newer anchor covers them. The check cannot see archives, exports or checkpoints already shipped by `[audit.sink]`. So before you remove a key, save a copy of `/.well-known/jwks.json` with each archive and export, or keep the key.
+
+### Rotation with replicas or cached JWKS
+
+Each replica reloads on its own, and a verifier that caches the JWKS may not see a new key at once. A token signed by the new key on one replica would then fail on another. Rotate in two reloads, neither of which needs an override:
+
+1. Publish the new key first, and keep signing with the old one. Set `previous_key_paths` to the new public key and leave `private_key_pem_path` as it is:
+
+   ```toml
+   [issuer]
+   private_key_pem_path = "/etc/attenuo/issuer-1.pem"          # still signs
+   previous_key_paths   = ["/etc/attenuo/issuer-2.pub"]        # published, verify only
+   ```
+
+   Reload every replica. The JWKS now lists both keys, old first. Wait until every cache has the new key (the JWKS cache time of your verifiers).
+2. Swap: point `private_key_pem_path` at the new key and set `previous_key_paths` to the old public key, as in step 2 above. Reload every replica. Tokens of either key verify everywhere.
+
+The reload swaps the signing key and the verifying keys in one step. Each request uses one set of keys from start to end. New tokens, approval tokens, audit checkpoints and prune anchors are signed with the new key. Only the two key settings are read from the file; other sections that differ are named in the answer as needing a restart. Two things keep the key the server started with until a restart, when they are on: the DPoP nonces (`[token] dpop_nonce`) and the subject digests of `[telemetry]` and `[logging] redact_subjects`. The reload names them under `kept_until_restart`.
+
+An environment variable wins over the file at a reload, as at startup. While `ATTENUO__ISSUER__PRIVATE_KEY_PEM_PATH` is set, editing `private_key_pem_path` in the file does nothing; the reload warns about it. Change the file the variable names, or unset it and restart.
+
+The reload refuses, and changes nothing, when a key file cannot be read, is not an Ed25519 key of the right kind, or holds the same key as another file. It also refuses two mistakes that are easy to make:
+
+- A new signing key without the current one in `previous_key_paths` (`keys_reload_drops_current`). That would make every live token fail at once. Pass `--allow-drop-current` only for a key compromise.
+- Verifying keys that leave out a key that signed an audit checkpoint or prune anchor the log still holds (`keys_reload_drops_audit_key`). That would make `audit verify` fail. Pass `--allow-drop-audit-key` only when you accept that. The current key always signs the audit log, so dropping it always needs both flags.
 
 Notes:
 
-- The originating-user block of a token (`ou_sig`) is signed once, at the root, and copied to every child. A child minted after the switch is signed by the new key but still carries an old-key `ou_sig` (its `ou_kid` names the old key), so the old key must stay trusted until the whole chain has expired. That is why step 4 waits for the longest chain, not for one token.
+- The originating-user block of a token (`ou_sig`) is signed once, at the root, and copied to every child. A child minted after the switch is signed by the new key but still carries an old-key `ou_sig` (its `ou_kid` names the old key), so the old key must stay trusted until the whole chain has expired. That is why step 4 waits for the longest chain, not for one token. Dropping the old key ends those children too, though the new key signed them.
 - A token whose `kid` is not in the trusted set is rejected with `invalid_grant`, whatever its signature. Tokens issued by a version before `kid` existed carry no `kid` and are tried against every trusted key.
 - Third parties that verify attenuo tokens offline should select the key by `kid` and refresh the JWKS when they see an unknown one. `attenuo token inspect --verify` fetches the JWKS and trusts every key in it.
-- In an emergency (key compromise), skip the overlap: replace the key and leave `previous_key_paths` empty. Every outstanding token stops verifying; agents re-run login and exchange.
+- In an emergency (key compromise), skip the overlap: replace the key, leave the old one out of `previous_key_paths`, and run `attenuo admin key reload --allow-drop-current --allow-drop-audit-key` (or restart). Every outstanding token stops verifying; agents re-run login and exchange. Then restart too, so the DPoP nonces and subject digests stop using the old key.
 
-The audit log does not depend on the issuer key. It is a plain SHA-256 hash chain, so rotation does not break `audit verify`. Old leases stay in the database but belong to tokens that no longer verify.
+The audit log's hash chain does not depend on the issuer key, but its signed checkpoints and prune anchors do. Each one names the `kid` that signed it, and `audit verify` checks it against the JWKS. So a rotation keeps `audit verify` passing as long as every key that signed a checkpoint or anchor you keep stays in `previous_key_paths`. A reload refuses to drop such a key unless asked. Old leases stay in the database but belong to tokens that no longer verify.
 
 The PEM is the most sensitive file attenuo owns. Whoever has it can mint any token for any user. Back it up apart from the database, with the same care as any signing key.
 

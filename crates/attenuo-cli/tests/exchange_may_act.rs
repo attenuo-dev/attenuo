@@ -80,6 +80,7 @@ async fn no_delegation_makes_a_token_nobody_may_exchange() {
     };
     let may_act = |token: &str| {
         state
+            .keys()
             .verifier
             .verify(token, time::OffsetDateTime::now_utc())
             .unwrap()

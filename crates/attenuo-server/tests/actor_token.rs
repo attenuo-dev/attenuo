@@ -306,6 +306,7 @@ async fn spiffe_jwt_svid_authenticates_the_actor() {
     assert_eq!(status, StatusCode::OK, "{v}");
     let child = h
         .state
+        .keys()
         .verifier
         .verify(
             v["access_token"].as_str().unwrap(),
@@ -635,6 +636,7 @@ async fn actor_tokens_are_single_use_and_cap_the_child_ttl() {
     assert_eq!(status, StatusCode::OK, "{v}");
     let child = h
         .state
+        .keys()
         .verifier
         .verify(
             v["access_token"].as_str().unwrap(),

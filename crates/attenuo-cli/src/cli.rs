@@ -341,6 +341,35 @@ pub(crate) enum AdminCmd {
     /// The agents and PEPs of the server's config (`[[agents]]`, `[[peps]]`).
     #[command(subcommand)]
     Agent(AgentCmd),
+    /// The server's token signing key and the retired keys that still verify (`[issuer]`).
+    #[command(subcommand)]
+    Key(AdminKeyCmd),
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum AdminKeyCmd {
+    /// Ask the server to re-read the key files named by `[issuer] private_key_pem_path` and
+    /// `previous_key_paths` in its config file and put them in force without a restart
+    /// (`POST /admin/keys/reload`, role `admin`). Prints the signing key id before and after,
+    /// the key ids added to and removed from the verifying set, and the sections of the file
+    /// that differ from the ones in force and need a restart; warnings go to stderr, and the
+    /// exit status stays 0. On a refusal (a key file that cannot be read or is not an Ed25519
+    /// key, a key listed twice, a reload that drops the current key or a key that signed the
+    /// audit log) the keys in force are unchanged. Only key ids are shown, never a key.
+    Reload {
+        /// Accept a new signing key while the current one is not in `previous_key_paths`:
+        /// every token it signed stops verifying at once (key compromise).
+        #[arg(long)]
+        allow_drop_current: bool,
+        /// Accept verifying keys that leave out a key that signed audit checkpoints or anchors
+        /// the log holds: `attenuo audit verify` then reports them as signed by an unknown key.
+        #[arg(long)]
+        allow_drop_audit_key: bool,
+        /// Accept a file whose `[issuer]` (its key files aside) or `[audit]` differs from the
+        /// running config. Refused without it, as such a file may be another server's.
+        #[arg(long)]
+        allow_mismatch: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]

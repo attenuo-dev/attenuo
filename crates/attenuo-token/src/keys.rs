@@ -152,7 +152,8 @@ fn pem_decode(pem: &str, label: &str) -> Result<Vec<u8>, TokenError> {
     let b64: String = body.chars().filter(|c| !c.is_whitespace()).collect();
     STANDARD
         .decode(b64)
-        .map_err(|e| TokenError::Key(format!("invalid PEM base64: {e}")))
+        // Not the decoder's message: it names the refused byte, which is part of the file.
+        .map_err(|_| TokenError::Key("invalid PEM base64".into()))
 }
 
 #[cfg(test)]
