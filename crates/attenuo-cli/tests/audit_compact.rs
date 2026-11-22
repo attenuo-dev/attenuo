@@ -163,7 +163,7 @@ async fn a_pruned_file_is_compacted_and_a_server_starts_on_it() {
         t.contains("dry run: ") && t.contains("was not changed"),
         "{t}"
     );
-    assert!(t.contains("would return:  about "), "{t}");
+    assert!(t.contains("would return:  at least "), "{t}");
     let out = compact(&db, true, &["--dry-run"]).await;
     assert_exit(&out, 0);
     let dry = json_of(&out);

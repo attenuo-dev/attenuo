@@ -2,8 +2,8 @@
 //! server stopped (`attenuo_audit::compact`, design note `docs/design/audit-retention.md`).
 //!
 //! Exit status: 0 when the file was compacted (or the dry run passed its checks), 2 when a
-//! check refused and the file was not changed, 3 when the file was compacted but the check
-//! after `VACUUM` found a difference (restore the backup), 1 on any other error.
+//! check refused and the file was not changed, 3 when `VACUUM` rewrote the file and the check
+//! after it found a difference or could not run (restore the backup), 1 on any other error.
 
 use std::path::Path;
 
@@ -58,6 +58,15 @@ pub(crate) fn audit_compact(db: &Path, dry_run: bool, json: bool) -> Result<Outc
             }
             Ok(Outcome::Exit(POST_CHECK_FAILED))
         }
+        Err(e @ CompactError::Unverified { .. }) => {
+            let detail = render::escape_controls(&e.to_string());
+            if json {
+                print_json(&json!({"ok": false, "unverified": detail}))?;
+            } else {
+                errln!("COMPACTED, BUT THE FILE COULD NOT BE CHECKED: {detail}");
+            }
+            Ok(Outcome::Exit(POST_CHECK_FAILED))
+        }
         Err(CompactError::Failed(e)) => {
             Err(anyhow::Error::new(e).context(format!("compacting {}", db.display())))
         }
@@ -72,6 +81,7 @@ fn report_json(r: &CompactReport) -> Value {
         "path": r.path,
         "size_before": r.disk_bytes_before,
         "size_after": r.disk_bytes_after,
+        "wal_bytes_before": r.wal_bytes_before,
         "bytes_returned": r.bytes_returned(),
         "free_bytes_before": b.free_bytes,
         "free_bytes_after": r.after.as_ref().map(|a| a.free_bytes),
@@ -96,7 +106,10 @@ fn report_lines(r: &CompactReport) -> Vec<String> {
             "size:          {} bytes, {} of them free pages",
             r.disk_bytes_before, b.free_bytes
         ));
-        lines.push(format!("would return:  about {} bytes", b.free_bytes));
+        lines.push(format!(
+            "would return:  at least {} bytes (the free pages), plus the -wal file's {} bytes",
+            b.free_bytes, r.wal_bytes_before
+        ));
     } else {
         lines.push(format!("compacted {}", r.path.display()));
         lines.push(format!("size before:   {} bytes", r.disk_bytes_before));

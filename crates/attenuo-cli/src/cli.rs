@@ -1238,12 +1238,14 @@ pub(crate) enum AuditCmd {
     /// SQLite's `VACUUM` on the file in place and truncates its write-ahead log, between
     /// checks. It refuses, and changes nothing, when the file is in use (the server's
     /// `<db>.lock` is held, or SQLite's exclusive lock cannot be taken within 2 seconds),
-    /// when `PRAGMA integrity_check` is not `ok`, when the schema version is not the one this
+    /// when it is not in WAL mode or is on a network filesystem, when `PRAGMA
+    /// integrity_check` is not `ok`, when the schema version is not the one this
     /// attenuo reads, when the hash chain does not verify, or when there is not enough free
     /// space for `VACUUM`'s copy. After `VACUUM` it checks that the integrity check, the schema
     /// version, the entry count, the chain head, the prune marker, the newest anchor and every
     /// row of every table are as before. It writes no audit entry. Exits 2 on a refusal, 3
-    /// when the check after `VACUUM` fails (restore the backup), 1 on an error.
+    /// when the check after `VACUUM` fails or cannot run (restore the backup), 1 on an
+    /// error.
     Compact {
         /// The database file: the server's `[audit] sqlite_path`.
         #[arg(long, value_name = "PATH")]
