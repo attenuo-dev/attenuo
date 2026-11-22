@@ -40,6 +40,9 @@ export async function verifyView(root) {
       ['Newest entry', newest ? time(newest.record.at) : null],
       ['Newest checkpoint', signed ? h('span', null, mono(`seq ${signed.seq}`), ' · ', time(signed.at)) : h('span', { class: 'muted' }, 'none yet')],
       ['Unsigned entries', mono(String((top.head || 0) - (signed ? signed.seq : 0)))],
+      ['First retained seq', Number.isInteger(top.first) && top.first > 1
+        ? h('span', null, mono(top.first), ' ', h('span', { class: 'muted small' }, `entries before it were pruned`))
+        : h('span', null, mono(1), ' ', h('span', { class: 'muted small' }, 'not pruned'))],
     ]));
     if (!cps.checkpoints.length) {
       replace(cpBox, empty('No checkpoints are stored yet. The server signs them on its schedule, or use Sign head now.'));
@@ -62,6 +65,8 @@ async function runVerify(btn, out) {
   try {
     const r = await api('/admin/audit/verify');
     const bad = r.bad_checkpoints || [];
+    const badAnchors = r.bad_anchors || [];
+    const pruned = r.pruned_through !== null && r.pruned_through !== undefined;
     replace(out,
       h('div', { class: 'row' },
         pill(r.ok ? 'chain ok' : 'chain broken', r.ok ? 'ok' : 'bad', true),
@@ -73,9 +78,18 @@ async function runVerify(btn, out) {
         ['Last signed seq', r.last_signed_seq !== null && r.last_signed_seq !== undefined ? mono(r.last_signed_seq) : h('span', { class: 'muted' }, 'none')],
         ['Unsigned tail', mono(r.unsigned_tail)],
         ['Bad checkpoints', bad.length ? h('span', null, pill(String(bad.length), 'bad')) : h('span', { class: 'muted' }, 'none')],
+        ['Pruned through', pruned ? mono(r.pruned_through) : h('span', { class: 'muted' }, 'not pruned')],
+        ['Anchors', mono(r.anchors ?? 0)],
+        ['Bad anchors', badAnchors.length ? h('span', null, pill(String(badAnchors.length), 'bad')) : h('span', { class: 'muted' }, 'none')],
       ]),
       bad.length
         ? table(['Checkpoint seq', 'Problem'], bad.map((b) => h('tr', null, h('td', { class: 'num' }, mono(b.seq)), h('td', { class: 'wrap' }, b.reason))), { short: true })
+        : null,
+      badAnchors.length
+        ? table(['Anchor through seq', 'Problem'], badAnchors.map((b) => h('tr', null, h('td', { class: 'num' }, mono(b.through_seq)), h('td', { class: 'wrap' }, b.reason))), { short: true })
+        : null,
+      pruned
+        ? h('p', { class: 'small muted' }, `Entries counts the retained entries only. The walk started at the prune anchor through seq ${r.pruned_through}, whose signature was checked; the pruned entries are in the archives.`)
         : null,
       r.unsigned_tail > 0
         ? h('p', { class: 'callout warn' }, `${r.unsigned_tail} newest entr${r.unsigned_tail === 1 ? 'y is' : 'ies are'} not covered by a signature yet.`)

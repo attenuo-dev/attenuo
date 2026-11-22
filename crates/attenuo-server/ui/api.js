@@ -64,13 +64,15 @@ export function needsRole(btn, min) {
 
 /**
  * An error answer from the admin API: status, the API's stable `code` (its `error` for a server
- * that sends no `code`) and its human-readable message.
+ * that sends no `code`), its human-readable message, and the answer's JSON object (`body`, or
+ * null), for the codes that carry more members (a 410 `audit_pruned` names the boundary).
  */
 export class ApiError extends Error {
-  constructor(status, code, message) {
+  constructor(status, code, message, body = null) {
     super(message);
     this.status = status;
     this.code = code;
+    this.body = body;
   }
 }
 
@@ -83,9 +85,11 @@ function headers(extra = {}) {
 async function errorFrom(resp) {
   let code = `http_${resp.status}`;
   let message = resp.statusText || `HTTP ${resp.status}`;
+  let obj = null;
   try {
     const body = await resp.json();
     if (body && typeof body === 'object') {
+      obj = body;
       // `code` is the stable machine code; `detail` is text for people. `error_description`
       // is a deprecated copy of the code, read only from a server that sends neither.
       code = body.code || body.error_description || body.error || code;
@@ -94,7 +98,7 @@ async function errorFrom(resp) {
   } catch {
     // Not JSON: keep the status text.
   }
-  return new ApiError(resp.status, code, message);
+  return new ApiError(resp.status, code, message, obj);
 }
 
 /**

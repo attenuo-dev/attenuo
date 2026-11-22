@@ -29,17 +29,18 @@ async function kvValue(scope, label) {
   return scope.locator('dl.kv dt', { hasText: label }).first().locator('xpath=following-sibling::dd[1]').innerText();
 }
 
-/** In both themes: contrast, no sideways scroll, a screenshot. */
-async function bothThemes(name) {
+/** In both themes: contrast, no sideways scroll, a screenshot. `on` is the main page unless
+ * given. */
+async function bothThemes(name, on = c) {
   const colours = {};
   for (const theme of THEMES) {
-    await c.setTheme(theme);
-    colours[theme] = await c.bodyColours();
-    const low = await c.lowContrast(4.5);
+    await on.setTheme(theme);
+    colours[theme] = await on.bodyColours();
+    const low = await on.lowContrast(4.5);
     assert.deepEqual(low, [], `${name}, ${theme} theme: text below 4.5:1 contrast`);
-    const overflow = await c.page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
+    const overflow = await on.page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
     assert.ok(overflow <= 0, `${name}, ${theme} theme: the page scrolls sideways by ${overflow}px`);
-    await c.screenshot(E.shots, `${name}-${theme}`);
+    await on.screenshot(E.shots, `${name}-${theme}`);
   }
   assert.notEqual(colours.dark.bg, colours.light.bg, `${name}: the theme toggle did not change the background`);
   assert.notEqual(colours.dark.fg, colours.light.fg, `${name}: the theme toggle did not change the text colour`);
@@ -115,6 +116,7 @@ test('audit explorer lists every entry', async () => {
     assert.ok(await c.page.locator('#main td span.mono', { hasText: new RegExp(`^${reason}$`) }).count() > 0, `a ${reason} row`);
   }
   assert.match(await c.page.locator('.pager .muted').innerText(), new RegExp(`head ${head}`));
+  assert.equal(await c.page.locator('#audit-pruned').count(), 0, 'a log never pruned shows no pruned line');
   await bothThemes('audit');
 });
 
@@ -632,6 +634,10 @@ test('verify panel: chain ok, then sign a checkpoint of the head', async () => {
   assert.equal(await out.locator('.pill.big').textContent(), 'chain ok');
   assert.equal(await kvValue(out, 'Entries'), String(head));
   assert.equal(await kvValue(out, 'First bad seq'), 'none');
+  assert.equal(await kvValue(out, 'Pruned through'), 'not pruned');
+  assert.equal(await kvValue(out, 'Anchors'), '0');
+  assert.equal(await kvValue(out, 'Bad anchors'), 'none');
+  assert.match(await kvValue(headPanel, 'First retained seq'), /^1 not pruned$/);
 
   await c.page.getByRole('button', { name: 'Sign head now…' }).click();
   await c.page.locator('dialog[open]').getByRole('button', { name: 'Sign checkpoint' }).click();
@@ -816,6 +822,109 @@ test('audit explorer pages back and forward through the cursor without gaps', as
   await topIs(head);
   assert.deepEqual(await seqs(), newest);
   await bothThemes('audit-paged');
+});
+
+// The smoke server cannot prune: `[audit.retention] prune = "manual"` needs `min_age_seconds`
+// at or above the run-state retentions, so no entry is old enough during a run, and start-up
+// refuses a smaller value. This test answers the console's reads in the browser instead (a
+// Playwright route), with a log of seqs 21..30 whose prune record is seq 21, so the pruned
+// views run in the real console code. The entries themselves are real ones, renumbered.
+test('a pruned log, from stubbed answers: the explorer line, a pruned seq, the prune record and the verify panel', async () => {
+  const real = (await admin('/admin/audit?order=desc&limit=10')).entries;
+  const adminRec = (await admin('/admin/audit?kind=admin&order=desc&limit=1')).entries[0];
+  assert.ok(real.length === 10 && adminRec, 'the log holds ten entries and an admin record');
+  const view = await admin(`/admin/audit/entries/${adminRec.seq}`);
+  const FIRST = 21;
+  const HEAD = 30;
+  const prune = { ...adminRec, seq: FIRST, record: { ...adminRec.record, kind: 'admin', tool: 'admin.audit.prune', reason: 'admin_action' } };
+  const log = real.map((e, i) => (HEAD - i === FIRST ? prune : { ...e, seq: HEAD - i }));
+  const page = (entries) => ({ entries, next_cursor: null, head: HEAD, first: FIRST });
+  const json = (route, status, body) => route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(body) });
+
+  const probe = await Console.open(E.ui);
+  try {
+    await probe.page.route('**/admin/audit**', (route) => {
+      const url = new URL(route.request().url());
+      const q = url.searchParams;
+      if (url.pathname === '/admin/audit') {
+        if (q.get('tool') === 'admin.audit.prune') return json(route, 200, page(q.get('kind') === 'admin' ? [prune] : []));
+        const lo = Number(q.get('from') || FIRST);
+        const hi = Number(q.get('to') || HEAD);
+        const limit = Number(q.get('limit') || 100);
+        const inRange = log.filter((e) => e.seq >= lo && e.seq <= hi);
+        const ordered = q.get('order') === 'desc' ? inRange : inRange.slice().reverse();
+        return json(route, 200, page(ordered.slice(0, limit)));
+      }
+      const m = url.pathname.match(/^\/admin\/audit\/entries\/(\d+)$/);
+      if (m && Number(m[1]) < FIRST) {
+        return json(route, 410, { error: 'audit_pruned', code: 'audit_pruned', detail: `seq ${m[1]} was pruned`, pruned_through: FIRST - 1, prune_seq: FIRST, first: FIRST });
+      }
+      if (m && Number(m[1]) === FIRST) return json(route, 200, { ...view, entry: prune, policy_reloaded_after: null });
+      if (url.pathname === '/admin/audit/verify') {
+        return json(route, 200, {
+          ok: false, entries: 10, first_bad_seq: null, checkpoints: 1, last_signed_seq: HEAD, unsigned_tail: 0,
+          bad_checkpoints: [], pruned_through: FIRST - 1, anchors: 1,
+          bad_anchors: [{ through_seq: FIRST - 1, reason: 'the anchor signature does not verify' }],
+        });
+      }
+      return route.continue();
+    });
+    await probe.login(E.adminToken);
+
+    // The explorer: one quiet line naming the boundary and linking the prune record, and
+    // paging back stops at the first retained entry.
+    await probe.go('#/audit');
+    const line = probe.page.locator('#audit-pruned');
+    await line.waitFor();
+    assert.equal(await line.innerText(), 'Entries before seq 21 were pruned by the prune recorded at seq 21. Their archive is kept outside the server.');
+    assert.equal(await line.locator('a').getAttribute('href'), '#/entry/21');
+    const seqs = (await probe.page.locator('#main table tbody tr td:first-child').allInnerTexts()).map(Number);
+    assert.deepEqual(seqs, [30, 29, 28, 27, 26, 25, 24, 23, 22, 21]);
+    assert.equal(await probe.page.getByRole('button', { name: 'Older', exact: true }).isDisabled(), true, 'nothing older than the first retained entry');
+    await bothThemes('audit-pruned', probe);
+
+    // A pruned seq: its own message, with the boundary and a link to the prune record.
+    await probe.go('#/entry/5');
+    const gone = probe.page.locator('section.panel', { has: probe.page.locator('h1', { hasText: 'was pruned' }) });
+    await gone.waitFor();
+    assert.match(await gone.locator('h1').innerText(), /^Entry #5 was pruned$/);
+    assert.match(await gone.locator('.callout.warn').innerText(), /This entry was pruned: the server deleted the start of the audit log through seq 20, after it was archived\./);
+    assert.equal(await kvValue(gone, 'Pruned through'), '20');
+    assert.equal(await kvValue(gone, 'First retained seq'), 'seq 21');
+    await bothThemes('entry-pruned', probe);
+
+    // The prune record reads as a prune, and names the boundary of the newest prune.
+    await gone.locator('dl.kv a', { hasText: 'seq 21' }).first().click();
+    const verdictPanel = probe.page.locator('section.panel', { has: probe.page.locator('#entry-title') });
+    await verdictPanel.waitFor();
+    assert.match(await verdictPanel.locator('.explain').innerText(), /^A prune of the start of the audit log, made with the admin token/);
+    await verdictPanel.locator('dd', { hasText: 'the newest prune' }).waitFor();
+    assert.equal(await kvValue(verdictPanel, 'Prune'), 'the newest prune: entries before seq 21 were pruned (boundary seq 20)');
+    await bothThemes('entry-prune-record', probe);
+
+    // The verify panel: the boundary, the anchors, and a bad anchor as visible as a bad
+    // checkpoint.
+    await probe.go('#/verify');
+    await probe.page.getByRole('button', { name: 'Verify now' }).click();
+    const out = probe.page.locator('section.panel', { has: probe.page.locator('h2', { hasText: 'Verification' }) });
+    await out.locator('.pill.big').waitFor();
+    assert.equal(await out.locator('.pill.big').textContent(), 'chain broken');
+    assert.equal(await kvValue(out, 'Pruned through'), '20');
+    assert.equal(await kvValue(out, 'Anchors'), '1');
+    assert.equal(await out.locator('dl.kv dt', { hasText: 'Bad anchors' }).locator('xpath=following-sibling::dd[1]').locator('.pill.bad').innerText(), '1');
+    assert.deepEqual(await out.locator('table tbody tr td').allInnerTexts(), ['20', 'the anchor signature does not verify']);
+    const head = probe.page.locator('section.panel', { has: probe.page.locator('h2', { hasText: 'Log head' }) });
+    assert.match(await kvValue(head, 'First retained seq'), /^21 entries before it were pruned$/);
+    await bothThemes('verify-pruned', probe);
+
+    // The only problems are the stubbed 410 of the pruned seq (and Chromium's console line
+    // about it).
+    const problems = await probe.allProblems();
+    assert.ok(problems.some((p) => /^HTTP 410: GET .*\/admin\/audit\/entries\/5$/.test(p)), problems.join('\n'));
+    assert.deepEqual(problems.filter((p) => !/\b410\b/.test(p)), []);
+  } finally {
+    await probe.close();
+  }
 });
 
 test('the CSP violation recorder works (a deliberate inline style is reported)', async () => {

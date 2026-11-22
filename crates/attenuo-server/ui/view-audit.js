@@ -85,7 +85,7 @@ async function fetchOlder(filters, start) {
     cursor = page.next_cursor;
   }
   const older = last.next_cursor === null ? null : { to: start.to, cursor: last.next_cursor };
-  return { entries, older, head: first.head };
+  return { entries, older, head: first.head, first: retainedFrom(first) };
 }
 
 /**
@@ -104,13 +104,55 @@ async function fetchNewer(filters, start, limit = PAGE) {
     cursor = page.next_cursor;
   }
   const newer = last.next_cursor === null ? null : { from: start.from, cursor: last.next_cursor };
-  return { entries, newer, head: last.head };
+  return { entries, newer, head: last.head, first: retainedFrom(last) };
 }
 
-/** How to read below the lowest of these (newest-first) entries: `to` just under it. */
-function olderThan(entries) {
+/** The first retained seq of a page: 1, or one above a prune's boundary. */
+function retainedFrom(page) {
+  return Number.isInteger(page.first) && page.first > 1 ? page.first : 1;
+}
+
+/**
+ * How to read below the lowest of these (newest-first) entries: `to` just under it, or null
+ * when the lowest is the first retained entry (seq 1, or the first one after a prune).
+ */
+function olderThan(entries, first) {
   const lowest = entries[entries.length - 1].seq;
-  return lowest > 1 ? { to: lowest - 1 } : null;
+  return lowest > first ? { to: lowest - 1 } : null;
+}
+
+/**
+ * The seq of the newest prune's own record (an `admin` record of tool `admin.audit.prune`),
+ * or null when none is found. It is the newest such record in the log: a prune record is
+ * always above its boundary, and only a prune writes one. Read with `GET /admin/audit`, which
+ * the viewer role may read; the anchors themselves are not served on the console listener.
+ */
+export async function newestPruneSeq() {
+  let cursor;
+  for (let hop = 0; hop < MAX_HOPS; hop++) {
+    const page = await api(`/admin/audit${qs({ kind: 'admin', tool: PRUNE_TOOL, order: 'desc', limit: 1, cursor })}`);
+    if (page.entries.length) return page.entries[0].seq;
+    if (page.next_cursor === null) return null;
+    cursor = page.next_cursor;
+  }
+  return null;
+}
+
+/** The tool of a prune's own audit record. */
+export const PRUNE_TOOL = 'admin.audit.prune';
+
+/**
+ * The quiet line above the table of a pruned log: "Entries before seq N were pruned", with a
+ * link to the prune's record when it is found.
+ */
+function prunedLine(first, pruneSeq) {
+  if (first <= 1) return null;
+  return h('p', { class: 'small muted', id: 'audit-pruned' },
+    `Entries before seq ${first} were pruned`,
+    pruneSeq !== null && pruneSeq !== undefined
+      ? [' by the ', link(['entry', pruneSeq], `prune recorded at seq ${pruneSeq}`), '.']
+      : '.',
+    ' Their archive is kept outside the server.');
 }
 
 // ---- rendering ----------------------------------------------------------------------------
@@ -193,12 +235,15 @@ export async function auditView(root, params) {
     older: null, // how fetchOlder reads the entries below the page; null at seq 1
     newer: null, // how fetchNewer reads the entries above it; null when it reaches the head
     head: 0,
+    first: 1, // the first retained seq: 1, or one above a prune's boundary
+    pruneSeq: undefined, // the newest prune's record, looked up once the log shows a prune
     timer: null,
     polling: false,
     fresh: new Set(),
   };
 
   const tableBox = h('div', null, loading());
+  const prunedBox = h('div');
   const info = h('span', { class: 'muted small' });
   const olderBtn = h('button', { type: 'button', on: { click: () => load('older') } }, 'Older');
   const newerBtn = h('button', { type: 'button', on: { click: () => load('newer') } }, 'Newer');
@@ -213,6 +258,7 @@ export async function auditView(root, params) {
       h('summary', null, active ? `Filters (${active} active)` : 'Filters'),
       filterForm(filters)),
     h('div', { class: 'pager' }, newestBtn, newerBtn, olderBtn, followBtn, h('span', { class: 'spacer' }), info, exportBtn),
+    prunedBox,
     tableBox,
   ]);
 
@@ -221,6 +267,7 @@ export async function auditView(root, params) {
   }
 
   function render() {
+    replace(prunedBox, prunedLine(state.first, state.pruneSeq));
     olderBtn.disabled = state.older === null;
     newerBtn.disabled = state.newer === null;
     newestBtn.disabled = state.newer === null;
@@ -247,8 +294,9 @@ export async function auditView(root, params) {
         if (res.entries.length === 0) return load('newest');
         state.entries = res.entries.slice().reverse();
         state.head = res.head;
+        state.first = res.first;
         state.newer = res.newer && { from: state.entries[0].seq + 1 };
-        state.older = olderThan(state.entries);
+        state.older = olderThan(state.entries, state.first);
       } else {
         // The entries above the page being left are what "Newer" brings back.
         const shownLowest = state.entries.length ? state.entries[state.entries.length - 1].seq : null;
@@ -256,13 +304,28 @@ export async function auditView(root, params) {
         state.entries = res.entries;
         state.older = res.older;
         state.head = res.head;
+        state.first = res.first;
         if (which !== 'older') state.newer = null;
         else if (shownLowest !== null) state.newer = { from: shownLowest };
       }
       state.fresh.clear();
+      await findPrune();
       render();
     } catch (e) {
       replace(tableBox, empty(`Could not load the log: ${e.message}`));
+      if (e.status === 401) throw e;
+    }
+  }
+
+  // Looks up the prune's record once the log shows a prune, and again when `first` moves (a
+  // newer prune). A failed lookup only leaves the line without its link.
+  async function findPrune() {
+    if (state.first <= 1 || state.pruneFirst === state.first) return;
+    state.pruneFirst = state.first;
+    try {
+      state.pruneSeq = await newestPruneSeq();
+    } catch (e) {
+      state.pruneSeq = null;
       if (e.status === 401) throw e;
     }
   }
@@ -297,11 +360,13 @@ export async function auditView(root, params) {
       if (top.head > state.head) {
         const res = await fetchNewer(filters, { from: state.head + 1 }, FOLLOW_CAP);
         state.head = res.head;
-        if (res.entries.length) {
-          for (const e of res.entries) state.fresh.add(e.seq);
-          state.entries = res.entries.slice().reverse().concat(state.entries).slice(0, FOLLOW_CAP);
-          state.older = olderThan(state.entries);
-        }
+        // A prune that committed while following: drop the rows it removed.
+        state.first = res.first;
+        state.entries = res.entries.slice().reverse().concat(state.entries)
+          .filter((e) => e.seq >= state.first).slice(0, FOLLOW_CAP);
+        for (const e of res.entries) state.fresh.add(e.seq);
+        state.older = state.entries.length ? olderThan(state.entries, state.first) : null;
+        await findPrune();
         render();
       }
     } catch {

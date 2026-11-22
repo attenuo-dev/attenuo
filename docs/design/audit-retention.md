@@ -309,5 +309,13 @@ After the review of phase 1b:
 - The shipped-anchor cross-check fails an export that holds the boundary of a shipped prune whose record is past the export's end (taken before that prune, or a rewound log), and the count of shipped checkpoints above the export's end is printed as `newer than this export`. Shipped objects joined without newlines (S3 objects concatenated) parse.
 - `testdata/audit-retention/` holds a small pruned log written by the Rust code with a fixed key (two archives, the retained export, the shipped file and the JWKS), verified by the Rust, Python and TypeScript suites. `write_golden_files` in `crates/attenuo-audit/tests/retention.rs` (ignored by default) writes it again.
 
-Not built yet: the console, `prune = "auto"`, `VACUUM`, and the SDKs' check of shipped anchors.
+The admin console (read-only; it has no prune button, and the retention routes stay off its listener):
+
+- The audit explorer reads `first` from `GET /admin/audit`. When it is above 1, one line above the table says `Entries before seq N were pruned`, with a link to the prune's record, the newest `admin` record of tool `admin.audit.prune` (found with the same route and its `kind` and `tool` filters; a prune record is always above its boundary, and only a prune writes one). Paging back stops at the first retained entry, and **Follow** drops the rows a prune removes while it runs.
+- The entry page answers a pruned seq (410 `audit_pruned`) with `Entry #N was pruned`, the boundary (`pruned_through`), a link to the prune record (`prune_seq`) and the first retained seq. A prune record explains itself as a prune and, for the newest prune, names its boundary; an older one says its boundary is in its signed anchor.
+- The Verify page shows the first retained seq next to the head, and the verify report's `pruned_through`, `anchors` and `bad_anchors`; a bad anchor gets the same red count and table as a bad checkpoint.
+- Nothing new is mounted on the console listener: everything comes from `GET /admin/audit`, `GET /admin/audit/entries/{seq}` and `GET /admin/audit/verify`, which the viewer role already reads. `GET /admin/audit/anchors` stays admin only and off the console.
+- The smoke server cannot make a real prune (`min_age_seconds` must be at least the run-state retentions), so the console test answers the console's reads in the browser with a stubbed pruned log; the real server's answers are covered by the Rust tests of the routes.
+
+Not built yet: `prune = "auto"`, `VACUUM`, and the SDKs' check of shipped anchors. The console showing each anchor (`GET /admin/audit/anchors`) is not built either: it would need that route on the console listener.
 
