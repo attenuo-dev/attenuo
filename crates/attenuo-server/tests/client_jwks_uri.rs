@@ -2,10 +2,12 @@
 //! URL (ADR-0017, update of 2026-11-22). Covers an agent at an exchange and at hop 0 and a
 //! PEP at AuthZEN with keys from the URL; key rotation (a new key through the unknown-`kid`
 //! refetch, a removed key refused after the TTL); a URL that is down or hangs (refused, and
-//! other clients go on); the refetch limit under a flood of made-up `kid`s; no redirects; key
-//! sets that are too large, not JSON or hold a private key; `ca_pem_path`; `jwks` and
-//! `jwks_url` together refused at startup and at a reload; a reload that moves the URL; the
-//! SR-110 comparison of refusals; and single use of an assertion.
+//! other clients go on, with one WARN line per failed fetch); the refetch limit under a flood
+//! of made-up `kid`s, and a failed refetch that keeps the keys in force; no redirects; key
+//! sets that are too large, not JSON or hold a private key, and keys for other uses that are
+//! skipped; `ca_pem_path`; `jwks` and `jwks_url` together refused at startup and at a reload;
+//! a reload that moves the URL; no PEP key fetch before the AuthZEN bearer check; the SR-110
+//! comparison of refusals; and single use of an assertion.
 //!
 //! The mock key server counts the requests of each path, so the tests can say when the
 //! server fetched and when it did not.
@@ -543,8 +545,9 @@ async fn a_replayed_assertion_is_refused() {
     );
 }
 
-/// Rotation without a config change: a key added to the set works at once (an unknown `kid`
-/// fetches the set again), and a key removed from it stops working once the TTL has passed.
+/// Rotation without a config change: a key added to the set works with the next request (an
+/// unknown `kid` fetches the set again, here with the refetch allowance unused; at most 30
+/// seconds later otherwise), and a key removed from it stops working once the TTL has passed.
 #[tokio::test]
 async fn keys_rotate_at_the_url_without_a_config_change() {
     let keys = KeyServer::start().await;
@@ -681,10 +684,19 @@ async fn a_client_whose_keys_cannot_be_fetched_is_refused_and_others_go_on() {
     assert!(!lines.is_empty(), "no WARN line for the failed fetch");
     assert!(lines[0].contains("HTTP 500"), "{}", lines[0]);
     assert!(fetch_failures(&closed)[0].contains("error sending request"));
-    // Within the failure backoff the next assertion is refused without a fetch.
-    let got = h.exchange_as("down", &coder.assertion("down")).await;
-    assert!(is(&got, NOT_AUTHENTICATED), "{got:?}");
+    // Within the failure backoff the next assertions are refused without a fetch.
+    for _ in 0..5 {
+        let got = h.exchange_as("down", &coder.assertion("down")).await;
+        assert!(is(&got, NOT_AUTHENTICATED), "{got:?}");
+    }
     assert_eq!(keys.hits("down"), 1);
+    // One WARN line per failed fetch, not one per refused request.
+    assert_eq!(
+        fetch_failures(&keys.url("down")).len(),
+        keys.hits("down"),
+        "{:?}",
+        fetch_failures(&keys.url("down"))
+    );
 
     // While a fetch hangs, other clients authenticate.
     let stuck = {
@@ -725,9 +737,9 @@ async fn a_redirect_is_not_followed() {
 }
 
 /// A set that is too large, not JSON, not a JWK Set, or that holds a private or symmetric
-/// key, too many keys or a short RSA key is refused whole, by the rules of an inline `jwks`:
-/// the client is not authenticated, also by a good key beside the bad one. The WARN line
-/// names the problem, never a private value.
+/// key or too many keys is refused whole, and so is a set with no usable key (here a short
+/// RSA key): the client is not authenticated, also by a good key beside the bad one. The WARN
+/// line names the problem, never a private value.
 #[tokio::test]
 async fn bad_key_sets_are_refused() {
     capture_logs();
@@ -771,7 +783,7 @@ async fn bad_key_sets_are_refused() {
             "weak",
             Answer::Json(json!({"keys": [{"kty": "RSA", "kid": "good", "e": "AQAB",
                 "n": base64_url(&[0xC5; 128])}]})),
-            "2048",
+            "no key of the set is usable",
         ),
     ];
     let mut lists = agent_secret("planner", "p");
@@ -794,6 +806,131 @@ async fn bad_key_sets_are_refused() {
     }
     let all = String::from_utf8_lossy(&LOGS.lock().unwrap()).into_owned();
     assert!(!all.contains(&d), "the private value is logged");
+}
+
+/// A published set may hold keys for other uses (`use: "enc"`, a curve or `alg` the server
+/// does not accept, a short RSA key): they are skipped, and the client authenticates with its
+/// signing key.
+#[tokio::test]
+async fn keys_for_other_uses_in_a_set_are_skipped() {
+    let keys = KeyServer::start().await;
+    let coder = Key::new("sig");
+    let mut enc = Key::new("enc").public();
+    enc["use"] = "enc".into();
+    let p384 = json!({"kty": "EC", "crv": "P-384", "kid": "p384",
+        "x": "AA", "y": "AA"});
+    let small = json!({"kty": "RSA", "kid": "small", "e": "AQAB",
+        "n": base64_url(&[0xC5; 128])});
+    keys.set(
+        "coder",
+        Answer::Json(json!({"keys": [enc, p384, small, coder.public()]})),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::start(&write_config(
+        dir.path(),
+        &keys,
+        &(agent_secret("planner", "p") + &remote("agents", "coder", &keys.url("coder"), "")),
+    ))
+    .await;
+    let got = h.exchange_as("coder", &coder.assertion("coder")).await;
+    assert!(is(&got, OK), "{got:?}");
+    // The skipped `enc` key's kid names no key that verifies.
+    let got = h
+        .exchange_as("coder", &coder.assertion_with_kid("coder", "enc"))
+        .await;
+    assert!(is(&got, NOT_AUTHENTICATED), "{got:?}");
+}
+
+/// Made-up `kid`s and a key host that fails now and then cannot lock a client out: a refetch
+/// for an unknown `kid` that fails keeps the keys in force until their TTL.
+#[tokio::test]
+async fn a_failed_refetch_for_a_made_up_kid_keeps_the_keys_in_force() {
+    let keys = KeyServer::start().await;
+    let coder = Key::new("real");
+    keys.serve_keys("coder", &[&coder]);
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::start(&write_config(
+        dir.path(),
+        &keys,
+        &(agent_secret("planner", "p") + &remote("agents", "coder", &keys.url("coder"), "")),
+    ))
+    .await;
+    assert!(is(
+        &h.exchange_as("coder", &coder.assertion("coder")).await,
+        OK
+    ));
+    keys.set("coder", Answer::Status(503));
+    let stranger = Key::new("x");
+    let got = h
+        .exchange_as("coder", &stranger.assertion_with_kid("coder", "made-up"))
+        .await;
+    assert!(is(&got, NOT_AUTHENTICATED), "{got:?}");
+    assert_eq!(
+        keys.hits("coder"),
+        2,
+        "the unknown kid fetched the set again"
+    );
+    assert!(is(
+        &h.exchange_as("coder", &coder.assertion("coder")).await,
+        OK
+    ));
+    assert_eq!(keys.hits("coder"), 2);
+}
+
+/// AuthZEN checks the bearer before it looks at a PEP's assertion: with no bearer (and
+/// `[authzen] allow_unsigned_chain` off) or a bad one, no PEP key is fetched, at any of the
+/// three endpoints. With a good bearer the key is fetched.
+#[tokio::test]
+async fn no_pep_key_is_fetched_before_the_authzen_bearer_check() {
+    let keys = KeyServer::start().await;
+    let gateway = Key::new("gw");
+    keys.serve_keys("gateway", &[&gateway]);
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::start(&write_config(
+        dir.path(),
+        &keys,
+        &(agent_secret("planner", "p") + &remote("peps", "gateway", &keys.url("gateway"), "")),
+    ))
+    .await;
+    let request = |path: &str| {
+        let mut body = json!({
+            "subject": {"type": "agent", "id": ""},
+            "action": {"name": "read_file"},
+            "resource": {"type": "tool", "id": "github/read_file",
+                         "properties": {"server": "github"}},
+            "context": {"input": {}},
+            "client_assertion_type": CLIENT_ASSERTION_TYPE,
+            "client_assertion": gateway.assertion("gateway"),
+        });
+        if path.ends_with("/evaluations") {
+            body["evaluations"] = json!([{}]);
+        }
+        if path.ends_with("/action") {
+            body["resource"] = json!({"type": "mcp_server", "id": "github"});
+        }
+        h.client.post(h.server.url(path)).json(&body)
+    };
+    let paths = [
+        "/access/v1/evaluation",
+        "/access/v1/evaluations",
+        "/access/v1/search/action",
+    ];
+    for path in paths {
+        let none = request(path).send().await.unwrap();
+        assert_eq!(none.status(), StatusCode::UNAUTHORIZED, "{path}");
+        let bad = request(path)
+            .bearer_auth("not-a-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), StatusCode::UNAUTHORIZED, "{path}");
+    }
+    assert_eq!(keys.hits("gateway"), 0, "a PEP key was fetched");
+    for path in paths {
+        let good = request(path).bearer_auth(&h.root).send().await.unwrap();
+        assert_eq!(good.status(), StatusCode::OK, "{path}");
+    }
+    assert_eq!(keys.hits("gateway"), 1);
 }
 
 /// `bytes` as base64url without padding.
@@ -873,8 +1010,9 @@ async fn inline_keys_with_a_url_are_refused_at_startup_and_at_a_reload() {
 }
 
 /// A reload that moves a client to another URL drops the keys of the old one at once, with no
-/// TTL to wait for; one that removes the client refuses it from the next request on. The
-/// answer counts the URL as a change, and the list digest covers it.
+/// TTL to wait for; one that removes the client refuses it in every request that takes the
+/// lists after the reload answered. The answer counts the URL as a change, and the list digest
+/// covers it.
 #[tokio::test]
 async fn a_reload_that_moves_the_url_drops_the_old_keys_at_once() {
     let keys = KeyServer::start().await;
@@ -897,7 +1035,7 @@ async fn a_reload_that_moves_the_url_drops_the_old_keys_at_once() {
     assert_eq!(status, StatusCode::OK, "{v}");
     assert_eq!(v["agents"]["changed"], json!(["coder"]), "{v}");
     let canonical = json!([
-        ["coder", null, [], keys.url("b")],
+        ["coder", null, [], keys.url("b"), 3600, null, null],
         ["planner", sha256_hex("p"), []],
     ]);
     assert_eq!(
@@ -920,9 +1058,10 @@ async fn a_reload_that_moves_the_url_drops_the_old_keys_at_once() {
 }
 
 /// SR-110: a caller without a key of the client learns nothing about it from a refusal. An
-/// unknown id, an id with a secret only, an id whose URL is down, and an id whose URL works
-/// but does not hold the signing key (by `kid`, or with the right `kid`) get the same answer,
-/// byte for byte apart from `Date`, at an exchange, at hop 0 and at AuthZEN.
+/// unknown id, an id with a secret only, an id with inline keys, an id whose URL is down, and
+/// an id whose URL works but does not hold the signing key (by `kid`, or with the right `kid`)
+/// get the same answer, byte for byte apart from `Date`, at an exchange, at hop 0 and at
+/// AuthZEN.
 #[tokio::test]
 async fn a_refusal_does_not_tell_unknown_secret_only_and_unreachable_clients_apart_sr110() {
     let keys = KeyServer::start().await;
@@ -931,12 +1070,20 @@ async fn a_refusal_does_not_tell_unknown_secret_only_and_unreachable_clients_apa
     keys.serve_keys("coder", &[&coder]);
     keys.serve_keys("gateway", &[&coder]);
     keys.set("down", Answer::Status(503));
+    let inline = |list: &str, id: &str| {
+        format!(
+            "[[{list}]]\nid = \"{id}\"\njwks = '''{}'''\n",
+            jwk_set(&[&coder])
+        )
+    };
     let dir = tempfile::tempdir().unwrap();
     let h = Harness::start(&write_config(
         dir.path(),
         &keys,
         &(agent_secret("planner", "p")
             + &agent_secret("reviewer", "r")
+            + &inline("agents", "inline")
+            + &inline("peps", "gw-inline")
             + &remote("agents", "coder", &keys.url("coder"), "")
             + &remote("agents", "down", &keys.url("down"), "")
             + "[[peps]]\nid = \"gw-secret\"\nsecret_sha256 = \""
@@ -953,6 +1100,8 @@ async fn a_refusal_does_not_tell_unknown_secret_only_and_unreachable_clients_apa
         [
             probe("nobody", "k"),
             probe("reviewer", "k"),
+            probe("inline", "nope"),
+            probe("inline", "coder-1"),
             probe("down", "k"),
             // A kid that is not in the set, and the right kid with another key.
             probe("coder", "nope"),
@@ -971,6 +1120,8 @@ async fn a_refusal_does_not_tell_unknown_secret_only_and_unreachable_clients_apa
     for a in [
         stranger.assertion_with_kid("nobody", "k"),
         stranger.assertion_with_kid("gw-secret", "k"),
+        stranger.assertion_with_kid("gw-inline", "nope"),
+        stranger.assertion_with_kid("gw-inline", "coder-1"),
         stranger.assertion_with_kid("gw-down", "k"),
         stranger.assertion_with_kid("gateway", "nope"),
         stranger.assertion_with_kid("gateway", "coder-1"),
