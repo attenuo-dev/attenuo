@@ -66,11 +66,12 @@ ignore = true
 # ---------------------------------------------------------------------------
 [bans]
 multiple-versions = "warn"
-# Should be "deny". It is "allow" for now because the workspace path
-# dependencies (`attenuo-core = { path = "..." }`) carry no `version`, which
-# cargo-deny reports as wildcards for publishable crates. Add
-# `version = "0.1.0"` to those entries in the root Cargo.toml (needed for
-# crates.io anyway) and flip this back to "deny".
+# Should be "deny". It was set to "allow" because the workspace path
+# dependencies (`attenuo-core = { path = "..." }`) carried no `version`, which
+# cargo-deny reports as wildcards for publishable crates. The
+# `[workspace.dependencies]` entries carry the workspace version now (needed
+# for crates.io), so this can go back to "deny" once `cargo deny check bans`
+# passes with it.
 wildcards = "allow"
 highlight = "all"
 workspace-default-features = "allow"

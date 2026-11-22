@@ -6,10 +6,10 @@
 #     nothing is uploaded, so tagging a release never publishes a package by accident.
 #   - workflow_dispatch: inputs `package` (python, typescript or both) and `dry_run` (default
 #     true). Only a dispatch with `dry_run=false` publishes, and only from a `v*` tag whose
-#     version equals the package's (dispatch with `--ref v0.1.0`). From a branch it fails.
+#     version equals the package's (dispatch with `--ref vX.Y.Z`). From a branch it fails.
 #
-#   gh workflow run release-packages.yml --ref v0.1.0 -f package=python -f dry_run=false
-#   gh workflow run release-packages.yml --ref v0.1.0 -f package=typescript -f dry_run=false
+#   gh workflow run release-packages.yml --ref vX.Y.Z -f package=python -f dry_run=false
+#   gh workflow run release-packages.yml --ref vX.Y.Z -f package=typescript -f dry_run=false
 #
 # Publishing
 #   - PyPI: trusted publishing (OIDC), no token. The PyPI project must list this repository,
