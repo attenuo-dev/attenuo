@@ -1061,14 +1061,14 @@ def _auto_prune(v: Any) -> AutoPrune | None:
         return None
     r = v.get("last_run")
     return AutoPrune(
-        keep_seconds=int(v.get("keep_seconds", 0)),
-        interval_seconds=int(v.get("interval_seconds", 0)),
+        keep_seconds=_opt_int(v.get("keep_seconds")) or 0,
+        interval_seconds=_opt_int(v.get("interval_seconds")) or 0,
         max_entries_per_run=_opt_int(v.get("max_entries_per_run")),
         archive_dir=_opt_str(v.get("archive_dir")),
         last_run=AutoPruneRun(
-            at=str(r.get("at", "")),
-            outcome=str(r.get("outcome", "")),
-            reason=str(r.get("reason", "")),
+            at=_opt_str(r.get("at")) or "",
+            outcome=_opt_str(r.get("outcome")) or "",
+            reason=_opt_str(r.get("reason")) or "",
             through=_opt_int(r.get("through")),
             prune_seq=_opt_int(r.get("prune_seq")),
             detail=_opt_str(r.get("detail")),

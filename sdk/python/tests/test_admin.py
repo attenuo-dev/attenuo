@@ -615,6 +615,32 @@ async def test_audit_prune_plan(make: Any) -> None:
     assert plan.auto.max_entries_per_run == 1000000
     assert plan.auto.archive_dir == "/var/lib/attenuo/audit-archive"
     assert plan.auto.last_run.archive == "audit-00000000000000000001-00000000000000000020.jsonl"
+    # Explicit nulls are read as absent, as the TypeScript SDK reads them.
+    nulls = {
+        **PLAN,
+        "auto": {
+            "keep_seconds": None,
+            "interval_seconds": None,
+            "max_entries_per_run": None,
+            "archive_dir": None,
+            "last_run": {k: None for k in pruned},
+        },
+    }
+    client, _ = make(lambda r: httpx.Response(200, json=nulls))
+    plan = await call(client, "audit_prune_plan")
+    assert plan.auto == AutoPrune(
+        keep_seconds=0,
+        interval_seconds=0,
+        last_run=AutoPruneRun(
+            at="",
+            outcome="",
+            reason="",
+            through=None,
+            prune_seq=None,
+            detail=None,
+            archive=None,
+        ),
+    )
 
 
 async def test_audit_prune(make: Any) -> None:
