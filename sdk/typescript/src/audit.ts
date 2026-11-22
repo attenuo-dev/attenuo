@@ -11,7 +11,11 @@
  * (`[audit.sink]`), the Rust `cross_check` (`attenuo audit verify --file --checkpoints`) rule for
  * rule: a checkpoint signed again after it was shipped, one deleted from the export, two
  * different shipped copies for one seq, and a shipped copy that does not verify are reported
- * with the same `seq` and reason in both.
+ * with the same `seq` and reason in both. The same file holds the signed anchors of the prunes
+ * (`attenuo-shipped-anchor-v1`), and `crossCheck` checks them as the Rust `cross_check_anchors`
+ * does, into the report's `anchors`: each must verify, the anchor of the boundary right before
+ * the export's start must be the one in its header, and an anchor that says entries the export
+ * still holds were pruned means the log was rewound. The report's `ok` covers both checks.
  *
  * An export taken after a prune starts at the first retained entry, and its header carries the
  * prune's signed `anchor`. `verifyExport` checks the anchor's signature, that the file starts
@@ -30,7 +34,7 @@
  */
 
 import { AttenuoError } from "./errors.js";
-import { canonicalize, parseJson, type JsonValue } from "./jcs.js";
+import { canonicalize, parseJson, parseJsonValues, type JsonValue } from "./jcs.js";
 import { b64urlDecode } from "./token.js";
 
 /** First element of the array the entry hash covers. */
@@ -44,10 +48,11 @@ export const SHIPPED_FORMAT = "attenuo-shipped-checkpoint-v1";
 /** The tool of a prune's own audit record. */
 export const PRUNE_TOOL = "admin.audit.prune";
 /**
- * The envelope of a prune's signed anchor, shipped through the same sink (ADR-0015). Skipped by
- * `parseShipped`: this package checks the anchor in an export's header, not shipped ones.
+ * Value of a shipped anchor's `format` member: the envelope of a prune's signed anchor, which the
+ * sink ships with the checkpoints (ADR-0015). `parseShipped` skips these lines and
+ * `parseShippedAnchors` reads them.
  */
-const SHIPPED_ANCHOR_FORMAT = "attenuo-shipped-anchor-v1";
+export const SHIPPED_ANCHOR_FORMAT = "attenuo-shipped-anchor-v1";
 const CHECKPOINT_CONTEXT = "attenuo-checkpoint-v1";
 const ANCHOR_CONTEXT = "attenuo-audit-anchor-v1";
 
@@ -161,7 +166,64 @@ export interface ShippedMismatch {
   reason: string;
 }
 
-/** The verdict of `crossCheck` (the fields of the Rust `CrossCheckReport`). */
+/** The nine members of a signed prune anchor (a missing optional member is `null`). */
+export interface AnchorFields {
+  through_seq: number;
+  through_hash: string;
+  prune_seq: number;
+  prune_entry_hash: string;
+  previous_through_seq: number | null;
+  archive_sha256: string | null;
+  at: string;
+  kid: string;
+  signature: string;
+}
+
+/** One shipped prune anchor (`attenuo-shipped-anchor-v1`) of a shipped file. */
+export interface ShippedAnchor {
+  /** 1-based line number in the file. */
+  line: number;
+  /** The signed anchor. */
+  anchor: AnchorFields;
+  /** The envelope's `format`, `kid`, `signature` and `anchor_sha256`, as shipped. */
+  format: string;
+  kid: string;
+  signature: string;
+  anchorSha256: string;
+  /** `[server] public_url` of the server that signed it, when set. */
+  publicUrl: string | undefined;
+}
+
+/** The shipped-anchor part of `crossCheck` (the fields of the Rust `AnchorCheckReport`). */
+export interface AnchorCheckReport {
+  /** Anchor lines in the shipped file. */
+  shipped: number;
+  /**
+   * Shipped anchors whose prune record lies at or before the export's end: the export was taken
+   * after that prune, so it must account for it (checked).
+   */
+  checked: number;
+  /** Of those, the ones the export accounts for. */
+  matched: number;
+  /**
+   * Shipped anchors whose prune record is past the export's end (an archive, or an export taken
+   * before that prune): not checked.
+   */
+  beyondRange: number;
+  /**
+   * Each shipped anchor the export does not account for, or that is unusable; `seq` is the
+   * anchor's `through_seq`. Also the header's own anchor (`line` 0) when the shipped file does
+   * not hold it.
+   */
+  mismatches: ShippedMismatch[];
+  /** No mismatches. */
+  ok: boolean;
+}
+
+/**
+ * The verdict of `crossCheck` (the fields of the Rust `CrossCheckReport`, and the shipped anchors
+ * in `anchors`).
+ */
 export interface CrossCheckReport {
   /** Lines in the shipped file. */
   shipped: number;
@@ -178,8 +240,15 @@ export interface CrossCheckReport {
   lastShippedSeq: number | undefined;
   /** In the order of the shipped file; the first is the first offending seq. */
   mismatches: ShippedMismatch[];
-  /** No mismatches. */
+  /** No mismatches here and none in `anchors`. */
   ok: boolean;
+  /**
+   * Shipped checkpoints before the export's range: not checked against its entries. The one at
+   * the header anchor's `through_seq` is checked against the anchor.
+   */
+  belowRange: number;
+  /** The shipped prune anchors of the same file, checked against the export. */
+  anchors: AnchorCheckReport;
 }
 
 /** An export to verify. */
@@ -519,41 +588,133 @@ const sameCheckpoint = (a: CheckpointFields, b: CheckpointFields): boolean =>
  * an error here: the line carries `inconsistency` and `crossCheck` reports it.
  */
 export async function parseShipped(source: ExportSource): Promise<ShippedLine[]> {
+  return shippedLines(await readText(source));
+}
+
+async function shippedLines(text: string): Promise<ShippedLine[]> {
   const out: ShippedLine[] = [];
-  for (const [n, raw] of (await readText(source)).split("\n").entries()) {
+  for (const [n, raw] of text.split("\n").entries()) {
     const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
     if (line.trim() === "") continue;
     const where = `shipped checkpoints, line ${n + 1}`;
-    const obj = parseLine(line, where);
-    if (!isObj(obj)) throw new ExportError(`${where}: not a JSON object`);
-    if (obj.format === SHIPPED_ANCHOR_FORMAT) continue;
-    if ("checkpoint" in obj) {
-      need(obj, where, { format: "str", kid: "str", signature: "str", checkpoint_sha256: "str" });
-      if (
-        obj.public_url !== undefined &&
-        obj.public_url !== null &&
-        typeof obj.public_url !== "string"
-      ) {
-        throw new ExportError(`${where}: \`public_url\` must be a string`);
+    for (const obj of lineValues(line, where)) {
+      if (!isObj(obj)) throw new ExportError(`${where}: not a JSON object`);
+      if (obj.format === SHIPPED_ANCHOR_FORMAT) continue;
+      if ("checkpoint" in obj) {
+        need(obj, where, { format: "str", kid: "str", signature: "str", checkpoint_sha256: "str" });
+        checkPublicUrl(obj, where);
+        if (!isObj(obj.checkpoint))
+          throw new ExportError(`${where}: \`checkpoint\` must be an object`);
+        const cp = cp5(toCheckpoint(obj.checkpoint, where));
+        out.push({ line: n + 1, checkpoint: cp, inconsistency: await inconsistency(obj, cp) });
+      } else {
+        const { type, ...rest } = obj;
+        if (type !== undefined && type !== "checkpoint") {
+          throw new ExportError(`${where}: not a checkpoint line (type ${JSON.stringify(type)})`);
+        }
+        out.push({
+          line: n + 1,
+          checkpoint: cp5(toCheckpoint(rest, where)),
+          inconsistency: undefined,
+        });
       }
-      if (!isObj(obj.checkpoint))
-        throw new ExportError(`${where}: \`checkpoint\` must be an object`);
-      const cp = cp5(toCheckpoint(obj.checkpoint, where));
-      out.push({ line: n + 1, checkpoint: cp, inconsistency: await inconsistency(obj, cp) });
-    } else {
-      const { type, ...rest } = obj;
-      if (type !== undefined && type !== "checkpoint") {
-        throw new ExportError(`${where}: not a checkpoint line (type ${JSON.stringify(type)})`);
-      }
+    }
+  }
+  return out;
+}
+
+/** The JSON values of one line: usually one, or several objects written back to back. */
+function lineValues(line: string, where: string): JsonValue[] {
+  try {
+    return parseJsonValues(line);
+  } catch (e) {
+    throw new ExportError(`${where}: ${(e as Error).message}`);
+  }
+}
+
+function checkPublicUrl(obj: Obj, where: string): void {
+  if (
+    obj.public_url !== undefined &&
+    obj.public_url !== null &&
+    typeof obj.public_url !== "string"
+  ) {
+    throw new ExportError(`${where}: \`public_url\` must be a string`);
+  }
+}
+
+/**
+ * Every shipped prune anchor of a shipped file: the values of a line that have an `anchor`
+ * member, with their 1-based line number. Other lines are skipped, and so is a line that is not
+ * JSON (`parseShipped` reports it). Objects written back to back on one line (S3 objects joined
+ * with `cat`, which adds no newline) are each read.
+ *
+ * Throws `ExportError` naming the line when a value with an `anchor` member is not a shipped
+ * anchor (a member missing or of the wrong type). An envelope that disagrees with its anchor is
+ * not an error here: `crossCheck` reports it.
+ */
+export async function parseShippedAnchors(source: ExportSource): Promise<ShippedAnchor[]> {
+  return shippedAnchors(await readText(source));
+}
+
+function shippedAnchors(text: string): ShippedAnchor[] {
+  const out: ShippedAnchor[] = [];
+  for (const [n, raw] of text.split("\n").entries()) {
+    const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
+    if (line.trim() === "") continue;
+    let values: JsonValue[];
+    try {
+      values = parseJsonValues(line);
+    } catch {
+      continue;
+    }
+    const where = `shipped anchors, line ${n + 1}`;
+    for (const obj of values) {
+      if (!isObj(obj) || !("anchor" in obj)) continue;
+      need(obj, where, { format: "str", kid: "str", signature: "str", anchor_sha256: "str" });
+      checkPublicUrl(obj, where);
+      checkAnchor(obj.anchor, `${where}: anchor`);
       out.push({
         line: n + 1,
-        checkpoint: cp5(toCheckpoint(rest, where)),
-        inconsistency: undefined,
+        anchor: anchor9(obj.anchor as Anchor),
+        format: obj.format as string,
+        kid: obj.kid as string,
+        signature: obj.signature as string,
+        anchorSha256: obj.anchor_sha256 as string,
+        publicUrl: typeof obj.public_url === "string" ? obj.public_url : undefined,
       });
     }
   }
   return out;
 }
+
+function anchor9(a: Anchor): AnchorFields {
+  return {
+    through_seq: a.through_seq,
+    through_hash: a.through_hash,
+    prune_seq: a.prune_seq,
+    prune_entry_hash: a.prune_entry_hash,
+    previous_through_seq: a.previous_through_seq ?? null,
+    archive_sha256: a.archive_sha256 ?? null,
+    at: a.at,
+    kid: a.kid,
+    signature: a.signature,
+  };
+}
+
+const ANCHOR_FIELDS = [
+  "through_seq",
+  "through_hash",
+  "prune_seq",
+  "prune_entry_hash",
+  "previous_through_seq",
+  "archive_sha256",
+  "at",
+  "kid",
+  "signature",
+] as const;
+
+const sameAnchor = (a: AnchorFields, b: AnchorFields): boolean =>
+  ANCHOR_FIELDS.every((k) => a[k] === b[k]);
 
 async function inconsistency(env: Obj, cp: CheckpointFields): Promise<string | undefined> {
   if (env.format !== SHIPPED_FORMAT) return `unsupported format \`${String(env.format)}\``;
@@ -592,9 +753,12 @@ export async function crossCheck(
 ): Promise<CrossCheckReport> {
   const keys = loadKeys(opts.checkpointPublicKeys);
   const { header, entries, checkpoints } = parse(await readText(exportSource));
-  const shipped = await parseShipped(shippedSource);
+  const shippedText = await readText(shippedSource);
+  const shipped = await shippedLines(shippedText);
+  const anchors = await checkAnchors(header, entries, shippedAnchors(shippedText), keys);
   const from = header.from as number;
   const to = header.to as number;
+  const headerAnchor = (header.anchor ?? undefined) as Anchor | undefined;
   const exported = new Map(checkpoints.map((c) => [c.seq, cp5(c)]));
   const entryHashes = new Map(entries.map((e) => [e.seq, e.entry_hash]));
   const firstBySeq = new Map<number, ShippedLine>();
@@ -602,6 +766,7 @@ export async function crossCheck(
   let inRange = 0;
   let matched = 0;
   let beyond = 0;
+  let below = 0;
   for (const s of shipped) {
     const cp = s.checkpoint;
     const fail = (reason: string): void => {
@@ -626,7 +791,21 @@ export async function crossCheck(
       beyond++;
       continue;
     }
-    if (cp.seq < from && !(cp.seq === 0 && from <= 1)) continue;
+    if (cp.seq < from && !(cp.seq === 0 && from <= 1)) {
+      below++;
+      if (headerAnchor !== undefined && headerAnchor.through_seq === cp.seq) {
+        const why = await verifyCheckpoint(cp, keys);
+        if (why !== undefined) {
+          fail(`shipped checkpoint does not verify: ${why}`);
+        } else if (cp.head_hash !== headerAnchor.through_hash) {
+          fail(
+            "the shipped checkpoint at the anchor's through_seq names another hash than the " +
+              "anchor (history rewritten before the prune)",
+          );
+        }
+      }
+      continue;
+    }
     inRange++;
     const why = await verifyCheckpoint(cp, keys);
     if (why !== undefined) {
@@ -665,6 +844,122 @@ export async function crossCheck(
     beyondRange: beyond,
     lastShippedSeq:
       shipped.length > 0 ? Math.max(...shipped.map((s) => s.checkpoint.seq)) : undefined,
+    mismatches,
+    ok: mismatches.length === 0 && anchors.ok,
+    belowRange: below,
+    anchors,
+  };
+}
+
+/** The Rust `cross_check_anchors`, rule for rule. */
+async function checkAnchors(
+  header: Obj,
+  entries: Entry[],
+  shipped: ShippedAnchor[],
+  keys: Map<string, Uint8Array>,
+): Promise<AnchorCheckReport> {
+  const from = header.from as number;
+  const to = header.to as number;
+  const lastEntry = entries[entries.length - 1];
+  const last = lastEntry === undefined ? to : Math.max(lastEntry.seq, to);
+  const end = lastEntry?.seq;
+  const rawHeaderAnchor = (header.anchor ?? undefined) as Anchor | undefined;
+  const headerAnchor = rawHeaderAnchor === undefined ? undefined : anchor9(rawHeaderAnchor);
+  const mismatches: ShippedMismatch[] = [];
+  let checked = 0;
+  let matched = 0;
+  let beyond = 0;
+  const firstByThrough = new Map<number, ShippedAnchor>();
+  let headerSeen = false;
+  for (const s of shipped) {
+    const a = s.anchor;
+    const through = a.through_seq;
+    const fail = (reason: string): void => {
+      mismatches.push({ seq: through, line: s.line, reason });
+    };
+    if (s.format !== SHIPPED_ANCHOR_FORMAT) {
+      fail(`shipped envelope is inconsistent: unsupported format \`${s.format}\``);
+      continue;
+    }
+    if (s.kid !== a.kid || s.signature !== a.signature) {
+      fail("shipped envelope is inconsistent: `kid` or `signature` differs from the anchor's own");
+      continue;
+    }
+    if (s.anchorSha256 !== (await sha256Hex(canonicalize(a)))) {
+      fail("shipped envelope is inconsistent: `anchor_sha256` does not match the anchor");
+      continue;
+    }
+    const why = await verifyAnchor(a as Anchor, keys);
+    if (why !== undefined) {
+      fail(`shipped anchor does not verify: ${why}`);
+      continue;
+    }
+    const prev = firstByThrough.get(through);
+    if (prev !== undefined) {
+      if (!sameAnchor(prev.anchor, a)) {
+        fail(
+          "the sink holds two different anchors for this boundary " +
+            `(lines ${prev.line} and ${s.line}): the log was pruned through this seq twice`,
+        );
+      }
+      continue; // else: a retried delivery, same content, counted once
+    }
+    firstByThrough.set(through, s);
+    // The boundary right before the export's start: its header's anchor, wherever the export
+    // ends.
+    const atStart = through + 1 === from;
+    if (a.prune_seq > last && !atStart) {
+      // An archive ends at its prune's boundary; a boundary strictly inside the export says the
+      // export holds entries that a later prune removed.
+      if (through >= from && through <= last && through !== end) {
+        checked++;
+        fail(
+          `the shipped prune through seq ${through} (its record at seq ${a.prune_seq} is past ` +
+            `this export's end at seq ${last}) has its boundary inside this export: the export ` +
+            "was taken before that prune, or the log was rewound to before it; check an export " +
+            "taken now",
+        );
+        continue;
+      }
+      beyond++;
+      continue;
+    }
+    checked++;
+    if (through + 1 < from) {
+      matched++;
+    } else if (atStart) {
+      headerSeen = true;
+      if (headerAnchor === undefined) {
+        fail(
+          "the export starts right after this shipped anchor's boundary, but its header " +
+            "carries no anchor",
+        );
+      } else if (sameAnchor(headerAnchor, a)) {
+        matched++;
+      } else {
+        fail("the export's header carries another anchor for this boundary than the one shipped");
+      }
+    } else {
+      fail(
+        `REWOUND: the shipped anchor says the log was pruned through seq ${through}, but the ` +
+          `export holds entries from seq ${from} (a restored backup, or the anchor row removed)`,
+      );
+    }
+  }
+  if (headerAnchor !== undefined && !headerSeen) {
+    mismatches.push({
+      seq: headerAnchor.through_seq,
+      line: 0,
+      reason:
+        "the export's header anchor is not in the shipped file (it was not shipped, or the " +
+        "file is incomplete)",
+    });
+  }
+  return {
+    shipped: shipped.length,
+    checked,
+    matched,
+    beyondRange: beyond,
     mismatches,
     ok: mismatches.length === 0,
   };
@@ -798,9 +1093,14 @@ function checkHeader(h: unknown): Obj {
   return h;
 }
 
-function checkAnchor(a: unknown): void {
-  if (!isObj(a)) throw new ExportError("header: `anchor` must be an object");
-  const where = "header anchor";
+function checkAnchor(a: unknown, where = "header anchor"): void {
+  if (!isObj(a)) {
+    throw new ExportError(
+      where === "header anchor"
+        ? "header: `anchor` must be an object"
+        : `${where}: must be an object`,
+    );
+  }
   need(a, where, {
     through_seq: "uint",
     through_hash: "str",

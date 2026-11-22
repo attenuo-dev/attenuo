@@ -7,13 +7,17 @@ import { beforeAll, describe, expect, it } from "vitest";
 import {
   ExportError,
   PRUNE_TOOL,
+  SHIPPED_ANCHOR_FORMAT,
   SHIPPED_FORMAT,
   crossCheck,
   parseShipped,
+  parseShippedAnchors,
   verifyExport,
   verifyExports,
+  type AnchorCheckReport,
   type CrossCheckReport,
   type ExportReport,
+  type ShippedMismatch,
   type VerifyExportOptions,
 } from "../src/index.js";
 import { entryHash, EXPORT_FORMAT, GENESIS_HASH } from "../src/audit.js";
@@ -523,7 +527,17 @@ describe("crossCheck", () => {
     const parsed = await parseShipped(withAnchor);
     expect(parsed.map((p) => p.line)).toEqual([1, 3]);
     const r = await cross(objs, withAnchor);
-    expect(r).toMatchObject({ ok: true, shipped: 2, matched: 2 });
+    expect(r).toMatchObject({ mismatches: [], shipped: 2, matched: 2 });
+    // The anchor itself is checked: this one is not signed by a key of the JWKS.
+    expect(r.ok).toBe(false);
+    expect(r.anchors).toMatchObject({ ok: false, shipped: 1 });
+    expect(r.anchors.mismatches).toEqual([
+      {
+        seq: 3,
+        line: 2,
+        reason: "shipped envelope is inconsistent: `anchor_sha256` does not match the anchor",
+      },
+    ]);
   });
 
   it("matches the genesis checkpoint and accepts an empty shipped file", async () => {
@@ -842,5 +856,289 @@ describe.skipIf(!existsSync(GOLDEN))("the golden files written by the Rust code"
     const r2 = await verifyExports([{ path: join(GOLDEN, "archive-2.jsonl") }, bad], o);
     expect(r2.ok).toBe(false);
     expect(r2.files[1]?.badAnchors.length).toBe(1);
+  });
+});
+
+// ---- the shipped prune anchors, against the golden files the Rust code writes -------------
+
+const goldenText = (n: string): string => readFileSync(join(GOLDEN, n), "utf8");
+const goldenOpts = (): VerifyExportOptions => ({
+  checkpointPublicKeys: JSON.parse(goldenText("jwks.json")) as { keys: unknown[] },
+});
+const goldenSource = (v: string | string[]): string[] | { path: string } =>
+  typeof v === "string" ? { path: join(GOLDEN, v) } : v;
+const goldenCross = (exp: string | string[], shipped: string | string[]) =>
+  crossCheck(goldenSource(exp), goldenSource(shipped), goldenOpts());
+
+interface GoldenCheck {
+  export: string;
+  shipped: string;
+  checkpoints: Obj;
+  anchors: Obj;
+}
+const goldenChecks = (): GoldenCheck[] =>
+  existsSync(GOLDEN)
+    ? (JSON.parse(goldenText("cross-checks.json")) as { checks: GoldenCheck[] }).checks
+    : [];
+
+const mismatchJson = (ms: ShippedMismatch[]): Obj[] =>
+  ms.map((m) => ({ seq: m.seq, line: m.line, reason: m.reason }));
+
+describe.skipIf(!existsSync(GOLDEN))("shipped anchors in the golden files", () => {
+  // `cross-checks.json` is what the Rust `cross_check` and `cross_check_anchors` answer for each
+  // pair, written with the other golden files.
+  it.each(goldenChecks().map((c) => [`${c.export}+${c.shipped}`, c] as const))(
+    "gives the Rust verdict for %s",
+    async (_name, check) => {
+      const r = await goldenCross(check.export, check.shipped);
+      expect({
+        shipped: r.shipped,
+        in_range: r.inRange,
+        matched: r.matched,
+        beyond_range: r.beyondRange,
+        below_range: r.belowRange,
+        last_shipped_seq: r.lastShippedSeq ?? null,
+        mismatches: mismatchJson(r.mismatches),
+        ok: r.mismatches.length === 0,
+      }).toEqual(check.checkpoints);
+      expect({
+        shipped: r.anchors.shipped,
+        checked: r.anchors.checked,
+        matched: r.anchors.matched,
+        beyond_range: r.anchors.beyondRange,
+        mismatches: mismatchJson(r.anchors.mismatches),
+        ok: r.anchors.ok,
+      }).toEqual(check.anchors);
+      expect(r.ok).toBe(check.checkpoints.ok === true && check.anchors.ok === true);
+    },
+  );
+
+  it("accounts for both shipped anchors in the archives and the retained export", async () => {
+    for (const [n, counts] of [
+      ["archive-1.jsonl", [0, 0, 2]],
+      ["archive-2.jsonl", [1, 1, 1]],
+      ["retained.jsonl", [2, 2, 0]],
+    ] as const) {
+      const r = await goldenCross(n, "shipped.jsonl");
+      expect(r.ok).toBe(true);
+      expect([r.anchors.checked, r.anchors.matched, r.anchors.beyondRange]).toEqual(counts);
+    }
+    expect((await goldenCross("retained.jsonl", "shipped.jsonl")).belowRange).toBe(1);
+  });
+
+  it("reports a rewound log that verifies on its own", async () => {
+    expect((await verifyExport({ path: join(GOLDEN, "rewound.jsonl") }, goldenOpts())).ok).toBe(
+      true,
+    );
+    const r = await goldenCross("rewound.jsonl", "shipped.jsonl");
+    expect([r.ok, r.mismatches]).toEqual([false, []]);
+    expect(r.anchors.mismatches).toHaveLength(1);
+    const m = r.anchors.mismatches[0]!;
+    expect([m.seq, m.line]).toEqual([10, 6]);
+    expect(m.reason).toMatch(/^REWOUND: the shipped anchor says the log was pruned through seq 10/);
+  });
+
+  it("reports an export that holds the boundary of a later shipped prune", async () => {
+    expect((await verifyExport({ path: join(GOLDEN, "stale.jsonl") }, goldenOpts())).ok).toBe(true);
+    const r = await goldenCross("stale.jsonl", "shipped.jsonl");
+    expect(r.anchors.mismatches).toHaveLength(1);
+    expect(r.anchors.mismatches[0]).toMatchObject({ seq: 10 });
+    expect(r.anchors.mismatches[0]!.reason).toContain("has its boundary inside this export");
+  });
+
+  it("reports a tampered shipped anchor signature", async () => {
+    const r = await goldenCross("retained.jsonl", "shipped-bad-signature.jsonl");
+    expect([r.ok, r.mismatches]).toEqual([false, []]);
+    expect(mismatchJson(r.anchors.mismatches)).toEqual([
+      { seq: 10, line: 6, reason: "shipped anchor does not verify: signature does not verify" },
+      {
+        seq: 10,
+        line: 0,
+        reason:
+          "the export's header anchor is not in the shipped file (it was not shipped, or the " +
+          "file is incomplete)",
+      },
+    ]);
+  });
+
+  it("reports another shipped anchor for the header's boundary", async () => {
+    const r = await goldenCross("archive-2.jsonl", "shipped-other-anchor.jsonl");
+    expect(mismatchJson(r.anchors.mismatches)).toEqual([
+      {
+        seq: 5,
+        line: 5,
+        reason: "the export's header carries another anchor for this boundary than the one shipped",
+      },
+    ]);
+  });
+
+  it("reports a header anchor that was not shipped", async () => {
+    const text = goldenText("shipped.jsonl")
+      .split("\n")
+      .filter((l) => l !== "");
+    const noFirst = text.filter((l) => !l.includes('"through_seq":5}'));
+    expect(noFirst).toHaveLength(text.length - 1);
+    const r = await goldenCross("archive-2.jsonl", noFirst);
+    expect(r.anchors.mismatches).toHaveLength(1);
+    expect(r.anchors.mismatches[0]).toMatchObject({ seq: 5, line: 0 });
+    // No anchor line at all, and no anchor in the header: nothing to check.
+    const onlyCps = text.filter((l) => !l.includes('"anchor"'));
+    const empty: AnchorCheckReport = {
+      shipped: 0,
+      checked: 0,
+      matched: 0,
+      beyondRange: 0,
+      mismatches: [],
+      ok: true,
+    };
+    const r2 = await goldenCross("archive-1.jsonl", onlyCps);
+    expect([r2.ok, r2.anchors]).toEqual([true, empty]);
+  });
+
+  it("parses S3 objects joined without newlines", async () => {
+    const joined = goldenText("shipped.jsonl").replaceAll("\n", "");
+    expect(joined.split("\n")).toHaveLength(1);
+    expect(await parseShipped([joined])).toHaveLength(
+      (await parseShipped({ path: join(GOLDEN, "shipped.jsonl") })).length,
+    );
+    const anchors = await parseShippedAnchors([joined]);
+    expect(anchors.map((a) => [a.line, a.anchor.through_seq])).toEqual([
+      [1, 5],
+      [1, 10],
+    ]);
+    for (const n of ["archive-1.jsonl", "archive-2.jsonl", "retained.jsonl"]) {
+      expect((await goldenCross(n, [joined])).ok).toBe(true);
+    }
+  });
+
+  it("reads the anchor envelopes", async () => {
+    const anchors = await parseShippedAnchors({ path: join(GOLDEN, "shipped.jsonl") });
+    expect(anchors).toHaveLength(2);
+    const first = anchors[0]!;
+    expect([first.format, first.publicUrl]).toEqual([SHIPPED_ANCHOR_FORMAT, undefined]);
+    expect([first.kid, first.signature]).toEqual([first.anchor.kid, first.anchor.signature]);
+    expect(Object.keys(first.anchor).sort()).toEqual([
+      "archive_sha256",
+      "at",
+      "kid",
+      "previous_through_seq",
+      "prune_entry_hash",
+      "prune_seq",
+      "signature",
+      "through_hash",
+      "through_seq",
+    ]);
+    expect(await parseShippedAnchors(["not json\n", '{"seq":1}\n'])).toEqual([]);
+  });
+
+  it("reports inconsistent anchor envelopes and counts a retried delivery once", async () => {
+    const text = goldenText("shipped.jsonl")
+      .split("\n")
+      .filter((l) => l !== "");
+    const cps = text.slice(0, -2);
+    const first = JSON.parse(text[text.length - 2]!) as Obj;
+    const second = JSON.parse(text[text.length - 1]!) as Obj;
+    const anchorsOf = async (...envs: Obj[]): Promise<AnchorCheckReport> =>
+      (await goldenCross("retained.jsonl", [...cps, ...envs.map((e) => JSON.stringify(e))]))
+        .anchors;
+    const retry = await anchorsOf(first, first, second);
+    expect([retry.ok, retry.shipped, retry.checked, retry.matched]).toEqual([true, 3, 2, 2]);
+    for (const [change, reason] of [
+      [{ anchor_sha256: "0".repeat(64) }, "`anchor_sha256` does not match the anchor"],
+      [{ kid: "other" }, "`kid` or `signature` differs from the anchor's own"],
+    ] as const) {
+      const r = await anchorsOf({ ...first, ...change }, second);
+      expect(r.mismatches[0]).toEqual({
+        seq: 5,
+        line: cps.length + 1,
+        reason: `shipped envelope is inconsistent: ${reason}`,
+      });
+    }
+    // Another format with an `anchor` member is neither an anchor nor a checkpoint, as for the
+    // CLI: the file does not parse.
+    const other = JSON.stringify({ ...first, format: "v0" });
+    expect((await parseShippedAnchors([other]))[0]!.format).toBe("v0");
+    await expect(goldenCross("retained.jsonl", [other])).rejects.toThrow(
+      "shipped checkpoints, line 1",
+    );
+  });
+});
+
+describe("shipped anchors", () => {
+  const anchorLine = (extra: Obj): string =>
+    JSON.stringify({
+      anchor: {
+        archive_sha256: null,
+        at: "2026-10-24T00:00:00Z",
+        kid: "k",
+        previous_through_seq: null,
+        prune_entry_hash: "ab".repeat(32),
+        prune_seq: 7,
+        signature: "s",
+        through_hash: "cd".repeat(32),
+        through_seq: 3,
+      },
+      anchor_sha256: "ef".repeat(32),
+      format: "attenuo-shipped-anchor-v1",
+      kid: "k",
+      public_url: null,
+      signature: "s",
+      ...extra,
+    });
+
+  it.each([
+    [{ kid: 1 }, "shipped anchors, line 1: `kid` must be a string"],
+    [{ anchor_sha256: null }, "`anchor_sha256` must be a string"],
+    [{ public_url: 3 }, "`public_url` must be a string"],
+    [{ anchor: 1 }, "shipped anchors, line 1: anchor: must be an object"],
+    [{ anchor: { through_seq: -1 } }, "`through_seq` must be a non-negative integer"],
+  ])("refuses a value with an anchor member that is not a shipped anchor: %j", async (c, m) => {
+    await expect(parseShippedAnchors([anchorLine(c)])).rejects.toThrow(m);
+  });
+
+  const anchorEnvelope = async (a: Obj): Promise<string> =>
+    canonicalize({
+      anchor: a,
+      anchor_sha256: await sha256Hex(canonicalize(a)),
+      format: SHIPPED_ANCHOR_FORMAT,
+      kid: a.kid,
+      public_url: null,
+      signature: a.signature,
+    });
+
+  it("checks the shipped checkpoint at the anchor's boundary, twins and a missing header anchor", async () => {
+    const { retained } = await prunedLog();
+    const anchor = retained[0]!.anchor as Obj;
+    const good = await sign(10, anchor.through_hash as string);
+    const other = await sign(10, "ee".repeat(32));
+    const env = await anchorEnvelope(anchor);
+    const ok = await cross(retained, [env, canonicalize(await envelope(good))]);
+    expect([ok.ok, ok.belowRange, ok.anchors.matched]).toEqual([true, 1, 1]);
+    const bad = await cross(retained, [env, canonicalize(await envelope(other))]);
+    expect(bad.mismatches).toEqual([
+      {
+        seq: 10,
+        line: 2,
+        reason:
+          "the shipped checkpoint at the anchor's through_seq names another hash than the " +
+          "anchor (history rewritten before the prune)",
+      },
+    ]);
+    // Two different valid anchors for one boundary.
+    const twin: Obj = { ...anchor, archive_sha256: "ff".repeat(32) };
+    twin.signature = await signAnchor(twin);
+    const twins = await cross(retained, [env, await anchorEnvelope(twin)]);
+    expect(twins.anchors.mismatches.map((m) => m.reason)).toEqual([
+      "the sink holds two different anchors for this boundary (lines 1 and 2): the log was " +
+        "pruned through this seq twice",
+    ]);
+    // An export that starts right after a shipped anchor's boundary but carries none.
+    const bareHeader: Obj = { ...retained[0]! };
+    delete bareHeader.anchor;
+    const bare = await cross([bareHeader, ...retained.slice(1)], [env]);
+    expect(bare.anchors.mismatches.map((m) => m.reason)).toEqual([
+      "the export starts right after this shipped anchor's boundary, but its header carries " +
+        "no anchor",
+    ]);
   });
 });

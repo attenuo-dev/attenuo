@@ -20,7 +20,13 @@ the same ``seq`` and reason in both::
     from attenuo.audit import cross_check
 
     cross = cross_check("audit.jsonl", "shipped.jsonl", checkpoint_public_keys=jwks)
-    assert cross.ok, cross.mismatches
+    assert cross.ok, (cross.mismatches, cross.anchors.mismatches)
+
+The same file holds the signed anchors of the prunes (``attenuo-shipped-anchor-v1``), and
+``cross_check`` checks them as ``cross_check_anchors`` does in Rust: each must verify, the anchor
+of the boundary right before the export's start must be the one in its header, and an anchor that
+says entries the export still holds were pruned means the log was rewound. The result is in
+``cross.anchors``; ``cross.ok`` covers both checks.
 
 An export taken after a prune starts at the first retained entry, and its header carries the
 prune's signed ``anchor``. ``verify_export`` checks the anchor's signature, that the file starts
@@ -66,7 +72,9 @@ __all__ = [
     "EXPORT_FORMAT",
     "GENESIS_HASH",
     "PRUNE_TOOL",
+    "SHIPPED_ANCHOR_FORMAT",
     "SHIPPED_FORMAT",
+    "AnchorCheckReport",
     "BadAnchor",
     "BadCheckpoint",
     "CrossCheckReport",
@@ -74,11 +82,13 @@ __all__ = [
     "ExportReport",
     "ExportsReport",
     "LinkProblem",
+    "ShippedAnchor",
     "ShippedLine",
     "ShippedMismatch",
     "cross_check",
     "entry_hash",
     "parse_shipped",
+    "parse_shipped_anchors",
     "verify_export",
     "verify_exports",
 ]
@@ -93,12 +103,24 @@ EXPORT_FORMAT = "attenuo-audit-export-v2"
 SHIPPED_FORMAT = "attenuo-shipped-checkpoint-v1"
 #: The tool of a prune's own audit record.
 PRUNE_TOOL = "admin.audit.prune"
-# The envelope of a prune's signed anchor, shipped through the same sink (ADR-0015). Skipped
-# by `parse_shipped`: this package checks the anchor in an export's header, not shipped ones.
-_SHIPPED_ANCHOR_FORMAT = "attenuo-shipped-anchor-v1"
+#: Value of a shipped anchor's ``format`` member: the envelope of a prune's signed anchor, which
+#: the sink ships with the checkpoints (ADR-0015). :func:`parse_shipped` skips these lines and
+#: :func:`parse_shipped_anchors` reads them.
+SHIPPED_ANCHOR_FORMAT = "attenuo-shipped-anchor-v1"
 _CHECKPOINT_CONTEXT = "attenuo-checkpoint-v1"
 _ANCHOR_CONTEXT = "attenuo-audit-anchor-v1"
 _CP_FIELDS = ("seq", "head_hash", "at", "kid", "signature")
+_ANCHOR_FIELDS = (
+    "through_seq",
+    "through_hash",
+    "prune_seq",
+    "prune_entry_hash",
+    "previous_through_seq",
+    "archive_sha256",
+    "at",
+    "kid",
+    "signature",
+)
 _U64_MAX = 2**64 - 1
 _B64URL = re.compile(r"[A-Za-z0-9_-]*")
 
@@ -215,8 +237,51 @@ class ShippedMismatch:
 
 
 @dataclass(frozen=True)
+class ShippedAnchor:
+    """One shipped prune anchor (``attenuo-shipped-anchor-v1``) of a shipped file."""
+
+    #: 1-based line number in the file.
+    line: int
+    #: The nine members of the signed anchor: ``through_seq``, ``through_hash``, ``prune_seq``,
+    #: ``prune_entry_hash``, ``previous_through_seq``, ``archive_sha256``, ``at``, ``kid``,
+    #: ``signature`` (a missing optional member is ``None``).
+    anchor: Mapping[str, Any]
+    #: The envelope's ``format``, ``kid``, ``signature`` and ``anchor_sha256``, as shipped.
+    format: str
+    kid: str
+    signature: str
+    anchor_sha256: str
+    #: ``[server] public_url`` of the server that signed it, when set.
+    public_url: str | None = None
+
+
+@dataclass(frozen=True)
+class AnchorCheckReport:
+    """The shipped-anchor part of :func:`cross_check` (the fields of the Rust
+    ``AnchorCheckReport``)."""
+
+    #: Anchor lines in the shipped file.
+    shipped: int = 0
+    #: Shipped anchors whose prune record lies at or before the export's end: the export was
+    #: taken after that prune, so it must account for it (checked).
+    checked: int = 0
+    #: Of those, the ones the export accounts for.
+    matched: int = 0
+    #: Shipped anchors whose prune record is past the export's end (an archive, or an export
+    #: taken before that prune): not checked.
+    beyond_range: int = 0
+    #: Each shipped anchor the export does not account for, or that is unusable; ``seq`` is the
+    #: anchor's ``through_seq``. Also the header's own anchor (``line`` 0) when the shipped file
+    #: does not hold it.
+    mismatches: tuple[ShippedMismatch, ...] = ()
+    #: No mismatches.
+    ok: bool = True
+
+
+@dataclass(frozen=True)
 class CrossCheckReport:
-    """The verdict of :func:`cross_check` (the fields of the Rust ``CrossCheckReport``)."""
+    """The verdict of :func:`cross_check` (the fields of the Rust ``CrossCheckReport``, and the
+    shipped anchors in ``anchors``)."""
 
     #: Lines in the shipped file.
     shipped: int
@@ -231,8 +296,13 @@ class CrossCheckReport:
     last_shipped_seq: int | None
     #: In the order of the shipped file; the first is the first offending seq.
     mismatches: tuple[ShippedMismatch, ...]
-    #: No mismatches.
+    #: No mismatches here and none in ``anchors``.
     ok: bool
+    #: Shipped checkpoints before the export's range: not checked against its entries. The one
+    #: at the header anchor's ``through_seq`` is checked against the anchor.
+    below_range: int = 0
+    #: The shipped prune anchors of the same file, checked against the export.
+    anchors: AnchorCheckReport = field(default_factory=AnchorCheckReport)
 
 
 def entry_hash(seq: int, prev_hash: str, record: Mapping[str, Any]) -> str:
@@ -519,34 +589,115 @@ def parse_shipped(
     checkpoint is not an error here: the line carries ``inconsistency`` and
     :func:`cross_check` reports it.
     """
+    return _shipped_lines(_read_text(path_or_lines))
+
+
+def _shipped_lines(text: str) -> list[ShippedLine]:
     out: list[ShippedLine] = []
-    for n, raw in enumerate(_read_text(path_or_lines).split("\n"), start=1):
+    for n, raw in enumerate(text.split("\n"), start=1):
         line = raw.removesuffix("\r")
         if not line.strip():
             continue
         where = f"shipped checkpoints, line {n}"
         try:
-            obj = _loads(line)
+            values = _line_values(line)
         except ValueError as e:
             raise ExportError(f"{where}: {e}") from e
-        if not isinstance(obj, dict):
-            raise ExportError(f"{where}: not a JSON object")
-        if obj.get("format") == _SHIPPED_ANCHOR_FORMAT:
-            continue
-        if "checkpoint" in obj:
-            _need(obj, where, format="str", kid="str", signature="str", checkpoint_sha256="str")
-            if obj.get("public_url") is not None and not isinstance(obj["public_url"], str):
-                raise ExportError(f"{where}: `public_url` must be a string")
-            if not isinstance(obj["checkpoint"], dict):
-                raise ExportError(f"{where}: `checkpoint` must be an object")
-            cp = _cp5(_checkpoint(obj["checkpoint"], where))
-            out.append(ShippedLine(n, cp, _inconsistency(obj, cp)))
-        else:
-            kind = obj.pop("type", "checkpoint")
-            if kind != "checkpoint":
-                raise ExportError(f"{where}: not a checkpoint line (type {json.dumps(kind)})")
-            out.append(ShippedLine(n, _cp5(_checkpoint(obj, where))))
+        for obj in values:
+            if not isinstance(obj, dict):
+                raise ExportError(f"{where}: not a JSON object")
+            if obj.get("format") == SHIPPED_ANCHOR_FORMAT:
+                continue
+            if "checkpoint" in obj:
+                _need(obj, where, format="str", kid="str", signature="str", checkpoint_sha256="str")
+                _public_url(obj, where)
+                if not isinstance(obj["checkpoint"], dict):
+                    raise ExportError(f"{where}: `checkpoint` must be an object")
+                cp = _cp5(_checkpoint(obj["checkpoint"], where))
+                out.append(ShippedLine(n, cp, _inconsistency(obj, cp)))
+            else:
+                kind = obj.pop("type", "checkpoint")
+                if kind != "checkpoint":
+                    raise ExportError(f"{where}: not a checkpoint line (type {json.dumps(kind)})")
+                out.append(ShippedLine(n, _cp5(_checkpoint(obj, where))))
     return out
+
+
+def parse_shipped_anchors(
+    path_or_lines: str | os.PathLike[str] | Iterable[str | bytes],
+) -> list[ShippedAnchor]:
+    """Every shipped prune anchor of a shipped file: the values of a line that have an
+    ``anchor`` member, with their 1-based line number. Other lines are skipped, and so is a line
+    that is not JSON (:func:`parse_shipped` reports it). Objects written back to back on one
+    line (S3 objects joined with ``cat``, which adds no newline) are each read.
+
+    Raises :class:`ExportError` naming the line when a value with an ``anchor`` member is not a
+    shipped anchor (a member missing or of the wrong type). An envelope that disagrees with its
+    anchor is not an error here: :func:`cross_check` reports it.
+    """
+    return _shipped_anchors(_read_text(path_or_lines))
+
+
+def _shipped_anchors(text: str) -> list[ShippedAnchor]:
+    out: list[ShippedAnchor] = []
+    for n, raw in enumerate(text.split("\n"), start=1):
+        line = raw.removesuffix("\r")
+        if not line.strip():
+            continue
+        try:
+            values = _line_values(line)
+        except ValueError:
+            continue
+        where = f"shipped anchors, line {n}"
+        for obj in values:
+            if not isinstance(obj, dict) or "anchor" not in obj:
+                continue
+            _need(obj, where, format="str", kid="str", signature="str", anchor_sha256="str")
+            _public_url(obj, where)
+            a = _anchor(obj["anchor"], f"{where}: anchor")
+            out.append(
+                ShippedAnchor(
+                    line=n,
+                    anchor=_a9(a),
+                    format=obj["format"],
+                    kid=obj["kid"],
+                    signature=obj["signature"],
+                    anchor_sha256=obj["anchor_sha256"],
+                    public_url=obj.get("public_url"),
+                )
+            )
+    return out
+
+
+def _public_url(obj: Mapping[str, Any], where: str) -> None:
+    if obj.get("public_url") is not None and not isinstance(obj["public_url"], str):
+        raise ExportError(f"{where}: `public_url` must be a string")
+
+
+def _a9(a: Mapping[str, Any]) -> dict[str, Any]:
+    return {k: a.get(k) for k in _ANCHOR_FIELDS}
+
+
+def _anchor_sha256(a: Mapping[str, Any]) -> str:
+    """Hex SHA-256 of the RFC 8785 canonical JSON of the nine anchor members."""
+    # Members in code-unit order; the integers by hand, as in `_checkpoint_sha256`.
+    data = (
+        b'{"archive_sha256":%s,"at":%s,"kid":%s,"previous_through_seq":%s,'
+        b'"prune_entry_hash":%s,"prune_seq":%d,"signature":%s,"through_hash":%s,'
+        b'"through_seq":%d}'
+        % (
+            rfc8785.dumps(a.get("archive_sha256")),
+            rfc8785.dumps(a["at"]),
+            rfc8785.dumps(a["kid"]),
+            _opt_uint(a.get("previous_through_seq")),
+            rfc8785.dumps(a["prune_entry_hash"]),
+            a["prune_seq"],
+            rfc8785.dumps(a["signature"]),
+            rfc8785.dumps(a["through_hash"]),
+            a["through_seq"],
+        )
+    )
+    return hashlib.sha256(data).hexdigest()
 
 
 def _cp5(c: Mapping[str, Any]) -> dict[str, Any]:
@@ -599,18 +750,39 @@ def cross_check(
     - the export's entry at that seq must hash to the shipped ``head_hash``.
 
     Two different shipped checkpoints for one seq are reported too, and so is an envelope whose
-    ``kid``, ``signature`` or ``checkpoint_sha256`` disagrees with its checkpoint. This does not
-    replace :func:`verify_export`: run both.
+    ``kid``, ``signature`` or ``checkpoint_sha256`` disagrees with its checkpoint. A shipped
+    checkpoint before the export's range is counted in ``below_range``; the one at the header
+    anchor's ``through_seq`` must name the anchor's ``through_hash``.
+
+    The shipped prune anchors of the same file are checked too, into ``anchors``
+    (:class:`AnchorCheckReport`), as the Rust ``cross_check_anchors`` does. Each must verify
+    and agree with its envelope. Then, for an anchor whose prune record (``prune_seq``) is at or
+    before the export's last seq:
+
+    - an anchor below the export's start is an older prune, accounted for;
+    - the anchor of the boundary right before the export's start must be the header's anchor;
+    - an anchor whose boundary is at or past the export's start says entries the export holds
+      were pruned: the log was **rewound** (a restored backup, or the anchor row removed).
+
+    An anchor whose prune record is past the export's end is not checked, except when its
+    boundary lies inside the export and is not its last entry: the export then holds entries a
+    later prune removed. A header anchor that the file does not hold is a mismatch too.
+
+    ``ok`` is true only when both checks pass. This does not replace :func:`verify_export`: run
+    both.
     """
     keys = _load_keys(checkpoint_public_keys)
     header, entries, cps = _parse(_read_text(export))
-    lines = parse_shipped(shipped)
+    shipped_text = _read_text(shipped)
+    lines = _shipped_lines(shipped_text)
+    anchors = _check_anchors(header, entries, _shipped_anchors(shipped_text), keys)
     lo, hi = header["from"], header["to"]
+    header_anchor = header.get("anchor")
     exported = {c["seq"]: _cp5(c) for c in cps}
     entry_hashes = {e["seq"]: e["entry_hash"] for e in entries}
     first_by_seq: dict[int, ShippedLine] = {}
     mismatches: list[ShippedMismatch] = []
-    in_range = matched = beyond = 0
+    in_range = matched = beyond = below = 0
     for s in lines:
         cp = s.checkpoint
         seq = cp["seq"]
@@ -636,6 +808,16 @@ def cross_check(
             beyond += 1
             continue
         if seq < lo and not (seq == 0 and lo <= 1):
+            below += 1
+            if header_anchor is not None and header_anchor["through_seq"] == seq:
+                why = _verify_checkpoint(cp, keys)
+                if why is not None:
+                    fail(f"shipped checkpoint does not verify: {why}")
+                elif cp["head_hash"] != header_anchor["through_hash"]:
+                    fail(
+                        "the shipped checkpoint at the anchor's through_seq names another hash "
+                        "than the anchor (history rewritten before the prune)"
+                    )
             continue
         in_range += 1
         why = _verify_checkpoint(cp, keys)
@@ -671,6 +853,115 @@ def cross_check(
         matched=matched,
         beyond_range=beyond,
         last_shipped_seq=max((s.checkpoint["seq"] for s in lines), default=None),
+        mismatches=tuple(mismatches),
+        ok=not mismatches and anchors.ok,
+        below_range=below,
+        anchors=anchors,
+    )
+
+
+def _check_anchors(
+    header: Mapping[str, Any],
+    entries: list[dict[str, Any]],
+    shipped: list[ShippedAnchor],
+    keys: dict[str, bytes],
+) -> AnchorCheckReport:
+    """The Rust ``cross_check_anchors``, rule for rule."""
+    lo, hi = header["from"], header["to"]
+    last = max(entries[-1]["seq"], hi) if entries else hi
+    end = entries[-1]["seq"] if entries else None
+    raw_header_anchor = header.get("anchor")
+    header_anchor = None if raw_header_anchor is None else _a9(raw_header_anchor)
+    mismatches: list[ShippedMismatch] = []
+    checked = matched = beyond = 0
+    first_by_through: dict[int, ShippedAnchor] = {}
+    header_seen = False
+    for s in shipped:
+        a = s.anchor
+        through = a["through_seq"]
+
+        def fail(reason: str, s: ShippedAnchor = s, through: int = through) -> None:
+            mismatches.append(ShippedMismatch(through, s.line, reason))
+
+        if s.format != SHIPPED_ANCHOR_FORMAT:
+            fail(f"shipped envelope is inconsistent: unsupported format `{s.format}`")
+            continue
+        if s.kid != a["kid"] or s.signature != a["signature"]:
+            fail(
+                "shipped envelope is inconsistent: `kid` or `signature` differs from the "
+                "anchor's own"
+            )
+            continue
+        if s.anchor_sha256 != _anchor_sha256(a):
+            fail("shipped envelope is inconsistent: `anchor_sha256` does not match the anchor")
+            continue
+        why = _verify_anchor(a, keys)
+        if why is not None:
+            fail(f"shipped anchor does not verify: {why}")
+            continue
+        prev = first_by_through.get(through)
+        if prev is not None:
+            if prev.anchor != a:
+                fail(
+                    "the sink holds two different anchors for this boundary "
+                    f"(lines {prev.line} and {s.line}): the log was pruned through this seq twice"
+                )
+            continue  # else: a retried delivery, same content, counted once
+        first_by_through[through] = s
+        # The boundary right before the export's start: its header's anchor, wherever the
+        # export ends.
+        at_start = through + 1 == lo
+        if a["prune_seq"] > last and not at_start:
+            # An archive ends at its prune's boundary; a boundary strictly inside the export
+            # says the export holds entries that a later prune removed.
+            if lo <= through <= last and through != end:
+                checked += 1
+                fail(
+                    f"the shipped prune through seq {through} (its record at seq "
+                    f"{a['prune_seq']} is past this export's end at seq {last}) has its "
+                    "boundary inside this export: the export was taken before that prune, or "
+                    "the log was rewound to before it; check an export taken now"
+                )
+                continue
+            beyond += 1
+            continue
+        checked += 1
+        if through + 1 < lo:
+            matched += 1
+        elif at_start:
+            header_seen = True
+            if header_anchor is None:
+                fail(
+                    "the export starts right after this shipped anchor's boundary, but its "
+                    "header carries no anchor"
+                )
+            elif header_anchor == a:
+                matched += 1
+            else:
+                fail(
+                    "the export's header carries another anchor for this boundary than the "
+                    "one shipped"
+                )
+        else:
+            fail(
+                f"REWOUND: the shipped anchor says the log was pruned through seq {through}, "
+                f"but the export holds entries from seq {lo} (a restored backup, or the anchor "
+                "row removed)"
+            )
+    if header_anchor is not None and not header_seen:
+        mismatches.append(
+            ShippedMismatch(
+                header_anchor["through_seq"],
+                0,
+                "the export's header anchor is not in the shipped file (it was not shipped, or "
+                "the file is incomplete)",
+            )
+        )
+    return AnchorCheckReport(
+        shipped=len(shipped),
+        checked=checked,
+        matched=matched,
+        beyond_range=beyond,
         mismatches=tuple(mismatches),
         ok=not mismatches,
     )
@@ -719,6 +1010,24 @@ def _no_const(name: str) -> Any:
 
 def _loads(text: str) -> Any:
     return json.loads(text, object_pairs_hook=_no_dupes, parse_constant=_no_const)
+
+
+_DECODER = json.JSONDecoder(object_pairs_hook=_no_dupes, parse_constant=_no_const)
+_JSON_WS = " \t\n\r"
+
+
+def _line_values(line: str) -> list[Any]:
+    """The JSON values of one line: usually one, or several objects written back to back (S3
+    objects joined with ``cat``, which adds no newline between them)."""
+    out: list[Any] = []
+    i, n = 0, len(line)
+    while True:
+        while i < n and line[i] in _JSON_WS:
+            i += 1
+        if i >= n:
+            return out
+        value, i = _DECODER.raw_decode(line, i)
+        out.append(value)
 
 
 def _is_uint(v: Any) -> bool:
@@ -805,10 +1114,13 @@ def _check_header(h: Any) -> dict[str, Any]:
     return h
 
 
-def _anchor(a: Any) -> dict[str, Any]:
+def _anchor(a: Any, where: str = "header anchor") -> dict[str, Any]:
     if not isinstance(a, dict):
-        raise ExportError("header: `anchor` must be an object")
-    where = "header anchor"
+        raise ExportError(
+            "header: `anchor` must be an object"
+            if where == "header anchor"
+            else f"{where}: must be an object"
+        )
     _need(
         a,
         where,

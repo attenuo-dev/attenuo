@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { canonicalize, parseJson } from "../src/jcs.js";
+import { canonicalize, parseJson, parseJsonValues } from "../src/jcs.js";
 
 // The known answers are the RFC 8785 examples (sections 3.2.2, 3.2.3 and Appendix B), the same
 // ones crates/attenuo-core/src/jcs.rs checks against the Rust implementation.
@@ -150,5 +150,22 @@ describe("parseJson", () => {
     expect(Object.keys(v)).toEqual(["__proto__"]);
     expect(({} as Record<string, unknown>).x).toBeUndefined();
     expect(canonicalize(v)).toBe('{"__proto__":{"x":1}}');
+  });
+});
+
+describe("parseJsonValues", () => {
+  it("reads values written back to back, as S3 objects joined with cat are", () => {
+    expect(parseJsonValues('{"a":1}{"b":[2]} {"c":null}\n')).toEqual([
+      { a: 1 },
+      { b: [2] },
+      { c: null },
+    ]);
+    expect(parseJsonValues(" \t ")).toEqual([]);
+  });
+
+  it("is as strict as parseJson for each value", () => {
+    expect(() => parseJsonValues('{"a":1}{"a":1,"a":2}')).toThrow("duplicate member");
+    expect(() => parseJsonValues('{"a":1}x')).toThrow("unexpected character");
+    expect(() => parseJson('{"a":1}{"b":2}')).toThrow("trailing characters");
   });
 });

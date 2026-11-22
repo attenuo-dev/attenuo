@@ -53,6 +53,18 @@ const NUMBER = /-?(?:0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?/y;
  * `AttenuoError` with the offset of the problem.
  */
 export function parseJson(text: string): JsonValue {
+  return parseValues(text, false)[0] as JsonValue;
+}
+
+/**
+ * Parse text that holds JSON values one after the other, as `parseJson` parses one: S3 objects
+ * joined with `cat`, which adds no newline between them. Whitespace alone gives `[]`.
+ */
+export function parseJsonValues(text: string): JsonValue[] {
+  return parseValues(text, true);
+}
+
+function parseValues(text: string, many: boolean): JsonValue[] {
   let i = 0;
   const fail = (msg: string): never => {
     throw new AttenuoError(`invalid JSON at offset ${i}: ${msg}`);
@@ -194,8 +206,17 @@ export function parseJson(text: string): JsonValue {
     if (!Number.isFinite(n)) return fail("number out of range");
     return n;
   };
-  const v = value(0);
+  if (!many) {
+    const v = value(0);
+    ws();
+    if (i < text.length) fail("trailing characters");
+    return [v];
+  }
+  const out: JsonValue[] = [];
   ws();
-  if (i < text.length) fail("trailing characters");
-  return v;
+  while (i < text.length) {
+    out.push(value(0));
+    ws();
+  }
+  return out;
 }
