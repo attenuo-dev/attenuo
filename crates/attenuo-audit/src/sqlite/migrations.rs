@@ -309,7 +309,8 @@ fn v4_lease_subject_issuer(conn: &Connection) -> Result<(), AuditError> {
 /// Migration 5: the `audit_anchors` table of audit retention (ADR-0015). One row per prune:
 /// the signed [`Anchor`](crate::checkpoint::Anchor) that says the log starts after
 /// `through_seq`, and `state`, `deleting` until the batched deletes of the rows at or below
-/// `through_seq` are done, then `done`. It starts empty, and no existing row changes: a file
+/// `through_seq` are done, then `done`; and `shipped_at`, the time `[audit.sink]` delivered the
+/// anchor, null until then (the server queues an anchor again while it is null). It starts empty, and no existing row changes: a file
 /// that is never pruned keeps its chain and checkpoints exactly as they were.
 fn v5_audit_anchors(conn: &Connection) -> Result<(), AuditError> {
     conn.execute_batch(ANCHOR_SCHEMA)?;

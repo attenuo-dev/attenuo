@@ -60,6 +60,10 @@ pub struct StoredAnchor {
     pub anchor: Anchor,
     /// Where its batched deletes are.
     pub state: AnchorState,
+    /// When `[audit.sink]` delivered the anchor (RFC 3339); `None` until then. The server
+    /// queues an undelivered anchor again at start-up, and refuses the next prune with
+    /// `sink_behind` until it is delivered.
+    pub shipped_at: Option<String>,
 }
 
 /// Which guard refused a prune ([`AuditError::PruneRefused`]). Each has its own HTTP code.
@@ -189,8 +193,11 @@ pub struct PlanGuards {
     pub sink_degraded: bool,
     /// A prune is still deleting: nothing can be pruned until it is done.
     pub in_progress: bool,
-    /// The guard that set `through` below `requested`, by its refusal code; `None` when
-    /// `through` is the request.
+    /// With a sink: the anchor of the newest prune is not delivered yet, so nothing can be
+    /// pruned until it is (`sink_behind`). False for a log never pruned or without a sink.
+    pub anchor_undelivered: bool,
+    /// What set `through` below `requested`: the refusal code of a guard, or `"before"` when
+    /// it was the `before` time asked for; `None` when `through` is the request.
     pub limited_by: Option<&'static str>,
 }
 
@@ -217,7 +224,8 @@ fn db_size_of(conn: &Connection) -> Result<(u64, u64), AuditError> {
 }
 
 const ANCHOR_COLUMNS: &str = "through_seq, through_hash, prune_seq, prune_entry_hash, \
-                              previous_through_seq, archive_sha256, at, kid, signature, state";
+                              previous_through_seq, archive_sha256, at, kid, signature, state, \
+                              shipped_at";
 
 fn u64_of(v: i64) -> u64 {
     u64::try_from(v).unwrap_or(0)
@@ -242,6 +250,7 @@ fn anchor_from_row(row: &Row<'_>) -> rusqlite::Result<StoredAnchor> {
         } else {
             AnchorState::Deleting
         },
+        shipped_at: row.get(10)?,
     })
 }
 
@@ -289,7 +298,7 @@ fn insert_anchor(conn: &Connection, a: &Anchor, state: AnchorState) -> Result<()
     conn.execute(
         &format!(
             "INSERT INTO audit_anchors ({ANCHOR_COLUMNS}) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL)"
         ),
         params![
             seq_to_i64(a.through_seq)?,
@@ -319,15 +328,28 @@ fn entry_link(conn: &Connection, seq: u64) -> Result<Option<(String, String)>, A
 }
 
 /// The first record of any delegation chain whose root lease is still in the registry (the
-/// `leases` table of the same file), through `audit_chain_id_idx`.
+/// `leases` table of the same file). One lookup per root lease, each the first entry of
+/// `audit_chain_id_idx` for that chain (the index is ordered by `(chain_id, seq)`), so the cost
+/// grows with the number of roots in the registry and not with the records of their chains.
+/// It runs under the write gate in a prune. Its plan is pinned by a test.
+pub(super) const LIVE_RUN_SQL: &str = "SELECT MIN((SELECT a.seq FROM audit a \
+     WHERE a.chain_id = l.id ORDER BY a.seq LIMIT 1)) \
+     FROM leases l WHERE l.parent IS NULL";
+
 fn live_run_seq(conn: &Connection) -> Result<Option<u64>, AuditError> {
     let min: Option<i64> = conn
-        .prepare_cached(
-            "SELECT MIN(seq) FROM audit \
-             WHERE chain_id IN (SELECT id FROM leases WHERE parent IS NULL)",
-        )?
+        .prepare_cached(LIVE_RUN_SQL)?
         .query_row([], |r| r.get(0))?;
     Ok(min.map(u64_of))
+}
+
+/// `now - min_age`, or the earliest time there is when that does not fit (a `min_age` of
+/// centuries), so that nothing is old enough rather than a panic under the writer's lock.
+fn age_cutoff(limits: &PruneLimits) -> OffsetDateTime {
+    limits
+        .now
+        .checked_sub(limits.min_age)
+        .unwrap_or(time::PrimitiveDateTime::MIN.assume_utc())
 }
 
 fn refused(guard: PruneGuard, detail: impl Into<String>) -> AuditError {
@@ -387,7 +409,7 @@ fn check_guards(
         }
     };
     let at = parse_time(&at)?;
-    if at > limits.now - limits.min_age {
+    if at > age_cutoff(limits) {
         return Err(refused(
             PruneGuard::TooRecent,
             format!(
@@ -408,6 +430,18 @@ fn check_guards(
         ));
     }
     if let Some(sink) = limits.sink {
+        // The anchor of the prune before must be off the host before another prune: it is
+        // the only record of where the log starts that is not in this file.
+        if let Some(prev) = newest_anchor(conn)?.filter(|a| a.shipped_at.is_none()) {
+            return Err(refused(
+                PruneGuard::SinkBehind,
+                format!(
+                    "[audit.sink] has not delivered the anchor of the prune through seq {} yet; \
+                     try again once it has",
+                    prev.anchor.through_seq
+                ),
+            ));
+        }
         if sink.degraded || sink.delivered_through.is_none_or(|d| d < through) {
             return Err(refused(
                 PruneGuard::SinkBehind,
@@ -482,6 +516,45 @@ impl SqliteAudit {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// The anchors `[audit.sink]` has not delivered yet (`shipped_at` null), oldest first: the
+    /// server queues them again at start-up.
+    ///
+    /// # Errors
+    ///
+    /// As [`pruned_through`](Self::pruned_through).
+    pub fn unshipped_anchors(&self) -> Result<Vec<StoredAnchor>, AuditError> {
+        let conn = self.read_conn()?;
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT {ANCHOR_COLUMNS} FROM audit_anchors WHERE shipped_at IS NULL \
+             ORDER BY through_seq"
+        ))?;
+        let rows = stmt.query_map([], anchor_from_row)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Record that `[audit.sink]` delivered the anchor through `through_seq` at `at`. Only the
+    /// first delivery is kept; an unknown anchor changes nothing. `shipped_at` is not signed:
+    /// it only drives the re-queueing and the `sink_behind` guard.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Poisoned`] when a writer panicked holding the log's lock, or
+    /// [`AuditError::Sqlite`] when the update fails.
+    pub fn mark_anchor_shipped(
+        &self,
+        through_seq: u64,
+        at: OffsetDateTime,
+    ) -> Result<(), AuditError> {
+        let conn = self.inner.conn.lock()?;
+        let _gate = self.inner.gate.hold();
+        conn.execute(
+            "UPDATE audit_anchors SET shipped_at = ?2 \
+             WHERE through_seq = ?1 AND shipped_at IS NULL",
+            params![seq_to_i64(through_seq)?, fmt_utc(at)],
+        )?;
+        Ok(())
+    }
+
     /// The size of the database file as SQLite sees it, `(page_count * page_size,
     /// freelist_count * page_size)` in bytes: the second is the part a `DELETE` freed, which
     /// new rows reuse; the file does not shrink without `VACUUM`.
@@ -527,6 +600,27 @@ impl SqliteAudit {
         bound: PlanBound,
         limits: &PruneLimits,
     ) -> Result<PrunePlan, AuditError> {
+        self.plan_with_scan(bound, limits, PLAN_SCAN)
+    }
+
+    /// Tests: [`prune_plan`](Self::prune_plan) looking at most `scan` checkpoints.
+    #[cfg(any(test, feature = "testing"))]
+    #[doc(hidden)]
+    pub fn prune_plan_with_scan(
+        &self,
+        bound: PlanBound,
+        limits: &PruneLimits,
+        scan: i64,
+    ) -> Result<PrunePlan, AuditError> {
+        self.plan_with_scan(bound, limits, scan)
+    }
+
+    fn plan_with_scan(
+        &self,
+        bound: PlanBound,
+        limits: &PruneLimits,
+        scan: i64,
+    ) -> Result<PrunePlan, AuditError> {
         let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         let anchor = newest_anchor(&tx)?;
@@ -536,10 +630,12 @@ impl SqliteAudit {
             PlanBound::Through(b) => (b.min(head), None),
             PlanBound::Before(t) => (head, Some(t)),
         };
-        let cutoff = limits.now - limits.min_age;
+        let cutoff = age_cutoff(limits);
         let live = live_run_seq(&tx)?;
         let in_progress = deleting_anchor(&tx)?.is_some();
         let sink = limits.sink;
+        let anchor_undelivered =
+            sink.is_some() && anchor.as_ref().is_some_and(|a| a.shipped_at.is_none());
         let mut guards = PlanGuards {
             requested,
             before: before.map(fmt_utc),
@@ -548,6 +644,7 @@ impl SqliteAudit {
             sink_delivered_through: sink.and_then(|s| s.delivered_through),
             sink_degraded: sink.is_some_and(|s| s.degraded),
             in_progress,
+            anchor_undelivered,
             limited_by: None,
         };
         // The bounds that do not depend on the entry's time, tightest first.
@@ -562,7 +659,7 @@ impl SqliteAudit {
             limit(0, PruneGuard::InProgress.code(), &mut upper);
         }
         if let Some(s) = sink {
-            let delivered = if s.degraded {
+            let delivered = if s.degraded || anchor_undelivered {
                 0
             } else {
                 s.delivered_through.unwrap_or(0)
@@ -571,6 +668,38 @@ impl SqliteAudit {
         }
         if let Some(l) = live {
             limit(l.saturating_sub(1), PruneGuard::LiveRun.code(), &mut upper);
+        }
+        // The newest entry that is old enough (and older than `before`), found by a binary
+        // search on seq, so that the checkpoint scan below starts near it and not at the head
+        // of a busy log. Entry times are in seq order but for clock steps; the scan checks
+        // each checkpoint's own entry again, so a step can only make the plan smaller.
+        if upper > floor {
+            let old_enough = |seq: u64| -> Result<Option<&'static str>, AuditError> {
+                let Some((_, at)) = entry_link(&tx, seq)? else {
+                    return Ok(Some(PruneGuard::NotAtCheckpoint.code()));
+                };
+                let t = parse_time(&at)?;
+                Ok(if t > cutoff {
+                    Some(PruneGuard::TooRecent.code())
+                } else if before.is_some_and(|b| t >= b) {
+                    Some("before")
+                } else {
+                    None
+                })
+            };
+            if let Some(code) = old_enough(upper)? {
+                let (mut lo, mut hi) = (floor, upper - 1);
+                // The largest seq in (floor, upper) that is old enough, or `floor`.
+                while lo < hi {
+                    let mid = lo + (hi - lo).div_ceil(2);
+                    if old_enough(mid)?.is_none() {
+                        lo = mid;
+                    } else {
+                        hi = mid - 1;
+                    }
+                }
+                limit(lo, code, &mut upper);
+            }
         }
         // The newest checkpoint at or below `upper` that matches its entry and is old
         // enough (and older than `before`). Why the first one looked at was passed over says
@@ -586,7 +715,7 @@ impl SqliteAudit {
             let mut rows = stmt.query(params![
                 i64::try_from(upper).unwrap_or(i64::MAX),
                 i64::try_from(floor).unwrap_or(i64::MAX),
-                PLAN_SCAN
+                scan
             ])?;
             while let Some(row) = rows.next()? {
                 let cp = checkpoint_from_row(row)?;
@@ -765,6 +894,7 @@ impl SqliteAudit {
                 anchor: StoredAnchor {
                     anchor: anchor.clone(),
                     state: AnchorState::Deleting,
+                    shipped_at: None,
                 },
                 checkpoint_before: Some(before.0),
                 checkpoint_after: Some(after.clone()),
@@ -804,6 +934,11 @@ impl SqliteAudit {
     /// [`AuditError::Sqlite`] when the transaction fails (it rolls back; the next call
     /// retries).
     pub fn prune_step(&self, batch_rows: usize) -> Result<PruneStep, AuditError> {
+        // Most ticks find nothing to delete: say so from the reader, without a write
+        // transaction. A prune that commits meanwhile is found by the next tick.
+        if self.reader.is_some() && deleting_anchor(&*self.read_conn()?)?.is_none() {
+            return Ok(PruneStep::default());
+        }
         let mut conn = self.inner.conn.lock()?;
         let _gate = self.inner.gate.hold();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;

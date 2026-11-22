@@ -391,6 +391,7 @@ impl SignedVerifyReport {
             entries: self.entries,
             ok: self.first_bad_seq.is_none(),
             first_bad_seq: self.first_bad_seq,
+            unauthenticated_start: None,
         }
     }
 }

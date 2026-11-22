@@ -137,8 +137,9 @@ allow_network_filesystem = false
 # never prunes. "manual" lets the admin prune through GET /admin/audit/prune/plan and
 # POST /admin/audit/prune, after exporting and keeping the archive; it needs [audit.sink] and a
 # file sqlite_path ("auto" is not built). Nothing younger than min_age_seconds is pruned, and
-# it may not be below [leases] retention_seconds + run_state_retention_seconds. The rows are
-# deleted afterwards, batch_rows per transaction (1 to 1000000), by the maintenance task.
+# it may not be below [leases] retention_seconds + run_state_retention_seconds, nor below
+# [leases] user_window_retention_seconds (at most 100 years). The rows are deleted afterwards,
+# batch_rows per transaction (1 to 1000000), by the maintenance task.
 [audit.retention]
 prune = "off"
 min_age_seconds = 7776000

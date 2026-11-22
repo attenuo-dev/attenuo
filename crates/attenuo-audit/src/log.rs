@@ -94,6 +94,11 @@ pub struct VerifyReport {
     /// Sequence number of the first entry that fails verification. For a deleted entry this is
     /// the seq of the entry that follows the gap, since the deleted one is no longer present.
     pub first_bad_seq: Option<u64>,
+    /// Set for a pruned log: the walk started right after this seq, where the newest anchor
+    /// row says the log starts, and that row's signature was **not** checked (this walk has no
+    /// keys). `entries` counts from there. Only a signed verify authenticates the start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unauthenticated_start: Option<u64>,
 }
 
 /// Verify an ordered stream of entries. An entry is bad when its seq is not the previous seq + 1
@@ -139,6 +144,7 @@ where
                     entries: count,
                     ok: false,
                     first_bad_seq: Some(seq),
+                    unauthenticated_start: None,
                 })
             }
             Err(e) => return Err(e),
@@ -160,6 +166,7 @@ where
                 entries: count,
                 ok: false,
                 first_bad_seq: Some(entry.seq),
+                unauthenticated_start: None,
             });
         };
         on_ok(&entry);
@@ -170,6 +177,7 @@ where
         entries: count,
         ok: true,
         first_bad_seq: None,
+        unauthenticated_start: None,
     })
 }
 
@@ -207,6 +215,13 @@ pub trait AuditSink: Send + Sync {
     fn range(&self, from_seq: u64, limit: usize) -> Result<Vec<AuditEntry>, AuditError>;
 
     /// Walk the whole chain and report the first break, if any.
+    ///
+    /// For a pruned log (ADR-0015) the walk starts where the newest anchor row says the log
+    /// starts, and that row is not authenticated here: there are no keys to check its
+    /// signature, so a forged row is taken at its word. The report says so in
+    /// [`VerifyReport::unauthenticated_start`]. The signed verify
+    /// (`SqliteAudit::verify_chain_signed`) checks the anchor; no user-facing path calls this
+    /// one.
     ///
     /// # Errors
     ///

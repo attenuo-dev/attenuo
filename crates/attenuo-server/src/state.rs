@@ -250,6 +250,9 @@ impl AppState {
             metrics.clone(),
             checkpoint_sink.as_ref().map(|s| s.handle()),
         )?;
+        if let Some(sink) = &checkpoint_sink {
+            ship_unshipped_anchors(sink, &audit, clock.clone())?;
+        }
         // The DPoP restart fence, from the liveness marker in the same file; none in memory.
         let (dpop, dpop_heartbeat) = if store_fence.is_some() {
             let (dpop, heartbeat) = restart_fence(dpop, &leases, clock.clone())?;
@@ -772,6 +775,38 @@ fn restart_fence(
     let heartbeat = LivenessHeartbeat::spawn(liveness.clone(), clock, period)
         .context("starting the DPoP liveness thread")?;
     Ok((dpop.with_restart_fence(previous, liveness), heartbeat))
+}
+
+/// Record each anchor `[audit.sink]` delivers (`shipped_at`, ADR-0015), and queue again every
+/// anchor not delivered yet: one queued before a restart, or before the sink was set. Weak, so
+/// the sink's thread does not keep the store alive.
+fn ship_unshipped_anchors(
+    sink: &crate::sink::CheckpointSink,
+    audit: &Arc<SqliteAudit>,
+    clock: Arc<dyn attenuo_core::Clock>,
+) -> anyhow::Result<()> {
+    let weak = Arc::downgrade(audit);
+    sink.on_anchor_delivered(move |a| {
+        let Some(audit) = weak.upgrade() else { return };
+        if let Err(e) = audit.mark_anchor_shipped(a.through_seq, clock.now_utc()) {
+            // The anchor is queued again at the next start; a second copy is harmless.
+            tracing::error!(error = %e, through_seq = a.through_seq, "recording an anchor's delivery failed");
+        }
+    });
+    let unshipped = audit
+        .unshipped_anchors()
+        .context("reading the prune anchors not yet shipped")?;
+    let handle = sink.handle();
+    for a in &unshipped {
+        handle.push_anchor(&a.anchor);
+    }
+    if !unshipped.is_empty() {
+        tracing::warn!(
+            anchors = unshipped.len(),
+            "[audit.sink] queued again the prune anchors it had not delivered before the restart"
+        );
+    }
+    Ok(())
 }
 
 /// Report the database's size on the metrics (`audit_db_size_bytes`, `audit_db_free_bytes`),

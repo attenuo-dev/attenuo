@@ -240,6 +240,10 @@ async fn a_prune_end_to_end_with_a_file_sink() {
     let rep = verify_export(&parse_export(&archive).unwrap(), &keys).unwrap();
     assert!(rep.report.ok && rep.from_genesis, "{rep:?}");
     let digest = hex::encode(sha2::Sha256::digest(archive.as_bytes()));
+    // A real cursor of a page that ends below the boundary, taken before the prune.
+    let (_, page) = h.get("/admin/audit?limit=3").await;
+    let cursor = page["next_cursor"].as_str().unwrap().to_string();
+    assert_eq!(page["entries"][2]["seq"], 3);
 
     // The prune.
     let (status, out) = h.prune(20, Some(&digest)).await;
@@ -252,9 +256,12 @@ async fn a_prune_end_to_end_with_a_file_sink() {
     assert_eq!(out["already"], false);
     assert_eq!(out["anchor"]["archive_sha256"], digest.as_str());
     assert_eq!(out["shipped"]["queued"], true);
-    let record = h.state.audit.entry_at(36).unwrap().unwrap().record;
+    let prune_entry = h.state.audit.entry_at(36).unwrap().unwrap().record;
     assert_eq!(
-        (record.tool.as_str(), record.originating_subject.as_str()),
+        (
+            prune_entry.tool.as_str(),
+            prune_entry.originating_subject.as_str()
+        ),
         (PRUNE_TOOL, "urn:attenuo:admin")
     );
     // A repeat is idempotent; another digest for the same boundary is a conflict.
@@ -286,6 +293,12 @@ async fn a_prune_end_to_end_with_a_file_sink() {
     let (_, body) = h.get("/admin/audit?from=1&limit=3").await;
     assert_eq!(body["first"], 21);
     assert_eq!(body["entries"][0]["seq"], 21);
+    // The cursor below the boundary resumes at B + 1.
+    let (status, body) = h
+        .get(&format!("/admin/audit?limit=3&cursor={cursor}"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["entries"][0]["seq"], 21, "{body}");
     let (_, body) = h.get("/admin/audit?order=desc&to=15").await;
     assert_eq!(body["entries"], json!([]));
     assert_eq!(body["next_cursor"], Value::Null);
@@ -392,6 +405,70 @@ async fn a_prune_end_to_end_with_a_file_sink() {
     }
     let r = cross_check(&export, &cps, &keys);
     assert!(r.ok, "{r:?}");
+
+    // The delivery is recorded and reported.
+    let s = h.state.clone();
+    wait_for(move || {
+        s.audit
+            .newest_anchor()
+            .ok()
+            .flatten()
+            .is_some_and(|a| a.shipped_at.is_some())
+    })
+    .await;
+    let (_, anchors) = h.get("/admin/audit/anchors").await;
+    assert!(anchors["anchors"][0]["shipped_at"].is_string(), "{anchors}");
+    let (_, again) = h.prune(20, Some(&digest)).await;
+    assert!(again["shipped"]["anchor_shipped_at"].is_string(), "{again}");
+    assert_eq!(
+        (
+            &again["shipped"]["queued"],
+            &again["shipped"]["anchor_pending"]
+        ),
+        (&json!(false), &json!(false)),
+        "{again}"
+    );
+
+    // An anchor not delivered (as after a crash before its delivery) holds the next prune
+    // with `sink_behind`; the repeated request queues it again, and once it is delivered the
+    // next prune goes through.
+    h.state
+        .audit
+        .with_connection(|c| {
+            c.execute("UPDATE audit_anchors SET shipped_at = NULL", [])?;
+            Ok(())
+        })
+        .unwrap();
+    for i in 0..10 {
+        h.state.audit.append(record(100 + i, old())).unwrap();
+    }
+    wait_for(|| sink.delivered_through() >= Some(40)).await;
+    let (status, body) = h.prune(40, None).await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (StatusCode::CONFLICT, Some("sink_behind")),
+        "{body}"
+    );
+    assert!(
+        body["detail"]
+            .as_str()
+            .unwrap()
+            .contains("the anchor of the prune through seq 20"),
+        "{body}"
+    );
+    let (_, plan) = h.get("/admin/audit/prune/plan").await;
+    assert_eq!(plan["guards"]["anchor_undelivered"], true, "{plan}");
+    let (_, again) = h.prune(20, Some(&digest)).await;
+    assert_eq!(again["shipped"]["queued"], true, "{again}");
+    assert_eq!(
+        again["shipped"]["anchor_shipped_at"],
+        Value::Null,
+        "{again}"
+    );
+    let s = h.state.clone();
+    wait_for(move || s.audit.unshipped_anchors().is_ok_and(|u| u.is_empty())).await;
+    let (status, body) = h.prune(40, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }
 
 /// Each guard refuses through the route with its code, and nothing is written.
@@ -438,6 +515,12 @@ async fn every_guard_refuses_through_the_route() {
         (status, body["code"].as_str()),
         (StatusCode::GONE, Some("audit_pruned"))
     );
+    // The same members as every other 410 `audit_pruned`.
+    assert_eq!(
+        (&body["pruned_through"], &body["prune_seq"], &body["first"]),
+        (&json!(20), &json!(38), &json!(21)),
+        "{body}"
+    );
     for _ in 0..10 {
         h.state.audit.append(record(0, old())).unwrap();
     }
@@ -470,43 +553,72 @@ async fn a_sink_that_delivered_nothing_refuses_with_sink_behind() {
     assert_eq!(plan["guards"]["limited_by"], "sink_behind");
 }
 
-/// Appends from several tasks while the prune commits and its deletes run: none is lost or
-/// denied, and the log verifies from its anchor.
+/// Appends from several tasks while the prune commits and its deletes run: the appends start
+/// before the prune and go on after it, none is denied, and every seq above the old head is
+/// an append or the prune record, each given once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn appends_during_a_prune_are_kept() {
+    use std::sync::atomic::{AtomicBool, Ordering};
     let dir = tempfile::tempdir().unwrap();
     let cfg = config(&dir, PruneMode::Manual);
     let h = start(dir, cfg).await;
     h.fill(1005).await;
+    let stop = Arc::new(AtomicBool::new(false));
     let mut tasks = Vec::new();
     for t in 0..4 {
-        let state = h.state.clone();
+        let (state, stop) = (h.state.clone(), stop.clone());
         tasks.push(tokio::spawn(async move {
             let mut seqs = Vec::new();
-            for i in 0..50 {
+            let mut i = 0;
+            while !stop.load(Ordering::SeqCst) {
                 let e = state
-                    .blocking(move |s| s.audit.append(record(t * 1000 + i, old())))
+                    .blocking(move |s| s.audit.append(record(t * 100_000 + i, old())))
                     .await
-                    .unwrap();
+                    .expect("an append during a prune is not denied");
                 seqs.push(e.seq);
+                i += 1;
             }
             seqs
         }));
     }
+    // The appends are running before the prune.
+    let s = h.state.clone();
+    wait_for(move || s.audit.head().ok().flatten().is_some_and(|e| e.seq >= 1025)).await;
     let (status, body) = h.prune(1000, None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    let prune_seq = body["prune_seq"].as_u64().unwrap();
     let deleted = attenuo_server::prune_audit_log(&h.state).await;
+    // And go on after it.
+    let s = h.state.clone();
+    wait_for(move || {
+        s.audit
+            .head()
+            .ok()
+            .flatten()
+            .is_some_and(|e| e.seq >= prune_seq + 25)
+    })
+    .await;
+    stop.store(true, Ordering::SeqCst);
     let mut seqs: Vec<u64> = Vec::new();
     for t in tasks {
         seqs.extend(t.await.unwrap());
     }
-    // Every append got its own seq, none at or below the boundary.
+    let n = seqs.len();
     seqs.sort_unstable();
     seqs.dedup();
-    assert_eq!(seqs.len(), 200);
-    assert!(seqs[0] > 1000);
-    let prune_seq = body["prune_seq"].as_u64().unwrap();
+    assert_eq!(seqs.len(), n, "no seq given twice");
+    assert!(
+        seqs.iter().any(|&s| s < prune_seq),
+        "an append before the prune record"
+    );
+    assert!(seqs.iter().any(|&s| s > prune_seq), "an append after it");
     assert!(!seqs.contains(&prune_seq));
+    // Every seq above the old head: an append or the prune record.
+    let head = h.state.audit.head().unwrap().unwrap().seq;
+    let mut all = seqs.clone();
+    all.push(prune_seq);
+    all.sort_unstable();
+    assert_eq!(all, (1006..=head).collect::<Vec<_>>());
     let total = deleted + attenuo_server::prune_audit_log(&h.state).await;
     assert_eq!(total, 1000);
     assert_eq!(
@@ -515,8 +627,94 @@ async fn appends_during_a_prune_are_kept() {
     );
     let (_, v) = h.get("/admin/audit/verify").await;
     assert_eq!(v["ok"], true, "{v}");
-    // 5 old entries above the boundary, the prune record, and the 200.
-    assert_eq!(v["entries"], 206, "{v}");
+    // 5 old entries above the boundary, the prune record, and the appends.
+    assert_eq!(v["entries"], json!(5 + 1 + n), "{v}");
+}
+
+/// A delegation chain whose root lease is in the registry and has a record at or below the
+/// boundary: `prune_live_run` through the route, and nothing is written.
+#[tokio::test]
+async fn a_live_run_refuses_through_the_route() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config(&dir, PruneMode::Manual);
+    let h = start(dir, cfg).await;
+    // The mint's records come first, so the run's first record is below the boundary.
+    let r = reqwest::Client::new()
+        .post(h.server.url("/admin/root-token"))
+        .bearer_auth(ADMIN)
+        .json(&json!({"subject": "alice", "issuer": "https://idp.example",
+                      "agent": "planner", "capabilities": ["github:*"]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let minted = h.state.audit.len().unwrap() as usize;
+    h.fill(30 - minted).await;
+    let before = h.state.audit.len().unwrap();
+    let (_, plan) = h.get("/admin/audit/prune/plan").await;
+    let live = plan["guards"]["live_run_seq"].as_u64().unwrap();
+    assert!(live <= 20, "{plan}");
+    let (status, body) = h.prune(20, None).await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (StatusCode::CONFLICT, Some("prune_live_run")),
+        "{body}"
+    );
+    assert_eq!(h.state.audit.len().unwrap(), before);
+    assert_eq!(h.state.audit.pruned_through().unwrap(), None);
+}
+
+/// An anchor the sink had not delivered when the server stopped is queued again at the next
+/// start, delivered, and recorded.
+#[tokio::test]
+async fn an_undelivered_anchor_is_shipped_after_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config(&dir, PruneMode::Manual);
+    let (router, state) = attenuo_server::build(&cfg).unwrap();
+    let running = Running::start(cfg.clone(), state.clone(), router).await;
+    for i in 0..25 {
+        state.audit.append(record(i, old())).unwrap();
+    }
+    let sink = state.checkpoint_sink.as_ref().unwrap();
+    wait_for(|| sink.delivered_through() >= Some(20)).await;
+    let r = reqwest::Client::new()
+        .post(running.url("/admin/audit/prune"))
+        .bearer_auth(ADMIN)
+        .json(&json!({"through": 20}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let s = state.clone();
+    wait_for(move || s.audit.unshipped_anchors().is_ok_and(|u| u.is_empty())).await;
+    running.stop(state).await;
+    // As if the process had died with the anchor still queued: not delivered, not in the file.
+    let path = dir.path().join("shipped.jsonl");
+    let kept: String = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.contains("attenuo-shipped-anchor-v1"))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    std::fs::write(&path, kept).unwrap();
+    {
+        let log = attenuo_audit::SqliteAudit::open(dir.path().join("audit.sqlite")).unwrap();
+        log.with_connection(|c| {
+            c.execute("UPDATE audit_anchors SET shipped_at = NULL", [])?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(log.unshipped_anchors().unwrap().len(), 1);
+    }
+
+    let (router, state) = attenuo_server::build(&cfg).unwrap();
+    let running = Running::start(cfg, state.clone(), router).await;
+    let s = state.clone();
+    wait_for(move || s.audit.unshipped_anchors().is_ok_and(|u| u.is_empty())).await;
+    let anchors = parse_shipped_anchors(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(anchors.len(), 1);
+    assert_eq!(anchors[0].1.anchor.through_seq, 20);
+    running.stop(state).await;
 }
 
 /// The server stops between the prune's commit and its deletes: after a restart, even with

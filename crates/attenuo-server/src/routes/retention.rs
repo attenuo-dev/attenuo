@@ -10,7 +10,9 @@
 
 use std::sync::Arc;
 
-use attenuo_audit::{PlanBound, PruneLimits, SinkProgress, StoredAnchor, PRUNE_TOOL};
+use attenuo_audit::{
+    AuditError, PlanBound, PruneGuard, PruneLimits, SinkProgress, StoredAnchor, PRUNE_TOOL,
+};
 use attenuo_core::Decision;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -123,8 +125,10 @@ pub struct PruneBody {
 /// pruned_through, deleting, shipped, already}` once the prune is committed; the rows are
 /// deleted afterwards, in batches of `[audit.retention] batch_rows`, by the maintenance task
 /// (`deleting` is true until they are gone). `shipped` is null without `[audit.sink]`, else
-/// `{queued, delivered_through}`: whether the checkpoints and the anchor were queued now, and
-/// the highest checkpoint seq the sink has delivered.
+/// `{queued, delivered_through, anchor_shipped_at, anchor_pending}`: whether the anchor (and,
+/// for a new prune, the two checkpoints) were queued by this call, the highest checkpoint seq
+/// the sink has delivered, when the sink delivered the anchor (null until it has), and
+/// whether the anchor is queued and not yet delivered.
 ///
 /// Repeating a request that succeeded answers 200 with the stored anchor and
 /// `"already": true`, and writes nothing.
@@ -162,7 +166,8 @@ pub async fn prune(
     let now = limits.now;
     let out = state
         .blocking(move |s| {
-            s.audit
+            let done = s
+                .audit
                 .prune_through(body.through, body.archive_sha256, &limits, |args| {
                     admin_record(
                         &who,
@@ -173,9 +178,21 @@ pub async fn prune(
                         args.clone(),
                         now,
                     )
-                })
+                });
+            // Below the boundary: answer with it, as every other 410 `audit_pruned` does.
+            Ok::<_, AuditError>(match done {
+                Err(AuditError::PruneRefused {
+                    guard: PruneGuard::AlreadyPruned,
+                    detail,
+                }) => Err((detail, s.audit.newest_anchor()?)),
+                other => Ok(other?),
+            })
         })
-        .await?;
+        .await?
+        .map_err(|(detail, anchor)| match anchor {
+            Some(a) => ApiError::audit_pruned(detail, &a.anchor),
+            None => ApiError::new(StatusCode::GONE, "audit_pruned", detail),
+        })?;
     let a = &out.anchor.anchor;
     if !out.already {
         tracing::warn!(
@@ -186,10 +203,20 @@ pub async fn prune(
             "audit log pruned; the rows are deleted in the background"
         );
     }
+    // A repeat finds the anchor queued, or queues it again if it is neither delivered nor
+    // queued (it was queued before a restart that lost it, and the restart queued it, but a
+    // repeat costs nothing). The anchor is never dropped from the queue.
     let shipped = state.checkpoint_sink.as_ref().map(|s| {
+        let queued = if out.already && out.anchor.shipped_at.is_none() {
+            s.handle().push_anchor(a)
+        } else {
+            !out.already
+        };
         json!({
-            "queued": !out.already,
+            "queued": queued,
             "delivered_through": s.delivered_through(),
+            "anchor_shipped_at": out.anchor.shipped_at,
+            "anchor_pending": out.anchor.shipped_at.is_none() && s.anchor_pending(a.through_seq),
         })
     });
     Ok(Json(json!({
@@ -214,7 +241,8 @@ pub struct AnchorsQuery {
 }
 
 /// `GET /admin/audit/anchors?cursor=&limit=`: the anchors of every prune, newest first, as
-/// `{anchors, next_cursor}`, each the signed anchor with its `state` (`deleting` or `done`).
+/// `{anchors, next_cursor}`, each the signed anchor with its `state` (`deleting` or `done`)
+/// and `shipped_at`, when `[audit.sink]` delivered it (null until then).
 /// Paged like `GET /admin/audit/checkpoints`. Answers an empty list for a log never pruned,
 /// whatever `[audit.retention] prune` is.
 ///

@@ -492,6 +492,36 @@ describe("crossCheck", () => {
     expect([w.inRange, w.mismatches.map((m) => m.seq)]).toEqual([1, [6]]);
   });
 
+  it("skips a prune anchor line in the shipped file", async () => {
+    const objs = await makeExport();
+    const shipped = await shippedLines(checkpointsOf(objs));
+    const anchor =
+      JSON.stringify({
+        anchor: {
+          archive_sha256: null,
+          at: "2026-10-24T00:00:00Z",
+          kid: "k",
+          previous_through_seq: null,
+          prune_entry_hash: "ab".repeat(32),
+          prune_seq: 7,
+          signature: "s",
+          through_hash: "cd".repeat(32),
+          through_seq: 3,
+        },
+        anchor_sha256: "ef".repeat(32),
+        format: "attenuo-shipped-anchor-v1",
+        kid: "k",
+        public_url: null,
+        signature: "s",
+      }) + "\n";
+    const [first, second] = shipped as [string, string];
+    const withAnchor = [first, anchor, second];
+    const parsed = await parseShipped(withAnchor);
+    expect(parsed.map((p) => p.line)).toEqual([1, 3]);
+    const r = await cross(objs, withAnchor);
+    expect(r).toMatchObject({ ok: true, shipped: 2, matched: 2 });
+  });
+
   it("matches the genesis checkpoint and accepts an empty shipped file", async () => {
     const objs = await makeExport(6, { cps: [0, 3, 6] });
     objs.push({ type: "checkpoint", ...(await sign(0, GENESIS_HASH)) });

@@ -157,6 +157,22 @@ async fn every_route_answers_each_role_as_the_table_says_console_listener() {
             && p != "/admin/audit/anchors"
     };
     check_every_route(&console.url(""), |_, p| on_console(p)).await;
+    // The routes left out are not there at all, for any credential.
+    let client = reqwest::Client::new();
+    for (method, path) in [
+        ("GET", "/admin/audit/prune/plan"),
+        ("POST", "/admin/audit/prune"),
+        ("GET", "/admin/audit/anchors"),
+    ] {
+        for token in [None, Some(LEGACY), Some("vera-token")] {
+            let (status, body) = send(&client, &console.url(""), method, path, token).await;
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "{method} {path} on the console with {token:?}: {body}"
+            );
+        }
+    }
 }
 
 #[tokio::test]

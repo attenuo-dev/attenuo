@@ -12,7 +12,8 @@
 //! (SR-50) and calls [`SinkHandle::push`], which only queues. The queue is bounded
 //! (`queue_capacity`); when it is full the oldest queued checkpoint is dropped, because every
 //! later checkpoint covers the entries an earlier one does, and
-//! `attenuo_audit_sink_dropped_total` counts it. One background thread, with its own
+//! `attenuo_audit_sink_dropped_total` counts it. A prune's anchor is never dropped (see
+//! below). One background thread, with its own
 //! single-threaded Tokio runtime, delivers the queue in order. A failed delivery is retried
 //! with exponential backoff and full jitter between half and all of the delay (`initial_backoff_ms`
 //! doubling up to `max_backoff_seconds`) until it succeeds; it is never skipped, so a sink
@@ -31,7 +32,11 @@
 //! [`ShippedAnchor`] envelope ([`Shipped::Anchor`]): one more webhook `POST`, file line or S3
 //! object (`<prefix>anchor-<through_seq, 20 digits>-<first 16 hex of anchor_sha256>.json`).
 //! [`SinkHandle::delivered_through`] is the highest checkpoint seq delivered since start,
-//! which the prune's "sink caught up" guard reads.
+//! which the prune's "sink caught up" guard reads. An anchor is never dropped from a full
+//! queue ([`QueueItem::keep`]) and, like a checkpoint, never given up: a receiver that refuses
+//! it holds every later checkpoint behind it, and the sink goes degraded. Each delivery is
+//! told to [`CheckpointSink::on_anchor_delivered`] (the server records the anchor's
+//! `shipped_at`), and the server queues again at start-up any anchor not delivered yet.
 //!
 //! The queue itself ([`Queue`]) is generic over what it carries, so the approval notifier
 //! (`[approvals.notify]`) and the revocation notifier (`[leases.notify]`), both in
@@ -106,6 +111,13 @@ pub trait QueueItem: Send + Sync + 'static {
     fn attempts(&self) -> u32 {
         0
     }
+
+    /// Never dropped from a full queue: a push onto a full queue drops the oldest item that
+    /// is not kept instead, and when every queued item is kept the queue grows past its
+    /// capacity. Default false.
+    fn keep(&self) -> bool {
+        false
+    }
 }
 
 /// What became of a queued item, told to the queue's [`Settle`] hook.
@@ -154,6 +166,12 @@ impl QueueItem for Shipped {
             Self::Checkpoint(c) => format!("checkpoint seq {}", c.checkpoint.seq),
             Self::Anchor(a) => format!("anchor through seq {}", a.anchor.through_seq),
         }
+    }
+
+    /// A prune's anchor is the only copy off the host of where the log starts: it is never
+    /// dropped (ADR-0015).
+    fn keep(&self) -> bool {
+        matches!(self, Self::Anchor(_))
     }
 }
 
@@ -425,14 +443,16 @@ impl<T> Clone for QueueHandle<T> {
 
 impl<T: QueueItem> QueueHandle<T> {
     /// Queue `item` for delivery. Never blocks on the network or on disk. When the queue is
-    /// full the oldest queued item is dropped and counted.
+    /// full the oldest queued item that is not [kept](QueueItem::keep) is dropped and
+    /// counted.
     pub fn push(&self, item: T) {
         let Ok(mut st) = self.shared.state.lock() else {
             return;
         };
         let mut dropped = None;
         if st.queue.len() >= self.shared.limits.capacity {
-            if let Some(old) = st.queue.pop_front() {
+            let oldest = st.queue.iter().position(|q| !q.item.keep());
+            if let Some(old) = oldest.and_then(|i| st.queue.remove(i)) {
                 self.shared.role.dropped(&self.shared.metrics);
                 tracing::error!(
                     dropped = %old.item.log_id(),
@@ -584,6 +604,37 @@ pub struct SinkHandle {
     queue: QueueHandle<Shipped>,
     public_url: Option<String>,
     delivered_through: Arc<AtomicU64>,
+    anchors: Arc<AnchorTracking>,
+}
+
+/// Told of each anchor the sink delivered ([`CheckpointSink::on_anchor_delivered`]).
+type AnchorDelivered = Box<dyn Fn(&Anchor) + Send + Sync>;
+
+/// What became of the anchors pushed: the ones queued and not yet delivered, and who to tell
+/// of a delivery (the audit log, which records `shipped_at`).
+#[derive(Default)]
+struct AnchorTracking {
+    pending: Mutex<std::collections::BTreeSet<u64>>,
+    on_delivered: std::sync::OnceLock<AnchorDelivered>,
+}
+
+impl std::fmt::Debug for AnchorTracking {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AnchorTracking")
+            .field("pending", &self.pending)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AnchorTracking {
+    fn delivered(&self, a: &Anchor) {
+        if let Ok(mut p) = self.pending.lock() {
+            p.remove(&a.through_seq);
+        }
+        if let Some(f) = self.on_delivered.get() {
+            f(a);
+        }
+    }
 }
 
 impl SinkHandle {
@@ -595,12 +646,30 @@ impl SinkHandle {
         )));
     }
 
-    /// Queue a prune's anchor for delivery. Never blocks on the network or on disk.
-    pub fn push_anchor(&self, a: &Anchor) {
-        self.queue.push(Shipped::Anchor(ShippedAnchor::new(
-            a,
-            self.public_url.clone(),
-        )));
+    /// Queue a prune's anchor for delivery, unless it is queued already and not yet
+    /// delivered. Never blocks on the network or on disk, and the anchor is never dropped
+    /// from a full queue ([`QueueItem::keep`]). True when it was queued now.
+    pub fn push_anchor(&self, a: &Anchor) -> bool {
+        let fresh = self
+            .anchors
+            .pending
+            .lock()
+            .map_or(true, |mut p| p.insert(a.through_seq));
+        if fresh {
+            self.queue.push(Shipped::Anchor(ShippedAnchor::new(
+                a,
+                self.public_url.clone(),
+            )));
+        }
+        fresh
+    }
+
+    /// The anchor through `through_seq` is queued and not yet delivered.
+    pub fn anchor_pending(&self, through_seq: u64) -> bool {
+        self.anchors
+            .pending
+            .lock()
+            .is_ok_and(|p| p.contains(&through_seq))
     }
 
     /// The highest checkpoint seq delivered since start; `None` before the first. The prune's
@@ -636,21 +705,27 @@ pub struct CheckpointSink {
     public_url: Option<String>,
     kind: SinkKind,
     delivered_through: Arc<AtomicU64>,
+    anchors: Arc<AnchorTracking>,
 }
 
-/// Wraps the configured deliverer to keep the highest checkpoint seq delivered.
+/// Wraps the configured deliverer to keep the highest checkpoint seq delivered, and to tell
+/// of each anchor delivered.
 struct Tracked {
     inner: Box<dyn Deliver>,
     delivered_through: Arc<AtomicU64>,
+    anchors: Arc<AnchorTracking>,
 }
 
 #[async_trait]
 impl Deliver for Tracked {
     async fn deliver(&self, item: &Shipped) -> Result<(), String> {
         self.inner.deliver(item).await?;
-        if let Some(c) = item.checkpoint() {
-            self.delivered_through
-                .fetch_max(c.checkpoint.seq, Ordering::AcqRel);
+        match item {
+            Shipped::Checkpoint(c) => {
+                self.delivered_through
+                    .fetch_max(c.checkpoint.seq, Ordering::AcqRel);
+            }
+            Shipped::Anchor(a) => self.anchors.delivered(&a.anchor),
         }
         Ok(())
     }
@@ -705,15 +780,18 @@ impl CheckpointSink {
         metrics: Arc<Metrics>,
     ) -> anyhow::Result<Self> {
         let delivered_through = Arc::new(AtomicU64::new(0));
+        let anchors = Arc::new(AnchorTracking::default());
         let deliver = Box::new(Tracked {
             inner: deliver,
             delivered_through: delivered_through.clone(),
+            anchors: anchors.clone(),
         });
         Ok(Self {
             queue: Queue::start(deliver, limits, QueueRole::Checkpoints, metrics)?,
             public_url,
             kind: SinkKind::Webhook,
             delivered_through,
+            anchors,
         })
     }
 
@@ -723,7 +801,19 @@ impl CheckpointSink {
             queue: self.queue.handle(),
             public_url: self.public_url.clone(),
             delivered_through: self.delivered_through.clone(),
+            anchors: self.anchors.clone(),
         }
+    }
+
+    /// Run `f` on the delivery thread after each anchor is delivered (the server records
+    /// `shipped_at` with it). Set once; a second call is ignored.
+    pub fn on_anchor_delivered(&self, f: impl Fn(&Anchor) + Send + Sync + 'static) {
+        let _ = self.anchors.on_delivered.set(Box::new(f));
+    }
+
+    /// The anchor through `through_seq` is queued and not yet delivered.
+    pub fn anchor_pending(&self, through_seq: u64) -> bool {
+        self.handle().anchor_pending(through_seq)
     }
 
     /// The highest checkpoint seq delivered since start ([`SinkHandle::delivered_through`]).
@@ -1531,9 +1621,12 @@ mod tests {
             if self.0.fail.load(Ordering::SeqCst) {
                 return Err("down".into());
             }
-            if let Some(c) = s.checkpoint() {
-                self.0.got.lock().unwrap().push(c.checkpoint.seq);
-            }
+            // A checkpoint by its seq, an anchor by 1000 plus its boundary.
+            let n = match s {
+                Shipped::Checkpoint(c) => c.checkpoint.seq,
+                Shipped::Anchor(a) => 1000 + a.anchor.through_seq,
+            };
+            self.0.got.lock().unwrap().push(n);
             Ok(())
         }
     }
@@ -1637,9 +1730,56 @@ mod tests {
         h.push_anchor(&anchor(20));
         h.push(&cp(31));
         wait_until(|| h.delivered() == 3);
-        assert_eq!(*fake.got.lock().unwrap(), vec![30, 31]);
+        assert_eq!(*fake.got.lock().unwrap(), vec![30, 1020, 31]);
         assert_eq!(h.delivered_through(), Some(31));
         assert_eq!(sink.delivered_through(), Some(31));
+        sink.shutdown(Duration::from_secs(1));
+    }
+
+    /// An anchor is never dropped from a full queue: the oldest checkpoint goes instead, and
+    /// with only anchors queued the queue grows past its capacity. Delivery is told to the
+    /// hook, and an anchor queued and not yet delivered is not queued twice.
+    #[test]
+    fn a_full_queue_keeps_the_anchor() {
+        let fake = Arc::new(Fake::default());
+        fake.fail.store(true, Ordering::SeqCst);
+        let metrics = Metrics::new();
+        let sink = CheckpointSink::with_deliver(
+            Box::new(FakeRef(fake.clone())),
+            limits(2, Duration::from_secs(3600)),
+            None,
+            metrics.clone(),
+        )
+        .unwrap();
+        let delivered: Arc<Mutex<Vec<u64>>> = Arc::default();
+        let seen = delivered.clone();
+        sink.on_anchor_delivered(move |a| seen.lock().unwrap().push(a.through_seq));
+        let h = sink.handle();
+        h.push(&cp(1));
+        wait_until(|| fake.attempts.load(Ordering::SeqCst) >= 1);
+        // Seq 1 is in flight; the anchor is the oldest queued, then 2..=5 come.
+        assert!(h.push_anchor(&anchor(20)));
+        assert!(!h.push_anchor(&anchor(20)), "queued already");
+        assert!(sink.anchor_pending(20));
+        for s in 2..=5 {
+            h.push(&cp(s));
+        }
+        assert_eq!(h.status().queued, 2);
+        // Checkpoints 2, 3 and 4 were dropped; 5 goes for the next anchor, and with only
+        // anchors queued the queue grows past its capacity rather than dropping one.
+        assert!(h.push_anchor(&anchor(30)));
+        assert!(h.push_anchor(&anchor(40)));
+        assert_eq!(h.status().queued, 3);
+        fake.fail.store(false, Ordering::SeqCst);
+        wait_until(|| h.delivered() == 4);
+        assert_eq!(*fake.got.lock().unwrap(), vec![1, 1020, 1030, 1040]);
+        assert_eq!(*delivered.lock().unwrap(), vec![20, 30, 40]);
+        assert!(!sink.anchor_pending(20));
+        // Delivered: it can be queued again (a repeated prune of an anchor not yet recorded).
+        assert!(h.push_anchor(&anchor(20)));
+        assert!(metrics
+            .render()
+            .contains("attenuo_audit_sink_dropped_total 4\n"));
         sink.shutdown(Duration::from_secs(1));
     }
 

@@ -521,7 +521,8 @@ pub struct RefundBody {
 /// `admin` record (tool `admin.budget.refund`) naming the decision. For an allowed call whose
 /// effect an operator knows did not happen; neither the agent nor the upstream can refund.
 /// When the charge log has nothing for the decision, the audit log (append-only, every
-/// decision kept) tells why (`no_charge_refusal`): 410 `charge_pruned` when its record shows
+/// decision kept unless the log was pruned past it, `[audit.retention]`) tells why
+/// (`no_charge_refusal`): 410 `charge_pruned` when its record shows
 /// a run-limit charge (the charge-log entry was pruned, `[leases] run_state_retention_seconds`,
 /// only once the run's leases are gone), 404 `not_found` naming "charged nothing" or "unknown
 /// decision" otherwise. 409 when it was already refunded. The run usage the
@@ -1539,6 +1540,7 @@ pub async fn audit_export(
     let head = head.map_or(0, |h| h.seq);
     let anchor = anchor.map(|a| a.anchor);
     let first = anchor.as_ref().map_or(1, |a| a.through_seq + 1);
+    let header_anchor_floor = anchor.as_ref().map(|a| a.through_seq);
     let from = q.from.unwrap_or(first);
     // An export never claims a range it cannot hold.
     if let Some(a) = anchor.as_ref() {
@@ -1592,6 +1594,7 @@ pub async fn audit_export(
             .with_anchor(header_anchor),
     );
 
+    let floor = header_anchor_floor;
     let first = stream::once(async move { Ok::<_, std::io::Error>(Bytes::from(header)) });
     let rest = stream::unfold(
         (state, ExportPhase::Entries { next: from }),
@@ -1609,13 +1612,32 @@ pub async fn audit_export(
                             .min(EXPORT_PAGE);
                         let f = filter.clone();
                         let page = state
-                            .blocking(move |s| s.audit.range_filtered(next, to, &f, want))
+                            .blocking(move |s| {
+                                let entries = s.audit.range_filtered(next, to, &f, want)?;
+                                Ok::<_, AuditError>((entries, s.audit.pruned_through()?))
+                            })
                             .await;
+                        // A prune that commits during the export hides the rows it covers
+                        // from the pages still to come: end the body with an error rather
+                        // than ship a file with a gap.
+                        let page = page
+                            .map_err(|e| e.to_string())
+                            .and_then(|(entries, pruned)| match pruned {
+                                Some(b) if b >= next && Some(b) != floor => {
+                                    let why = format!(
+                                        "the log was pruned through seq {b} during the export; \
+                                         export again from seq {}",
+                                        b + 1
+                                    );
+                                    tracing::warn!("audit export ended early: {why}");
+                                    Err(why)
+                                }
+                                _ => Ok(entries),
+                            });
                         match page {
-                            Err(e) => Some((
-                                Err(std::io::Error::other(e.to_string())),
-                                (state, ExportPhase::Done),
-                            )),
+                            Err(e) => {
+                                Some((Err(std::io::Error::other(e)), (state, ExportPhase::Done)))
+                            }
                             Ok(entries) if entries.is_empty() => {
                                 Some((Ok(Bytes::new()), (state, ExportPhase::Checkpoints)))
                             }

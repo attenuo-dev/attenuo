@@ -60,7 +60,8 @@ CREATE TABLE audit_anchors (
     at                   TEXT    NOT NULL,
     kid                  TEXT    NOT NULL,
     signature            TEXT    NOT NULL,
-    state                TEXT    NOT NULL
+    state                TEXT    NOT NULL,
+    shipped_at           TEXT    NULL
 );
 "#;
 

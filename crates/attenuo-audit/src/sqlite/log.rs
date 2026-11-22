@@ -49,6 +49,11 @@ pub(super) const ENTRY_COLUMNS: &str =
 /// `audit_anchors` in the same statement, so it is never behind the snapshot it filters.
 pub(super) const RETAINED: &str = "seq > (SELECT COALESCE(MAX(through_seq), 0) FROM audit_anchors)";
 
+/// [`SqliteAudit::len`]: the retained rows (see there why it is two counts).
+pub(super) const LEN_SQL: &str =
+    "SELECT (SELECT COUNT(*) FROM audit) - (SELECT COUNT(*) FROM audit \
+     WHERE seq <= (SELECT COALESCE(MAX(through_seq), 0) FROM audit_anchors))";
+
 /// The same for `checkpoints`: the checkpoint at the newest anchor's `through_seq` stays (the
 /// anchor refers to it); older ones are pruned with the entries they cover.
 pub(super) const RETAINED_CHECKPOINT: &str =
@@ -171,9 +176,10 @@ fn head_in(tx: &Transaction<'_>) -> Result<Option<AuditEntry>, AuditError> {
 /// (and the signed checkpoints'), and decoding the head on every append cost more than the
 /// insert itself.
 ///
-/// On an empty table it falls back to the newest prune anchor (its prune record's seq and
-/// hash), so that no seq is given twice even if every row were deleted by hand after a prune;
-/// a log never pruned starts at `(0, GENESIS_HASH)` as before.
+/// On an empty table it falls back to the largest seq the file still names: the newest prune
+/// anchor's prune record (its seq and hash) or the newest stored checkpoint (its seq and head
+/// hash), whichever is larger, so that no seq is given twice even if every row were deleted by
+/// hand after a prune. A log never pruned starts at `(0, GENESIS_HASH)` as before.
 pub(super) fn head_link(tx: &Connection) -> Result<(u64, String), AuditError> {
     let link = tx
         .prepare_cached("SELECT seq, entry_hash FROM audit ORDER BY seq DESC LIMIT 1")?
@@ -183,15 +189,25 @@ pub(super) fn head_link(tx: &Connection) -> Result<(u64, String), AuditError> {
         .optional()?;
     let link = match link {
         Some(l) => Some(l),
-        None => tx
-            .prepare_cached(
-                "SELECT prune_seq, prune_entry_hash FROM audit_anchors \
-                 ORDER BY through_seq DESC LIMIT 1",
-            )?
-            .query_row([], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-            })
-            .optional()?,
+        None => {
+            let pair = |row: &Row<'_>| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?));
+            let anchor = tx
+                .prepare_cached(
+                    "SELECT prune_seq, prune_entry_hash FROM audit_anchors \
+                     ORDER BY prune_seq DESC LIMIT 1",
+                )?
+                .query_row([], pair)
+                .optional()?;
+            let checkpoint = tx
+                .prepare_cached("SELECT seq, head_hash FROM checkpoints ORDER BY seq DESC LIMIT 1")?
+                .query_row([], pair)
+                .optional()?;
+            // Only for a pruned log: a log never pruned keeps its old behaviour.
+            match (anchor, checkpoint) {
+                (Some(a), Some(c)) => Some(if c.0 > a.0 { c } else { a }),
+                (a, _) => a,
+            }
+        }
     };
     match link {
         None => Ok((0, GENESIS_HASH.to_string())),
@@ -425,7 +441,13 @@ pub(super) struct Inner {
     /// Tests: the step of the prune transaction that fails on purpose (0: none).
     #[cfg(any(test, feature = "testing"))]
     pub(super) prune_fail_at: AtomicU8,
+    /// Tests: runs once, at the start of the next signed verify's walk (after its snapshot).
+    #[cfg(any(test, feature = "testing"))]
+    verify_walk_hook: Mutex<Option<VerifyWalkHook>>,
 }
+
+#[cfg(any(test, feature = "testing"))]
+type VerifyWalkHook = Box<dyn FnOnce() + Send>;
 
 /// Tests: holds the writer between taking a batch and committing it, so a test can make an
 /// append's wait run out at exactly that point.
@@ -1013,6 +1035,8 @@ impl SqliteAudit {
                 take_gate: None,
                 #[cfg(any(test, feature = "testing"))]
                 prune_fail_at: AtomicU8::new(0),
+                #[cfg(any(test, feature = "testing"))]
+                verify_walk_hook: Mutex::new(None),
             }),
             writer: OnceLock::new(),
             wal: None,
@@ -1414,15 +1438,38 @@ impl SqliteAudit {
         keys: &CheckpointKeys,
     ) -> Result<SignedVerifyReport, AuditError> {
         let (upper, checkpoints, anchors) = self.verify_snapshot()?;
+        let report = self.verify_signed_from(upper, &checkpoints, &anchors, keys)?;
+        if report.ok {
+            return Ok(report);
+        }
+        // The walk reads its entries a page at a time, each page in its own read transaction,
+        // so a prune that commits (and deletes rows) meanwhile can look like a break. When the
+        // anchors changed since the snapshot, walk once more from a new one.
+        let again = self.verify_snapshot()?;
+        if again.2 == anchors {
+            return Ok(report);
+        }
+        self.verify_signed_from(again.0, &again.1, &again.2, keys)
+    }
+
+    fn verify_signed_from(
+        &self,
+        upper: i64,
+        checkpoints: &[Checkpoint],
+        anchors: &[super::retention::StoredAnchor],
+        keys: &CheckpointKeys,
+    ) -> Result<SignedVerifyReport, AuditError> {
+        #[cfg(any(test, feature = "testing"))]
+        self.run_verify_walk_hook();
         if anchors.is_empty() {
             return verify_with_checkpoints(
                 self.entries_through(None, upper),
-                &checkpoints,
+                checkpoints,
                 keys,
                 Start::Genesis,
             );
         }
-        super::retention::verify_pruned(self, upper, &checkpoints, &anchors, keys)
+        super::retention::verify_pruned(self, upper, checkpoints, anchors, keys)
     }
 
     /// Run `f` against the underlying connection while holding the write lock.
@@ -1811,11 +1858,10 @@ impl SqliteAudit {
     /// [`AuditError::Sqlite`] when the count query fails.
     pub fn len(&self) -> Result<u64, AuditError> {
         let conn = self.read_conn()?;
-        let n: i64 = conn.query_row(
-            &format!("SELECT COUNT(*) FROM audit WHERE {RETAINED}"),
-            [],
-            |r| r.get(0),
-        )?;
+        // Every row, counted on the smallest covering index as before retention, less the
+        // rows a prune still has to delete (none once its deletes are done), counted on the
+        // primary key: a `WHERE seq > ...` on the whole count would walk the table instead.
+        let n: i64 = conn.query_row(LEN_SQL, [], |r| r.get(0))?;
         Ok(u64::try_from(n).unwrap_or(0))
     }
 
@@ -1909,7 +1955,11 @@ impl AuditSink for SqliteAudit {
                     a.anchor.through_hash.clone(),
                 )),
                 |_| {},
-            ),
+            )
+            .map(|mut r| {
+                r.unauthenticated_start = Some(a.anchor.through_seq);
+                r
+            }),
         }
     }
 
@@ -1945,6 +1995,20 @@ impl SqliteAudit {
             .send(WalMsg::Settle(done))
             .expect("the WAL checkpointer is running");
         settled.recv().expect("the WAL checkpointer answers");
+    }
+
+    /// Tests: run `f` once, at the start of the next signed verify's walk, after it has read
+    /// its snapshot (to make a prune overlap the walk).
+    #[doc(hidden)]
+    pub fn on_next_verify_walk(&self, f: impl FnOnce() + Send + 'static) {
+        *self.inner.verify_walk_hook.lock().unwrap() = Some(Box::new(f));
+    }
+
+    fn run_verify_walk_hook(&self) {
+        let hook = self.inner.verify_walk_hook.lock().unwrap().take();
+        if let Some(f) = hook {
+            f();
+        }
     }
 
     /// Tests and measurements: the pauses the WAL checkpointers have imposed so far.

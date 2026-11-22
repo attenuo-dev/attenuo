@@ -34,6 +34,11 @@ export const GENESIS_HASH = "0".repeat(64);
 export const EXPORT_FORMAT = "attenuo-audit-export-v2";
 /** Value of a shipped checkpoint's `format` member. */
 export const SHIPPED_FORMAT = "attenuo-shipped-checkpoint-v1";
+/**
+ * The envelope of a prune's signed anchor, shipped through the same sink (ADR-0015). Skipped by
+ * `parseShipped`: this package does not check anchors yet.
+ */
+const SHIPPED_ANCHOR_FORMAT = "attenuo-shipped-anchor-v1";
 const CHECKPOINT_CONTEXT = "attenuo-checkpoint-v1";
 
 /** The input is not an audit export this version can verify. */
@@ -297,8 +302,9 @@ const sameCheckpoint = (a: CheckpointFields, b: CheckpointFields): boolean =>
  *
  * A line is the sink's envelope (`format`, `checkpoint`, `kid`, `signature`,
  * `checkpoint_sha256`) or a bare checkpoint (an export's `checkpoint` line, or
- * `GET /admin/audit/checkpoint` saved by an operator's own job). Blank lines are skipped;
- * anything else throws `ExportError`. An envelope that disagrees with its own checkpoint is not
+ * `GET /admin/audit/checkpoint` saved by an operator's own job). Blank lines are skipped, and
+ * so are lines whose `format` is `attenuo-shipped-anchor-v1` (the signed anchor of a prune,
+ * which the sink ships with the checkpoints); anything else throws `ExportError`. An envelope that disagrees with its own checkpoint is not
  * an error here: the line carries `inconsistency` and `crossCheck` reports it.
  */
 export async function parseShipped(source: ExportSource): Promise<ShippedLine[]> {
@@ -309,6 +315,7 @@ export async function parseShipped(source: ExportSource): Promise<ShippedLine[]>
     const where = `shipped checkpoints, line ${n + 1}`;
     const obj = parseLine(line, where);
     if (!isObj(obj)) throw new ExportError(`${where}: not a JSON object`);
+    if (obj.format === SHIPPED_ANCHOR_FORMAT) continue;
     if ("checkpoint" in obj) {
       need(obj, where, { format: "str", kid: "str", signature: "str", checkpoint_sha256: "str" });
       if (

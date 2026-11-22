@@ -234,7 +234,7 @@ fn a_forged_anchor_row_with_a_copied_checkpoint_fails() {
             &format!(
                 "DELETE FROM audit WHERE seq <= 20; \
                  INSERT INTO audit_anchors VALUES (20, '{}', {}, '{}', NULL, NULL, '{}', '{}', \
-                 '{signature}', 'done');",
+                 '{signature}', 'done', NULL);",
                 cp.head_hash, head.seq, head.entry_hash, cp.at, cp.kid
             ),
         );
@@ -442,7 +442,8 @@ fn a_head_with_a_checkpoint_gets_no_second_one() {
 }
 
 /// The table emptied by hand after a prune: the next append continues from the anchor's prune
-/// record, so no seq is given twice.
+/// record, so no seq is given twice; and from a stored checkpoint above it, when the log grew
+/// past the prune record before it was emptied.
 #[test]
 fn head_link_on_an_empty_table_continues_from_the_anchor() {
     let issuer = issuer();
@@ -453,6 +454,18 @@ fn head_link_on_an_empty_table_continues_from_the_anchor() {
     let e = log.append(record(1)).unwrap();
     assert_eq!(e.seq, out.anchor.anchor.prune_seq + 1);
     assert_eq!(e.prev_hash, out.anchor.anchor.prune_entry_hash);
+
+    let log = log_of(&issuer, 10, 30);
+    let out = prune(&log, 20, None).unwrap();
+    finish(&log, 100);
+    for i in 0..15 {
+        log.append(record(100 + i)).unwrap();
+    }
+    let cp = log.last_checkpoint().unwrap().unwrap();
+    assert!(cp.seq > out.anchor.anchor.prune_seq, "{cp:?}");
+    exec(&log, "DELETE FROM audit;");
+    let e = log.append(record(1)).unwrap();
+    assert_eq!((e.seq, e.prev_hash), (cp.seq + 1, cp.head_hash));
 }
 
 /// A repeated request answers with the stored anchor and `already: true`, and writes nothing;
@@ -565,6 +578,19 @@ fn every_guard_refuses_and_writes_nothing() {
     );
     assert_eq!(refuse(5, &limits()).code(), "audit_pruned");
     assert_eq!(refuse(9, &limits()), PruneGuard::AlreadyPruned);
+    // With a sink, the anchor of the prune before must be delivered first.
+    assert_eq!(refuse(20, &caught_up), PruneGuard::SinkBehind);
+    let plan = log.prune_plan(PlanBound::Through(20), &caught_up).unwrap();
+    assert!(plan.guards.anchor_undelivered);
+    assert_eq!(
+        (plan.through, plan.guards.limited_by),
+        (None, Some("sink_behind"))
+    );
+    assert_eq!(log.unshipped_anchors().unwrap().len(), 1);
+    log.mark_anchor_shipped(10, now()).unwrap();
+    assert!(log.unshipped_anchors().unwrap().is_empty());
+    assert!(log.newest_anchor().unwrap().unwrap().shipped_at.is_some());
+    // Without a sink the guard does not apply.
     log.prune_through(20, None, &caught_up, prune_record)
         .unwrap();
 }
@@ -982,4 +1008,308 @@ fn measure_a_delete_batch() {
     finish(&log, 10_000);
     let (size, free) = log.db_size().unwrap();
     println!("after: file {size} bytes, free {free}");
+}
+
+// --- review follow-ups -----------------------------------------------------------------------
+
+/// The plain `verify_chain` of a pruned log walks from the newest anchor row without checking
+/// its signature, and says so; a forged row passes it but fails the signed verify.
+#[test]
+fn the_plain_verify_says_its_start_is_not_authenticated() {
+    let issuer = issuer();
+    let log = log_of(&issuer, 10, 35);
+    let r = log.verify_chain().unwrap();
+    assert_eq!(r.unauthenticated_start, None);
+    prune(&log, 20, None).unwrap();
+    finish(&log, 100);
+    let r = log.verify_chain().unwrap();
+    assert!(r.ok);
+    assert_eq!(r.unauthenticated_start, Some(20));
+    // A forged anchor row over a cut the attacker made: the plain walk takes it at its word.
+    let log = log_of(&issuer, 10, 35);
+    let e20 = log.entry_at(20).unwrap().unwrap();
+    exec(
+        &log,
+        &format!(
+            "DELETE FROM audit WHERE seq <= 20; \
+             INSERT INTO audit_anchors VALUES (20, '{}', 35, 'x', NULL, NULL, 'at', 'k', 'AAAA', \
+             'done', NULL);",
+            e20.entry_hash
+        ),
+    );
+    let r = log.verify_chain().unwrap();
+    assert!(r.ok && r.unauthenticated_start == Some(20), "{r:?}");
+    let signed = log.verify_chain_signed(&keys(&issuer)).unwrap();
+    assert!(!signed.ok && !signed.bad_anchors.is_empty(), "{signed:?}");
+}
+
+/// The newest anchor needs its checkpoint at `through_seq`: none stored, or one tampered with,
+/// is a bad anchor, and the walk falls back to genesis.
+#[test]
+fn verify_needs_a_good_checkpoint_at_the_anchor() {
+    let issuer = issuer();
+    let keys = keys(&issuer);
+    let log = log_of(&issuer, 10, 35);
+    prune(&log, 20, None).unwrap();
+    finish(&log, 100);
+    exec(&log, "DELETE FROM checkpoints WHERE seq = 20;");
+    let r = log.verify_chain_signed(&keys).unwrap();
+    assert!(!r.ok && r.pruned_through.is_none(), "{r:?}");
+    assert!(
+        r.bad_anchors[0]
+            .reason
+            .contains("no stored checkpoint at through_seq"),
+        "{r:?}"
+    );
+    assert_eq!(r.first_bad_seq, Some(21));
+
+    let log = log_of(&issuer, 10, 35);
+    prune(&log, 20, None).unwrap();
+    finish(&log, 100);
+    exec(
+        &log,
+        &format!(
+            "UPDATE checkpoints SET head_hash = '{}' WHERE seq = 20;",
+            "e".repeat(64)
+        ),
+    );
+    let r = log.verify_chain_signed(&keys).unwrap();
+    assert!(!r.ok, "{r:?}");
+    assert!(
+        r.bad_anchors[0]
+            .reason
+            .contains("does not verify or names another hash"),
+        "{r:?}"
+    );
+}
+
+/// The tail cut from the prune record on: the anchor's prune record is missing.
+#[test]
+fn a_tail_cut_through_the_prune_record_is_reported() {
+    let issuer = issuer();
+    let log = log_of(&issuer, 10, 35);
+    let out = prune(&log, 20, None).unwrap();
+    finish(&log, 100);
+    let p = out.anchor.anchor.prune_seq;
+    exec(&log, &format!("DELETE FROM audit WHERE seq >= {p};"));
+    let r = log.verify_chain_signed(&keys(&issuer)).unwrap();
+    assert!(!r.ok, "{r:?}");
+    assert!(
+        r.bad_anchors
+            .iter()
+            .any(|b| b.reason == "no entry at prune_seq"),
+        "{r:?}"
+    );
+}
+
+/// Two prunes, then the oldest anchor row deleted: the newest names a `previous_through_seq`
+/// that no row has.
+#[test]
+fn a_deleted_older_anchor_row_breaks_the_link() {
+    let issuer = issuer();
+    let log = log_of(&issuer, 10, 45);
+    prune(&log, 20, None).unwrap();
+    finish(&log, 100);
+    prune(&log, 40, None).unwrap();
+    finish(&log, 100);
+    assert!(log.verify_chain_signed(&keys(&issuer)).unwrap().ok);
+    exec(&log, "DELETE FROM audit_anchors WHERE through_seq = 20;");
+    let r = log.verify_chain_signed(&keys(&issuer)).unwrap();
+    assert!(!r.ok, "{r:?}");
+    assert!(
+        r.bad_anchors
+            .iter()
+            .any(|b| b.through_seq == 40 && b.reason.contains("previous_through_seq")),
+        "{r:?}"
+    );
+}
+
+/// An export whose header carries a validly signed anchor that names another start, and one
+/// whose prune record inside the file does not match the anchor.
+#[test]
+fn an_export_header_anchor_must_name_the_start_and_match_the_prune_record() {
+    let issuer = issuer();
+    let keys = keys(&issuer);
+    let log = log_of(&issuer, 10, 45);
+    let first = prune(&log, 20, None).unwrap();
+    finish(&log, 100);
+    let second = prune(&log, 40, None).unwrap();
+    finish(&log, 100);
+    let head = log.head().unwrap().unwrap().seq;
+    let entries = range(&log, 41, head);
+    let cps = log.checkpoints_between(41, head).unwrap();
+    // Genuine, but the anchor of the first prune: it names seq 21 as the start, not 41.
+    assert!(keys.verify_anchor(&first.anchor.anchor).is_ok());
+    let header = ExportHeader::new(41, head, "2027-01-01T00:00:00Z".into())
+        .with_anchor(Some(first.anchor.anchor.clone()));
+    let r = verify_export(
+        &parse_export(&export_text(&header, &entries, &cps)).unwrap(),
+        &keys,
+    )
+    .unwrap();
+    assert!(!r.report.ok && !r.from_anchor, "{r:?}");
+    assert!(
+        r.report.bad_anchors[0]
+            .reason
+            .contains("but the export starts at 41"),
+        "{r:?}"
+    );
+    // The right anchor, but the prune record in the file was replaced (its hash recomputed).
+    let p = second.anchor.anchor.prune_seq;
+    assert_eq!(p, head, "the prune record is the last entry");
+    let mut entries = entries;
+    let last = entries.last_mut().unwrap();
+    last.record.tool = "admin.policies.reload".into();
+    let json = attenuo_audit::canonical_record_json(&last.record);
+    last.entry_hash = attenuo_audit::entry_hash_from_json(p, &last.prev_hash, &json);
+    let header = ExportHeader::new(41, head, "2027-01-01T00:00:00Z".into())
+        .with_anchor(Some(second.anchor.anchor.clone()));
+    let r = verify_export(
+        &parse_export(&export_text(&header, &entries, &cps)).unwrap(),
+        &keys,
+    )
+    .unwrap();
+    assert!(!r.report.ok, "{r:?}");
+    assert!(
+        r.report.bad_anchors[0]
+            .reason
+            .contains("does not hash to prune_entry_hash"),
+        "{r:?}"
+    );
+}
+
+/// A prune whose deletes run while a signed verify walks the log: the walk sees rows vanish
+/// under it, finds the anchors changed and walks once more from a new snapshot.
+#[test]
+fn a_verify_that_overlaps_a_prune_walks_again() {
+    let issuer = issuer();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v.sqlite");
+    let log = Arc::new(file_log(&path, &issuer, 10));
+    for i in 0..35 {
+        log.append(record(i)).unwrap();
+    }
+    let during = log.clone();
+    log.on_next_verify_walk(move || {
+        prune(&during, 20, None).unwrap();
+        finish(&during, 100);
+    });
+    let r = log.verify_chain_signed(&keys(&issuer)).unwrap();
+    assert!(r.ok, "{r:?}");
+    assert_eq!(r.pruned_through, Some(20));
+}
+
+/// A busy log has more checkpoints above the age cutoff than the plan looks at: the plan
+/// starts at the newest entry old enough, so it still finds the boundary.
+#[test]
+fn the_plan_finds_a_boundary_below_many_recent_checkpoints() {
+    let issuer = issuer();
+    // A checkpoint at every entry; records are one second apart from t0.
+    let log = log_of(&issuer, 1, 200);
+    // Entries up to t0 + 49 s are old enough: 50 of them, 150 younger checkpoints above.
+    let young = PruneLimits {
+        now: t0() + Duration::days(90) + Duration::seconds(49),
+        ..limits()
+    };
+    let plan = log
+        .prune_plan_with_scan(PlanBound::Through(u64::MAX), &young, 10)
+        .unwrap();
+    assert_eq!(plan.through, Some(50), "{plan:?}");
+    assert_eq!(plan.guards.limited_by, Some("prune_too_recent"));
+    // And `before` the same way.
+    let plan = log
+        .prune_plan_with_scan(
+            PlanBound::Before(t0() + Duration::seconds(30)),
+            &limits(),
+            10,
+        )
+        .unwrap();
+    assert_eq!(plan.through, Some(30), "{plan:?}");
+    assert_eq!(plan.guards.limited_by, Some("before"));
+}
+
+/// A `min_age` too large to subtract from the clock refuses as too recent, never panics.
+#[test]
+fn a_huge_min_age_is_too_recent_not_a_panic() {
+    let issuer = issuer();
+    let log = log_of(&issuer, 10, 35);
+    let huge = PruneLimits {
+        min_age: Duration::MAX,
+        ..limits()
+    };
+    assert_eq!(
+        guard_of(
+            log.prune_through(20, None, &huge, prune_record)
+                .unwrap_err()
+        ),
+        PruneGuard::TooRecent
+    );
+    assert_eq!(
+        log.prune_plan(PlanBound::Through(30), &huge)
+            .unwrap()
+            .through,
+        None
+    );
+    // The writer is still usable.
+    log.append(record(99)).unwrap();
+}
+
+/// How long the live-run lookup takes with many chains whose root lease is in the registry
+/// (run with `cargo test --release -p attenuo-audit --test retention -- --ignored --nocapture
+/// measure_the_live_run_lookup`).
+#[test]
+#[ignore = "a measurement, not a test"]
+fn measure_the_live_run_lookup() {
+    let issuer = issuer();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("l.sqlite");
+    let log = file_log(&path, &issuer, 1000);
+    let chains: usize = std::env::var("CHAINS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10_000);
+    let per_chain: usize = std::env::var("PER_CHAIN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
+    log.with_connection(|c| {
+        c.execute_batch("PRAGMA synchronous = OFF")?;
+        Ok(())
+    })
+    .unwrap();
+    let leases = SqliteLeaseStore::open(&path).unwrap();
+    let mut n = 0;
+    for round in 0..per_chain {
+        for c in 0..chains {
+            let mut r = record(n);
+            r.chain_id = Some(format!("c{c}"));
+            log.append(r).unwrap();
+            n += 1;
+        }
+        if round == 0 {
+            for c in 0..chains {
+                leases
+                    .register(
+                        &LeaseId::new(format!("c{c}")),
+                        None,
+                        now() + Duration::hours(1),
+                    )
+                    .unwrap();
+            }
+        }
+    }
+    // The records sit at seq 1.. so the first live record is at 1: the guard refuses, after
+    // the lookup ran in full.
+    let started = std::time::Instant::now();
+    let rounds = 20;
+    for _ in 0..rounds {
+        let plan = log.prune_plan(PlanBound::Through(1000), &limits()).unwrap();
+        assert_eq!(plan.guards.live_run_seq, Some(1));
+    }
+    println!(
+        "{chains} live chains x {per_chain} records ({} rows): one plan (live-run lookup \
+         included) {:?}",
+        chains * per_chain,
+        started.elapsed() / rounds
+    );
 }

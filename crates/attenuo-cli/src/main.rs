@@ -1439,8 +1439,14 @@ fn verify_lines(resp: &Value) -> Vec<String> {
                 resp["entries"],
                 b + 1
             )),
-            None => out.push(format!(
+            None if anchors_ok => out.push(format!(
                 "audit chain OK: {} entries verified",
+                resp["entries"]
+            )),
+            // A prune anchor failed, so the walk ran from genesis: the rows link, but the
+            // log's start is not what its anchor says.
+            None => out.push(format!(
+                "audit chain links: {} entries verified from genesis (a prune anchor is INVALID)",
                 resp["entries"]
             )),
         }
@@ -1872,6 +1878,17 @@ mod tests {
                 .iter()
                 .any(|l| l == "prune anchor through seq 20 INVALID: bad signature"),
             "{lines:?}"
+        );
+        // The anchor failed, so the server walked from genesis and found the rows intact:
+        // the first line must not say OK.
+        let genesis = json!({"entries": 36, "ok": false, "first_bad_seq": null,
+                             "checkpoints": 2, "last_signed_seq": 36, "unsigned_tail": 0,
+                             "bad_checkpoints": [], "pruned_through": null, "anchors": 1,
+                             "bad_anchors": [{"through_seq": 20, "reason": "bad signature"}]});
+        let lines = verify_lines(&genesis);
+        assert_eq!(
+            lines[0],
+            "audit chain links: 36 entries verified from genesis (a prune anchor is INVALID)"
         );
         let e = json!({"entries": 15, "ok": true, "first_bad_seq": null, "checkpoints": 2,
                        "last_signed_seq": 36, "unsigned_tail": 0, "bad_checkpoints": [],

@@ -891,6 +891,8 @@ pub const DEFAULT_PRUNE_MIN_AGE_SECONDS: u64 = 7_776_000;
 pub const DEFAULT_PRUNE_BATCH_ROWS: u64 = 10_000;
 /// Largest `[audit.retention] batch_rows`.
 pub const MAX_PRUNE_BATCH_ROWS: u64 = 1_000_000;
+/// Largest `[audit.retention] min_age_seconds`: 100 years (of 365 days).
+pub const MAX_PRUNE_MIN_AGE_SECONDS: u64 = 3_153_600_000;
 
 /// `[audit.retention]`: pruning the oldest entries of the audit log (ADR-0015). A prune
 /// writes a signed anchor naming the last pruned seq and its hash, so the retained log still
@@ -903,8 +905,8 @@ pub struct RetentionSection {
     #[serde(default)]
     pub prune: PruneMode,
     /// Nothing younger than this, in seconds, is pruned: the entry at the boundary must be
-    /// older. Default 7776000 (90 days). May not be below the run-state retentions of
-    /// `[leases]`.
+    /// older. Default 7776000 (90 days), at most 3153600000 (100 years). May not be below the
+    /// run-state retentions of `[leases]`.
     #[serde(default = "default_prune_min_age_seconds")]
     pub min_age_seconds: u64,
     /// Rows deleted per transaction once a prune is committed. Default 10000, between 1 and
@@ -931,9 +933,11 @@ impl Default for RetentionSection {
 }
 
 impl RetentionSection {
-    /// `min_age_seconds` as a duration.
+    /// `min_age_seconds` as a duration, at most [`MAX_PRUNE_MIN_AGE_SECONDS`] (start-up
+    /// refuses more).
     pub fn min_age(&self) -> time::Duration {
-        time::Duration::seconds(i64::try_from(self.min_age_seconds).unwrap_or(i64::MAX))
+        let secs = self.min_age_seconds.min(MAX_PRUNE_MIN_AGE_SECONDS);
+        time::Duration::seconds(i64::try_from(secs).unwrap_or(i64::MAX))
     }
 }
 
@@ -3374,8 +3378,24 @@ impl Config {
                 r.batch_rows
             );
         }
+        if r.min_age_seconds > MAX_PRUNE_MIN_AGE_SECONDS {
+            anyhow::bail!(
+                "[audit.retention] min_age_seconds must be at most {MAX_PRUNE_MIN_AGE_SECONDS} \
+                 (100 years), not {}",
+                r.min_age_seconds
+            );
+        }
         if r.prune == PruneMode::Off {
             return Ok(());
+        }
+        if self.leases.retention_seconds == 0 {
+            tracing::warn!(
+                "[audit.retention] prune = \"{}\" with [leases] retention_seconds = 0: every \
+                 lease tree stays in the registry, so the prune_live_run guard refuses any \
+                 boundary at or above the first record of a chain that was ever issued; set \
+                 retention_seconds to let old trees go",
+                r.prune
+            );
         }
         if self.audit.sqlite_path == ":memory:" {
             anyhow::bail!(
@@ -3926,6 +3946,21 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(e.contains("batch_rows"), "{e}");
+        // So is a min_age_seconds that would not fit below the clock.
+        let e = Config::from_toml("[audit.retention]\nmin_age_seconds = 9223372036854775807\n")
+            .unwrap()
+            .check_retention()
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("at most 3153600000"), "{e}");
+        let huge = RetentionSection {
+            min_age_seconds: u64::MAX,
+            ..RetentionSection::default()
+        };
+        assert_eq!(
+            huge.min_age(),
+            time::Duration::seconds(i64::try_from(MAX_PRUNE_MIN_AGE_SECONDS).unwrap())
+        );
     }
 
     #[test]

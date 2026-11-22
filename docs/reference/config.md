@@ -97,7 +97,7 @@ Ships every signed checkpoint off the host as it is created (SR-21); see [Shippi
 | `prefix` | `attenuo/checkpoints/` | s3: object key prefix; keys are `<prefix><seq, 20 digits>-<16 hex of checkpoint_sha256>.json`. |
 | `access_key_id`, `secret_access_key`, `session_token` | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` | s3 credentials. Give them `PutObject` only. With `session_token` (temporary STS credentials) each PUT also sends `x-amz-security-token`, signed. All three are read once at start and never refreshed: when temporary credentials expire, every PUT is refused (403; the log names S3's error code: MinIO answers `InvalidAccessKeyId`, AWS documents `ExpiredToken`) and checkpoints queue until the server is restarted with new ones. |
 | `ca_pem_path` | unset | webhook and s3: PEM file of CA certificates that the sink's requests trust in addition to the web PKI roots built into attenuo (not the system trust store), for a receiver or an S3-compatible store (MinIO, Ceph, Garage) whose certificate a private CA issued. Only the sink uses it; every other outbound connection keeps the built-in roots alone. It adds roots and changes nothing else: the certificate must still be valid for the URL's host. Every `CERTIFICATE` block of the file is used, other blocks are ignored. A file that is missing, unreadable or empty, holds no certificate, or holds one that cannot be used as a root refuses to start. Read once at start: a new file needs a restart. A relative path is resolved against the working directory. With an `http://` URL it is not used, and a warning says so at start. A refused TLS connection is logged with its cause (`invalid peer certificate: UnknownIssuer`). |
-| `queue_capacity` | 1024 | Checkpoints waiting for delivery, at most. When full, the oldest queued one is dropped and `attenuo_audit_sink_dropped_total` counts it. |
+| `queue_capacity` | 1024 | Checkpoints waiting for delivery, at most. When full, the oldest queued checkpoint is dropped and `attenuo_audit_sink_dropped_total` counts it. A prune's anchor is never dropped: with only anchors queued the queue grows past this. |
 | `max_lag_seconds` | 300 | `/readyz` reports the sink degraded once the oldest undelivered checkpoint is older than this, or the queue is full. |
 | `fail_readiness` | `false` | Make a degraded sink fail `/readyz` (503). Off by default: the server keeps serving and reports `"degraded": true`. |
 | `timeout_seconds` | 10 | Per-request timeout (webhook, s3). |
@@ -106,7 +106,10 @@ Ships every signed checkpoint off the host as it is created (SR-21); see [Shippi
 
 `queue_capacity`, `max_lag_seconds`, `timeout_seconds`, `initial_backoff_ms` and `max_backoff_seconds` must each be at least 1. A webhook `url` and an s3 `endpoint` must start with `http://` or `https://`.
 
-A prune of the log (`[audit.retention]` below) also ships its signed anchor through the sink, in the format `attenuo-shipped-anchor-v1`: one more webhook `POST` (with `x-attenuo-anchor-through-seq` and `x-attenuo-anchor-sha256` in place of the checkpoint headers), one more line of the file (told apart by its `anchor` member), or one more S3 object, `<prefix>anchor-<through_seq, 20 digits>-<16 hex of anchor_sha256>.json`.
+A prune of the log (`[audit.retention]` below) also ships its signed anchor through the sink, in the format `attenuo-shipped-anchor-v1`: one more webhook `POST` (with `x-attenuo-anchor-through-seq` and `x-attenuo-anchor-sha256` in place of the checkpoint headers), one more line of the file (told apart by its `anchor` member), or one more S3 object, `<prefix>anchor-<through_seq, 20 digits>-<16 hex of anchor_sha256>.json`. The anchor is retried until it is delivered, like a checkpoint, and is never dropped or given up. Two things follow for what reads the sink:
+
+- A webhook receiver must accept the anchor's body (status 2xx). One that refuses it holds every later checkpoint behind it in the queue, and the sink goes degraded (`/readyz`) until the receiver accepts it.
+- An older `attenuo audit verify --checkpoints`, or an older Python or TypeScript SDK `cross_check`, fails on a shipped file that holds an anchor line: it reads the line as a malformed checkpoint. Upgrade the CLI and the SDKs before the first prune; this release skips anchor lines.
 
 ### `[audit.retention]`
 
@@ -115,10 +118,14 @@ Whether the oldest part of the audit log may be pruned, behind a signed anchor t
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `prune` | `"off"` | `"off"` or `"manual"`. With `"manual"` the admin prunes through `GET /admin/audit/prune/plan` and `POST /admin/audit/prune` ([HTTP API](http-api.md#audit-retention)); with `"off"` both answer 409 `prune_disabled`. `"auto"` is not built yet and refuses to start. |
-| `min_age_seconds` | 7776000 (90 days) | Nothing younger is pruned: the entry at the boundary must be older than this (409 `prune_too_recent`). |
+| `min_age_seconds` | 7776000 (90 days) | Nothing younger is pruned: the entry at the boundary must be older than this (409 `prune_too_recent`). At most 3153600000 (100 years); a larger value refuses to start, whatever `prune` is. |
 | `batch_rows` | 10000 | Rows deleted per transaction once a prune is committed. The maintenance task runs the batches (at most `[leases] maintenance_max_passes` per run, every `maintenance_interval_seconds`), and appends wait for each one: on a 200,000-row file a batch of 10000 took about 0.35 s. Between 1 and 1000000. |
 
 With `prune` other than `"off"` the server refuses to start when `sqlite_path` is `":memory:"`, when `[audit.sink]` is not set (the anchor must leave the host), or when `min_age_seconds` is below the run-state retention of `[leases]`: below `retention_seconds + run_state_retention_seconds` (each term only when it is not 0) or below `user_window_retention_seconds`. With the defaults that floor is 37 days (3196800 seconds).
+
+With `[leases] retention_seconds = 0` lease trees are never pruned from the registry, so every chain ever issued counts as live and `prune_live_run` refuses any boundary at or above its first record: in practice almost nothing can be pruned. The server starts, with a warning that says so.
+
+Anchors, and the checkpoint at the newest boundary, are never pruned. A key that signed one must stay in the JWKS after a key rotation (`[issuer] previous_key_paths`), or `audit verify` reports the anchor as signed by an unknown key and the log as broken.
 
 ## `[authzen]`
 

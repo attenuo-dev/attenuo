@@ -551,7 +551,7 @@ On every refusal the operators in force are unchanged. An entry whose `expires_a
 
 ### Budget refund
 
-`POST /admin/budgets/refund` works from the charge log, which keeps what each allowed call charged until `[leases] run_state_retention_seconds` after its run's leases are gone. When the charge log has no entry for `decision_id`, the server looks the decision up in the audit log, which is append-only and keeps every decision record, and answers by what the record shows:
+`POST /admin/budgets/refund` works from the charge log, which keeps what each allowed call charged until `[leases] run_state_retention_seconds` after its run's leases are gone. When the charge log has no entry for `decision_id`, the server looks the decision up in the audit log, which is append-only and keeps every decision record unless the log was pruned past it (`[audit.retention]`; the 404 then names the boundary), and answers by what the record shows:
 
 | Status | `error` | When | `detail` |
 | --- | --- | --- | --- |
@@ -703,20 +703,25 @@ With `[audit.retention] prune = "manual"` ([config](config.md#auditretention), [
   "at": "2026-07-30T23:59:58Z",
   "guards": {"requested": 1000150, "before": null, "min_age_cutoff": "2026-08-24T12:00:00Z",
              "live_run_seq": 1000123, "sink_delivered_through": 1041000, "sink_degraded": false,
-             "in_progress": false, "limited_by": "prune_not_at_checkpoint"},
+             "in_progress": false, "anchor_undelivered": false,
+             "limited_by": "prune_not_at_checkpoint"},
   "anchor": null
 }
 ```
 
-`through` is null when nothing can be pruned. `limited_by` names, by its refusal code, the guard that set `through` below the request. The archive of that prune is the export `from..=through`: export it, verify it with `attenuo audit verify --file`, and keep it off the host before pruning.
+`through` is null when nothing can be pruned. `limited_by` says what set `through` below the request: the refusal code of a guard (see the table below), or `"before"` when it was the `before` time asked for, which is not a refusal. `anchor_undelivered` is true while `[audit.sink]` has not delivered the anchor of the previous prune, which holds the next one (`sink_behind`). The archive of that prune is the export `from..=through`: export it, verify it with `attenuo audit verify --file`, and keep it off the host before pruning.
 
 `POST /admin/audit/prune` with `{"through": B, "archive_sha256": "<64 hex>"}` (`archive_sha256` optional, the SHA-256 of the archive file's bytes) commits the prune in one transaction: the signed checkpoint of the head (if it has none), the prune record (`admin`, tool `admin.audit.prune`, its arguments `{through_seq, through_hash, previous_through_seq, archive_sha256}`), the signed anchor, and the checkpoint of the prune record. With `[audit.sink]` the two checkpoints and the anchor are queued for shipping. It answers:
 
 ```json
 {"prune_seq": 1041231, "pruned_through": 1000000, "anchor": {...},
  "checkpoint_before": {...}, "checkpoint_after": {...}, "deleting": true,
- "shipped": {"queued": true, "delivered_through": 1041000}, "already": false}
+ "shipped": {"queued": true, "delivered_through": 1041000,
+             "anchor_shipped_at": null, "anchor_pending": true},
+ "already": false}
 ```
+
+`shipped` is null without `[audit.sink]`. `queued` says whether this call queued the anchor (and, for a new prune, the two checkpoints); `delivered_through` is the highest checkpoint seq the sink has delivered since the server started; `anchor_shipped_at` is when the sink delivered the anchor (null until then), and `anchor_pending` whether it is queued and not yet delivered. The anchor is never dropped from a full queue, and it is queued again at start-up while `anchor_shipped_at` is null. A repeated request for a prune whose anchor is neither delivered nor queued queues it again.
 
 From then on every read starts at B + 1. The rows at or below B are deleted afterwards, in transactions of `[audit.retention] batch_rows`, by the maintenance task; a restart resumes them, and the anchor's `state` goes from `deleting` to `done`. Repeating a request that succeeded answers 200 with the stored anchor and `"already": true`. The guards, each a 409 with nothing written:
 
@@ -725,13 +730,13 @@ From then on every read starts at B + 1. The rows at or below B are deleted afte
 | `prune_not_at_checkpoint` | B has no stored checkpoint, or its `head_hash` is not the entry's hash |
 | `prune_too_recent` | the entry at B is younger than `min_age_seconds` |
 | `prune_live_run` | a run whose root lease is still in the lease registry has an entry at or below B |
-| `sink_behind` | `[audit.sink]` is degraded, or has not delivered the checkpoint at B or a later one since the server started |
+| `sink_behind` | `[audit.sink]` is degraded, has not delivered the checkpoint at B or a later one since the server started, or has not delivered the anchor of the previous prune |
 | `prune_in_progress` | the rows of an earlier prune are still being deleted |
 | `prune_conflict` | B was already pruned with another `archive_sha256` |
 
-A `through` below the current boundary is 410 `audit_pruned`; 400 `invalid_request` for a malformed body, a `through` of 0 or an `archive_sha256` that is not 64 lower-case hex digits.
+A `through` below the current boundary is 410 `audit_pruned`, with `pruned_through`, `prune_seq` and `first` as on every other 410 `audit_pruned`; 400 `invalid_request` for a malformed body, a `through` of 0 or an `archive_sha256` that is not 64 lower-case hex digits.
 
-After a prune, `GET /admin/audit/verify` checks the newest anchor's signature, the checkpoint at B and the prune record, and walks the chain from B + 1. A log whose first rows were deleted without a valid anchor (by someone with write access to the file but no key) reports `ok: false` at its first row, as before. `GET /admin/audit/anchors` lists every anchor.
+After a prune, `GET /admin/audit/verify` checks the newest anchor's signature, the checkpoint at B and the prune record, and walks the chain from B + 1. A log whose first rows were deleted without a valid anchor (by someone with write access to the file but no key) reports `ok: false` at its first row, as before. `GET /admin/audit/anchors` lists every anchor, newest first, each with its `state` and `shipped_at`. An export that is streaming when a prune commits above its position ends with an error instead of a file with a gap (export again from the new first seq), and a verify whose walk overlaps a prune's deletes walks once more from a new snapshot when the anchors changed.
 
 ### Policies: read, check, dry run
 

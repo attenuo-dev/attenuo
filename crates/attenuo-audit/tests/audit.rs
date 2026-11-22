@@ -35,7 +35,8 @@ fn empty_log_verifies_and_checkpoints_at_genesis() {
             VerifyReport {
                 entries: 0,
                 ok: true,
-                first_bad_seq: None
+                first_bad_seq: None,
+                unauthenticated_start: None
             }
         );
     }
@@ -169,7 +170,8 @@ fn tamper_record_json_is_detected() {
         VerifyReport {
             entries: 4,
             ok: false,
-            first_bad_seq: Some(4)
+            first_bad_seq: Some(4),
+            unauthenticated_start: None
         }
     );
 }
@@ -849,7 +851,8 @@ fn an_entry_at_u64_max_fails_verification_cleanly_f4() {
         VerifyReport {
             entries: 2,
             ok: false,
-            first_bad_seq: Some(u64::MAX)
+            first_bad_seq: Some(u64::MAX),
+            unauthenticated_start: None
         }
     );
 }

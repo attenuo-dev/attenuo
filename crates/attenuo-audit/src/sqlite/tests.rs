@@ -1342,3 +1342,131 @@ fn an_existing_database_keeps_its_mode_sr103() {
         assert_eq!(mode(&p), 0o640, "{}", p.display());
     }
 }
+
+/// The query plan of `sql` on `conn`, one `detail` per line.
+fn plan_of(conn: &Connection, sql: &str) -> Vec<String> {
+    let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+    let nulls = vec![rusqlite::types::Null; stmt.parameter_count()];
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(nulls), |r| r.get::<_, String>(3))
+        .unwrap();
+    rows.collect::<Result<_, _>>().unwrap()
+}
+
+/// The entry reads that gained the retained clause (ADR-0015) keep the index they used
+/// without it: the clause only adds a lookup of the newest anchor on its primary key. Pinned
+/// on the statements that run per request, and printed for every one.
+#[test]
+fn the_retained_clause_keeps_each_read_on_its_index() {
+    use super::log::RETAINED;
+    let log = SqliteAudit::open_in_memory().unwrap();
+    let statements = [
+        format!("SELECT {ENTRY_COLUMNS} FROM audit WHERE seq = ?1 AND {RETAINED}"),
+        format!(
+            "SELECT {ENTRY_COLUMNS} FROM audit WHERE originating_subject = ?1 AND {RETAINED} \
+             ORDER BY seq DESC LIMIT ?2"
+        ),
+        format!(
+            "SELECT {ENTRY_COLUMNS} FROM audit WHERE {RECORD_ID_EXPR} = ?1 AND {RETAINED} \
+             ORDER BY seq"
+        ),
+        format!(
+            "SELECT {ENTRY_COLUMNS} FROM audit WHERE kind = ?1 AND tool = ?2 AND decision = ?3 \
+             AND seq > ?4 AND {RETAINED} ORDER BY seq LIMIT 1"
+        ),
+        format!(
+            "SELECT {ENTRY_COLUMNS} FROM audit WHERE chain_id = ?1 \
+             AND kind IN ('root_token', 'exchange') AND {RETAINED} ORDER BY seq"
+        ),
+        format!(
+            "SELECT {ENTRY_COLUMNS} FROM audit WHERE chain_digest = ?1 AND {RETAINED} ORDER BY seq"
+        ),
+        format!(
+            "SELECT {ENTRY_COLUMNS} FROM audit WHERE seq >= ?1 AND {RETAINED} ORDER BY seq \
+             LIMIT ?2"
+        ),
+    ];
+    log.with_connection(|c| {
+        for sql in &statements {
+            let with = plan_of(c, sql);
+            let without = plan_of(
+                c,
+                &sql.replace(&format!(" AND {RETAINED}"), "")
+                    .replace(&format!(" WHERE {RETAINED}"), ""),
+            );
+            println!("{sql}\n  with:    {with:?}\n  without: {without:?}");
+            // The first line is the read of `audit`: the same index with the clause as without
+            // it, or a scan the clause turns into a search by seq.
+            // The index is named before its constraints, which may gain `rowid>?`.
+            let access = |l: &str| l.split(" (").next().unwrap_or(l).to_string();
+            let main = access(&with[0]);
+            assert!(
+                main == access(&without[0])
+                    || (without[0].starts_with("SCAN audit")
+                        && main.contains("INTEGER PRIMARY KEY")),
+                "{sql}: {with:?} vs {without:?}"
+            );
+            // The anchor lookup is one search on its primary key, never a scan.
+            assert!(
+                with.iter().any(|l| l.contains("audit_anchors")),
+                "{sql}: {with:?}"
+            );
+            assert!(
+                !with.iter().any(|l| l.starts_with("SCAN audit_anchors")),
+                "{sql}: {with:?}"
+            );
+        }
+        // The count keeps its covering index for the whole table.
+        let len = plan_of(c, super::log::LEN_SQL);
+        println!("{}\n  {len:?}", super::log::LEN_SQL);
+        assert!(
+            len.iter()
+                .any(|l| l.starts_with("SCAN audit USING COVERING INDEX")),
+            "{len:?}"
+        );
+        assert!(
+            len.iter()
+                .any(|l| l.starts_with("SEARCH audit USING INTEGER PRIMARY KEY (rowid<?)")),
+            "{len:?}"
+        );
+        // Pinned: an entry by seq and a subject's newest entries.
+        let by_seq = plan_of(c, &statements[0]);
+        assert_eq!(
+            by_seq[0],
+            "SEARCH audit USING INTEGER PRIMARY KEY (rowid=?)"
+        );
+        let by_subject = plan_of(c, &statements[1]);
+        assert!(
+            by_subject[0].starts_with("SEARCH audit USING INDEX audit_subject_idx"),
+            "{by_subject:?}"
+        );
+        Ok(())
+    })
+    .unwrap();
+}
+
+/// The live-run lookup of a prune runs one search of `audit_chain_id_idx` per root lease,
+/// each stopping at the chain's first record, and does not read every record of every live
+/// chain.
+#[test]
+fn the_live_run_lookup_is_one_index_search_per_root_lease() {
+    let log = SqliteAudit::open_in_memory().unwrap();
+    log.with_connection(|c| {
+        let plan = plan_of(c, super::retention::LIVE_RUN_SQL);
+        println!("{plan:?}");
+        assert!(
+            plan.iter()
+                .any(|l| l.starts_with("CORRELATED SCALAR SUBQUERY")),
+            "{plan:?}"
+        );
+        assert!(
+            plan.iter()
+                .any(|l| l
+                    .starts_with("SEARCH a USING COVERING INDEX audit_chain_id_idx (chain_id=?)")),
+            "{plan:?}"
+        );
+        assert!(!plan.iter().any(|l| l.contains("TEMP B-TREE")), "{plan:?}");
+        Ok(())
+    })
+    .unwrap();
+}
