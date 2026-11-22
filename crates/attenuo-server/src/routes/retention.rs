@@ -241,20 +241,38 @@ pub async fn prune(
             "audit log pruned; the rows are deleted in the background"
         );
     }
-    // A repeat finds the anchor queued, or queues it again if it is neither delivered nor
-    // queued (it was queued before a restart that lost it, and the restart queued it, but a
-    // repeat costs nothing). The anchor is never dropped from the queue.
+    // A repeat of a prune whose anchor is not recorded as shipped: the anchor is queued (a
+    // no-op) or is queued now (it was lost with a restart, and the restart queued it, but a
+    // repeat costs nothing), or this process delivered it. Then it is not shipped a second
+    // time: the delivery ended after the prune above read `shipped_at`, or recording it
+    // failed, so it is recorded now (the first time recorded is kept).
+    let mut shipped_at = out.anchor.shipped_at;
+    let mut queued = !out.already;
+    if let (true, None, Some(sink)) = (out.already, &shipped_at, &state.checkpoint_sink) {
+        let handle = sink.handle();
+        queued = handle.push_anchor(a);
+        if !queued && handle.anchor_delivered(a.through_seq) {
+            let through = a.through_seq;
+            shipped_at = state
+                .blocking(move |s| {
+                    s.audit.mark_anchor_shipped(through, now)?;
+                    // A repeat is always of the newest prune (an older one is 410).
+                    Ok::<_, ApiError>(
+                        s.audit
+                            .newest_anchor()?
+                            .filter(|n| n.anchor.through_seq == through)
+                            .and_then(|n| n.shipped_at),
+                    )
+                })
+                .await?;
+        }
+    }
     let shipped = state.checkpoint_sink.as_ref().map(|s| {
-        let queued = if out.already && out.anchor.shipped_at.is_none() {
-            s.handle().push_anchor(a)
-        } else {
-            !out.already
-        };
         json!({
             "queued": queued,
             "delivered_through": s.delivered_through(),
-            "anchor_shipped_at": out.anchor.shipped_at,
-            "anchor_pending": out.anchor.shipped_at.is_none() && s.anchor_pending(a.through_seq),
+            "anchor_shipped_at": shipped_at,
+            "anchor_pending": shipped_at.is_none() && s.anchor_pending(a.through_seq),
         })
     });
     Ok(Json(json!({

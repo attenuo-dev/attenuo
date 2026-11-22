@@ -458,15 +458,14 @@ async fn a_prune_end_to_end_with_a_file_sink() {
     );
     let (_, plan) = h.get("/admin/audit/prune/plan").await;
     assert_eq!(plan["guards"]["anchor_undelivered"], true, "{plan}");
+    // The repeat records the delivery; this process delivered the anchor, so it is not
+    // shipped a second time.
     let (_, again) = h.prune(20, Some(&digest)).await;
-    assert_eq!(again["shipped"]["queued"], true, "{again}");
-    assert_eq!(
-        again["shipped"]["anchor_shipped_at"],
-        Value::Null,
-        "{again}"
-    );
-    let s = h.state.clone();
-    wait_for(move || s.audit.unshipped_anchors().is_ok_and(|u| u.is_empty())).await;
+    assert_eq!(again["shipped"]["queued"], false, "{again}");
+    assert!(again["shipped"]["anchor_shipped_at"].is_string(), "{again}");
+    assert_eq!(again["shipped"]["anchor_pending"], false, "{again}");
+    assert!(h.state.audit.unshipped_anchors().unwrap().is_empty());
+    assert_eq!(parse_shipped_anchors(&h.shipped()).unwrap().len(), 1);
     let (status, body) = h.prune(40, None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
 }
