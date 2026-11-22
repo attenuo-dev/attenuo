@@ -844,7 +844,8 @@ impl Metrics {
             &mut out,
             "audit_db_free_bytes",
             "Bytes of that file on SQLite's free list (freelist_count * page_size): freed by \
-             deletes and reused by new rows; the file does not shrink without VACUUM.",
+             deletes and reused by new rows. The server never shrinks the file; `attenuo \
+             audit compact` does, with the server stopped.",
             &self.audit_db_free_bytes,
         );
         simple_counter(
