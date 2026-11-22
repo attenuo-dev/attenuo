@@ -2,7 +2,7 @@
 
 TypeScript client for the [attenuo](https://github.com/attenuo-dev/attenuo/blob/main/README.md) authorization server: exchange delegation tokens, attenuate capabilities, call MCP tools through the enforcing proxy, handle denials, renew leases, and read the audit log.
 
-**Status: pre-alpha**, like the server. Version 0.1.0, released together with attenuo 0.1.0: the SDK carries the server's version number, follows that release's wire format and will change with it. Once 0.1.0 is on npm, `npm install @attenuo/sdk` installs it; until the maintainer publishes it, build it from a checkout.
+**Status: pre-alpha**, like the server. Version 0.2.0, released together with attenuo 0.2.0: the SDK carries the server's version number, follows that release's wire format and will change with it. Once it is on npm, `npm install @attenuo/sdk` installs it; until the maintainer publishes it, build it from a checkout.
 
 ```sh
 cd sdk/typescript
@@ -998,7 +998,7 @@ cd sdk/typescript && npm run build && ATTENUO_INTEGRATION=1 npm test
 
 ## Not done
 
-- Not on npm until the maintainer publishes 0.1.0.
+- Not on npm until the maintainer publishes it.
 - `callToolStream` yields server-initiated requests (sampling, elicitation) but cannot answer them, and does not resume a broken stream with `Last-Event-ID` (it keeps the id on each event). Use the MCP client for those.
 - The detached `ou_sig` over the user block is not checked locally; the server checks it on every request.
 - Hop-0 exchange was run once against Keycloak 26.8.2 in dev mode on loopback (`scripts/live-keycloak-smoke.sh`, not part of CI); not against a hosted IdP.

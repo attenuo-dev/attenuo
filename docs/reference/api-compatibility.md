@@ -1,6 +1,6 @@
 # API compatibility before 1.0
 
-attenuo is pre-alpha at version 0.1.0. Versions follow SemVer 2.0, and before 1.0 a minor release may break things ([CONTRIBUTING](https://github.com/attenuo-dev/attenuo/blob/main/CONTRIBUTING.md#releases)). This page says what that means for each surface a client, a policy author or an operator codes against: what we try not to break, what may still change, how a change is announced, and what is not versioned at all yet. It describes what the code does on `main`, and where the code and this page disagree, the code is right.
+attenuo is pre-alpha at version 0.2.0. Versions follow SemVer 2.0, and before 1.0 a minor release may break things ([CONTRIBUTING](https://github.com/attenuo-dev/attenuo/blob/main/CONTRIBUTING.md#releases)). This page says what that means for each surface a client, a policy author or an operator codes against: what we try not to break, what may still change, how a change is announced, and what is not versioned at all yet. It describes what the code does on `main`, and where the code and this page disagree, the code is right.
 
 ## The rules
 
@@ -65,7 +65,7 @@ Routes stay as they are until this is decided, and the decision is due before 1.
 
 1. **Keep unversioned paths and version in a header or media type.** No route changes. Clients cannot tell versions apart from a URL, proxies and logs cannot either, and every client must send the header.
 2. **Add `/v1` to the project's own routes at 1.0 and keep the old paths as aliases for one minor release.** `/token` becomes `/v1/token`, `/admin/...` becomes `/v1/admin/...`, `/approvals/{id}` becomes `/v1/approvals/{id}`, and `/mcp/{server}` becomes `/v1/mcp/{server}`. Paths fixed by other specifications stay where those specifications put them: `/access/v1/*`, `/.well-known/jwks.json`, `/.well-known/authzen-configuration`, and the probes `/healthz`, `/readyz` and `/metrics`. The aliases log a deprecation warning and are removed in the next minor release.
-3. **Add `/v1` now, before 0.1.0 is tagged.** Same mapping as option 2 with no alias period, since there are no released clients. It touches every client, SDK, example and doc at once, while the API is still expected to change.
+3. **Add `/v1` in a minor release before 1.0, with no alias period.** Same mapping as option 2. The earlier it is done, the fewer released clients have to move. It touches every client, SDK, example and doc at once, while the API is still expected to change.
 
 **Recommended: option 2.** It puts the version where every proxy, log and reader can see it, keeps the paths that standards fix, and gives the one existing set of clients a release to move. Option 3 pays the same cost earlier, before the API has settled enough for "v1" to mean anything. The decision will be recorded as an ADR; nothing here changes a route.
 

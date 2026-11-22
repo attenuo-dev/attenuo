@@ -35,7 +35,7 @@ body:
     attributes:
       label: Version or commit
       description: Output of `attenuo-server --version`, the crate version, or the git SHA.
-      placeholder: "0.1.0 / 252f73c"
+      placeholder: "0.2.0 / 252f73c"
     validations:
       required: true
   - type: textarea

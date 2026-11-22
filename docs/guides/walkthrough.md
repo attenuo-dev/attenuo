@@ -50,7 +50,7 @@ curl -s $SRV/healthz
 ```
 
 ```json
-{"status":"ok","version":"0.1.0"}
+{"status":"ok","version":"0.2.0"}
 ```
 
 ### Hop 0 from your identity provider

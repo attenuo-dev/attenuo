@@ -359,7 +359,11 @@ jobs:
           kubectl version --client
       - name: Create the cluster
         run: kind create cluster --wait 180s
+      # The newest published image. The chart's appVersion names the release being prepared,
+      # whose image exists only once its tag is pushed; move this to it after the release.
       - run: bash scripts/helm-smoke.sh
+        env:
+          ATTENUO_IMAGE_TAG: "0.1.0"
 
   # The admin console in headless Chromium: every page in both themes, with zero console
   # errors and CSP violations allowed (scripts/console-smoke.sh, tests/console/).
