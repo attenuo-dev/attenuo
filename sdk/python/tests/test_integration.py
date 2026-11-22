@@ -2015,7 +2015,7 @@ def test_keys_reload_rotates_the_signing_key(reload_stack: Stack) -> None:
 @pytest.fixture
 def prune_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Stack]:
     """A stack that can prune: a file audit log with a checkpoint every 3 entries, the file
-    checkpoint sink, ``prune = "manual"``, and ``min_age_seconds = 2``. The run-state
+    checkpoint sink, ``prune = "manual"``, and ``min_age_seconds = 5``. The run-state
     retentions are 0 (keep everything) so that the start-up floor on ``min_age_seconds`` is 0,
     and the test makes no lease, so no live run holds the boundary. The maintenance task, which
     deletes the pruned rows, runs every second."""
@@ -2024,7 +2024,7 @@ def prune_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Stack]:
         work,
         "[leases]\nretention_seconds = 0\nrun_state_retention_seconds = 0\n"
         "user_window_retention_seconds = 0\nmaintenance_interval_seconds = 1\n\n"
-        '[audit.retention]\nprune = "manual"\nmin_age_seconds = 2\n\n'
+        '[audit.retention]\nprune = "manual"\nmin_age_seconds = 5\n\n'
         '[audit.sink]\nkind = "file"\npath = "{work}/shipped.jsonl"\n\n',
         edits={
             'sqlite_path = ":memory:"': (
@@ -2051,9 +2051,13 @@ def test_audit_prune_plan_prune_and_anchors(prune_stack: Stack) -> None:
             admin.policy_reload()
         early = admin.audit_prune_plan()
         assert early.through is None and early.guards.limited_by == "prune_too_recent"
-        time.sleep(2.5)
-
+        # Until the entries are old enough: polled, not one fixed sleep, so a slow machine
+        # only waits longer.
+        deadline = time.monotonic() + 60
         plan = admin.audit_prune_plan()
+        while plan.guards.limited_by == "prune_too_recent" and time.monotonic() < deadline:
+            time.sleep(0.25)
+            plan = admin.audit_prune_plan()
         assert plan.from_ == 1 and plan.through is not None and plan.guards.limited_by is None
         assert plan.checkpoint is not None and plan.checkpoint["seq"] == plan.through
         assert plan.entries == plan.through and plan.anchor is None

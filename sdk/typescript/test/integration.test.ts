@@ -1636,7 +1636,7 @@ describe.skipIf(!enabled)("agents and keys reload against the real server", () =
 
 describe.skipIf(!enabled)("audit retention against the real server", () => {
   // A file audit log with a checkpoint every 3 entries, the file checkpoint sink,
-  // `prune = "manual"` and `min_age_seconds = 2`. The run-state retentions are 0 (keep
+  // `prune = "manual"` and `min_age_seconds = 5`. The run-state retentions are 0 (keep
   // everything) so that the start-up floor on `min_age_seconds` is 0, and the test makes no
   // lease, so no live run holds the boundary. The maintenance task, which deletes the pruned
   // rows, runs every second.
@@ -1646,7 +1646,7 @@ describe.skipIf(!enabled)("audit retention against the real server", () => {
     stack = await startStack(
       "[leases]\nretention_seconds = 0\nrun_state_retention_seconds = 0\n" +
         "user_window_retention_seconds = 0\nmaintenance_interval_seconds = 1\n\n" +
-        '[audit.retention]\nprune = "manual"\nmin_age_seconds = 2\n\n' +
+        '[audit.retention]\nprune = "manual"\nmin_age_seconds = 5\n\n' +
         '[audit.sink]\nkind = "file"\npath = "{work}/shipped.jsonl"\n\n',
       [],
       {
@@ -1685,9 +1685,14 @@ describe.skipIf(!enabled)("audit retention against the real server", () => {
     for (let i = 0; i < 6; i++) await admin.policyReload();
     const early = await admin.auditPrunePlan();
     expect([early.through, early.guards.limitedBy]).toEqual([undefined, "prune_too_recent"]);
-    await sleep(2500);
-
-    const plan = await admin.auditPrunePlan();
+    // Until the entries are old enough: polled, not one fixed sleep, so a slow machine only
+    // waits longer.
+    const oldEnough = Date.now() + 60_000;
+    let plan = await admin.auditPrunePlan();
+    while (plan.guards.limitedBy === "prune_too_recent" && Date.now() < oldEnough) {
+      await sleep(250);
+      plan = await admin.auditPrunePlan();
+    }
     expect([plan.from, plan.guards.limitedBy, plan.anchor]).toEqual([1, undefined, undefined]);
     const through = plan.through!;
     expect(plan.checkpoint?.seq).toBe(through);
