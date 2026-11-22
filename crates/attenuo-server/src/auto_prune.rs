@@ -421,7 +421,11 @@ async fn cutoff_of(
 ) -> Result<OffsetDateTime, AuditError> {
     let newest = state.blocking(newest_entry_at).await?;
     let now = state.now();
-    let bound = state.auto_prune.bound_at(state.clock.now()).unwrap_or(now);
+    // Without a start reading there is no bound to trust, so nothing is old enough.
+    let bound = state
+        .auto_prune
+        .bound_at(state.clock.now())
+        .unwrap_or(OffsetDateTime::UNIX_EPOCH);
     let from = [Some(now), newest, Some(bound)]
         .into_iter()
         .flatten()
@@ -909,6 +913,17 @@ impl ArchiveJob {
             return Err(refuse("not a regular file".to_string()));
         }
         let (sha256, exported_at) = self.check(s, target, None).map_err(refuse)?;
+        // `exported_at` is the one header value the file chooses. It must be a time in the
+        // form this server writes (UTC, whole seconds), so that it cannot carry other text
+        // into a file whose digest is then signed.
+        let canonical = OffsetDateTime::parse(&exported_at, &Rfc3339)
+            .ok()
+            .is_some_and(|t| rfc3339(t) == exported_at);
+        if !canonical {
+            return Err(refuse(
+                "its header's exported_at is not a time as this server writes it".to_string(),
+            ));
+        }
         // The check covers the chain, not every byte: an unknown field, a repeated key or a
         // line the verifier skips would pass it. So the export of the same range is made
         // again, with the file's own `exported_at` (the only header value not taken from the

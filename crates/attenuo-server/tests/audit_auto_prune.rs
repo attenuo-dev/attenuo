@@ -1419,6 +1419,17 @@ async fn a_planted_archive_with_extra_content_is_refused_not_signed() {
     planted(|text| text.replacen("\"record\":{", "\"record\":{\"reason\":\"forged\",", 1)).await;
     planted(|text| format!("{text}{{\"type\":\"note\",\"text\":\"forged\"}}\n")).await;
     planted(|text| format!("{text}\n")).await;
+    // The header's `exported_at` is the one value the file chooses: it must be a time in the
+    // server's own form, not free text and not another spelling of a time.
+    let exported_at = |text: &str, value: &str| {
+        let start = text.find("\"exported_at\":\"").expect("exported_at") + 15;
+        let end = start + text[start..].find('"').expect("closing quote");
+        format!("{}{value}{}", &text[..start], &text[end..])
+    };
+    let detail = planted(|text| exported_at(text, "FORGED: approved by nobody")).await;
+    assert!(detail.contains("exported_at"), "{detail}");
+    planted(|text| exported_at(text, "2026-01-01T00:00:00.5Z")).await;
+    planted(|text| exported_at(text, "2026-01-01T05:30:00+05:30")).await;
 }
 
 /// A manual prune that commits after the archive is written and checked, just before the
