@@ -23,8 +23,13 @@ COPY . .
 # it here keeps rustup from downloading them on every build.
 # Cache mounts keep the registry and target dir between builds; the binaries are copied out
 # inside the same RUN because the target mount does not survive it.
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/target \
+# Each target architecture gets its own caches (BuildKit sets TARGETARCH). A multi-arch build
+# runs both architectures at once: sharing one registry made the two unpack the same crate
+# and fail with "File exists" (cargo's unpack lock lives outside the mount). The target dir
+# was shared too; it now is not.
+ARG TARGETARCH
+RUN --mount=type=cache,id=attenuo-cargo-registry-${TARGETARCH},sharing=locked,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=attenuo-target-${TARGETARCH},sharing=locked,target=/src/target \
     export RUSTUP_TOOLCHAIN="$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)" \
  && cargo build --release --locked -p attenuo-server -p attenuo-cli \
  && mkdir /out \
@@ -32,8 +37,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 # The fake MCP server (a test double that echoes calls), built only for the `demo` target.
 FROM build AS build-demo
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/src/target \
+ARG TARGETARCH
+RUN --mount=type=cache,id=attenuo-cargo-registry-${TARGETARCH},sharing=locked,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=attenuo-target-${TARGETARCH},sharing=locked,target=/src/target \
     export RUSTUP_TOOLCHAIN="$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)" \
  && cargo build --release --locked -p attenuo-proxy --features testing --example fake_mcp \
  && cp target/release/examples/fake_mcp /out/fake-mcp
