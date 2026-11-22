@@ -481,7 +481,7 @@ Write entries and the checkpoints inside the range. Needs the admin token.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `--from` | 1 | First sequence number. |
+| `--from` | the first entry | First sequence number: 1, or after a prune (`[audit.retention]`) one above its boundary, and the export then carries the signed anchor in its header. A `--from` or `--to` at or below the boundary is refused (410 `audit_pruned`). |
 | `--to` | the head | Last sequence number, inclusive. |
 | `--format` | `jsonl` | `jsonl` streams one object per line (header, entries, checkpoints). `json` writes one object `{header, entries, checkpoints}`. |
 | `--out` | stdout | Write to this file. |

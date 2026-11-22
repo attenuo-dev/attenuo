@@ -150,8 +150,13 @@ async fn every_route_answers_each_role_as_the_table_says_console_listener() {
     let console = spawn_router(attenuo_server::admin_ui::router(state, &cfg))
         .await
         .unwrap();
-    // The console never mounts the root mint.
-    check_every_route(&console.url(""), |_, p| p != "/admin/root-token").await;
+    // The console never mounts the root mint, and does not mount the audit retention routes.
+    let on_console = |p: &str| {
+        p != "/admin/root-token"
+            && !p.starts_with("/admin/audit/prune")
+            && p != "/admin/audit/anchors"
+    };
+    check_every_route(&console.url(""), |_, p| on_console(p)).await;
 }
 
 #[tokio::test]

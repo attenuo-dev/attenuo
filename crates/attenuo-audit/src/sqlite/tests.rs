@@ -863,17 +863,19 @@ fn the_record_id_index_is_added_to_an_existing_log_without_touching_rows() {
         for i in 0..5 {
             log.append(record(i)).unwrap();
         }
+        let id = log.entry_at(4).unwrap().unwrap().record.id.to_string();
         // Make the file look like one written before the index existed (and so before
-        // schema versions, before the replay table of version 3 and the subject issuer of 4).
+        // schema versions, before the replay table of version 3, the subject issuer of 4 and the
+        // anchor table of 5).
         log.with_connection(|c| {
             Ok(c.execute_batch(
                 "DROP INDEX audit_record_id_idx; DROP TABLE used_credentials; \
+                 DROP TABLE audit_anchors; \
                  ALTER TABLE lease_subjects DROP COLUMN issuer; PRAGMA user_version = 0;",
             )?)
         })
         .unwrap();
         assert!(!index_exists(&log));
-        let id = log.entry_at(4).unwrap().unwrap().record.id.to_string();
         (dump(&log), id)
     };
     let log = SqliteAudit::open(&path).unwrap();
@@ -885,7 +887,7 @@ fn the_record_id_index_is_added_to_an_existing_log_without_touching_rows() {
     log.with_connection(|c| {
         c.execute_batch(
             "DROP INDEX audit_record_id_idx; DROP TABLE used_credentials; \
-             ALTER TABLE lease_subjects DROP COLUMN issuer; \
+             DROP TABLE audit_anchors; ALTER TABLE lease_subjects DROP COLUMN issuer; \
              UPDATE audit SET record_json = '{not json' WHERE seq = 2; \
              PRAGMA user_version = 0;",
         )?;
@@ -1215,9 +1217,9 @@ fn a_paged_verify_stops_at_its_snapshot() {
             });
         }
     });
-    let (upper, _) = log.verify_snapshot().unwrap();
+    let (upper, _, _) = log.verify_snapshot().unwrap();
     assert_eq!(upper, n);
-    let mut walk = log.entries_through(upper);
+    let mut walk = log.entries_through(None, upper);
     let first = walk.next().unwrap().unwrap();
     assert_eq!(first.seq, 1);
     // Appends land while the walk is in its first page.

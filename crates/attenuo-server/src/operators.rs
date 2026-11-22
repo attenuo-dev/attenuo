@@ -535,7 +535,7 @@ fn ct_eq32(a: &[u8; 32], b: &[u8; 32]) -> bool {
 /// - operator: revoking leases (by id or by selector, the `?preview=true` dry run included)
 ///   and deciding approvals;
 /// - admin: everything else (policy reload, operators reload, budget refunds, the dev root
-///   mint).
+///   mint, and the audit retention routes: the prune plan, the prune and the anchors).
 pub const ROUTE_ROLES: &[(&str, &str, AdminRole)] = &[
     ("GET", "/admin/whoami", AdminRole::Viewer),
     ("GET", "/admin/leases/{lease_id}", AdminRole::Viewer),
@@ -563,6 +563,9 @@ pub const ROUTE_ROLES: &[(&str, &str, AdminRole)] = &[
     ("POST", "/admin/policies/reload", AdminRole::Admin),
     ("POST", "/admin/operators/reload", AdminRole::Admin),
     ("POST", "/admin/root-token", AdminRole::Admin),
+    ("GET", "/admin/audit/prune/plan", AdminRole::Admin),
+    ("POST", "/admin/audit/prune", AdminRole::Admin),
+    ("GET", "/admin/audit/anchors", AdminRole::Admin),
 ];
 
 /// The least role a request needs: its entry in [`ROUTE_ROLES`], or [`AdminRole::Admin`] when

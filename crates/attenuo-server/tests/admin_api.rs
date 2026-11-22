@@ -321,11 +321,13 @@ async fn a_page_is_entries_next_cursor_and_head() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         keys(&body),
-        BTreeSet::from(["entries", "next_cursor", "head"])
+        BTreeSet::from(["entries", "next_cursor", "head", "first"])
     );
     let expected = serde_json::to_value(h.state.audit.range(3, 4).unwrap()).unwrap();
     assert_eq!(body["entries"], expected);
     assert_eq!(body["head"], 12);
+    // A log never pruned starts at 1.
+    assert_eq!(body["first"], 1);
     let cursor = body["next_cursor"].as_str().unwrap().to_string();
     let (_, body) = h
         .get(

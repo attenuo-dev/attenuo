@@ -594,7 +594,8 @@ pub async fn refund_budget(
 ///   when its run's root lease is revoked as well as when it is pruned: 404 `not_found` saying
 ///   so (the two cannot be told apart from the record);
 /// - any other record charged nothing: 404 `not_found`, "charged nothing";
-/// - no record with that id (or not a UUID): 404 `not_found`, "unknown decision".
+/// - no record with that id (or not a UUID): 404 `not_found`, "unknown decision", naming the
+///   prune boundary when the audit log was pruned (`[audit.retention]`).
 ///
 /// Reads only; nothing is audited for the refusal. A failed audit read is a 500.
 fn no_charge_refusal(state: &AppState, decision_id: &str) -> ApiError {
@@ -607,9 +608,18 @@ fn no_charge_refusal(state: &AppState, decision_id: &str) -> ApiError {
         Err(_) => None,
     };
     let Some(record) = record else {
-        return ApiError::not_found(format!(
-            "unknown decision `{decision_id}`: no audit record has this id; nothing to refund"
-        ));
+        return match state.audit.newest_anchor() {
+            Ok(Some(a)) => ApiError::not_found(format!(
+                "unknown decision `{decision_id}`: no audit record has this id; nothing to \
+                 refund. The audit log was pruned through seq {} at {}: a record written \
+                 before then is not in the log and may be in the prune's archive",
+                a.anchor.through_seq, a.anchor.at
+            )),
+            Ok(None) => ApiError::not_found(format!(
+                "unknown decision `{decision_id}`: no audit record has this id; nothing to refund"
+            )),
+            Err(e) => ApiError::internal(e),
+        };
     };
     let decided = record.kind == RecordKind::Decision && record.decision.is_allow();
     if decided && record.budget.is_some() {
@@ -1107,7 +1117,9 @@ fn entry_filter(q: &AuditQuery) -> Result<EntryFilter, ApiError> {
 ///
 /// The cursor's position is a seq, so entries appended while a client pages never shift the
 /// ones it has not read: each is returned once. `head` is the newest seq (0 for an empty log);
-/// reading it signs nothing, unlike `/admin/audit/checkpoint`.
+/// reading it signs nothing, unlike `/admin/audit/checkpoint`. `first` is the first retained
+/// seq: 1, or one above the boundary of a prune (`[audit.retention]`). A range or a cursor
+/// below it is not refused: oldest first it starts at `first`, newest first it ends there.
 ///
 /// # Errors
 ///
@@ -1152,11 +1164,15 @@ pub async fn audit_range(
     } else {
         MAX_AUDIT_SCAN - 1
     };
-    let (entries, next, head) = state
+    let (entries, next, head, first) = state
         .blocking(move |s| {
             // Read before the entries: entries appended after it are outside this page.
             let head = s.audit.head()?.map_or(0, |h| h.seq);
             let end = hi.min(head);
+            // Nothing below the first retained seq is read: a range or cursor below a prune
+            // boundary starts there (ascending) or ends there (descending).
+            let first = s.audit.first_retained_seq()?;
+            let lo = lo.max(first);
             // One more than the page, to tell whether anything follows it.
             let fetch = limit + 1;
             let (mut entries, next) = match order {
@@ -1196,13 +1212,14 @@ pub async fn audit_range(
                 }
             };
             entries.truncate(limit);
-            Ok::<_, attenuo_audit::AuditError>((entries, next, head))
+            Ok::<_, attenuo_audit::AuditError>((entries, next, head, first))
         })
         .await?;
     Ok(Json(json!({
         "entries": entries,
         "next_cursor": next.map(|p| page::encode(page::List::Audit, dir, p)),
         "head": head,
+        "first": first,
     })))
 }
 
@@ -1326,18 +1343,30 @@ fn entry_view(state: &AppState, entry: AuditEntry) -> Result<Value, ApiError> {
 ///
 /// # Errors
 ///
-/// 404 `not_found` when there is no entry at `seq`, and 500 `server_error` when the audit log or
-/// the lease store fails.
+/// 404 `not_found` when there is no entry at `seq`, 410 `audit_pruned` when `seq` is at or
+/// below the boundary of a prune (the body adds `pruned_through`, `prune_seq` and `first`),
+/// and 500 `server_error` when the audit log or the lease store fails.
 pub async fn audit_entry(
     State(state): State<Arc<AppState>>,
     Path(seq): Path<u64>,
 ) -> Result<Json<Value>, ApiError> {
     state
         .blocking(move |s| {
-            let entry = s
-                .audit
-                .entry_at(seq)?
-                .ok_or_else(|| ApiError::not_found(format!("no audit entry at seq {seq}")))?;
+            let Some(entry) = s.audit.entry_at(seq)? else {
+                return Err(match s.audit.newest_anchor()? {
+                    Some(a) if seq <= a.anchor.through_seq => ApiError::audit_pruned(
+                        format!(
+                            "the audit entry at seq {seq} was pruned: the log starts at seq {} \
+                             (pruned through {} by the record at seq {})",
+                            a.anchor.through_seq + 1,
+                            a.anchor.through_seq,
+                            a.anchor.prune_seq
+                        ),
+                        &a.anchor,
+                    ),
+                    _ => ApiError::not_found(format!("no audit entry at seq {seq}")),
+                });
+            };
             entry_view(s, entry).map(Json)
         })
         .await
@@ -1349,8 +1378,9 @@ pub async fn audit_entry(
 ///
 /// # Errors
 ///
-/// 400 `invalid_request` when `id` is not a UUID, 404 `not_found` when no record has it, and 500
-/// `server_error` when the audit log or the lease store fails.
+/// 400 `invalid_request` when `id` is not a UUID, 404 `not_found` when no record has it (the
+/// message names the prune boundary when the log was pruned: ids carry no time, so a pruned
+/// id is not told apart), and 500 `server_error` when the audit log or the lease store fails.
 pub async fn audit_record(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1360,10 +1390,18 @@ pub async fn audit_record(
     state
         .blocking(move |s| {
             // Records store the hyphenated lower-case form.
-            let entry = s
-                .audit
-                .entry_by_record_id(&id.to_string())?
-                .ok_or_else(|| ApiError::not_found(format!("no audit record with id {id}")))?;
+            let Some(entry) = s.audit.entry_by_record_id(&id.to_string())? else {
+                // A record id carries no time, so a pruned id cannot be told from an unknown one.
+                return Err(match s.audit.newest_anchor()? {
+                    Some(a) => ApiError::not_found(format!(
+                        "no audit record with id {id}; the log was pruned through seq {} at {}: \
+                         a record written before then is not in the log and may be in the \
+                         prune's archive",
+                        a.anchor.through_seq, a.anchor.at
+                    )),
+                    None => ApiError::not_found(format!("no audit record with id {id}")),
+                });
+            };
             entry_view(s, entry).map(Json)
         })
         .await
@@ -1441,7 +1479,7 @@ const EXPORT_PAGE: usize = 500;
 /// Query of `GET /admin/audit/export`: the range and the optional filters.
 #[derive(Debug, Deserialize)]
 pub struct ExportQuery {
-    /// First sequence number (default 1).
+    /// First sequence number (default 1, or one above the boundary of a prune).
     pub from: Option<u64>,
     /// Last sequence number, inclusive (default: the head when the export starts).
     pub to: Option<u64>,
@@ -1468,6 +1506,10 @@ enum ExportPhase {
 /// `attenuo_audit::export`), streamed a page at a time so a large range never sits in memory.
 /// Verify the result offline with `attenuo audit verify --file`.
 ///
+/// After a prune (`[audit.retention]`) `from` defaults to the first retained seq, and an export
+/// from there carries the signed anchor in its header (`anchor`), so that `attenuo audit verify
+/// --file` checks the file continues the pruned prefix (`from_anchor`).
+///
 /// `kind`, `chain_id`, `tool` and `decision` keep only the matching entries. The header then
 /// carries a `filter` member and the file cannot be verified (its chain has gaps); verify an
 /// unfiltered export.
@@ -1475,7 +1517,8 @@ enum ExportPhase {
 /// # Errors
 ///
 /// 400 `invalid_request` when `from` is 0, `to` is smaller than `from`, a filter does not parse (as
-/// for `GET /admin/audit`) or `kind` names more than one kind, and 500 `server_error` when the head
+/// for `GET /admin/audit`) or `kind` names more than one kind; 410 `audit_pruned` when `from` or
+/// `to` is at or below the boundary of a prune; and 500 `server_error` when the head
 /// cannot be read. A read failure once the stream has started ends the stream with an error
 /// instead.
 pub async fn audit_export(
@@ -1484,17 +1527,35 @@ pub async fn audit_export(
 ) -> Result<Response, ApiError> {
     use futures_util::stream;
 
-    let from = q.from.unwrap_or(1);
-    if from == 0 {
+    if q.from == Some(0) {
         return Err(ApiError::bad_request(
             "invalid_request",
             "`from` must be at least 1",
         ));
     }
-    let head = state
-        .blocking(|s| s.audit.head())
-        .await?
-        .map_or(0, |h| h.seq);
+    let (head, anchor) = state
+        .blocking(|s| Ok::<_, AuditError>((s.audit.head()?, s.audit.newest_anchor()?)))
+        .await?;
+    let head = head.map_or(0, |h| h.seq);
+    let anchor = anchor.map(|a| a.anchor);
+    let first = anchor.as_ref().map_or(1, |a| a.through_seq + 1);
+    let from = q.from.unwrap_or(first);
+    // An export never claims a range it cannot hold.
+    if let Some(a) = anchor.as_ref() {
+        for (name, v) in [("from", q.from), ("to", q.to)] {
+            if let Some(v) = v.filter(|v| *v <= a.through_seq) {
+                return Err(ApiError::audit_pruned(
+                    format!(
+                        "`{name}` = {v} is pruned: the log was pruned through seq {} and starts \
+                         at seq {first}; export from {first}, and find older entries in the \
+                         prune's archive",
+                        a.through_seq
+                    ),
+                    a,
+                ));
+            }
+        }
+    }
     let to = q.to.map_or(head, |t| t.min(head));
     if q.to.is_some_and(|t| t < from) {
         return Err(ApiError::bad_request(
@@ -1523,8 +1584,12 @@ pub async fn audit_export(
         decision: parsed.decision,
     };
     let exported_at = state.now().format(&Rfc3339).map_err(ApiError::internal)?;
+    // From the first retained seq, the header carries the anchor that seq continues from.
+    let header_anchor = anchor.filter(|a| from == a.through_seq + 1);
     let header = attenuo_audit::header_line(
-        &attenuo_audit::ExportHeader::new(from, to, exported_at).with_filter(filter.clone()),
+        &attenuo_audit::ExportHeader::new(from, to, exported_at)
+            .with_filter(filter.clone())
+            .with_anchor(header_anchor),
     );
 
     let first = stream::once(async move { Ok::<_, std::io::Error>(Bytes::from(header)) });

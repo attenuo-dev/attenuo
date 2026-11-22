@@ -20,6 +20,20 @@
 //! (one line in the file; wrapped here). `checkpoint_sha256` is the hex SHA-256 of the
 //! canonical JSON of `checkpoint`, so a receiver can index and deduplicate on it; `kid` and
 //! `signature` repeat the checkpoint's own fields for receivers that do not parse it.
+//!
+//! A prune of the log (audit retention) also ships its signed [`Anchor`], through the same
+//! sink, as a [`ShippedAnchor`] envelope of its own format, [`SHIPPED_ANCHOR_FORMAT`]:
+//!
+//! ```text
+//! {"anchor":{"archive_sha256":"..","at":"..","kid":"..","previous_through_seq":null,
+//!  "prune_entry_hash":"..","prune_seq":1041231,"signature":"..","through_hash":"..",
+//!  "through_seq":1000000},"anchor_sha256":"..","format":"attenuo-shipped-anchor-v1",
+//!  "kid":"..","public_url":null,"signature":".."}
+//! ```
+//!
+//! In a file sink it is one more line of the same file, told apart by its `anchor` member.
+//! [`parse_shipped`] skips such lines, so a cross-check of checkpoints reads a file that holds
+//! anchors as before; [`parse_shipped_anchors`] reads them.
 
 use std::collections::BTreeMap;
 
@@ -27,7 +41,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::checkpoint::{Checkpoint, CheckpointKeys};
+use crate::checkpoint::{Anchor, Checkpoint, CheckpointKeys};
 use crate::error::AuditError;
 use crate::export::Export;
 
@@ -51,6 +65,80 @@ pub struct ShippedCheckpoint {
     pub public_url: Option<String>,
     /// Hex SHA-256 of the RFC 8785 canonical JSON of `checkpoint`.
     pub checkpoint_sha256: String,
+}
+
+/// Value of a shipped anchor's `format` field.
+pub const SHIPPED_ANCHOR_FORMAT: &str = "attenuo-shipped-anchor-v1";
+
+/// One prune anchor as the sink sends it, next to the checkpoints: the webhook body, one line
+/// of the file sink, one S3 object.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShippedAnchor {
+    /// The envelope version, [`SHIPPED_ANCHOR_FORMAT`].
+    pub format: String,
+    /// The signed anchor itself.
+    pub anchor: Anchor,
+    /// The anchor's `kid`, repeated.
+    pub kid: String,
+    /// The anchor's `signature`, repeated.
+    pub signature: String,
+    /// `[server] public_url` of the server that signed it, when set.
+    #[serde(default)]
+    pub public_url: Option<String>,
+    /// Hex SHA-256 of the RFC 8785 canonical JSON of `anchor`.
+    pub anchor_sha256: String,
+}
+
+impl ShippedAnchor {
+    /// The envelope for `a`; `public_url` is the signing server's `[server] public_url`.
+    pub fn new(a: &Anchor, public_url: Option<String>) -> Self {
+        let bytes = attenuo_core::jcs::to_vec(a).expect("anchors have a canonical form");
+        Self {
+            format: SHIPPED_ANCHOR_FORMAT.to_string(),
+            kid: a.kid.clone(),
+            signature: a.signature.clone(),
+            public_url,
+            anchor_sha256: hex::encode(Sha256::digest(bytes)),
+            anchor: a.clone(),
+        }
+    }
+
+    /// The canonical JSON bytes (the webhook body, the S3 object).
+    pub fn to_canonical_json(&self) -> Vec<u8> {
+        attenuo_core::jcs::to_vec(self).expect("shipped anchors have a canonical form")
+    }
+
+    /// One JSONL line, newline included (the file sink).
+    pub fn to_line(&self) -> String {
+        let mut s = String::from_utf8(self.to_canonical_json()).expect("JSON is UTF-8");
+        s.push('\n');
+        s
+    }
+}
+
+/// Every shipped anchor in a file of shipped lines, with its 1-based line number; other lines
+/// are skipped.
+///
+/// # Errors
+///
+/// [`AuditError::Export`] naming the line when a line with an `anchor` member is not JSON or
+/// not a shipped anchor.
+pub fn parse_shipped_anchors(text: &str) -> Result<Vec<(usize, ShippedAnchor)>, AuditError> {
+    let mut out = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if v.get("anchor").is_some() {
+            let a: ShippedAnchor = serde_json::from_value(v)
+                .map_err(|e| AuditError::Export(format!("shipped anchors, line {}: {e}", n + 1)))?;
+            out.push((n + 1, a));
+        }
+    }
+    Ok(out)
 }
 
 /// Hex SHA-256 of the canonical JSON of `cp` (all five fields).
@@ -111,7 +199,8 @@ pub struct ShippedLine {
     pub inconsistency: Option<String>,
 }
 
-/// Parse a JSONL file of shipped checkpoints. Blank lines are skipped.
+/// Parse a JSONL file of shipped checkpoints. Blank lines, and the shipped anchors a prune adds
+/// to the same file ([`ShippedAnchor`], read by [`parse_shipped_anchors`]), are skipped.
 ///
 /// # Errors
 ///
@@ -126,6 +215,11 @@ pub fn parse_shipped(text: &str) -> Result<Vec<ShippedLine>, AuditError> {
         let at =
             |e: String| AuditError::Export(format!("shipped checkpoints, line {}: {e}", n + 1));
         let mut v: Value = serde_json::from_str(line).map_err(|e| at(e.to_string()))?;
+        if v.get("anchor").is_some()
+            && v.get("format").and_then(Value::as_str) == Some(SHIPPED_ANCHOR_FORMAT)
+        {
+            continue;
+        }
         let parsed = if v.get("checkpoint").is_some() {
             let s: ShippedCheckpoint = serde_json::from_value(v).map_err(|e| at(e.to_string()))?;
             ShippedLine {
@@ -175,6 +269,11 @@ pub struct CrossCheckReport {
     /// Shipped checkpoints past the export's range: not checked. If the export was taken up
     /// to the head of the log, these say the log is shorter than what was shipped.
     pub beyond_range: u64,
+    /// Shipped checkpoints before the export's range: not checked against its entries. An
+    /// export of a pruned log's retained part has them; one whose header carries an anchor
+    /// checks the shipped checkpoint at the anchor's `through_seq` against it.
+    #[serde(default)]
+    pub below_range: u64,
     /// Highest seq in the shipped file.
     pub last_shipped_seq: Option<u64>,
     /// Each shipped checkpoint the export disagrees with, or that is unusable.
@@ -212,7 +311,8 @@ pub fn cross_check(
         .collect();
     let mut first_by_seq: BTreeMap<u64, &ShippedLine> = BTreeMap::new();
     let mut mismatches = Vec::new();
-    let (mut in_range, mut matched, mut beyond) = (0u64, 0u64, 0u64);
+    let (mut in_range, mut matched, mut beyond, mut below) = (0u64, 0u64, 0u64, 0u64);
+    let anchor = export.header.as_ref().and_then(|h| h.anchor.as_ref());
     for s in shipped {
         let cp = &s.checkpoint;
         let mut fail = |reason: String| {
@@ -245,6 +345,18 @@ pub fn cross_check(
             continue;
         }
         if cp.seq < from && !(cp.seq == 0 && from <= 1) {
+            below += 1;
+            if let Some(a) = anchor.filter(|a| a.through_seq == cp.seq) {
+                if let Err(reason) = keys.verify(cp) {
+                    fail(format!("shipped checkpoint does not verify: {reason}"));
+                } else if cp.head_hash != a.through_hash {
+                    fail(
+                        "the shipped checkpoint at the anchor's through_seq names another hash \
+                         than the anchor (history rewritten before the prune)"
+                            .to_string(),
+                    );
+                }
+            }
             continue;
         }
         in_range += 1;
@@ -300,6 +412,7 @@ pub fn cross_check(
         in_range,
         matched,
         beyond_range: beyond,
+        below_range: below,
         last_shipped_seq: shipped.iter().map(|s| s.checkpoint.seq).max(),
         ok: mismatches.is_empty(),
         mismatches,

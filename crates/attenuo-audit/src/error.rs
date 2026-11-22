@@ -109,6 +109,16 @@ pub enum AuditError {
     /// charged; the decision fails closed.
     #[error("audit append shed: {0}")]
     Overloaded(&'static str),
+    /// A prune of the log was refused by one of its guards
+    /// ([`SqliteAudit::prune_through`](crate::SqliteAudit::prune_through)); nothing was
+    /// written.
+    #[error("prune refused ({guard}): {detail}")]
+    PruneRefused {
+        /// The guard that refused it.
+        guard: crate::sqlite::PruneGuard,
+        /// What it found, for people.
+        detail: String,
+    },
     /// The database file's schema version (`PRAGMA user_version`) is newer than this build
     /// knows: a newer attenuo wrote it. Nothing was read or written. Run the newer binary, or
     /// restore the backup taken before the upgrade; there is no downgrade.

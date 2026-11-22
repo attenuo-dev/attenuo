@@ -47,6 +47,23 @@ CREATE TABLE IF NOT EXISTS checkpoints (
 );
 "#;
 
+/// Migration 5 (audit retention, ADR-0015): one signed anchor per prune of the log. Plain DDL,
+/// as every migration after the first.
+pub(super) const ANCHOR_SCHEMA: &str = r#"
+CREATE TABLE audit_anchors (
+    through_seq          INTEGER PRIMARY KEY,
+    through_hash         TEXT    NOT NULL,
+    prune_seq            INTEGER NOT NULL UNIQUE,
+    prune_entry_hash     TEXT    NOT NULL,
+    previous_through_seq INTEGER NULL,
+    archive_sha256       TEXT    NULL,
+    at                   TEXT    NOT NULL,
+    kid                  TEXT    NOT NULL,
+    signature            TEXT    NOT NULL,
+    state                TEXT    NOT NULL
+);
+"#;
+
 /// Which entry hash construction the `audit` table was written with (key `entry_hash`).
 pub(super) const META_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS audit_meta (

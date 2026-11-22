@@ -84,6 +84,7 @@ The table is generated from `attenuo_core::error_codes::ERROR_CODES`, the one pl
 | `attribute_type_mismatch` |  | `-32003` (200) | yes | An originating-user attribute does not have its declared type. |
 | `audience_mismatch` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The credential's audience is not this server. |
 | `audit_error` |  | `-32003` (200) | yes | The decision could not be written to the audit log (fail closed). |
+| `audit_pruned` | 410 |  |  | The audit entries asked for were pruned (`[audit.retention]`); the body names the boundary. |
 | `bad_signature` | 400 `invalid_grant`, 401 `invalid_token` |  |  | The credential's signature does not verify. |
 | `batch_too_large` | 400 |  |  | An AuthZEN batch has more entries than `[authzen] max_batch`. |
 | `budget_error` |  | `-32003` (200) | yes | The run-limit counters could not be read or written (fail closed). |
@@ -174,6 +175,12 @@ The table is generated from `attenuo_core::error_codes::ERROR_CODES`, the one pl
 | `policy_deny` |  | `-32003` (200) | yes | The Cedar policy denies the call. |
 | `policy_error` |  | `-32003` (200) | yes | The call could not be evaluated safely (fail closed). |
 | `policy_invalid` | 422 |  |  | The policy set does not parse or validate. |
+| `prune_conflict` | 409 |  |  | The log was already pruned through this seq with another archive digest. |
+| `prune_disabled` | 409 |  |  | `[audit.retention] prune` is `"off"`: the audit log is not pruned. |
+| `prune_in_progress` | 409 |  |  | The rows of an earlier prune are still being deleted. |
+| `prune_live_run` | 409 |  |  | A run still in the lease registry has entries at or below the requested boundary. |
+| `prune_not_at_checkpoint` | 409 |  |  | The requested boundary is not a signed checkpoint that matches the log. |
+| `prune_too_recent` | 409 |  |  | The entry at the requested boundary is younger than `[audit.retention] min_age_seconds`. |
 | `rate_limited` | 429 | `-32007` (429) |  | A rate limit is used up; retry after `Retry-After`. |
 | `reload_unavailable` | 409 |  |  | The policy, or the admin operators, cannot be reloaded in this configuration (no policy file; a server not started from a config file). |
 | `replay_cache_full` | 503 `temporarily_unavailable` |  |  | Too many single-use credentials are in flight; retry later. |
@@ -190,6 +197,7 @@ The table is generated from `attenuo_core::error_codes::ERROR_CODES`, the one pl
 | `session_mismatch` |  | `-32003` (403) |  | The `Mcp-Session-Id` belongs to another principal. |
 | `session_registry_full` |  | `-32006` (503) |  | No free session slot (`[proxy] max_sessions`). |
 | `session_unknown` |  | `-32600` (404) |  | The `Mcp-Session-Id` is not bound; start a new session. |
+| `sink_behind` | 409 |  |  | The checkpoint sink is degraded or has not delivered the checkpoint at the requested boundary. |
 | `tenant_mismatch` | 400 `invalid_grant` |  |  | The ID-JAG's `tenant` is not the `[[idps]] tenant` of its issuer. |
 | `token_expired` | 401 `unauthorized`, 400 `invalid_grant` | `-32001` (401), `-32001` (200) |  | The token verified but has expired (a bearer, or at `POST /token` the subject token or a hop of its chain). |
 | `too_many_capabilities` | 400 `invalid_scope` |  |  | A request (an exchange, a hop-0 request, `POST /admin/root-token`) asks for more than 1,024 capabilities, more than one token may hold. |
@@ -220,7 +228,7 @@ The table is generated from `attenuo_core::error_codes::ERROR_CODES`, the one pl
 
 ## Paging
 
-Every route that returns a list a client may need to read past one answer pages the same way: `GET /admin/audit`, `GET /admin/audit/checkpoints` and `GET /admin/approvals`.
+Every route that returns a list a client may need to read past one answer pages the same way: `GET /admin/audit`, `GET /admin/audit/checkpoints`, `GET /admin/audit/anchors` and `GET /admin/approvals`.
 
 - **Request.** `limit` is the page size; `cursor` is the `next_cursor` of the previous page, sent back unchanged with the same filters (and `order`, where there is one). Leave `cursor` out for the first page.
 - **Answer.** The items (`entries`, `checkpoints` or `approvals`) and `next_cursor`: a string for the next page, or `null` when there is nothing after this one. A page can hold fewer than `limit` items, even none, while `next_cursor` is set (a filtered audit page reads a bounded range of the log): keep following it until it is `null`.
@@ -482,9 +490,9 @@ Each route needs at least one role; a role includes the ones below it. The table
 
 | Role | Routes |
 | --- | --- |
-| `viewer` | `GET /admin/whoami`, `GET /admin/leases/{lease_id}`, `GET /admin/leases/{lease_id}/tree`, every `GET /admin/audit...` route (`/admin/audit/checkpoint` included: it signs a checkpoint of the head when there is none, which records no new fact), `GET /admin/policies`, `GET /admin/policies/check`, `POST /admin/policies/evaluate` (a dry run that writes nothing), `GET /admin/approvals`, `GET /admin/approvals/{id}` |
+| `viewer` | `GET /admin/whoami`, `GET /admin/leases/{lease_id}`, `GET /admin/leases/{lease_id}/tree`, `GET /admin/audit`, `GET /admin/audit/verify`, `GET /admin/audit/entries/{seq}`, `GET /admin/audit/records/{id}`, `GET /admin/audit/checkpoints`, `GET /admin/audit/checkpoint` (it signs a checkpoint of the head when there is none, which records no new fact), `GET /admin/audit/export`, `GET /admin/policies`, `GET /admin/policies/check`, `POST /admin/policies/evaluate` (a dry run that writes nothing), `GET /admin/approvals`, `GET /admin/approvals/{id}` |
 | `operator` | `POST /admin/leases/{lease_id}/revoke`, `POST /admin/leases/revoke` (its `?preview=true` dry run included), `POST /admin/approvals/{id}` |
-| `admin` | `POST /admin/budgets/refund`, `POST /admin/policies/reload`, `POST /admin/operators/reload`, `POST /admin/root-token` |
+| `admin` | `POST /admin/budgets/refund`, `POST /admin/policies/reload`, `POST /admin/operators/reload`, `POST /admin/root-token`, and the audit retention routes `GET /admin/audit/prune/plan`, `POST /admin/audit/prune` and `GET /admin/audit/anchors` |
 
 `[admin] token` is the operator `admin` with role `admin`. The audit log records an admin action with `originating_subject` `urn:attenuo:admin` for `[admin] token`, as before operators existed, and `urn:attenuo:admin:<name>` for a named operator; an approval decided by an operator has that subject as `approver.subject` and as the approval token's `sub`.
 
@@ -497,13 +505,16 @@ Where they are served: on the main listener by default; with `[admin] listen` se
 | `POST /admin/leases/{lease_id}/revoke` | Revoke the lease and all descendants. Body `{"reason": "..."}` (optional). Answers `{lease_id, revoked, reason, audit_id}`: `revoked` counts the leases that changed, `audit_id` is the `admin.lease.revoke` record (null when it could not be written; the revocation stands). The SDKs return it: Python `revoke_lease(...).audit_id`, TypeScript `(await revokeLease(...)).auditId`. |
 | `POST /admin/leases/revoke?preview` | Revoke every lease of one originating user, one delegation chain or the chain that opened one MCP session, each with its descendants, in one transaction; `preview=true` is a dry run. See [Revoke by user or chain](#revoke-by-user-or-chain) and [Revoke by session](#revoke-by-session). |
 | `GET /admin/leases/{lease_id}/tree?max_nodes` | The lease, its descendants and its ancestors, and how many leases a revoke would change now. Read-only; see [Lease tree](#lease-tree). 404 for an unknown lease. |
-| `GET /admin/audit` | Audit entries, oldest first or with `order=desc` newest first, `{entries, next_cursor, head}` (`head` is the newest `seq`), paged as in [Paging](#paging): `limit` default 100, at most 1000. `from` and `to` select a `seq` range. Filters are below. |
-| `GET /admin/audit/entries/{seq}` | One entry with its context, `{entry, lease_states, covered_by_checkpoint, policy_reloaded_after}` (below). 404 when there is no entry at `seq`. |
-| `GET /admin/audit/records/{id}` | The same for the entry whose record id is `id`: the UUID that proxy denials and AuthZEN answers return as `decision_id`. 400 if `id` is not a UUID, 404 if no record has it. |
+| `GET /admin/audit` | Audit entries, oldest first or with `order=desc` newest first, `{entries, next_cursor, head, first}` (`head` is the newest `seq`, `first` the first retained `seq`: 1, or one above the boundary of a [prune](#audit-retention)), paged as in [Paging](#paging): `limit` default 100, at most 1000. `from` and `to` select a `seq` range; a range or cursor below `first` is not refused, it starts (oldest first) or ends (newest first) at `first`. Filters are below. |
+| `GET /admin/audit/entries/{seq}` | One entry with its context, `{entry, lease_states, covered_by_checkpoint, policy_reloaded_after}` (below). 404 when there is no entry at `seq`; 410 `audit_pruned` when `seq` was pruned, with `pruned_through`, `prune_seq` (the prune record) and `first` in the body. |
+| `GET /admin/audit/records/{id}` | The same for the entry whose record id is `id`: the UUID that proxy denials and AuthZEN answers return as `decision_id`. 400 if `id` is not a UUID, 404 if no record has it. A record id carries no time, so after a prune a pruned id is a 404 too; the message then names the boundary and says the record may be in the prune's archive. |
 | `GET /admin/audit/checkpoints?limit&cursor` | Stored checkpoints, newest first, `{checkpoints, next_cursor}`; each is `{seq, head_hash, at, kid, signature}`. Paged as in [Paging](#paging): `limit` default 100, at most 1000. Read-only: it never signs, unlike `/admin/audit/checkpoint`. |
-| `GET /admin/audit/verify` | Walk the whole hash chain, verify every checkpoint signature against the JWKS, and report `{entries, ok, first_bad_seq, checkpoints, last_signed_seq, unsigned_tail, bad_checkpoints}`. |
+| `GET /admin/audit/verify` | Walk the whole hash chain, verify every checkpoint signature against the JWKS, and report `{entries, ok, first_bad_seq, checkpoints, last_signed_seq, unsigned_tail, bad_checkpoints, pruned_through, anchors, bad_anchors}`. After a prune the walk starts at the newest anchor: `pruned_through` is its boundary (null for a log never pruned), `anchors` counts the anchors checked, and `bad_anchors` lists the ones that failed, `{through_seq, reason}`; `entries` counts retained entries. A log whose first row is not seq 1 and that has no valid anchor naming it is `ok: false` at its first row. |
 | `GET /admin/audit/checkpoint` | The signed checkpoint of the head, `{seq, head_hash, at, kid, signature}` (signing it now if the head has none). For keeping outside the host. `hash` repeats `head_hash` for older clients. |
-| `GET /admin/audit/export?from&to` | Entries `from..=to` (default: the whole log) and the checkpoints in that range, streamed as `application/x-ndjson`: a `header` line, `entry` lines, then `checkpoint` lines. Verify offline with `attenuo audit verify --file`. `kind`, `chain_id`, `tool` and `decision` keep only the matching entries; the header then has a `filter` member naming them and the file cannot be verified. The SDKs take the same four: Python `audit_export(kind=, chain_id=, tool=, decision=)`, TypeScript `auditExport(from, to, { kind, chainId, tool, decision })`. 400 if `from` is 0 or `to < from`, for an unknown kind or decision, more than one kind, or an empty filter value. |
+| `GET /admin/audit/export?from&to` | Entries `from..=to` (default: the whole log) and the checkpoints in that range, streamed as `application/x-ndjson`: a `header` line, `entry` lines, then `checkpoint` lines. Verify offline with `attenuo audit verify --file`. `kind`, `chain_id`, `tool` and `decision` keep only the matching entries; the header then has a `filter` member naming them and the file cannot be verified. The SDKs take the same four: Python `audit_export(kind=, chain_id=, tool=, decision=)`, TypeScript `auditExport(from, to, { kind, chainId, tool, decision })`. 400 if `from` is 0 or `to < from`, for an unknown kind or decision, more than one kind, or an empty filter value. After a prune `from` defaults to the first retained seq, a `from` or `to` at or below the boundary is 410 `audit_pruned`, and an export from the first retained seq has the signed anchor as the header's `anchor` member: `attenuo audit verify --file` then checks that the file continues it and reports `from_anchor: true` (a verifier that does not know the member verifies the file as a window). |
+| `GET /admin/audit/prune/plan?through&before` | With `[audit.retention] prune = "manual"`: the largest boundary the guards allow at or below `through` (a seq) or for entries older than `before` (RFC 3339), the head when neither is given. See [Audit retention](#audit-retention). Reads only. |
+| `POST /admin/audit/prune` | With `[audit.retention] prune = "manual"`: prune the log through a boundary, body `{"through": <seq>, "archive_sha256": "<hex>"}`. See [Audit retention](#audit-retention). |
+| `GET /admin/audit/anchors?limit&cursor` | The signed anchors of past prunes, newest first, `{anchors, next_cursor}`, each `{through_seq, through_hash, prune_seq, prune_entry_hash, previous_through_seq, archive_sha256, at, kid, signature, state}`. Paged as in [Paging](#paging): `limit` default 50, at most 500. Empty for a log never pruned, whatever `prune` is. |
 | `POST /admin/policies/reload` | Re-read the policy file. On failure the old policy stays. |
 | `POST /admin/operators/reload` | Re-read `[[admin.operators]]`, and nothing else, from the config file the server was started with, and swap them in at once. See [Operators reload](#operators-reload). Also on the console listener with `[admin_ui] allow_write = true`. |
 | `GET /admin/policies` | The policy set in force: file path, its `sha256` and `loaded_at` (startup or last successful reload), `policy_ids`, validation `warnings`, and `policies: [{id, text}]`. |
@@ -677,6 +688,51 @@ The single-entry routes (`/admin/audit/entries/{seq}`, `/admin/audit/records/{id
 - `covered_by_checkpoint`: the oldest stored checkpoint at or after the entry, whose signature covers it through the hash chain, or null when the entry is newer than every checkpoint. It is returned as stored; `GET /admin/audit/verify` checks signatures.
 - `policy_reloaded_after`: the seq of the first successful `POST /admin/policies/reload` recorded after the entry, or null. When set, the policy in force now may not be the one that decided.
 
+### Audit retention
+
+With `[audit.retention] prune = "manual"` ([config](config.md#auditretention), [ADR-0015](../decisions/0015-audit-retention.md)) the admin may prune the oldest part of the log. With `prune = "off"`, the default, both routes below answer 409 `prune_disabled` and the log is never pruned.
+
+`GET /admin/audit/prune/plan?through=<seq>` (or `?before=<RFC 3339>`, or neither for the head) answers the largest boundary B the guards allow at or below the request:
+
+```json
+{
+  "from": 1,
+  "through": 1000000,
+  "entries": 1000000,
+  "checkpoint": {"seq": 1000000, "head_hash": "...", "at": "...", "kid": "...", "signature": "..."},
+  "at": "2026-07-30T23:59:58Z",
+  "guards": {"requested": 1000150, "before": null, "min_age_cutoff": "2026-08-24T12:00:00Z",
+             "live_run_seq": 1000123, "sink_delivered_through": 1041000, "sink_degraded": false,
+             "in_progress": false, "limited_by": "prune_not_at_checkpoint"},
+  "anchor": null
+}
+```
+
+`through` is null when nothing can be pruned. `limited_by` names, by its refusal code, the guard that set `through` below the request. The archive of that prune is the export `from..=through`: export it, verify it with `attenuo audit verify --file`, and keep it off the host before pruning.
+
+`POST /admin/audit/prune` with `{"through": B, "archive_sha256": "<64 hex>"}` (`archive_sha256` optional, the SHA-256 of the archive file's bytes) commits the prune in one transaction: the signed checkpoint of the head (if it has none), the prune record (`admin`, tool `admin.audit.prune`, its arguments `{through_seq, through_hash, previous_through_seq, archive_sha256}`), the signed anchor, and the checkpoint of the prune record. With `[audit.sink]` the two checkpoints and the anchor are queued for shipping. It answers:
+
+```json
+{"prune_seq": 1041231, "pruned_through": 1000000, "anchor": {...},
+ "checkpoint_before": {...}, "checkpoint_after": {...}, "deleting": true,
+ "shipped": {"queued": true, "delivered_through": 1041000}, "already": false}
+```
+
+From then on every read starts at B + 1. The rows at or below B are deleted afterwards, in transactions of `[audit.retention] batch_rows`, by the maintenance task; a restart resumes them, and the anchor's `state` goes from `deleting` to `done`. Repeating a request that succeeded answers 200 with the stored anchor and `"already": true`. The guards, each a 409 with nothing written:
+
+| Code | Refused when |
+| --- | --- |
+| `prune_not_at_checkpoint` | B has no stored checkpoint, or its `head_hash` is not the entry's hash |
+| `prune_too_recent` | the entry at B is younger than `min_age_seconds` |
+| `prune_live_run` | a run whose root lease is still in the lease registry has an entry at or below B |
+| `sink_behind` | `[audit.sink]` is degraded, or has not delivered the checkpoint at B or a later one since the server started |
+| `prune_in_progress` | the rows of an earlier prune are still being deleted |
+| `prune_conflict` | B was already pruned with another `archive_sha256` |
+
+A `through` below the current boundary is 410 `audit_pruned`; 400 `invalid_request` for a malformed body, a `through` of 0 or an `archive_sha256` that is not 64 lower-case hex digits.
+
+After a prune, `GET /admin/audit/verify` checks the newest anchor's signature, the checkpoint at B and the prune record, and walks the chain from B + 1. A log whose first rows were deleted without a valid anchor (by someone with write access to the file but no key) reports `ok: false` at its first row, as before. `GET /admin/audit/anchors` lists every anchor.
+
 ### Policies: read, check, dry run
 
 These three routes change nothing and write no audit record. They answer the questions an operator has before acting: which policy file is loaded, would the edited file load, and what would the policies say about this call.
@@ -806,6 +862,9 @@ Every series is prefixed `attenuo_`. Label values come from fixed sets, so the n
 | `audit_append_shed_total` | counter | `cause` (`queue_full`, `timeout`) | Audit appends that failed instead of waiting for the writer: `[audit] append_queue_max` appends were already waiting, or no answer came within `[audit] append_timeout_seconds`. Each denied its decision with `audit_error`. |
 | `audit_checkpoints_total` | counter | none | Signed audit checkpoints written. |
 | `audit_checkpoint_last_timestamp_seconds` | gauge | none | Unix time this process wrote the newest signed audit checkpoint; 0 when none. |
+| `audit_db_size_bytes` | gauge | none | Size of the SQLite database file of the audit log and lease registry (`page_count * page_size`), the WAL not included. Read at each scrape when the store is not busy, else the last value read; 0 before the first. |
+| `audit_db_free_bytes` | gauge | none | Bytes of that file on SQLite's free list (`freelist_count * page_size`): space that deletes, a prune's among them, freed and new rows reuse. The file does not shrink without `VACUUM`, which the server never runs. |
+| `audit_pruned_entries_total` | counter | none | Audit entries deleted by prunes of the log (`[audit.retention]`). |
 | `audit_sink_delivered_total` | counter | none | Signed checkpoints delivered off the host by `[audit.sink]`. |
 | `audit_sink_failures_total` | counter | none | Deliveries by `[audit.sink]` that failed and will be retried. |
 | `audit_sink_dropped_total` | counter | none | Checkpoints dropped from a full `[audit.sink]` queue before delivery. |

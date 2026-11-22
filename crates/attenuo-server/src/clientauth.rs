@@ -1686,6 +1686,7 @@ mod tests {
                 code_only: false,
                 decision_id: None,
                 retry_after: None,
+                extra: None,
             }
         );
         // Another jti is fine; the same jti for a PEP of the same name is another key.

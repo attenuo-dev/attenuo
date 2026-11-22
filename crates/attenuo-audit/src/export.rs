@@ -25,6 +25,13 @@
 //! they existed reads exactly as it did, and a verifier that predates them still refuses a
 //! file filtered on them because it refuses any header that has a `filter` at all.
 //!
+//! A header may carry `anchor` (an [`Anchor`], audit retention) when the export starts right
+//! after a prune of the log: `from` is the anchor's `through_seq + 1`. [`verify_export_with`]
+//! then checks the anchor's signature and that the first entry is `through_seq + 1` with
+//! `prev_hash` equal to `through_hash`, and reports `from_anchor: true`. A verifier that does
+//! not know the member ignores it and verifies the file as a window, as before. Added without
+//! a format bump, as `filter`'s members were.
+//!
 //! Format `attenuo-audit-export-v2` goes with entry hash construction
 //! [`ENTRY_HASH_VERSION`](crate::ENTRY_HASH_VERSION) (RFC 8785, SR-20). A `v1` export, hashed
 //! the earlier way, is refused when parsed.
@@ -33,7 +40,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::checkpoint::{
-    verify_with_checkpoints, Checkpoint, CheckpointKeys, SignedVerifyReport, Start,
+    verify_with_checkpoints, Anchor, BadAnchor, Checkpoint, CheckpointKeys, SignedVerifyReport,
+    Start,
 };
 use crate::error::AuditError;
 use crate::log::AuditEntry;
@@ -96,6 +104,11 @@ pub struct ExportHeader {
     /// export, then filter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter: Option<RecordFilter>,
+    /// The signed anchor of the prune the export starts after (`from` is its
+    /// `through_seq + 1`), when the log was pruned and the export starts at its first
+    /// retained entry. Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<Anchor>,
 }
 
 impl ExportHeader {
@@ -107,7 +120,14 @@ impl ExportHeader {
             to,
             exported_at,
             filter: None,
+            anchor: None,
         }
+    }
+
+    /// The same header for an export that starts right after the prune `anchor` names.
+    pub fn with_anchor(mut self, anchor: Option<Anchor>) -> Self {
+        self.anchor = anchor;
+        self
     }
 
     /// The same header for a filtered export (an empty filter is no filter).
@@ -273,6 +293,11 @@ pub struct ExportReport {
     /// The file starts at seq 1 and its first `prev_hash` is the genesis value. When `false`
     /// the entries before `first_seq` are not covered by this file.
     pub from_genesis: bool,
+    /// The header carries a prune anchor whose signature verifies, and the file starts right
+    /// after it: its first entry is the anchor's `through_seq + 1` with `prev_hash` equal to
+    /// its `through_hash`. The entries before were pruned from the log through the server.
+    #[serde(default)]
+    pub from_anchor: bool,
     /// Entries of the header's range are missing from the start or end of the file.
     pub truncated: bool,
     /// Entries whose seq lies outside the header's `from..=to`. Any makes the export fail:
@@ -338,11 +363,41 @@ pub fn verify_export_with(
     let first_seq = export.entries.first().map(|e| e.seq);
     let last_seq = export.entries.last().map(|e| e.seq);
     let from_genesis = first_seq == Some(1) && export.entries[0].prev_hash == crate::GENESIS_HASH;
-    let start = if first_seq == Some(1) {
-        Start::Genesis
-    } else {
-        Start::Window
+    // An anchor in the header: checked here, and the walk starts where it says.
+    let mut bad_anchors = Vec::new();
+    let anchor = header.anchor.as_ref();
+    if let Some(a) = anchor {
+        let fail = |reason: String| BadAnchor {
+            through_seq: a.through_seq,
+            reason,
+        };
+        if let Err(reason) = keys.verify_anchor(a) {
+            bad_anchors.push(fail(reason));
+        } else if a.through_seq.checked_add(1) != Some(header.from) {
+            bad_anchors.push(fail(format!(
+                "the header's anchor is through seq {}, but the export starts at {}",
+                a.through_seq, header.from
+            )));
+        } else if let Some(p) = export.entries.iter().find(|e| e.seq == a.prune_seq) {
+            if let Err(reason) = a.check_prune_record(p) {
+                bad_anchors.push(fail(reason));
+            }
+        }
+    }
+    let anchored = anchor.filter(|_| bad_anchors.is_empty());
+    let start = match anchored {
+        Some(a) => Start::Anchored {
+            seq: a.through_seq,
+            hash: a.through_hash.clone(),
+        },
+        None if first_seq == Some(1) => Start::Genesis,
+        None => Start::Window,
     };
+    let from_anchor = anchored.is_some_and(|a| {
+        export.entries.first().is_some_and(|e| {
+            Some(e.seq) == a.through_seq.checked_add(1) && e.prev_hash == a.through_hash
+        })
+    });
     // Checkpoints beyond the window cannot be matched to an entry; only those inside count.
     let (lo, hi) = (first_seq.unwrap_or(0), last_seq.unwrap_or(0));
     let inside: Vec<Checkpoint> = export
@@ -370,6 +425,11 @@ pub fn verify_export_with(
         }
     }
     report.checkpoints = export.checkpoints.len() as u64;
+    report.anchors = u64::from(anchor.is_some());
+    if !bad_anchors.is_empty() {
+        report.ok = false;
+    }
+    report.bad_anchors = bad_anchors;
     // The header says which range was asked for; a file that starts later or ends earlier has
     // had entries cut off, and one with entries outside it holds more than it declares.
     let truncated = match (first_seq, last_seq) {
@@ -390,6 +450,7 @@ pub fn verify_export_with(
         first_seq,
         last_seq,
         from_genesis,
+        from_anchor,
         truncated,
         outside_range,
         unsigned_tail_rejected,

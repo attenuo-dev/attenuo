@@ -219,6 +219,20 @@ const report = await verifyExport({ path: "audit.jsonl" }, { checkpointPublicKey
 
 Both follow the Rust check rule for rule: the same file gets the same verdict and the same `first_bad_seq`. A file that is not an export at all (no header, wrong format, filtered, not JSON) raises `ExportError`. The cross-language tests in `sdk/python/tests/test_integration.py` export from a real server, flip one byte and check that the Rust CLI, Python and TypeScript all name the same `seq`; a second one runs a server with a file sink and the issuer key in the test's hands, rewrites and re-signs the export, deletes a checkpoint, and tampers with the shipped file, and checks that all three report the same mismatches (`seq`, line and reason). They are a little stricter than Rust in two ways: they hash the record as it appears in the file (Rust decodes it into its record type first and so ignores a member it does not know), and they refuse duplicate object members. TypeScript also refuses integers beyond 2^53 (Python and Rust keep a `u64` seq exact).
 
+## Pruning the oldest entries
+
+By default the log is never pruned. With `[audit.retention] prune = "manual"` ([config](../reference/config.md#auditretention)) the admin can remove the entries `1..=B`, where B is a signed checkpoint old enough (`min_age_seconds`, 90 days by default) that no live run still points into it and that `[audit.sink]` has already delivered ([ADR-0015](../decisions/0015-audit-retention.md), [HTTP API](../reference/http-api.md#audit-retention)):
+
+1. `GET /admin/audit/prune/plan?before=<time>` names the largest B the guards allow.
+2. Export `1..=B` (`attenuo audit export --from 1 --to B`), verify it with `audit verify --file`, and keep the file off the host. That file is the archive; the server never sees it.
+3. `POST /admin/audit/prune {"through": B, "archive_sha256": "<sha256 of the file>"}`.
+
+The prune writes, in one transaction, a checkpoint of the head, an `admin` record of tool `admin.audit.prune` naming B, its hash and the archive digest, a signed **anchor**, and a checkpoint of that record. The anchor is `{through_seq, through_hash, prune_seq, prune_entry_hash, previous_through_seq, archive_sha256, at, kid, signature}`, signed by the issuer key under its own context (`attenuo-audit-anchor-v1`), so it can never pass as a checkpoint. The sink ships the two checkpoints and the anchor (format `attenuo-shipped-anchor-v1`). From then on every read starts at B + 1, and the maintenance task deletes the old rows in batches of `batch_rows`.
+
+After a prune, `audit verify` checks the anchor's signature, that the checkpoint at B matches `through_hash`, that the prune record is there and names the same values, and that the first retained entry links to `through_hash`. Someone who can write the file but holds no key cannot fake this: deleting the first rows without an anchor, copying a genuine checkpoint into a forged anchor row, or reusing an old anchor after removing more rows all fail verification. An export from B + 1 carries the anchor in its header, and `audit verify --file` reports `from_anchor` for it; the archive verifies on its own, from genesis, and its last entry hash is the first `prev_hash` of the retained export.
+
+`audit_pruned_entries_total` counts the deleted rows, and `audit_db_size_bytes` and `audit_db_free_bytes` show the file's size and the part SQLite freed and reuses; the file does not shrink, since the server never runs `VACUUM`.
+
 ## What the chain does not prove
 
 Entries after the last checkpoint are protected by the hash chain only, and the verify report says how many there are (`unsigned_tail`). A signed checkpoint proves what the log looked like when it was signed, not that nothing was deleted afterwards unless you hold a copy of it from somewhere else.
@@ -228,7 +242,7 @@ Entries after the last checkpoint are protected by the hash chain only, and the 
 
 The checkpoint sink ships what the server signs; entries after the newest checkpoint are not covered until the next one is signed (at most `checkpoint_every` entries or `checkpoint_interval_seconds`).
 
-The log is never pruned and there is no rotation, so it grows without bound. A prune that archives a prefix at a signed checkpoint and leaves a signed anchor is proposed in [ADR-0015](../decisions/0015-audit-retention.md); not built.
+The log is never pruned unless pruned (`[audit.retention]`), and there is no rotation, so by default it grows without bound. With `[audit.retention] prune = "manual"` (and `[audit.sink]`, which it needs) the admin can prune the oldest entries behind a signed anchor ([ADR-0015](../decisions/0015-audit-retention.md)); see [Pruning the oldest entries](#pruning-the-oldest-entries). The CLI command that archives and prunes in one go (`attenuo audit prune`), verifying several files as one log, automatic pruning and the SDK verifiers' knowledge of the anchor are not built yet.
 
 Revocations, policy reloads, budget refunds (`admin.budget.refund`, naming the refunded decision) and dev root mints are appended to the log as admin actions (reason `admin_action`, server `attenuo`, subject `urn:attenuo:admin`, which no user can have). To pick out server events, filter on `kind` (anything but `decision`), or on `server = "attenuo"` and the tool (`token.*`, `lease.renew`, `admin.*`); no upstream or agent can use the name `attenuo`. The revoke response carries the `audit_id` of that record, or says that the append failed.
 

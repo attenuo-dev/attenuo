@@ -521,8 +521,9 @@ const APPROVAL_COLUMNS: &str = "id, chain_id, lease, call_hash, server, tool, ar
 /// Write `path` as a file at schema version 1 with the content of the current-version file
 /// `source`: every table and index as `source` has it (from its own `CREATE` statements),
 /// except `approvals`, which has version 1's shape and gets each approval's position as its
-/// rowid, `used_credentials` (version 3), which is left out, and `lease_subjects`, without
-/// the `issuer` of version 4; every row of every other table; and `user_version` 1. No
+/// rowid, `used_credentials` (version 3) and `audit_anchors` (version 5), which are left out,
+/// and `lease_subjects`, without the `issuer` of version 4; every row of every other table;
+/// and `user_version` 1. No
 /// `sqlite_sequence`, as in a real version 1 file.
 fn version_1_copy(source: &Path, path: &Path) {
     let conn = Connection::open(path).unwrap();
@@ -531,7 +532,8 @@ fn version_1_copy(source: &Path, path: &Path) {
         let mut stmt = src
             .prepare(
                 "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL \
-                 AND name NOT LIKE 'sqlite_%' AND tbl_name NOT IN ('approvals', 'used_credentials') \
+                 AND name NOT LIKE 'sqlite_%' \
+                 AND tbl_name NOT IN ('approvals', 'used_credentials', 'audit_anchors') \
                  ORDER BY type DESC, name",
             )
             .unwrap();
@@ -547,7 +549,8 @@ fn version_1_copy(source: &Path, path: &Path) {
         let mut stmt = conn
             .prepare(
                 "SELECT name FROM sqlite_master WHERE type = 'table' \
-                 AND name NOT LIKE 'sqlite_%' AND name NOT IN ('approvals', 'used_credentials')",
+                 AND name NOT LIKE 'sqlite_%' \
+                 AND name NOT IN ('approvals', 'used_credentials', 'audit_anchors')",
             )
             .unwrap();
         let rows = stmt.query_map([], |r| r.get(0)).unwrap();
@@ -727,11 +730,13 @@ fn a_version_2_file_gains_the_replay_table() {
         write_leases(&store);
     }
     {
-        // Version 2 is the current schema without migration 3's table and index, and
-        // without migration 4's column.
+        // Version 2 is the current schema without migration 3's table and index, without
+        // migration 4's column and without migration 5's table.
         let conn = Connection::open(&path).unwrap();
-        conn.execute_batch("DROP TABLE used_credentials; PRAGMA user_version = 2;")
-            .unwrap();
+        conn.execute_batch(
+            "DROP TABLE used_credentials; DROP TABLE audit_anchors; PRAGMA user_version = 2;",
+        )
+        .unwrap();
         without_subject_issuer(&conn);
     }
     assert!(!objects(&path)
@@ -808,9 +813,11 @@ fn a_version_3_file_gains_the_subject_issuer() {
         store.record_subject(&id("l2"), "alice").unwrap();
     }
     {
-        // Version 3 is the current schema without migration 4's column.
+        // Version 3 is the current schema without migration 4's column and migration 5's
+        // table.
         let conn = Connection::open(&path).unwrap();
         without_subject_issuer(&conn);
+        conn.execute_batch("DROP TABLE audit_anchors;").unwrap();
         conn.pragma_update(None, "user_version", 3).unwrap();
     }
     let rows = dump(&path);
@@ -822,7 +829,7 @@ fn a_version_3_file_gains_the_subject_issuer() {
     assert_eq!(store.schema().migrated_from, Some(3));
     let log = SqliteAudit::open(&path).unwrap();
     assert_eq!(log.schema().migrated_from, None);
-    assert_eq!(user_version(&path), 4);
+    assert_eq!(user_version(&path), i64::from(SCHEMA_VERSION));
     assert_eq!(objects(&path), current_objects());
     {
         let fresh = dir.path().join("fresh.sqlite");
@@ -881,6 +888,56 @@ fn a_version_3_file_gains_the_subject_issuer() {
         store.originating_user(&id("l3")).unwrap(),
         Some(("https://idp.example".into(), "alice".into()))
     );
+}
+
+/// Migration 5 on a version 4 file with a log, checkpoints, leases, an approval and an outbox
+/// notice: every row is kept, the chain and its checkpoints verify as before, the head is the
+/// same, the file gains an empty `audit_anchors` table (the schema of a new file), and the log
+/// still reads from seq 1 with no prune boundary.
+#[test]
+fn a_version_4_file_gains_the_anchor_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v4.sqlite");
+    let issuer = issuer();
+    write_log(&path, &issuer, 30);
+    {
+        let store = SqliteLeaseStore::open(&path).unwrap();
+        write_leases(&store);
+    }
+    {
+        // Version 4 is the current schema without migration 5's table.
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("DROP TABLE audit_anchors; PRAGMA user_version = 4;")
+            .unwrap();
+    }
+    assert!(!objects(&path).iter().any(|o| o == "audit_anchors"));
+    let rows = dump(&path);
+    assert_eq!(rows["checkpoints"].1.len(), 4);
+    let head_before = head(&path);
+
+    let log = SqliteAudit::open(&path).unwrap();
+    assert_eq!(log.schema().version, SCHEMA_VERSION);
+    assert_eq!(log.schema().migrated_from, Some(4));
+    let store = SqliteLeaseStore::open(&path).unwrap();
+    assert_eq!(store.schema().migrated_from, None);
+    assert_eq!(user_version(&path), i64::from(SCHEMA_VERSION));
+    assert_eq!(objects(&path), current_objects());
+
+    let after = dump(&path);
+    assert_rows_kept(&rows, &after);
+    for (table, content) in &rows {
+        assert_eq!(&after[table], content, "{table} is untouched");
+    }
+    assert_eq!(after["audit_anchors"].1, Vec::<String>::new());
+    assert_eq!(head(&path), head_before);
+    let report = log.verify_chain_signed(&keys(&issuer)).unwrap();
+    assert!(report.ok, "{report:?}");
+    assert_eq!((report.entries, report.checkpoints), (30, 4));
+    assert_eq!(report.pruned_through, None);
+    assert_eq!(report.anchors, 0);
+    assert_eq!(log.pruned_through().unwrap(), None);
+    assert_eq!(log.first_retained_seq().unwrap(), 1);
+    assert!(log.anchors_before(u64::MAX, 10).unwrap().is_empty());
 }
 
 /// The tables as of commit 3593549 (`kind` and `chain_id` on records, before the record-id

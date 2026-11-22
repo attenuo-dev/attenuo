@@ -110,24 +110,25 @@ pub fn verify_entries<I>(entries: I) -> Result<VerifyReport, AuditError>
 where
     I: IntoIterator<Item = Result<AuditEntry, AuditError>>,
 {
-    walk_entries(entries, true, |_| {})
+    walk_entries(entries, Some((1, GENESIS_HASH.to_string())), |_| {})
 }
 
-/// The chain walk behind [`verify_entries`]. With `anchored` the run must start at seq 1 with
-/// the genesis `prev_hash`; without it (an export of a window of the log) the first entry sets
-/// the expected seq and `prev_hash`, and only its own hash and everything after it is checked.
-/// `on_ok` sees each entry that passes, in order.
+/// The chain walk behind [`verify_entries`]. With `first` the run must start at that seq with
+/// that `prev_hash` (seq 1 and the genesis hash for a whole log, `B + 1` and the hash at `B`
+/// for a log pruned through `B`); without it (an export of a window of the log) the first
+/// entry sets the expected seq and `prev_hash`, and only its own hash and everything after it
+/// is checked. `on_ok` sees each entry that passes, in order.
 pub(crate) fn walk_entries<I>(
     entries: I,
-    anchored: bool,
+    first: Option<(u64, String)>,
     mut on_ok: impl FnMut(&AuditEntry),
 ) -> Result<VerifyReport, AuditError>
 where
     I: IntoIterator<Item = Result<AuditEntry, AuditError>>,
 {
     let mut count = 0u64;
-    let mut expected_seq = 1u64;
-    let mut expected_prev = GENESIS_HASH.to_string();
+    let anchored = first.is_some();
+    let (mut expected_seq, mut expected_prev) = first.unwrap_or((1, GENESIS_HASH.to_string()));
     let mut first = true;
     for item in entries {
         count += 1;

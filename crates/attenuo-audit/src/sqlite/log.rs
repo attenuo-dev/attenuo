@@ -42,6 +42,18 @@ pub(super) const ENTRY_COLUMNS: &str =
      agents, chain_depth, chain_digest, leases, server, tool, arguments_digest, session_id, \
      policy_ids, record_json, kind, chain_id";
 
+/// The SQL condition that keeps a row of `audit` in the retained log: above the newest prune
+/// anchor's `through_seq` (every row, for a log never pruned). Every read of entries adds it,
+/// so from the commit of a prune on, every reader sees the log start at `through_seq + 1`
+/// whether or not the batched deletes have removed the rows below yet. It reads
+/// `audit_anchors` in the same statement, so it is never behind the snapshot it filters.
+pub(super) const RETAINED: &str = "seq > (SELECT COALESCE(MAX(through_seq), 0) FROM audit_anchors)";
+
+/// The same for `checkpoints`: the checkpoint at the newest anchor's `through_seq` stays (the
+/// anchor refers to it); older ones are pruned with the entries they cover.
+pub(super) const RETAINED_CHECKPOINT: &str =
+    "seq >= (SELECT COALESCE(MAX(through_seq), 0) FROM audit_anchors)";
+
 /// A commit of one record handed back no entry. `commit` returns one entry per record, so this
 /// does not happen; if it ever did, the caller gets a storage error instead of a panic on the
 /// request path.
@@ -54,7 +66,7 @@ fn no_entry_for_record() -> AuditError {
 /// The hash covers `record_json`; the denormalized columns exist for queries. If someone edits a
 /// column (say, flips `decision` from `deny` to `allow`) without touching the JSON, the hash would
 /// still verify, so the mismatch is surfaced as a corrupt entry instead.
-fn entry_from_row(row: &Row<'_>) -> Result<AuditEntry, AuditError> {
+pub(super) fn entry_from_row(row: &Row<'_>) -> Result<AuditEntry, AuditError> {
     let seq: i64 = row.get(0)?;
     let seq = u64::try_from(seq).map_err(|_| AuditError::Corrupt {
         seq: 0,
@@ -158,13 +170,29 @@ fn head_in(tx: &Transaction<'_>) -> Result<Option<AuditEntry>, AuditError> {
 /// does not decode and cross-check the row: checking stored entries is `verify_chain`'s job
 /// (and the signed checkpoints'), and decoding the head on every append cost more than the
 /// insert itself.
-fn head_link(tx: &Transaction<'_>) -> Result<(u64, String), AuditError> {
+///
+/// On an empty table it falls back to the newest prune anchor (its prune record's seq and
+/// hash), so that no seq is given twice even if every row were deleted by hand after a prune;
+/// a log never pruned starts at `(0, GENESIS_HASH)` as before.
+pub(super) fn head_link(tx: &Connection) -> Result<(u64, String), AuditError> {
     let link = tx
         .prepare_cached("SELECT seq, entry_hash FROM audit ORDER BY seq DESC LIMIT 1")?
         .query_row([], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
         })
         .optional()?;
+    let link = match link {
+        Some(l) => Some(l),
+        None => tx
+            .prepare_cached(
+                "SELECT prune_seq, prune_entry_hash FROM audit_anchors \
+                 ORDER BY through_seq DESC LIMIT 1",
+            )?
+            .query_row([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .optional()?,
+    };
     match link {
         None => Ok((0, GENESIS_HASH.to_string())),
         Some((seq, hash)) => match u64::try_from(seq) {
@@ -177,7 +205,7 @@ fn head_link(tx: &Transaction<'_>) -> Result<(u64, String), AuditError> {
     }
 }
 
-fn query_entries(
+pub(super) fn query_entries(
     conn: &Connection,
     sql: &str,
     params: &[&dyn rusqlite::ToSql],
@@ -187,7 +215,7 @@ fn query_entries(
     rows.map(|r| r?).collect()
 }
 
-fn checkpoint_from_row(row: &Row<'_>) -> rusqlite::Result<Checkpoint> {
+pub(super) fn checkpoint_from_row(row: &Row<'_>) -> rusqlite::Result<Checkpoint> {
     let seq: i64 = row.get(0)?;
     Ok(Checkpoint {
         seq: u64::try_from(seq.max(0)).unwrap_or(0),
@@ -198,7 +226,7 @@ fn checkpoint_from_row(row: &Row<'_>) -> rusqlite::Result<Checkpoint> {
     })
 }
 
-fn insert_checkpoint(conn: &Connection, cp: &Checkpoint) -> Result<(), AuditError> {
+pub(super) fn insert_checkpoint(conn: &Connection, cp: &Checkpoint) -> Result<(), AuditError> {
     conn.execute(
         "INSERT INTO checkpoints (seq, head_hash, at, kid, signature) \
          VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -213,7 +241,7 @@ fn insert_checkpoint(conn: &Connection, cp: &Checkpoint) -> Result<(), AuditErro
     Ok(())
 }
 
-fn checkpoint_at(conn: &Connection, seq: u64) -> Result<Option<Checkpoint>, AuditError> {
+pub(super) fn checkpoint_at(conn: &Connection, seq: u64) -> Result<Option<Checkpoint>, AuditError> {
     // A seq above `i64::MAX` is never stored, so there is no such checkpoint.
     let Ok(seq) = i64::try_from(seq) else {
         return Ok(None);
@@ -227,15 +255,18 @@ fn checkpoint_at(conn: &Connection, seq: u64) -> Result<Option<Checkpoint>, Audi
 }
 
 type CheckpointHook = Arc<dyn Fn(&Checkpoint) + Send + Sync>;
+type AnchorHook = Arc<dyn Fn(&crate::checkpoint::Anchor) + Send + Sync>;
 
 /// Automatic checkpointing: sign the head every `every` entries, inside the append's
 /// transaction, so a checkpoint can never refer to a head that was not committed. That
 /// transaction commits with `synchronous=FULL` whatever the store's durability, before the
 /// `on_created` hook sees the checkpoint (SR-50).
-struct Checkpointing {
-    signer: attenuo_token::DetachedSigner,
-    every: u64,
-    on_created: Option<CheckpointHook>,
+pub(super) struct Checkpointing {
+    pub(super) signer: attenuo_token::DetachedSigner,
+    pub(super) every: u64,
+    pub(super) on_created: Option<CheckpointHook>,
+    /// Called once for every prune anchor this log signs, after its commit (synced).
+    pub(super) on_anchor: Option<AnchorHook>,
 }
 
 /// Most appends committed in one transaction by the writer thread.
@@ -370,11 +401,11 @@ pub struct SqliteAudit {
 pub(super) struct Inner {
     /// Shared with the WAL checkpointer, which holds it briefly to pause appends.
     pub(super) conn: Arc<Mutex<Connection>>,
-    checkpointing: Option<Checkpointing>,
+    pub(super) checkpointing: Option<Checkpointing>,
     activity: Arc<Activity>,
     /// The connection's `synchronous` level when it is below `FULL` on a file: commits that
     /// write a signed checkpoint raise it to `FULL` for themselves (SR-50).
-    relaxed_sync: Option<i64>,
+    pub(super) relaxed_sync: Option<i64>,
     /// The database file, if there is one (canonical path): what a synced commit covers.
     file: Option<PathBuf>,
     /// Held across every write transaction (see [`WriteGate`]).
@@ -391,6 +422,9 @@ pub(super) struct Inner {
     /// Tests: the writer stops here once it has taken a batch, before committing it.
     #[cfg(test)]
     pub(super) take_gate: Option<Arc<TakeGate>>,
+    /// Tests: the step of the prune transaction that fails on purpose (0: none).
+    #[cfg(any(test, feature = "testing"))]
+    pub(super) prune_fail_at: AtomicU8,
 }
 
 /// Tests: holds the writer between taking a batch and committing it, so a test can make an
@@ -870,7 +904,7 @@ impl Inner {
 }
 
 /// Insert `entry`, whose record serializes to `record_json`.
-fn insert_entry(
+pub(super) fn insert_entry(
     tx: &Transaction<'_>,
     entry: &AuditEntry,
     record_json: &str,
@@ -977,6 +1011,8 @@ impl SqliteAudit {
                 probe: None,
                 #[cfg(test)]
                 take_gate: None,
+                #[cfg(any(test, feature = "testing"))]
+                prune_fail_at: AtomicU8::new(0),
             }),
             writer: OnceLock::new(),
             wal: None,
@@ -992,7 +1028,7 @@ impl SqliteAudit {
 
     /// The connection queries run on: the read-only reader when there is one, else the
     /// writer's connection. Only reads go through here.
-    fn read_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, AuditError> {
+    pub(super) fn read_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, AuditError> {
         match &self.reader {
             Some(r) => Ok(r.lock()?),
             None => Ok(self.inner.conn.lock()?),
@@ -1003,7 +1039,12 @@ impl SqliteAudit {
     /// a whole-log verify walks. A checkpoint is written in the same transaction as the entry
     /// it names or after it, so in one snapshot a checkpoint past the newest seq means the log
     /// was truncated, never that an append was half seen.
-    pub(super) fn verify_snapshot(&self) -> Result<(i64, Vec<Checkpoint>), AuditError> {
+    ///
+    /// The prune anchors are read in the same transaction (oldest first), so a prune is seen
+    /// whole or not at all.
+    pub(super) fn verify_snapshot(
+        &self,
+    ) -> Result<(i64, Vec<Checkpoint>, Vec<super::retention::StoredAnchor>), AuditError> {
         let mut conn = self.read_conn()?;
         let tx = conn.transaction()?;
         let upper: i64 =
@@ -1015,23 +1056,28 @@ impl SqliteAudit {
             let rows = stmt.query_map([], checkpoint_from_row)?;
             rows.collect::<Result<_, _>>()?
         };
+        let anchors = super::retention::all_anchors(&tx)?;
         tx.commit()?;
-        Ok((upper, checkpoints))
+        Ok((upper, checkpoints, anchors))
     }
 
     /// Every entry with `seq <= upper`, in order, read [`VERIFY_PAGE`] rows at a time, each
     /// page under the read lock for just that page. A row that cannot be decoded comes back
     /// as its error ([`AuditError::Corrupt`]) in its place; a failed query ends the walk
     /// with that error.
+    /// With `after`, only entries with `seq > after` (a log pruned through `after`).
     pub(super) fn entries_through(
         &self,
+        after: Option<u64>,
         upper: i64,
     ) -> impl Iterator<Item = Result<AuditEntry, AuditError>> + '_ {
         let sql = format!(
             "SELECT {ENTRY_COLUMNS} FROM audit WHERE seq >= ?1 AND seq <= ?2 ORDER BY seq \
              LIMIT ?3"
         );
-        let mut next: i64 = i64::MIN;
+        let mut next: i64 = after.map_or(i64::MIN, |a| {
+            i64::try_from(a).unwrap_or(i64::MAX).saturating_add(1)
+        });
         let mut page: std::collections::VecDeque<Result<AuditEntry, AuditError>> =
             std::collections::VecDeque::new();
         let mut done = false;
@@ -1203,6 +1249,7 @@ impl SqliteAudit {
             signer,
             every,
             on_created: None,
+            on_anchor: None,
         });
         self
     }
@@ -1218,6 +1265,20 @@ impl SqliteAudit {
     ) -> Self {
         if let Some(c) = self.inner_mut().checkpointing.as_mut() {
             c.on_created = Some(Arc::new(hook));
+        }
+        self
+    }
+
+    /// Call `hook` once for every prune anchor this log signs
+    /// ([`prune_through`](Self::prune_through)), after the commit that wrote it, which ran with
+    /// `synchronous=FULL`. The server ships it off the host with the checkpoints. No effect
+    /// before [`with_checkpointing`](Self::with_checkpointing).
+    pub fn with_anchor_hook(
+        mut self,
+        hook: impl Fn(&crate::checkpoint::Anchor) + Send + Sync + 'static,
+    ) -> Self {
+        if let Some(c) = self.inner_mut().checkpointing.as_mut() {
+            c.on_anchor = Some(Arc::new(hook));
         }
         self
     }
@@ -1245,7 +1306,8 @@ impl SqliteAudit {
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             let (seq, hash) = match head_in(&tx)? {
                 Some(h) => (h.seq, h.entry_hash),
-                None => (0, GENESIS_HASH.to_string()),
+                // An empty table: genesis, or after a prune the anchor's prune record.
+                None => head_link(&tx)?,
             };
             if let Some(existing) = checkpoint_at(&tx, seq)? {
                 if existing.head_hash == hash {
@@ -1322,10 +1384,10 @@ impl SqliteAudit {
     /// [`AuditError::Sqlite`] when the query fails or a row has the wrong shape.
     pub fn checkpoints_between(&self, from: u64, to: u64) -> Result<Vec<Checkpoint>, AuditError> {
         let conn = self.read_conn()?;
-        let mut stmt = conn.prepare_cached(
+        let mut stmt = conn.prepare_cached(&format!(
             "SELECT seq, head_hash, at, kid, signature FROM checkpoints \
-             WHERE seq >= ?1 AND seq <= ?2 ORDER BY seq",
-        )?;
+                 WHERE seq >= ?1 AND seq <= ?2 AND {RETAINED_CHECKPOINT} ORDER BY seq"
+        ))?;
         let rows = stmt.query_map(
             [
                 i64::try_from(from).unwrap_or(i64::MAX),
@@ -1351,13 +1413,16 @@ impl SqliteAudit {
         &self,
         keys: &CheckpointKeys,
     ) -> Result<SignedVerifyReport, AuditError> {
-        let (upper, checkpoints) = self.verify_snapshot()?;
-        verify_with_checkpoints(
-            self.entries_through(upper),
-            &checkpoints,
-            keys,
-            Start::Genesis,
-        )
+        let (upper, checkpoints, anchors) = self.verify_snapshot()?;
+        if anchors.is_empty() {
+            return verify_with_checkpoints(
+                self.entries_through(None, upper),
+                &checkpoints,
+                keys,
+                Start::Genesis,
+            );
+        }
+        super::retention::verify_pruned(self, upper, &checkpoints, &anchors, keys)
     }
 
     /// Run `f` against the underlying connection while holding the write lock.
@@ -1386,7 +1451,7 @@ impl SqliteAudit {
     /// decoded.
     pub fn by_subject(&self, subject: &str, limit: usize) -> Result<Vec<AuditEntry>, AuditError> {
         let sql = format!(
-            "SELECT {ENTRY_COLUMNS} FROM audit WHERE originating_subject = ?1 \
+            "SELECT {ENTRY_COLUMNS} FROM audit WHERE originating_subject = ?1 AND {RETAINED} \
              ORDER BY seq DESC LIMIT ?2"
         );
         let conn = self.read_conn()?;
@@ -1468,6 +1533,7 @@ impl SqliteAudit {
              AND (?11 IS NULL OR chain_id = ?11) \
              AND (?12 IS NULL OR julianday(at) >= julianday(?12) - 1.0 / 86400) \
              AND (?13 IS NULL OR julianday(at) <= julianday(?13) + 1.0 / 86400) \
+             AND {RETAINED} \
              ORDER BY seq {direction} LIMIT ?14"
         );
         let kinds = if filter.kinds.is_empty() {
@@ -1548,7 +1614,7 @@ impl SqliteAudit {
         let Ok(seq) = i64::try_from(seq) else {
             return Ok(None);
         };
-        let sql = format!("SELECT {ENTRY_COLUMNS} FROM audit WHERE seq = ?1");
+        let sql = format!("SELECT {ENTRY_COLUMNS} FROM audit WHERE seq = ?1 AND {RETAINED}");
         let conn = self.read_conn()?;
         Ok(query_entries(&conn, &sql, &[&seq])?.pop())
     }
@@ -1563,8 +1629,10 @@ impl SqliteAudit {
     /// [`AuditError::Sqlite`] when the query fails, or [`AuditError::Corrupt`] when a row cannot be
     /// decoded. An unknown id is `Ok(None)`.
     pub fn entry_by_record_id(&self, id: &str) -> Result<Option<AuditEntry>, AuditError> {
-        let sql =
-            format!("SELECT {ENTRY_COLUMNS} FROM audit WHERE {RECORD_ID_EXPR} = ?1 ORDER BY seq");
+        let sql = format!(
+            "SELECT {ENTRY_COLUMNS} FROM audit WHERE {RECORD_ID_EXPR} = ?1 AND {RETAINED} \
+             ORDER BY seq"
+        );
         let conn = self.read_conn()?;
         let found = query_entries(&conn, &sql, &[&id])?;
         // Record ids are random UUIDs, so one row at most is expected; take the first whose
@@ -1585,10 +1653,10 @@ impl SqliteAudit {
         limit: usize,
     ) -> Result<Vec<Checkpoint>, AuditError> {
         let conn = self.read_conn()?;
-        let mut stmt = conn.prepare_cached(
+        let mut stmt = conn.prepare_cached(&format!(
             "SELECT seq, head_hash, at, kid, signature FROM checkpoints \
-             WHERE seq < ?1 ORDER BY seq DESC LIMIT ?2",
-        )?;
+                 WHERE seq < ?1 AND {RETAINED_CHECKPOINT} ORDER BY seq DESC LIMIT ?2"
+        ))?;
         let rows = stmt.query_map(
             [
                 i64::try_from(before).unwrap_or(i64::MAX),
@@ -1613,10 +1681,10 @@ impl SqliteAudit {
             return Ok(None);
         };
         let conn = self.read_conn()?;
-        let mut stmt = conn.prepare_cached(
+        let mut stmt = conn.prepare_cached(&format!(
             "SELECT seq, head_hash, at, kid, signature FROM checkpoints \
-             WHERE seq >= ?1 ORDER BY seq LIMIT 1",
-        )?;
+                 WHERE seq >= ?1 AND {RETAINED_CHECKPOINT} ORDER BY seq LIMIT 1"
+        ))?;
         Ok(stmt.query_row([seq], checkpoint_from_row).optional()?)
     }
 
@@ -1642,7 +1710,7 @@ impl SqliteAudit {
         };
         let sql = format!(
             "SELECT {ENTRY_COLUMNS} FROM audit \
-             WHERE kind = ?1 AND tool = ?2 AND decision = ?3 AND seq > ?4 \
+             WHERE kind = ?1 AND tool = ?2 AND decision = ?3 AND seq > ?4 AND {RETAINED} \
              ORDER BY seq LIMIT 1"
         );
         let conn = self.read_conn()?;
@@ -1677,7 +1745,7 @@ impl SqliteAudit {
         let mut found: BTreeMap<LeaseId, AuditEntry> = BTreeMap::new();
         let sql = format!(
             "SELECT {ENTRY_COLUMNS} FROM audit WHERE chain_id = ?1 \
-             AND kind IN ('root_token', 'exchange') ORDER BY seq"
+             AND kind IN ('root_token', 'exchange') AND {RETAINED} ORDER BY seq"
         );
         let conn = self.read_conn()?;
         let mut stmt = conn.prepare_cached(&sql)?;
@@ -1702,7 +1770,9 @@ impl SqliteAudit {
     /// [`AuditError::Sqlite`] when the query fails, or [`AuditError::Corrupt`] when a row cannot be
     /// decoded.
     pub fn by_chain(&self, chain_digest: &str) -> Result<Vec<AuditEntry>, AuditError> {
-        let sql = format!("SELECT {ENTRY_COLUMNS} FROM audit WHERE chain_digest = ?1 ORDER BY seq");
+        let sql = format!(
+            "SELECT {ENTRY_COLUMNS} FROM audit WHERE chain_digest = ?1 AND {RETAINED} ORDER BY seq"
+        );
         let conn = self.read_conn()?;
         query_entries(&conn, &sql, &[&chain_digest])
     }
@@ -1721,7 +1791,8 @@ impl SqliteAudit {
     pub fn by_lease(&self, lease: &LeaseId) -> Result<Vec<AuditEntry>, AuditError> {
         let pattern = like_contains(&serde_json::to_string(&lease.0)?);
         let sql = format!(
-            "SELECT {ENTRY_COLUMNS} FROM audit WHERE leases LIKE ?1 ESCAPE '\\' ORDER BY seq"
+            "SELECT {ENTRY_COLUMNS} FROM audit WHERE leases LIKE ?1 ESCAPE '\\' AND {RETAINED} \
+             ORDER BY seq"
         );
         let conn = self.read_conn()?;
         let candidates = query_entries(&conn, &sql, &[&pattern])?;
@@ -1732,7 +1803,7 @@ impl SqliteAudit {
             .collect())
     }
 
-    /// Number of entries.
+    /// Number of retained entries (all of them for a log never pruned).
     ///
     /// # Errors
     ///
@@ -1740,7 +1811,11 @@ impl SqliteAudit {
     /// [`AuditError::Sqlite`] when the count query fails.
     pub fn len(&self) -> Result<u64, AuditError> {
         let conn = self.read_conn()?;
-        let n: i64 = conn.query_row("SELECT COUNT(*) FROM audit", [], |r| r.get(0))?;
+        let n: i64 = conn.query_row(
+            &format!("SELECT COUNT(*) FROM audit WHERE {RETAINED}"),
+            [],
+            |r| r.get(0),
+        )?;
         Ok(u64::try_from(n).unwrap_or(0))
     }
 
@@ -1804,8 +1879,10 @@ impl AuditSink for SqliteAudit {
     }
 
     fn range(&self, from_seq: u64, limit: usize) -> Result<Vec<AuditEntry>, AuditError> {
-        let sql =
-            format!("SELECT {ENTRY_COLUMNS} FROM audit WHERE seq >= ?1 ORDER BY seq LIMIT ?2");
+        let sql = format!(
+            "SELECT {ENTRY_COLUMNS} FROM audit WHERE seq >= ?1 AND {RETAINED} ORDER BY seq \
+             LIMIT ?2"
+        );
         let conn = self.read_conn()?;
         query_entries(
             &conn,
@@ -1818,10 +1895,22 @@ impl AuditSink for SqliteAudit {
     }
 
     fn verify_chain(&self) -> Result<VerifyReport, AuditError> {
-        let (upper, _) = self.verify_snapshot()?;
+        let (upper, _, anchors) = self.verify_snapshot()?;
         // A row that cannot be decoded (corrupt JSON, column/JSON disagreement) surfaces as
         // `AuditError::Corrupt`, which `verify_entries` reports as a break at that seq.
-        verify_entries(self.entries_through(upper))
+        match anchors.last() {
+            None => verify_entries(self.entries_through(None, upper)),
+            // Without keys the anchor's signature cannot be checked: the chain is walked from
+            // where it says the log starts. `verify_chain_signed` checks the anchor.
+            Some(a) => crate::log::walk_entries(
+                self.entries_through(Some(a.anchor.through_seq), upper),
+                Some((
+                    a.anchor.through_seq.saturating_add(1),
+                    a.anchor.through_hash.clone(),
+                )),
+                |_| {},
+            ),
+        }
     }
 
     fn checkpoint(&self) -> Result<(u64, String), AuditError> {
