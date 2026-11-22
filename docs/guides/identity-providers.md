@@ -118,7 +118,7 @@ Notes:
 
 - Use a separate entry and a separate secret for each agent identity. Do not share one across agents.
 - The secret goes in the agent's runtime. Treat a leak as a leak of that agent's root-grant ceiling for every user whose ID token the attacker can also get.
-- Secrets are static. Rotating one means editing the config and restarting. To keep no shared secret on the server at all, give the agent a key pair instead (below). There is no mTLS client authentication.
+- Secrets are static. To rotate one, edit the entry and run `attenuo admin agent reload` (or restart); see [Deploying](deploying.md#adding-or-rotating-an-agent-without-a-restart). To keep no shared secret on the server at all, give the agent a key pair instead (below). There is no mTLS client authentication.
 - If an `actor` is sent on an intake request it must equal the authenticated agent.
 
 ### A key instead of a secret

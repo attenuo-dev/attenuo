@@ -109,3 +109,7 @@ Now:
 Rejected: keeping the codes and documenting what they reveal (option 3 of the report), because the secret path already promises that ids do not show; folding the server-wide `alg` check into the one answer too, because it does not depend on the client and its code helps a client that signs with an algorithm the server does not take.
 
 This is a breaking change of the HTTP API for a client that matched the two removed codes; neither SDK nor the CLI did.
+
+### Update 2026-11-22: keys change without a restart
+
+The decision above stands. One consequence it listed, "Adding, rotating or removing a key is editing the config and restarting", no longer holds: `POST /admin/agents/reload` (`attenuo admin agent reload`, role `admin`) re-reads `[[agents]]` and `[[peps]]` from the config file, checks them with the startup rules and swaps both lists in at once ([HTTP API](../reference/http-api.md#agents-reload)). Keys are still inline and never fetched (no `jwks_uri`). The record of used assertions is keyed by client kind, id and `jti`, so a rotation does not make an old assertion usable again. Tokens already issued to a removed client are not revoked by the reload.

@@ -217,7 +217,9 @@ attribute_claims = ["email", "groups", "amr"]
 # Agents (OAuth clients) that may present user credentials at POST /token, authenticated with
 # client_id/client_secret (form or HTTP Basic). secret_sha256 = `printf %s "$SECRET" | sha256sum`.
 # With no [[agents]], every request that authenticates with client credentials is rejected
-# (an agent with an actor_token from [[actor_trust]] needs no entry).
+# (an agent with an actor_token from [[actor_trust]] needs no entry). Read at startup, and
+# again with [[peps]] by `attenuo admin agent reload` (POST /admin/agents/reload), which puts
+# changed lists in force without a restart; tokens already issued are not revoked by it.
 [[agents]]
 id = "planner"
 secret_sha256 = "a93d472e76b73bffcef69973eb463fb679b1365377e183a459d7f33c2ee97b7a"   # "planner-secret-change-me"
@@ -500,6 +502,6 @@ enabled = false
 # listen = "127.0.0.1:9101"
 # A non-loopback `listen` is refused at startup unless this is true.
 # allow_public = false
-# Mount POST /admin/leases/{id}/revoke, POST /admin/policies/reload, POST /admin/approvals/{id}
-# and POST /admin/budgets/refund on this listener.
+# Mount POST /admin/leases/{id}/revoke, POST /admin/policies/reload, POST /admin/approvals/{id},
+# POST /admin/budgets/refund and the operators and agents reloads on this listener.
 # allow_write = false

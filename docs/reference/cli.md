@@ -11,7 +11,7 @@ attenuo [--server URL] [--json] <command>
 | Option | Environment | Default | Meaning |
 | --- | --- | --- | --- |
 | `--server`, `--url` | `ATTENUO_SERVER` | `http://127.0.0.1:8080` | Base URL of the attenuo server. Goes before the subcommand. Every request goes here, except requests to `/admin/*` when `--admin-server` is set. Give the final URL: the CLI follows no redirect (SR-112), and a 3xx answer is an error (exit 1) naming the URL, the status and the `Location`, for example `error: http://attenuo.internal:8080/token answered 308 Permanent Redirect (Location https://attenuo.internal/token); attenuo does not follow redirects, so --server must be the final URL, the one that answers without a redirect`. The same holds for `--admin-server` and for an `approval verify --jwks` URL. |
-| `--admin-server URL` | `ATTENUO_ADMIN_SERVER` | `--server` | Base URL of the admin API, for a server with `[admin] listen` ([network exposure](../guides/deploying.md#network-exposure)): the main listener answers `/admin/*` as an unknown path. Every request to `/admin/*` goes here. Those are the requests of `token root`, `lease`, `audit` other than `audit verify --file`, `approval list`, `show`, `grant` and `decline`, `budget refund`, `policy reload`, `show`, `check` and `evaluate`, `policy test --via admin-evaluate`, and `admin operator reload`. Everything else, including `health` and the JWKS that `token inspect --verify`, `approval verify` and `audit verify --file` fetch, still goes to `--server`, so one invocation can use both. Unset or empty, `/admin/*` goes to `--server` as well, and a `404` without an error code from it (the main listener's answer to a path it does not serve) gets a second line, `hint: the server may serve its admin API on a separate listener ([admin] listen); pass --admin-server URL (or set ATTENUO_ADMIN_SERVER)`. A JSON `404` `not_found` (an unknown lease, approval or audit record) gets no hint. Goes before or after the subcommand. |
+| `--admin-server URL` | `ATTENUO_ADMIN_SERVER` | `--server` | Base URL of the admin API, for a server with `[admin] listen` ([network exposure](../guides/deploying.md#network-exposure)): the main listener answers `/admin/*` as an unknown path. Every request to `/admin/*` goes here. Those are the requests of `token root`, `lease`, `audit` other than `audit verify --file`, `approval list`, `show`, `grant` and `decline`, `budget refund`, `policy reload`, `show`, `check` and `evaluate`, `policy test --via admin-evaluate`, `admin operator reload` and `admin agent reload`. Everything else, including `health` and the JWKS that `token inspect --verify`, `approval verify` and `audit verify --file` fetch, still goes to `--server`, so one invocation can use both. Unset or empty, `/admin/*` goes to `--server` as well, and a `404` without an error code from it (the main listener's answer to a path it does not serve) gets a second line, `hint: the server may serve its admin API on a separate listener ([admin] listen); pass --admin-server URL (or set ATTENUO_ADMIN_SERVER)`. A JSON `404` `not_found` (an unknown lease, approval or audit record) gets no hint. Goes before or after the subcommand. |
 | `--admin-token-stdin` | | off | Read the admin token from the first line of standard input. The three admin token options go before or after the subcommand. |
 | `--admin-token-file PATH` | | none | Read the admin token from the first line of a file. |
 | `--admin-token TOKEN` | `ATTENUO_ADMIN_TOKEN` | none | Bearer for `/admin/*`. Prefer the environment variable, stdin or a file: an argument is readable by other local users (`ps`, `/proc/<pid>/cmdline`) and lands in shell history, so the CLI prints a warning to stderr when it is used. |
@@ -263,6 +263,21 @@ reloaded operators: 1 added, 1 removed, 1 changed
 ```
 
 A refusal exits 1 with the server's code, and the operators in force stay as they were: `operators_invalid` (the file is not TOML, or an entry breaks a [startup rule](config.md#adminoperators)), `operators_no_admin` (the new list would leave no unexpired credential with role `admin`, and there is no `[admin] token`), `reload_unavailable` (the server was not started from a config file), `config_unreadable` (the file cannot be read), or `admin_role_insufficient` (the token's role is below `admin`).
+
+### `admin agent reload`
+
+Ask the server to re-read `[[agents]]` and `[[peps]]` from the config file it was started with and put them in force without a restart (`POST /admin/agents/reload`, role `admin`). Prints, for each list, how many entries are in force and the ids added, removed and changed (secret or keys), then the other sections of the file that differ from the running config and need a restart, then the startup warnings the new lists raise; `--json` prints the server's answer. Use it to add an agent or a PEP, to rotate a secret or a key, or to remove a credential.
+
+```console
+$ attenuo admin agent reload
+agents: 3 in force, 1 added, 1 removed, 1 changed
+peps: 1 in force, 0 added, 0 removed, 0 changed
+  added    agent tester
+  removed  agent coder
+  changed  agent reviewer
+```
+
+A removed agent cannot authenticate again, but tokens already issued to it are not revoked: revoke them with [`lease revoke`](#lease-revoke-id---reason-text). A refusal exits 1 with the server's code, and the lists in force stay as they were: `agents_invalid` (the file does not parse, or a list breaks a [startup rule](config.md#agents)), `reload_unavailable` (the server was not started from a config file), `config_unreadable` (the file cannot be read), or `admin_role_insufficient` (the token's role is below `admin`).
 
 ### `token inspect <JWT>`
 

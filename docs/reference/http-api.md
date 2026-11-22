@@ -73,6 +73,7 @@ The table is generated from `attenuo_core::error_codes::ERROR_CODES`, the one pl
 | `admin_disabled` | 403 |  |  | The admin API is turned off. |
 | `admin_role_insufficient` | 403 |  |  | The admin credential's role is below the one the route needs; the message names the role needed. |
 | `agent_token_refused` | 403 |  |  | A delegation token cannot decide an approval. |
+| `agents_invalid` | 422 |  |  | The reloaded config file does not parse, or its `[[agents]]` or `[[peps]]` break a startup rule; the agents and peps in force are unchanged. |
 | `already_refunded` | 409 |  |  | The budget charge was already refunded. |
 | `approval_expired` | 409 |  |  | The approval, or the lease it is bound to, has expired. |
 | `approval_invalid` |  | `-32003` (200) | yes | A presented approval token does not verify, is for another call, or names an approval that is no longer granted. |
@@ -493,7 +494,7 @@ Each route needs at least one role; a role includes the ones below it. The table
 | --- | --- |
 | `viewer` | `GET /admin/whoami`, `GET /admin/leases/{lease_id}`, `GET /admin/leases/{lease_id}/tree`, `GET /admin/audit`, `GET /admin/audit/verify`, `GET /admin/audit/entries/{seq}`, `GET /admin/audit/records/{id}`, `GET /admin/audit/checkpoints`, `GET /admin/audit/checkpoint` (it signs a checkpoint of the head when there is none, which records no new fact), `GET /admin/audit/export`, `GET /admin/policies`, `GET /admin/policies/check`, `POST /admin/policies/evaluate` (a dry run that writes nothing), `GET /admin/approvals`, `GET /admin/approvals/{id}` |
 | `operator` | `POST /admin/leases/{lease_id}/revoke`, `POST /admin/leases/revoke` (its `?preview=true` dry run included), `POST /admin/approvals/{id}` |
-| `admin` | `POST /admin/budgets/refund`, `POST /admin/policies/reload`, `POST /admin/operators/reload`, `POST /admin/root-token`, and the audit retention routes `GET /admin/audit/prune/plan`, `POST /admin/audit/prune` and `GET /admin/audit/anchors` |
+| `admin` | `POST /admin/budgets/refund`, `POST /admin/policies/reload`, `POST /admin/operators/reload`, `POST /admin/agents/reload`, `POST /admin/root-token`, and the audit retention routes `GET /admin/audit/prune/plan`, `POST /admin/audit/prune` and `GET /admin/audit/anchors` |
 
 `[admin] token` is the operator `admin` with role `admin`. The audit log records an admin action with `originating_subject` `urn:attenuo:admin` for `[admin] token`, as before operators existed, and `urn:attenuo:admin:<name>` for a named operator; an approval decided by an operator has that subject as `approver.subject` and as the approval token's `sub`.
 
@@ -518,6 +519,7 @@ Where they are served: on the main listener by default; with `[admin] listen` se
 | `GET /admin/audit/anchors?limit&cursor` | The signed anchors of past prunes, newest first, `{anchors, next_cursor}`, each `{through_seq, through_hash, prune_seq, prune_entry_hash, previous_through_seq, archive_sha256, at, kid, signature, state}`. Paged as in [Paging](#paging): `limit` default 50, at most 500. Empty for a log never pruned, whatever `prune` is. |
 | `POST /admin/policies/reload` | Re-read the policy file. On failure the old policy stays. |
 | `POST /admin/operators/reload` | Re-read `[[admin.operators]]`, and nothing else, from the config file the server was started with, and swap them in at once. See [Operators reload](#operators-reload). Also on the console listener with `[admin_ui] allow_write = true`. |
+| `POST /admin/agents/reload` | Re-read `[[agents]]` and `[[peps]]` from the config file the server was started with, check them as startup does, and swap both in at once. Tokens already issued are not revoked. See [Agents reload](#agents-reload). Also on the console listener with `[admin_ui] allow_write = true`. |
 | `GET /admin/policies` | The policy set in force: file path, its `sha256` and `loaded_at` (startup or last successful reload), `policy_ids`, validation `warnings`, and `policies: [{id, text}]`. |
 | `GET /admin/policies/check` | Lint the policy file as it is on disk now against the running schema, with line and column for each issue, and say whether it differs from the loaded one. Loads nothing, audits nothing. 409 `check_unavailable` without `policy.policies_path`. |
 | `POST /admin/policies/evaluate` | Dry run: what the loaded policies decide for one call, given a token or a chain, and optionally the run-limit state to assume (`budget`). No lease check, no charge, no audit record, no decision metric. |
@@ -549,6 +551,40 @@ It answers `{"added": [...], "removed": [...], "changed": [...], "audit_id": "<u
 - 500 `config_unreadable`: the file cannot be read; the cause is in the server log only.
 
 On every refusal the operators in force are unchanged. An entry whose `expires_at` has already passed is accepted, with a warning naming it, and its token is refused.
+
+### Agents reload
+
+`POST /admin/agents/reload` (role `admin`, no body) re-reads the config file the server was started with (`--config` or `ATTENUO_CONFIG`), parses it as startup does (with the `ATTENUO__...` [environment overrides](config.md#environment-overrides)), checks `[[agents]]` and `[[peps]]` with the startup rules ([config](config.md#agents)) against the other settings in force, and puts both lists in force in one step. Only these two lists are applied. Reloads run one at a time.
+
+It answers:
+
+```json
+{
+  "agents": {"count": 3, "added": ["tester"], "removed": ["coder"], "changed": ["reviewer"]},
+  "peps": {"count": 1, "added": [], "removed": [], "changed": []},
+  "restart_needed": ["[[root_grants]]"],
+  "warnings": [],
+  "audit_id": "<uuid>"
+}
+```
+
+- `count` is the number of entries now in force. `added`, `removed` and `changed` are ids, never a digest or a key; `changed` means a different `secret_sha256` or `jwks`.
+- `restart_needed` names each other section of the file (`[server]`, `[[root_grants]]`, ...) whose values differ from the ones in force. They are not applied; a restart applies them. `[[admin.operators]]` is not compared: `POST /admin/operators/reload` reloads it. An empty list means the file matches the running config apart from the two lists.
+- `warnings` are the startup warnings the new lists raise, such as an `[[idps]]` entry with no `client_ids` entry for a new agent, or no agents at all.
+- The `admin.agents.reload` audit record names the caller as `originating_subject` and has `{path, agents, peps, restart_needed}` as its arguments, the first two as in the answer (kept as their digest, as for every record). A refused reload is recorded as a `deny` whose `reason` is the refusal's code.
+
+What changes when:
+
+- A request sees both old lists or both new ones, never a mix. A request admitted before the swap completes with the lists it was admitted with.
+- From the next request on, a removed agent or PEP, an old secret and an old key are refused (401 `invalid_client` / `client_authentication_failed`), and an added one, a new secret and a new key are accepted.
+- Tokens and leases already issued are not revoked. A token issued to a removed agent keeps working, and `POST /token/renew` keeps renewing it, until it expires or its lease is revoked: `POST /admin/leases/{lease_id}/revoke` or `POST /admin/leases/revoke` (`attenuo lease revoke`).
+- The per-agent `[limits] token_requests_per_minute` window and the record of used client assertions (`jti`) are kept by id, so a rotation resets neither.
+
+Refusals (on every one, both lists in force are unchanged):
+
+- 422 `agents_invalid`: the file does not parse as the server's config (not TOML, an unknown key, a wrong type), or a list breaks a startup rule (an empty or duplicate id, the reserved id `attenuo`, a `secret_sha256` that is not 64 hex characters, an entry with neither a secret nor keys, a `jwks` the server refuses, or no `[[peps]]` while `[authzen] allow_unsigned_chain = true`). `detail` is the message startup would give, followed by `; the agents and peps in force are unchanged`. A TOML error names its line and never quotes the file.
+- 409 `reload_unavailable`: the server was not started from a config file.
+- 500 `config_unreadable`: the file cannot be read; the cause is in the server log only.
 
 ### Budget refund
 
