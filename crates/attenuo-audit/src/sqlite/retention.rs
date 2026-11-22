@@ -605,7 +605,8 @@ impl SqliteAudit {
 
     /// The size of the database file as SQLite sees it, `(page_count * page_size,
     /// freelist_count * page_size)` in bytes: the second is the part a `DELETE` freed, which
-    /// new rows reuse; the file does not shrink without `VACUUM`.
+    /// new rows reuse. The server never shrinks the file; `attenuo audit compact` does,
+    /// offline, with the server stopped ([`compact`](super::compact)).
     ///
     /// # Errors
     ///
