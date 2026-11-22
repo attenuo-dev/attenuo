@@ -565,7 +565,7 @@ On every refusal the operators in force are unchanged. An entry whose `expires_a
 
 `POST /admin/agents/reload` (role `admin`) re-reads the config file the server was started with (`--config` or `ATTENUO_CONFIG`), parses it as startup does (with the `ATTENUO__...` [environment overrides](config.md#environment-overrides)), checks `[[agents]]` and `[[peps]]` with the startup rules ([config](config.md#agents)) against the other settings in force, and puts both lists in force in one step. Only these two lists are applied. Reloads run one at a time.
 
-The body is empty, `{}`, or overrides of two refusals: `{"allow_empty": true}` accepts a file that leaves a list empty while the server has entries in it, and `{"allow_mismatch": true}` accepts a file whose `[issuer]` or `[audit]` differs from the running config. An unknown field is a 400.
+The body is empty, `{}`, or overrides of two refusals: `{"allow_empty": true}` accepts a file that leaves a list empty while the server has entries in it, and `{"allow_mismatch": true}` accepts a file whose `[issuer]` or `[audit]` differs from the running config. An unknown field is a 400. The SDKs wrap it: Python `AdminClient.agents_reload(allow_empty=False, allow_mismatch=False)` returns an `AgentsReload`, TypeScript `AdminClient.agentsReload({ allowEmpty, allowMismatch })` resolves to one.
 
 It answers:
 
@@ -610,7 +610,7 @@ Refusals (on every one, both lists in force are unchanged):
 
 A reload reads key files more strictly than startup. It never generates a key, so the file must set `private_key_pem_path` and the file must exist. Each key file must be a regular file (a link to one is fine) of at most 64 KiB. Each key may be listed once: the signing key listed in `previous_key_paths` too, or one retired key in two files (a private and a public one), is refused.
 
-The body is empty, `{}`, or overrides of three refusals: `{"allow_drop_current": true}`, `{"allow_drop_audit_key": true}` and `{"allow_mismatch": true}`. An unknown field is a 400.
+The body is empty, `{}`, or overrides of three refusals: `{"allow_drop_current": true}`, `{"allow_drop_audit_key": true}` and `{"allow_mismatch": true}`. An unknown field is a 400. The SDKs wrap it: Python `AdminClient.keys_reload(allow_drop_current=False, allow_drop_audit_key=False, allow_mismatch=False)` returns a `KeysReload`, TypeScript `AdminClient.keysReload({ allowDropCurrent, allowDropAuditKey, allowMismatch })` resolves to one.
 
 It answers key ids (`kid`) only, never a key or a file's content:
 
@@ -802,7 +802,7 @@ The single-entry routes (`/admin/audit/entries/{seq}`, `/admin/audit/records/{id
 
 ### Audit retention
 
-With `[audit.retention] prune = "manual"` ([config](config.md#auditretention), [ADR-0015](../decisions/0015-audit-retention.md)) the admin may prune the oldest part of the log. With `prune = "off"`, the default, both routes below answer 409 `prune_disabled` and the log is never pruned.
+With `[audit.retention] prune = "manual"` ([config](config.md#auditretention), [ADR-0015](../decisions/0015-audit-retention.md)) the admin may prune the oldest part of the log. With `prune = "off"`, the default, both routes below answer 409 `prune_disabled` and the log is never pruned. The SDKs wrap the three routes: Python `audit_prune_plan(through=, before=)`, `audit_prune(through, archive_sha256=, from_=, through_hash=)` and `audit_anchors(cursor=, limit=)`, TypeScript `auditPrunePlan({ through, before })`, `auditPrune(through, { archiveSha256, from, throughHash })` and `auditAnchors({ cursor, limit })`.
 
 `GET /admin/audit/prune/plan?through=<seq>` (or `?before=<RFC 3339>`, or neither for the head) answers the largest boundary B the guards allow at or below the request:
 
