@@ -627,12 +627,15 @@ impl std::fmt::Debug for AnchorTracking {
 }
 
 impl AnchorTracking {
+    /// The hook first (the server records `shipped_at`), then the anchor stops being pending:
+    /// whoever finds it not pending can read whether it was shipped
+    /// ([`SinkHandle::push_anchor_unless`]).
     fn delivered(&self, a: &Anchor) {
-        if let Ok(mut p) = self.pending.lock() {
-            p.remove(&a.through_seq);
-        }
         if let Some(f) = self.on_delivered.get() {
             f(a);
+        }
+        if let Ok(mut p) = self.pending.lock() {
+            p.remove(&a.through_seq);
         }
     }
 }
@@ -650,11 +653,27 @@ impl SinkHandle {
     /// delivered. Never blocks on the network or on disk, and the anchor is never dropped
     /// from a full queue ([`QueueItem::keep`]). True when it was queued now.
     pub fn push_anchor(&self, a: &Anchor) -> bool {
-        let fresh = self
-            .anchors
-            .pending
-            .lock()
-            .map_or(true, |mut p| p.insert(a.through_seq));
+        self.push_anchor_unless(a, || false)
+    }
+
+    /// [`SinkHandle::push_anchor`] for a caller that read "not shipped" a moment ago (a
+    /// repeated prune): `shipped` is asked again while the pending set is held, and a true
+    /// answer queues nothing. A delivery records `shipped_at` before the anchor stops being
+    /// pending, so an anchor that is neither pending nor shipped here was never queued by
+    /// this process, or its delivery could not be recorded; without the second look, a
+    /// delivery that ends between the caller's read and this call ships the anchor twice.
+    /// `shipped` may read the audit log (call this off the async threads).
+    pub fn push_anchor_unless(&self, a: &Anchor, shipped: impl FnOnce() -> bool) -> bool {
+        let fresh = match self.anchors.pending.lock() {
+            Ok(mut p) => {
+                if p.contains(&a.through_seq) || shipped() {
+                    false
+                } else {
+                    p.insert(a.through_seq)
+                }
+            }
+            Err(_) => true,
+        };
         if fresh {
             self.queue.push(Shipped::Anchor(ShippedAnchor::new(
                 a,
@@ -1733,6 +1752,48 @@ mod tests {
         assert_eq!(*fake.got.lock().unwrap(), vec![30, 1020, 31]);
         assert_eq!(h.delivered_through(), Some(31));
         assert_eq!(sink.delivered_through(), Some(31));
+        sink.shutdown(Duration::from_secs(1));
+    }
+
+    /// A repeated prune that read "not shipped" just before the delivery ended does not ship
+    /// the anchor again: the delivery is recorded before the anchor stops being pending, and
+    /// `push_anchor_unless` looks again while it holds the pending set.
+    #[test]
+    fn an_anchor_delivered_meanwhile_is_not_queued_again() {
+        let fake = Arc::new(Fake::default());
+        let sink = CheckpointSink::with_deliver(
+            Box::new(FakeRef(fake.clone())),
+            limits(8, Duration::from_secs(3600)),
+            None,
+            Metrics::new(),
+        )
+        .unwrap();
+        // The hook stands for the audit log's `shipped_at`; while it runs the anchor is
+        // still pending.
+        let shipped: Arc<Mutex<Vec<u64>>> = Arc::default();
+        let (seen, probe) = (shipped.clone(), sink.handle());
+        let pending_in_hook = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = pending_in_hook.clone();
+        sink.on_anchor_delivered(move |a| {
+            flag.store(probe.anchor_pending(a.through_seq), Ordering::SeqCst);
+            seen.lock().unwrap().push(a.through_seq);
+        });
+        let h = sink.handle();
+        assert!(h.push_anchor(&anchor(20)));
+        wait_until(|| !h.anchor_pending(20));
+        assert!(pending_in_hook.load(Ordering::SeqCst));
+        // Not pending, and recorded as shipped: nothing is queued.
+        let is_shipped = || shipped.lock().unwrap().contains(&20);
+        assert!(!h.push_anchor_unless(&anchor(20), is_shipped));
+        // Pending: the question is not even asked.
+        fake.fail.store(true, Ordering::SeqCst);
+        assert!(h.push_anchor(&anchor(30)));
+        assert!(!h.push_anchor_unless(&anchor(30), || panic!("asked while pending")));
+        // Neither pending nor shipped (queued before a restart that lost it): queued.
+        assert!(h.push_anchor_unless(&anchor(40), || false));
+        fake.fail.store(false, Ordering::SeqCst);
+        wait_until(|| h.delivered() == 3);
+        assert_eq!(*fake.got.lock().unwrap(), vec![1020, 1030, 1040]);
         sink.shutdown(Duration::from_secs(1));
     }
 
