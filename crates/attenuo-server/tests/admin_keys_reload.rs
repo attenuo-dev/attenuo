@@ -152,14 +152,26 @@ struct Harness {
     client: reqwest::Client,
     dir: tempfile::TempDir,
     keys: Keys,
+    /// Sections every file written has, before the file's own `extra`.
+    base: String,
 }
 
 impl Harness {
     /// Keys written, a server started from a config file whose signing key is k1.
     async fn start() -> Self {
-        let dir = tempfile::tempdir().unwrap();
+        Self::start_with(tempfile::tempdir().unwrap(), String::new()).await
+    }
+
+    /// As [`start`](Self::start), in `dir`, with `base` in every file.
+    async fn start_with(dir: tempfile::TempDir, base: String) -> Self {
         let keys = write_keys(dir.path());
-        let path = write_file(dir.path(), &File::default());
+        let path = write_file(
+            dir.path(),
+            &File {
+                extra: &base,
+                ..File::default()
+            },
+        );
         let cfg = Config::load(&path).unwrap();
         let (router, state) = attenuo_server::build(&cfg).unwrap();
         Self {
@@ -168,6 +180,7 @@ impl Harness {
             client: reqwest::Client::new(),
             dir,
             keys,
+            base,
         }
     }
 
@@ -176,7 +189,14 @@ impl Harness {
     }
 
     fn write(&self, file: &File) {
-        write_file(self.dir.path(), file);
+        let extra = format!("{}{}", self.base, file.extra);
+        write_file(
+            self.dir.path(),
+            &File {
+                extra: &extra,
+                ..*file
+            },
+        );
     }
 
     async fn reload_with(&self, bearer: &str, body: Value) -> (StatusCode, Value) {
@@ -413,7 +433,7 @@ async fn a_rotation_with_an_overlap_keeps_old_tokens() {
     assert_eq!(v["removed"], json!([k.k1]), "{v}");
     assert!(
         v["warnings"].to_string().contains(&format!(
-            "tokens signed by the retired kid `{}` no longer verify",
+            "tokens signed by the retired kid `{}`, or rooted under it (ou_kid), no longer verify",
             k.k1
         )),
         "{v}"
@@ -461,7 +481,10 @@ async fn dropping_the_current_key_needs_allow_drop_current() {
     assert_eq!(v["removed"], json!([k.k1]), "{v}");
     let warnings = v["warnings"].to_string();
     assert!(
-        warnings.contains(&format!("tokens signed by kid `{}` no longer verify", k.k1)),
+        warnings.contains(&format!(
+            "tokens signed by kid `{}`, or rooted under it (ou_kid), no longer verify",
+            k.k1
+        )),
         "{warnings}"
     );
     assert!(
@@ -924,71 +947,499 @@ async fn audit_verify_passes_across_a_rotation() {
 }
 
 /// Tokens are minted, exchanged and checked while the keys flip between k1 and k2 (each time
-/// with the other kept as retired): no request fails, since every token's key stays trusted.
-/// Two reloads sent at once are both answered, one after the other.
+/// with the other kept as retired): no request fails, since every token's key stays trusted,
+/// and a root minted after each reload carries the new key. Two reloads sent at once are
+/// serialized: one answer starts from the keys the other put in force. Then k1 and k2 are both
+/// dropped for k3 while exchanges of their tokens run: each exchange uses one set of keys, so a
+/// child is never signed by k3 for a parent of a dropped key, and once the reload has answered
+/// those parents are refused.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tokens_during_reloads_never_fail() {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     let h = Arc::new(Harness::start().await);
+    let (k1, k2, k3) = (h.keys.k1.clone(), h.keys.k2.clone(), h.keys.k3.clone());
     let stop = Arc::new(AtomicBool::new(false));
     let done = Arc::new(AtomicUsize::new(0));
     let mut workers = Vec::new();
     for _ in 0..3 {
         let (h, stop, done) = (h.clone(), stop.clone(), done.clone());
         workers.push(tokio::spawn(async move {
-            let mut kids = std::collections::BTreeSet::new();
             while !stop.load(Ordering::Relaxed) {
                 let parent = h.root().await;
-                kids.insert(kid_of(&parent));
                 let (status, v) = h.exchange(&parent).await;
                 assert_eq!(status, StatusCode::OK, "{v}");
                 let child = v["access_token"].as_str().unwrap().to_string();
-                kids.insert(kid_of(&child));
                 let (status, v) = h.exchange_as(&child, "tester").await;
                 assert_eq!(status, StatusCode::OK, "{v}");
                 done.fetch_add(1, Ordering::Relaxed);
             }
-            kids
         }));
     }
-    let mut seen_kids = std::collections::BTreeSet::new();
-    for round in 0..12 {
-        let (signing, previous) = if round % 2 == 0 {
+    let flip = |round: usize| {
+        if round.is_multiple_of(2) {
             ("k2.pem", "k1.pem")
         } else {
             ("k1.pem", "k2.pem")
-        };
+        }
+    };
+    let mut seen_kids = std::collections::BTreeSet::new();
+    for round in 0..12 {
+        let (signing, previous) = flip(round);
         h.write(&File {
             signing: Some(signing),
             previous: &[previous],
             ..File::default()
         });
         let v = h.reload().await;
-        seen_kids.insert(v["signing_kid"].as_str().unwrap().to_string());
+        let signing_kid = v["signing_kid"].as_str().unwrap().to_string();
+        assert_eq!(
+            kid_of(&h.root().await),
+            signing_kid,
+            "minted with the new key"
+        );
+        seen_kids.insert(signing_kid);
         let jwks = h.jwks_kids().await;
         assert_eq!(jwks.len(), 2, "{jwks:?}");
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    // Two at once: both answered, serialized.
-    let (a, b) = tokio::join!(
-        h.reload_with(LEGACY, json!({})),
-        h.reload_with(LEGACY, json!({}))
-    );
-    assert_eq!(a.0, StatusCode::OK, "{}", a.1);
-    assert_eq!(b.0, StatusCode::OK, "{}", b.1);
+    assert_eq!(seen_kids, [k1.clone(), k2.clone()].into_iter().collect());
+
+    // Two at once, each reading a different file: serialized, so one answer's previous key is
+    // the other's new key, and the keys in force are those of the one that came second.
+    for round in 0..6 {
+        let ((first_signing, first_previous), (second_signing, second_previous)) =
+            (flip(round), flip(round + 1));
+        h.write(&File {
+            signing: Some(first_signing),
+            previous: &[first_previous],
+            ..File::default()
+        });
+        let one = h.reload_with(LEGACY, json!({}));
+        let two = async {
+            h.write(&File {
+                signing: Some(second_signing),
+                previous: &[second_previous],
+                ..File::default()
+            });
+            h.reload_with(LEGACY, json!({})).await
+        };
+        let ((s1, a), (s2, b)) = tokio::join!(one, two);
+        assert_eq!(s1, StatusCode::OK, "{a}");
+        assert_eq!(s2, StatusCode::OK, "{b}");
+        let later = if b["previous_signing_kid"] == a["signing_kid"] {
+            &b
+        } else {
+            assert_eq!(a["previous_signing_kid"], b["signing_kid"], "{a} {b}");
+            &a
+        };
+        assert_eq!(h.jwks_kids().await, json_strings(&later["verifying_kids"]));
+        assert_eq!(
+            h.state.keys().issuer.key_id(),
+            later["signing_kid"].as_str().unwrap()
+        );
+    }
     stop.store(true, Ordering::Relaxed);
-    let mut minted = std::collections::BTreeSet::new();
     for w in workers {
-        minted.extend(w.await.unwrap());
+        w.await.unwrap();
     }
     assert!(done.load(Ordering::Relaxed) > 0);
-    assert_eq!(seen_kids.len(), 2);
-    assert_eq!(
-        minted,
-        [h.keys.k1.clone(), h.keys.k2.clone()].into_iter().collect(),
-        "tokens were minted under both keys"
-    );
     let report = h.get("/admin/audit/verify").await;
     assert_eq!(report["ok"], true, "{report}");
+
+    // Parents of both keys, then both dropped for k3 while they are exchanged.
+    h.write(&File {
+        signing: Some("k2.pem"),
+        previous: &["k1.pem"],
+        ..File::default()
+    });
+    h.reload().await;
+    let mut parents = Vec::new();
+    for _ in 0..30 {
+        parents.push(h.root().await);
+    }
+    let k2_root = h.root().await;
+    h.write(&File {
+        signing: Some("k1.pem"),
+        previous: &["k2.pem"],
+        ..File::default()
+    });
+    h.reload().await;
+    for _ in 0..30 {
+        parents.push(h.root().await);
+    }
+    let k1_root = h.root().await;
+    let parents = Arc::new(std::sync::Mutex::new(parents));
+    let dropped = Arc::new(AtomicBool::new(false));
+    let mut workers = Vec::new();
+    for _ in 0..3 {
+        let (h, parents, dropped) = (h.clone(), parents.clone(), dropped.clone());
+        let (k1, k2, k3) = (k1.clone(), k2.clone(), k3.clone());
+        workers.push(tokio::spawn(async move {
+            let mut refused_after = 0;
+            loop {
+                let Some(parent) = parents.lock().unwrap().pop() else {
+                    return refused_after;
+                };
+                let after = dropped.load(Ordering::SeqCst);
+                let (status, v) = h.exchange(&parent).await;
+                if status == StatusCode::OK {
+                    assert!(!after, "a parent of a dropped key, after the reload: {v}");
+                    let child = kid_of(v["access_token"].as_str().unwrap());
+                    assert!(child == k1 || child == k2, "a mix: {child} (k3 is {k3})");
+                } else {
+                    assert!(!v.to_string().contains("replayed"), "{v}");
+                    if after {
+                        refused_after += 1;
+                    }
+                }
+            }
+        }));
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    h.write(&File {
+        signing: Some("k3.pem"),
+        ..File::default()
+    });
+    let v = h
+        .reload_body(json!({"allow_drop_current": true, "allow_drop_audit_key": true}))
+        .await;
+    dropped.store(true, Ordering::SeqCst);
+    assert_eq!(v["verifying_kids"], json!([k3]), "{v}");
+    let mut refused_after = 0;
+    for w in workers {
+        refused_after += w.await.unwrap();
+    }
+    // One kept aside of each dropped key: refused too.
+    for (parent, kid) in [(&k1_root, &k1), (&k2_root, &k2)] {
+        assert_eq!(kid_of(parent), *kid);
+        let (status, v) = h.exchange(parent).await;
+        assert_ne!(status, StatusCode::OK, "{v}");
+        assert!(!v.to_string().contains("replayed"), "{v}");
+        refused_after += 1;
+    }
+    assert!(refused_after >= 2);
+    let fresh = h.root().await;
+    assert_eq!(kid_of(&fresh), k3);
+    let (status, v) = h.exchange(&fresh).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+}
+
+fn json_strings(v: &Value) -> Vec<String> {
+    v.as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s.as_str().unwrap().to_string())
+        .collect()
+}
+
+/// The claims of a JWT.
+fn claims_of(token: &str) -> Value {
+    let claims = token.split('.').nth(1).unwrap();
+    serde_json::from_slice(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(claims)
+            .unwrap(),
+    )
+    .unwrap()
+}
+
+/// Dropping a retired key also ends the tokens rooted under it: a child signed by the kept key
+/// carries its root's `ou_kid`, and its `ou_sig` is checked under that key only. The warning
+/// says so; a child of a root of the kept key is not touched.
+#[tokio::test]
+async fn dropping_a_retired_key_ends_the_tokens_rooted_under_it() {
+    let h = Harness::start().await;
+    let k = &h.keys;
+    let old_root = h.root().await;
+    h.write(&File {
+        signing: Some("k2.pem"),
+        previous: &["k1.pub"],
+        ..File::default()
+    });
+    h.reload().await;
+    let (status, v) = h.exchange(&old_root).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let rooted_in_k1 = v["access_token"].as_str().unwrap().to_string();
+    assert_eq!(kid_of(&rooted_in_k1), k.k2, "signed by the kept key");
+    assert_eq!(claims_of(&rooted_in_k1)["ou_kid"], k.k1.as_str());
+    let (status, v) = h.exchange(&h.root().await).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    let rooted_in_k2 = v["access_token"].as_str().unwrap().to_string();
+    assert_eq!(claims_of(&rooted_in_k2)["ou_kid"], k.k2.as_str());
+
+    h.write(&File {
+        signing: Some("k2.pem"),
+        ..File::default()
+    });
+    let v = h.reload_body(json!({"allow_drop_audit_key": true})).await;
+    assert_eq!(
+        v["warnings"][0],
+        format!(
+            "tokens signed by the retired kid `{}`, or rooted under it (ou_kid), no longer verify",
+            k.k1
+        ),
+        "{v}"
+    );
+    let (status, v) = h.exchange_as(&rooted_in_k1, "tester").await;
+    assert_ne!(status, StatusCode::OK, "{v}");
+    assert!(!v.to_string().contains("replayed"), "{v}");
+    let (status, v) = h.exchange_as(&rooted_in_k2, "tester").await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+}
+
+/// The rotation for replicas and verifiers that cache the JWKS, in two reloads, neither of
+/// which needs an override: first the new public key is published beside the signing key
+/// (which stays the signer), then the signing key is swapped once every cache has it.
+#[tokio::test]
+async fn a_two_step_rotation_needs_no_override() {
+    let h = Harness::start().await;
+    let k = &h.keys;
+    let dir = h.dir.path();
+    let k2 = Issuer::from_pem(
+        new_key().config().clone(),
+        &std::fs::read_to_string(dir.join("k2.pem")).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(dir.join("k2.pub"), k2.public_key_pem()).unwrap();
+    let before = h.root().await;
+
+    // Step 1: publish k2, keep signing with k1.
+    h.write(&File {
+        signing: Some("k1.pem"),
+        previous: &["k2.pub"],
+        ..File::default()
+    });
+    let v = h.reload().await;
+    assert_eq!(v["signing_kid"], k.k1.as_str(), "{v}");
+    assert_eq!(v["changed"], true, "{v}");
+    assert_eq!(v["added"], json!([k.k2]), "{v}");
+    assert_eq!(v["warnings"], json!([]), "{v}");
+    assert_eq!(h.jwks_kids().await, [k.k1.clone(), k.k2.clone()]);
+    assert_eq!(kid_of(&h.root().await), k.k1, "still signed by k1");
+    assert_eq!(
+        h.state.audit.checkpoint_signer_kid().as_deref(),
+        Some(k.k1.as_str())
+    );
+
+    // Step 2: sign with k2, keep k1 to verify.
+    h.write(&File {
+        signing: Some("k2.pem"),
+        previous: &["k1.pub"],
+        ..File::default()
+    });
+    let v = h.reload().await;
+    assert_eq!(v["signing_kid"], k.k2.as_str(), "{v}");
+    assert_eq!(v["removed"], json!([]), "{v}");
+    assert_eq!(v["warnings"], json!([]), "{v}");
+    assert_eq!(h.jwks_kids().await, [k.k2.clone(), k.k1.clone()]);
+    assert_eq!(kid_of(&h.root().await), k.k2);
+    let (status, v) = h.exchange(&before).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+}
+
+/// An agents reload leaves the key files to a keys reload, and says so when the file's differ
+/// from the ones in force; once the keys reload has run, it says nothing.
+#[tokio::test]
+async fn an_agents_reload_says_when_the_key_files_differ() {
+    let h = Harness::start().await;
+    let agents_reload = || async {
+        let resp = h
+            .client
+            .post(h.url("/admin/agents/reload"))
+            .bearer_auth(LEGACY)
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        resp.json::<Value>().await.unwrap()
+    };
+    let note = "the file's [issuer] private_key_pem_path or previous_key_paths differ from the \
+                key files in force: run a keys reload (POST /admin/keys/reload, attenuo admin \
+                key reload) to apply them";
+    let v = agents_reload().await;
+    assert_eq!(v["warnings"], json!([]), "{v}");
+
+    h.write(&File {
+        signing: Some("k2.pem"),
+        previous: &["k1.pem"],
+        ..File::default()
+    });
+    let v = agents_reload().await;
+    assert_eq!(v["warnings"], json!([note]), "{v}");
+    assert_eq!(v["restart_needed"], json!([]), "{v}");
+    assert_eq!(
+        h.jwks_kids().await,
+        std::slice::from_ref(&h.keys.k1),
+        "not applied"
+    );
+
+    h.reload().await;
+    let v = agents_reload().await;
+    assert_eq!(v["warnings"], json!([]), "{v}");
+
+    // The same keys from another file: a keys reload takes the new paths, changing nothing.
+    std::fs::copy(
+        h.dir.path().join("k2.pem"),
+        h.dir.path().join("k2-copy.pem"),
+    )
+    .unwrap();
+    h.write(&File {
+        signing: Some("k2-copy.pem"),
+        previous: &["k1.pem"],
+        ..File::default()
+    });
+    assert_eq!(agents_reload().await["warnings"], json!([note]));
+    let v = h.reload().await;
+    assert_eq!(v["changed"], false, "{v}");
+    assert_eq!(agents_reload().await["warnings"], json!([]));
+}
+
+/// Cedar policy of the end-to-end test: ask before a destructive call once the run has read
+/// something untrusted, unless the call carries a granted approval.
+const APPROVAL_POLICY: &str = r#"
+@id("allow")
+permit(principal, action, resource);
+
+@id("confirm_destructive_after_untrusted_read")
+@obligation("approval")
+forbid(principal, action, resource)
+when { resource.destructive && context.session.tainted && !context.approval.present };
+"#;
+
+/// Through the proxy: a token of a kept key passes `/mcp` after a rotation, an approval token
+/// signed before it is still taken, and a renewal works; once the old key is dropped, `/mcp`
+/// and renewal refuse its token (the verified-token cache does not keep it alive). The subject
+/// digests of `[logging] redact_subjects` are named as kept until a restart, and an explicit
+/// `"allow_mismatch": false` is still a refusal.
+#[tokio::test]
+async fn the_proxy_approvals_and_renewals_follow_a_reload() {
+    use attenuo_proxy::testing::FakeMcpServer;
+
+    let upstream = FakeMcpServer::new(&["read_web", "delete_repo"]);
+    let upstream_task = upstream.spawn().await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let policy = dir.path().join("policies.cedar");
+    std::fs::write(&policy, APPROVAL_POLICY).unwrap();
+    let base = format!(
+        "[logging]\nredact_subjects = true\n\n\
+         [policy]\npolicies_path = \"{}\"\n\n\
+         [policy.catalog.github.read_web]\nreadonly = true\n\n\
+         [policy.catalog.github.delete_repo]\nreadonly = false\n\n\
+         [[upstreams]]\nname = \"github\"\nurl = \"{}\"\n\n",
+        policy.display(),
+        upstream_task.url("/mcp"),
+    );
+    let h = Harness::start_with(dir, base).await;
+    let k = &h.keys;
+    let call = |token: String, tool: &'static str, meta: Value| {
+        let h = &h;
+        async move {
+            let resp = h
+                .client
+                .post(h.url("/mcp/github"))
+                .header("accept", "application/json, text/event-stream")
+                .bearer_auth(&token)
+                .json(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                       "params": {"name": tool, "arguments": {"repo": "alice/site"},
+                                  "_meta": meta}}))
+                .send()
+                .await
+                .unwrap();
+            let status = resp.status();
+            (status, resp.json::<Value>().await.unwrap_or(Value::Null))
+        }
+    };
+    let renew = |token: String| {
+        let h = &h;
+        async move {
+            h.client
+                .post(h.url("/token/renew"))
+                .bearer_auth(&token)
+                .json(&json!({}))
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+
+    // A k1 run: an untrusted read, then a destructive call that waits for an approval.
+    let t1 = h.root().await;
+    let (status, v) = call(t1.clone(), "read_web", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(v.get("result").is_some(), "{v}");
+    let (_, v) = call(t1.clone(), "delete_repo", json!({})).await;
+    assert_eq!(v["error"]["code"], -32008, "{v}");
+    let approval_id = v["error"]["data"]["approval_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let resp = h
+        .client
+        .post(h.url(&format!("/admin/approvals/{approval_id}")))
+        .bearer_auth(LEGACY)
+        .json(&json!({"decision": "grant"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let granted: Value = resp.json().await.unwrap();
+    let approval = granted["approval_token"].as_str().unwrap().to_string();
+    assert_eq!(kid_of(&approval), k.k1);
+
+    // Rotate to k2, k1 kept.
+    h.write(&File {
+        signing: Some("k2.pem"),
+        previous: &["k1.pub"],
+        ..File::default()
+    });
+    let v = h.reload_body(json!({"allow_mismatch": false})).await;
+    assert_eq!(
+        v["kept_until_restart"],
+        json!(["subject digests ([telemetry], [logging] redact_subjects)"]),
+        "{v}"
+    );
+    // The k1 approval token is still taken, the k1 token still passes and renews.
+    let (status, v) = call(
+        t1.clone(),
+        "delete_repo",
+        json!({"dev.attenuo/approval": approval}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(v.get("result").is_some(), "{v}");
+    let (status, v) = call(t1.clone(), "read_web", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(v.get("result").is_some(), "{v}");
+    assert_eq!(renew(t1.clone()).await, StatusCode::OK);
+    let t2 = h.root().await;
+    assert_eq!(kid_of(&t2), k.k2);
+    let (_, v) = call(t2.clone(), "read_web", json!({})).await;
+    assert!(v.get("result").is_some(), "{v}");
+
+    // Drop k1: its token is refused at `/mcp` and at renewal, the k2 one is not.
+    h.write(&File {
+        signing: Some("k2.pem"),
+        ..File::default()
+    });
+    h.reload_body(json!({"allow_drop_audit_key": true})).await;
+    let (status, v) = call(t1.clone(), "read_web", json!({})).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{v}");
+    assert_eq!(renew(t1).await, StatusCode::UNAUTHORIZED);
+    let (status, v) = call(t2.clone(), "read_web", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(v.get("result").is_some(), "{v}");
+    assert_eq!(renew(t2).await, StatusCode::OK);
+
+    // `"allow_mismatch": false` is the default, said out loud: still refused.
+    h.write(&File {
+        signing: Some("k3.pem"),
+        previous: &["k2.pem"],
+        issuer: "https://other.test",
+        ..File::default()
+    });
+    let v = h.refused(json!({"allow_mismatch": false})).await;
+    assert_eq!(v["code"], "config_file_mismatch", "{v}");
 }

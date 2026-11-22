@@ -41,6 +41,29 @@ pub struct IssuerKeys {
     pub checkpoint_keys: CheckpointKeys,
     /// Counts the swaps: what the proxy's verified-token cache ties its entries to.
     generation: u64,
+    /// The key files these keys were read from, as configured.
+    paths: KeyPaths,
+}
+
+/// The key files of an [`IssuerKeys`], as the configuration named them (after environment
+/// overrides): what an agents reload compares the file with, to tell that the keys there are
+/// not the keys in force.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KeyPaths {
+    /// `[issuer] private_key_pem_path` (none for an ephemeral key).
+    pub signing: Option<PathBuf>,
+    /// `[issuer] previous_key_paths`.
+    pub previous: Vec<PathBuf>,
+}
+
+impl KeyPaths {
+    /// The key files `config` names.
+    pub fn of(config: &crate::config::IssuerSection) -> Self {
+        Self {
+            signing: config.private_key_pem_path.clone(),
+            previous: config.previous_key_paths.clone(),
+        }
+    }
 }
 
 impl std::fmt::Debug for IssuerKeys {
@@ -70,7 +93,21 @@ impl IssuerKeys {
             jwks,
             checkpoint_keys,
             generation: 0,
+            paths: KeyPaths::default(),
         })
+    }
+
+    /// The same keys, read from `paths`.
+    #[must_use]
+    pub fn with_paths(mut self, paths: KeyPaths) -> Self {
+        self.paths = paths;
+        self
+    }
+
+    /// The key files these keys were read from (empty unless set by
+    /// [`with_paths`](Self::with_paths)).
+    pub fn paths(&self) -> &KeyPaths {
+        &self.paths
     }
 
     /// The `kid` of every key that verifies: the signing key first, then the retired ones.
@@ -195,12 +232,16 @@ pub enum KeyFileError {
         why: String,
     },
     /// The file is not a key of the kind wanted (another type or curve, a public key where the
-    /// signing key is wanted, no PEM block, a damaged one): `key_file_invalid`.
+    /// signing key is wanted, no PEM block, a damaged one), or not a regular file of a key's
+    /// size: `key_file_invalid`.
     Invalid {
         /// The file.
         path: PathBuf,
         /// What is wrong, in fixed words.
         why: &'static str,
+        /// The parser's own reason, when there is one (`invalid PEM base64`, the DER fault).
+        /// It is in fixed words too and never quotes the file.
+        cause: Option<String>,
     },
     /// Two of the files hold the same key: `key_duplicate`.
     Duplicate {
@@ -219,7 +260,16 @@ impl std::fmt::Display for KeyFileError {
             Self::Unreadable { path, why } => {
                 write!(f, "the key file {} cannot be read: {why}", path.display())
             }
-            Self::Invalid { path, why } => write!(f, "the key file {} {why}", path.display()),
+            Self::Invalid {
+                path,
+                why,
+                cause: None,
+            } => write!(f, "the key file {} {why}", path.display()),
+            Self::Invalid {
+                path,
+                why,
+                cause: Some(cause),
+            } => write!(f, "the key file {} {why} ({cause})", path.display()),
             Self::Duplicate { kid, first, second } => write!(
                 f,
                 "the key files {} and {} hold the same key (kid `{kid}`); list each key once",
@@ -283,9 +333,10 @@ fn invalid_why(pem: &str, signing: bool) -> &'static str {
 ///
 /// [`KeyFileError::Invalid`] when `pem` is not an Ed25519 PKCS#8 `PRIVATE KEY`.
 pub fn signing_key(config: IssuerConfig, path: &Path, pem: &str) -> Result<Issuer, KeyFileError> {
-    Issuer::from_pem(config, pem).map_err(|_| KeyFileError::Invalid {
+    Issuer::from_pem(config, pem).map_err(|e| KeyFileError::Invalid {
         path: path.to_owned(),
         why: invalid_why(pem, true),
+        cause: Some(e.to_string()),
     })
 }
 
@@ -295,21 +346,54 @@ pub fn signing_key(config: IssuerConfig, path: &Path, pem: &str) -> Result<Issue
 ///
 /// [`KeyFileError::Invalid`] when `pem` holds no Ed25519 key the issuer takes.
 pub fn previous_key_id(path: &Path, pem: &str) -> Result<String, KeyFileError> {
-    Issuer::previous_key_id(pem).map_err(|_| KeyFileError::Invalid {
+    Issuer::previous_key_id(pem).map_err(|e| KeyFileError::Invalid {
         path: path.to_owned(),
         why: invalid_why(pem, false),
+        cause: Some(e.to_string()),
     })
 }
 
-/// Read one key file as text.
+/// The most a key file may hold. An Ed25519 PEM is under 200 bytes; this leaves room for
+/// comments and a certificate chain someone kept beside the key, and stops a reload from
+/// reading a large file someone pointed it at by mistake.
+pub const MAX_KEY_FILE_BYTES: u64 = 64 * 1024;
+
+/// Read one key file as text: a regular file (a link to one is fine) of at most
+/// [`MAX_KEY_FILE_BYTES`].
 async fn read_key_file(path: &Path) -> Result<String, KeyFileError> {
-    tokio::fs::read_to_string(path)
+    use tokio::io::AsyncReadExt;
+    let unreadable = |e: std::io::Error| KeyFileError::Unreadable {
+        path: path.to_owned(),
+        // The kind only: an `InvalidData` error of a file that is not UTF-8 says no more.
+        why: e.to_string(),
+    };
+    let invalid = |why| KeyFileError::Invalid {
+        path: path.to_owned(),
+        why,
+        cause: None,
+    };
+    let file = tokio::fs::File::open(path).await.map_err(unreadable)?;
+    let meta = file.metadata().await.map_err(unreadable)?;
+    if !meta.is_file() {
+        return Err(invalid("is not a regular file"));
+    }
+    let too_big = "is larger than 64 KiB, far more than a key";
+    if meta.len() > MAX_KEY_FILE_BYTES {
+        return Err(invalid(too_big));
+    }
+    // Bounded again while reading, in case the file grows after the check.
+    let mut bytes = Vec::new();
+    file.take(MAX_KEY_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
         .await
-        .map_err(|e| KeyFileError::Unreadable {
-            path: path.to_owned(),
-            // The kind only: an `InvalidData` error of a file that is not UTF-8 says no more.
-            why: e.to_string(),
-        })
+        .map_err(unreadable)?;
+    if bytes.len() as u64 > MAX_KEY_FILE_BYTES {
+        return Err(invalid(too_big));
+    }
+    String::from_utf8(bytes).map_err(|_| KeyFileError::Unreadable {
+        path: path.to_owned(),
+        why: "it is not UTF-8 text".into(),
+    })
 }
 
 /// Read the signing key at `signing` and the retired keys at `previous` for a key reload,
@@ -342,9 +426,10 @@ pub async fn read_key_files(
         // Parsed just above, so this does not fail.
         issuer
             .trust_previous_key(&pem)
-            .map_err(|_| KeyFileError::Invalid {
+            .map_err(|e| KeyFileError::Invalid {
                 path: path.clone(),
                 why: invalid_why(&pem, false),
+                cause: Some(e.to_string()),
             })?;
         seen.push((kid, path));
     }
@@ -484,6 +569,45 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, KeyFileError::Unreadable { .. }), "{err}");
+    }
+
+    /// A directory, a file over 64 KiB and a file that is not UTF-8 are refused before any
+    /// parsing, and a damaged key keeps the parser's reason without quoting the file.
+    #[tokio::test]
+    async fn read_key_files_refuses_what_is_not_a_key_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = |n: &str| dir.path().join(n);
+        let a = issuer();
+        std::fs::write(p("a.pem"), a.private_key_pem()).unwrap();
+        let mut big = a.private_key_pem();
+        big.push_str(&"#".repeat(usize::try_from(MAX_KEY_FILE_BYTES).unwrap()));
+        std::fs::write(p("big.pem"), big).unwrap();
+        std::fs::write(p("bin.pem"), [0xff, 0xfe, 0x00]).unwrap();
+        std::fs::write(
+            p("bad64.pem"),
+            "-----BEGIN PRIVATE KEY-----\nsecret!!\n-----END PRIVATE KEY-----\n",
+        )
+        .unwrap();
+        let cfg = || a.config().clone();
+
+        let err = read_key_files(cfg(), dir.path(), &[]).await.unwrap_err();
+        assert!(err.to_string().contains("not a regular file"), "{err}");
+        let err = read_key_files(cfg(), &p("a.pem"), &[p("big.pem")])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, KeyFileError::Invalid { path, .. } if *path == p("big.pem")),
+            "{err}"
+        );
+        assert!(err.to_string().contains("64 KiB"), "{err}");
+        let err = read_key_files(cfg(), &p("bin.pem"), &[]).await.unwrap_err();
+        assert!(matches!(err, KeyFileError::Unreadable { .. }), "{err}");
+        let err = read_key_files(cfg(), &p("bad64.pem"), &[])
+            .await
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("(key error: invalid PEM base64)"), "{text}");
+        assert!(!text.contains("secret"), "{text}");
     }
 
     fn kids_of(jwks: &Value) -> Vec<String> {

@@ -3355,12 +3355,30 @@ impl Config {
         K: Into<std::ffi::OsString>,
         V: Into<std::ffi::OsString>,
     {
+        Ok(Self::reparse_with_overrides(text, env)?.0)
+    }
+
+    /// As [`reparse`](Self::reparse), and the keys an environment variable set (a value there
+    /// wins over the file's, at a reload as at startup).
+    ///
+    /// # Errors
+    ///
+    /// As [`reparse`](Self::reparse).
+    pub fn reparse_with_overrides<I, K, V>(
+        text: &str,
+        env: I,
+    ) -> anyhow::Result<(Self, Vec<EnvOverride>)>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<std::ffi::OsString>,
+        V: Into<std::ffi::OsString>,
+    {
         let quiet = |e: toml::de::Error| anyhow::anyhow!(toml_error_text(text, &e));
         let base: Self = toml::from_str(text).map_err(quiet)?;
         let file: toml::Table = text.parse().map_err(quiet)?;
-        let (mut config, _) = overrides::apply(file, base, env)?;
+        let (mut config, set) = overrides::apply(file, base, env)?;
         config.apply_env();
-        Ok(config)
+        Ok((config, set))
     }
 
     /// Check `[[ext_authz]]`: each `server` a valid server name ([`check_server_name`]) named

@@ -16,7 +16,7 @@ use super::admin::{audited_refusal, audited_refusal_with, IDENTITY_SECTIONS};
 use super::extract::Body;
 use super::{audit_admin, REASON_ADMIN_ACTION};
 use crate::error::ApiError;
-use crate::issuer_keys::{IssuerKeys, KeyFileError};
+use crate::issuer_keys::{IssuerKeys, KeyFileError, KeyPaths};
 use crate::operators::AdminIdentity;
 use crate::state::AppState;
 
@@ -72,7 +72,8 @@ pub struct KeysReloadBody {
 /// `key_file_invalid` or `key_duplicate` for a key file that cannot be read, holds no Ed25519
 /// key of the kind wanted, or holds the same key as another; 422 `keys_reload_drops_current`
 /// without `allow_drop_current`; 422 `keys_reload_drops_audit_key` without
-/// `allow_drop_audit_key`. The 422s are audited as a `deny`; the 400, 409 and 500 are not.
+/// `allow_drop_audit_key`; 500 `server_error` when the file cannot be compared with the config
+/// in force (not expected). The 422s are audited as a `deny`; the 400, 409 and 500s are not.
 pub async fn reload_keys(
     State(state): State<Arc<AppState>>,
     Extension(who): Extension<AdminIdentity>,
@@ -98,17 +99,18 @@ pub async fn reload_keys(
     })?;
     let now = state.now();
     let unchanged = "the signing key and the verifying keys in force are unchanged";
-    let file = match crate::config::Config::reparse(&text, std::env::vars_os()) {
-        Ok(file) => file,
-        Err(e) => {
-            let refusal = ApiError::new(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "keys_config_invalid",
-                format!("{e:#}; {unchanged}"),
-            );
-            return Err(audited_refusal(&state, who, TOOL, &path, refusal, now).await);
-        }
-    };
+    let (file, env_set) =
+        match crate::config::Config::reparse_with_overrides(&text, std::env::vars_os()) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                let refusal = ApiError::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "keys_config_invalid",
+                    format!("{e:#}; {unchanged}"),
+                );
+                return Err(audited_refusal(&state, who, TOOL, &path, refusal, now).await);
+            }
+        };
     let Some(signing_path) = file.issuer.private_key_pem_path.clone() else {
         let refusal = ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -120,15 +122,14 @@ pub async fn reload_keys(
         );
         return Err(audited_refusal(&state, who, TOOL, &path, refusal, now).await);
     };
-    let restart_needed = match file.section_digests() {
-        Ok(sections) => state.config_sections.differing(&sections),
-        // Not expected: the config serialized at startup. Say that nothing was compared
-        // rather than that nothing differs.
-        Err(e) => {
-            tracing::error!(error = %e, "the reloaded config could not be compared");
-            vec!["(the other sections could not be compared)".to_string()]
-        }
-    };
+    // Not expected to fail: the config serialized at startup. Without the comparison the
+    // mismatch check cannot be made, so nothing is applied.
+    let sections = file.section_digests().map_err(|e| {
+        ApiError::internal(format!(
+            "the file could not be compared with the config in force ({e:#}); {unchanged}"
+        ))
+    })?;
+    let restart_needed = state.config_sections.differing(&sections);
     let foreign: Vec<&str> = IDENTITY_SECTIONS
         .into_iter()
         .filter(|s| restart_needed.iter().any(|r| r == s))
@@ -175,7 +176,9 @@ pub async fn reload_keys(
             return Err(audited_refusal(&state, who, TOOL, &path, refusal, now).await);
         }
     };
-    let new = IssuerKeys::new(issuer).map_err(|e| ApiError::internal(format!("{e:#}")))?;
+    let new = IssuerKeys::new(issuer)
+        .map_err(|e| ApiError::internal(format!("{e:#}")))?
+        .with_paths(KeyPaths::of(&file.issuer));
     let (old_signing, new_signing) = (current.issuer.key_id(), new.issuer.key_id());
     let (old_kids, new_kids) = (current.kids(), new.kids());
     let kid_args = || {
@@ -238,23 +241,43 @@ pub async fn reload_keys(
     let mut warnings: Vec<String> = removed
         .iter()
         .map(|kid| {
+            // A child token's `ou_sig` is checked under the key its `ou_kid` names, so a
+            // token signed by a kept key but rooted under this one stops verifying too.
             if **kid == old_signing {
                 format!(
-                    "tokens signed by kid `{kid}` no longer verify: their agents must get new \
-                     ones"
+                    "tokens signed by kid `{kid}`, or rooted under it (ou_kid), no longer \
+                     verify: their agents must get new ones"
                 )
             } else {
-                format!("tokens signed by the retired kid `{kid}` no longer verify")
+                format!(
+                    "tokens signed by the retired kid `{kid}`, or rooted under it (ou_kid), no \
+                     longer verify"
+                )
             }
         })
         .collect();
+    // A key path set by the environment wins over the file at a reload as at startup, so an
+    // edit of that line in the file does nothing.
+    for o in env_set
+        .iter()
+        .filter(|o| KEY_PATH_KEYS.contains(&o.key.as_str()))
+    {
+        warnings.push(format!(
+            "{} comes from the environment ({}), not from the file: an edit of that line in \
+             the file has no effect while the variable is set",
+            o.key, o.variable
+        ));
+    }
     if !dropped_audit.is_empty() {
         warnings.push(format!(
             "audit checkpoints and anchors signed by kid {} no longer verify against the JWKS",
             backquoted(&dropped_audit)
         ));
     }
-    if changed {
+    if !changed && new.paths() != current.paths() {
+        // The same keys from other files: only what an agents reload compares changes.
+        state.keys.swap(new);
+    } else if changed {
         // The verifying set first, then the audit signer: a checkpoint signed with the new key
         // is never checked against a set without it. A request in flight finishes with the
         // snapshot it took.
@@ -324,6 +347,12 @@ pub async fn reload_keys(
         "audit_id": audit_id,
     })))
 }
+
+/// The `[issuer]` keys that name key files, as an [`crate::config::EnvOverride`] names them.
+const KEY_PATH_KEYS: [&str; 2] = [
+    "[issuer] private_key_pem_path",
+    "[issuer] previous_key_paths",
+];
 
 /// `` `a`, `b` `` for a refusal's text.
 fn backquoted(kids: &[String]) -> String {

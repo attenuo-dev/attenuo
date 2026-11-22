@@ -261,7 +261,9 @@ impl AppState {
             None => None,
         };
         let signer = issuer.detached_signer();
-        let keys = SharedKeys::new(IssuerKeys::new(issuer)?);
+        let keys = SharedKeys::new(
+            IssuerKeys::new(issuer)?.with_paths(crate::issuer_keys::KeyPaths::of(&config.issuer)),
+        );
         let (audit, leases, store_fence) = open_storage(
             &config.audit,
             signer,

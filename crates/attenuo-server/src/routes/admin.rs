@@ -1253,11 +1253,21 @@ fn seq_range(from: Option<u64>, to: Option<u64>) -> Result<(u64, u64), ApiError>
 pub async fn audit_verify(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<SignedVerifyReport>, ApiError> {
-    Ok(Json(
-        state
-            .blocking(|s| s.audit.verify_chain_signed(&s.keys().checkpoint_keys))
-            .await?,
-    ))
+    let report = state
+        .blocking(|s| {
+            let keys = s.keys();
+            let report = s.audit.verify_chain_signed(&keys.checkpoint_keys)?;
+            // A key reload between taking the keys and reading the log can leave a checkpoint
+            // signed by a key the snapshot does not hold yet: check once more with the keys
+            // in force.
+            let now = s.keys();
+            if report.ok || now.generation() == keys.generation() {
+                return Ok(report);
+            }
+            s.audit.verify_chain_signed(&now.checkpoint_keys)
+        })
+        .await?;
+    Ok(Json(report))
 }
 
 /// `GET /admin/audit/checkpoint`: the signed checkpoint of the current head,
@@ -1988,7 +1998,8 @@ pub(super) const IDENTITY_SECTIONS: [&str; 2] = ["[audit]", "[issuer]"];
 /// ids `added`, `removed` and `changed` (`secret_sha256` or `jwks`), never a secret digest or a
 /// key; `restart_needed`, the other sections of the file that differ from the ones in force
 /// (applied only by a restart); the startup `warnings` the new lists raise, and those for a
-/// removed agent that can still get tokens another way; `restart_warnings`, what the file's
+/// removed agent that can still get tokens another way, and one when the file's key files
+/// differ from the ones in force (a keys reload applies them); `restart_warnings`, what the file's
 /// own settings would refuse after a restart; and the id of the audit record.
 ///
 /// Each HTTP request authenticates against one snapshot: it sees both old lists or both new
@@ -2005,8 +2016,9 @@ pub(super) const IDENTITY_SECTIONS: [&str; 2] = ["[audit]", "[issuer]"];
 /// startup rule, with the message startup would give (a TOML error names its line and never
 /// quotes a value); 422 `config_file_mismatch` when the file's `[issuer]` or `[audit]` differs
 /// from the running config, without `allow_mismatch`; 422 `agents_reload_empties` when the
-/// file leaves a list empty that is not empty now, without `allow_empty`. The 422s are audited
-/// as a `deny`; the 400, 409 and 500 are not.
+/// file leaves a list empty that is not empty now, without `allow_empty`; 500 `server_error`
+/// when the file cannot be compared with the config in force (not expected). The 422s are
+/// audited as a `deny`; the 400, 409 and 500s are not.
 pub async fn reload_agents(
     State(state): State<Arc<AppState>>,
     Extension(who): Extension<AdminIdentity>,
@@ -2073,15 +2085,14 @@ pub async fn reload_agents(
             return Err(audited_refusal(&state, who, TOOL, &path, refusal, now).await);
         }
     }
-    let restart_needed = match file.section_digests() {
-        Ok(sections) => state.config_sections.differing(&sections),
-        // Not expected: the config serialized at startup. Say that nothing was compared
-        // rather than that nothing differs.
-        Err(e) => {
-            tracing::error!(error = %e, "the reloaded config could not be compared");
-            vec!["(the other sections could not be compared)".to_string()]
-        }
-    };
+    // Not expected to fail: the config serialized at startup. Without the comparison the
+    // mismatch check cannot be made, so nothing is applied.
+    let sections = file.section_digests().map_err(|e| {
+        ApiError::internal(format!(
+            "the file could not be compared with the config in force ({e:#}); {unchanged}"
+        ))
+    })?;
+    let restart_needed = state.config_sections.differing(&sections);
     let foreign: Vec<&str> = IDENTITY_SECTIONS
         .into_iter()
         .filter(|s| restart_needed.iter().any(|r| r == s))
@@ -2130,6 +2141,15 @@ pub async fn reload_agents(
     let old = state.clients.swap(Arc::clone(&new));
     let (agents, peps) = old.changes_to(&new);
     warnings.extend(state.client_rules.removed_agent_warnings(&agents.removed));
+    // `restart_needed` leaves the key files out, as a keys reload applies them.
+    if crate::issuer_keys::KeyPaths::of(&file.issuer) != *state.keys().paths() {
+        warnings.push(
+            "the file's [issuer] private_key_pem_path or previous_key_paths differ from the \
+             key files in force: run a keys reload (POST /admin/keys/reload, attenuo admin \
+             key reload) to apply them"
+                .to_string(),
+        );
+    }
     for w in warnings.iter().chain(&restart_warnings) {
         tracing::warn!(warning = ?w, "agents reload");
     }
