@@ -240,6 +240,14 @@ pub struct Metrics {
     audit_db_free_bytes: AtomicU64,
     /// Audit entries deleted by prunes of the log (`[audit.retention]`).
     audit_pruned_entries: AtomicU64,
+    /// Unix time of the newest prune of the audit log (its anchor's `at`), read from the
+    /// file at start and set by every prune since; 0 for a log never pruned.
+    audit_prune_last_unix: AtomicU64,
+    /// Runs of the automatic prune (`[audit.retention] prune = "auto"`), by (outcome,
+    /// reason). Outcomes and reasons come from a fixed set ([`crate::auto_prune`]).
+    audit_auto_prune_runs: Mutex<BTreeMap<(&'static str, &'static str), u64>>,
+    /// Unix time the automatic prune last ran, whatever its outcome; 0 before the first run.
+    audit_auto_prune_last_run_unix: AtomicU64,
     /// `GET` listen streams ended, by [`StreamEndCause::index`].
     streams_ended: [AtomicU64; StreamEndCause::ALL.len()],
     /// `stream.end` records not written, by [`StreamEndCause::index`] of the reason (only the
@@ -307,6 +315,9 @@ impl Default for Metrics {
             audit_db_size_bytes: AtomicU64::default(),
             audit_db_free_bytes: AtomicU64::default(),
             audit_pruned_entries: AtomicU64::default(),
+            audit_prune_last_unix: AtomicU64::default(),
+            audit_auto_prune_runs: Mutex::default(),
+            audit_auto_prune_last_run_unix: AtomicU64::default(),
             streams_ended: Default::default(),
             stream_end_suppressed: Default::default(),
             lease_refusal_suppressed: Mutex::default(),
@@ -570,6 +581,24 @@ impl Metrics {
         self.audit_pruned_entries.fetch_add(n, Ordering::Relaxed);
     }
 
+    /// The newest prune of the audit log was made at `unix` seconds (its anchor's `at`); an
+    /// older time than the one held changes nothing (`audit_prune_last_timestamp_seconds`).
+    pub fn audit_pruned_at(&self, unix: u64) {
+        self.audit_prune_last_unix
+            .fetch_max(unix, Ordering::Relaxed);
+    }
+
+    /// Count one run of the automatic prune, by `outcome` (`pruned`, `skipped` or `failed`)
+    /// and `reason`, and note that it ran now (`audit_auto_prune_runs_total`,
+    /// `audit_auto_prune_last_run_timestamp_seconds`).
+    pub fn audit_auto_prune_run(&self, outcome: &'static str, reason: &'static str) {
+        if let Ok(mut m) = self.audit_auto_prune_runs.lock() {
+            *m.entry((outcome, reason)).or_default() += 1;
+        }
+        self.audit_auto_prune_last_run_unix
+            .store(unix_secs(std::time::SystemTime::now()), Ordering::Relaxed);
+    }
+
     /// Read the audit store's shed appends through `source` at every render
     /// (`audit_append_shed_total`). Set once; later calls are ignored. Until it is set, or
     /// when `source` returns `None`, the series read zero.
@@ -823,6 +852,35 @@ impl Metrics {
             "audit_pruned_entries_total",
             "Audit entries deleted by prunes of the log ([audit.retention]).",
             &self.audit_pruned_entries,
+        );
+        simple_gauge(
+            &mut out,
+            "audit_prune_last_timestamp_seconds",
+            "Unix time of the newest prune of the audit log, manual or automatic (its anchor's \
+             time); 0 for a log never pruned.",
+            &self.audit_prune_last_unix,
+        );
+        header_lines(
+            &mut out,
+            "audit_auto_prune_runs_total",
+            "Runs of the automatic prune of the audit log ([audit.retention] prune = \"auto\"), \
+             by outcome (pruned, skipped, failed) and reason. A series appears once counted.",
+            "counter",
+        );
+        if let Ok(m) = self.audit_auto_prune_runs.lock() {
+            for ((outcome, reason), n) in m.iter() {
+                let _ = writeln!(
+                    out,
+                    "{PREFIX}_audit_auto_prune_runs_total{{outcome=\"{outcome}\",reason=\"{reason}\"}} {n}"
+                );
+            }
+        }
+        simple_gauge(
+            &mut out,
+            "audit_auto_prune_last_run_timestamp_seconds",
+            "Unix time the automatic prune of the audit log last ran, whatever its outcome; 0 \
+             before the first run.",
+            &self.audit_auto_prune_last_run_unix,
         );
         simple_counter(
             &mut out,

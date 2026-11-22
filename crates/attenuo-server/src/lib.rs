@@ -28,7 +28,7 @@
 //! | `GET /admin/audit`, `/admin/audit/verify`, `/admin/audit/checkpoint` | admin | audit |
 //! | `GET /admin/audit/entries/{seq}`, `/admin/audit/records/{id}`, `/admin/audit/checkpoints` | admin | one entry with its context; stored checkpoints (read-only) |
 //! | `GET /admin/audit/export?from&to` | admin | stream a verifiable slice of the log as JSON Lines |
-//! | `GET /admin/audit/prune/plan?through` or `?before`, `POST /admin/audit/prune` | admin | plan and commit a prune of the oldest entries behind a signed anchor, with `[audit.retention] prune = "manual"` ([`routes::retention`]) |
+//! | `GET /admin/audit/prune/plan?through` or `?before`, `POST /admin/audit/prune` | admin | plan and commit a prune of the oldest entries behind a signed anchor, with `[audit.retention] prune = "manual"` or `"auto"` ([`routes::retention`]; the automatic prune is [`auto_prune`]) |
 //! | `GET /admin/audit/anchors` | admin | the signed anchors of past prunes, newest first (read-only) |
 //! | `POST /admin/policies/reload` | admin | hot-reload the Cedar policy file |
 //! | `POST /admin/operators/reload` | admin | re-read `[[admin.operators]]` from the config file and swap them in ([`routes::admin::reload_operators`]) |
@@ -74,6 +74,8 @@
 pub(crate) mod actor;
 // Used by the integration tests.
 pub mod admin_ui;
+// Used by the integration tests.
+pub mod auto_prune;
 // Used by the benches (`result_digest`).
 pub mod authz;
 pub(crate) mod clientauth;
@@ -188,6 +190,7 @@ use axum::Router;
 use tower_http::trace::TraceLayer;
 
 pub use authz::{Pipeline, PipelineDecision, ServerAuthorizer, SharedPolicy};
+pub use auto_prune::auto_prune_once;
 pub use config::Config;
 pub use state::AppState;
 
@@ -789,6 +792,16 @@ pub async fn run(
         let ticks = maintenance_ticks(state.clone(), stopped());
         tasks.push((
             "lease maintenance",
+            tokio::spawn(async move {
+                ticks.await;
+                Ok(())
+            }),
+        ));
+    }
+    if state.retention.prune == config::PruneMode::Auto {
+        let ticks = auto_prune::auto_prune_ticks(state.clone(), stopped());
+        tasks.push((
+            "automatic audit prune",
             tokio::spawn(async move {
                 ticks.await;
                 Ok(())

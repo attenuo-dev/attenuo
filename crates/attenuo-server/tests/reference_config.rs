@@ -91,6 +91,13 @@ secret_access_key = "s"
 session_token = "s"
 ca_pem_path = "sink-ca.pem"
 
+[audit.retention]
+prune = "auto"
+keep_seconds = 7776000
+interval_seconds = 3600
+archive_dir = "/var/lib/attenuo/audit-archive"
+max_entries_per_run = 1000000
+
 [admin]
 token = "t"
 listen = "127.0.0.1:9102"

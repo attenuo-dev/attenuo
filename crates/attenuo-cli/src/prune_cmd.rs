@@ -664,6 +664,41 @@ fn plan_lines(plan: &Value) -> Vec<String> {
     if let Some(b) = plan["anchor"]["through_seq"].as_u64() {
         out.push(format!("the log was pruned before, through seq {b}"));
     }
+    out.extend(auto_lines(&plan["auto"]));
+    out
+}
+
+/// The plan's `auto` member (`[audit.retention] prune = "auto"`) in one or two lines;
+/// nothing when it is null.
+fn auto_lines(auto: &Value) -> Vec<String> {
+    if !auto.is_object() {
+        return Vec::new();
+    }
+    let archive = match auto["archive_dir"].as_str() {
+        Some(d) => format!("archives in {}", render::escape_controls(d)),
+        None => "no archive is kept".to_string(),
+    };
+    let mut out = vec![format!(
+        "automatic prune: on, of entries older than {} seconds, every {} seconds, at most {} \
+         entries a run; {archive}",
+        auto["keep_seconds"], auto["interval_seconds"], auto["max_entries_per_run"]
+    )];
+    let last = &auto["last_run"];
+    if last.is_object() {
+        let mut line = format!(
+            "last automatic run: {} at {} ({})",
+            render::escape_controls(last["outcome"].as_str().unwrap_or("?")),
+            render::escape_controls(last["at"].as_str().unwrap_or("?")),
+            render::escape_controls(last["reason"].as_str().unwrap_or("?"))
+        );
+        if let Some(t) = last["through"].as_u64() {
+            line.push_str(&format!(", through seq {t}"));
+        }
+        if let Some(a) = last["archive"].as_str() {
+            line.push_str(&format!(", archive {}", render::escape_controls(a)));
+        }
+        out.push(line);
+    }
     out
 }
 
@@ -757,6 +792,37 @@ mod tests {
         place(&tmp, &out).unwrap();
         assert_eq!(std::fs::read(&out).unwrap(), b"new");
         assert!(!tmp.exists());
+    }
+
+    #[test]
+    fn plan_text_names_the_automatic_prune() {
+        let mut plan = json!({"from": 1, "through": null, "entries": 0, "guards": {},
+                              "anchor": null, "auto": null});
+        assert!(!plan_lines(&plan).join("\n").contains("automatic"));
+        plan["auto"] = json!({"keep_seconds": 7776000, "interval_seconds": 3600,
+                              "max_entries_per_run": 1000000, "archive_dir": "/var/a",
+                              "last_run": null});
+        let text = plan_lines(&plan).join("\n");
+        assert!(
+            text.contains(
+                "automatic prune: on, of entries older than 7776000 seconds, every \
+                           3600 seconds, at most 1000000 entries a run; archives in /var/a"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("last automatic run"), "{text}");
+        plan["auto"]["archive_dir"] = Value::Null;
+        plan["auto"]["last_run"] = json!({"at": "2026-01-01T00:00:00Z", "outcome": "pruned",
+                                          "reason": "ok", "through": 20, "prune_seq": 26,
+                                          "detail": null, "archive": "audit-1-20.jsonl"});
+        let text = plan_lines(&plan).join("\n");
+        for want in [
+            "no archive is kept",
+            "last automatic run: pruned at 2026-01-01T00:00:00Z (ok), through seq 20, archive \
+             audit-1-20.jsonl",
+        ] {
+            assert!(text.contains(want), "{want} not in {text}");
+        }
     }
 
     #[test]

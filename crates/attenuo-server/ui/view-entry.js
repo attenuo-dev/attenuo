@@ -59,13 +59,13 @@ function prunedPanel(seq, body) {
     h('p', { class: 'callout warn' },
       'This entry was pruned: the server deleted the start of the audit log',
       through !== null ? [' through seq ', mono(through)] : null,
-      ', after it was archived. The entry is in that archive, not on the server.'),
+      '. A prune by an admin archives the entries first; the automatic prune does only when [audit.retention] archive_dir is set. The entry is not on the server.'),
     kv([
       ['Pruned through', through !== null ? mono(through) : undefined],
       ['Prune record', pruneSeq !== null ? link(['entry', pruneSeq], `seq ${pruneSeq}`) : undefined],
       ['First retained seq', first !== null ? link(['entry', first], `seq ${first}`) : undefined],
     ]),
-    h('p', { class: 'small muted' }, 'To read it, verify the archive with ', mono('attenuo audit verify --file <archive>'), ' and look it up there.'));
+    h('p', { class: 'small muted' }, 'To read it, verify an archive that holds it with ', mono('attenuo audit verify --file <archive>'), ' and look it up there.'));
 }
 
 // A prune's own record (`admin`, tool `admin.audit.prune`). Its arguments are only a digest,
@@ -92,14 +92,21 @@ function pruneRecordInfo(entry) {
 }
 
 const PRUNE_EXPLAIN = 'A prune of the start of the audit log, made by an admin: the entries up to the boundary were archived, then deleted. The boundary, its hash and the archive’s SHA-256 are in the prune’s signed anchor.';
+// The record of an automatic prune names the server's own subject, not an operator.
+const AUTO_PRUNE_SUBJECT = 'urn:attenuo:retention';
+const AUTO_PRUNE_EXPLAIN = 'An automatic prune of the start of the audit log ([audit.retention] prune = "auto"), made by the server: the entries up to the boundary were older than the keep window and their checkpoint had left the host, so they were deleted. With [audit.retention] archive_dir set, the server wrote them to an archive file there first; without it, no copy was kept. The boundary, its hash and the archive’s digest, if any, are in the prune’s signed anchor.';
 
 function isPruneRecord(r) {
   return r.kind === 'admin' && r.tool === PRUNE_TOOL;
 }
 
+function pruneExplain(r) {
+  return r.originating_subject === AUTO_PRUNE_SUBJECT ? AUTO_PRUNE_EXPLAIN : PRUNE_EXPLAIN;
+}
+
 function verdict(entry) {
   const r = entry.record;
-  const why = isPruneRecord(r) ? PRUNE_EXPLAIN : explainReason(r.reason);
+  const why = isPruneRecord(r) ? pruneExplain(r) : explainReason(r.reason);
   return h('section', { class: 'panel', 'aria-labelledby': 'entry-title' },
     h('header', null,
       h('h1', { id: 'entry-title' }, `Entry `, mono(`#${entry.seq}`)),
