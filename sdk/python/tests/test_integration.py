@@ -63,7 +63,7 @@ from attenuo import (
     _retry,
     call_hash,
 )
-from attenuo.audit import entry_hash
+from attenuo.audit import cross_check, entry_hash, verify_exports
 from attenuo.mcp import TokenAuth
 
 pytestmark = [
@@ -2010,3 +2010,94 @@ def test_keys_reload_rotates_the_signing_key(reload_stack: Stack) -> None:
         jwks = httpx.get(f"{reload_stack.url}/.well-known/jwks.json").json()
         assert [k["kid"] for k in jwks["keys"]] == rotated.verifying_kids
         assert not admin.keys_reload().changed
+
+
+@pytest.fixture
+def prune_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Stack]:
+    """A stack that can prune: a file audit log with a checkpoint every 3 entries, the file
+    checkpoint sink, ``prune = "manual"``, and ``min_age_seconds = 2``. The run-state
+    retentions are 0 (keep everything) so that the start-up floor on ``min_age_seconds`` is 0,
+    and the test makes no lease, so no live run holds the boundary. The maintenance task, which
+    deletes the pruned rows, runs every second."""
+    work = tmp_path_factory.mktemp("attenuo-it-prune")
+    yield from run_stack(
+        work,
+        "[leases]\nretention_seconds = 0\nrun_state_retention_seconds = 0\n"
+        "user_window_retention_seconds = 0\nmaintenance_interval_seconds = 1\n\n"
+        '[audit.retention]\nprune = "manual"\nmin_age_seconds = 2\n\n'
+        '[audit.sink]\nkind = "file"\npath = "{work}/shipped.jsonl"\n\n',
+        edits={
+            'sqlite_path = ":memory:"': (
+                f'sqlite_path = "{work}/audit.sqlite"\ncheckpoint_every = 3'
+            )
+        },
+    )
+
+
+def write_export(path: Path, lines: Iterator[dict[str, Any]]) -> str:
+    """Write an export's lines to ``path``; the SHA-256 of the file's bytes."""
+    text = "".join(json.dumps(o, separators=(",", ":")) + "\n" for o in lines)
+    path.write_text(text)
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def test_audit_prune_plan_prune_and_anchors(prune_stack: Stack) -> None:
+    work = prune_stack.work
+    jwks = httpx.get(f"{prune_stack.url}/.well-known/jwks.json").json()
+    with AdminClient(prune_stack.url, ADMIN_TOKEN) as admin:
+        assert admin.audit_anchors().anchors == []
+        # Admin records belong to no run, so the live-run guard does not hold them.
+        for _ in range(6):
+            admin.policy_reload()
+        early = admin.audit_prune_plan()
+        assert early.through is None and early.guards.limited_by == "prune_too_recent"
+        time.sleep(2.5)
+
+        plan = admin.audit_prune_plan()
+        assert plan.from_ == 1 and plan.through is not None and plan.guards.limited_by is None
+        assert plan.checkpoint is not None and plan.checkpoint["seq"] == plan.through
+        assert plan.entries == plan.through and plan.anchor is None
+        through = plan.through
+        archive = work / "archive.jsonl"
+        digest = write_export(archive, admin.audit_export(1, through))
+
+        # A boundary that is not a checkpoint is refused, with the server's code.
+        with pytest.raises(ApiError) as e:
+            admin.audit_prune(through - 1, archive_sha256=digest)
+        assert (e.value.status, e.value.code) == (409, "prune_not_at_checkpoint")
+
+        done = admin.audit_prune(through, archive_sha256=digest, from_=1)
+        assert (done.pruned_through, done.already) == (through, False)
+        assert done.anchor.through_seq == through and done.anchor.archive_sha256 == digest
+        assert done.shipped is not None
+        again = admin.audit_prune(through, archive_sha256=digest)
+        assert again.already and again.anchor == done.anchor
+        with pytest.raises(ApiError) as e:
+            admin.audit_prune(through, archive_sha256="f" * 64)
+        assert (e.value.status, e.value.code) == (409, "prune_conflict")
+        with pytest.raises(ApiError) as e:
+            admin.audit_prune(through - 3, archive_sha256=digest)
+        assert (e.value.status, e.value.code) == (410, "audit_pruned")
+
+        page = admin.audit_anchors(limit=10)
+        assert [a.through_seq for a in page.anchors] == [through] and page.next_cursor is None
+        listed = page.anchors[0]
+        assert (listed.signature, listed.prune_seq) == (done.anchor.signature, done.prune_seq)
+        assert listed.state in ("deleting", "done")
+        wait_for(
+            lambda: (
+                (a := admin.audit_anchors().anchors[0]).state == "done" and a.shipped_at is not None
+            ),
+            10,
+            "the prune to finish and the sink to ship its anchor",
+        )
+
+        # The retained export starts from the anchor; it and the archive verify as one log, and
+        # it cross-checks against what the sink shipped, anchor included.
+        retained = work / "retained.jsonl"
+        write_export(retained, admin.audit_export(through + 1))
+        r = verify_exports([archive, retained], checkpoint_public_keys=jwks)
+        assert r.ok, r
+        c = cross_check(retained, work / "shipped.jsonl", checkpoint_public_keys=jwks)
+        assert c.ok, c
+        assert (c.anchors.shipped, c.anchors.checked, c.anchors.matched) == (1, 1, 1)

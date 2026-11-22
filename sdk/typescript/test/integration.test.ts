@@ -47,7 +47,9 @@ import {
   UnauthorizedError,
   VerificationError,
   ExportError,
+  crossCheck,
   verifyExport,
+  verifyExports,
   withLimits,
 } from "../src/index.js";
 import { retryHooks } from "../src/retry.js";
@@ -1629,5 +1631,118 @@ describe.skipIf(!enabled)("agents and keys reload against the real server", () =
     };
     expect(jwks.keys.map((k) => k.kid)).toEqual(rotated.verifyingKids);
     expect((await admin.keysReload()).changed).toBe(false);
+  });
+});
+
+describe.skipIf(!enabled)("audit retention against the real server", () => {
+  // A file audit log with a checkpoint every 3 entries, the file checkpoint sink,
+  // `prune = "manual"` and `min_age_seconds = 2`. The run-state retentions are 0 (keep
+  // everything) so that the start-up floor on `min_age_seconds` is 0, and the test makes no
+  // lease, so no live run holds the boundary. The maintenance task, which deletes the pruned
+  // rows, runs every second.
+  let stack = { url: "", work: "", procs: [] as ChildProcess[] };
+
+  beforeAll(async () => {
+    stack = await startStack(
+      "[leases]\nretention_seconds = 0\nrun_state_retention_seconds = 0\n" +
+        "user_window_retention_seconds = 0\nmaintenance_interval_seconds = 1\n\n" +
+        '[audit.retention]\nprune = "manual"\nmin_age_seconds = 2\n\n' +
+        '[audit.sink]\nkind = "file"\npath = "{work}/shipped.jsonl"\n\n',
+      [],
+      {
+        edits: {
+          'sqlite_path = ":memory:"': 'sqlite_path = "{work}/audit.sqlite"\ncheckpoint_every = 3',
+        },
+      },
+    );
+  });
+
+  afterAll(async () => {
+    await stopStack(stack.procs, stack.work);
+  });
+
+  /** Write an export's lines to `path`; the SHA-256 of the file's bytes. */
+  async function writeExport(path: string, lines: AsyncIterable<object>): Promise<string> {
+    let text = "";
+    for await (const l of lines) text += JSON.stringify(l) + "\n";
+    writeFileSync(path, text);
+    return createHash("sha256").update(text).digest("hex");
+  }
+
+  const refusal = async (p: Promise<unknown>): Promise<[number, string | undefined]> => {
+    const err = await p.catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ApiError);
+    return [(err as ApiError).status, (err as ApiError).code];
+  };
+
+  it("plans, refuses, prunes and lists the anchor, which the SDK then cross-checks", async () => {
+    const admin = new AdminClient(stack.url, ADMIN_TOKEN);
+    const jwks = (await (await fetch(`${stack.url}/.well-known/jwks.json`)).json()) as {
+      keys: unknown[];
+    };
+    expect((await admin.auditAnchors()).anchors).toEqual([]);
+    // Admin records belong to no run, so the live-run guard does not hold them.
+    for (let i = 0; i < 6; i++) await admin.policyReload();
+    const early = await admin.auditPrunePlan();
+    expect([early.through, early.guards.limitedBy]).toEqual([undefined, "prune_too_recent"]);
+    await sleep(2500);
+
+    const plan = await admin.auditPrunePlan();
+    expect([plan.from, plan.guards.limitedBy, plan.anchor]).toEqual([1, undefined, undefined]);
+    const through = plan.through!;
+    expect(plan.checkpoint?.seq).toBe(through);
+    expect(plan.entries).toBe(through);
+    const archive = join(stack.work, "archive.jsonl");
+    const digest = await writeExport(archive, admin.auditExport(1, through));
+
+    // A boundary that is not a checkpoint is refused, with the server's code.
+    expect(await refusal(admin.auditPrune(through - 1, { archiveSha256: digest }))).toEqual([
+      409,
+      "prune_not_at_checkpoint",
+    ]);
+    const done = await admin.auditPrune(through, { archiveSha256: digest, from: 1 });
+    expect([done.prunedThrough, done.already]).toEqual([through, false]);
+    expect([done.anchor.through_seq, done.anchor.archive_sha256]).toEqual([through, digest]);
+    expect(done.shipped).toBeDefined();
+    const again = await admin.auditPrune(through, { archiveSha256: digest });
+    expect([again.already, again.anchor.signature]).toEqual([true, done.anchor.signature]);
+    expect(await refusal(admin.auditPrune(through, { archiveSha256: "f".repeat(64) }))).toEqual([
+      409,
+      "prune_conflict",
+    ]);
+    expect(await refusal(admin.auditPrune(through - 3, { archiveSha256: digest }))).toEqual([
+      410,
+      "audit_pruned",
+    ]);
+
+    const page = await admin.auditAnchors({ limit: 10 });
+    expect(page.anchors.map((a) => a.through_seq)).toEqual([through]);
+    expect(page.nextCursor).toBeUndefined();
+    expect([page.anchors[0]!.signature, page.anchors[0]!.prune_seq]).toEqual([
+      done.anchor.signature,
+      done.pruneSeq,
+    ]);
+    const deadline = Date.now() + 10_000;
+    for (;;) {
+      const a = (await admin.auditAnchors()).anchors[0]!;
+      if (a.state === "done" && typeof a.shipped_at === "string") break;
+      if (Date.now() > deadline) throw new Error(`the prune did not finish: ${JSON.stringify(a)}`);
+      await sleep(100);
+    }
+
+    // The retained export starts from the anchor; it and the archive verify as one log, and it
+    // cross-checks against what the sink shipped, anchor included.
+    const retained = join(stack.work, "retained.jsonl");
+    await writeExport(retained, admin.auditExport(through + 1));
+    const opts = { checkpointPublicKeys: jwks };
+    const r = await verifyExports([{ path: archive }, { path: retained }], opts);
+    expect(r.ok).toBe(true);
+    const c = await crossCheck(
+      { path: retained },
+      { path: join(stack.work, "shipped.jsonl") },
+      opts,
+    );
+    expect(c.ok).toBe(true);
+    expect([c.anchors.shipped, c.anchors.checked, c.anchors.matched]).toEqual([1, 1, 1]);
   });
 });
