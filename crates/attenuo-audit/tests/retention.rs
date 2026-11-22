@@ -1673,6 +1673,17 @@ fn golden_issuer() -> Issuer {
 /// `archive-2.jsonl`, 6..=10, its header carrying the first anchor), the retained export
 /// (`retained.jsonl`, 11..=14, with the second anchor and both prune records), what the sink
 /// shipped (`shipped.jsonl`) and the JWKS. Each archive's digest is signed into its anchor.
+///
+/// It also writes the negative cases the three verifiers must agree on: `stale.jsonl`, an
+/// export of 6..=13 taken before the second prune, whose boundary lies inside it;
+/// `rewound.jsonl`, 6..=14 with the first anchor in its header, as a log restored to before the
+/// second prune would export (it verifies on its own, the shipped second anchor says 6..=10 were
+/// pruned); `shipped-bad-signature.jsonl`, `shipped.jsonl` with the second anchor's signature
+/// changed (the envelope made again around it, so only the signature check fails); and
+/// `shipped-other-anchor.jsonl`, `shipped.jsonl` with another valid anchor for the first
+/// boundary in place of the one in `archive-2.jsonl`'s header. Last, `cross-checks.json` holds
+/// what the Rust cross-checks answer for each export and shipped file, for the other suites.
+///
 /// Run it with `cargo test -p attenuo-audit --test retention write_golden_files -- --ignored`
 /// after a change of the formats, then commit the files.
 #[test]
@@ -1694,19 +1705,63 @@ fn write_golden_files() {
     let first = prune(&log, 5, Some(&sha(&a1))).unwrap().anchor.anchor;
     finish(&log, 100);
     let a2 = export(6, 10, Some(first.clone()));
+    // Before the second prune: an export of everything after the first one, and the entries
+    // and checkpoints of 6..=10 that the second prune deletes.
+    let before_second = log.head().unwrap().unwrap().seq;
+    let stale = export(6, before_second, Some(first.clone()));
+    let pruned_entries = range(&log, 6, 10);
+    let pruned_cps = log.checkpoints_between(6, 10).unwrap();
     let second = prune(&log, 10, Some(&sha(&a2))).unwrap().anchor.anchor;
     finish(&log, 100);
     let head = log.head().unwrap().unwrap().seq;
     let retained = export(11, head, Some(second.clone()));
-    let mut shipped: String = log
+    // A log restored to before the second prune: 6..=10 are there again, after them the
+    // entries the server wrote since.
+    let rewound = {
+        let header = ExportHeader::new(6, head, "2027-01-01T00:00:00Z".into())
+            .with_anchor(Some(first.clone()));
+        let mut entries = pruned_entries;
+        entries.extend(range(&log, 11, head));
+        let mut cps = pruned_cps;
+        cps.extend(log.checkpoints_between(11, head).unwrap());
+        export_text(&header, &entries, &cps)
+    };
+    let checkpoint_lines: String = log
         .checkpoints_between(0, head)
         .unwrap()
         .iter()
         .map(|c| ShippedCheckpoint::new(c, None).to_line())
         .collect();
-    for a in [&first, &second] {
-        shipped.push_str(&ShippedAnchor::new(a, None).to_line());
-    }
+    let anchor_lines = |anchors: &[&attenuo_audit::Anchor]| -> String {
+        anchors
+            .iter()
+            .map(|a| ShippedAnchor::new(a, None).to_line())
+            .collect()
+    };
+    let shipped = checkpoint_lines.clone() + &anchor_lines(&[&first, &second]);
+    // The second anchor with one character of its signature changed.
+    let mut forged = second.clone();
+    let swap = if forged.signature.starts_with('A') {
+        "B"
+    } else {
+        "A"
+    };
+    forged.signature.replace_range(..1, swap);
+    let bad_signature = checkpoint_lines.clone() + &anchor_lines(&[&first, &forged]);
+    // Another anchor for the first boundary, signed with the server's key: the log was pruned
+    // through 5 again with another archive digest.
+    let twin = attenuo_audit::Anchor::sign(
+        &issuer.detached_signer(),
+        first.through_seq,
+        &first.through_hash,
+        first.prune_seq,
+        &first.prune_entry_hash,
+        first.previous_through_seq,
+        Some("f".repeat(64)),
+        now(),
+    )
+    .unwrap();
+    let other_anchor = checkpoint_lines + &anchor_lines(&[&twin, &second]);
     let jwks: Vec<Value> = issuer
         .trusted_public_keys()
         .into_iter()
@@ -1724,6 +1779,10 @@ fn write_golden_files() {
         ("archive-2.jsonl", a2),
         ("retained.jsonl", retained),
         ("shipped.jsonl", shipped),
+        ("stale.jsonl", stale),
+        ("rewound.jsonl", rewound),
+        ("shipped-bad-signature.jsonl", bad_signature),
+        ("shipped-other-anchor.jsonl", other_anchor),
         (
             "jwks.json",
             serde_json::to_string_pretty(&json!({ "keys": jwks })).unwrap() + "\n",
@@ -1731,6 +1790,57 @@ fn write_golden_files() {
     ] {
         std::fs::write(dir.join(name), text).unwrap();
     }
+    let checks = serde_json::to_string_pretty(&golden_checks()).unwrap() + "\n";
+    std::fs::write(dir.join(GOLDEN_CHECKS), checks).unwrap();
+}
+
+/// The file of the verdicts the Rust cross-checks give on the golden files.
+const GOLDEN_CHECKS: &str = "cross-checks.json";
+
+/// The export and shipped file of each verdict in [`GOLDEN_CHECKS`].
+const GOLDEN_PAIRS: [(&str, &str); 8] = [
+    ("archive-1.jsonl", "shipped.jsonl"),
+    ("archive-2.jsonl", "shipped.jsonl"),
+    ("retained.jsonl", "shipped.jsonl"),
+    ("rewound.jsonl", "shipped.jsonl"),
+    ("stale.jsonl", "shipped.jsonl"),
+    ("archive-2.jsonl", "shipped-bad-signature.jsonl"),
+    ("retained.jsonl", "shipped-bad-signature.jsonl"),
+    ("archive-2.jsonl", "shipped-other-anchor.jsonl"),
+];
+
+/// What `cross_check` and `cross_check_anchors` answer for each of [`GOLDEN_PAIRS`], as the
+/// files on disk are now: the Python and TypeScript suites compare their reports with it.
+fn golden_checks() -> Value {
+    let dir = golden_dir();
+    let read = |n: &str| std::fs::read_to_string(dir.join(n)).unwrap();
+    let keys =
+        CheckpointKeys::from_jwks(&serde_json::from_str::<Value>(&read("jwks.json")).unwrap())
+            .unwrap();
+    let checks: Vec<Value> = GOLDEN_PAIRS
+        .iter()
+        .map(|(export, shipped)| {
+            let e = parse_export(&read(export)).unwrap();
+            let text = read(shipped);
+            let cps = parse_shipped(&text).unwrap();
+            let anchors = attenuo_audit::parse_shipped_anchors(&text).unwrap();
+            json!({
+                "export": export,
+                "shipped": shipped,
+                "checkpoints": cross_check(&e, &cps, &keys),
+                "anchors": attenuo_audit::cross_check_anchors(&e, &anchors, &keys),
+            })
+        })
+        .collect();
+    json!({ "checks": checks })
+}
+
+/// The committed verdicts are the ones the Rust code gives now.
+#[test]
+fn the_golden_cross_checks_are_current() {
+    let text = std::fs::read_to_string(golden_dir().join(GOLDEN_CHECKS)).unwrap();
+    let stored: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(stored, golden_checks());
 }
 
 /// The committed golden files verify: each strictly, as one log from genesis, against the
@@ -1773,4 +1883,78 @@ fn the_golden_files_verify() {
         let anchor = a.header.as_ref().unwrap().anchor.as_ref().unwrap();
         assert_eq!(anchor.archive_sha256.as_deref(), Some(digest.as_str()));
     }
+    // The counts the Python and TypeScript suites check too.
+    let r = attenuo_audit::cross_check_anchors(&parsed[0], &anchors, &keys);
+    assert_eq!(
+        (r.shipped, r.checked, r.matched, r.beyond_range),
+        (2, 0, 0, 2)
+    );
+    let r = attenuo_audit::cross_check_anchors(&parsed[1], &anchors, &keys);
+    assert_eq!((r.checked, r.matched, r.beyond_range), (1, 1, 1));
+    let r = attenuo_audit::cross_check_anchors(&parsed[2], &anchors, &keys);
+    assert_eq!((r.checked, r.matched, r.beyond_range), (2, 2, 0));
+    let r = cross_check(&parsed[2], &cps, &keys);
+    assert_eq!(r.below_range, 1);
+}
+
+/// The golden negative cases: each export verifies on its own, and the shipped anchors catch
+/// it, with the reason the Python and TypeScript suites expect too.
+#[test]
+fn the_golden_negative_cases_fail_the_anchor_cross_check() {
+    let dir = golden_dir();
+    let read = |n: &str| std::fs::read_to_string(dir.join(n)).unwrap();
+    let keys =
+        CheckpointKeys::from_jwks(&serde_json::from_str::<Value>(&read("jwks.json")).unwrap())
+            .unwrap();
+    let export = |n: &str| parse_export(&read(n)).unwrap();
+    let anchors = |n: &str| attenuo_audit::parse_shipped_anchors(&read(n)).unwrap();
+    let reasons = |e: &attenuo_audit::Export, shipped: &str| {
+        let r = attenuo_audit::cross_check_anchors(e, &anchors(shipped), &keys);
+        assert!(!r.ok);
+        r.mismatches
+            .into_iter()
+            .map(|m| (m.seq, m.line, m.reason))
+            .collect::<Vec<_>>()
+    };
+    // A log restored to before the second prune: it verifies, the shipped anchor says no.
+    let rewound = export("rewound.jsonl");
+    assert!(verify_export(&rewound, &keys).unwrap().report.ok);
+    let r = reasons(&rewound, "shipped.jsonl");
+    assert_eq!(r.len(), 1, "{r:?}");
+    assert_eq!((r[0].0, r[0].1), (10, 6));
+    assert!(r[0].2.starts_with("REWOUND: "), "{r:?}");
+    // An export taken before the second prune, whose boundary lies inside it.
+    let stale = export("stale.jsonl");
+    assert!(verify_export(&stale, &keys).unwrap().report.ok);
+    let r = reasons(&stale, "shipped.jsonl");
+    assert_eq!(r.len(), 1, "{r:?}");
+    assert!(
+        r[0].2.contains("has its boundary inside this export"),
+        "{r:?}"
+    );
+    // The second anchor's signature changed.
+    let retained = export("retained.jsonl");
+    let r = reasons(&retained, "shipped-bad-signature.jsonl");
+    assert_eq!(
+        r.iter().map(|m| m.2.as_str()).collect::<Vec<_>>(),
+        vec![
+            "shipped anchor does not verify: signature does not verify",
+            "the export's header anchor is not in the shipped file (it was not shipped, or \
+             the file is incomplete)",
+        ]
+    );
+    // Another anchor for the boundary in the header of archive-2.
+    let r = reasons(&export("archive-2.jsonl"), "shipped-other-anchor.jsonl");
+    assert_eq!(r.len(), 1, "{r:?}");
+    assert_eq!(r[0].0, 5);
+    assert!(r[0].2.contains("another anchor for this boundary"), "{r:?}");
+    // S3 objects joined with no newline parse as the same anchors.
+    let joined = read("shipped.jsonl").replace('\n', "");
+    let a = attenuo_audit::parse_shipped_anchors(&joined).unwrap();
+    assert_eq!(a.len(), 2);
+    assert_eq!(
+        parse_shipped(&joined).unwrap().len(),
+        parse_shipped(&read("shipped.jsonl")).unwrap().len()
+    );
+    assert!(attenuo_audit::cross_check_anchors(&retained, &a, &keys).ok);
 }

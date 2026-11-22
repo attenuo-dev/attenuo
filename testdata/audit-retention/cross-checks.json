@@ -1,0 +1,215 @@
+{
+  "checks": [
+    {
+      "anchors": {
+        "beyond_range": 2,
+        "checked": 0,
+        "matched": 0,
+        "mismatches": [],
+        "ok": true,
+        "shipped": 2
+      },
+      "checkpoints": {
+        "below_range": 0,
+        "beyond_range": 4,
+        "in_range": 0,
+        "last_shipped_seq": 14,
+        "matched": 0,
+        "mismatches": [],
+        "ok": true,
+        "shipped": 4
+      },
+      "export": "archive-1.jsonl",
+      "shipped": "shipped.jsonl"
+    },
+    {
+      "anchors": {
+        "beyond_range": 1,
+        "checked": 1,
+        "matched": 1,
+        "mismatches": [],
+        "ok": true,
+        "shipped": 2
+      },
+      "checkpoints": {
+        "below_range": 0,
+        "beyond_range": 3,
+        "in_range": 1,
+        "last_shipped_seq": 14,
+        "matched": 1,
+        "mismatches": [],
+        "ok": true,
+        "shipped": 4
+      },
+      "export": "archive-2.jsonl",
+      "shipped": "shipped.jsonl"
+    },
+    {
+      "anchors": {
+        "beyond_range": 0,
+        "checked": 2,
+        "matched": 2,
+        "mismatches": [],
+        "ok": true,
+        "shipped": 2
+      },
+      "checkpoints": {
+        "below_range": 1,
+        "beyond_range": 0,
+        "in_range": 3,
+        "last_shipped_seq": 14,
+        "matched": 3,
+        "mismatches": [],
+        "ok": true,
+        "shipped": 4
+      },
+      "export": "retained.jsonl",
+      "shipped": "shipped.jsonl"
+    },
+    {
+      "anchors": {
+        "beyond_range": 0,
+        "checked": 2,
+        "matched": 1,
+        "mismatches": [
+          {
+            "line": 6,
+            "reason": "REWOUND: the shipped anchor says the log was pruned through seq 10, but the export holds entries from seq 6 (a restored backup, or the anchor row removed)",
+            "seq": 10
+          }
+        ],
+        "ok": false,
+        "shipped": 2
+      },
+      "checkpoints": {
+        "below_range": 0,
+        "beyond_range": 0,
+        "in_range": 4,
+        "last_shipped_seq": 14,
+        "matched": 4,
+        "mismatches": [],
+        "ok": true,
+        "shipped": 4
+      },
+      "export": "rewound.jsonl",
+      "shipped": "shipped.jsonl"
+    },
+    {
+      "anchors": {
+        "beyond_range": 0,
+        "checked": 2,
+        "matched": 1,
+        "mismatches": [
+          {
+            "line": 6,
+            "reason": "the shipped prune through seq 10 (its record at seq 14 is past this export's end at seq 13) has its boundary inside this export: the export was taken before that prune, or the log was rewound to before it; check an export taken now",
+            "seq": 10
+          }
+        ],
+        "ok": false,
+        "shipped": 2
+      },
+      "checkpoints": {
+        "below_range": 0,
+        "beyond_range": 1,
+        "in_range": 3,
+        "last_shipped_seq": 14,
+        "matched": 3,
+        "mismatches": [],
+        "ok": true,
+        "shipped": 4
+      },
+      "export": "stale.jsonl",
+      "shipped": "shipped.jsonl"
+    },
+    {
+      "anchors": {
+        "beyond_range": 0,
+        "checked": 1,
+        "matched": 1,
+        "mismatches": [
+          {
+            "line": 6,
+            "reason": "shipped anchor does not verify: signature does not verify",
+            "seq": 10
+          }
+        ],
+        "ok": false,
+        "shipped": 2
+      },
+      "checkpoints": {
+        "below_range": 0,
+        "beyond_range": 3,
+        "in_range": 1,
+        "last_shipped_seq": 14,
+        "matched": 1,
+        "mismatches": [],
+        "ok": true,
+        "shipped": 4
+      },
+      "export": "archive-2.jsonl",
+      "shipped": "shipped-bad-signature.jsonl"
+    },
+    {
+      "anchors": {
+        "beyond_range": 0,
+        "checked": 1,
+        "matched": 1,
+        "mismatches": [
+          {
+            "line": 6,
+            "reason": "shipped anchor does not verify: signature does not verify",
+            "seq": 10
+          },
+          {
+            "line": 0,
+            "reason": "the export's header anchor is not in the shipped file (it was not shipped, or the file is incomplete)",
+            "seq": 10
+          }
+        ],
+        "ok": false,
+        "shipped": 2
+      },
+      "checkpoints": {
+        "below_range": 1,
+        "beyond_range": 0,
+        "in_range": 3,
+        "last_shipped_seq": 14,
+        "matched": 3,
+        "mismatches": [],
+        "ok": true,
+        "shipped": 4
+      },
+      "export": "retained.jsonl",
+      "shipped": "shipped-bad-signature.jsonl"
+    },
+    {
+      "anchors": {
+        "beyond_range": 1,
+        "checked": 1,
+        "matched": 0,
+        "mismatches": [
+          {
+            "line": 5,
+            "reason": "the export's header carries another anchor for this boundary than the one shipped",
+            "seq": 5
+          }
+        ],
+        "ok": false,
+        "shipped": 2
+      },
+      "checkpoints": {
+        "below_range": 0,
+        "beyond_range": 3,
+        "in_range": 1,
+        "last_shipped_seq": 14,
+        "matched": 1,
+        "mismatches": [],
+        "ok": true,
+        "shipped": 4
+      },
+      "export": "archive-2.jsonl",
+      "shipped": "shipped-other-anchor.jsonl"
+    }
+  ]
+}
