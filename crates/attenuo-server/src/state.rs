@@ -77,7 +77,7 @@ pub struct AppState {
     pub(crate) client_rules: ClientRules,
     /// A digest of each section of the config in force but the reloadable lists, which
     /// `POST /admin/agents/reload` compares the file with to say what needs a restart.
-    pub config_sections: crate::config::SectionDigests,
+    pub(crate) config_sections: crate::config::SectionDigests,
     /// `[[root_grants]]`, the ceilings of root tokens.
     pub root_grants: Vec<RootGrant>,
     /// Trusted IdPs for hop-0 intake.
@@ -326,7 +326,7 @@ impl AppState {
             );
         }
         // `[[agents]]` and `[[peps]]`, with the check `POST /admin/agents/reload` makes too.
-        let client_rules = ClientRules::from_config(config, &actor_trust);
+        let client_rules = ClientRules::from_config(config);
         let (clients, warnings) = client_rules.check(&config.agents, &config.peps)?;
         for warning in warnings {
             tracing::warn!("{warning}");

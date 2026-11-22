@@ -3176,26 +3176,109 @@ pub fn check_reserved_client_ids(agents: &[AgentConfig], peps: &[PepConfig]) -> 
     Ok(())
 }
 
-/// The message of a TOML error in `text`, with its line, and without the line itself: the
-/// default rendering quotes it, and it can be `[admin] token = "..."` or another secret. What
-/// the reloads answer (`POST /admin/operators/reload`, `POST /admin/agents/reload`).
+/// The message of a TOML error in `text`, with its line and, when the line names one, its key
+/// and table, and without any value of the file. The default rendering quotes the line, and a
+/// deserializer's message may repeat the value it refused (`invalid type: string "...",
+/// expected u64`, `unknown variant `...``); either can be `[admin] token = "..."` or another
+/// secret. So the line is never quoted, every double-quoted string in the message is replaced
+/// by `"…"`, and so is every other occurrence of the refused value (the text the error points
+/// at). What the reloads answer (`POST /admin/operators/reload`, `POST /admin/agents/reload`).
 pub(crate) fn toml_error_text(text: &str, e: &toml::de::Error) -> String {
-    let line = e
-        .span()
-        .and_then(|s| text.get(..s.start))
+    let span = e.span();
+    let start = span.as_ref().map(|s| s.start).filter(|&s| s <= text.len());
+    let line = start
+        .and_then(|s| text.get(..s))
         .map_or(0, |before| before.matches('\n').count() + 1);
-    format!(
-        "the config file is not valid TOML (line {line}): {}",
-        e.message()
-    )
+    let mut message = e.message().to_string();
+    // The refused value as written, without its quotes: every backquoted or bare copy of it
+    // in the message goes.
+    if let Some(value) = span
+        .as_ref()
+        .and_then(|s| text.get(s.clone()))
+        .map(|v| v.trim().trim_matches(|c| c == '"' || c == '\''))
+        .filter(|v| !v.is_empty())
+    {
+        message = message.replace(&format!("`{value}`"), "`…`");
+        message = message.replace(&format!("'{value}'"), "'…'");
+    }
+    let message = redact_quoted(&message);
+    let place = start.map(|s| toml_place(text, s)).unwrap_or_default();
+    format!("the config file is not valid TOML (line {line}{place}): {message}")
+}
+
+/// `message` with the content of each double-quoted string (escapes included) replaced by
+/// `…`. A deserializer's message quotes values that way, never a type or a key.
+fn redact_quoted(message: &str) -> String {
+    let mut out = String::with_capacity(message.len());
+    let mut chars = message.chars();
+    while let Some(c) = chars.next() {
+        out.push(c);
+        if c != '"' {
+            continue;
+        }
+        out.push('…');
+        let mut escaped = false;
+        for c in chars.by_ref() {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                out.push('"');
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// `, key `k` in [table]` for the error at byte `at` of `text`: the bare key before `=` on its
+/// line and the last table header above it, each only when it is made of the characters a bare
+/// key or a header holds (nothing that could be a value). Empty when neither is found.
+fn toml_place(text: &str, at: usize) -> String {
+    let bare = |s: &str, extra: &[char]| {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "_-.".contains(c) || extra.contains(&c))
+    };
+    let before = text.get(..at).unwrap_or_default();
+    let line_start = before.rfind('\n').map_or(0, |i| i + 1);
+    let line = text.get(line_start..).unwrap_or_default();
+    let line = line.split('\n').next().unwrap_or_default();
+    let key = line
+        .split_once('=')
+        .map(|(k, _)| k.trim())
+        .filter(|k| bare(k, &[]));
+    let table = before
+        .get(..line_start)
+        .unwrap_or_default()
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| l.starts_with('['))
+        .filter(|h| bare(h, &['[', ']']));
+    match (key, table) {
+        (Some(k), Some(t)) => format!(", key `{k}` in {t}"),
+        (Some(k), None) => format!(", key `{k}`"),
+        (None, Some(t)) => format!(", in {t}"),
+        (None, None) => String::new(),
+    }
 }
 
 /// A digest of each top-level section of a config, but `[[agents]]`, `[[peps]]` and
 /// `[[admin.operators]]` (which have reloads of their own): what `POST /admin/agents/reload`
 /// compares the file with, to say which sections differ from the ones in force and so need a
 /// restart. Only digests are kept, no value of the config.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct SectionDigests(BTreeMap<String, [u8; 32]>);
+
+impl std::fmt::Debug for SectionDigests {
+    /// The section names only: a digest of a section with few possible values (one that holds
+    /// a short token, say) could be guessed from it.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_set().entries(self.0.keys()).finish()
+    }
+}
 
 impl SectionDigests {
     /// The sections (`[server]`, `[[upstreams]]`) whose digest differs between `self` and
@@ -4153,6 +4236,60 @@ mod tests {
         );
         assert!(err.contains("line 4"), "{err}");
         assert!(!err.contains("a-secret-token"), "{err}");
+    }
+
+    /// A value the deserializer refused is never repeated: not a string of the wrong type, not
+    /// an unknown variant, not a string inside a list. The key, the table and the expected type
+    /// stay.
+    #[test]
+    fn toml_error_text_never_repeats_a_value() {
+        let parse = |text: &str| {
+            format!(
+                "{:#}",
+                Config::reparse(text, std::iter::empty::<(String, String)>()).unwrap_err()
+            )
+        };
+        for (text, want) in [
+            (
+                "[limits]\nmax_in_flight = \"s3cret-hunter2-wrong-type\"\n",
+                "(line 2, key `max_in_flight` in [limits]): invalid type: string \"…\", expected",
+            ),
+            (
+                "[token]\nactor_auth = \"s3cret-hunter2-variant\"\n",
+                "(line 2, key `actor_auth` in [token]): unknown variant `…`, expected one of",
+            ),
+            (
+                "[server]\nlisten = [\"s3cret-hunter2-in-a-list\"]\n",
+                "(line 2, key `listen` in [server]): invalid type: sequence",
+            ),
+            (
+                "[server]\nlisten = 's3cret-hunter2-literal'\n",
+                "(line 2, key `listen` in [server]):",
+            ),
+        ] {
+            let err = parse(text);
+            assert!(err.contains(want), "{want}: {err}");
+            assert!(!err.contains("hunter2"), "{err}");
+        }
+    }
+
+    #[test]
+    fn redact_quoted_blanks_each_string() {
+        assert_eq!(
+            redact_quoted(r#"invalid type: string "a\"b", expected "c" or `d`"#),
+            r#"invalid type: string "…", expected "…" or `d`"#
+        );
+        assert_eq!(redact_quoted("no quotes"), "no quotes");
+        assert_eq!(redact_quoted("open \"never closed"), "open \"…");
+    }
+
+    /// `SectionDigests` prints its section names, never a digest.
+    #[test]
+    fn section_digests_debug_names_only() {
+        let cfg = Config::from_toml("[admin]\ntoken = \"t-0123456789abcdef0123456789\"\n").unwrap();
+        let shown = format!("{:?}", cfg.section_digests().unwrap());
+        assert!(shown.contains("admin"), "{shown}");
+        assert!(!shown.chars().any(|c| c.is_ascii_digit()), "{shown}");
     }
 
     #[test]

@@ -229,23 +229,23 @@ pub fn check_operators(ops: &[AdminOperator], legacy: Option<[u8; 32]>) -> anyho
 /// [`AdminOperator`] (an unknown key, a missing one, an unknown role, an `expires_at` that is
 /// not an RFC 3339 time with an offset).
 pub fn operators_from_toml(text: &str) -> anyhow::Result<Vec<AdminOperator>> {
-    // Only the error's message and line: its default rendering quotes the line, which can be
-    // `[admin] token = "..."`.
-    let mut file: toml::Table = text
-        .parse()
-        .map_err(|e: toml::de::Error| anyhow::anyhow!(crate::config::toml_error_text(text, &e)))?;
-    let Some(admin) = file.remove("admin") else {
-        return Ok(Vec::new());
-    };
-    let toml::Value::Table(mut admin) = admin else {
-        anyhow::bail!("`admin` is not a table");
-    };
-    match admin.remove("operators") {
-        None => Ok(Vec::new()),
-        Some(ops) => ops
-            .try_into::<Vec<AdminOperator>>()
-            .map_err(|e| anyhow::anyhow!("[[admin.operators]]: {}", e.message())),
+    /// The file, read for `[[admin.operators]]` alone: every other key is ignored.
+    #[derive(Deserialize)]
+    struct File {
+        #[serde(default)]
+        admin: Option<AdminOnly>,
     }
+    #[derive(Deserialize)]
+    struct AdminOnly {
+        #[serde(default)]
+        operators: Vec<AdminOperator>,
+    }
+    // Deserialized from the text, so that an error points into it: its message then names
+    // the line and key and leaves out every value ([`crate::config::toml_error_text`]); the
+    // default rendering quotes the line, which can be `[admin] token = "..."`.
+    let file: File = toml::from_str(text)
+        .map_err(|e| anyhow::anyhow!(crate::config::toml_error_text(text, &e)))?;
+    Ok(file.admin.map(|a| a.operators).unwrap_or_default())
 }
 
 #[derive(Clone)]
@@ -755,11 +755,16 @@ mod tests {
         assert!(!err.contains("secret-admin-token"), "{err}");
         assert!(operators_from_toml("admin = 1\n").is_err());
         let err = operators_from_toml(
-            "[[admin.operators]]\nname = \"a\"\ntoken_sha256 = \"x\"\nrole = \"root\"\n",
+            "[[admin.operators]]\nname = \"a\"\ntoken_sha256 = \"x\"\nrole = \"hunter2-role\"\n",
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("root"), "{err}");
+        // The key and the expected values, never the value refused.
+        assert!(
+            err.contains("key `role` in [[admin.operators]]): unknown variant `…`, expected"),
+            "{err}"
+        );
+        assert!(!err.contains("hunter2"), "{err}");
     }
 
     /// A reload keeps `[admin] token`, checks the new list as at startup against it, and
