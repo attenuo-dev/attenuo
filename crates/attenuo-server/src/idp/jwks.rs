@@ -12,6 +12,8 @@
 //! Bounds: a JWKS or discovery body over [`MAX_JWKS_BYTES`] is rejected, at most
 //! [`MAX_JWKS_KEYS`] keys are kept, and symmetric (`oct`) keys, keys marked for encryption and
 //! keys that fail to parse are skipped. A failed refresh fails closed: stale keys are not used.
+//! A client cache ([`FailurePolicy`]) also waits a backoff after a failed fetch, and keeps keys
+//! still within their TTL when only a refetch for an unknown `kid` failed.
 //!
 //! Concurrency: a fetch runs in a task of its own, one at a time per cache, and no lock is
 //! held across it; the requests that need it wait for its end, the others go on with the
@@ -85,10 +87,15 @@ pub(crate) fn fetch_client(
 /// or holds no certificate.
 pub(crate) fn read_ca_pem(path: &std::path::Path) -> Result<Vec<reqwest::Certificate>, String> {
     let pem = std::fs::read(path).map_err(|e| format!("cannot read the file ({e})"))?;
+    ca_pem_certs(&pem)
+}
+
+/// [`read_ca_pem`] of the bytes of the file.
+fn ca_pem_certs(pem: &[u8]) -> Result<Vec<reqwest::Certificate>, String> {
     if pem.iter().all(u8::is_ascii_whitespace) {
         return Err("the file is empty; it must hold PEM CA certificates".into());
     }
-    let certs = reqwest::Certificate::from_pem_bundle(&pem)
+    let certs = reqwest::Certificate::from_pem_bundle(pem)
         .map_err(|e| format!("not a PEM certificate file ({e})"))?;
     if certs.is_empty() {
         return Err("no PEM certificate (-----BEGIN CERTIFICATE-----) in the file".into());
@@ -107,17 +114,34 @@ pub(crate) fn entry_client(
     ca_pem_path: Option<&std::path::Path>,
     timeout: Duration,
 ) -> Result<reqwest::Client, String> {
+    entry_client_and_ca_digest(shared, ca_pem_path, timeout).map(|(client, _)| client)
+}
+
+/// [`entry_client`], and the SHA-256 of the `ca_pem_path` file's bytes as they were read for
+/// it (lowercase hex), so that a change of the file's content can be told.
+///
+/// # Errors
+///
+/// As [`entry_client`].
+pub(crate) fn entry_client_and_ca_digest(
+    shared: &reqwest::Client,
+    ca_pem_path: Option<&std::path::Path>,
+    timeout: Duration,
+) -> Result<(reqwest::Client, Option<String>), String> {
+    use sha2::{Digest, Sha256};
     let Some(path) = ca_pem_path else {
-        return Ok(shared.clone());
+        return Ok((shared.clone(), None));
     };
     let fail = |e: String| format!("ca_pem_path {:?}: {e}", path.display().to_string());
-    let roots = read_ca_pem(path).map_err(fail)?;
-    fetch_client(timeout, &roots).map_err(|e| {
+    let pem = std::fs::read(path).map_err(|e| fail(format!("cannot read the file ({e})")))?;
+    let roots = ca_pem_certs(&pem).map_err(fail)?;
+    let client = fetch_client(timeout, &roots).map_err(|e| {
         fail(format!(
             "a certificate cannot be used as a trust anchor ({})",
             error_chain(&e)
         ))
-    })
+    })?;
+    Ok((client, Some(hex::encode(Sha256::digest(&pem)))))
 }
 
 /// [`fetch_client`]'s builder, for a test that swaps the resolver underneath the pin.
@@ -218,29 +242,64 @@ pub(crate) struct CachedKey {
 /// refused (a fetch failure, so it fails closed). The second argument is the cache's label.
 pub(crate) type ParseKeys<K> = fn(&Value, &str) -> Result<Vec<K>, String>;
 
+/// What a cache does when a fetch fails. The default is the IdP and `[[actor_trust]]`
+/// behaviour: the keys are dropped, the next request fetches again, and the caller logs.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct FailurePolicy {
+    /// How long after a failed fetch the next one may start; until then the stored failure is
+    /// the answer, without a fetch.
+    pub(crate) backoff: Duration,
+    /// A failed refetch for an unknown `kid` keeps the keys that are still within their TTL:
+    /// only the request with the unknown `kid` is refused. A failed fetch of keys past their
+    /// TTL still drops them (fail closed).
+    pub(crate) keep_fresh_keys: bool,
+    /// Log each failed fetch here, once, at warn level as `client JWKS unavailable`, so that
+    /// callers answered with a stored failure log it at debug level only.
+    pub(crate) warn: bool,
+}
+
 struct CacheState<K> {
     jwks_uri: Option<String>,
     keys: Vec<K>,
     fetched_at: Option<Instant>,
     last_forced: Option<Instant>,
-    /// When the last fetch failed and why, while no later fetch has succeeded.
+    /// When the last failed fetch ended and why, while no later fetch has succeeded.
     failed: Option<(Instant, JwksError)>,
     /// A fetch is running (in a task of its own); callers that need it wait for it.
     fetching: bool,
+    /// Fetches started so far; the one running, if any, is number `started`.
+    started: u64,
+    /// Fetches ended so far. A caller that started or joined fetch `n` waits until
+    /// `ended >= n`, so a wake-up by the end of an earlier fetch is not taken for its own.
+    ended: u64,
+    /// Whether the last fetch that ended failed: what the callers that waited for it get.
+    last_failed: bool,
+    /// The task of the last fetch started, for a test that stops it.
+    #[cfg(test)]
+    task: Option<tokio::task::AbortHandle>,
 }
+
+/// A fetch made up by a test instead of an HTTP request.
+#[cfg(test)]
+type FakeFetch<K> = Arc<
+    dyn Fn()
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<K>, JwksError>> + Send>>
+        + Send
+        + Sync,
+>;
 
 struct Inner<K> {
     client: reqwest::Client,
     issuer: String,
     configured_url: Option<String>,
     ttl: Duration,
-    /// How long after a failed fetch the next one may start; until then the failure is the
-    /// answer. Zero for IdPs and `[[actor_trust]]` entries.
-    failure_backoff: Duration,
+    on_failure: FailurePolicy,
     parse: ParseKeys<K>,
     state: StdMutex<CacheState<K>>,
     /// Bumped each time a fetch ends, so that callers waiting for it wake up.
     done: watch::Sender<u64>,
+    #[cfg(test)]
+    fake: Option<FakeFetch<K>>,
 }
 
 impl<K> Inner<K> {
@@ -273,7 +332,7 @@ impl JwksCache<CachedKey> {
             issuer,
             jwks_url,
             ttl,
-            Duration::ZERO,
+            FailurePolicy::default(),
             |doc, issuer| Ok(parse_jwks(doc, issuer)),
         )
     }
@@ -289,16 +348,16 @@ impl JwksCache<CachedKey> {
 }
 
 impl<K: Clone + Send + Sync + 'static> JwksCache<K> {
-    /// A cache whose fetched documents `parse` turns into keys, and which, after a failed
-    /// fetch, starts no other for `failure_backoff`. `label` names the cache in log lines and
-    /// is given to `parse`. With `jwks_url` unset the URL is discovered at `label`, which is
-    /// then the issuer.
+    /// A cache whose fetched documents `parse` turns into keys, and which handles a failed
+    /// fetch as `on_failure` says. `label` names the cache in log lines and is given to
+    /// `parse`. With `jwks_url` unset the URL is discovered at `label`, which is then the
+    /// issuer.
     pub(crate) fn with_parser(
         client: reqwest::Client,
         label: String,
         jwks_url: Option<String>,
         ttl: Duration,
-        failure_backoff: Duration,
+        on_failure: FailurePolicy,
         parse: ParseKeys<K>,
     ) -> Self {
         Self {
@@ -307,7 +366,7 @@ impl<K: Clone + Send + Sync + 'static> JwksCache<K> {
                 issuer: label,
                 configured_url: jwks_url,
                 ttl,
-                failure_backoff,
+                on_failure,
                 parse,
                 state: StdMutex::new(CacheState {
                     jwks_uri: None,
@@ -316,8 +375,15 @@ impl<K: Clone + Send + Sync + 'static> JwksCache<K> {
                     last_forced: None,
                     failed: None,
                     fetching: false,
+                    started: 0,
+                    ended: 0,
+                    last_failed: false,
+                    #[cfg(test)]
+                    task: None,
                 }),
                 done: watch::channel(0).0,
+                #[cfg(test)]
+                fake: None,
             }),
         }
     }
@@ -327,56 +393,61 @@ impl<K: Clone + Send + Sync + 'static> JwksCache<K> {
     /// a refetch would not change.
     ///
     /// The keys are fetched when there are none younger than the TTL. When `pick` finds
-    /// nothing in keys that were not just fetched, they are fetched once more, at most once
-    /// per [`UNKNOWN_KID_REFETCH_COOLDOWN`]; within it the answer is
-    /// [`JwksError::UnknownKid`] without a fetch. A failed fetch drops the cached keys (fail
-    /// closed); with a `failure_backoff`, the next fetch starts only after it.
-    /// `kid` is the token's, for the log line of a refetch.
+    /// nothing in fresh keys, they are fetched once more, at most once per
+    /// [`UNKNOWN_KID_REFETCH_COOLDOWN`]; within it the answer is [`JwksError::UnknownKid`]
+    /// without a fetch. A failed fetch drops the cached keys (fail closed), except as the
+    /// cache's [`FailurePolicy`] says. A caller that waited for a fetch is answered from the
+    /// outcome of that fetch, or of a later one: the keys it fetched are used even if their
+    /// TTL has passed since. `kid` is the token's, for the log line of a refetch.
     pub(crate) async fn find<T>(
         &self,
         kid: Option<&str>,
         pick: impl Fn(&[K]) -> Result<Option<T>, JwksError>,
     ) -> Result<T, JwksError> {
         let inner = &self.inner;
-        let mut waited = false;
+        // The fetch this call waits for: one it started or joined.
+        let mut waiting_for: Option<u64> = None;
         loop {
             let mut done = {
                 let mut st = inner.lock();
-                let fresh = st.fetched_at.is_some_and(|t| t.elapsed() < inner.ttl);
-                if waited {
-                    // The fetch this call waited for has ended; it decides.
-                    if !fresh {
-                        return Err(st.failed.as_ref().map_or_else(
-                            || JwksError::Unavailable("the key fetch did not finish".into()),
-                            |(_, e)| e.clone(),
-                        ));
-                    }
-                    return pick(&st.keys)?.ok_or(JwksError::UnknownKid);
-                }
-                if fresh {
-                    if let Some(k) = pick(&st.keys)? {
-                        return Ok(k);
-                    }
-                    if !st.fetching {
-                        let cooling = st
-                            .last_forced
-                            .is_some_and(|t| t.elapsed() < UNKNOWN_KID_REFETCH_COOLDOWN);
-                        if cooling {
-                            return Err(JwksError::UnknownKid);
+                if let Some(n) = waiting_for {
+                    if st.ended >= n {
+                        if st.last_failed {
+                            return Err(st.failed.as_ref().map_or_else(
+                                || JwksError::Unavailable("the key fetch failed".into()),
+                                |(_, e)| e.clone(),
+                            ));
                         }
-                        st.last_forced = Some(Instant::now());
-                        tracing::info!(issuer = %inner.issuer, kid = ?kid, "unknown kid; refetching JWKS");
-                        self.start_fetch(&mut st);
+                        return pick(&st.keys)?.ok_or(JwksError::UnknownKid);
                     }
-                } else if !st.fetching {
-                    if let Some((at, e)) = &st.failed {
-                        if at.elapsed() < inner.failure_backoff {
-                            return Err(e.clone());
+                    // Woken by the end of an earlier fetch: this one still runs.
+                } else {
+                    let fresh = st.fetched_at.is_some_and(|t| t.elapsed() < inner.ttl);
+                    if fresh {
+                        if let Some(k) = pick(&st.keys)? {
+                            return Ok(k);
                         }
+                        if !st.fetching {
+                            let cooling = st
+                                .last_forced
+                                .is_some_and(|t| t.elapsed() < UNKNOWN_KID_REFETCH_COOLDOWN);
+                            if cooling {
+                                return Err(JwksError::UnknownKid);
+                            }
+                            st.last_forced = Some(Instant::now());
+                            tracing::info!(issuer = %inner.issuer, kid = ?kid, "unknown kid; refetching JWKS");
+                            self.start_fetch(&mut st, true);
+                        }
+                    } else if !st.fetching {
+                        if let Some((at, e)) = &st.failed {
+                            if at.elapsed() < inner.on_failure.backoff {
+                                return Err(e.clone());
+                            }
+                        }
+                        self.start_fetch(&mut st, false);
                     }
-                    self.start_fetch(&mut st);
+                    waiting_for = Some(st.started);
                 }
-                waited = true;
                 // Subscribed under the lock, so the end of the running fetch is not missed.
                 inner.done.subscribe()
             };
@@ -386,48 +457,61 @@ impl<K: Clone + Send + Sync + 'static> JwksCache<K> {
     }
 
     /// Start a fetch in a task of its own. The caller holds the lock and saw none running.
-    fn start_fetch(&self, st: &mut CacheState<K>) {
+    /// `forced`: a refetch for an unknown `kid`, while the cached keys are fresh.
+    fn start_fetch(&self, st: &mut CacheState<K>, forced: bool) {
         st.fetching = true;
+        st.started += 1;
         let discovered = st.jwks_uri.clone();
-        let guard = FetchGuard(Some(Arc::clone(&self.inner)));
-        tokio::spawn(async move {
-            let Some(inner) = guard.0.as_ref() else {
+        let guard = FetchGuard(Some((Arc::clone(&self.inner), forced)));
+        let _task = tokio::spawn(async move {
+            let Some((inner, _)) = guard.0.as_ref() else {
                 return;
             };
             let outcome = inner.fetch(discovered).await;
             guard.finish(outcome);
         });
+        #[cfg(test)]
+        {
+            st.task = Some(_task.abort_handle());
+        }
     }
 }
 
 /// Ends a running fetch: [`finish`](Self::finish) stores its outcome; dropped without it (the
-/// task panicked or the runtime shut down), the fetch counts as failed, so that no caller
-/// waits for it forever.
-struct FetchGuard<K>(Option<Arc<Inner<K>>>);
+/// task panicked, was stopped, or the runtime shut down), the fetch counts as failed, so that
+/// no caller waits for it forever.
+struct FetchGuard<K>(Option<(Arc<Inner<K>>, bool)>);
 
 impl<K> FetchGuard<K> {
     fn finish(mut self, outcome: Result<(Option<String>, Vec<K>), JwksError>) {
-        if let Some(inner) = self.0.take() {
-            end_fetch(&inner, outcome);
+        if let Some((inner, forced)) = self.0.take() {
+            end_fetch(&inner, forced, outcome);
         }
     }
 }
 
 impl<K> Drop for FetchGuard<K> {
     fn drop(&mut self) {
-        if let Some(inner) = self.0.take() {
+        if let Some((inner, forced)) = self.0.take() {
             end_fetch(
                 &inner,
+                forced,
                 Err(JwksError::Unavailable("the key fetch stopped".into())),
             );
         }
     }
 }
 
-fn end_fetch<K>(inner: &Inner<K>, outcome: Result<(Option<String>, Vec<K>), JwksError>) {
+fn end_fetch<K>(
+    inner: &Inner<K>,
+    forced: bool,
+    outcome: Result<(Option<String>, Vec<K>), JwksError>,
+) {
     {
         let mut st = inner.lock();
         st.fetching = false;
+        // One fetch at a time: the one ending is the last one started.
+        st.ended = st.started;
         match outcome {
             Ok((discovered, keys)) => {
                 tracing::debug!(issuer = %inner.issuer, keys = keys.len(), "JWKS fetched");
@@ -435,14 +519,27 @@ fn end_fetch<K>(inner: &Inner<K>, outcome: Result<(Option<String>, Vec<K>), Jwks
                 st.keys = keys;
                 st.fetched_at = Some(Instant::now());
                 st.failed = None;
+                st.last_failed = false;
             }
             Err(e) => {
-                // Fail closed: if the refresh fails, the old keys are not used either. A
-                // discovered jwks_uri may have moved; rediscover next time.
-                st.jwks_uri = None;
-                st.keys.clear();
-                st.fetched_at = None;
+                if inner.on_failure.warn {
+                    // The detail names the URL and the cause: logged, never answered (SR-17).
+                    tracing::warn!(
+                        client = %inner.issuer,
+                        detail = ?e.to_string(),
+                        "client JWKS unavailable"
+                    );
+                }
+                let fresh = st.fetched_at.is_some_and(|t| t.elapsed() < inner.ttl);
+                if !(forced && fresh && inner.on_failure.keep_fresh_keys) {
+                    // Fail closed: if the refresh fails, the old keys are not used either. A
+                    // discovered jwks_uri may have moved; rediscover next time.
+                    st.jwks_uri = None;
+                    st.keys.clear();
+                    st.fetched_at = None;
+                }
                 st.failed = Some((Instant::now(), e));
+                st.last_failed = true;
             }
         }
     }
@@ -456,6 +553,10 @@ impl<K> Inner<K> {
         &self,
         discovered: Option<String>,
     ) -> Result<(Option<String>, Vec<K>), JwksError> {
+        #[cfg(test)]
+        if let Some(fake) = &self.fake {
+            return fake().await.map(|keys| (None, keys));
+        }
         let uri = match (&self.configured_url, discovered) {
             (Some(u), _) => u.clone(),
             (None, Some(u)) => u,
@@ -877,7 +978,7 @@ mod tests {
     }
 
     /// Requests that need the keys at once share one fetch.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_requests_share_one_fetch() {
         use std::sync::atomic::Ordering;
         let (url, hits, _) = slow_key_server(Duration::from_millis(200)).await;
@@ -896,7 +997,7 @@ mod tests {
 
     /// No lock is held across a fetch: while an unknown `kid` waits for a slow refetch, a
     /// request with a cached key is answered from the cache.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_slow_refetch_does_not_hold_up_cached_keys() {
         use std::sync::atomic::Ordering;
         let (url, hits, _) = slow_key_server(Duration::from_secs(3)).await;
@@ -922,7 +1023,7 @@ mod tests {
 
     /// With a failure backoff, a failed fetch is the answer until it has passed: no new fetch.
     /// Without one (IdPs), the next request fetches again.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_failure_backoff_holds_back_the_next_fetch() {
         use std::sync::atomic::Ordering;
         let (url, hits, down) = slow_key_server(Duration::ZERO).await;
@@ -933,7 +1034,10 @@ mod tests {
             "i".into(),
             Some(url.clone()),
             Duration::from_secs(300),
-            Duration::from_secs(3600),
+            FailurePolicy {
+                backoff: Duration::from_secs(3600),
+                ..FailurePolicy::default()
+            },
             |doc, issuer| Ok(parse_jwks(doc, issuer)),
         );
         let pick = |keys: &[CachedKey]| select(keys, Some("a"), Algorithm::EdDSA);
@@ -955,6 +1059,219 @@ mod tests {
         // Back up: the cache without a backoff recovers on the next request.
         down.store(false, Ordering::SeqCst);
         plain.key_for(Some("a"), Algorithm::EdDSA).await.unwrap();
+    }
+
+    /// What one made-up fetch does.
+    enum Step {
+        Answer(Result<Vec<&'static str>, JwksError>),
+        Panic,
+        Hang,
+    }
+
+    /// A cache of made-up keys (`kid`s) whose fetches the test answers one by one with
+    /// `steps`; `calls` counts the fetches started.
+    fn scripted(
+        ttl: Duration,
+        on_failure: FailurePolicy,
+    ) -> (
+        JwksCache<&'static str>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::sync::mpsc::UnboundedSender<Step>,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Step>();
+        let rx = Arc::new(tokio::sync::Mutex::new(rx));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        let fake: FakeFetch<&'static str> = Arc::new(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            let rx = Arc::clone(&rx);
+            Box::pin(async move {
+                let step = rx.lock().await.recv().await;
+                match step {
+                    Some(Step::Answer(outcome)) => outcome,
+                    Some(Step::Panic) => panic!("a made-up fetch panics"),
+                    Some(Step::Hang) => std::future::pending().await,
+                    None => Err(JwksError::Unavailable("no more steps".into())),
+                }
+            })
+        });
+        let mut cache = JwksCache::with_parser(
+            reqwest::Client::new(),
+            "scripted".into(),
+            Some("https://keys.invalid/jwks".into()),
+            ttl,
+            on_failure,
+            |_, _| Err("not fetched over HTTP".into()),
+        );
+        Arc::get_mut(&mut cache.inner).expect("not shared yet").fake = Some(fake);
+        (cache, calls, tx)
+    }
+
+    fn keys(kids: &[&'static str]) -> Step {
+        Step::Answer(Ok(kids.to_vec()))
+    }
+
+    fn down() -> Step {
+        Step::Answer(Err(JwksError::Unavailable("down".into())))
+    }
+
+    /// Look `kid` up in a scripted cache.
+    async fn lookup(
+        cache: &JwksCache<&'static str>,
+        kid: &'static str,
+    ) -> Result<&'static str, JwksError> {
+        cache
+            .find(Some(kid), |keys| {
+                Ok(keys.iter().copied().find(|k| *k == kid))
+            })
+            .await
+    }
+
+    async fn calls_reach(calls: &std::sync::atomic::AtomicUsize, n: usize) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while calls.load(std::sync::atomic::Ordering::SeqCst) < n {
+            assert!(Instant::now() < deadline, "fetch {n} never started");
+            tokio::task::yield_now().await;
+        }
+    }
+
+    const CLIENT: FailurePolicy = FailurePolicy {
+        backoff: Duration::ZERO,
+        keep_fresh_keys: true,
+        warn: false,
+    };
+
+    /// A caller woken by the end of an earlier fetch keeps waiting for its own: here the
+    /// wake-up that fetch 1 sends after fetch 2 has started.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_stale_wake_up_does_not_answer_from_an_earlier_fetch() {
+        let (cache, calls, steps) = scripted(Duration::from_secs(300), FailurePolicy::default());
+        let cache = Arc::new(cache);
+        steps.send(down()).unwrap();
+        assert!(matches!(
+            lookup(&cache, "a").await,
+            Err(JwksError::Unavailable(_))
+        ));
+        let mut second = {
+            let cache = Arc::clone(&cache);
+            tokio::spawn(async move { lookup(&cache, "a").await })
+        };
+        calls_reach(&calls, 2).await;
+        // What the end of fetch 1 did, late: wake every waiter.
+        cache.inner.done.send_modify(|n| *n = n.wrapping_add(1));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), &mut second)
+                .await
+                .is_err(),
+            "the caller took the end of fetch 1 for the end of its own"
+        );
+        steps.send(keys(&["a"])).unwrap();
+        assert_eq!(second.await.unwrap(), Ok("a"));
+    }
+
+    /// A caller that waited for a fetch takes the set it got, even when the TTL has passed by
+    /// the time it looks (here a TTL of zero).
+    #[tokio::test]
+    async fn a_waiter_takes_the_set_its_fetch_got_even_past_the_ttl() {
+        let (cache, _, steps) = scripted(Duration::ZERO, FailurePolicy::default());
+        steps.send(keys(&["a"])).unwrap();
+        assert_eq!(lookup(&cache, "a").await, Ok("a"));
+    }
+
+    /// A client cache: a refetch for an unknown `kid` that fails keeps the fresh keys, so
+    /// made-up `kid`s and a flaky key host cannot lock the real client out.
+    #[tokio::test]
+    async fn a_failed_unknown_kid_refetch_keeps_fresh_client_keys() {
+        let (cache, calls, steps) = scripted(Duration::from_secs(300), CLIENT);
+        steps.send(keys(&["a"])).unwrap();
+        assert_eq!(lookup(&cache, "a").await, Ok("a"));
+        steps.send(down()).unwrap();
+        assert!(matches!(
+            lookup(&cache, "made-up").await,
+            Err(JwksError::Unavailable(_))
+        ));
+        assert_eq!(lookup(&cache, "a").await, Ok("a"));
+        // The refetch allowance is used up: no fetch, and the key in force still works.
+        assert_eq!(lookup(&cache, "other").await, Err(JwksError::UnknownKid));
+        assert_eq!(lookup(&cache, "a").await, Ok("a"));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// A client cache still fails closed when the refresh of keys past their TTL fails.
+    #[tokio::test]
+    async fn a_failed_refresh_past_the_ttl_drops_client_keys() {
+        let (cache, _, steps) = scripted(Duration::ZERO, CLIENT);
+        steps.send(keys(&["a"])).unwrap();
+        assert_eq!(lookup(&cache, "a").await, Ok("a"));
+        steps.send(down()).unwrap();
+        assert!(matches!(
+            lookup(&cache, "a").await,
+            Err(JwksError::Unavailable(_))
+        ));
+        assert!(cache.inner.lock().keys.is_empty());
+    }
+
+    /// Without the client policy (IdPs, `[[actor_trust]]`), a failed refetch for an unknown
+    /// `kid` drops the keys, as before.
+    #[tokio::test]
+    async fn without_the_client_policy_a_failed_refetch_drops_the_keys() {
+        let (cache, calls, steps) = scripted(Duration::from_secs(300), FailurePolicy::default());
+        steps.send(keys(&["a"])).unwrap();
+        assert_eq!(lookup(&cache, "a").await, Ok("a"));
+        steps.send(down()).unwrap();
+        assert!(lookup(&cache, "made-up").await.is_err());
+        assert!(cache.inner.lock().keys.is_empty());
+        steps.send(keys(&["a"])).unwrap();
+        assert_eq!(lookup(&cache, "a").await, Ok("a"));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    /// A fetch task that panics ends its fetch: the waiters get an error, and the next call
+    /// fetches again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_fetch_task_that_panics_ends_the_fetch() {
+        let (cache, calls, steps) = scripted(Duration::from_secs(300), FailurePolicy::default());
+        let cache = Arc::new(cache);
+        let waiters: Vec<_> = (0..4)
+            .map(|_| {
+                let cache = Arc::clone(&cache);
+                tokio::spawn(async move { lookup(&cache, "a").await })
+            })
+            .collect();
+        calls_reach(&calls, 1).await;
+        steps.send(Step::Panic).unwrap();
+        for w in waiters {
+            let Err(JwksError::Unavailable(msg)) = w.await.unwrap() else {
+                panic!("a waiter of a panicked fetch must get an error");
+            };
+            assert!(msg.contains("stopped"), "{msg}");
+        }
+        steps.send(keys(&["a"])).unwrap();
+        assert_eq!(lookup(&cache, "a").await, Ok("a"));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// A fetch task that is stopped (aborted) ends its fetch the same way.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_stopped_fetch_task_ends_the_fetch() {
+        let (cache, calls, steps) = scripted(Duration::from_secs(300), FailurePolicy::default());
+        let cache = Arc::new(cache);
+        steps.send(Step::Hang).unwrap();
+        let waiter = {
+            let cache = Arc::clone(&cache);
+            tokio::spawn(async move { lookup(&cache, "a").await })
+        };
+        calls_reach(&calls, 1).await;
+        let task = cache.inner.lock().task.take().expect("a fetch task");
+        task.abort();
+        let Err(JwksError::Unavailable(msg)) = waiter.await.unwrap() else {
+            panic!("a waiter of a stopped fetch must get an error");
+        };
+        assert!(msg.contains("stopped"), "{msg}");
+        steps.send(keys(&["a"])).unwrap();
+        assert_eq!(lookup(&cache, "a").await, Ok("a"));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[test]
