@@ -11,7 +11,7 @@ attenuo [--server URL] [--json] <command>
 | Option | Environment | Default | Meaning |
 | --- | --- | --- | --- |
 | `--server`, `--url` | `ATTENUO_SERVER` | `http://127.0.0.1:8080` | Base URL of the attenuo server. Goes before the subcommand. Every request goes here, except requests to `/admin/*` when `--admin-server` is set. Give the final URL: the CLI follows no redirect (SR-112), and a 3xx answer is an error (exit 1) naming the URL, the status and the `Location`, for example `error: http://attenuo.internal:8080/token answered 308 Permanent Redirect (Location https://attenuo.internal/token); attenuo does not follow redirects, so --server must be the final URL, the one that answers without a redirect`. The same holds for `--admin-server` and for an `approval verify --jwks` URL. |
-| `--admin-server URL` | `ATTENUO_ADMIN_SERVER` | `--server` | Base URL of the admin API, for a server with `[admin] listen` ([network exposure](../guides/deploying.md#network-exposure)): the main listener answers `/admin/*` as an unknown path. Every request to `/admin/*` goes here. Those are the requests of `token root`, `lease`, `audit` other than `audit verify --file`, `approval list`, `show`, `grant` and `decline`, `budget refund`, `policy reload`, `show`, `check` and `evaluate`, `policy test --via admin-evaluate`, `admin operator reload` and `admin agent reload`. Everything else, including `health` and the JWKS that `token inspect --verify`, `approval verify` and `audit verify --file` fetch, still goes to `--server`, so one invocation can use both. Unset or empty, `/admin/*` goes to `--server` as well, and a `404` without an error code from it (the main listener's answer to a path it does not serve) gets a second line, `hint: the server may serve its admin API on a separate listener ([admin] listen); pass --admin-server URL (or set ATTENUO_ADMIN_SERVER)`. A JSON `404` `not_found` (an unknown lease, approval or audit record) gets no hint. Goes before or after the subcommand. |
+| `--admin-server URL` | `ATTENUO_ADMIN_SERVER` | `--server` | Base URL of the admin API, for a server with `[admin] listen` ([network exposure](../guides/deploying.md#network-exposure)): the main listener answers `/admin/*` as an unknown path. Every request to `/admin/*` goes here. Those are the requests of `token root`, `lease`, `audit` other than `audit verify --file`, `approval list`, `show`, `grant` and `decline`, `budget refund`, `policy reload`, `show`, `check` and `evaluate`, `policy test --via admin-evaluate`, `admin operator reload`, `admin agent reload` and `admin key reload`. Everything else, including `health` and the JWKS that `token inspect --verify`, `approval verify` and `audit verify --file` fetch, still goes to `--server`, so one invocation can use both. Unset or empty, `/admin/*` goes to `--server` as well, and a `404` without an error code from it (the main listener's answer to a path it does not serve) gets a second line, `hint: the server may serve its admin API on a separate listener ([admin] listen); pass --admin-server URL (or set ATTENUO_ADMIN_SERVER)`. A JSON `404` `not_found` (an unknown lease, approval or audit record) gets no hint. Goes before or after the subcommand. |
 | `--admin-token-stdin` | | off | Read the admin token from the first line of standard input. The three admin token options go before or after the subcommand. |
 | `--admin-token-file PATH` | | none | Read the admin token from the first line of a file. |
 | `--admin-token TOKEN` | `ATTENUO_ADMIN_TOKEN` | none | Bearer for `/admin/*`. Prefer the environment variable, stdin or a file: an argument is readable by other local users (`ps`, `/proc/<pid>/cmdline`) and lands in shell history, so the CLI prints a warning to stderr when it is used. |
@@ -271,7 +271,7 @@ Ask the server to re-read `[[agents]]` and `[[peps]]` from the config file it wa
 | Option | Meaning |
 | --- | --- |
 | `--allow-empty` | Accept a file that leaves `[[agents]]` or `[[peps]]` empty while the server has entries in force. Without it the reload is refused (`agents_reload_empties`): an empty or cut-off file reads that way. |
-| `--allow-mismatch` | Accept a file whose `[issuer]` or `[audit]` differs from the running config. Without it the reload is refused (`config_file_mismatch`): such a file may be another server's. Only the lists are applied either way. |
+| `--allow-mismatch` | Accept a file whose `[issuer]` (its key files aside) or `[audit]` differs from the running config. Without it the reload is refused (`config_file_mismatch`): such a file may be another server's. Only the lists are applied either way. |
 
 ```console
 $ attenuo admin agent reload
@@ -287,6 +287,28 @@ Warnings go to stderr, one `warning:` line each, in text and `--json` mode alike
 Removing an agent stops it authenticating with its secret or key. It does not always stop new tokens: with `[token] require_actor_auth = false` an exchange can still name it as the actor, and an `[[actor_trust]]` entry that maps a workload to its id still lets it in with an actor token (removing that takes a restart). The reload warns about both. Tokens already issued are not revoked either: revoke them with [`lease revoke`](#lease-revoke-id---reason-text). To contain a compromised agent, remove it, reload, and revoke its leases.
 
 A refusal exits 1 with the server's code, and the lists in force stay as they were: `agents_invalid` (the file does not parse, or a list breaks a [startup rule](config.md#agents)), `agents_reload_empties` and `config_file_mismatch` (above), `reload_unavailable` (the server was not started from a config file), `config_unreadable` (the file cannot be read), or `admin_role_insufficient` (the token's role is below `admin`).
+
+### `admin key reload`
+
+Ask the server to rotate its token signing key without a restart (`POST /admin/keys/reload`, role `admin`). The server re-reads its config file, takes from it only `[issuer] private_key_pem_path` and `previous_key_paths`, reads those key files, and puts the new signing key and verifying keys in force at once. Prints the signing key id before and after, the key ids added to and removed from the verifying set, the key that now signs audit checkpoints, and the sections of the file that differ from the running config and need a restart; `--json` prints the server's answer. Only key ids are printed, never a key. The steps of a rotation are in [Deploying](../guides/deploying.md#key-rotation).
+
+| Option | Meaning |
+| --- | --- |
+| `--allow-drop-current` | Accept a new signing key while the current one is not in `previous_key_paths`. Every token the current key signed stops verifying at once. Without it the reload is refused (`keys_reload_drops_current`). Use it after a key compromise. |
+| `--allow-drop-audit-key` | Accept verifying keys that leave out a key that signed audit checkpoints or anchors the log still holds, or the key that signs them now. `attenuo audit verify` then reports those as signed by an unknown key. Without it the reload is refused (`keys_reload_drops_audit_key`). |
+| `--allow-mismatch` | Accept a file whose `[issuer]` (its key files aside) or `[audit]` differs from the running config. Without it the reload is refused (`config_file_mismatch`): such a file may be another server's. Only the keys are applied either way. |
+
+```console
+$ attenuo admin key reload
+signing key: 9gqQK0TiSahsP4OxT1Gk2g -> mQ3lMQcsS6m-yZ-a9pD1yQ
+verifying keys: 2 in force, 1 added, 0 removed
+  added    mQ3lMQcsS6m-yZ-a9pD1yQ
+audit checkpoints signed by: mQ3lMQcsS6m-yZ-a9pD1yQ
+```
+
+Warnings go to stderr, one `warning:` line each, and the exit status stays 0. A line `still keyed by the startup key (restart to re-key)` names the DPoP nonces and the subject digests, when they are on: they keep the key the server started with until a restart.
+
+A refusal exits 1 with the server's code, and the keys in force stay as they were: `keys_config_invalid` (the file does not parse, or sets no `private_key_pem_path`), `key_file_unreadable`, `key_file_invalid` (not an Ed25519 key of the kind wanted), `key_duplicate` (a key in two files), `keys_reload_drops_current`, `keys_reload_drops_audit_key` and `config_file_mismatch` (above), `reload_unavailable` (the server was not started from a config file), `config_unreadable` (the file cannot be read), or `admin_role_insufficient` (the token's role is below `admin`).
 
 ### `token inspect <JWT>`
 
