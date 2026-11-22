@@ -73,6 +73,7 @@ fn renew_sync(state: &AppState, headers: &HeaderMap) -> Result<Response, ApiErro
     })?;
     let now = state.now();
     let verified = state
+        .keys()
         .verifier
         .verify(bearer, now)
         .map_err(|e| ApiError::bad_token(&e))?;

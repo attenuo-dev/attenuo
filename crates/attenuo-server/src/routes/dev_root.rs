@@ -128,7 +128,9 @@ fn mint_root_sync(
         authenticated_at: now,
         attributes,
     };
-    let issued = state
+    // One snapshot of the issuer's keys to sign and register the token with.
+    let keys = state.keys();
+    let issued = keys
         .issuer
         .issue_root_with(
             user,
@@ -145,6 +147,7 @@ fn mint_root_sync(
         .map_err(crate::error::mint_refusal)?;
     register_issued(
         state,
+        &keys.verifier,
         &issued.token,
         &issued.lease,
         None,

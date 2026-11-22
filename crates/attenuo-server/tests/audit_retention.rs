@@ -219,7 +219,7 @@ async fn a_prune_end_to_end_with_a_file_sink() {
     let cfg = config(&dir, PruneMode::Manual);
     let h = start(dir, cfg).await;
     h.fill(35).await;
-    let keys = h.state.checkpoint_keys.clone();
+    let keys = h.state.keys().checkpoint_keys.clone();
     let pruned_id = h.state.audit.entry_at(7).unwrap().unwrap().record.id;
 
     // The plan rounds 27 down to the checkpoint at 20.
@@ -763,7 +763,7 @@ async fn the_deletes_resume_after_a_restart() {
     assert!(
         state
             .audit
-            .verify_chain_signed(&state.checkpoint_keys)
+            .verify_chain_signed(&state.keys().checkpoint_keys)
             .unwrap()
             .ok
     );
@@ -844,7 +844,7 @@ async fn an_export_overtaken_by_a_prune_ends_with_an_error() {
     // a file that does not verify as complete.
     assert!(!text.contains("\"seq\":501,"));
     assert!(parse_export(&text)
-        .map(|e| verify_export(&e, &state.checkpoint_keys)
+        .map(|e| verify_export(&e, &state.keys().checkpoint_keys)
             .map_or(true, |r| !r.report.ok || r.truncated))
         .unwrap_or(true));
 }

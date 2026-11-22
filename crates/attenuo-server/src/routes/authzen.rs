@@ -701,6 +701,7 @@ fn bearer_auth(
     };
     let now = state.now();
     let v = state
+        .keys()
         .verifier
         .verify(token, now)
         .map_err(|e| ApiError::bad_token(&e))?;
@@ -807,7 +808,7 @@ fn admit(
         .map_err(|e| ApiError::bad_request("invalid_request", e.to_string()))?;
     if let Some(pep) = body_chain_pep {
         chain_value
-            .validate_at(now, state.verifier.max_depth())
+            .validate_at(now, state.keys().verifier.max_depth())
             .map_err(|e| {
                 // The code `POST /admin/policies/check` answers a chain that does not validate.
                 ApiError::bad_request("invalid_request", e.to_string()).with_code(INVALID_CHAIN)

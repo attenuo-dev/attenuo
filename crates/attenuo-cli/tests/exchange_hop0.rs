@@ -194,6 +194,7 @@ async fn an_id_token_becomes_a_root_token() {
     let url = server.url("").trim_end_matches('/').to_string();
     let verify = |token: &str| {
         state
+            .keys()
             .verifier
             .verify(token, OffsetDateTime::now_utc())
             .unwrap()
@@ -333,6 +334,7 @@ async fn a_bound_id_jag_with_a_client_key_becomes_a_bound_root_token() {
     let resp: Value = serde_json::from_str(&ok(&run(c, None).await)).unwrap();
     assert_eq!(resp["token_type"], "DPoP", "{resp}");
     let root = state
+        .keys()
         .verifier
         .verify(
             resp["access_token"].as_str().unwrap(),

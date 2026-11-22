@@ -173,7 +173,7 @@ pub fn approval_token(
 /// [`approval_json`] plus `approval_token` while the approval is granted and unexpired.
 fn approval_body(state: &AppState, a: &Approval, now: OffsetDateTime) -> Value {
     let mut v = approval_json(a, now);
-    if let Some(t) = approval_token(&state.issuer, a, now) {
+    if let Some(t) = approval_token(&state.keys().issuer, a, now) {
         v["approval_token"] = json!(t);
     }
     v
@@ -263,7 +263,8 @@ fn required_bearer(headers: &HeaderMap) -> Result<&str, ApiError> {
 
 /// Is `token` one of this server's delegation tokens (by its unverified `iss`)?
 fn is_delegation_token(state: &AppState, token: &str) -> bool {
-    crate::idp::unverified_issuer(token).as_deref() == Some(state.issuer.config().issuer.as_str())
+    crate::idp::unverified_issuer(token).as_deref()
+        == Some(state.keys().issuer.config().issuer.as_str())
 }
 
 /// Check that `id_token` is an ID token of the originating user of `a`'s run. Returns the
@@ -380,6 +381,7 @@ pub async fn user_get(
     let a = state.blocking(move |s| load(s, &id2)).await?;
     if is_delegation_token(&state, &token) {
         let verified = state
+            .keys()
             .verifier
             .verify(&token, now)
             .map_err(|e| ApiError::bad_token(&e))?;

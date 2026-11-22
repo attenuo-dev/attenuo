@@ -1255,7 +1255,7 @@ pub async fn audit_verify(
 ) -> Result<Json<SignedVerifyReport>, ApiError> {
     Ok(Json(
         state
-            .blocking(|s| s.audit.verify_chain_signed(&s.checkpoint_keys))
+            .blocking(|s| s.audit.verify_chain_signed(&s.keys().checkpoint_keys))
             .await?,
     ))
 }
@@ -1795,10 +1795,10 @@ pub async fn reload_policies(
     })))
 }
 
-/// Audit a refused reload (`tool` is `admin.operators.reload` or `admin.agents.reload`) as a
-/// `deny` whose reason is the refusal's code, then hand the refusal back. A failure to audit
-/// is logged; the refusal is answered either way.
-async fn audited_refusal(
+/// Audit a refused reload (`tool` is `admin.operators.reload`, `admin.agents.reload` or
+/// `admin.keys.reload`) as a `deny` whose reason is the refusal's code, then hand the refusal
+/// back. A failure to audit is logged; the refusal is answered either way.
+pub(super) async fn audited_refusal(
     state: &Arc<AppState>,
     who: AdminIdentity,
     tool: &'static str,
@@ -1806,7 +1806,21 @@ async fn audited_refusal(
     refusal: ApiError,
     now: OffsetDateTime,
 ) -> ApiError {
-    let p = path.to_path_buf();
+    audited_refusal_with(state, who, tool, path, json!({}), refusal, now).await
+}
+
+/// [`audited_refusal`], with `args` (an object of names, ids and paths, never a secret or a
+/// file's content) added to the record's arguments beside `path`.
+pub(super) async fn audited_refusal_with(
+    state: &Arc<AppState>,
+    who: AdminIdentity,
+    tool: &'static str,
+    path: &std::path::Path,
+    mut args: Value,
+    refusal: ApiError,
+    now: OffsetDateTime,
+) -> ApiError {
+    args["path"] = json!(path);
     let reason = refusal.stable_code().to_string();
     let _ = state
         .blocking(move |state| {
@@ -1817,7 +1831,7 @@ async fn audited_refusal(
                 Decision::Deny,
                 &reason,
                 Vec::new(),
-                json!({ "path": p }),
+                args,
                 now,
             )
         })
@@ -1965,7 +1979,7 @@ pub struct AgentsReloadBody {
 }
 
 /// The two sections whose difference makes a file look like another server's.
-const IDENTITY_SECTIONS: [&str; 2] = ["[audit]", "[issuer]"];
+pub(super) const IDENTITY_SECTIONS: [&str; 2] = ["[audit]", "[issuer]"];
 
 /// `POST /admin/agents/reload`: re-read `[[agents]]` and `[[peps]]` from the config file the
 /// server was started with, check them as startup does (the same function, against the other

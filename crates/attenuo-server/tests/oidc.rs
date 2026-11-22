@@ -322,6 +322,7 @@ impl Harness {
 
     fn verify(&self, token: &str) -> attenuo_core::DelegationChain {
         self.state
+            .keys()
             .verifier
             .verify(token, OffsetDateTime::now_utc())
             .unwrap()
@@ -1062,6 +1063,7 @@ async fn id_jag_bound_to_a_dpop_key_needs_its_proof() {
     assert_eq!(body["token_type"], "DPoP", "{body}");
     let verified = h
         .state
+        .keys()
         .verifier
         .verify(
             body["access_token"].as_str().unwrap(),
@@ -1122,6 +1124,7 @@ async fn id_jag_dpop_proofs_follow_draft_06_section_9_11() {
     assert_eq!(body["token_type"], "DPoP", "{body}");
     let verified = h
         .state
+        .keys()
         .verifier
         .verify(body["access_token"].as_str().unwrap(), now())
         .unwrap();

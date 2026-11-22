@@ -280,6 +280,7 @@ async fn jwt_svid_authenticates_the_agent_at_hop_0() {
     let root = v["access_token"].as_str().unwrap().to_owned();
     let verified = h
         .state
+        .keys()
         .verifier
         .verify(&root, OffsetDateTime::now_utc())
         .unwrap();
@@ -434,6 +435,7 @@ async fn hop_0_actor_tokens_are_single_use_and_cap_the_root_ttl() {
     assert!(v["expires_in"].as_u64().unwrap() <= 45, "{v}");
     let chain = h
         .state
+        .keys()
         .verifier
         .verify(
             v["access_token"].as_str().unwrap(),

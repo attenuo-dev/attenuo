@@ -1315,6 +1315,7 @@ async fn the_unsigned_chain_path_follows_the_peps() {
     let (token, _) = h.root().await;
     let chain = h
         .state
+        .keys()
         .verifier
         .verify(&token, time::OffsetDateTime::now_utc())
         .unwrap()

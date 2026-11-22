@@ -390,7 +390,10 @@ fn exchange_sync(
     }
     // A subject token that does not verify, or whose DPoP proof does not, is refused with a
     // server log line only, so an anonymous caller cannot write to the audit log (SR-18).
-    let parent = state.verifier.verify(&req.subject_token, now)?;
+    // One snapshot of the issuer's keys for the whole exchange: the parent is verified, the
+    // child signed and read back with the same keys, whatever a key reload does meanwhile.
+    let issuer_keys = state.keys();
+    let parent = issuer_keys.verifier.verify(&req.subject_token, now)?;
     // DPoP (SR-24): bind the child to the header proof's key; a bound parent needs proof of
     // its key and a bound child.
     let cnf = state.dpop.bind_exchange(
@@ -405,6 +408,7 @@ fn exchange_sync(
     let asked = req.requested.clone();
     let dpop_bound = cnf.is_some();
     let verified = Verified {
+        keys: &issuer_keys,
         parent: &parent,
         mismatch,
         actor_auth,
@@ -438,6 +442,8 @@ fn exchange_sync(
 
 /// What [`exchange_sync`] established before the subject token's chain is used.
 struct Verified<'a> {
+    /// The request's snapshot of the issuer's keys, which verified `parent`.
+    keys: &'a crate::issuer_keys::IssuerKeys,
     parent: &'a attenuo_token::VerifiedToken,
     mismatch: Option<ApiError>,
     actor_auth: &'static str,
@@ -454,6 +460,7 @@ fn exchange_verified(
     now: OffsetDateTime,
 ) -> Result<Response, Failure> {
     let Verified {
+        keys: issuer_keys,
         parent,
         mismatch,
         actor_auth,
@@ -536,7 +543,7 @@ fn exchange_verified(
         req.requested = clamp_to_remaining(state, parent_hop, &req.requested)?;
     }
     let resp = req
-        .execute_with(&state.issuer, now, not_after, cnf)
+        .execute_with(&issuer_keys.issuer, now, not_after, cnf)
         .map_err(|e| match refusal_reason(&e) {
             Some(reason) => Failure::Refused(reason, mint_refusal(e)),
             None => Failure::Other(mint_refusal(e)),
@@ -559,7 +566,7 @@ fn exchange_verified(
         ReplayRefusal::Full | ReplayRefusal::Unavailable => Failure::Other(r.into()),
     })?;
     // The response carries no chain; read it back from the token we just minted.
-    let issued = state
+    let issued = issuer_keys
         .verifier
         .verify(&resp.access_token, now)
         .map_err(ApiError::from)?;
@@ -571,6 +578,7 @@ fn exchange_verified(
     let parent_lease = parent.chain.hops.last().map(|h| &h.lease);
     register_issued(
         state,
+        &issuer_keys.verifier,
         &resp.access_token,
         &resp.lease,
         parent_lease,

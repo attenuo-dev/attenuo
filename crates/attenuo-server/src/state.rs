@@ -4,10 +4,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use anyhow::Context;
-use attenuo_audit::{CheckpointKeys, SqliteAudit, SqliteLeaseStore};
+use attenuo_audit::{SqliteAudit, SqliteLeaseStore};
 use attenuo_policy::{PolicyEngine, PolicyEngineBuilder};
-use attenuo_token::{Issuer, IssuerConfig, Verifier};
-use serde_json::Value;
+use attenuo_token::{Issuer, IssuerConfig};
 use sha2::Digest;
 use time::{Duration, OffsetDateTime};
 
@@ -16,20 +15,28 @@ use crate::authz::Pipeline;
 use crate::clientauth::{ClientRules, SharedClients};
 use crate::config::{ActorAuth, Config, RootGrant};
 use crate::idp::IdpRegistry;
+use crate::issuer_keys::{IssuerKeys, SharedKeys};
 use crate::metrics::Metrics;
 
 /// Everything the handlers share.
 pub struct AppState {
-    /// Mints and exchanges tokens with the server's signing key.
-    pub issuer: Issuer,
-    /// Verifies delegation tokens against the current and retired issuer keys.
-    pub verifier: Verifier,
+    /// The issuer's keys in force: the signing key, the verifier of the current and retired
+    /// keys, the JWKS and the keys audit checkpoints are checked with. `POST /admin/keys/reload`
+    /// swaps them in whole; a request takes one snapshot ([`AppState::keys`]).
+    pub keys: SharedKeys,
+    /// Held by `POST /admin/keys/reload` from reading the files to the swap, so two reloads
+    /// cannot cross.
+    pub keys_reload: tokio::sync::Mutex<()>,
+    /// The `kid` of the key the server started with: the DPoP nonces and the subject digests
+    /// stay keyed by it until a restart ([`crate::issuer_keys`]).
+    pub startup_kid: String,
+    /// What is keyed by the startup key and does not follow a key reload: `[token]
+    /// dpop_nonce` and the subject digests, each when it is on.
+    pub startup_key_uses: Vec<&'static str>,
     /// The decision pipeline the proxy and the AuthZEN endpoints share.
     pub pipeline: Arc<Pipeline>,
     /// The hash-chained audit log.
     pub audit: Arc<SqliteAudit>,
-    /// Public keys that may have signed audit checkpoints (the JWKS: current plus retired).
-    pub checkpoint_keys: CheckpointKeys,
     /// `[audit] checkpoint_interval_seconds`; zero means no timer.
     pub checkpoint_interval: std::time::Duration,
     /// The lease registry. It shares the audit log's SQLite file unless that is `:memory:`.
@@ -105,8 +112,6 @@ pub struct AppState {
     pub public_url: Option<String>,
     /// `[issuer] lease_interval_seconds`: lifetime of a lease after issuance or renewal.
     pub lease_interval: Duration,
-    /// Precomputed `/.well-known/jwks.json` body.
-    pub jwks: Value,
     /// The server's metrics, served on the `[metrics]` listener.
     pub metrics: Arc<Metrics>,
     /// One-time use of IdP credentials and of (parent token, actor) exchanges.
@@ -220,8 +225,11 @@ impl AppState {
         )
         .with_future_skew(config.token.dpop_future_skew())
         .with_nonce(config.token.dpop_nonce, issuer.private_key_pem().as_bytes());
-        let verifier = issuer.verifier();
-        let jwks = crate::issuer_keys::jwks_from_keys(&issuer.trusted_public_keys())?;
+        let startup_kid = issuer.key_id();
+        let mut startup_key_uses = Vec::new();
+        if config.token.dpop_nonce == crate::config::DpopNonceMode::Required {
+            startup_key_uses.push("[token] dpop_nonce");
+        }
 
         let (engine, policies_sha256) = build_engine(config)?;
         if config
@@ -236,7 +244,6 @@ impl AppState {
         });
         let policy = Arc::new(crate::authz::SharedPolicy::new(engine));
 
-        let checkpoint_keys = CheckpointKeys::from_jwks(&jwks)?;
         let metrics = Metrics::new();
         let metrics_for_limits = metrics.clone();
         let checkpoint_sink = match &config.audit.sink {
@@ -253,9 +260,11 @@ impl AppState {
             }
             None => None,
         };
+        let signer = issuer.detached_signer();
+        let keys = SharedKeys::new(IssuerKeys::new(issuer)?);
         let (audit, leases, store_fence) = open_storage(
             &config.audit,
-            issuer.detached_signer(),
+            signer,
             metrics.clone(),
             checkpoint_sink.as_ref().map(|s| s.handle()),
         )?;
@@ -294,7 +303,7 @@ impl AppState {
         let mut pipeline = Pipeline::new(policy, leases.clone(), audit.clone())
             .with_metrics(metrics.clone())
             .with_approval_ttl(config.approvals.ttl())
-            .with_approval_verifier(verifier.clone());
+            .with_approval_verifier(keys.clone());
         let trace_settings = config.telemetry.resolve()?;
         let trace = trace_settings
             .as_ref()
@@ -302,8 +311,9 @@ impl AppState {
         if trace.is_some() || config.logging.redact_subjects {
             // Keyed like the DPoP nonces, by the issuer's private key (open question 5). The
             // log lines use the same digest as the exported span, so the two can be matched.
-            let digest =
-                crate::telemetry::SubjectDigest::derive(issuer.private_key_pem().as_bytes());
+            let digest = crate::telemetry::SubjectDigest::derive(
+                keys.snapshot().issuer.private_key_pem().as_bytes(),
+            );
             if config.logging.redact_subjects {
                 let d = digest.clone();
                 pipeline = pipeline
@@ -312,6 +322,7 @@ impl AppState {
             if trace.is_some() {
                 pipeline = pipeline.with_subject_digest(digest);
             }
+            startup_key_uses.push("subject digests ([telemetry], [logging] redact_subjects)");
         }
         if let Some(n) = &approval_notifier {
             pipeline = pipeline.with_approval_notifier(n.handle());
@@ -363,11 +374,12 @@ impl AppState {
         }
 
         Ok(Self {
-            issuer,
-            verifier,
+            keys,
+            keys_reload: tokio::sync::Mutex::new(()),
+            startup_kid,
+            startup_key_uses,
             pipeline,
             audit,
-            checkpoint_keys,
             checkpoint_interval: std::time::Duration::from_secs(
                 config.audit.checkpoint_interval_seconds,
             ),
@@ -398,7 +410,6 @@ impl AppState {
             actor_trust,
             public_url: config.server.public_url.clone(),
             lease_interval: lease_interval(config)?,
-            jwks,
             metrics,
             replay,
             dpop,
@@ -465,6 +476,12 @@ impl AppState {
             // is dropped.
             while rx.changed().await.is_ok() {}
         }
+    }
+
+    /// The issuer's keys in force now. A request takes them once and uses them throughout, so
+    /// a key reload meanwhile does not split it between two sets.
+    pub fn keys(&self) -> Arc<IssuerKeys> {
+        self.keys.snapshot()
     }
 
     /// The current time by [`AppState::clock`].
@@ -544,8 +561,7 @@ fn load_issuer(config: &Config) -> anyhow::Result<Issuer> {
         Some(path) if path.exists() => {
             let pem = std::fs::read_to_string(path)
                 .with_context(|| format!("reading issuer key {}", path.display()))?;
-            Issuer::from_pem(ic, &pem)
-                .with_context(|| format!("parsing issuer key {}", path.display()))?
+            crate::issuer_keys::signing_key(ic, path, &pem)?
         }
         Some(path) => {
             let issuer = Issuer::generate(ic);
@@ -564,6 +580,7 @@ fn load_issuer(config: &Config) -> anyhow::Result<Issuer> {
     for path in &config.issuer.previous_key_paths {
         let pem = std::fs::read_to_string(path)
             .with_context(|| format!("reading previous issuer key {}", path.display()))?;
+        crate::issuer_keys::previous_key_id(path, &pem)?;
         issuer
             .trust_previous_key(&pem)
             .with_context(|| format!("parsing previous issuer key {}", path.display()))?;
@@ -1089,7 +1106,7 @@ mod tests {
             LeaseId::new("l1"),
         )
         .unwrap();
-        let send = |amount: Value| {
+        let send = |amount: serde_json::Value| {
             let call = ToolCall::new(
                 "banking",
                 "send_money",
@@ -1419,7 +1436,10 @@ mod tests {
         cfg.issuer.private_key_pem_path = Some(dir.path().join("k/issuer.pem"));
         let a = AppState::from_config(&cfg).unwrap();
         let b = AppState::from_config(&cfg).unwrap();
-        assert_eq!(a.issuer.public_key_pem(), b.issuer.public_key_pem());
+        assert_eq!(
+            a.keys().issuer.public_key_pem(),
+            b.keys().issuer.public_key_pem()
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

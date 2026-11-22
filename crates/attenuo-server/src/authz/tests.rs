@@ -202,7 +202,7 @@ async fn verified_tokens_are_cached_but_expiry_is_rechecked() {
     assert!(was_hit);
     {
         let chains = auth.verified.chains.lock().unwrap();
-        let cached = chains.get(&VerifiedTokens::key(&issued.token)).unwrap();
+        let cached = chains.get(&VerifiedTokens::key(0, &issued.token)).unwrap();
         assert!(Arc::ptr_eq(&hit.claims, cached));
         assert_eq!(cached.chain, issued.chain);
     }
@@ -220,6 +220,50 @@ async fn verified_tokens_are_cached_but_expiry_is_rechecked() {
     let forged = String::from_utf8(forged).unwrap();
     assert!(auth.authenticate(&forged, now).await.is_err());
     assert_eq!(auth.verified.chains.lock().unwrap().len(), 1);
+}
+
+/// The cache follows a key reload: an entry the old keys verified is not used once a swap
+/// drops its key (the token is verified again, and refused), and a swap that keeps the key
+/// verifies it again under the new keys.
+#[tokio::test]
+async fn the_verified_token_cache_follows_a_key_reload() {
+    use crate::issuer_keys::{IssuerKeys, SharedKeys};
+    let (p, _leases, _audit, _chain) = setup();
+    let config = attenuo_token::IssuerConfig {
+        issuer: "https://attenuo.test".into(),
+        audience: "attenuo".into(),
+        max_depth: 4,
+        default_ttl: Duration::minutes(5),
+    };
+    let k1 = attenuo_token::Issuer::generate(config.clone());
+    let now = OffsetDateTime::now_utc();
+    let user = OriginatingUser {
+        subject: "alice".into(),
+        issuer: "idp".into(),
+        authenticated_at: now,
+        attributes: Default::default(),
+    };
+    let caps = CapabilitySet::from_iter([Capability::new("github", "read_*")]);
+    let issued = k1
+        .issue_root(user, AgentId::new("planner"), caps, None, now)
+        .unwrap();
+    let k1_pem = k1.private_key_pem();
+    let keys = SharedKeys::new(IssuerKeys::new(k1).unwrap());
+    let auth = ServerAuthorizer::new(keys.clone(), Arc::new(p));
+    assert!(auth.authenticate(&issued.token, now).await.is_ok());
+    assert!(auth.verify_inner(&issued.token, now).unwrap().1, "cached");
+
+    // k2 with k1 retired: the token verifies again (a miss), then is served from the cache.
+    let mut k2 = attenuo_token::Issuer::generate(config.clone());
+    k2.trust_previous_key(&k1_pem).unwrap();
+    keys.swap(IssuerKeys::new(k2).unwrap());
+    assert!(!auth.verify_inner(&issued.token, now).unwrap().1, "a miss");
+    assert!(auth.verify_inner(&issued.token, now).unwrap().1);
+
+    // k3 alone: the cached entry is not used, and the token is refused.
+    keys.swap(IssuerKeys::new(attenuo_token::Issuer::generate(config)).unwrap());
+    assert_eq!(keys.snapshot().generation(), 2);
+    assert!(auth.authenticate(&issued.token, now).await.is_err());
 }
 
 /// SR-46: a token over `VERIFIED_TOKEN_MAX_BYTES` is verified, but not kept.
@@ -286,18 +330,18 @@ fn verified_token_cache_stays_bounded() {
     let v = Arc::new(issuer.verifier().verify(&issued.token, now).unwrap().claims);
     let cache = VerifiedTokens::new(3);
     for i in 0..10 {
-        cache.insert(VerifiedTokens::key(&format!("t{i}")), v.clone(), now);
+        cache.insert(VerifiedTokens::key(0, &format!("t{i}")), v.clone(), now);
         assert!(cache.chains.lock().unwrap().len() <= 3);
     }
     // Expired entries go first when the cache is full.
     let expired_at = v.chain.hops[0].expires_at;
     let cache = VerifiedTokens::new(2);
-    cache.insert(VerifiedTokens::key("a"), v.clone(), now);
-    cache.insert(VerifiedTokens::key("b"), v.clone(), now);
-    cache.insert(VerifiedTokens::key("c"), v.clone(), expired_at);
+    cache.insert(VerifiedTokens::key(0, "a"), v.clone(), now);
+    cache.insert(VerifiedTokens::key(0, "b"), v.clone(), now);
+    cache.insert(VerifiedTokens::key(0, "c"), v.clone(), expired_at);
     let chains = cache.chains.lock().unwrap();
     assert_eq!(chains.len(), 1);
-    assert!(chains.contains_key(&VerifiedTokens::key("c")));
+    assert!(chains.contains_key(&VerifiedTokens::key(0, "c")));
 }
 
 /// An allowed call with no approval token and no granted approval writes once, its audit

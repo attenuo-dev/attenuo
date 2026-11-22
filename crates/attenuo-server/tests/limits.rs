@@ -778,6 +778,7 @@ async fn a_pep_search_with_an_unsigned_chain_counts_against_its_run() {
     let alice = h.mint_root("alice", "planner").await;
     let chain = h
         .state
+        .keys()
         .verifier
         .verify(&alice, time::OffsetDateTime::now_utc())
         .unwrap()

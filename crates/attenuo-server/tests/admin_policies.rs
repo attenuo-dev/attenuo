@@ -201,6 +201,7 @@ impl Harness {
 
     fn chain_of(&self, token: &str) -> attenuo_core::DelegationChain {
         self.state
+            .keys()
             .verifier
             .verify(token, OffsetDateTime::now_utc())
             .unwrap()
@@ -478,6 +479,7 @@ fn old_token(h: &Harness) -> (String, attenuo_core::DelegationChain) {
         .collect::<CapabilitySet>();
     let issued = h
         .state
+        .keys()
         .issuer
         .issue_root(
             user,
@@ -489,6 +491,7 @@ fn old_token(h: &Harness) -> (String, attenuo_core::DelegationChain) {
         .unwrap();
     let chain = h
         .state
+        .keys()
         .verifier
         .verify(&issued.token, then + Duration::minutes(1))
         .unwrap()

@@ -225,7 +225,7 @@ async fn redacted_subjects_are_digests_in_every_log_line_but_not_in_the_audit_lo
     let run = start(true).await;
     let entries = run_request(&run.server, subject).await;
     let digest =
-        SubjectDigest::derive(run.state.issuer.private_key_pem().as_bytes()).digest(subject);
+        SubjectDigest::derive(run.state.keys().issuer.private_key_pem().as_bytes()).digest(subject);
     let shown = format!("hmac:{digest}");
 
     let text = captured(&TEXT);

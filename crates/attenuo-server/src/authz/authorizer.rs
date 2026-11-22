@@ -10,7 +10,7 @@ use attenuo_core::{DelegationChain, OutputLabel, ToolCall};
 use attenuo_proxy::{
     AuthDecision, AuthError, Authenticated, Authorizer, CallContext, RequestAuth, Stage,
 };
-use attenuo_token::{Claims, VerifiedToken, Verifier};
+use attenuo_token::{Claims, VerifiedToken};
 use serde_json::Value;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -20,11 +20,12 @@ use super::usage::micros;
 use super::{
     result_digest, untrusted_args_json, usage_json, LimitHit, Pipeline, REASON_LABEL_ERROR,
 };
+use crate::issuer_keys::VerifierSource;
 
 /// The proxy's authorizer: token verification, DPoP ([`crate::dpop`]) and
 /// [`Pipeline::decide`].
 pub struct ServerAuthorizer {
-    verifier: Verifier,
+    verifier: VerifierSource,
     pipeline: Arc<Pipeline>,
     pub(super) verified: VerifiedTokens,
     dpop: Option<Arc<crate::dpop::Dpop>>,
@@ -33,11 +34,13 @@ pub struct ServerAuthorizer {
 }
 
 impl ServerAuthorizer {
-    /// An authorizer that verifies tokens with `verifier` and decides with `pipeline`. DPoP is
-    /// not checked until [`Self::with_dpop`], so a bound token is refused until then.
-    pub fn new(verifier: Verifier, pipeline: Arc<Pipeline>) -> Self {
+    /// An authorizer that verifies tokens with `verifier` (a [`attenuo_token::Verifier`], or
+    /// the server's [`crate::issuer_keys::SharedKeys`], which a key reload swaps) and decides
+    /// with `pipeline`. DPoP is not checked until [`Self::with_dpop`], so a bound token is
+    /// refused until then.
+    pub fn new(verifier: impl Into<VerifierSource>, pipeline: Arc<Pipeline>) -> Self {
         Self {
-            verifier,
+            verifier: verifier.into(),
             pipeline,
             verified: VerifiedTokens::new(VERIFIED_TOKENS_CAPACITY),
             dpop: None,
@@ -92,8 +95,11 @@ impl ServerAuthorizer {
         token: &str,
         now: OffsetDateTime,
     ) -> Result<(Verified, bool), AuthError> {
-        let key = VerifiedTokens::key(token);
-        if let Some(claims) = self.verified.get(&key, now, self.verifier.max_depth()) {
+        // One set of keys for the lookup and the verification; the cache entry is tied to it,
+        // so a key reload is never answered from an entry the old set verified.
+        let verifier = self.verifier.current();
+        let key = VerifiedTokens::key(verifier.generation(), token);
+        if let Some(claims) = self.verified.get(&key, now, verifier.max_depth()) {
             return Ok((
                 Verified {
                     claims,
@@ -102,7 +108,7 @@ impl ServerAuthorizer {
                 true,
             ));
         }
-        let VerifiedToken { chain, claims } = self.verifier.verify(token, now).map_err(|e| {
+        let VerifiedToken { chain, claims } = verifier.verify(token, now).map_err(|e| {
             if crate::error::is_expiry(&e) {
                 AuthError::TokenExpired
             } else {
@@ -157,14 +163,15 @@ pub const VERIFIED_TOKENS_CAPACITY: usize = 4096;
 /// narrowing of its parent), which would make the cache's 4096 entries hundreds of MiB (SR-46).
 pub const VERIFIED_TOKEN_MAX_BYTES: usize = 16 * 1024;
 
-/// Claims of tokens that already passed [`Verifier::verify`], keyed by the SHA-256 of the
-/// exact token text. An entry is the claims alone: `claims.chain` is the verified chain, and
+/// Claims of tokens that already passed [`attenuo_token::Verifier::verify`], keyed by the
+/// SHA-256 of the generation of the keys that verified them and the exact token text. An entry is the claims alone: `claims.chain` is the verified chain, and
 /// the copy [`VerifiedToken`] keeps beside it is not stored.
 ///
 /// An agent sends the same bearer token on every call, and verifying it (two Ed25519
 /// signatures, JSON decoding, structural checks) costs about 100 us, the largest single stage
-/// after the policy. None of that can change while the server runs: the trusted keys are fixed
-/// when the verifier is built, and the token's bytes are what was signed. The only
+/// after the policy. None of that can change for a given set of keys: the trusted keys are fixed
+/// within one generation (a key reload starts the next, whose lookups miss every older entry),
+/// and the token's bytes are what was signed. The only
 /// time-dependent checks are expiry, so a cache hit re-runs `validate_at(now)` (every hop's
 /// expiry, which includes the token's `exp`, the last hop's) and nothing is cached for a token
 /// that failed. Lease revocation is unaffected: leases are checked on every call.
@@ -184,9 +191,15 @@ impl VerifiedTokens {
         }
     }
 
-    pub(super) fn key(token: &str) -> [u8; 32] {
+    /// The key of `token` verified by the keys of `generation`
+    /// ([`crate::issuer_keys::IssuerKeys::generation`]).
+    pub(super) fn key(generation: u64, token: &str) -> [u8; 32] {
         use sha2::{Digest, Sha256};
-        Sha256::digest(token.as_bytes()).into()
+        Sha256::new()
+            .chain_update(generation.to_be_bytes())
+            .chain_update(token.as_bytes())
+            .finalize()
+            .into()
     }
 
     /// The cached claims, if their chain is still valid at `now`.

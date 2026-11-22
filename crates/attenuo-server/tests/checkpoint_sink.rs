@@ -167,7 +167,11 @@ async fn webhook_sink_ships_each_checkpoint_with_retries_sr21() {
             headers["x-attenuo-checkpoint-sha256"],
             s.checkpoint_sha256.as_str()
         );
-        h.state.checkpoint_keys.verify(&s.checkpoint).unwrap();
+        h.state
+            .keys()
+            .checkpoint_keys
+            .verify(&s.checkpoint)
+            .unwrap();
         // The body is canonical JSON, so it is also a valid line of a shipped file.
         assert_eq!(body.as_ref(), s.to_canonical_json().as_slice());
         shipped_text.push_str(&s.to_line());
@@ -178,7 +182,7 @@ async fn webhook_sink_ships_each_checkpoint_with_retries_sr21() {
     let report = cross_check(
         &export,
         &parse_shipped(&shipped_text).unwrap(),
-        &h.state.checkpoint_keys,
+        &h.state.keys().checkpoint_keys,
     );
     assert!(report.ok, "{report:?}");
     assert_eq!((report.in_range, report.matched), (2, 2));
@@ -277,7 +281,7 @@ async fn file_sink_appends_jsonl_that_cross_checks_the_export_sr21() {
         vec![2, 4, 6]
     );
     let export = parse_export(&h.export().await).unwrap();
-    let report = cross_check(&export, &lines, &h.state.checkpoint_keys);
+    let report = cross_check(&export, &lines, &h.state.keys().checkpoint_keys);
     assert!(report.ok && report.matched == 3, "{report:?}");
 }
 

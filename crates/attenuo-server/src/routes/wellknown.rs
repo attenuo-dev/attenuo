@@ -20,7 +20,7 @@ pub async fn healthz() -> Json<Value> {
 /// `GET /.well-known/jwks.json`: the issuer's Ed25519 public key, so other verifiers can check
 /// attenuo tokens without sharing a PEM out of band.
 pub async fn jwks(State(state): State<Arc<AppState>>) -> Json<Value> {
-    Json(state.jwks.clone())
+    Json(state.keys().jwks.clone())
 }
 
 /// `GET /.well-known/authzen-configuration`: AuthZEN 1.0 PDP metadata (sections 9.1.1 and 9.2).
