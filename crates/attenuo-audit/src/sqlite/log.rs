@@ -1515,7 +1515,7 @@ impl SqliteAudit {
         self.verify_signed_from(again.0, &again.1, &again.2, keys)
     }
 
-    fn verify_signed_from(
+    pub(super) fn verify_signed_from(
         &self,
         upper: i64,
         checkpoints: &[Checkpoint],

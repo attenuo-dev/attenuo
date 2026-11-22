@@ -1015,6 +1015,38 @@ impl SqliteAudit {
         Ok(out)
     }
 
+    /// Verify the part of the log a prune through `through` removes, before an automatic
+    /// prune makes it (`[audit.retention] prune = "auto"`), as
+    /// [`verify_chain_signed`](Self::verify_chain_signed) does for the whole log but
+    /// stopping at `through`: from the newest anchor (or genesis) the chain, every stored
+    /// checkpoint up to there, and the anchors. When the newest anchor's prune record lies
+    /// above `through`, the walk goes on to it, so that the anchor is checked whole. Reads only,
+    /// on the reader, so appends are not held up.
+    ///
+    /// The prefix is safe to prune when the report is `ok`, its `last_signed_seq` is at least
+    /// `through` (a checkpoint at or past it verified) and its `pruned_through` is the log's
+    /// boundary.
+    ///
+    /// # Errors
+    ///
+    /// As [`verify_chain_signed`](Self::verify_chain_signed).
+    pub fn verify_retained_through(
+        &self,
+        through: u64,
+        keys: &CheckpointKeys,
+    ) -> Result<SignedVerifyReport, AuditError> {
+        let (head, checkpoints, anchors) = self.verify_snapshot()?;
+        let newest_prune = anchors.last().map_or(0, |a| a.anchor.prune_seq);
+        let upper = i64::try_from(through.max(newest_prune))
+            .unwrap_or(i64::MAX)
+            .min(head);
+        let checkpoints: Vec<Checkpoint> = checkpoints
+            .into_iter()
+            .filter(|c| i64::try_from(c.seq).is_ok_and(|s| s <= upper))
+            .collect();
+        self.verify_signed_from(upper, &checkpoints, &anchors, keys)
+    }
+
     /// One batch of the deletes of the prune that is `deleting`, if any: at most
     /// `batch_rows` entries at or below its boundary, in one short transaction under the
     /// write gate. The batch that finds no more rows also deletes the checkpoints below the

@@ -2024,3 +2024,72 @@ fn the_golden_negative_cases_fail_the_anchor_cross_check() {
     );
     assert!(attenuo_audit::cross_check_anchors(&retained, &a, &keys).ok);
 }
+
+/// `verify_retained_through`, which an automatic prune runs before it prunes: it walks the
+/// prefix only, so a break above it is not its business, and a break, a rewritten entry or a
+/// bad checkpoint inside it fails it. After a prune it walks from the anchor, on to the prune
+/// record when that lies above the boundary asked for.
+#[test]
+fn the_prefix_verify_sees_the_prefix_only() {
+    let issuer = issuer();
+    let k = keys(&issuer);
+    let log = log_of(&issuer, 10, 45);
+    let r = log.verify_retained_through(20, &k).unwrap();
+    assert!(r.ok, "{r:?}");
+    assert_eq!(
+        (r.entries, r.last_signed_seq, r.pruned_through),
+        (20, Some(20), None)
+    );
+    // A rewritten entry above the prefix is not seen; inside it, it is.
+    exec(
+        &log,
+        "UPDATE audit SET entry_hash = 'ff' || substr(entry_hash, 3) WHERE seq = 33",
+    );
+    assert!(log.verify_retained_through(20, &k).unwrap().ok);
+    assert!(!log.verify_chain_signed(&k).unwrap().ok);
+    let log = log_of(&issuer, 10, 45);
+    exec(
+        &log,
+        "UPDATE audit SET entry_hash = 'ff' || substr(entry_hash, 3) WHERE seq = 7",
+    );
+    let r = log.verify_retained_through(20, &k).unwrap();
+    assert!(!r.ok, "{r:?}");
+    assert_eq!(r.first_bad_seq, Some(7));
+    // A checkpoint in the prefix signed by another key.
+    let log = log_of(&issuer, 10, 45);
+    let other = self::issuer();
+    let forged = Checkpoint::sign(
+        &other.detached_signer(),
+        10,
+        &log.entry_at(10).unwrap().unwrap().entry_hash,
+        now(),
+    )
+    .unwrap();
+    let (sig, kid) = (forged.signature.clone(), forged.kid.clone());
+    log.with_connection(|c| {
+        c.execute(
+            "UPDATE checkpoints SET signature = ?1, kid = ?2 WHERE seq = 10",
+            rusqlite::params![sig, kid],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    let r = log.verify_retained_through(20, &k).unwrap();
+    assert!(!r.ok, "{r:?}");
+    assert_eq!(r.bad_checkpoints[0].seq, 10);
+
+    // After a prune through 20 (the prune record at 46): a prefix through 30 is walked from
+    // the anchor and on to the prune record, so the anchor is checked whole.
+    let log = log_of(&issuer, 10, 45);
+    prune(&log, 20, None).unwrap();
+    finish(&log, 100);
+    let r = log.verify_retained_through(30, &k).unwrap();
+    assert!(r.ok, "{r:?}");
+    assert_eq!(r.pruned_through, Some(20));
+    assert_eq!(r.entries, 26, "21..=46: on to the prune record");
+    // The prefix starts after the boundary only through a valid anchor.
+    exec(&log, "UPDATE audit_anchors SET signature = 'AAAA'");
+    let r = log.verify_retained_through(30, &k).unwrap();
+    assert!(!r.ok, "{r:?}");
+    assert_eq!(r.pruned_through, None);
+}
