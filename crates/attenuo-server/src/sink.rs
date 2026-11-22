@@ -688,6 +688,12 @@ impl SinkHandle {
         self.anchors.lock().pending.contains(&through_seq)
     }
 
+    /// This process delivered the anchor through `through_seq`. A repeated prune that finds
+    /// the delivery not recorded (`shipped_at` is null) records it rather than ship again.
+    pub fn anchor_delivered(&self, through_seq: u64) -> bool {
+        self.anchors.lock().delivered.contains(&through_seq)
+    }
+
     /// The highest checkpoint seq delivered since start; `None` before the first. The prune's
     /// "sink caught up" guard reads it (ADR-0015).
     pub fn delivered_through(&self) -> Option<u64> {
