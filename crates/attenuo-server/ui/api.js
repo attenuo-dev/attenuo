@@ -36,11 +36,31 @@ export function forgetToken() {
 
 export function setIdentity(who) {
   identity = who && typeof who.name === 'string' && typeof who.role === 'string' ? who : null;
+  if (identity && (identity.console === null || typeof identity.console !== 'object')) identity.console = null;
 }
 
 export function getIdentity() {
   return identity;
 }
+
+/**
+ * Whether this console listener mounts the write routes (`[admin_ui] allow_write`), from the
+ * `console` member its `GET /admin/whoami` adds: true, false, or null when the server did not
+ * say (an older server), in which case a write is tried and a 404 says writes are off.
+ */
+export function writesAllowed() {
+  const v = identity && identity.console ? identity.console.allow_write : undefined;
+  return typeof v === 'boolean' ? v : null;
+}
+
+/** `[audit.retention] prune` of the server (`off`, `manual` or `auto`), or null when unknown. */
+export function auditPruneMode() {
+  const v = identity && identity.console ? identity.console.audit_prune : undefined;
+  return typeof v === 'string' ? v : null;
+}
+
+/** The text shown in place of a write action on a listener without `allow_write`. */
+export const WRITES_OFF = 'Writes are disabled on this listener ([admin_ui] allow_write is off), so the console does not offer this action. Use the attenuo CLI against the admin API instead.';
 
 /** Whether the logged-in operator's role reaches `min` (`viewer`, `operator` or `admin`). */
 export function roleAllows(min) {

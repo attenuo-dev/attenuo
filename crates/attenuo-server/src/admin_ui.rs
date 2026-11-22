@@ -17,9 +17,15 @@
 //!   `/admin/ui/favicon.svg` with the same headers.
 //! - The read-only admin routes ([`read_routes`]) behind [`require_admin`]: audit queries,
 //!   entries and checkpoints, lease status and tree, the loaded policies, a lint of the policy
-//!   file, and the `POST /admin/policies/evaluate` dry run (JSON `Content-Type` required). One
-//!   of them, `GET /admin/audit/checkpoint`, signs a checkpoint of the head when it has none;
-//!   it is mounted as a read because it changes no recorded fact and the CLI treats it as one.
+//!   file, the prune plan (`GET /admin/audit/prune/plan`, role `admin` as everywhere, for the
+//!   state of the automatic prune), and the `POST /admin/policies/evaluate` dry run (JSON
+//!   `Content-Type` required). One of them, `GET /admin/audit/checkpoint`, signs a checkpoint
+//!   of the head when it has none; it is mounted as a read because it changes no recorded fact
+//!   and the CLI treats it as one. `POST /admin/audit/prune` and `GET /admin/audit/anchors`
+//!   are never mounted here.
+//! - `GET /admin/whoami` answers here with one more member, `console`: `{"allow_write": bool,
+//!   "audit_prune": "off" | "manual" | "auto"}` ([`ConsoleSettings`]), so the page knows at
+//!   login whether to offer its write actions and whether there is an automatic prune to show.
 //! - With `[admin_ui] allow_write = true` only, the routes that change state
 //!   ([`write_routes`]), which also require `Content-Type: application/json`. Without it,
 //!   `POST /admin/leases/revoke` is still mounted for its dry run (`?preview=true`, JSON
@@ -42,10 +48,12 @@ use sha2::Digest;
 use tower_http::trace::TraceLayer;
 
 use crate::config::Config;
+use crate::config::PruneMode;
 use crate::error::ApiError;
+use crate::operators::AdminIdentity;
 use crate::routes::admin::{self, require_admin};
 use crate::routes::extract::{Body, Path, Query};
-use crate::routes::{approvals, keys, policies};
+use crate::routes::{approvals, keys, policies, retention};
 use crate::state::AppState;
 
 /// Where the console lives on its listener. Asset paths are relative to it.
@@ -144,6 +152,11 @@ pub const ASSETS: &[Asset] = &[
         bytes: include_bytes!("../ui/view-policy.js"),
     },
     Asset {
+        path: "view-reload.js",
+        content_type: JS,
+        bytes: include_bytes!("../ui/view-reload.js"),
+    },
+    Asset {
         path: "view-verify.js",
         content_type: JS,
         bytes: include_bytes!("../ui/view-verify.js"),
@@ -178,9 +191,44 @@ fn asset_table() -> AssetTable {
     )
 }
 
+/// What the console listener's `GET /admin/whoami` adds to the answer, as its `console`
+/// member: whether this listener mounts the write routes (`[admin_ui] allow_write`) and
+/// `[audit.retention] prune`. Both are settings, not data: the page uses them to hide the
+/// write actions a read-only listener would refuse, and to ask for the prune plan only when
+/// there is an automatic prune to show (the plan answers 409 otherwise, which the browser
+/// would log on every visit).
+#[derive(Debug, Clone, Copy)]
+pub struct ConsoleSettings {
+    /// `[admin_ui] allow_write`.
+    pub allow_write: bool,
+}
+
+/// `GET /admin/whoami` on the console listener: [`admin::whoami`] plus
+/// `"console": {"allow_write": bool, "audit_prune": "off" | "manual" | "auto"}`.
+async fn console_whoami(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(settings): axum::Extension<ConsoleSettings>,
+    who: axum::Extension<AdminIdentity>,
+) -> axum::Json<serde_json::Value> {
+    let axum::Json(mut body) = admin::whoami(who).await;
+    let prune = match state.retention.prune {
+        PruneMode::Off => "off",
+        PruneMode::Manual => "manual",
+        PruneMode::Auto => "auto",
+    };
+    body["console"] = serde_json::json!({
+        "allow_write": settings.allow_write,
+        "audit_prune": prune,
+    });
+    axum::Json(body)
+}
+
 /// The admin routes the console listener always mounts: those without side effects on leases
 /// or policy. `POST /admin/policies/evaluate` is a dry run (no lease check, no audit record),
 /// so it is here too; being a `POST` it requires a JSON `Content-Type` like the write routes.
+/// `GET /admin/audit/prune/plan` reads only (a plan and the automatic prune's state); it needs
+/// the `admin` role here as on the admin API, and the prune itself is not mounted.
+/// `GET /admin/whoami` needs the [`ConsoleSettings`] extension, which [`router`] adds.
 pub fn read_routes() -> Router<Arc<AppState>> {
     let evaluate = Router::new()
         .route(
@@ -189,7 +237,7 @@ pub fn read_routes() -> Router<Arc<AppState>> {
         )
         .route_layer(middleware::from_fn(require_json));
     Router::new()
-        .route("/admin/whoami", get(admin::whoami))
+        .route("/admin/whoami", get(console_whoami))
         .route("/admin/audit", get(admin::audit_range))
         .route("/admin/audit/verify", get(admin::audit_verify))
         // Signs a checkpoint of the head when it has none yet; a read for the CLI and here.
@@ -198,6 +246,8 @@ pub fn read_routes() -> Router<Arc<AppState>> {
         .route("/admin/audit/entries/{seq}", get(admin::audit_entry))
         .route("/admin/audit/records/{id}", get(admin::audit_record))
         .route("/admin/audit/export", get(admin::audit_export))
+        // Reads only; role `admin` (ROUTE_ROLES). `POST /admin/audit/prune` is never here.
+        .route("/admin/audit/prune/plan", get(retention::prune_plan))
         .route("/admin/leases/{lease_id}", get(admin::lease_status))
         .route("/admin/leases/{lease_id}/tree", get(admin::lease_tree))
         .route("/admin/policies", get(policies::get_policies))
@@ -264,6 +314,9 @@ pub fn router(state: Arc<AppState>, config: &Config) -> Router {
     }
     // `require_admin` is added last so it runs first: no bearer is 401 before anything else.
     let api = api
+        .layer(axum::Extension(ConsoleSettings {
+            allow_write: config.admin_ui.allow_write,
+        }))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_admin))
         .with_state(state);
 

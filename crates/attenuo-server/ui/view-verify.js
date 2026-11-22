@@ -1,9 +1,11 @@
 // Verify panel (#/verify): the head of the log, stored checkpoints, a full chain verification
-// and, as a separate deliberate action, signing a checkpoint of the head.
+// and, as a separate deliberate action, signing a checkpoint of the head. With
+// `[audit.retention] prune = "auto"`, and for the admin role only, the state of the automatic
+// prune: its settings and its last run, from the `auto` member of the prune plan.
 'use strict';
 
 import { h, append, replace, link, mono, short, time, pill, table, empty, loading, kv } from './dom.js';
-import { api, showNotice, showError } from './api.js';
+import { api, showNotice, showError, roleAllows, auditPruneMode } from './api.js';
 
 export async function verifyView(root) {
   const headBox = h('div', null, loading());
@@ -26,6 +28,7 @@ export async function verifyView(root) {
       h('section', { class: 'panel' }, h('header', null, h('h2', null, 'Log head'), signBtn), headBox, readyBox),
       h('section', { class: 'panel' }, h('header', null, h('h2', null, 'Verification'), verifyBtn), verifyOut,
         h('p', { class: 'small muted' }, 'Walks every entry and checks each stored checkpoint signature against the server’s keys. On a large log this takes a while.'))),
+    autoPrunePanel(),
     h('section', { class: 'panel' }, h('header', null, h('h2', null, 'Newest checkpoints')), cpBox),
   ]);
 
@@ -149,4 +152,103 @@ function confirmSign(after) {
   dialog.addEventListener('cancel', () => dialog.remove());
   document.body.append(dialog);
   dialog.showModal();
+}
+
+// ---- automatic prune --------------------------------------------------------------------
+
+/** What each reason of an automatic run means, in one line. */
+const RUN_REASONS = {
+  ok: 'The run pruned the log.',
+  nothing_to_prune: 'Nothing past the last boundary is at a signed checkpoint yet.',
+  prune_too_recent: 'No signed checkpoint is old enough: everything newer than keep_seconds stays.',
+  sink_behind: 'The audit sink has not delivered a checkpoint at or past the boundary yet, or the last anchor.',
+  prune_live_run: 'A run that is still live started at or before the boundary.',
+  prune_in_progress: 'The rows of an earlier prune are still being deleted.',
+  prune_not_at_checkpoint: 'The boundary is not at a signed checkpoint.',
+  concurrent_prune: 'Another prune changed the log while this run worked.',
+  clock_jump: 'The wall clock moved more than an hour away from the monotonic clock, so the run did nothing.',
+  verify_failed: 'The entries it would prune do not verify, so nothing was pruned.',
+  archive_write_failed: 'The archive file could not be written, so nothing was pruned.',
+  archive_exists: 'archive_dir already holds a different file of the archive’s name; the server never replaces it.',
+  archive_verify_failed: 'The archive file, read back, does not verify, so nothing was pruned.',
+  error: 'The store failed, so nothing was pruned.',
+  panic: 'The run stopped on an internal error, so nothing was pruned.',
+};
+
+/** Seconds in the largest whole unit (`90 days`), or `N seconds`. */
+export function humanSeconds(s) {
+  if (!Number.isInteger(s) || s < 0) return String(s);
+  const units = [[86400, 'day'], [3600, 'hour'], [60, 'minute'], [1, 'second']];
+  for (const [n, name] of units) {
+    if (s >= n && s % n === 0) {
+      const v = s / n;
+      return `${v.toLocaleString('en')} ${name}${v === 1 ? '' : 's'}`;
+    }
+  }
+  return '0 seconds';
+}
+
+function seconds(s) {
+  return h('span', null, humanSeconds(s), ' ', h('span', { class: 'muted small' }, `(${s} s)`));
+}
+
+/**
+ * The automatic prune: shown only when the server prunes on its own and the operator has the
+ * admin role, which `GET /admin/audit/prune/plan` needs. Otherwise nothing is drawn and nothing
+ * is asked, so a server without it logs no refused request.
+ */
+function autoPrunePanel() {
+  if (auditPruneMode() !== 'auto' || !roleAllows('admin')) return null;
+  const box = h('div', { class: 'stack' }, loading());
+  const panel = h('section', { class: 'panel', id: 'auto-prune', 'aria-labelledby': 'auto-prune-title' },
+    h('header', null, h('h2', { id: 'auto-prune-title' }, 'Automatic prune')), box);
+  api('/admin/audit/prune/plan', { quiet: [403, 409, 500] })
+    .then((plan) => replace(box, autoPruneState(plan.auto)))
+    .catch((e) => {
+      if (e.status === 401) return;
+      replace(box, h('p', { class: 'callout bad' }, `The prune plan could not be read: `, mono(e.code), ` ${e.message}`));
+    });
+  return panel;
+}
+
+/** The `auto` member of the plan: null unless `prune = "auto"`. */
+export function autoPruneState(auto) {
+  if (!auto || typeof auto !== 'object') {
+    return h('p', { class: 'muted' }, 'The server does not prune the audit log on its own.');
+  }
+  return [
+    h('div', { class: 'row' }, pill('on', 'ok', true),
+      h('span', null, 'The server prunes the audit log on its own ([audit.retention] prune = "auto").')),
+    kv([
+      ['Keeps', seconds(auto.keep_seconds)],
+      ['Checks every', seconds(auto.interval_seconds)],
+      ['At most per run', Number.isInteger(auto.max_entries_per_run) ? `${auto.max_entries_per_run.toLocaleString('en')} entries` : undefined],
+      ['Archive directory', auto.archive_dir ? mono(auto.archive_dir) : pill('not set', 'warn')],
+    ]),
+    auto.archive_dir
+      ? h('p', { class: 'small muted' }, 'Each prune first writes the entries it removes to a file in this directory, checks it, and signs its digest into the prune anchor.')
+      : h('p', { class: 'callout warn', id: 'auto-prune-no-archive' },
+        'No archive directory is set ([audit.retention] archive_dir): the automatic prune deletes the entries it removes and keeps no copy. The shipped checkpoints and anchors prove what was pruned, but not what the entries said.'),
+    h('h3', null, 'Last run'),
+    lastRun(auto.last_run),
+  ];
+}
+
+function lastRun(run) {
+  if (!run) {
+    return h('p', { class: 'muted', id: 'auto-prune-no-run' }, 'No run yet since the server started. The first run is one interval after start, and the last run is not kept across a restart.');
+  }
+  const kind = run.outcome === 'pruned' ? 'ok' : run.outcome === 'failed' ? 'bad' : '';
+  const explain = Object.prototype.hasOwnProperty.call(RUN_REASONS, run.reason) ? RUN_REASONS[run.reason] : null;
+  const through = Number.isInteger(run.through) ? run.through : null;
+  return h('div', { class: 'stack', id: 'auto-prune-last-run' },
+    kv([
+      ['Time', time(run.at)],
+      ['Outcome', pill(run.outcome, kind)],
+      ['Reason', h('span', null, mono(run.reason), explain ? h('span', { class: 'muted small' }, ` ${explain}`) : null)],
+      [run.outcome === 'pruned' ? 'Pruned through' : 'Boundary tried', through !== null ? mono(through) : h('span', { class: 'muted' }, 'none')],
+      ['Prune record', Number.isInteger(run.prune_seq) ? link(['entry', run.prune_seq], `seq ${run.prune_seq}`) : h('span', { class: 'muted' }, 'none')],
+      ['Archive file', run.archive ? mono(run.archive) : h('span', { class: 'muted' }, 'none')],
+      ['Detail', run.detail ? h('span', null, run.detail) : undefined],
+    ]));
 }

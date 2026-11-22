@@ -32,6 +32,13 @@ function env() {
     ui: need('CONSOLE_SMOKE_UI'),
     roServer: need('CONSOLE_SMOKE_RO_SERVER'),
     roUi: need('CONSOLE_SMOKE_RO_UI'),
+    // The read-only server's signing key file, a second key for the keys reload test.
+    roKey: need('CONSOLE_SMOKE_RO_KEY'),
+    // The auto server: automatic prune with an archive directory, writes allowed; the reload
+    // tests edit the files in its directory (config.toml, policy.cedar, the key files).
+    autoServer: need('CONSOLE_SMOKE_AUTO_SERVER'),
+    autoUi: need('CONSOLE_SMOKE_AUTO_UI'),
+    autoDir: need('CONSOLE_SMOKE_AUTO_DIR'),
     adminToken: need('CONSOLE_SMOKE_ADMIN_TOKEN'),
     cli: need('CONSOLE_SMOKE_CLI'),
     shots: need('CONSOLE_SMOKE_SHOTS'),

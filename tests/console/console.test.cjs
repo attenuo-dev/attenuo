@@ -8,9 +8,11 @@
 // failed or 4xx/5xx request and no CSP violation.
 'use strict';
 
+const fs = require('node:fs');
+const nodePath = require('node:path');
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { env, cli, cliJson, populate, populateReadOnly } = require('./lib/populate.cjs');
+const { env, operatorEnv, cli, cliJson, populate, populateReadOnly } = require('./lib/populate.cjs');
 const { Console } = require('./lib/browser.cjs');
 
 const E = env();
@@ -482,7 +484,7 @@ test('policy page: loaded set, file check and a dry-run evaluation', async () =>
   assert.equal(await check.locator('.pill.big').textContent(), 'ok');
   assert.match(await check.innerText(), /0 errors/);
   assert.match(await check.innerText(), /same as loaded/i);
-  assert.equal(await c.page.getByRole('button', { name: 'Reload' }).isEnabled(), true);
+  assert.equal(await c.page.getByRole('button', { name: 'Reload…', exact: true }).isEnabled(), true);
 
   // Dry runs read the run-limit counters without charging them. The coder's one repo is
   // used up, so a second repo is over the limit, while the repo it already read still passes.
@@ -649,6 +651,10 @@ test('verify panel: chain ok, then sign a checkpoint of the head', async () => {
   // every visit logged a 404 console error. It now says where readiness lives instead.
   assert.match(await headPanel.innerText(), /Readiness \(\/readyz\) is served on the main listener/);
   assert.ok(!c.requests.includes('GET /readyz'), 'the Verify page requested /readyz');
+  // This server does not prune (`prune = "off"`): no automatic prune section, and the page
+  // never asks for the prune plan, which would answer 409.
+  assert.equal(await c.page.locator('#auto-prune').count(), 0, 'an automatic prune section on a server that does not prune');
+  assert.ok(!c.requests.some((r) => r.includes('/admin/audit/prune')), 'the Verify page asked for the prune plan');
   await bothThemes('verify');
 });
 
@@ -1062,6 +1068,464 @@ test('Follow on a filtered page of a pruned log keeps Older working when nothing
     await onlyPruned410s(probe);
   } finally {
     await probe.close();
+  }
+});
+
+// ---- reloads and the automatic prune (the auto and read-only servers) ---------------------
+
+const AUTO_CONFIG = () => nodePath.join(E.autoDir, 'config.toml');
+
+/** GET on another console listener as the admin, answering 200. */
+async function adminAt(ui, path) {
+  const resp = await fetch(`${ui}${path}`, { headers: { Authorization: `Bearer ${E.adminToken}`, Accept: 'application/json' } });
+  assert.equal(resp.status, 200, `GET ${ui}${path}`);
+  return resp.json();
+}
+
+/** Run `body` with the auto server's config file changed by `edit`, then put it back. */
+async function withConfig(edit, body) {
+  const file = AUTO_CONFIG();
+  const before = fs.readFileSync(file, 'utf8');
+  const after = edit(before);
+  assert.notEqual(after, before, 'the config edit changed nothing');
+  fs.writeFileSync(file, after);
+  try {
+    return await body();
+  } finally {
+    fs.writeFileSync(file, before);
+  }
+}
+
+/** A fresh page on `ui` at device scale factor 2, logged in with `token`, at `hash`. */
+async function openAt(ui, token, hash) {
+  const p = await Console.open(ui, { deviceScaleFactor: 2 });
+  await p.login(token);
+  await p.go(hash);
+  return p;
+}
+
+/** The problems of a page apart from the refused requests a test made on purpose. */
+async function problemsBut(p, statuses) {
+  const re = new RegExp(`\\b(${statuses.join('|')})\\b`);
+  return (await p.allProblems()).filter((x) => !re.test(x));
+}
+
+/** Open the reload dialog of panel `id`, optionally tick `options`, press Reload. */
+async function runReload(p, id, button, options = []) {
+  await p.page.locator(`#reload-${id}`).getByRole('button', { name: button }).click();
+  const dialog = p.page.locator('dialog[open]');
+  await dialog.locator('h2').waitFor();
+  for (const o of options) await dialog.locator(`#reload-opt-${o}`).check();
+  await dialog.getByRole('button', { name: 'Reload', exact: true }).click();
+  return dialog;
+}
+
+/** Wait until the dialog shows a refusal, and return its text. */
+async function refusalText(dialog, id) {
+  const err = dialog.locator(`#reload-${id}-error:not([hidden])`);
+  await err.waitFor();
+  return err.innerText();
+}
+
+/** The kv value `label` in the result box of panel `id`, once the result is drawn. */
+async function resultValue(p, id, label) {
+  const box = p.page.locator(`#reload-${id}-result`);
+  await box.locator('dl.kv').first().waitFor();
+  return kvValue(box, label);
+}
+
+test('reload page: reload the admin operators, then a refusal shows its code and message', async () => {
+  const p = await openAt(E.autoUi, E.adminToken, '#/reload');
+  try {
+    const panel = p.page.locator('#reload-operators');
+    await panel.waitFor();
+    assert.match(await panel.innerText(), /\[\[admin\.operators\]\] entries, and nothing else/);
+    assert.equal(await p.page.locator('#reload-writes-off').count(), 0, 'the writes-off note on a console with writes');
+    assert.match(await p.page.locator('#reload-policies').innerText(), /Check and reload the policies/);
+
+    // The confirmation says what the reload does; Cancel sends nothing.
+    await panel.getByRole('button', { name: 'Reload operators…' }).click();
+    const dialog = p.page.locator('dialog[open]');
+    assert.match(await dialog.locator('h2').innerText(), /^Reload the admin operators\?$/);
+    await dialog.getByRole('button', { name: 'Cancel' }).click();
+    await p.page.waitForFunction(() => document.querySelectorAll('dialog').length === 0);
+    assert.ok(!p.requests.includes('POST /admin/operators/reload'), 'Cancel sent the reload');
+
+    // Happy path: the file is as at startup, so nothing changes, and the record is written.
+    await runReload(p, 'operators', 'Reload operators…');
+    assert.equal(await resultValue(p, 'operators', 'Added'), 'none');
+    assert.equal(await resultValue(p, 'operators', 'Removed'), 'none');
+    assert.equal(await resultValue(p, 'operators', 'Changed'), 'none');
+    const auditId = (await resultValue(p, 'operators', 'Audit record')).trim();
+    const rec = await adminAt(E.autoUi, `/admin/audit/records/${auditId}`);
+    assert.equal(rec.entry.record.tool, 'admin.operators.reload');
+    assert.equal(rec.entry.record.decision, 'allow');
+    assert.match(await p.page.locator('#status').innerText(), /Operators reloaded: 0 added, 0 removed, 0 changed/);
+
+    // A refusal: an entry with a role that does not exist. The dialog stays open with the
+    // server's code and message; the operators in force are unchanged.
+    await withConfig((t) => `${t}\n[[admin.operators]]\nname = "bad"\nrole = "root"\ntoken_sha256 = "${'0'.repeat(64)}"\n`, async () => {
+      const d = await runReload(p, 'operators', 'Reload operators…');
+      const text = await refusalText(d, 'operators');
+      assert.match(text, /Refused: operators_invalid \(HTTP 422\)/);
+      assert.match(text, /the operators in force are unchanged/);
+      assert.match(text, /Nothing was changed\./);
+      await bothThemes('reload-operators-refused', p);
+      await d.getByRole('button', { name: 'Cancel' }).click();
+    });
+    assert.deepEqual(await problemsBut(p, [422]), []);
+  } finally {
+    await p.close();
+  }
+});
+
+test('reload page: agents and PEPs, with the risky options off by default, a refusal, then the option', async () => {
+  const p = await openAt(E.autoUi, E.adminToken, '#/reload');
+  const bodies = [];
+  p.page.on('request', (r) => { if (r.url().endsWith('/admin/agents/reload')) bodies.push(r.postData()); });
+  try {
+    await p.page.locator('#reload-agents').waitFor();
+    await p.page.locator('#reload-agents').getByRole('button', { name: 'Reload agents and PEPs…' }).click();
+    const dialog = p.page.locator('dialog[open]');
+    for (const o of ['allow_empty', 'allow_mismatch']) {
+      assert.equal(await dialog.locator(`#reload-opt-${o}`).isChecked(), false, `${o} starts checked`);
+    }
+    const text = await dialog.innerText();
+    assert.match(text, /Off: a file with no \[\[agents\]\] or no \[\[peps\]\] entries is refused/);
+    assert.match(text, /Off: a file whose \[issuer\] or \[audit\] differs from the running config is refused/);
+    assert.equal(await dialog.locator('.callout.warn').isHidden(), true, 'the safety warning shows with every check on');
+    await dialog.getByRole('button', { name: 'Reload', exact: true }).click();
+
+    // The file is as at startup: both lists, their digests, nothing added, no restart needed.
+    const rows = p.page.locator('#reload-agents-result tbody tr');
+    await rows.first().waitFor();
+    // textContent: the row header is upper-cased by the style sheet.
+    const cells = async (i) => (await rows.nth(i).locator('th, td').allTextContents()).map((t) => t.trim());
+    const agents = await cells(0);
+    assert.deepEqual([agents[0], agents[1], agents[3], agents[4], agents[5]], ['[[agents]]', '2', 'none', 'none', 'none']);
+    assert.match(agents[2], /^[0-9a-f]{16}…$/);
+    assert.deepEqual((await cells(1)).slice(0, 2), ['[[peps]]', '0']);
+    assert.equal(await resultValue(p, 'agents', 'Needs a restart'), 'none');
+    assert.equal(bodies.shift(), '{}', 'a reload with every check on sends no option');
+
+    // Another server's [issuer]: refused with its code and message, in the open dialog.
+    await withConfig((t) => t.replace('audience = "attenuo"', 'audience = "another-server"'), async () => {
+      const d = await runReload(p, 'agents', 'Reload agents and PEPs…');
+      const refused = await refusalText(d, 'agents');
+      assert.match(refused, /Refused: config_file_mismatch \(HTTP 422\)/);
+      assert.match(refused, /the file's \[issuer\] differs from the running config/);
+      assert.equal(bodies.shift(), '{}');
+      // Turning the check off is a deliberate step: the warning shows, and the option is sent.
+      await d.locator('#reload-opt-allow_mismatch').check();
+      assert.equal(await d.locator('.callout.warn').isVisible(), true);
+      await bothThemes('reload-agents-option', p);
+      await d.getByRole('button', { name: 'Reload', exact: true }).click();
+      await p.page.waitForFunction(() => document.querySelectorAll('dialog').length === 0);
+      assert.deepEqual(JSON.parse(bodies.shift()), { allow_mismatch: true });
+      await p.page.waitForFunction(() => /\[issuer\]/.test(document.querySelector('#reload-agents-result')?.innerText ?? ''));
+      assert.match(await resultValue(p, 'agents', 'Needs a restart'), /\[issuer\]/);
+    });
+    await bothThemes('reload-agents-result', p);
+    assert.deepEqual(await problemsBut(p, [422]), []);
+  } finally {
+    await p.close();
+  }
+});
+
+test('reload page: issuer keys, a refused rotation, then a rotation with an overlap', async () => {
+  const p = await openAt(E.autoUi, E.adminToken, '#/reload');
+  try {
+    await p.page.locator('#reload-keys').waitFor();
+    const jwks = async () => (await (await fetch(`${E.autoServer}/.well-known/jwks.json`)).json()).keys.map((k) => k.kid);
+    const [k1] = await jwks();
+
+    // The files are as at startup: the same key signs, nothing changed.
+    const d0 = await runReload(p, 'keys', 'Reload issuer keys…');
+    await p.page.waitForFunction(() => document.querySelectorAll('dialog').length === 0);
+    assert.equal(await d0.count(), 0);
+    assert.equal(await resultValue(p, 'keys', 'Changed'), 'no: the same keys are in force');
+    assert.equal(await resultValue(p, 'keys', 'Signing key'), k1);
+    assert.equal(await resultValue(p, 'keys', 'Previous signing key'), k1);
+    assert.equal(await resultValue(p, 'keys', 'Added'), 'none');
+
+    // A new signing key without the current one: refused, every check on.
+    const k2File = nodePath.join(E.autoDir, 'k2.pem');
+    fs.copyFileSync(E.roKey, k2File);
+    const k1Line = `private_key_pem_path = "${nodePath.join(E.autoDir, 'k1.pem')}"`;
+    assert.ok(fs.readFileSync(AUTO_CONFIG(), 'utf8').includes(k1Line));
+    const d = await withConfig((t) => t.replace(k1Line, `private_key_pem_path = "${k2File}"`), async () => {
+      const dialog = await runReload(p, 'keys', 'Reload issuer keys…');
+      for (const o of ['allow_drop_current', 'allow_drop_audit_key', 'allow_mismatch']) {
+        assert.equal(await dialog.locator(`#reload-opt-${o}`).isChecked(), false, `${o} starts checked`);
+      }
+      const refused = await refusalText(dialog, 'keys');
+      assert.match(refused, /Refused: keys_reload_drops_current \(HTTP 422\)/);
+      assert.match(refused, new RegExp(`the current one, kid \`${k1}\`, is not in \\[issuer\\] previous_key_paths`));
+      // Turning one check off leaves the next one on: the audit log was signed by k1.
+      await dialog.locator('#reload-opt-allow_drop_current').check();
+      await dialog.getByRole('button', { name: 'Reload', exact: true }).click();
+      await dialog.locator('#reload-keys-error', { hasText: 'keys_reload_drops_audit_key' }).waitFor();
+      assert.match(await refusalText(dialog, 'keys'), /which signed audit checkpoints or anchors the log holds/);
+      await bothThemes('reload-keys-refused', p);
+      await dialog.getByRole('button', { name: 'Cancel' }).click();
+      return dialog;
+    });
+    assert.equal(await d.count(), 0);
+    assert.deepEqual(await jwks(), [k1], 'a refused reload changed the JWKS');
+
+    // With the current key kept for an overlap: no option needed, k2 signs, k1 still verifies.
+    await withConfig((t) => t.replace(k1Line, `private_key_pem_path = "${k2File}"\nprevious_key_paths = ["${nodePath.join(E.autoDir, 'k1.pem')}"]`), async () => {
+      await runReload(p, 'keys', 'Reload issuer keys…');
+      await p.page.waitForFunction(() => document.querySelectorAll('dialog').length === 0);
+      await p.page.waitForFunction(() => /^yes$/.test(document.querySelector('#reload-keys-result dl.kv dd')?.innerText ?? ''));
+      const kids = await jwks();
+      assert.equal(kids.length, 2);
+      const k2 = kids.find((k) => k !== k1);
+      assert.equal(await resultValue(p, 'keys', 'Signing key'), k2);
+      assert.equal(await resultValue(p, 'keys', 'Previous signing key'), k1);
+      assert.equal(await resultValue(p, 'keys', 'Verifying keys'), `${k2}, ${k1}`);
+      assert.equal(await resultValue(p, 'keys', 'Added'), k2);
+      assert.equal(await resultValue(p, 'keys', 'Removed'), 'none');
+      assert.equal(await resultValue(p, 'keys', 'Audit signing key'), k2);
+      await bothThemes('reload-keys-result', p);
+    });
+    assert.deepEqual(await problemsBut(p, [422]), []);
+  } finally {
+    await p.close();
+  }
+});
+
+test('reload dialogs: Cancel has the focus, a reload in flight cannot be dismissed, and its outcome is always shown', async () => {
+  const p = await openAt(E.autoUi, E.adminToken, '#/reload');
+  const route = '**/admin/operators/reload';
+  /** Hold the next reload request until the returned function is called with what to do. */
+  const hold = async () => {
+    let release;
+    const held = new Promise((r) => { release = r; });
+    await p.page.route(route, async (r) => {
+      const act = await held;
+      await act(r);
+    }, { times: 1 });
+    return release;
+  };
+  const open = async () => {
+    await p.page.locator('#reload-operators').getByRole('button', { name: 'Reload operators…' }).click();
+    const dialog = p.page.locator('dialog[open]');
+    await dialog.locator('h2').waitFor();
+    return dialog;
+  };
+  try {
+    await p.page.locator('#reload-operators').waitFor();
+    let dialog = await open();
+    assert.equal(await p.page.evaluate(() => document.activeElement?.textContent), 'Cancel', 'Cancel does not have the focus');
+
+    // In flight: Cancel is disabled and Escape (twice) leaves the dialog open; the answer then
+    // closes it and draws the result.
+    let release = await hold();
+    await dialog.getByRole('button', { name: 'Reload', exact: true }).click();
+    await p.page.waitForFunction(() => [...document.querySelectorAll('dialog[open] button')].find((b) => b.textContent === 'Cancel')?.disabled);
+    await p.page.keyboard.press('Escape');
+    await p.page.keyboard.press('Escape');
+    // Chromium may close a dialog on a repeated Escape without a cancelable event; the console
+    // then shows it again at once, so it is open (and still in the page) a moment later.
+    await p.page.waitForFunction(() => document.querySelectorAll('dialog[open]').length === 1, null, { timeout: 2000 });
+    assert.equal(await p.page.locator('dialog').count(), 1, 'Escape removed a dialog whose reload is in flight');
+    assert.equal(await dialog.getByRole('button', { name: 'Reload', exact: true }).isDisabled(), true, 'a second reload can start');
+    release((r) => r.continue());
+    await p.page.waitForFunction(() => document.querySelectorAll('dialog').length === 0);
+    assert.equal(await resultValue(p, 'operators', 'Added'), 'none');
+
+    // The page changes while a reload runs: the router removes the dialog, and the outcome
+    // still reaches the status line.
+    dialog = await open();
+    release = await hold();
+    await dialog.getByRole('button', { name: 'Reload', exact: true }).click();
+    await p.page.waitForFunction(() => [...document.querySelectorAll('dialog[open] button')].find((b) => b.textContent === 'Cancel')?.disabled);
+    await p.go('#/audit');
+    await p.page.waitForFunction(() => document.querySelectorAll('dialog').length === 0);
+    release((r) => r.fulfill({ status: 422, contentType: 'application/json', body: JSON.stringify({ error: 'invalid_request', code: 'operators_invalid', detail: 'stubbed refusal' }) }));
+    await p.page.locator('#status', { hasText: 'Admin operators reload: refused, operators_invalid: stubbed refusal. Nothing was changed.' }).waitFor();
+
+    // No answer, and a 5xx: the outcome is unknown, not "nothing changed".
+    await p.go('#/reload');
+    dialog = await open();
+    await p.page.route(route, (r) => r.abort('connectionreset'), { times: 1 });
+    await dialog.getByRole('button', { name: 'Reload', exact: true }).click();
+    let text = await refusalText(dialog, 'operators');
+    assert.match(text, /No answer: network/);
+    assert.match(text, /The result is unknown: the reload may or may not have happened\. The audit log shows whether it did/);
+    assert.doesNotMatch(text, /Nothing was changed/);
+    await p.page.route(route, (r) => r.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ error: 'server_error', code: 'server_error', detail: 'stubbed failure' }) }), { times: 1 });
+    await dialog.getByRole('button', { name: 'Reload', exact: true }).click();
+    await dialog.locator('#reload-operators-error', { hasText: 'HTTP 500' }).waitFor();
+    text = await refusalText(dialog, 'operators');
+    assert.match(text, /No answer: server_error \(HTTP 500\)/);
+    assert.match(text, /stubbed failure/);
+    assert.match(text, /The result is unknown/);
+    assert.doesNotMatch(text, /Nothing was changed/);
+    await bothThemes('reload-unknown-outcome', p);
+    await dialog.getByRole('button', { name: 'Cancel' }).click();
+    // Only the stubbed failures: the 422 and 500 answers and the reset connection.
+    assert.deepEqual((await p.allProblems()).filter((x) => !/\b(422|500)\b|ERR_CONNECTION_RESET|request failed/.test(x)), []);
+  } finally {
+    await p.close();
+  }
+});
+
+test('policy page: reload through the confirmation, then a file that does not load is refused', async () => {
+  const p = await openAt(E.autoUi, E.adminToken, '#/policy');
+  const policyFile = nodePath.join(E.autoDir, 'policy.cedar');
+  const original = fs.readFileSync(policyFile, 'utf8');
+  try {
+    const check = async () => {
+      await p.page.getByRole('button', { name: 'Check file on disk' }).click();
+      await p.page.locator('.pill.big', { hasText: /^ok$/ }).waitFor();
+    };
+    await check();
+    const reload = p.page.getByRole('button', { name: 'Reload…', exact: true });
+    await reload.click();
+    let dialog = p.page.locator('dialog[open]');
+    await dialog.locator('h2').waitFor();
+    assert.equal(await p.page.evaluate(() => document.activeElement?.textContent), 'Cancel', 'Cancel does not have the focus');
+    assert.match(await dialog.locator('h2').innerText(), /^Reload the policy file\?$/);
+    assert.match(await dialog.innerText(), /If it does not load, the old policies stay in force/);
+    await dialog.getByRole('button', { name: 'Reload', exact: true }).click();
+    const result = p.page.locator('#policy-reload-result');
+    await result.locator('dl.kv').waitFor();
+    const loaded = await adminAt(E.autoUi, '/admin/policies');
+    // A reload waits for the next check, as before the confirmation existed.
+    assert.equal(await reload.isDisabled(), true, 'Reload… is enabled right after a reload');
+    assert.match(await kvValue(result, 'Policies'), new RegExp(`^${loaded.policies.length}: `));
+    assert.equal(await kvValue(result, 'sha256'), loaded.sha256);
+    const auditId = (await kvValue(result, 'Audit record')).trim();
+    assert.equal((await adminAt(E.autoUi, `/admin/audit/records/${auditId}`)).entry.record.tool, 'admin.policies.reload');
+
+    // The file breaks after a clean check: the reload is refused and the old set stays.
+    await check();
+    fs.writeFileSync(policyFile, `${original}\npermit(principal, action, resource) when { nonsense };\n`);
+    await reload.click();
+    dialog = p.page.locator('dialog[open]');
+    await dialog.getByRole('button', { name: 'Reload', exact: true }).click();
+    const err = dialog.locator('#policy-reload-error:not([hidden])');
+    await err.waitFor();
+    assert.match(await err.innerText(), /Refused: policy_invalid \(HTTP 422\)/);
+    assert.match(await err.innerText(), /The old policies stay in force\./);
+    assert.equal((await adminAt(E.autoUi, '/admin/policies')).sha256, loaded.sha256, 'a refused reload changed the policies');
+    await dialog.getByRole('button', { name: 'Cancel' }).click();
+    assert.deepEqual(await problemsBut(p, [422]), []);
+  } finally {
+    fs.writeFileSync(policyFile, original);
+    await p.close();
+  }
+});
+
+test('a read-only console offers no reload, and shows the automatic prune without an archive', async () => {
+  const p = await openAt(E.roUi, E.adminToken, '#/reload');
+  try {
+    await p.page.locator('#reload-writes-off').waitFor();
+    assert.match(await p.page.locator('#reload-writes-off').innerText(), /Writes are disabled on this listener/);
+    for (const id of ['operators', 'agents', 'keys']) {
+      assert.equal(await p.page.locator(`#reload-${id} button`).count(), 0, `a ${id} reload button on a read-only console`);
+    }
+    assert.match(await p.page.locator('#reload-keys').innerText(), /From a shell: attenuo admin key reload/);
+    await p.go('#/policy');
+    await p.page.getByRole('button', { name: 'Check file on disk' }).click();
+    await p.page.locator('.pill.big', { hasText: /^ok$/ }).waitFor();
+    assert.equal(await p.page.getByRole('button', { name: 'Reload…' }).count(), 0, 'a policy Reload on a read-only console');
+    assert.match(await p.page.locator('section.panel', { hasText: 'Check and reload' }).innerText(), /Writes are disabled on this listener/);
+
+    // The automatic prune is on, with no archive directory: a warning says what that means.
+    await p.go('#/verify');
+    const auto = p.page.locator('#auto-prune');
+    await auto.locator('dl.kv').waitFor();
+    assert.match(await auto.innerText(), /The server prunes the audit log on its own/);
+    assert.equal(await kvValue(auto, 'Keeps'), '90 days (7776000 s)');
+    assert.equal(await kvValue(auto, 'Checks every'), '1 hour (3600 s)');
+    // Pills are upper-cased by the style sheet.
+    assert.equal((await kvValue(auto, 'Archive directory')).toLowerCase(), 'not set');
+    assert.match(await p.page.locator('#auto-prune-no-archive').innerText(), /deletes the entries it removes and keeps no copy/);
+    assert.match(await p.page.locator('#auto-prune-no-run').innerText(), /No run yet since the server started/);
+    await bothThemes('auto-prune-no-archive', p);
+    assert.ok(!p.requests.some((r) => r.startsWith('POST ')), 'the read-only console sent a write');
+    assert.deepEqual(await p.allProblems(), []);
+  } finally {
+    await p.close();
+  }
+});
+
+test('verify page: the automatic prune with an archive directory and its last run', async () => {
+  // The auto server checks every second; nothing is old enough, so each run is skipped.
+  let plan;
+  for (let i = 0; i < 100; i++) {
+    plan = await adminAt(E.autoUi, '/admin/audit/prune/plan');
+    if (plan.auto.last_run) break;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  assert.ok(plan.auto.last_run, 'no automatic run within 10 s');
+  const p = await openAt(E.autoUi, E.adminToken, '#/verify');
+  try {
+    const auto = p.page.locator('#auto-prune');
+    await auto.locator('#auto-prune-last-run').waitFor();
+    assert.equal(await kvValue(auto, 'Keeps'), '90 days (7776000 s)');
+    assert.equal(await kvValue(auto, 'Checks every'), '1 second (1 s)');
+    assert.equal(await kvValue(auto, 'At most per run'), '1,000,000 entries');
+    assert.equal(await kvValue(auto, 'Archive directory'), nodePath.join(E.autoDir, 'archive'));
+    assert.equal(await p.page.locator('#auto-prune-no-archive').count(), 0, 'the no-archive warning with an archive directory');
+    assert.equal((await kvValue(auto, 'Outcome')).toLowerCase(), 'skipped');
+    assert.match(await kvValue(auto, 'Reason'), /^(prune_too_recent|nothing_to_prune|sink_behind|prune_live_run) \S/);
+    assert.equal(await kvValue(auto, 'Prune record'), 'none');
+    assert.equal(await kvValue(auto, 'Archive file'), 'none');
+
+    // A run that pruned, from a stubbed plan (the smoke log has nothing 90 days old): the
+    // boundary, the prune record and the archive file name.
+    const at = new Date(Date.now() - 60_000).toISOString().replace(/\.\d+Z$/, 'Z');
+    await p.page.route('**/admin/audit/prune/plan', (route) => route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        ...plan,
+        auto: {
+          ...plan.auto,
+          last_run: {
+            at, outcome: 'pruned', reason: 'ok', through: 120, prune_seq: 125, detail: null,
+            archive: 'audit-00000000000000000001-00000000000000000120.jsonl',
+          },
+        },
+      }),
+    }));
+    await p.go('#/audit');
+    await p.go('#/verify');
+    await auto.locator('#auto-prune-last-run').waitFor();
+    await p.page.waitForFunction(() => /Pruned through/.test(document.querySelector('#auto-prune-last-run')?.innerText ?? ''));
+    assert.equal((await kvValue(auto, 'Outcome')).toLowerCase(), 'pruned');
+    assert.match(await kvValue(auto, 'Reason'), /^ok The run pruned the log\.$/);
+    assert.equal(await kvValue(auto, 'Pruned through'), '120');
+    assert.equal(await auto.getByRole('link', { name: 'seq 125' }).getAttribute('href'), '#/entry/125');
+    assert.equal(await kvValue(auto, 'Archive file'), 'audit-00000000000000000001-00000000000000000120.jsonl');
+    assert.equal(await auto.locator('time').getAttribute('datetime'), at);
+    await bothThemes('auto-prune-archive', p);
+    assert.deepEqual(await p.allProblems(), []);
+  } finally {
+    await p.close();
+  }
+});
+
+test('a viewer sees no automatic prune section and asks for no plan; the reload buttons are disabled', async () => {
+  const p = await openAt(E.autoUi, operatorEnv().viewer, '#/verify');
+  try {
+    await p.page.locator('section.panel', { hasText: 'Log head' }).locator('dl.kv').waitFor();
+    assert.equal(await p.page.locator('#auto-prune').count(), 0, 'the automatic prune section for a viewer');
+    assert.ok(!p.requests.some((r) => r.includes('/admin/audit/prune')), 'a viewer asked for the prune plan');
+    await p.go('#/reload');
+    for (const [id, name] of [['operators', 'Reload operators…'], ['agents', 'Reload agents and PEPs…'], ['keys', 'Reload issuer keys…']]) {
+      const b = p.page.locator(`#reload-${id}`).getByRole('button', { name });
+      assert.equal(await b.isDisabled(), true, `${name} is enabled for a viewer`);
+      assert.equal(await b.getAttribute('title'), 'Needs the admin role; you are viewer.');
+    }
+    assert.match(await p.page.locator('#reload-keys').innerText(), /Reloading needs the admin role/);
+    assert.deepEqual(await p.allProblems(), []);
+  } finally {
+    await p.close();
   }
 });
 

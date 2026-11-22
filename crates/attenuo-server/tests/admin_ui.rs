@@ -319,6 +319,8 @@ async fn read_routes_need_the_admin_bearer_and_carry_no_store() {
         "/admin/leases/nope/tree",
         "/admin/policies",
         "/admin/policies/check",
+        "/admin/audit/prune/plan",
+        "/admin/whoami",
     ] {
         let r = h.get(path).await;
         assert_eq!(r.status(), StatusCode::UNAUTHORIZED, "{path}");
@@ -902,4 +904,215 @@ async fn session_revocation_on_the_console_previews_without_allow_write_and_revo
             assert_eq!(status["active"], true, "nothing was revoked");
         }
     }
+}
+
+/// The console's `GET /admin/whoami` adds `console`: whether this listener mounts the write
+/// routes, and `[audit.retention] prune`. The main listener's answer has no such member.
+#[tokio::test]
+async fn whoami_on_the_console_names_its_write_setting_and_the_prune_mode() {
+    for allow_write in [false, true] {
+        let h = Harness::start(allow_write).await;
+        let r = h.admin_get("/admin/whoami").await;
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_security_headers(r.headers());
+        assert_no_store(r.headers());
+        let v: Value = r.json().await.unwrap();
+        assert_eq!(
+            v,
+            json!({"name": "admin", "role": "admin", "expires_at": null,
+                   "console": {"allow_write": allow_write, "audit_prune": "off"}})
+        );
+        let main: Value = Harness::client()
+            .get(h.main.url("/admin/whoami"))
+            .bearer_auth(ADMIN)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(main.get("console").is_none(), "{main}");
+        // Without a bearer it is a 401 like every admin route.
+        assert_eq!(
+            h.get("/admin/whoami").await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+}
+
+const VIEWER: &str = "viewer-token";
+const OPERATOR: &str = "operator-token";
+
+/// A file-backed config with a file sink and `prune = "auto"` keeping 90 days (the timer never
+/// fires during a test), a viewer and an operator, and the console with or without writes.
+fn auto_prune_config(dir: &std::path::Path, allow_write: bool, archive: bool) -> Config {
+    use attenuo_server::config::{AdminOperator, PruneMode, SinkKind, SinkSection};
+    use attenuo_server::operators::{token_sha256_hex, AdminRole};
+    let mut cfg = Config::default();
+    cfg.audit.sqlite_path = dir.join("audit.sqlite").to_string_lossy().into_owned();
+    let mut sink = SinkSection::new(SinkKind::File);
+    sink.path = Some(dir.join("shipped.jsonl"));
+    cfg.audit.sink = Some(sink);
+    cfg.audit.retention.prune = PruneMode::Auto;
+    cfg.audit.retention.keep_seconds = Some(7_776_000);
+    cfg.audit.retention.interval_seconds = Some(86_400);
+    if archive {
+        let archive = dir.join("archive");
+        std::fs::create_dir(&archive).unwrap();
+        cfg.audit.retention.archive_dir = Some(archive);
+    }
+    cfg.issuer.private_key_pem_path = Some(dir.join("issuer.pem"));
+    cfg.admin.token = Some(ADMIN.into());
+    cfg.admin.operators = [
+        ("vera", VIEWER, AdminRole::Viewer),
+        ("otto", OPERATOR, AdminRole::Operator),
+    ]
+    .into_iter()
+    .map(|(name, token, role)| AdminOperator {
+        name: name.into(),
+        token_sha256: token_sha256_hex(token),
+        role,
+        expires_at: None,
+    })
+    .collect();
+    cfg.admin_ui.enabled = true;
+    cfg.admin_ui.allow_write = allow_write;
+    cfg
+}
+
+async fn console_get(console: &Spawned, path: &str, bearer: Option<&str>) -> (StatusCode, Value) {
+    let mut req = Harness::client().get(console.url(path));
+    if let Some(b) = bearer {
+        req = req.bearer_auth(b);
+    }
+    let r = req.send().await.unwrap();
+    let status = r.status();
+    assert_security_headers(r.headers());
+    assert_no_store(r.headers());
+    (status, r.json().await.unwrap_or(Value::Null))
+}
+
+/// `GET /admin/audit/prune/plan` is a read route of the console listener, with or without
+/// `allow_write`: the admin role gets the plan with the automatic prune's settings and last
+/// run, the viewer and operator roles get 403 `admin_role_insufficient` as on the admin API,
+/// and no bearer is 401. The prune itself and the anchors are never mounted there.
+#[tokio::test]
+async fn the_prune_plan_is_a_read_route_of_the_console_for_the_admin_role() {
+    for (allow_write, archive) in [(false, false), (true, true)] {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = auto_prune_config(dir.path(), allow_write, archive);
+        let (_router, state) = attenuo_server::build(&cfg).unwrap();
+        let console = spawn_router(attenuo_server::admin_ui::router(state.clone(), &cfg))
+            .await
+            .unwrap();
+
+        let (status, who) = console_get(&console, "/admin/whoami", Some(VIEWER)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            who["console"],
+            json!({"allow_write": allow_write, "audit_prune": "auto"})
+        );
+
+        let (status, plan) = console_get(&console, "/admin/audit/prune/plan", Some(ADMIN)).await;
+        assert_eq!(status, StatusCode::OK, "{plan}");
+        let auto = &plan["auto"];
+        assert_eq!(auto["keep_seconds"], 7_776_000, "{plan}");
+        assert_eq!(auto["interval_seconds"], 86_400, "{plan}");
+        assert_eq!(auto["last_run"], Value::Null, "{plan}");
+        match &cfg.audit.retention.archive_dir {
+            Some(d) => assert_eq!(auto["archive_dir"], d.display().to_string()),
+            None => assert_eq!(auto["archive_dir"], Value::Null),
+        }
+        // After a run, the plan names it.
+        let run = attenuo_server::auto_prune_once(&state).await;
+        let (_, plan) = console_get(&console, "/admin/audit/prune/plan", Some(ADMIN)).await;
+        assert_eq!(plan["auto"]["last_run"]["outcome"], run.outcome, "{plan}");
+        assert_eq!(plan["auto"]["last_run"]["reason"], run.reason, "{plan}");
+
+        for bearer in [VIEWER, OPERATOR] {
+            let (status, body) =
+                console_get(&console, "/admin/audit/prune/plan", Some(bearer)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{bearer}: {body}");
+            assert_eq!(body["code"], "admin_role_insufficient", "{body}");
+        }
+        let (status, _) = console_get(&console, "/admin/audit/prune/plan", None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        // The plan path answers GET only: another method is refused (405, or 404 where the
+        // console has no route for it) and writes nothing, the audit head and anchors included.
+        let head = |c: &Spawned| {
+            let url = c.url("/admin/audit?order=desc&limit=1");
+            async move {
+                let v: Value = Harness::client()
+                    .get(url)
+                    .bearer_auth(ADMIN)
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                v["head"].as_u64().unwrap()
+            }
+        };
+        let before = head(&console).await;
+        assert!(state.audit.newest_anchor().unwrap().is_none());
+        for method in [
+            reqwest::Method::POST,
+            reqwest::Method::PUT,
+            reqwest::Method::DELETE,
+        ] {
+            let r = Harness::client()
+                .request(method.clone(), console.url("/admin/audit/prune/plan"))
+                .bearer_auth(ADMIN)
+                .json(&json!({"through": 1}))
+                .send()
+                .await
+                .unwrap();
+            assert!(
+                r.status() == StatusCode::METHOD_NOT_ALLOWED || r.status() == StatusCode::NOT_FOUND,
+                "{method} /admin/audit/prune/plan: {}",
+                r.status()
+            );
+            assert_security_headers(r.headers());
+        }
+        assert_eq!(
+            head(&console).await,
+            before,
+            "a refused method wrote to the log"
+        );
+        assert!(state.audit.newest_anchor().unwrap().is_none());
+        assert_eq!(state.audit.pruned_through().unwrap(), None);
+
+        // Never the prune, never the anchors.
+        let r = Harness::client()
+            .post(console.url("/admin/audit/prune"))
+            .bearer_auth(ADMIN)
+            .json(&json!({"through": 1}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            r.status(),
+            StatusCode::NOT_FOUND,
+            "allow_write={allow_write}"
+        );
+        assert_security_headers(r.headers());
+        let (status, _) = console_get(&console, "/admin/audit/anchors", Some(ADMIN)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "allow_write={allow_write}");
+    }
+}
+
+/// With `prune = "off"` the plan route is still mounted on the console and answers as on the
+/// admin API, 409 `prune_disabled`, which is why the console asks for it only when the
+/// `console` member of `whoami` says `auto`.
+#[tokio::test]
+async fn the_prune_plan_on_the_console_answers_prune_disabled_when_prune_is_off() {
+    let h = Harness::start(false).await;
+    let r = h.admin_get("/admin/audit/prune/plan").await;
+    assert_eq!(r.status(), StatusCode::CONFLICT);
+    assert_security_headers(r.headers());
+    assert_no_store(r.headers());
+    let v: Value = r.json().await.unwrap();
+    assert_eq!(v["code"], "prune_disabled", "{v}");
 }

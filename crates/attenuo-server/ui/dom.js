@@ -73,6 +73,38 @@ export function link(segments, text, attrs = {}) {
   return h('a', { ...attrs, href }, text);
 }
 
+/**
+ * Open a modal dialog on <body>, labelled by the element with id `labelledBy`, holding
+ * `content`. Escape removes it, and so does leaving the page (the router removes every
+ * dialog, so a dialog never acts for a page that is gone). While `opts.busy()` is true (a
+ * request of the dialog is in flight), Escape does not close it: the `cancel` event is
+ * cancelled, and should the browser close it anyway (it may, for a repeated Escape), it is
+ * shown again. Returns {dialog, close}.
+ */
+export function modal(labelledBy, content, opts = {}) {
+  const busy = typeof opts.busy === 'function' ? opts.busy : () => false;
+  const dialog = h('dialog', { 'aria-labelledby': labelledBy }, content);
+  let closing = false;
+  const close = () => {
+    closing = true;
+    if (dialog.open) dialog.close();
+    dialog.remove();
+  };
+  dialog.addEventListener('cancel', (ev) => {
+    if (busy()) {
+      ev.preventDefault();
+      return;
+    }
+    dialog.remove();
+  });
+  dialog.addEventListener('close', () => {
+    if (!closing && busy() && dialog.isConnected) dialog.showModal();
+  });
+  document.body.append(dialog);
+  dialog.showModal();
+  return { dialog, close };
+}
+
 /** A monospace span, for ids, hashes and seqs. */
 export function mono(text, attrs = {}) {
   return h('span', { ...attrs, class: `mono ${attrs.class || ''}`.trim() }, text ?? '');

@@ -9,8 +9,11 @@
 # through the CLI (a chain, denials, a `budget_exhausted` decision, approvals), open every
 # console page in headless Chromium in both themes, and fail on any console error, page error
 # or CSP violation. A second attenuo-server on the same upstream, whose console listener does
-# not allow writes, is where the tests check that the console refuses a revocation there. The
-# main server also has four `[[admin.operators]]` (viewer, operator, operator with a future
+# not allow writes, is where the tests check that the console refuses a revocation there and
+# offers no reload; it also prunes its audit log automatically, without an archive directory. A
+# third attenuo-server, the "auto" one, prunes automatically with an archive directory and
+# allows writes: the reload tests edit its config file, its policy file and its key files, and
+# the Verify page shows its automatic prune. The main server also has four `[[admin.operators]]` (viewer, operator, operator with a future
 # expiry, expired viewer); tests/console/roles.test.cjs then logs in as each, and as the admin
 # token, in a fresh page and checks the header, the buttons the role allows and the expired
 # login message. All servers are stopped on exit, pass or fail.
@@ -65,9 +68,10 @@ CLI_BIN="$BIN/attenuo"
 FAKE_BIN="$BIN/examples/fake_mcp"
 [ -x "$FAKE_BIN" ] || FAKE_BIN="$BIN/fake_mcp"
 
-# Five distinct free ports: main, upstream, console, and the read-only server's main and console.
+# Seven distinct free ports: main, upstream, console, the read-only server's main and console,
+# and the auto server's main and console.
 PORTS=()
-while [ "${#PORTS[@]}" -lt 5 ]; do
+while [ "${#PORTS[@]}" -lt 7 ]; do
   p="$(free_port)"
   case " ${PORTS[*]:-} " in *" $p "*) ;; *) PORTS+=("$p") ;; esac
 done
@@ -76,6 +80,8 @@ MCP_PORT="${PORTS[1]}"
 UI_PORT="${PORTS[2]}"
 RO_MAIN_PORT="${PORTS[3]}"
 RO_UI_PORT="${PORTS[4]}"
+AUTO_MAIN_PORT="${PORTS[5]}"
+AUTO_UI_PORT="${PORTS[6]}"
 
 # The demo policy plus a destructive tool the policy allows outright and asks about once the
 # run is tainted unless the call carries an approval, which the policy page's dry runs with
@@ -151,11 +157,24 @@ operator_entry() { # name role token [expires_at]
   operator_entry gone viewer "$EXPIRED_TOKEN" "2020-01-01T00:00:00Z"
 } >> "$WORK/config.toml"
 
-# The read-only server: the same config on its own ports, with a console that cannot write.
+# The read-only server: the same config on its own ports, with a console that cannot write,
+# and an automatic prune without an archive directory (which needs a log in a file and a sink).
+# Its signing key is created at start; the keys reload test uses it as a second key.
+mkdir -p "$WORK/ro"
 sed -e "s/18080/$RO_MAIN_PORT/g" -e "s/13001/$MCP_PORT/g" \
     -e "s#examples/github-leak-demo/policy.cedar#$DEMO/policy.cedar#" \
+    -e "s#^sqlite_path = \":memory:\"#sqlite_path = \"$WORK/ro/audit.sqlite\"#" \
+    -e "s#^\[issuer\]#[issuer]\nprivate_key_pem_path = \"$WORK/ro/issuer.pem\"#" \
     "$DEMO/config.toml" > "$WORK/config-ro.toml"
 cat >> "$WORK/config-ro.toml" <<EOF
+
+[audit.sink]
+kind = "file"
+path = "$WORK/ro/shipped.jsonl"
+
+[audit.retention]
+prune = "auto"
+keep_seconds = 7776000
 
 [admin_ui]
 enabled = true
@@ -163,21 +182,55 @@ listen = "127.0.0.1:$RO_UI_PORT"
 allow_write = false
 EOF
 
+# The auto server: the demo config on its own ports with its own copy of the policy, a signing
+# key file, a log in a file, a sink, an automatic prune every second with an archive directory
+# (nothing in the log is old enough, so each run is skipped), a console that writes, and the
+# viewer operator.
+AUTO="$WORK/auto"
+mkdir -p "$AUTO/archive"
+cp "$DEMO/policy.cedar" "$AUTO/policy.cedar"
+sed -e "s/18080/$AUTO_MAIN_PORT/g" -e "s/13001/$MCP_PORT/g" \
+    -e "s#examples/github-leak-demo/policy.cedar#$AUTO/policy.cedar#" \
+    -e "s#^sqlite_path = \":memory:\"#sqlite_path = \"$AUTO/audit.sqlite\"#" \
+    -e "s#^\[issuer\]#[issuer]\nprivate_key_pem_path = \"$AUTO/k1.pem\"#" \
+    "$DEMO/config.toml" > "$AUTO/config.toml"
+cat >> "$AUTO/config.toml" <<EOF
+
+[audit.sink]
+kind = "file"
+path = "$AUTO/shipped.jsonl"
+
+[audit.retention]
+prune = "auto"
+keep_seconds = 7776000
+interval_seconds = 1
+archive_dir = "$AUTO/archive"
+
+[admin_ui]
+enabled = true
+listen = "127.0.0.1:$AUTO_UI_PORT"
+allow_write = true
+EOF
+operator_entry vera viewer "$VIEWER_TOKEN" >> "$AUTO/config.toml"
+
 "$FAKE_BIN" --port "$MCP_PORT" > "$WORK/fake-mcp.out" 2> "$WORK/fake-mcp.log" &
 PIDS+=($!)
 RUST_LOG=warn "$SERVER_BIN" --config "$WORK/config.toml" > "$WORK/server.log" 2>&1 &
 PIDS+=($!)
 RUST_LOG=warn "$SERVER_BIN" --config "$WORK/config-ro.toml" > "$WORK/server-ro.log" 2>&1 &
 PIDS+=($!)
+RUST_LOG=warn "$SERVER_BIN" --config "$AUTO/config.toml" > "$WORK/server-auto.log" 2>&1 &
+PIDS+=($!)
 
 for _ in $(seq 1 100); do
   curl -sf -o /dev/null "http://127.0.0.1:$MAIN_PORT/healthz" \
     && curl -sf -o /dev/null "http://127.0.0.1:$UI_PORT/admin/ui/" \
     && curl -sf -o /dev/null "http://127.0.0.1:$RO_UI_PORT/admin/ui/" \
+    && curl -sf -o /dev/null "http://127.0.0.1:$AUTO_UI_PORT/admin/ui/" \
     && grep -q listening "$WORK/fake-mcp.out" 2>/dev/null && break
   sleep 0.1
 done
-for port in "$UI_PORT" "$RO_UI_PORT"; do
+for port in "$UI_PORT" "$RO_UI_PORT" "$AUTO_UI_PORT"; do
   curl -sf -o /dev/null "http://127.0.0.1:$port/admin/ui/" || { echo "server on $port did not start" >&2; exit 1; }
 done
 
@@ -192,6 +245,10 @@ CONSOLE_SMOKE_SERVER="http://127.0.0.1:$MAIN_PORT" \
 CONSOLE_SMOKE_UI="http://127.0.0.1:$UI_PORT" \
 CONSOLE_SMOKE_RO_SERVER="http://127.0.0.1:$RO_MAIN_PORT" \
 CONSOLE_SMOKE_RO_UI="http://127.0.0.1:$RO_UI_PORT" \
+CONSOLE_SMOKE_RO_KEY="$WORK/ro/issuer.pem" \
+CONSOLE_SMOKE_AUTO_SERVER="http://127.0.0.1:$AUTO_MAIN_PORT" \
+CONSOLE_SMOKE_AUTO_UI="http://127.0.0.1:$AUTO_UI_PORT" \
+CONSOLE_SMOKE_AUTO_DIR="$AUTO" \
 CONSOLE_SMOKE_ADMIN_TOKEN="demo-admin-token" \
 CONSOLE_SMOKE_CLI="$CLI_BIN" \
 CONSOLE_SMOKE_SHOTS="$SHOTS" \
