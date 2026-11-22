@@ -205,7 +205,7 @@ jkt  4MMDxQj9pafXPrWH6dxBeoSk2DpHFpEZvXvsmr6JibU
 
 ### `key gen --client <PATH> [--kid KID]`
 
-Write a new Ed25519 client key for `private_key_jwt` (RFC 7523) to `PATH` as a private JWK, mode 0600, and print the `jwks` line, with only its public half, to paste into the agent's `[[agents]]` entry (or a PEP's `[[peps]]` entry). The `kid` is `--kid`, or the key's RFC 7638 thumbprint. An existing file is never overwritten (exit code 1). Pass the file to `token exchange --client-key`; the SDKs read the same format. With `--json`: `{path, kid, alg, jwk}`. To rotate, generate a key with a new `kid`, add it to the entry's `jwks` next to the old one, restart, move the agent over, then remove the old key ([config](config.md#agents)).
+Write a new Ed25519 client key for `private_key_jwt` (RFC 7523) to `PATH` as a private JWK, mode 0600, and print the `jwks` line, with only its public half, to paste into the agent's `[[agents]]` entry (or a PEP's `[[peps]]` entry). The `kid` is `--kid`, or the key's RFC 7638 thumbprint. An existing file is never overwritten (exit code 1). Pass the file to `token exchange --client-key`; the SDKs read the same format. With `--json`: `{path, kid, alg, jwk}`. To rotate, generate a key with a new `kid`, add it to the entry's `jwks` next to the old one, run [`admin agent reload`](#admin-agent-reload) (or restart), move the agent over, then remove the old key and reload again ([config](config.md#agents)).
 
 ```console
 $ attenuo key gen --client coder-client.jwk --kid coder-2026-11
@@ -266,7 +266,12 @@ A refusal exits 1 with the server's code, and the operators in force stay as the
 
 ### `admin agent reload`
 
-Ask the server to re-read `[[agents]]` and `[[peps]]` from the config file it was started with and put them in force without a restart (`POST /admin/agents/reload`, role `admin`). Prints, for each list, how many entries are in force and the ids added, removed and changed (secret or keys), then the other sections of the file that differ from the running config and need a restart, then the startup warnings the new lists raise; `--json` prints the server's answer. Use it to add an agent or a PEP, to rotate a secret or a key, or to remove a credential.
+Ask the server to re-read `[[agents]]` and `[[peps]]` from the config file it was started with and put them in force without a restart (`POST /admin/agents/reload`, role `admin`). Prints, for each list, how many entries are in force and the ids added, removed and changed (secret or keys), then the other sections of the file that differ from the running config and need a restart; `--json` prints the server's answer. Use it to add an agent or a PEP, to rotate a secret or a key, or to remove a credential.
+
+| Option | Meaning |
+| --- | --- |
+| `--allow-empty` | Accept a file that leaves `[[agents]]` or `[[peps]]` empty while the server has entries in force. Without it the reload is refused (`agents_reload_empties`): an empty or cut-off file reads that way. |
+| `--allow-mismatch` | Accept a file whose `[issuer]` or `[audit]` differs from the running config. Without it the reload is refused (`config_file_mismatch`): such a file may be another server's. Only the lists are applied either way. |
 
 ```console
 $ attenuo admin agent reload
@@ -277,7 +282,11 @@ peps: 1 in force, 0 added, 0 removed, 0 changed
   changed  agent reviewer
 ```
 
-A removed agent cannot authenticate again, but tokens already issued to it are not revoked: revoke them with [`lease revoke`](#lease-revoke-id---reason-text). A refusal exits 1 with the server's code, and the lists in force stay as they were: `agents_invalid` (the file does not parse, or a list breaks a [startup rule](config.md#agents)), `reload_unavailable` (the server was not started from a config file), `config_unreadable` (the file cannot be read), or `admin_role_insufficient` (the token's role is below `admin`).
+Warnings go to stderr, one `warning:` line each, in text and `--json` mode alike, and the exit status stays 0: the startup warnings the new lists raise, a removed agent that can still get new tokens another way (see below), and the lists that the file's own settings would refuse after a restart.
+
+Removing an agent stops it authenticating with its secret or key. It does not always stop new tokens: with `[token] require_actor_auth = false` an exchange can still name it as the actor, and an `[[actor_trust]]` entry that maps a workload to its id still lets it in with an actor token (removing that takes a restart). The reload warns about both. Tokens already issued are not revoked either: revoke them with [`lease revoke`](#lease-revoke-id---reason-text). To contain a compromised agent, remove it, reload, and revoke its leases.
+
+A refusal exits 1 with the server's code, and the lists in force stay as they were: `agents_invalid` (the file does not parse, or a list breaks a [startup rule](config.md#agents)), `agents_reload_empties` and `config_file_mismatch` (above), `reload_unavailable` (the server was not started from a config file), `config_unreadable` (the file cannot be read), or `admin_role_insufficient` (the token's role is below `admin`).
 
 ### `token inspect <JWT>`
 
