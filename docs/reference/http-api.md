@@ -530,8 +530,8 @@ Where they are served: on the main listener by default; with `[admin] listen` se
 | `GET /admin/audit/verify` | Walk the whole hash chain, verify every checkpoint signature against the JWKS, and report `{entries, ok, first_bad_seq, checkpoints, last_signed_seq, unsigned_tail, bad_checkpoints, pruned_through, anchors, bad_anchors}`. After a prune the walk starts at the newest anchor: `pruned_through` is its boundary (null for a log never pruned), `anchors` counts the anchors checked, and `bad_anchors` lists the ones that failed, `{through_seq, reason}`; `entries` counts retained entries. A log whose first row is not seq 1 and that has no valid anchor naming it is `ok: false` at its first row. |
 | `GET /admin/audit/checkpoint` | The signed checkpoint of the head, `{seq, head_hash, at, kid, signature}` (signing it now if the head has none). For keeping outside the host. `hash` repeats `head_hash` for older clients. |
 | `GET /admin/audit/export?from&to` | Entries `from..=to` (default: the whole log) and the checkpoints in that range, streamed as `application/x-ndjson`: a `header` line, `entry` lines, then `checkpoint` lines. Verify offline with `attenuo audit verify --file`. `kind`, `chain_id`, `tool` and `decision` keep only the matching entries; the header then has a `filter` member naming them and the file cannot be verified. The SDKs take the same four: Python `audit_export(kind=, chain_id=, tool=, decision=)`, TypeScript `auditExport(from, to, { kind, chainId, tool, decision })`. 400 if `from` is 0 or `to < from`, for an unknown kind or decision, more than one kind, or an empty filter value. After a prune `from` defaults to the first retained seq, a `from` or `to` at or below the boundary is 410 `audit_pruned`, and an export from the first retained seq has the signed anchor as the header's `anchor` member: `attenuo audit verify --file` then checks that the file continues it and reports `from_anchor: true` (a verifier that does not know the member verifies the file as a window). |
-| `GET /admin/audit/prune/plan?through&before` | With `[audit.retention] prune = "manual"`: the largest boundary the guards allow at or below `through` (a seq) or for entries older than `before` (RFC 3339), the head when neither is given. See [Audit retention](#audit-retention). Reads only. |
-| `POST /admin/audit/prune` | With `[audit.retention] prune = "manual"`: prune the log through a boundary, body `{"through": <seq>, "archive_sha256": "<hex>"}`. See [Audit retention](#audit-retention). |
+| `GET /admin/audit/prune/plan?through&before` | With `[audit.retention] prune = "manual"` or `"auto"`: the largest boundary the guards allow at or below `through` (a seq) or for entries older than `before` (RFC 3339), the head when neither is given. With `"auto"`, also the automatic prune's settings and last run (`auto`). See [Audit retention](#audit-retention). Reads only. |
+| `POST /admin/audit/prune` | With `[audit.retention] prune = "manual"` or `"auto"`: prune the log through a boundary, body `{"through": <seq>, "archive_sha256": "<hex>"}`. See [Audit retention](#audit-retention). |
 | `GET /admin/audit/anchors?limit&cursor` | The signed anchors of past prunes, newest first, `{anchors, next_cursor}`, each `{through_seq, through_hash, prune_seq, prune_entry_hash, previous_through_seq, archive_sha256, at, kid, signature, state}`. Paged as in [Paging](#paging): `limit` default 50, at most 500. Empty for a log never pruned, whatever `prune` is. |
 | `POST /admin/policies/reload` | Re-read the policy file. On failure the old policy stays. |
 | `POST /admin/operators/reload` | Re-read `[[admin.operators]]`, and nothing else, from the config file the server was started with, and swap them in at once. See [Operators reload](#operators-reload). Also on the console listener with `[admin_ui] allow_write = true`. |
@@ -810,7 +810,7 @@ The single-entry routes (`/admin/audit/entries/{seq}`, `/admin/audit/records/{id
 
 ### Audit retention
 
-With `[audit.retention] prune = "manual"` ([config](config.md#auditretention), [ADR-0015](../decisions/0015-audit-retention.md)) the admin may prune the oldest part of the log. With `prune = "off"`, the default, both routes below answer 409 `prune_disabled` and the log is never pruned. The SDKs wrap the three routes: Python `audit_prune_plan(through=, before=)`, `audit_prune(through, archive_sha256=, from_=, through_hash=)` and `audit_anchors(cursor=, limit=)`, TypeScript `auditPrunePlan({ through, before })`, `auditPrune(through, { archiveSha256, from, throughHash })` and `auditAnchors({ cursor, limit })`.
+With `[audit.retention] prune = "manual"` or `"auto"` ([config](config.md#auditretention), [ADR-0015](../decisions/0015-audit-retention.md)) the admin may prune the oldest part of the log. With `"auto"` the server also prunes on its own, through the same plan and the same prune (see [the automatic prune](#the-automatic-prune) below). With `prune = "off"`, the default, both routes below answer 409 `prune_disabled` and the log is never pruned. The SDKs wrap the three routes: Python `audit_prune_plan(through=, before=)`, `audit_prune(through, archive_sha256=, from_=, through_hash=)` and `audit_anchors(cursor=, limit=)`, TypeScript `auditPrunePlan({ through, before })`, `auditPrune(through, { archiveSha256, from, throughHash })` and `auditAnchors({ cursor, limit })`.
 
 `GET /admin/audit/prune/plan?through=<seq>` (or `?before=<RFC 3339>`, or neither for the head) answers the largest boundary B the guards allow at or below the request:
 
@@ -825,7 +825,8 @@ With `[audit.retention] prune = "manual"` ([config](config.md#auditretention), [
              "live_run_seq": 1000123, "sink_delivered_through": 1041000, "sink_degraded": false,
              "in_progress": false, "anchor_undelivered": false,
              "limited_by": "prune_not_at_checkpoint"},
-  "anchor": null
+  "anchor": null,
+  "auto": null
 }
 ```
 
@@ -856,6 +857,22 @@ From then on every read starts at B + 1. The rows at or below B are deleted afte
 | `prune_archive_mismatch` | `from` is not the first retained seq, or `through_hash` is not the entry hash at B; for a repeat of a prune that succeeded, they differ from the stored anchor (`previous_through_seq + 1`, or 1, and `through_hash`) |
 
 A `through` below the current boundary is 410 `audit_pruned`, with `pruned_through`, `prune_seq` and `first` as on every other 410 `audit_pruned`; 400 `invalid_request` for a malformed body, a `through` of 0 or an `archive_sha256` that is not 64 lower-case hex digits.
+
+#### The automatic prune
+
+With `prune = "auto"` the plan's `auto` member is `{keep_seconds, interval_seconds, max_entries_per_run, archive_dir, last_run}`; it is null with `"manual"`. `archive_dir` is the configured directory, or null when the server keeps no archive. `last_run` is null until the server has run one since it started, then:
+
+```json
+{"at": "2026-11-22T10:00:00Z", "outcome": "pruned", "reason": "ok",
+ "through": 120000, "prune_seq": 250013, "detail": null,
+ "archive": "audit-00000000000000000001-00000000000000120000.jsonl"}
+```
+
+`outcome` is `pruned`, `skipped` or `failed`. `reason` is `ok` for a prune. For a skipped run it is the code of the guard that stopped it (the table above, or `audit_pruned` when nothing past the boundary is at a checkpoint), `nothing_to_prune`, `concurrent_prune` when another prune changed the log during the run, or `clock_jump` when the wall clock moved more than an hour away from the monotonic clock since the last run. For a failed run it is `verify_failed` (the entries it would prune do not verify, so they are kept), `archive_write_failed` (the archive file could not be written), `archive_exists` (a file of the archive's name is there and is not this prefix's archive; it is never replaced), `archive_verify_failed` (the archive file does not verify when read back), `error` (the store failed) or `panic`. `through` is the boundary it pruned or tried, `prune_seq` the prune record's seq, `detail` more words for a skip or a failure, and `archive` the archive file's name in `archive_dir` when the run got that far. The plan itself is still the admin's: its age floor is `min_age_seconds`, not `keep_seconds`.
+
+Each run plans with only entries older than its cutoff old enough: `keep_seconds` before the earliest of now, the newest entry that is not a prune record, and the wall time at start plus the monotonic time since ([configuration reference](config.md#auditretention)), at most `max_entries_per_run` entries, and verifies the entries from the log's start to the boundary (the chain, every checkpoint and the anchors, as `GET /admin/audit/verify` does). With `archive_dir` it then writes those entries as an export file and verifies the file ([config](config.md#auditretention)). Only then does it prune, with the plan's first seq and the boundary's hash as `from` and `through_hash`, so a prune that something else made in between refuses it. The prune record's `originating_subject` is `urn:attenuo:retention`. The anchor's `archive_sha256` is the archive file's SHA-256, or null without `archive_dir`. The runs are counted in `audit_auto_prune_runs_total{outcome, reason}` ([metrics](#metrics)).
+
+#### After a prune
 
 After a prune, `GET /admin/audit/verify` checks the newest anchor's signature, the checkpoint at B and the prune record, and walks the chain from B + 1. A log whose first rows were deleted without a valid anchor (by someone with write access to the file but no key) reports `ok: false` at its first row, as before. `GET /admin/audit/anchors` lists every anchor, newest first, each with its `state` and `shipped_at`. An export that is streaming when a prune commits above its position ends with an error instead of a file with a gap (export again from the new first seq), and a verify whose walk overlaps a prune's deletes walks once more from a new snapshot when the anchors changed.
 
@@ -991,6 +1008,9 @@ Every series is prefixed `attenuo_`. Label values come from fixed sets, so the n
 | `audit_db_size_bytes` | gauge | none | Size of the SQLite database file of the audit log and lease registry (`page_count * page_size`), the WAL not included. Read at each scrape when the store is not busy, else the last value read; 0 before the first. |
 | `audit_db_free_bytes` | gauge | none | Bytes of that file on SQLite's free list (`freelist_count * page_size`): space that deletes, a prune's among them, freed and new rows reuse. The file does not shrink without `VACUUM`, which the server never runs. |
 | `audit_pruned_entries_total` | counter | none | Audit entries deleted by prunes of the log (`[audit.retention]`). |
+| `audit_prune_last_timestamp_seconds` | gauge | none | Unix time of the newest prune of the audit log, manual or automatic (its anchor's `at`), read from the file at start; 0 for a log never pruned. |
+| `audit_auto_prune_runs_total` | counter | `outcome` (`pruned`, `skipped`, `failed`), `reason` | Runs of the automatic prune (`[audit.retention] prune = "auto"`). `reason` is `ok` for a prune, a guard code (`prune_too_recent`, `sink_behind`, ...), `nothing_to_prune`, `concurrent_prune` or `clock_jump` for a skip, and `verify_failed`, `archive_write_failed`, `archive_exists`, `archive_verify_failed`, `error` or `panic` for a failure ([the automatic prune](#the-automatic-prune)). A series appears once counted. |
+| `audit_auto_prune_last_run_timestamp_seconds` | gauge | none | Unix time the automatic prune last ran, whatever its outcome; 0 before the first run. |
 | `audit_sink_delivered_total` | counter | none | Signed checkpoints delivered off the host by `[audit.sink]`. |
 | `audit_sink_failures_total` | counter | none | Deliveries by `[audit.sink]` that failed and will be retried. |
 | `audit_sink_dropped_total` | counter | none | Checkpoints dropped from a full `[audit.sink]` queue before delivery. |

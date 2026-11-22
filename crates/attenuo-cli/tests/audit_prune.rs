@@ -1018,3 +1018,234 @@ async fn export_out_writes_links_and_devices_directly() {
         .contains("\"seq\":10,"));
     no_partial_files(s.dir.path());
 }
+
+/// Append one record written ten days ago: inside the keep window, and the newest entry, which
+/// the automatic prune measures the window back from.
+fn recent_entry(state: &AppState) {
+    let mut r = audit_common::record(0);
+    r.at = OffsetDateTime::now_utc() - Duration::days(10);
+    state.audit.append(r).unwrap();
+}
+
+/// Rows at or below seq 20 still in the table, deleted by a prune or not.
+fn rows_through_20(state: &AppState) -> i64 {
+    state
+        .audit
+        .with_connection(|c| {
+            Ok(
+                c.query_row("SELECT COUNT(*) FROM audit WHERE seq <= 20", [], |r| {
+                    r.get(0)
+                })?,
+            )
+        })
+        .unwrap()
+}
+
+/// `prune = "auto"` with a restart between the automatic prune's commit and the end of its
+/// deletes. The operator kept an export of `1..=20` before the prune; the automatic prune
+/// keeps no archive of its own. At every point (deletes not started, after the restart,
+/// deletes done) the live log verifies, and `audit verify --file archive --file retained
+/// --checkpoints shipped` passes as one log from genesis, with the shipped anchor checked.
+#[tokio::test]
+async fn an_automatic_prune_and_a_restart_keep_the_files_verifiable_as_one_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let auto = |batch: u64| {
+        let mut cfg = config(dir.path(), PruneMode::Auto);
+        cfg.audit.retention.keep_seconds = Some(7_776_000);
+        cfg.audit.retention.interval_seconds = Some(86_400);
+        cfg.audit.retention.batch_rows = batch;
+        cfg
+    };
+    let start = |cfg: Config| async move {
+        let (router, state) = attenuo_server::build(&cfg).unwrap();
+        (spawn_router(router).await.unwrap(), state)
+    };
+    let (server, state) = start(auto(10_000)).await;
+    let path = |name: &str| dir.path().join(name);
+    let cli = |server: &Spawned| {
+        let mut c = attenuo();
+        c.env("ATTENUO_ADMIN_TOKEN", ADMIN)
+            .args(["--server", &server.url("")]);
+        c
+    };
+    // `n` old records and the sink caught up, as `Server::fill` does.
+    for i in 0..25 {
+        let mut r = audit_common::record(i);
+        r.at = OffsetDateTime::now_utc() - Duration::days(200);
+        state.audit.append(r).unwrap();
+    }
+    // The automatic prune measures the window back from the newest entry: one recent one.
+    recent_entry(&state);
+    let sink = state.checkpoint_sink.as_ref().unwrap();
+    wait_for(|| sink.delivered_through() >= Some(20)).await;
+
+    // The operator's own archive, before the automatic prune.
+    let archive = path("archive.jsonl");
+    let mut c = cli(&server);
+    c.args(["audit", "export", "--from", "1", "--to", "20", "--out"])
+        .arg(&archive);
+    assert_exit(&run(c).await, 0);
+
+    let done = attenuo_server::auto_prune_once(&state).await;
+    assert_eq!(
+        (done.outcome, done.through),
+        (attenuo_server::auto_prune::OUTCOME_PRUNED, Some(20)),
+        "{done:?}"
+    );
+    let anchor = state.audit.newest_anchor().unwrap().unwrap();
+    assert_eq!(anchor.state, attenuo_audit::AnchorState::Deleting);
+    assert_eq!(rows_through_20(&state), 20, "nothing deleted yet");
+    let s = state.clone();
+    wait_for(move || s.audit.unshipped_anchors().is_ok_and(|u| u.is_empty())).await;
+
+    let shipped = path("shipped.jsonl");
+    let sp = shipped.to_str().unwrap().to_string();
+    let check = |server: &Spawned, name: &'static str| {
+        let retained = path(name);
+        let mut export = cli(server);
+        export.args(["audit", "export", "--out"]).arg(&retained);
+        let mut live = cli(server);
+        live.args(["audit", "verify"]);
+        let mut files = cli(server);
+        files
+            .args(["audit", "verify", "--file"])
+            .arg(&archive)
+            .arg("--file")
+            .arg(&retained)
+            .args(["--checkpoints", &sp]);
+        async move {
+            let t = assert_exit(&run(live).await, 0);
+            assert!(t.contains("from seq 21 (pruned through 20"), "{t}");
+            assert_exit(&run(export).await, 0);
+            let t = assert_exit(&run(files).await, 0);
+            for want in [
+                "as one log, from genesis",
+                "all files: OK",
+                "shipped prune anchors: OK",
+            ] {
+                assert!(t.contains(want), "{want} not in {t}");
+            }
+        }
+    };
+    // Committed, no row deleted yet.
+    check(&server, "retained-1.jsonl").await;
+
+    // Stop between the commit and the deletes, and start again on the same file, deleting
+    // seven rows per batch.
+    drop(server);
+    let released = state.released();
+    drop(state);
+    tokio::time::timeout(std::time::Duration::from_secs(10), released)
+        .await
+        .expect("the first server let go of its state");
+    let (server, state) = start(auto(7)).await;
+    assert_eq!(state.audit.first_retained_seq().unwrap(), 21);
+    assert_eq!(
+        state.audit.newest_anchor().unwrap().unwrap().state,
+        attenuo_audit::AnchorState::Deleting
+    );
+    // The automatic prune makes no second prune while the first one deletes.
+    let again = attenuo_server::auto_prune_once(&state).await;
+    assert_eq!(
+        (again.outcome, again.reason),
+        (
+            attenuo_server::auto_prune::OUTCOME_SKIPPED,
+            "prune_in_progress"
+        ),
+        "{again:?}"
+    );
+    check(&server, "retained-2.jsonl").await;
+
+    // The deletes resume and finish.
+    assert_eq!(attenuo_server::prune_audit_log(&state).await, 20);
+    assert_eq!(
+        state.audit.newest_anchor().unwrap().unwrap().state,
+        attenuo_audit::AnchorState::Done
+    );
+    assert_eq!(rows_through_20(&state), 0);
+    check(&server, "retained-3.jsonl").await;
+}
+
+/// `prune = "auto"` with `archive_dir`, two automatic prunes in a row: the two archive files
+/// the server wrote, the retained export and the shipped checkpoints verify with
+/// `audit verify --file a1 --file a2 --file retained --checkpoints shipped` as one log from
+/// genesis, the shipped anchors checked; each anchor names its file's SHA-256. The dry run
+/// prints the automatic prune's state.
+#[tokio::test]
+async fn two_automatic_prunes_with_archive_dir_leave_files_that_verify_as_one_log() {
+    use sha2::Digest;
+
+    let dir = tempfile::tempdir().unwrap();
+    let archive_dir = dir.path().join("archive");
+    std::fs::create_dir(&archive_dir).unwrap();
+    let mut cfg = config(dir.path(), PruneMode::Auto);
+    cfg.audit.retention.keep_seconds = Some(7_776_000);
+    cfg.audit.retention.interval_seconds = Some(86_400);
+    cfg.audit.retention.archive_dir = Some(archive_dir.clone());
+    let (router, state) = attenuo_server::build(&cfg).unwrap();
+    let s = Server {
+        server: spawn_router(router).await.unwrap(),
+        state,
+        dir,
+    };
+    s.fill(25).await;
+    recent_entry(&s.state);
+    let first = attenuo_server::auto_prune_once(&s.state).await;
+    assert_eq!(
+        (first.outcome, first.through),
+        (attenuo_server::auto_prune::OUTCOME_PRUNED, Some(20)),
+        "{first:?}"
+    );
+    s.settle().await;
+    s.fill(20).await;
+    recent_entry(&s.state);
+    let second = attenuo_server::auto_prune_once(&s.state).await;
+    assert_eq!(
+        (second.outcome, second.through),
+        (attenuo_server::auto_prune::OUTCOME_PRUNED, Some(40)),
+        "{second:?}"
+    );
+    s.settle().await;
+
+    let a1 = archive_dir.join(first.archive.unwrap());
+    let a2 = archive_dir.join(second.archive.unwrap());
+    let anchors = s.state.audit.anchors_before(u64::MAX, 10).unwrap();
+    let digest = |p: &Path| hex::encode(sha2::Sha256::digest(std::fs::read(p).unwrap()));
+    // Newest first.
+    assert_eq!(anchors[0].anchor.archive_sha256, Some(digest(&a2)));
+    assert_eq!(anchors[1].anchor.archive_sha256, Some(digest(&a1)));
+
+    let retained = s.path("retained.jsonl");
+    export_retained(&s, &retained).await;
+    let shipped = s.path("shipped.jsonl");
+    let out = verify(
+        &s,
+        &[&a1, &a2, &retained],
+        &["--checkpoints", shipped.to_str().unwrap()],
+    )
+    .await;
+    let t = assert_exit(&out, 0);
+    for want in [
+        "as one log, from genesis",
+        "all files: OK",
+        "shipped prune anchors: OK",
+    ] {
+        assert!(t.contains(want), "{want} not in {t}");
+    }
+    // Without the first archive the files do not reach genesis.
+    let out = verify(
+        &s,
+        &[&a2, &retained],
+        &["--checkpoints", shipped.to_str().unwrap()],
+    )
+    .await;
+    assert!(!text(&out).contains("from genesis"), "{}", text(&out));
+
+    let out = prune(&s, &["--dry-run", "--through", "1000"]).await;
+    let t = text(&out);
+    assert!(
+        t.contains("automatic prune: on") && t.contains("archives in"),
+        "{t}"
+    );
+    assert!(t.contains("last automatic run: pruned"), "{t}");
+}

@@ -2024,3 +2024,149 @@ fn the_golden_negative_cases_fail_the_anchor_cross_check() {
     );
     assert!(attenuo_audit::cross_check_anchors(&retained, &a, &keys).ok);
 }
+
+/// `verify_retained_through`, which an automatic prune runs before it prunes: it walks the
+/// prefix only, so a break above it is not its business, and a break, a rewritten entry or a
+/// bad checkpoint inside it fails it. After a prune it walks from the anchor, on to the prune
+/// record when that lies above the boundary asked for.
+#[test]
+fn the_prefix_verify_sees_the_prefix_only() {
+    let issuer = issuer();
+    let k = keys(&issuer);
+    let log = log_of(&issuer, 10, 45);
+    let r = log.verify_retained_through(20, &k).unwrap();
+    assert!(r.ok, "{r:?}");
+    assert_eq!(
+        (r.entries, r.last_signed_seq, r.pruned_through),
+        (20, Some(20), None)
+    );
+    // A rewritten entry above the prefix is not seen; inside it, it is.
+    exec(
+        &log,
+        "UPDATE audit SET entry_hash = 'ff' || substr(entry_hash, 3) WHERE seq = 33",
+    );
+    assert!(log.verify_retained_through(20, &k).unwrap().ok);
+    assert!(!log.verify_chain_signed(&k).unwrap().ok);
+    let log = log_of(&issuer, 10, 45);
+    exec(
+        &log,
+        "UPDATE audit SET entry_hash = 'ff' || substr(entry_hash, 3) WHERE seq = 7",
+    );
+    let r = log.verify_retained_through(20, &k).unwrap();
+    assert!(!r.ok, "{r:?}");
+    assert_eq!(r.first_bad_seq, Some(7));
+    // A checkpoint in the prefix signed by another key.
+    let log = log_of(&issuer, 10, 45);
+    let other = self::issuer();
+    let forged = Checkpoint::sign(
+        &other.detached_signer(),
+        10,
+        &log.entry_at(10).unwrap().unwrap().entry_hash,
+        now(),
+    )
+    .unwrap();
+    let (sig, kid) = (forged.signature.clone(), forged.kid.clone());
+    log.with_connection(|c| {
+        c.execute(
+            "UPDATE checkpoints SET signature = ?1, kid = ?2 WHERE seq = 10",
+            rusqlite::params![sig, kid],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    let r = log.verify_retained_through(20, &k).unwrap();
+    assert!(!r.ok, "{r:?}");
+    assert_eq!(r.bad_checkpoints[0].seq, 10);
+
+    // After a prune through 20 (the prune record at 46): a prefix through 30 is walked from
+    // the anchor and on to the prune record, so the anchor is checked whole.
+    let log = log_of(&issuer, 10, 45);
+    prune(&log, 20, None).unwrap();
+    finish(&log, 100);
+    let r = log.verify_retained_through(30, &k).unwrap();
+    assert!(r.ok, "{r:?}");
+    assert_eq!(r.pruned_through, Some(20));
+    assert_eq!(r.entries, 26, "21..=46: on to the prune record");
+    // The prefix starts after the boundary only through a valid anchor.
+    exec(&log, "UPDATE audit_anchors SET signature = 'AAAA'");
+    let r = log.verify_retained_through(30, &k).unwrap();
+    assert!(!r.ok, "{r:?}");
+    assert_eq!(r.pruned_through, None);
+}
+
+/// `write_export` writes what the server's export route writes (a header, the entries, the
+/// checkpoints of the range), the same bytes for the same `exported_at`, and with the anchor
+/// in the header after a prune. `verify_export_file` reads such a file in two passes and
+/// reports what `verify_export` reports on the parsed text, with the file's SHA-256.
+#[test]
+fn an_export_written_by_the_store_verifies_from_the_file() {
+    use sha2::{Digest, Sha256};
+
+    let issuer = issuer();
+    let k = keys(&issuer);
+    let log = log_of(&issuer, 10, 45);
+    let at = "2026-01-01T00:00:00Z".to_string();
+    let write = |log: &SqliteAudit, from, through| {
+        let mut out = Vec::new();
+        let n = log
+            .write_export(from, through, at.clone(), &mut out)
+            .unwrap();
+        (n, out)
+    };
+    let (n, bytes) = write(&log, 1, 20);
+    assert_eq!(n, 20);
+    assert_eq!(write(&log, 1, 20).1, bytes, "the same bytes again");
+    let text = String::from_utf8(bytes.clone()).unwrap();
+    let header = ExportHeader::new(1, 20, at.clone());
+    let cps: Vec<Checkpoint> = log.checkpoints_between(1, 20).unwrap();
+    assert_eq!(text, export_text(&header, &range(&log, 1, 20), &cps));
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("a.jsonl");
+    std::fs::write(&file, &bytes).unwrap();
+    let parsed = verify_export(&parse_export(&text).unwrap(), &k).unwrap();
+    let got = attenuo_audit::verify_export_file(&file, &k, Default::default()).unwrap();
+    assert!(got.report.report.ok && got.report.from_genesis, "{got:?}");
+    assert_eq!(got.report, parsed);
+    assert_eq!(got.sha256, hex::encode(Sha256::digest(&bytes)));
+    assert_eq!(got.entries, 20);
+    assert_eq!(
+        got.last_entry_hash.as_deref(),
+        Some(log.entry_at(20).unwrap().unwrap().entry_hash.as_str())
+    );
+
+    // After a prune through 20: the next range carries the anchor and starts from it.
+    prune(&log, 20, None).unwrap();
+    finish(&log, 100);
+    let err = log
+        .write_export(15, 30, at.clone(), &mut Vec::new())
+        .unwrap_err();
+    assert!(err.to_string().contains("is pruned"), "{err}");
+    let (_, bytes) = write(&log, 21, 30);
+    std::fs::write(&file, &bytes).unwrap();
+    let got = attenuo_audit::verify_export_file(&file, &k, Default::default()).unwrap();
+    assert!(got.report.report.ok && got.report.from_anchor, "{got:?}");
+    assert_eq!(
+        got.header.anchor,
+        Some(log.newest_anchor().unwrap().unwrap().anchor)
+    );
+    let text = String::from_utf8(bytes).unwrap();
+    assert_eq!(
+        got.report,
+        verify_export(&parse_export(&text).unwrap(), &k).unwrap()
+    );
+
+    // One changed byte in an entry: the file fails as the parsed text does.
+    let bad = text.replacen("\"seq\":25", "\"seq\":26", 1);
+    std::fs::write(&file, &bad).unwrap();
+    let got = attenuo_audit::verify_export_file(&file, &k, Default::default()).unwrap();
+    assert!(!got.report.report.ok);
+    assert_eq!(
+        got.report,
+        verify_export(&parse_export(&bad).unwrap(), &k).unwrap()
+    );
+    // A file whose first line is not a header is refused.
+    let lines: Vec<&str> = text.lines().collect();
+    std::fs::write(&file, format!("{}\n{}\n", lines[1], lines[0])).unwrap();
+    let err = attenuo_audit::verify_export_file(&file, &k, Default::default()).unwrap_err();
+    assert!(err.to_string().contains("not its header"), "{err}");
+}

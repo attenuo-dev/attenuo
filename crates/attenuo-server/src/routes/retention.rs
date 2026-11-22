@@ -35,7 +35,8 @@ const DEFAULT_ANCHOR_PAGE: usize = 50;
 /// Largest page of `GET /admin/audit/anchors`.
 const MAX_ANCHOR_PAGE: usize = 500;
 
-/// 409 `prune_disabled` unless `[audit.retention] prune` allows a prune.
+/// 409 `prune_disabled` unless `[audit.retention] prune` allows a prune (`"manual"`, or
+/// `"auto"`, which allows the admin's prunes too).
 fn require_enabled(state: &AppState) -> Result<(), ApiError> {
     match state.retention.prune {
         PruneMode::Off => Err(ApiError::new(
@@ -43,14 +44,15 @@ fn require_enabled(state: &AppState) -> Result<(), ApiError> {
             "prune_disabled",
             "the audit log is not pruned: [audit.retention] prune is \"off\"",
         )),
-        PruneMode::Manual => Ok(()),
+        PruneMode::Manual | PruneMode::Auto => Ok(()),
     }
 }
 
-/// The guards' inputs now: the age floor, the sink's progress and the clock.
-fn limits(state: &AppState) -> PruneLimits {
+/// The guards' inputs now: the age floor `min_age` (`min_age_seconds` for the admin's
+/// prunes, `keep_seconds` for the automatic one), the sink's progress and the clock.
+pub(crate) fn limits(state: &AppState, min_age: time::Duration) -> PruneLimits {
     PruneLimits {
-        min_age: state.retention.min_age(),
+        min_age,
         sink: state.checkpoint_sink.as_ref().map(|s| SinkProgress {
             degraded: s.status().degraded,
             delivered_through: s.delivered_through(),
@@ -71,10 +73,12 @@ pub struct PlanQuery {
 
 /// `GET /admin/audit/prune/plan?through=` or `?before=`: the largest boundary the guards
 /// allow at or below the request (the head when neither is given), as `{from, through,
-/// entries, checkpoint, at, guards, anchor}`. `through` is null when nothing can be pruned;
+/// entries, checkpoint, at, guards, anchor, auto}`. `through` is null when nothing can be pruned;
 /// `guards` gives the bound each guard sets and `limited_by` the code of the one that set
-/// `through` below the request. Reads only. The archive of a prune through `through` is the
-/// export `from..=through`.
+/// `through` below the request; `auto` is null unless `prune = "auto"`, else the automatic
+/// prune's `{keep_seconds, interval_seconds, last_run}` ([`crate::auto_prune::AutoPruneRun`]).
+/// The plan itself is the admin's: its age floor is `min_age_seconds`, not `keep_seconds`.
+/// Reads only. The archive of a prune through `through` is the export `from..=through`.
 ///
 /// # Errors
 ///
@@ -99,13 +103,30 @@ pub async fn prune_plan(
         })?),
         (None, None) => PlanBound::Through(u64::MAX),
     };
-    let limits = limits(&state);
+    let limits = limits(&state, state.retention.min_age());
     let plan = state
         .blocking(move |s| s.audit.prune_plan(bound, &limits))
         .await?;
-    Ok(Json(
-        serde_json::to_value(plan).map_err(ApiError::internal)?,
-    ))
+    let mut body = serde_json::to_value(plan).map_err(ApiError::internal)?;
+    body["auto"] = auto_state(&state);
+    Ok(Json(body))
+}
+
+/// The `auto` member of the plan: null unless `[audit.retention] prune = "auto"`, else
+/// `{keep_seconds, interval_seconds, max_entries_per_run, archive_dir, last_run}`,
+/// `archive_dir` being the configured path or null, and `last_run` null until this process
+/// ran one ([`crate::auto_prune::AutoPruneRun`]).
+fn auto_state(state: &AppState) -> Value {
+    if state.retention.prune != PruneMode::Auto {
+        return Value::Null;
+    }
+    json!({
+        "keep_seconds": state.retention.keep_seconds,
+        "interval_seconds": state.retention.interval().as_secs(),
+        "max_entries_per_run": state.retention.max_entries_per_run(),
+        "archive_dir": state.retention.archive_dir.as_ref().map(|d| d.display().to_string()),
+        "last_run": state.auto_prune.last(),
+    })
 }
 
 /// Body of `POST /admin/audit/prune`.
@@ -196,7 +217,7 @@ pub async fn prune(
         from: body.from,
         through_hash: body.through_hash.clone(),
     };
-    let limits = limits(&state);
+    let limits = limits(&state, state.retention.min_age());
     let now = limits.now;
     let out = state
         .blocking(move |s| {
@@ -233,6 +254,11 @@ pub async fn prune(
         })?;
     let a = &out.anchor.anchor;
     if !out.already {
+        if let Ok(t) = OffsetDateTime::parse(&a.at, &Rfc3339) {
+            state
+                .metrics
+                .audit_pruned_at(u64::try_from(t.unix_timestamp()).unwrap_or(0));
+        }
         tracing::warn!(
             through = a.through_seq,
             prune_seq = a.prune_seq,

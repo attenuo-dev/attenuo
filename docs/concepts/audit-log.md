@@ -248,6 +248,16 @@ Anchors, and the checkpoint at the newest B, are kept forever. Their signatures 
 
 `audit_pruned_entries_total` counts the deleted rows, and `audit_db_size_bytes` and `audit_db_free_bytes` show the file's size and the part SQLite freed and reuses; the file does not shrink, since the server never runs `VACUUM`.
 
+### The automatic prune
+
+With `[audit.retention] prune = "auto"` and `keep_seconds` ([config](../reference/config.md#auditretention)) the server prunes on its own, every `interval_seconds` (an hour by default). Each run uses the same plan, guards and prune as `attenuo audit prune`, with `keep_seconds` as the age floor. It picks the newest checkpoint older than `keep_seconds` that the guards allow, which includes `[audit.sink]` having delivered that checkpoint and the last prune's anchor. It then verifies the entries it would remove, and prunes only if they verify. The admin can still prune by hand.
+
+The automatic prune trusts the host clock, so it bounds the cutoff. A run's cutoff is `keep_seconds` before the earliest of now, the newest entry that is not a prune record, and the wall time at start plus the monotonic time since. Inside one process, a clock jump cannot speed pruning up. Across a restart the server cannot tell a jumped clock from real downtime, so after a restart with a wrong clock the cutoff starts from the wrong time. Entries written while the clock was behind carry old timestamps, and can be pruned early by up to that error once the clock is set right. On an idle server the last `keep_seconds` before the newest entry are kept. A run whose wall clock and monotonic clock moved more than an hour apart is skipped with the reason `clock_jump` and a warning. `archive_dir` is what protects the content.
+
+The sink holds the checkpoints and the anchor: they prove that a prefix of a given length and last hash existed and was pruned by the server at a given time, but not what was in it. To keep what was in it, set `archive_dir`. Each run then first writes the entries it removes there as an export file, checks it, and signs its SHA-256 into the anchor (`archive_sha256`). The files stay on the host until you copy them off; someone who controls the host can delete them, and the digest in the shipped anchor is what proves that a kept copy is the real one. Without `archive_dir` no copy is kept, the anchor has no `archive_sha256`, and the server warns at start; export the records yourself before they pass `keep_seconds` if you need them ([configuration reference](../reference/config.md#auditretention)). The prune record's subject is `urn:attenuo:retention`, not an operator's. The console's entry page says when a prune record is an automatic one.
+
+`audit_auto_prune_runs_total{outcome, reason}` counts the runs (`pruned`, `skipped` with the guard that stopped it, or `failed`), and `GET /admin/audit/prune/plan` shows the last one under `auto`.
+
 ## What the chain does not prove
 
 Entries after the last checkpoint are protected by the hash chain only, and the verify report says how many there are (`unsigned_tail`). A signed checkpoint proves what the log looked like when it was signed, not that nothing was deleted afterwards unless you hold a copy of it from somewhere else.
@@ -257,7 +267,7 @@ Entries after the last checkpoint are protected by the hash chain only, and the 
 
 The checkpoint sink ships what the server signs; entries after the newest checkpoint are not covered until the next one is signed (at most `checkpoint_every` entries or `checkpoint_interval_seconds`).
 
-Rows of the log are never deleted unless an admin prunes them (`[audit.retention]`), and there is no rotation, so by default it grows without bound. With `[audit.retention] prune = "manual"` (and `[audit.sink]`, which it needs) the admin can prune the oldest entries behind a signed anchor ([ADR-0015](../decisions/0015-audit-retention.md)); see [Pruning the oldest entries](#pruning-the-oldest-entries). Automatic pruning (`prune = "auto"`) and `VACUUM` are not built yet.
+Rows of the log are never deleted unless an admin prunes them (`[audit.retention]`), and there is no rotation, so by default it grows without bound. With `[audit.retention] prune = "manual"` (and `[audit.sink]`, which it needs) the admin can prune the oldest entries behind a signed anchor ([ADR-0015](../decisions/0015-audit-retention.md)); see [Pruning the oldest entries](#pruning-the-oldest-entries). With `prune = "auto"` the server prunes on a timer (see [The automatic prune](#the-automatic-prune)). `VACUUM` is not built: the file does not shrink.
 
 Revocations, policy reloads, budget refunds (`admin.budget.refund`, naming the refunded decision) and dev root mints are appended to the log as admin actions (reason `admin_action`, server `attenuo`, subject `urn:attenuo:admin`, which no user can have). To pick out server events, filter on `kind` (anything but `decision`), or on `server = "attenuo"` and the tool (`token.*`, `lease.renew`, `admin.*`); no upstream or agent can use the name `attenuo`. The revoke response carries the `audit_id` of that record, or says that the append failed.
 

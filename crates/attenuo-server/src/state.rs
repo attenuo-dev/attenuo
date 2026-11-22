@@ -8,6 +8,7 @@ use attenuo_audit::{SqliteAudit, SqliteLeaseStore};
 use attenuo_policy::{PolicyEngine, PolicyEngineBuilder};
 use attenuo_token::{Issuer, IssuerConfig};
 use sha2::Digest;
+use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
 
 use crate::actor::ActorTrustRegistry;
@@ -125,6 +126,9 @@ pub struct AppState {
     /// `[audit.retention]`: whether the admin may prune the log, the age floor and the rows
     /// of one delete batch (ADR-0015).
     pub retention: crate::config::RetentionSection,
+    /// The last run of the automatic prune (`[audit.retention] prune = "auto"`), for
+    /// `GET /admin/audit/prune/plan`.
+    pub auto_prune: crate::auto_prune::AutoPruneStatus,
     /// `[approvals] client_id`: the `aud` of approval ID tokens, when set.
     pub approvals_client_id: Option<String>,
     /// `[approvals.notify]`: the approval notifier; `None` when unset.
@@ -273,6 +277,13 @@ impl AppState {
         if let Some(sink) = &checkpoint_sink {
             ship_unshipped_anchors(sink, &audit, clock.clone())?;
         }
+        // `audit_prune_last_timestamp_seconds` starts from the newest prune in the file.
+        if let Some(t) = audit
+            .newest_anchor()?
+            .and_then(|a| OffsetDateTime::parse(&a.anchor.at, &Rfc3339).ok())
+        {
+            metrics.audit_pruned_at(u64::try_from(t.unix_timestamp()).unwrap_or(0));
+        }
         // The DPoP restart fence, from the liveness marker in the same file; none in memory.
         let (dpop, dpop_heartbeat) = if store_fence.is_some() {
             let (dpop, heartbeat) = restart_fence(dpop, &leases, clock.clone())?;
@@ -418,6 +429,7 @@ impl AppState {
             checkpoint_sink,
             sink_fails_readiness: config.audit.sink.as_ref().is_some_and(|s| s.fail_readiness),
             retention: config.audit.retention.clone(),
+            auto_prune: crate::auto_prune::AutoPruneStatus::starting_at(clock.as_ref()),
             approvals_client_id: config.approvals.client_id.clone(),
             approval_notifier,
             lease_notifier,

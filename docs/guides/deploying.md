@@ -221,7 +221,7 @@ Placement:
 - Keep it away from anything agents can reach. Whoever can write the file can rewrite the log and un-revoke leases.
 - In a container, mount a volume. The image's working directory is `/var/lib/attenuo`, owned by the `attenuo` user (uid 10001).
 - Watch free disk space. An audit append that fails turns the decision into a deny with reason `audit_error`, so a full disk stops all calls and token issuance. That is the fail-closed rule working as designed.
-- Rows of the audit log are never deleted unless pruned (`[audit.retention]`), so by default the file grows for as long as the server takes traffic. With `[audit.retention] prune = "manual"` and `[audit.sink]` set, the admin can archive and prune the oldest entries with `attenuo audit prune` (see [Bounding the audit log](#bounding-the-audit-log)). Without that, size the volume for the log you expect to keep, and never delete rows by hand: a log whose first entries are missing without a valid anchor fails `audit verify`, exactly as a truncated one does. Watch `audit_db_size_bytes` for your own growth rate; how many bytes an entry takes has not been measured.
+- Rows of the audit log are never deleted unless pruned (`[audit.retention]`), so by default the file grows for as long as the server takes traffic. With `[audit.retention] prune = "manual"` and `[audit.sink]` set, the admin can archive and prune the oldest entries with `attenuo audit prune`; with `prune = "auto"` the server prunes on its own what is older than `keep_seconds` (see [Bounding the audit log](#bounding-the-audit-log)). Without that, size the volume for the log you expect to keep, and never delete rows by hand: a log whose first entries are missing without a valid anchor fails `audit verify`, exactly as a truncated one does. Watch `audit_db_size_bytes` for your own growth rate; how many bytes an entry takes has not been measured.
 - The file runs in SQLite's WAL mode, so next to `attenuo.sqlite` you will see `attenuo.sqlite-wal` and `attenuo.sqlite-shm`. They belong to the database: keep them on the same volume, and never copy or delete one of the three on its own. A background thread folds the WAL into the main file every `[audit] wal_checkpoint_seconds` (default 5) and empties it when the server is idle and at a clean shutdown, so after `SIGTERM` the `-wal` file is empty. Under sustained load the `-wal` file grows to roughly 64 to 100 MB before it starts over; leave room for it.
 
 ### One process per file
@@ -302,6 +302,42 @@ By default no row of the audit log is ever deleted. To keep the file bounded, pr
 5. **The file does not shrink.** SQLite keeps the freed pages and reuses them for new entries, so after a prune the file stays the same size and stops growing until the freed space is used up. `audit_db_free_bytes` shows how much is free. The server never runs `VACUUM`; to give the space back to the disk, stop the server and run `sqlite3 attenuo.sqlite VACUUM` yourself (it rewrites the whole file and needs about as much free space again; not tested here).
 
 Never delete rows by hand: a log whose first entries are gone without a valid anchor fails `audit verify` at its first entry, as a truncated log does.
+
+### Pruning on a timer
+
+To have the server prune for you, set:
+
+```toml
+[audit.retention]
+prune = "auto"
+keep_seconds = 7776000                       # prune what is older than 90 days
+interval_seconds = 3600                      # look once an hour (the default)
+archive_dir = "/var/lib/attenuo/audit-archive"  # keep a copy of what is pruned
+```
+
+`keep_seconds` must be at least `min_age_seconds` and at least a day. Every interval the server makes the same plan as step 2 with `keep_seconds` as the age, verifies the entries it would prune, and prunes them only if they verify and the sink has delivered their checkpoint and the last anchor. You can still run `attenuo audit prune` by hand; the two never both commit.
+
+**Set `archive_dir`.** We recommend it for every server with `prune = "auto"`. Create the directory first, writable by the server's account only (the server warns if its group or everyone can write it), and give an absolute path (a relative one is taken from the server's working directory). The server refuses to start if it cannot write there. Before each prune, the server writes the entries it is about to remove into it as `audit-<from>-<through>.jsonl`, the same file `attenuo audit export` writes, and checks the file. If that fails, nothing is pruned. The anchor it ships carries the file's SHA-256.
+
+The server does not move these files. That is your job, as in step 4:
+
+- Copy new files from `archive_dir` off the host (to backup storage, object storage, another machine). Someone who controls the host can delete the files there. The SHA-256 in the shipped anchor is what proves that a copy you kept is the real one: check it with `sha256sum`, or with `attenuo audit verify --file <archive> ... --file <retained> --checkpoints <shipped>`, which checks the files against the shipped anchors.
+- Delete old files from `archive_dir` when your own policy allows. The server never replaces a file and never deletes one it did not just write (it removes its own file only when the prune that file was for did not happen). A file with the name it wants that is not that prefix's archive stops the automatic prune (`reason="archive_exists"`) until you move it away. The shipped anchors name the real archives; a file that matches no anchor is not part of the log, and the server warns about it once.
+- Plan for the space: each file holds the entries one prune removed. `max_entries_per_run` (a million by default) caps that size, and also splits the first prune of a large old log into several runs.
+
+**Without `archive_dir` the server keeps no copy.** It warns at start. The shipped checkpoints and anchors prove how many entries were pruned and their last hash, not what they said. If you must keep the records and do not set `archive_dir`, export each new stretch yourself, from the seq after your last archive to a recent checkpoint, well before it passes `keep_seconds`, and keep those files off the host. Entries that pass `keep_seconds` before you export them are gone for good.
+
+**The clock matters.** The cutoff of a run is `keep_seconds` before the earliest of three times: now, the newest entry that is not a prune record, and the wall time at start plus the monotonic time since. Inside one process, a clock jump cannot speed pruning up: the cutoff moves at most as fast as the monotonic clock, with or without new entries. Across a restart the server cannot tell a jumped clock from real downtime, so after a restart with a wrong clock the cutoff starts from the wrong time. Entries written while the clock was behind carry old timestamps, and once the clock is set right they can be pruned early by up to that error. On an idle server the last `keep_seconds` before the newest entry are kept. `archive_dir` is what protects the content. Keep NTP healthy, alert on `clock_jump`, and set `archive_dir`.
+
+Watch it with these:
+
+- `audit_auto_prune_runs_total{outcome="failed"}` should stay at 0. `reason="verify_failed"` means the entries do not verify: the server keeps them, and `attenuo audit verify` tells you where the log is broken. Treat it as an incident. `reason="archive_write_failed"` means `archive_dir` is missing, read-only or full. `reason="archive_exists"` means a file with the archive's name that is not this prefix's archive is in the way.
+- `audit_auto_prune_runs_total{outcome="skipped",reason="clock_jump"}` should stay at 0. An increase means the wall clock and the monotonic clock moved apart by more than an hour between two runs. Most often the host's clock was stepped; check it. On Linux the monotonic clock does not count a suspend or a VM pause, so resuming a paused host or VM can count one too.
+- `audit_auto_prune_runs_total{outcome="skipped",reason="sink_behind"}` growing means the sink is not delivering; nothing is pruned until it does.
+- `audit_prune_last_timestamp_seconds` tells you when the log was last pruned, by anyone.
+- `GET /admin/audit/prune/plan` shows the settings and the last run under `auto`, and so does `attenuo audit prune --dry-run --through <seq>`.
+
+A run that fails is logged and tried again at the next interval. It never stops the server and does not change `/readyz`. At shutdown the server waits for a run in progress to finish. A run reads every entry it removes, to verify it and, with `archive_dir`, to write and check the file, so the first runs on a large log that was never pruned can take a while; `max_entries_per_run` keeps each one bounded. The deletes then take several runs of the maintenance task.
 
 ## Leases: tuning the interval
 
@@ -505,6 +541,7 @@ listen = "127.0.0.1:9100"
 | `audit_checkpoint_last_timestamp_seconds`, `audit_wal_last_complete_timestamp_seconds`, `audit_wal_checkpoints_total{result}`, `audit_wal_backstops_total` | Signed checkpoints and the SQLite WAL checkpointer keeping up. |
 | `audit_sink_dropped_total`, `audit_sink_oldest_undelivered_timestamp_seconds` | Checkpoints not leaving the host. |
 | `audit_db_size_bytes`, `audit_db_free_bytes`, `audit_pruned_entries_total` | The database file's size and the part of it on SQLite's free list, as a trend, and the entries prunes of the log (`[audit.retention]`) have deleted. |
+| `audit_auto_prune_runs_total`, `audit_auto_prune_last_run_timestamp_seconds`, `audit_prune_last_timestamp_seconds` | With `prune = "auto"`: alert on any `outcome="failed"`, and on a last run or a last prune older than you expect (see [Pruning on a timer](#pruning-on-a-timer)). |
 | `approval_notify_dropped_total`, `approval_notify_outbox_rows` | `[approvals.notify]` notices given up, and notices stored but not yet delivered. The outbox count staying up means the receiver is down; the notices survive a restart. |
 | `lease_notify_dropped_total`, `lease_notify_outbox_rows` | The same for `[leases.notify]` revocation notices. A dropped one costs only time: the PEP still learns of the revocation when it next asks. |
 

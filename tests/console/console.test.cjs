@@ -941,7 +941,7 @@ test('a pruned log, from stubbed answers: the explorer line, a pruned seq, the p
     await probe.go('#/audit');
     const line = probe.page.locator('#audit-pruned');
     await line.locator('a').waitFor();
-    assert.equal(await line.innerText(), 'Entries before seq 21 were pruned by the prune recorded at seq 24. Their archive is kept outside the server.');
+    assert.equal(await line.innerText(), 'Entries before seq 21 were pruned by the prune recorded at seq 24. An archive of them, if one was kept, is outside the server.');
     assert.equal(await line.locator('a').getAttribute('href'), '#/entry/24');
     assert.ok(stub.asked.includes('/admin/audit/entries/20'), stub.asked.join('\n'));
     assert.ok(!stub.asked.some((u) => u.includes('tool=admin.audit.prune')), 'the prune is found without a filtered scan');
@@ -961,7 +961,7 @@ test('a pruned log, from stubbed answers: the explorer line, a pruned seq, the p
     const gone = probe.page.locator('section.panel', { has: probe.page.locator('h1', { hasText: 'was pruned' }) });
     await gone.waitFor();
     assert.match(await gone.locator('h1').innerText(), /^Entry #5 was pruned$/);
-    assert.match(await gone.locator('.callout.warn').innerText(), /This entry was pruned: the server deleted the start of the audit log through seq 20, after it was archived\./);
+    assert.match(await gone.locator('.callout.warn').innerText(), /This entry was pruned: the server deleted the start of the audit log through seq 20\. attenuo audit prune archives the entries before it prunes, and the automatic prune does when \[audit\.retention\] archive_dir is set; a prune made another way may have kept no copy\./);
     assert.equal(await kvValue(gone, 'Pruned through'), '20');
     assert.equal(await kvValue(gone, 'Prune record'), 'seq 24');
     assert.equal(await kvValue(gone, 'First retained seq'), 'seq 21');
@@ -977,6 +977,16 @@ test('a pruned log, from stubbed answers: the explorer line, a pruned seq, the p
     assert.match(await verdictPanel.locator('.explain').innerText(), /^A prune of the start of the audit log, made by an admin/);
     assert.equal(await kvValue(verdictPanel, 'Prune'), 'the newest prune: entries through seq 20 were pruned; the log now starts at seq 21');
     await bothThemes('entry-prune-record', probe);
+
+    // The record of an automatic prune names the server's own subject, and says that a copy
+    // was kept only with archive_dir.
+    const pruneRec = stub.log.get(PRUNE_SEQ);
+    stub.log.set(PRUNE_SEQ, { ...pruneRec, record: { ...pruneRec.record, originating_subject: 'urn:attenuo:retention' } });
+    await probe.go(`#/entry/${FIRST}`);
+    await probe.go(`#/entry/${PRUNE_SEQ}`);
+    await verdictPanel.locator('.explain', { hasText: 'An automatic prune' }).waitFor();
+    assert.match(await verdictPanel.locator('.explain').innerText(), /^An automatic prune of the start of the audit log .* With \[audit\.retention\] archive_dir set, the server wrote them to an archive file there first; without it, no copy was kept\./);
+    stub.log.set(PRUNE_SEQ, pruneRec);
 
     // The verify panel, a good walk from the anchor: the boundary, the anchors, and a bad
     // older anchor as visible as a bad checkpoint.

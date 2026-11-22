@@ -856,6 +856,10 @@ pub enum PruneMode {
     Off,
     /// Pruned only when the admin asks (`POST /admin/audit/prune`).
     Manual,
+    /// Pruned by the server on a timer (`interval_seconds`), of what is older than
+    /// `keep_seconds` and already delivered by `[audit.sink]`. The admin may still prune by
+    /// hand, as with `"manual"`.
+    Auto,
 }
 
 impl<'de> Deserialize<'de> for PruneMode {
@@ -864,12 +868,9 @@ impl<'de> Deserialize<'de> for PruneMode {
         match s.as_str() {
             "off" => Ok(Self::Off),
             "manual" => Ok(Self::Manual),
-            "auto" => Err(serde::de::Error::custom(
-                "[audit.retention] prune = \"auto\" is not built yet: use \"manual\" (the admin \
-                 prunes through POST /admin/audit/prune) or \"off\"",
-            )),
+            "auto" => Ok(Self::Auto),
             other => Err(serde::de::Error::custom(format!(
-                "[audit.retention] prune must be \"off\" or \"manual\", not {other:?}"
+                "[audit.retention] prune must be \"off\", \"manual\" or \"auto\", not {other:?}"
             ))),
         }
     }
@@ -880,6 +881,7 @@ impl std::fmt::Display for PruneMode {
         f.write_str(match self {
             Self::Off => "off",
             Self::Manual => "manual",
+            Self::Auto => "auto",
         })
     }
 }
@@ -893,6 +895,16 @@ pub const DEFAULT_PRUNE_BATCH_ROWS: u64 = 10_000;
 pub const MAX_PRUNE_BATCH_ROWS: u64 = 1_000_000;
 /// Largest `[audit.retention] min_age_seconds`: 100 years (of 365 days).
 pub const MAX_PRUNE_MIN_AGE_SECONDS: u64 = 3_153_600_000;
+/// Smallest `[audit.retention] keep_seconds`: a day, whatever `min_age_seconds` allows, so
+/// that a value meant in days (`keep_seconds = 90`) does not start.
+pub const MIN_AUTO_KEEP_SECONDS: u64 = 86_400;
+/// Default `[audit.retention] interval_seconds`: an hour.
+pub const DEFAULT_AUTO_INTERVAL_SECONDS: u64 = 3_600;
+/// Largest `[audit.retention] interval_seconds`: a day.
+pub const MAX_AUTO_INTERVAL_SECONDS: u64 = 86_400;
+/// Default `[audit.retention] max_entries_per_run`: a million entries, so that the first
+/// automatic prune of a large old log is split into several smaller ones.
+pub const DEFAULT_AUTO_MAX_ENTRIES_PER_RUN: u64 = 1_000_000;
 
 /// `[audit.retention]`: pruning the oldest entries of the audit log (ADR-0015). A prune
 /// writes a signed anchor naming the last pruned seq and its hash, so the retained log still
@@ -901,7 +913,7 @@ pub const MAX_PRUNE_MIN_AGE_SECONDS: u64 = 3_153_600_000;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RetentionSection {
-    /// `"off"` (default) or `"manual"`. `"auto"` is not built and is refused.
+    /// `"off"` (default), `"manual"` or `"auto"`.
     #[serde(default)]
     pub prune: PruneMode,
     /// Nothing younger than this, in seconds, is pruned: the entry at the boundary must be
@@ -913,6 +925,23 @@ pub struct RetentionSection {
     /// 1000000.
     #[serde(default = "default_prune_batch_rows")]
     pub batch_rows: u64,
+    /// With `prune = "auto"` only, and required there: the server prunes what is older than
+    /// this, in seconds. At least `min_age_seconds` and a day, at most 100 years.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_seconds: Option<u64>,
+    /// With `prune = "auto"` only: seconds between two checks for something to prune.
+    /// Default 3600, between 1 and 86400.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_seconds: Option<u64>,
+    /// With `prune = "auto"` only: a directory where each automatic prune first writes the
+    /// entries it removes, as an export file. It must exist and be writable. Unset: the
+    /// entries are deleted and no copy is kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_dir: Option<std::path::PathBuf>,
+    /// With `prune = "auto"` only: at most this many entries per automatic prune (more when
+    /// no checkpoint falls inside the limit). Default 1000000, at least 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_entries_per_run: Option<u64>,
 }
 
 fn default_prune_min_age_seconds() -> u64 {
@@ -928,11 +957,48 @@ impl Default for RetentionSection {
             prune: PruneMode::Off,
             min_age_seconds: DEFAULT_PRUNE_MIN_AGE_SECONDS,
             batch_rows: DEFAULT_PRUNE_BATCH_ROWS,
+            keep_seconds: None,
+            interval_seconds: None,
+            archive_dir: None,
+            max_entries_per_run: None,
         }
     }
 }
 
 impl RetentionSection {
+    /// The prune routes answer (`"manual"` and `"auto"`).
+    pub fn allows_prune(&self) -> bool {
+        self.prune != PruneMode::Off
+    }
+
+    /// `keep_seconds` as a duration, with `prune = "auto"`; `None` otherwise (start-up
+    /// refuses `"auto"` without it).
+    pub fn keep(&self) -> Option<time::Duration> {
+        if self.prune != PruneMode::Auto {
+            return None;
+        }
+        let secs = self.keep_seconds?.min(MAX_PRUNE_MIN_AGE_SECONDS);
+        Some(time::Duration::seconds(
+            i64::try_from(secs).unwrap_or(i64::MAX),
+        ))
+    }
+
+    /// `interval_seconds` (default an hour) as a duration.
+    pub fn interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.interval_seconds
+                .unwrap_or(DEFAULT_AUTO_INTERVAL_SECONDS)
+                .clamp(1, MAX_AUTO_INTERVAL_SECONDS),
+        )
+    }
+
+    /// `max_entries_per_run` (default [`DEFAULT_AUTO_MAX_ENTRIES_PER_RUN`]), at least 1.
+    pub fn max_entries_per_run(&self) -> u64 {
+        self.max_entries_per_run
+            .unwrap_or(DEFAULT_AUTO_MAX_ENTRIES_PER_RUN)
+            .max(1)
+    }
+
     /// `min_age_seconds` as a duration, at most [`MAX_PRUNE_MIN_AGE_SECONDS`] (start-up
     /// refuses more).
     pub fn min_age(&self) -> time::Duration {
@@ -3617,6 +3683,10 @@ impl Config {
     /// retentions (`[leases] retention_seconds + run_state_retention_seconds`, each term only
     /// when not 0, and `user_window_retention_seconds`), so that a record is never pruned
     /// before the run state that might need it. `batch_rows` is checked whatever `prune` is.
+    /// The keys of `"auto"` (`keep_seconds`, `interval_seconds`, `archive_dir`,
+    /// `max_entries_per_run`) are refused with another mode. With `"auto"`, `archive_dir` must
+    /// be an existing directory a file can be written in (a probe file is created and
+    /// removed); without it, a warning says the records are deleted without a copy.
     ///
     /// # Errors
     ///
@@ -3635,6 +3705,22 @@ impl Config {
                  (100 years), not {}",
                 r.min_age_seconds
             );
+        }
+        if r.prune != PruneMode::Auto {
+            for (key, set) in [
+                ("keep_seconds", r.keep_seconds.is_some()),
+                ("interval_seconds", r.interval_seconds.is_some()),
+                ("archive_dir", r.archive_dir.is_some()),
+                ("max_entries_per_run", r.max_entries_per_run.is_some()),
+            ] {
+                if set {
+                    anyhow::bail!(
+                        "[audit.retention] {key} is only for prune = \"auto\", and prune is \"{}\": \
+                         remove it, or set prune = \"auto\"",
+                        r.prune
+                    );
+                }
+            }
         }
         if r.prune == PruneMode::Off {
             return Ok(());
@@ -3676,6 +3762,48 @@ impl Config {
                 r.min_age_seconds,
                 self.leases.user_window_retention_seconds
             );
+        }
+        if r.prune == PruneMode::Auto {
+            let Some(keep) = r.keep_seconds else {
+                anyhow::bail!(
+                    "[audit.retention] prune = \"auto\" needs keep_seconds: how old, in seconds, \
+                     an entry must be before the server prunes it (for example 7776000, 90 days)"
+                );
+            };
+            let least = r.min_age_seconds.max(MIN_AUTO_KEEP_SECONDS);
+            if keep < least {
+                anyhow::bail!(
+                    "[audit.retention] keep_seconds = {keep} is below {least}: it must be at least \
+                     min_age_seconds ({}) and at least a day ({MIN_AUTO_KEEP_SECONDS})",
+                    r.min_age_seconds
+                );
+            }
+            if keep > MAX_PRUNE_MIN_AGE_SECONDS {
+                anyhow::bail!(
+                    "[audit.retention] keep_seconds must be at most {MAX_PRUNE_MIN_AGE_SECONDS} \
+                     (100 years), not {keep}"
+                );
+            }
+            if let Some(i) = r.interval_seconds {
+                if !(1..=MAX_AUTO_INTERVAL_SECONDS).contains(&i) {
+                    anyhow::bail!(
+                        "[audit.retention] interval_seconds must be between 1 and \
+                         {MAX_AUTO_INTERVAL_SECONDS} (a day), not {i}"
+                    );
+                }
+            }
+            if r.max_entries_per_run == Some(0) {
+                anyhow::bail!("[audit.retention] max_entries_per_run must be at least 1");
+            }
+            match &r.archive_dir {
+                Some(dir) => check_archive_dir(dir)?,
+                None => tracing::warn!(
+                    "[audit.retention] prune = \"auto\" without archive_dir: automatic pruning \
+                     deletes audit records without keeping a copy of them. The shipped anchors \
+                     prove what was pruned, not what it said. Set archive_dir to keep each \
+                     pruned prefix as an export file"
+                ),
+            }
         }
         Ok(())
     }
@@ -3767,6 +3895,49 @@ impl Config {
         config.source_path = Some(path.to_path_buf());
         Ok((config, applied))
     }
+}
+
+/// Start-up check of `[audit.retention] archive_dir`: it exists, is a directory, and a file
+/// can be created, written, flushed and removed in it.
+fn check_archive_dir(dir: &std::path::Path) -> anyhow::Result<()> {
+    use std::io::Write;
+
+    let shown = dir.display();
+    let meta = std::fs::metadata(dir).map_err(|e| {
+        anyhow::anyhow!("[audit.retention] archive_dir {shown} cannot be used: {e}")
+    })?;
+    if !meta.is_dir() {
+        anyhow::bail!("[audit.retention] archive_dir {shown} is not a directory");
+    }
+    let probe = dir.join(format!(".attenuo-archive-probe-{}", std::process::id()));
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .and_then(|mut f| {
+            f.write_all(b"probe\n")?;
+            f.sync_all()
+        });
+    let _ = std::fs::remove_file(&probe);
+    written.map_err(|e| {
+        anyhow::anyhow!(
+            "[audit.retention] archive_dir {shown} is not writable: {e}; the automatic prune \
+             writes each pruned prefix there before it prunes"
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if meta.permissions().mode() & 0o022 != 0 {
+            tracing::warn!(
+                "[audit.retention] archive_dir {shown} is writable by its group or by everyone \
+                 (mode {:o}): another account could put files there or remove the archives. \
+                 Make it writable by the server's account only",
+                meta.permissions().mode() & 0o7777
+            );
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -4138,7 +4309,156 @@ mod tests {
     use super::*;
 
     /// The `[limits]` defaults: a cap, the three deadlines, and every rate limit off.
-    /// `[audit.retention]`: off by default, `"auto"` refused as not built, and the start-up
+    /// `prune = "auto"`: what it needs (everything `"manual"` needs, and `keep_seconds`), the
+    /// bounds of its two keys, and that the two keys refuse to start with another mode.
+    #[test]
+    fn audit_retention_auto_startup_checks() {
+        let auto = |extra: &str| {
+            Config::from_toml(&format!(
+                "[audit]\nsqlite_path = \"/var/lib/attenuo/a.sqlite\"\n\
+                 [audit.sink]\nkind = \"file\"\npath = \"/mnt/s/c.jsonl\"\n\
+                 [audit.retention]\nprune = \"auto\"\n{extra}"
+            ))
+            .unwrap()
+        };
+        let refused = |c: Config, needle: &str| {
+            let e = c.check_retention().unwrap_err().to_string();
+            assert!(e.contains(needle), "{needle}: {e}");
+        };
+        let c = auto("keep_seconds = 7776000\n");
+        c.check_retention().unwrap();
+        let r = &c.audit.retention;
+        assert_eq!(r.prune, PruneMode::Auto);
+        assert!(r.allows_prune());
+        assert_eq!(r.keep(), Some(time::Duration::days(90)));
+        assert_eq!(r.interval(), std::time::Duration::from_secs(3600));
+        // keep_seconds is required.
+        refused(auto(""), "needs keep_seconds");
+        // At least min_age_seconds, and at least a day.
+        refused(auto("keep_seconds = 7775999\n"), "at least min_age_seconds");
+        let mut c = auto("keep_seconds = 86399\n");
+        c.audit.retention.min_age_seconds = 1;
+        c.leases.retention_seconds = 1;
+        c.leases.run_state_retention_seconds = 0;
+        c.leases.user_window_retention_seconds = 0;
+        refused(c.clone(), "at least a day");
+        c.audit.retention.keep_seconds = Some(86_400);
+        c.check_retention().unwrap();
+        refused(
+            auto("keep_seconds = 3153600001\nmin_age_seconds = 7776000\n"),
+            "at most 3153600000",
+        );
+        // The interval: 1 to a day.
+        auto("keep_seconds = 7776000\ninterval_seconds = 1\n")
+            .check_retention()
+            .unwrap();
+        refused(
+            auto("keep_seconds = 7776000\ninterval_seconds = 0\n"),
+            "interval_seconds must be between 1 and 86400",
+        );
+        refused(
+            auto("keep_seconds = 7776000\ninterval_seconds = 86401\n"),
+            "interval_seconds must be between 1 and 86400",
+        );
+        // Everything "manual" refuses, "auto" refuses too.
+        let mut c = auto("keep_seconds = 7776000\n");
+        c.audit.sink = None;
+        refused(c, "needs [audit.sink]");
+        let mut c = auto("keep_seconds = 7776000\n");
+        c.audit.sqlite_path = ":memory:".into();
+        refused(c, ":memory:");
+        // The two keys with another mode refuse to start, so a typo in `prune` is not a
+        // silent "never pruned".
+        for mode in ["off", "manual"] {
+            for key in [
+                "keep_seconds = 7776000",
+                "interval_seconds = 60",
+                "archive_dir = \"/tmp\"",
+                "max_entries_per_run = 10",
+            ] {
+                let c = Config::from_toml(&format!(
+                    "[audit]\nsqlite_path = \"/var/lib/attenuo/a.sqlite\"\n\
+                     [audit.sink]\nkind = \"file\"\npath = \"/mnt/s/c.jsonl\"\n\
+                     [audit.retention]\nprune = \"{mode}\"\n{key}\n"
+                ))
+                .unwrap();
+                refused(c, "is only for prune = \"auto\"");
+            }
+        }
+        // Not "auto": no keep window.
+        assert_eq!(RetentionSection::default().keep(), None);
+        // max_entries_per_run: at least 1, default a million.
+        assert_eq!(
+            auto("keep_seconds = 7776000\n")
+                .audit
+                .retention
+                .max_entries_per_run(),
+            DEFAULT_AUTO_MAX_ENTRIES_PER_RUN
+        );
+        refused(
+            auto("keep_seconds = 7776000\nmax_entries_per_run = 0\n"),
+            "max_entries_per_run must be at least 1",
+        );
+        // archive_dir: an existing, writable directory; the probe file is gone after.
+        let dir = tempfile::tempdir().unwrap();
+        let with_dir = |p: &std::path::Path| {
+            let mut c = auto("keep_seconds = 7776000\n");
+            c.audit.retention.archive_dir = Some(p.to_path_buf());
+            c
+        };
+        with_dir(dir.path()).check_retention().unwrap();
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        refused(with_dir(&dir.path().join("missing")), "cannot be used");
+        let file = dir.path().join("a-file");
+        std::fs::write(&file, "x").unwrap();
+        refused(with_dir(&file), "is not a directory");
+    }
+
+    /// `prune = "auto"` without `archive_dir` starts, with a warning that the records are
+    /// deleted without a copy; with `archive_dir` it does not warn so.
+    #[test]
+    fn audit_retention_auto_without_archive_dir_warns() {
+        #[derive(Clone, Default)]
+        struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let logged = |c: &Config| {
+            let buf = Buf::default();
+            let w = buf.clone();
+            let sub = tracing_subscriber::fmt()
+                .with_writer(move || w.clone())
+                .with_ansi(false)
+                .finish();
+            tracing::subscriber::with_default(sub, || c.check_retention().unwrap());
+            let text = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+            text
+        };
+        let mut c = Config::from_toml(
+            "[audit]\nsqlite_path = \"/var/lib/attenuo/a.sqlite\"\n\
+             [audit.sink]\nkind = \"file\"\npath = \"/mnt/s/c.jsonl\"\n\
+             [audit.retention]\nprune = \"auto\"\nkeep_seconds = 7776000\n",
+        )
+        .unwrap();
+        let text = logged(&c);
+        assert!(text.contains("WARN"), "{text}");
+        assert!(
+            text.contains("deletes audit records without keeping a copy"),
+            "{text}"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        c.audit.retention.archive_dir = Some(dir.path().to_path_buf());
+        let text = logged(&c);
+        assert!(!text.contains("without keeping a copy"), "{text}");
+    }
+
+    /// `[audit.retention]`: off by default, an unknown mode refused, and the start-up
     /// refusals of a prune setting that cannot work (ADR-0015).
     #[test]
     fn audit_retention_defaults_and_startup_refusals() {
@@ -4149,11 +4469,18 @@ mod tests {
             (PruneMode::Off, 7_776_000, 10_000)
         );
         cfg.check_retention().unwrap();
-        let e = Config::from_toml("[audit.retention]\nprune = \"auto\"\n").unwrap_err();
-        assert!(e.to_string().contains("not built"), "{e}");
         let e = Config::from_toml("[audit.retention]\nprune = \"daily\"\n").unwrap_err();
-        assert!(e.to_string().contains("\"off\" or \"manual\""), "{e}");
-        assert!(Config::from_toml("[audit.retention]\nkeep_seconds = 1\n").is_err());
+        assert!(
+            e.to_string().contains("\"off\", \"manual\" or \"auto\""),
+            "{e}"
+        );
+        // archive_dir is a key of "auto" only.
+        let e = Config::from_toml("[audit.retention]\narchive_dir = \"/a\"\n")
+            .unwrap()
+            .check_retention()
+            .unwrap_err();
+        assert!(e.to_string().contains("only for prune = \"auto\""), "{e}");
+        assert!(Config::from_toml("[audit.retention]\narchive = \"/a\"\n").is_err());
 
         let manual = |extra: &str| {
             Config::from_toml(&format!(

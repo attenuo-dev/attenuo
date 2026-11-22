@@ -205,8 +205,10 @@ fn start_up_refuses_a_prune_setting_that_cannot_work() {
     let mut cfg = config(&dir, PruneMode::Manual);
     cfg.audit.retention.min_age_seconds = 86_400;
     refuse(cfg, "min_age_seconds = 86400 is below");
-    let e = Config::from_toml("[audit.retention]\nprune = \"auto\"\n").unwrap_err();
-    assert!(e.to_string().contains("not built"), "{e}");
+    // "auto" without its keep window (the rest of "auto" is in `audit_auto_prune.rs`).
+    let mut cfg = config(&dir, PruneMode::Auto);
+    cfg.audit.retention.keep_seconds = None;
+    refuse(cfg, "needs keep_seconds");
     // And the default settings with "manual" start.
     let _ = attenuo_server::build(&config(&dir, PruneMode::Manual)).unwrap();
 }

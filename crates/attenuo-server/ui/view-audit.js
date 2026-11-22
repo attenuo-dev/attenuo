@@ -132,7 +132,7 @@ function prunedLine(first, prune) {
     prune
       ? [' by the ', link(['entry', prune.prune_seq], `prune recorded at seq ${prune.prune_seq}`), '.']
       : '.',
-    ' Their archive is kept outside the server.');
+    ' An archive of them, if one was kept, is outside the server.');
 }
 
 // ---- rendering ----------------------------------------------------------------------------
