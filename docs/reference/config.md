@@ -111,7 +111,7 @@ Ships every signed checkpoint off the host as it is created (SR-21); see [Shippi
 A prune of the log (`[audit.retention]` below) also ships its signed anchor through the sink, in the format `attenuo-shipped-anchor-v1`: one more webhook `POST` (with `x-attenuo-anchor-through-seq` and `x-attenuo-anchor-sha256` in place of the checkpoint headers), one more line of the file (told apart by its `anchor` member), or one more S3 object, `<prefix>anchor-<through_seq, 20 digits>-<16 hex of anchor_sha256>.json`. The anchor is retried until it is delivered, like a checkpoint, and is never dropped or given up. Two things follow for what reads the sink:
 
 - A webhook receiver must accept the anchor's body (status 2xx). One that refuses it holds every later checkpoint behind it in the queue, and the sink goes degraded (`/readyz`) until the receiver accepts it.
-- An older `attenuo audit verify --checkpoints`, or an older Python or TypeScript SDK `cross_check`, fails on a shipped file that holds an anchor line: it reads the line as a malformed checkpoint. Upgrade the CLI and the SDKs before the first prune; this release skips anchor lines.
+- An older `attenuo audit verify --checkpoints`, or an older Python or TypeScript SDK `cross_check`, fails on a shipped file that holds an anchor line: it reads the line as a malformed checkpoint. Upgrade the CLI and the SDKs before the first prune. This release checks the anchor lines: `attenuo audit verify --checkpoints` and the SDKs' `cross_check` / `crossCheck` compare them with the export.
 
 ### `[audit.retention]`
 

@@ -11,20 +11,29 @@ import pytest
 
 from attenuo import (
     AdminClient,
+    AgentsReload,
+    AnchorPage,
     ApiError,
     AsyncAdminClient,
     AttenuoError,
+    AuditAnchor,
     AuditEntry,
     AuditFilter,
     BudgetLimit,
     BudgetRefund,
     Capability,
+    ClientListChanges,
     EvaluationBudget,
     EvaluationLabels,
     EvaluationUsage,
+    KeysReload,
     LeaseUserWindow,
     LeaseUserWindows,
     Prefix,
+    PruneGuards,
+    PrunePlan,
+    PruneResult,
+    PruneShipped,
     RevokeResult,
     StatedApproval,
     StatedBudget,
@@ -363,6 +372,279 @@ async def test_operators_reload(make: Any) -> None:
     with pytest.raises(ApiError) as e:
         await call(client, "operators_reload")
     assert e.value.error == "operators_no_admin"
+
+
+AGENTS_RELOAD = {
+    "agents": {
+        "count": 3,
+        "sha256": "aa" * 32,
+        "added": ["tester"],
+        "removed": ["coder"],
+        "changed": ["reviewer"],
+    },
+    "peps": {"count": 1, "sha256": "bb" * 32, "added": [], "removed": [], "changed": []},
+    "restart_needed": ["[[root_grants]]"],
+    "warnings": ["w"],
+    "restart_warnings": [],
+    "audit_id": "a1",
+    "later_member": {"ignored": True},
+}
+
+
+async def test_agents_reload(make: Any) -> None:
+    client, seen = make(lambda r: httpx.Response(200, json=AGENTS_RELOAD))
+    rep = await call(client, "agents_reload")
+    assert (seen[-1].method, seen[-1].url.path) == ("POST", "/admin/agents/reload")
+    assert json.loads(seen[-1].content) == {}
+    assert isinstance(rep, AgentsReload)
+    assert rep.agents == ClientListChanges(3, "aa" * 32, ["tester"], ["coder"], ["reviewer"])
+    assert rep.peps == ClientListChanges(1, "bb" * 32, [], [], [])
+    assert (rep.restart_needed, rep.warnings, rep.restart_warnings, rep.audit_id) == (
+        ["[[root_grants]]"],
+        ["w"],
+        [],
+        "a1",
+    )
+    # Only the overrides that are set are sent.
+    await call(client, "agents_reload", allow_empty=True)
+    assert json.loads(seen[-1].content) == {"allow_empty": True}
+    await call(client, "agents_reload", allow_empty=True, allow_mismatch=True)
+    assert json.loads(seen[-1].content) == {"allow_empty": True, "allow_mismatch": True}
+    # An answer without the audit id (the record failed) still parses.
+    client, _ = make(lambda r: httpx.Response(200, json={**AGENTS_RELOAD, "audit_id": None}))
+    assert (await call(client, "agents_reload")).audit_id is None
+
+
+@pytest.mark.parametrize(
+    "code", ["agents_reload_empties", "config_file_mismatch", "agents_invalid"]
+)
+async def test_agents_reload_refusals_carry_the_code(make: Any, code: str) -> None:
+    client, _ = make(
+        lambda r: httpx.Response(422, json={"error": code, "code": code, "detail": "unchanged"})
+    )
+    with pytest.raises(ApiError) as e:
+        await call(client, "agents_reload")
+    assert (e.value.status, e.value.code) == (422, code)
+
+
+KEYS_RELOAD = {
+    "signing_kid": "new",
+    "previous_signing_kid": "old",
+    "changed": True,
+    "verifying_kids": ["new", "old"],
+    "added": ["new"],
+    "removed": [],
+    "audit_signing_kid": "new",
+    "kept_until_restart": ["[token] dpop_nonce"],
+    "restart_needed": [],
+    "warnings": [],
+    "audit_id": "a2",
+    "later_member": 1,
+}
+
+
+async def test_keys_reload(make: Any) -> None:
+    client, seen = make(lambda r: httpx.Response(200, json=KEYS_RELOAD))
+    rep = await call(client, "keys_reload")
+    assert (seen[-1].method, seen[-1].url.path) == ("POST", "/admin/keys/reload")
+    assert json.loads(seen[-1].content) == {}
+    assert rep == KeysReload(
+        signing_kid="new",
+        previous_signing_kid="old",
+        changed=True,
+        verifying_kids=["new", "old"],
+        added=["new"],
+        removed=[],
+        audit_signing_kid="new",
+        kept_until_restart=["[token] dpop_nonce"],
+        restart_needed=[],
+        warnings=[],
+        audit_id="a2",
+    )
+    await call(client, "keys_reload", allow_drop_current=True, allow_drop_audit_key=True)
+    assert json.loads(seen[-1].content) == {
+        "allow_drop_current": True,
+        "allow_drop_audit_key": True,
+    }
+    await call(client, "keys_reload", allow_mismatch=True)
+    assert json.loads(seen[-1].content) == {"allow_mismatch": True}
+    client, _ = make(lambda r: httpx.Response(200, json={**KEYS_RELOAD, "changed": False}))
+    assert (await call(client, "keys_reload")).changed is False
+
+
+@pytest.mark.parametrize(
+    "code", ["keys_reload_drops_current", "keys_reload_drops_audit_key", "key_file_invalid"]
+)
+async def test_keys_reload_refusals_carry_the_code(make: Any, code: str) -> None:
+    client, _ = make(
+        lambda r: httpx.Response(422, json={"error": code, "code": code, "detail": "unchanged"})
+    )
+    with pytest.raises(ApiError) as e:
+        await call(client, "keys_reload")
+    assert (e.value.status, e.value.code) == (422, code)
+
+
+ANCHOR: dict[str, Any] = {
+    "through_seq": 1000,
+    "through_hash": "cd" * 32,
+    "prune_seq": 1041,
+    "prune_entry_hash": "ef" * 32,
+    "previous_through_seq": None,
+    "archive_sha256": "ab" * 32,
+    "at": "2026-11-01T00:00:00Z",
+    "kid": "k1",
+    "signature": "sig",
+}
+CHECKPOINT = {"seq": 1000, "head_hash": "cd" * 32, "at": "t", "kid": "k1", "signature": "s"}
+PLAN = {
+    "from": 1,
+    "through": 1000,
+    "entries": 1000,
+    "checkpoint": CHECKPOINT,
+    "at": "2026-07-30T23:59:58Z",
+    "guards": {
+        "requested": 1150,
+        "before": None,
+        "min_age_cutoff": "2026-08-24T12:00:00Z",
+        "live_run_seq": 1123,
+        "sink_delivered_through": 1100,
+        "sink_degraded": False,
+        "in_progress": False,
+        "anchor_undelivered": False,
+        "limited_by": "prune_not_at_checkpoint",
+        "later_guard": 3,
+    },
+    "anchor": {**ANCHOR, "state": "done", "shipped_at": "2026-11-01T00:00:01Z"},
+}
+
+
+async def test_audit_prune_plan(make: Any) -> None:
+    client, seen = make(lambda r: httpx.Response(200, json=PLAN))
+    plan = await call(client, "audit_prune_plan", through=1150)
+    assert (seen[-1].method, seen[-1].url.path) == ("GET", "/admin/audit/prune/plan")
+    assert dict(seen[-1].url.params) == {"through": "1150"}
+    assert isinstance(plan, PrunePlan)
+    assert (plan.from_, plan.through, plan.entries, plan.at) == (
+        1,
+        1000,
+        1000,
+        "2026-07-30T23:59:58Z",
+    )
+    assert plan.checkpoint == CHECKPOINT
+    assert plan.guards == PruneGuards(
+        requested=1150,
+        before=None,
+        min_age_cutoff="2026-08-24T12:00:00Z",
+        live_run_seq=1123,
+        sink_delivered_through=1100,
+        sink_degraded=False,
+        in_progress=False,
+        anchor_undelivered=False,
+        limited_by="prune_not_at_checkpoint",
+    )
+    assert plan.anchor is not None
+    assert (plan.anchor.through_seq, plan.anchor.state) == (1000, "done")
+    assert plan.anchor.shipped_at == "2026-11-01T00:00:01Z"
+    await call(client, "audit_prune_plan", before=datetime(2026, 8, 1, tzinfo=timezone.utc))
+    assert dict(seen[-1].url.params) == {"before": "2026-08-01T00:00:00+00:00"}
+    await call(client, "audit_prune_plan", before="2026-08-01T00:00:00Z")
+    assert dict(seen[-1].url.params) == {"before": "2026-08-01T00:00:00Z"}
+    await call(client, "audit_prune_plan")
+    assert dict(seen[-1].url.params) == {}
+    with pytest.raises(ValueError, match="not both"):
+        await call(client, "audit_prune_plan", through=1, before="2026-08-01T00:00:00Z")
+    # Nothing to prune, a log never pruned.
+    empty = {**PLAN, "through": None, "entries": 0, "checkpoint": None, "at": None, "anchor": None}
+    client, _ = make(lambda r: httpx.Response(200, json=empty))
+    plan = await call(client, "audit_prune_plan")
+    assert (plan.through, plan.checkpoint, plan.anchor) == (None, None, None)
+
+
+async def test_audit_prune(make: Any) -> None:
+    answer = {
+        "prune_seq": 1041,
+        "pruned_through": 1000,
+        "anchor": ANCHOR,
+        "checkpoint_before": {**CHECKPOINT, "seq": 1040},
+        "checkpoint_after": {**CHECKPOINT, "seq": 1041},
+        "deleting": True,
+        "shipped": {
+            "queued": True,
+            "delivered_through": 1000,
+            "anchor_shipped_at": None,
+            "anchor_pending": True,
+        },
+        "already": False,
+    }
+    client, seen = make(lambda r: httpx.Response(200, json=answer))
+    res = await call(
+        client, "audit_prune", 1000, archive_sha256="ab" * 32, from_=1, through_hash="cd" * 32
+    )
+    assert (seen[-1].method, seen[-1].url.path) == ("POST", "/admin/audit/prune")
+    assert json.loads(seen[-1].content) == {
+        "through": 1000,
+        "archive_sha256": "ab" * 32,
+        "from": 1,
+        "through_hash": "cd" * 32,
+    }
+    assert isinstance(res, PruneResult)
+    assert (res.prune_seq, res.pruned_through, res.deleting, res.already) == (
+        1041,
+        1000,
+        True,
+        False,
+    )
+    assert res.anchor == AuditAnchor(**ANCHOR)
+    assert res.anchor.raw == ANCHOR and res.anchor.state is None
+    assert res.checkpoint_before is not None and res.checkpoint_before["seq"] == 1040
+    assert res.shipped == PruneShipped(True, 1000, None, True)
+    # Only `through` is required; the members not given are not sent.
+    await call(client, "audit_prune", 1000)
+    assert json.loads(seen[-1].content) == {"through": 1000}
+    client, _ = make(
+        lambda r: httpx.Response(200, json={**answer, "shipped": None, "already": True})
+    )
+    res = await call(client, "audit_prune", 1000)
+    assert res.shipped is None and res.already
+
+
+@pytest.mark.parametrize(
+    ("status", "body"),
+    [
+        (409, {"error": "prune_archive_mismatch", "code": "prune_archive_mismatch"}),
+        (409, {"error": "prune_disabled", "code": "prune_disabled"}),
+        (410, {"error": "audit_pruned", "pruned_through": 1000, "prune_seq": 1041, "first": 1001}),
+    ],
+)
+async def test_audit_prune_refusals_carry_the_code(
+    make: Any, status: int, body: dict[str, Any]
+) -> None:
+    client, _ = make(lambda r: httpx.Response(status, json={**body, "detail": "x"}))
+    with pytest.raises(ApiError) as e:
+        await call(client, "audit_prune", 5, from_=1, through_hash="cd" * 32)
+    assert (e.value.status, e.value.code) == (status, body["error"])
+    with pytest.raises(ApiError) as e:
+        await call(client, "audit_prune_plan")
+    assert e.value.code == body["error"]
+
+
+async def test_audit_anchors(make: Any) -> None:
+    stored = {**ANCHOR, "state": "deleting", "shipped_at": None}
+    client, seen = make(
+        lambda r: httpx.Response(200, json={"anchors": [stored], "next_cursor": "c2"})
+    )
+    page = await call(client, "audit_anchors")
+    assert (seen[-1].method, seen[-1].url.path) == ("GET", "/admin/audit/anchors")
+    assert dict(seen[-1].url.params) == {}
+    assert isinstance(page, AnchorPage) and page.next_cursor == "c2"
+    [a] = page.anchors
+    assert (a.through_seq, a.prune_seq, a.state, a.shipped_at) == (1000, 1041, "deleting", None)
+    assert a.archive_sha256 == "ab" * 32 and a.previous_through_seq is None
+    await call(client, "audit_anchors", cursor="c2", limit=10)
+    assert dict(seen[-1].url.params) == {"cursor": "c2", "limit": "10"}
+    client, _ = make(lambda r: httpx.Response(200, json={"anchors": [], "next_cursor": None}))
+    page = await call(client, "audit_anchors")
+    assert page.anchors == [] and page.next_cursor is None
 
 
 async def test_mint_root_dev(make: Any) -> None:

@@ -63,7 +63,7 @@ from attenuo import (
     _retry,
     call_hash,
 )
-from attenuo.audit import entry_hash
+from attenuo.audit import cross_check, entry_hash, verify_exports
 from attenuo.mcp import TokenAuth
 
 pytestmark = [
@@ -1934,3 +1934,174 @@ def test_hop0_client_assertion_survives_the_nonce_retry(
         assert root.chain.hops[-1].agent == "signer"
         assert [(x.status, x.error) for x in rec.sent] == [(401, "use_dpop_nonce"), (200, None)]
         assert [x.assertion for x in rec.sent] == [assertion, assertion]
+
+
+@pytest.fixture
+def reload_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Stack]:
+    """A stack of its own whose issuer key is a file, for tests that edit its config file and
+    reload it."""
+    work = tmp_path_factory.mktemp("attenuo-it-reload")
+    pem = work / "issuer.pem"
+    write_key(pem)
+    yield from run_stack(work, issuer_key=pem)
+
+
+def write_key(path: Path) -> None:
+    key = Ed25519PrivateKey.generate()
+    path.write_bytes(key.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()))
+    path.chmod(0o600)
+
+
+def test_agents_reload_adds_an_agent_and_refuses_an_empty_file(reload_stack: Stack) -> None:
+    config = reload_stack.work / "config.toml"
+    text = config.read_text()
+    with AdminClient(reload_stack.url, ADMIN_TOKEN) as admin:
+        same = admin.agents_reload()
+        assert (same.agents.count, same.agents.added, same.agents.removed) == (2, [], [])
+        assert same.peps.count == 0 and same.restart_needed == [] and same.audit_id
+        assert len(same.agents.sha256) == 64
+
+        digest = hashlib.sha256(b"demo-auditor-secret").hexdigest()
+        config.write_text(text + f'\n[[agents]]\nid = "auditor"\nsecret_sha256 = "{digest}"\n')
+        added = admin.agents_reload()
+        assert (added.agents.count, added.agents.added) == (3, ["auditor"])
+        assert added.agents.sha256 != same.agents.sha256
+
+        # A file cut short before its [[agents]]: refused, and nothing changes.
+        config.write_text(text.split("[[agents]]")[0])
+        with pytest.raises(ApiError) as e:
+            admin.agents_reload()
+        assert (e.value.status, e.value.code) == (422, "agents_reload_empties")
+        config.write_text(text)
+        back = admin.agents_reload()
+        assert (back.agents.removed, back.agents.count) == (["auditor"], 2)
+
+
+def test_keys_reload_rotates_the_signing_key(reload_stack: Stack) -> None:
+    config = reload_stack.work / "config.toml"
+    text = config.read_text()
+    old_pem, new_pem = reload_stack.work / "issuer.pem", reload_stack.work / "issuer-2.pem"
+    write_key(new_pem)
+    with AdminClient(reload_stack.url, ADMIN_TOKEN) as admin:
+        same = admin.keys_reload()
+        assert not same.changed and same.signing_kid == same.previous_signing_kid
+        assert same.verifying_kids == [same.signing_kid] and same.audit_id
+        old_kid = same.signing_kid
+
+        # The new key alone would drop the current one: refused, and nothing changes.
+        config.write_text(text.replace(str(old_pem), str(new_pem), 1))
+        with pytest.raises(ApiError) as e:
+            admin.keys_reload()
+        assert (e.value.status, e.value.code) == (422, "keys_reload_drops_current")
+
+        # Keep the old key as a verifying key: the signing key changes.
+        config.write_text(
+            text.replace(
+                f'private_key_pem_path = "{old_pem}"',
+                f'private_key_pem_path = "{new_pem}"\nprevious_key_paths = ["{old_pem}"]',
+                1,
+            )
+        )
+        rotated = admin.keys_reload()
+        assert rotated.changed and rotated.previous_signing_kid == old_kid
+        assert rotated.signing_kid != old_kid and rotated.added == [rotated.signing_kid]
+        assert rotated.verifying_kids == [rotated.signing_kid, old_kid]
+        assert rotated.audit_signing_kid == rotated.signing_kid
+        jwks = httpx.get(f"{reload_stack.url}/.well-known/jwks.json").json()
+        assert [k["kid"] for k in jwks["keys"]] == rotated.verifying_kids
+        assert not admin.keys_reload().changed
+
+
+@pytest.fixture
+def prune_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Stack]:
+    """A stack that can prune: a file audit log with a checkpoint every 3 entries, the file
+    checkpoint sink, ``prune = "manual"``, and ``min_age_seconds = 5``. The run-state
+    retentions are 0 (keep everything) so that the start-up floor on ``min_age_seconds`` is 0,
+    and the test makes no lease, so no live run holds the boundary. The maintenance task, which
+    deletes the pruned rows, runs every second."""
+    work = tmp_path_factory.mktemp("attenuo-it-prune")
+    yield from run_stack(
+        work,
+        "[leases]\nretention_seconds = 0\nrun_state_retention_seconds = 0\n"
+        "user_window_retention_seconds = 0\nmaintenance_interval_seconds = 1\n\n"
+        '[audit.retention]\nprune = "manual"\nmin_age_seconds = 5\n\n'
+        '[audit.sink]\nkind = "file"\npath = "{work}/shipped.jsonl"\n\n',
+        edits={
+            'sqlite_path = ":memory:"': (
+                f'sqlite_path = "{work}/audit.sqlite"\ncheckpoint_every = 3'
+            )
+        },
+    )
+
+
+def write_export(path: Path, lines: Iterator[dict[str, Any]]) -> str:
+    """Write an export's lines to ``path``; the SHA-256 of the file's bytes."""
+    text = "".join(json.dumps(o, separators=(",", ":")) + "\n" for o in lines)
+    path.write_text(text)
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def test_audit_prune_plan_prune_and_anchors(prune_stack: Stack) -> None:
+    work = prune_stack.work
+    jwks = httpx.get(f"{prune_stack.url}/.well-known/jwks.json").json()
+    with AdminClient(prune_stack.url, ADMIN_TOKEN) as admin:
+        assert admin.audit_anchors().anchors == []
+        # Admin records belong to no run, so the live-run guard does not hold them.
+        for _ in range(6):
+            admin.policy_reload()
+        early = admin.audit_prune_plan()
+        assert early.through is None and early.guards.limited_by == "prune_too_recent"
+        # Until the entries are old enough: polled, not one fixed sleep, so a slow machine
+        # only waits longer.
+        deadline = time.monotonic() + 60
+        plan = admin.audit_prune_plan()
+        while plan.guards.limited_by == "prune_too_recent" and time.monotonic() < deadline:
+            time.sleep(0.25)
+            plan = admin.audit_prune_plan()
+        assert plan.from_ == 1 and plan.through is not None and plan.guards.limited_by is None
+        assert plan.checkpoint is not None and plan.checkpoint["seq"] == plan.through
+        assert plan.entries == plan.through and plan.anchor is None
+        through = plan.through
+        archive = work / "archive.jsonl"
+        digest = write_export(archive, admin.audit_export(1, through))
+
+        # A boundary that is not a checkpoint is refused, with the server's code.
+        with pytest.raises(ApiError) as e:
+            admin.audit_prune(through - 1, archive_sha256=digest)
+        assert (e.value.status, e.value.code) == (409, "prune_not_at_checkpoint")
+
+        done = admin.audit_prune(through, archive_sha256=digest, from_=1)
+        assert (done.pruned_through, done.already) == (through, False)
+        assert done.anchor.through_seq == through and done.anchor.archive_sha256 == digest
+        assert done.shipped is not None
+        again = admin.audit_prune(through, archive_sha256=digest)
+        assert again.already and again.anchor == done.anchor
+        with pytest.raises(ApiError) as e:
+            admin.audit_prune(through, archive_sha256="f" * 64)
+        assert (e.value.status, e.value.code) == (409, "prune_conflict")
+        with pytest.raises(ApiError) as e:
+            admin.audit_prune(through - 3, archive_sha256=digest)
+        assert (e.value.status, e.value.code) == (410, "audit_pruned")
+
+        page = admin.audit_anchors(limit=10)
+        assert [a.through_seq for a in page.anchors] == [through] and page.next_cursor is None
+        listed = page.anchors[0]
+        assert (listed.signature, listed.prune_seq) == (done.anchor.signature, done.prune_seq)
+        assert listed.state in ("deleting", "done")
+        wait_for(
+            lambda: (
+                (a := admin.audit_anchors().anchors[0]).state == "done" and a.shipped_at is not None
+            ),
+            10,
+            "the prune to finish and the sink to ship its anchor",
+        )
+
+        # The retained export starts from the anchor; it and the archive verify as one log, and
+        # it cross-checks against what the sink shipped, anchor included.
+        retained = work / "retained.jsonl"
+        write_export(retained, admin.audit_export(through + 1))
+        r = verify_exports([archive, retained], checkpoint_public_keys=jwks)
+        assert r.ok, r
+        c = cross_check(retained, work / "shipped.jsonl", checkpoint_public_keys=jwks)
+        assert c.ok, c
+        assert (c.anchors.shipped, c.anchors.checked, c.anchors.matched) == (1, 1, 1)

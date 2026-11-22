@@ -17,14 +17,19 @@ from attenuo.audit import (
     EXPORT_FORMAT,
     GENESIS_HASH,
     PRUNE_TOOL,
+    SHIPPED_ANCHOR_FORMAT,
     SHIPPED_FORMAT,
+    AnchorCheckReport,
     CrossCheckReport,
     ExportError,
     ExportsReport,
     LinkProblem,
+    ShippedAnchor,
+    ShippedMismatch,
     cross_check,
     entry_hash,
     parse_shipped,
+    parse_shipped_anchors,
     verify_export,
     verify_exports,
 )
@@ -439,7 +444,7 @@ ANCHOR_LINE = (
 )
 
 
-def test_a_prune_anchor_line_in_the_shipped_file_is_skipped() -> None:
+def test_a_prune_anchor_line_in_the_shipped_file_is_checked_as_an_anchor() -> None:
     objs = make_export()
     shipped = shipped_lines(checkpoints_of(objs))
     with_anchor = [shipped[0], ANCHOR_LINE, shipped[1]]
@@ -447,7 +452,14 @@ def test_a_prune_anchor_line_in_the_shipped_file_is_skipped() -> None:
     # The anchor is not a checkpoint; the lines after it keep their own numbers.
     assert [p.line for p in parsed] == [1, 3]
     r = cross(objs, with_anchor)
-    assert r.ok and r.shipped == 2 and r.matched == 2
+    assert r.mismatches == () and r.shipped == 2 and r.matched == 2
+    # The anchor itself is checked: this one is not signed by a key of the JWKS.
+    assert not r.ok and not r.anchors.ok and r.anchors.shipped == 1
+    assert r.anchors.mismatches == (
+        ShippedMismatch(
+            3, 2, "shipped envelope is inconsistent: `anchor_sha256` does not match the anchor"
+        ),
+    )
 
 
 def test_shipped_checkpoints_past_the_export_are_counted_not_checked() -> None:
@@ -760,3 +772,336 @@ def test_verify_exports_needs_a_list_of_files() -> None:
     for one in ("archive.jsonl", b"archive.jsonl", Path("archive.jsonl")):
         with pytest.raises(ExportError, match="not one path"):
             verify_exports(one, checkpoint_public_keys=JWKS)  # type: ignore[arg-type]
+
+
+# ---- the shipped prune anchors, against the golden files the Rust code writes --------------
+
+
+def golden(name: str) -> Path:
+    return GOLDEN / name
+
+
+def golden_jwks() -> dict[str, Any]:
+    keys: dict[str, Any] = json.loads(golden("jwks.json").read_text())
+    return keys
+
+
+def golden_cross(export: str | list[str], shipped: str | list[str]) -> CrossCheckReport:
+    e = golden(export) if isinstance(export, str) else export
+    s = golden(shipped) if isinstance(shipped, str) else shipped
+    return cross_check(e, s, checkpoint_public_keys=golden_jwks())
+
+
+def golden_checks() -> list[dict[str, Any]]:
+    if not GOLDEN.is_dir():
+        return []
+    checks: list[dict[str, Any]] = json.loads(golden("cross-checks.json").read_text())["checks"]
+    return checks
+
+
+def mismatch_json(ms: tuple[ShippedMismatch, ...]) -> list[dict[str, Any]]:
+    return [{"seq": m.seq, "line": m.line, "reason": m.reason} for m in ms]
+
+
+needs_golden = pytest.mark.skipif(
+    not GOLDEN.is_dir(), reason="the repository's testdata is not here"
+)
+
+
+@needs_golden
+@pytest.mark.parametrize("check", golden_checks(), ids=lambda c: f"{c['export']}+{c['shipped']}")
+def test_the_golden_cross_checks_give_the_rust_verdicts(check: dict[str, Any]) -> None:
+    # `cross-checks.json` is what the Rust `cross_check` and `cross_check_anchors` answer for
+    # each pair, written with the other golden files.
+    r = golden_cross(check["export"], check["shipped"])
+    cps, anchors = check["checkpoints"], check["anchors"]
+    assert {
+        "shipped": r.shipped,
+        "in_range": r.in_range,
+        "matched": r.matched,
+        "beyond_range": r.beyond_range,
+        "below_range": r.below_range,
+        "last_shipped_seq": r.last_shipped_seq,
+        "mismatches": mismatch_json(r.mismatches),
+        "ok": not r.mismatches,
+    } == cps
+    assert {
+        "shipped": r.anchors.shipped,
+        "checked": r.anchors.checked,
+        "matched": r.anchors.matched,
+        "beyond_range": r.anchors.beyond_range,
+        "mismatches": mismatch_json(r.anchors.mismatches),
+        "ok": r.anchors.ok,
+    } == anchors
+    assert r.ok == (cps["ok"] and anchors["ok"])
+
+
+@needs_golden
+def test_the_golden_archives_and_retained_export_account_for_both_shipped_anchors() -> None:
+    for n, counts in (
+        ("archive-1.jsonl", (0, 0, 2)),
+        ("archive-2.jsonl", (1, 1, 1)),
+        ("retained.jsonl", (2, 2, 0)),
+    ):
+        r = golden_cross(n, "shipped.jsonl")
+        assert r.ok and isinstance(r.anchors, AnchorCheckReport), (n, r)
+        assert (r.anchors.checked, r.anchors.matched, r.anchors.beyond_range) == counts
+    # The shipped checkpoint at the retained file's anchor boundary is checked against it.
+    assert golden_cross("retained.jsonl", "shipped.jsonl").below_range == 1
+
+
+@needs_golden
+def test_a_rewound_log_verifies_but_the_shipped_anchor_says_it_was_rewound() -> None:
+    jwks = golden_jwks()
+    assert verify_export(golden("rewound.jsonl"), checkpoint_public_keys=jwks).ok
+    r = golden_cross("rewound.jsonl", "shipped.jsonl")
+    assert not r.ok and r.mismatches == ()
+    [m] = r.anchors.mismatches
+    assert (m.seq, m.line) == (10, 6)
+    assert m.reason.startswith("REWOUND: the shipped anchor says the log was pruned through seq 10")
+
+
+@needs_golden
+def test_an_export_holding_the_boundary_of_a_later_shipped_prune_is_reported() -> None:
+    assert verify_export(golden("stale.jsonl"), checkpoint_public_keys=golden_jwks()).ok
+    [m] = golden_cross("stale.jsonl", "shipped.jsonl").anchors.mismatches
+    assert m.seq == 10 and "has its boundary inside this export" in m.reason
+
+
+@needs_golden
+def test_a_tampered_shipped_anchor_signature_is_reported() -> None:
+    r = golden_cross("retained.jsonl", "shipped-bad-signature.jsonl")
+    assert not r.ok and r.mismatches == ()
+    assert [(m.seq, m.line, m.reason) for m in r.anchors.mismatches] == [
+        (10, 6, "shipped anchor does not verify: signature does not verify"),
+        (
+            10,
+            0,
+            "the export's header anchor is not in the shipped file (it was not shipped, or the "
+            "file is incomplete)",
+        ),
+    ]
+
+
+@needs_golden
+def test_another_shipped_anchor_for_the_header_boundary_is_reported() -> None:
+    r = golden_cross("archive-2.jsonl", "shipped-other-anchor.jsonl")
+    [m] = r.anchors.mismatches
+    assert (m.seq, m.line) == (5, 5)
+    assert m.reason == (
+        "the export's header carries another anchor for this boundary than the one shipped"
+    )
+
+
+@needs_golden
+def test_a_header_anchor_that_was_not_shipped_is_reported() -> None:
+    text = golden("shipped.jsonl").read_text().splitlines(keepends=True)
+    no_first = [t for t in text if '"through_seq":5}' not in t]
+    assert len(no_first) == len(text) - 1
+    [m] = golden_cross("archive-2.jsonl", no_first).anchors.mismatches
+    assert (m.seq, m.line) == (5, 0) and "not in the shipped file" in m.reason
+    # No anchor line at all, and no anchor in the header: nothing to check.
+    only_cps = [t for t in text if '"anchor"' not in t]
+    r = golden_cross("archive-1.jsonl", only_cps)
+    assert r.ok and r.anchors == AnchorCheckReport()
+
+
+@needs_golden
+def test_s3_objects_joined_without_newlines_parse() -> None:
+    text = golden("shipped.jsonl").read_text()
+    joined = text.replace("\n", "")
+    assert len(joined.splitlines()) == 1
+    assert len(parse_shipped([joined])) == len(parse_shipped(golden("shipped.jsonl")))
+    anchors = parse_shipped_anchors([joined])
+    assert [(a.line, a.anchor["through_seq"]) for a in anchors] == [(1, 5), (1, 10)]
+    for n in ("archive-1.jsonl", "archive-2.jsonl", "retained.jsonl"):
+        assert golden_cross(n, [joined]).ok, n
+
+
+@needs_golden
+def test_parse_shipped_anchors_reads_the_envelopes() -> None:
+    anchors = parse_shipped_anchors(golden("shipped.jsonl"))
+    assert [type(a) for a in anchors] == [ShippedAnchor, ShippedAnchor]
+    first = anchors[0]
+    assert first.format == SHIPPED_ANCHOR_FORMAT and first.public_url is None
+    assert (first.kid, first.signature) == (first.anchor["kid"], first.anchor["signature"])
+    assert set(first.anchor) == {
+        "through_seq",
+        "through_hash",
+        "prune_seq",
+        "prune_entry_hash",
+        "previous_through_seq",
+        "archive_sha256",
+        "at",
+        "kid",
+        "signature",
+    }
+    # Other lines, and a line that is not JSON, are not anchors.
+    assert parse_shipped_anchors(["not json\n", '{"seq":1}\n']) == []
+
+
+@pytest.mark.parametrize(
+    ("change", "match"),
+    [
+        ({"kid": 1}, "shipped anchors, line 1: `kid` must be a string"),
+        ({"anchor_sha256": None}, "`anchor_sha256` must be a string"),
+        ({"public_url": 3}, "`public_url` must be a string"),
+        ({"anchor": 1}, "shipped anchors, line 1: anchor: must be an object"),
+        ({"anchor": {"through_seq": -1}}, "`through_seq` must be a non-negative integer"),
+    ],
+)
+def test_a_value_with_an_anchor_member_that_is_not_a_shipped_anchor_raises(
+    change: dict[str, Any], match: str
+) -> None:
+    env = {**json.loads(ANCHOR_LINE), **change}
+    with pytest.raises(ExportError, match=match):
+        parse_shipped_anchors([json.dumps(env)])
+
+
+@needs_golden
+def test_inconsistent_anchor_envelopes_and_a_retried_delivery() -> None:
+    text = golden("shipped.jsonl").read_text().splitlines(keepends=True)
+    cps, first, second = text[:-2], json.loads(text[-2]), json.loads(text[-1])
+
+    def anchors_of(*envs: dict[str, Any]) -> AnchorCheckReport:
+        return golden_cross("retained.jsonl", [*cps, *(json.dumps(e) for e in envs)]).anchors
+
+    # A retry: the same anchor twice is counted once and passes.
+    r = anchors_of(first, first, second)
+    assert r.ok and (r.shipped, r.checked, r.matched) == (3, 2, 2)
+    for change, reason in (
+        ({"anchor_sha256": "0" * 64}, "`anchor_sha256` does not match the anchor"),
+        ({"kid": "other"}, "`kid` or `signature` differs from the anchor's own"),
+    ):
+        r = anchors_of({**first, **change}, second)
+        assert r.mismatches[0] == ShippedMismatch(
+            5, len(cps) + 1, f"shipped envelope is inconsistent: {reason}"
+        ), r
+    # Another format with an `anchor` member is neither an anchor nor a checkpoint, as for the
+    # CLI: the file does not parse.
+    other = json.dumps({**first, "format": "v0"})
+    assert parse_shipped_anchors([other])[0].format == "v0"
+    with pytest.raises(ExportError, match="shipped checkpoints, line 1"):
+        golden_cross("retained.jsonl", [other])
+
+
+def anchor_envelope(a: dict[str, Any]) -> str:
+    """What the sink ships for the anchor ``a`` (signed by this test's key)."""
+    return rfc8785.dumps(
+        {
+            "anchor": a,
+            "anchor_sha256": hashlib.sha256(rfc8785.dumps(a)).hexdigest(),
+            "format": SHIPPED_ANCHOR_FORMAT,
+            "kid": a["kid"],
+            "public_url": None,
+            "signature": a["signature"],
+        }
+    ).decode()
+
+
+def test_the_shipped_checkpoint_at_the_anchor_boundary_must_name_its_hash() -> None:
+    _, retained, anchor = pruned_log()
+    good = sign(10, anchor["through_hash"])
+    other = sign(10, "ee" * 32)
+    shipped = [anchor_envelope(anchor), rfc8785.dumps(envelope(good)).decode()]
+    r = cross(retained, shipped)
+    assert r.ok and r.below_range == 1 and r.anchors.matched == 1
+    r = cross(retained, [anchor_envelope(anchor), rfc8785.dumps(envelope(other)).decode()])
+    assert r.mismatches == (
+        ShippedMismatch(
+            10,
+            2,
+            "the shipped checkpoint at the anchor's through_seq names another hash than the "
+            "anchor (history rewritten before the prune)",
+        ),
+    )
+    # Two different valid anchors for one boundary.
+    twin = {**anchor, "archive_sha256": "ff" * 32}
+    twin["signature"] = sign_anchor(twin)
+    r = cross(retained, [anchor_envelope(anchor), anchor_envelope(twin)])
+    assert [m.reason for m in r.anchors.mismatches] == [
+        "the sink holds two different anchors for this boundary (lines 1 and 2): the log was "
+        "pruned through this seq twice"
+    ]
+    # An export that starts right after a shipped anchor's boundary but carries none.
+    bare = [{k: v for k, v in retained[0].items() if k != "anchor"}, *retained[1:]]
+    r = cross(bare, [anchor_envelope(anchor)])
+    assert [m.reason for m in r.anchors.mismatches] == [
+        "the export starts right after this shipped anchor's boundary, but its header carries "
+        "no anchor"
+    ]
+
+
+# ---- what the readers skip, as the Rust readers do ----------------------------------------
+
+
+@needs_golden
+def test_a_checkpoint_envelope_relabelled_as_an_anchor_is_reported() -> None:
+    # The golden file has the last checkpoint again, its head_hash zeroed and its format the
+    # anchor format, with no `anchor` member. Rust reads it as a checkpoint envelope with an
+    # unsupported format, so it is not skipped.
+    r = golden_cross("retained.jsonl", "shipped-relabelled.jsonl")
+    assert not r.ok and r.anchors.ok
+    assert r.mismatches == (
+        ShippedMismatch(
+            14,
+            5,
+            "shipped envelope is inconsistent: unsupported format `attenuo-shipped-anchor-v1`",
+        ),
+    )
+    lines = parse_shipped(golden("shipped-relabelled.jsonl"))
+    assert [(p.line, p.checkpoint["seq"]) for p in lines][-1] == (5, 14)
+
+
+@needs_golden
+@pytest.mark.parametrize(
+    "line",
+    [
+        '{"format":"attenuo-shipped-anchor-v1"}',
+        '{"format":"attenuo-shipped-anchor-v1","kid":"k"}',
+    ],
+)
+def test_a_line_with_the_anchor_format_and_no_anchor_is_not_skipped(line: str) -> None:
+    text = golden("shipped.jsonl").read_text() + line + "\n"
+    with pytest.raises(ExportError, match="shipped checkpoints, line 7"):
+        parse_shipped([text])
+    with pytest.raises(ExportError, match="shipped checkpoints, line 7"):
+        golden_cross("retained.jsonl", [text])
+
+
+@needs_golden
+def test_only_what_rust_trims_makes_a_line_blank() -> None:
+    text = golden("shipped.jsonl").read_text()
+    # Unicode White_Space, which Rust's `trim` strips, is a blank line.
+    assert len(parse_shipped([text + " \t\xa0\u3000\u2028\x85\n"])) == 4
+    assert golden_cross("retained.jsonl", [text + "\xa0\n"]).ok
+    # U+001C..U+001F are not White_Space, though `str.strip()` strips them: Rust reads the line
+    # as JSON and fails, and so does the SDK.
+    for bad in ("\x1c", "\x1d\x1e\x1f"):
+        with pytest.raises(ExportError, match="line 7"):
+            parse_shipped([text + bad + "\n"])
+        with pytest.raises(ExportError, match="line 7"):
+            golden_cross("retained.jsonl", [text + bad + "\n"])
+    export = golden("retained.jsonl").read_text()
+    jwks = golden_jwks()
+    assert verify_export([export + "\u3000\n"], checkpoint_public_keys=jwks).ok
+    with pytest.raises(ExportError, match="line"):
+        verify_export([export + "\x1f\n"], checkpoint_public_keys=jwks)
+
+
+@pytest.mark.parametrize("written", ["10.0", "1e1", "1.0e1"])
+def test_an_unsigned_integer_written_with_a_fraction_or_exponent_is_refused(
+    written: str,
+) -> None:
+    # Rust reads `seq` and the anchor's seqs as u64 and refuses these; so does the SDK.
+    objs = make_export()
+    cp = checkpoints_of(objs)[0]
+    line = rfc8785.dumps(envelope(cp)).decode().replace(f'"seq":{cp["seq"]}', f'"seq":{written}')
+    with pytest.raises(ExportError, match="`seq` must be a non-negative integer"):
+        parse_shipped([line])
+    anchor_line = ANCHOR_LINE.replace('"through_seq":3', f'"through_seq":{written}')
+    with pytest.raises(ExportError, match="`through_seq` must be a non-negative integer"):
+        parse_shipped_anchors([anchor_line])
+    header = json.dumps(objs[0]).replace('"from": 1', f'"from": {written}')
+    with pytest.raises(ExportError, match="`from` must be a non-negative integer"):
+        verify_export([header + "\n", *lines(objs[1:])], checkpoint_public_keys=JWKS)

@@ -48,12 +48,43 @@ const MAX_DEPTH = 256;
 const NUMBER = /-?(?:0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?/y;
 
 /**
+ * Where a parse found numbers written with a fraction or an exponent (`10.0`, `1e1`): for each
+ * object or array, the member names or indexes that held one. A double cannot tell `10.0` from
+ * `10`, so a reader that wants an integer, as Rust's `u64` does, asks this map instead.
+ */
+export type FractionMarks = WeakMap<object, Set<string | number>>;
+
+/**
  * Parse JSON text strictly: RFC 8259 grammar only, duplicate object members are an error, and
  * an integer literal beyond 2^53 is an error rather than a silent rounding. Throws
- * `AttenuoError` with the offset of the problem.
+ * `AttenuoError` with the offset of the problem. When `marks` is given, it records where a
+ * number was written with a fraction or an exponent.
  */
-export function parseJson(text: string): JsonValue {
+export function parseJson(text: string, marks?: FractionMarks): JsonValue {
+  return parseValues(text, false, marks)[0] as JsonValue;
+}
+
+/**
+ * Parse text that holds JSON values one after the other, as `parseJson` parses one: S3 objects
+ * joined with `cat`, which adds no newline between them. Whitespace alone gives `[]`.
+ */
+export function parseJsonValues(text: string, marks?: FractionMarks): JsonValue[] {
+  return parseValues(text, true, marks);
+}
+
+function parseValues(text: string, many: boolean, marks?: FractionMarks): JsonValue[] {
   let i = 0;
+  // Whether the value `value` just returned was a number written with a fraction or exponent.
+  let fraction = false;
+  const mark = (container: object, key: string | number): void => {
+    if (marks === undefined) return;
+    let set = marks.get(container);
+    if (set === undefined) {
+      set = new Set();
+      marks.set(container, set);
+    }
+    set.add(key);
+  };
   const fail = (msg: string): never => {
     throw new AttenuoError(`invalid JSON at offset ${i}: ${msg}`);
   };
@@ -112,6 +143,12 @@ export function parseJson(text: string): JsonValue {
     }
   };
   const value = (depth: number): JsonValue => {
+    fraction = false;
+    const v = parseValue(depth);
+    fraction = typeof v === "number" && fraction;
+    return v;
+  };
+  const parseValue = (depth: number): JsonValue => {
     if (depth > MAX_DEPTH) return fail("nested too deeply");
     ws();
     const c = text[i];
@@ -131,9 +168,11 @@ export function parseJson(text: string): JsonValue {
         ws();
         if (text[i] !== ":") return fail("expected ':'");
         i++;
+        const v = value(depth + 1);
+        if (fraction) mark(obj, k);
         // `__proto__` must stay an own property, not set the prototype.
         Object.defineProperty(obj, k, {
-          value: value(depth + 1),
+          value: v,
           enumerable: true,
           writable: true,
           configurable: true,
@@ -160,6 +199,7 @@ export function parseJson(text: string): JsonValue {
       }
       for (;;) {
         arr.push(value(depth + 1));
+        if (fraction) mark(arr, arr.length - 1);
         ws();
         if (text[i] === ",") {
           i++;
@@ -192,10 +232,20 @@ export function parseJson(text: string): JsonValue {
       return fail(`integer ${m[0]} is beyond 2^53`);
     }
     if (!Number.isFinite(n)) return fail("number out of range");
+    fraction = m[1] !== undefined || m[2] !== undefined;
     return n;
   };
-  const v = value(0);
+  if (!many) {
+    const v = value(0);
+    ws();
+    if (i < text.length) fail("trailing characters");
+    return [v];
+  }
+  const out: JsonValue[] = [];
   ws();
-  if (i < text.length) fail("trailing characters");
-  return v;
+  while (i < text.length) {
+    out.push(value(0));
+    ws();
+  }
+  return out;
 }
