@@ -114,6 +114,10 @@ where
         .blocking(move |s| first(s, &h, &b))
         .await
         .map_err(refused)?;
+    // Between the bearer check and the decision there can now be a key fetch (at most 5
+    // seconds). That is safe: the bearer's signature and expiry were checked in `first`, and
+    // the decision in `second` looks up the chain's leases and their expiry again, as of its
+    // own time (a lease never outlives its token).
     let wanted = bearer.is_some() || state.authzen_allow_unsigned_chain;
     let peps = PepKeys::fetch(&state, &body, wanted).await;
     state
