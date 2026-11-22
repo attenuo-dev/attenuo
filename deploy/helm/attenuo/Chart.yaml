@@ -3,9 +3,9 @@ name: attenuo
 description: Authorization layer for AI agents that call tools over MCP (self-hosted server and proxy).
 type: application
 # The chart's own version; bumped on every chart change.
-version: 0.1.0
+version: 0.2.0
 # The attenuo release the chart deploys by default (the image tag).
-appVersion: "0.1.0"
+appVersion: "0.2.0"
 home: https://github.com/attenuo-dev/attenuo
 sources:
   - https://github.com/attenuo-dev/attenuo
