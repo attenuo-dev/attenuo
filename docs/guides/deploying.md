@@ -170,20 +170,39 @@ To rotate:
 
 1. Generate the new key: `openssl genpkey -algorithm ed25519 -out /etc/attenuo/issuer-2.pem`, then `chmod 600` it. (At startup the server also generates a key if the path does not exist. A reload does not.)
 2. Edit the config: point `private_key_pem_path` at the new file and add the old file to `previous_key_paths`. A previous key file may be the old private key or just its public key (`openssl pkey -in issuer-1.pem -pubout -out issuer-1.pub`); only the public half is used, so prefer the public file and archive the private one.
-3. Run `attenuo admin key reload` (role `admin`; `POST /admin/keys/reload`), or restart the server. The reload prints the old and new `kid` and the verifying keys. Check `/.well-known/jwks.json` lists both. With several replicas, reload each one.
-4. Wait at least the longest token lifetime (`default_ttl_seconds`, or the largest `ttl_seconds` you allow) plus `clock_skew`. By then every token signed by the old key has expired.
-5. Remove the old token key from `previous_key_paths` only if no audit checkpoint or anchor you keep was signed by it (see below). Then reload again, and destroy the old private key.
+3. Run `attenuo admin key reload` (role `admin`; `POST /admin/keys/reload`), or restart the server. The reload prints the old and new `kid` and the verifying keys. Check `/.well-known/jwks.json` lists both. With several replicas, or verifiers that cache the JWKS, use the two steps below instead.
+4. Wait at least the longest token lifetime (`default_ttl_seconds`, or the largest `ttl_seconds` you allow) plus `clock_skew`. By then every token signed by the old key has expired, and so has every child rooted under it.
+5. Keep the old public key in `previous_key_paths`. Then destroy the old private key. Keeping the public key costs nothing, and the old audit checkpoints and anchors keep verifying.
+
+You can remove the old key from `previous_key_paths` only when nothing you keep was signed by it: the reload refuses while the live audit log holds a checkpoint or anchor it signed (`keys_reload_drops_audit_key`). In practice that is after `attenuo audit prune` has removed every entry from its time and a newer anchor covers them. The check cannot see archives, exports or checkpoints already shipped by `[audit.sink]`. So before you remove a key, save a copy of `/.well-known/jwks.json` with each archive and export, or keep the key.
+
+### Rotation with replicas or cached JWKS
+
+Each replica reloads on its own, and a verifier that caches the JWKS may not see a new key at once. A token signed by the new key on one replica would then fail on another. Rotate in two reloads, neither of which needs an override:
+
+1. Publish the new key first, and keep signing with the old one. Set `previous_key_paths` to the new public key and leave `private_key_pem_path` as it is:
+
+   ```toml
+   [issuer]
+   private_key_pem_path = "/etc/attenuo/issuer-1.pem"          # still signs
+   previous_key_paths   = ["/etc/attenuo/issuer-2.pub"]        # published, verify only
+   ```
+
+   Reload every replica. The JWKS now lists both keys, old first. Wait until every cache has the new key (the JWKS cache time of your verifiers).
+2. Swap: point `private_key_pem_path` at the new key and set `previous_key_paths` to the old public key, as in step 2 above. Reload every replica. Tokens of either key verify everywhere.
 
 The reload swaps the signing key and the verifying keys in one step. Each request uses one set of keys from start to end. New tokens, approval tokens, audit checkpoints and prune anchors are signed with the new key. Only the two key settings are read from the file; other sections that differ are named in the answer as needing a restart. Two things keep the key the server started with until a restart, when they are on: the DPoP nonces (`[token] dpop_nonce`) and the subject digests of `[telemetry]` and `[logging] redact_subjects`. The reload names them under `kept_until_restart`.
+
+An environment variable wins over the file at a reload, as at startup. While `ATTENUO__ISSUER__PRIVATE_KEY_PEM_PATH` is set, editing `private_key_pem_path` in the file does nothing; the reload warns about it. Change the file the variable names, or unset it and restart.
 
 The reload refuses, and changes nothing, when a key file cannot be read, is not an Ed25519 key of the right kind, or holds the same key as another file. It also refuses two mistakes that are easy to make:
 
 - A new signing key without the current one in `previous_key_paths` (`keys_reload_drops_current`). That would make every live token fail at once. Pass `--allow-drop-current` only for a key compromise.
-- Verifying keys that leave out a key that signed an audit checkpoint or prune anchor the log still holds (`keys_reload_drops_audit_key`). That would make `audit verify` fail. Pass `--allow-drop-audit-key` only when you accept that.
+- Verifying keys that leave out a key that signed an audit checkpoint or prune anchor the log still holds (`keys_reload_drops_audit_key`). That would make `audit verify` fail. Pass `--allow-drop-audit-key` only when you accept that. The current key always signs the audit log, so dropping it always needs both flags.
 
 Notes:
 
-- The originating-user block of a token (`ou_sig`) is signed once, at the root, and copied to every child. A child minted after the switch is signed by the new key but still carries an old-key `ou_sig` (its `ou_kid` names the old key), so the old key must stay trusted until the whole chain has expired. That is why step 4 waits for the longest chain, not for one token.
+- The originating-user block of a token (`ou_sig`) is signed once, at the root, and copied to every child. A child minted after the switch is signed by the new key but still carries an old-key `ou_sig` (its `ou_kid` names the old key), so the old key must stay trusted until the whole chain has expired. That is why step 4 waits for the longest chain, not for one token. Dropping the old key ends those children too, though the new key signed them.
 - A token whose `kid` is not in the trusted set is rejected with `invalid_grant`, whatever its signature. Tokens issued by a version before `kid` existed carry no `kid` and are tried against every trusted key.
 - Third parties that verify attenuo tokens offline should select the key by `kid` and refresh the JWKS when they see an unknown one. `attenuo token inspect --verify` fetches the JWKS and trusts every key in it.
 - In an emergency (key compromise), skip the overlap: replace the key, leave the old one out of `previous_key_paths`, and run `attenuo admin key reload --allow-drop-current --allow-drop-audit-key` (or restart). Every outstanding token stops verifying; agents re-run login and exchange. Then restart too, so the DPoP nonces and subject digests stop using the old key.

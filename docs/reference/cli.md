@@ -294,7 +294,7 @@ Ask the server to rotate its token signing key without a restart (`POST /admin/k
 
 | Option | Meaning |
 | --- | --- |
-| `--allow-drop-current` | Accept a new signing key while the current one is not in `previous_key_paths`. Every token the current key signed stops verifying at once. Without it the reload is refused (`keys_reload_drops_current`). Use it after a key compromise. |
+| `--allow-drop-current` | Accept a new signing key while the current one is not in `previous_key_paths`. Every token the current key signed stops verifying at once. Without it the reload is refused (`keys_reload_drops_current`). Use it after a key compromise. It always needs `--allow-drop-audit-key` too, since the current key is the one that signs the audit log. |
 | `--allow-drop-audit-key` | Accept verifying keys that leave out a key that signed audit checkpoints or anchors the log still holds, or the key that signs them now. `attenuo audit verify` then reports those as signed by an unknown key. Without it the reload is refused (`keys_reload_drops_audit_key`). |
 | `--allow-mismatch` | Accept a file whose `[issuer]` (its key files aside) or `[audit]` differs from the running config. Without it the reload is refused (`config_file_mismatch`): such a file may be another server's. Only the keys are applied either way. |
 
@@ -306,9 +306,9 @@ verifying keys: 2 in force, 1 added, 0 removed
 audit checkpoints signed by: mQ3lMQcsS6m-yZ-a9pD1yQ
 ```
 
-Warnings go to stderr, one `warning:` line each, and the exit status stays 0. A line `still keyed by the startup key (restart to re-key)` names the DPoP nonces and the subject digests, when they are on: they keep the key the server started with until a restart.
+Warnings go to stderr, one `warning:` line each, with `--json` too, and the exit status stays 0. A line `warning: still keyed by the startup key (restart to re-key)` names the DPoP nonces and the subject digests, when they are on: they keep the key the server started with until a restart.
 
-A refusal exits 1 with the server's code, and the keys in force stay as they were: `keys_config_invalid` (the file does not parse, or sets no `private_key_pem_path`), `key_file_unreadable`, `key_file_invalid` (not an Ed25519 key of the kind wanted), `key_duplicate` (a key in two files), `keys_reload_drops_current`, `keys_reload_drops_audit_key` and `config_file_mismatch` (above), `reload_unavailable` (the server was not started from a config file), `config_unreadable` (the file cannot be read), or `admin_role_insufficient` (the token's role is below `admin`).
+A refusal exits 1 with the server's code, and the keys in force stay as they were: `keys_config_invalid` (the file does not parse, or sets no `private_key_pem_path`), `key_file_unreadable`, `key_file_invalid` (not a regular file, over 64 KiB, or not an Ed25519 key of the kind wanted), `key_duplicate` (a key in two files), `keys_reload_drops_current`, `keys_reload_drops_audit_key` and `config_file_mismatch` (above), `reload_unavailable` (the server was not started from a config file), `config_unreadable` (the file cannot be read), or `admin_role_insufficient` (the token's role is below `admin`).
 
 ### `token inspect <JWT>`
 
