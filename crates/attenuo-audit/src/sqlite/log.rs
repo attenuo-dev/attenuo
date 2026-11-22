@@ -459,6 +459,9 @@ pub(super) struct Inner {
     /// Tests: runs once, before the first page of the next `write_export`.
     #[cfg(any(test, feature = "testing"))]
     export_page_hook: Mutex<Option<VerifyWalkHook>>,
+    /// Tests: runs once, at the start of the next prune transaction, before its lock.
+    #[cfg(any(test, feature = "testing"))]
+    prune_hook: Mutex<Option<VerifyWalkHook>>,
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -1054,6 +1057,8 @@ impl SqliteAudit {
                 verify_walk_hook: Mutex::new(None),
                 #[cfg(any(test, feature = "testing"))]
                 export_page_hook: Mutex::new(None),
+                #[cfg(any(test, feature = "testing"))]
+                prune_hook: Mutex::new(None),
             }),
             writer: OnceLock::new(),
             wal: None,
@@ -2077,6 +2082,20 @@ impl SqliteAudit {
     #[doc(hidden)]
     pub fn on_next_export_page(&self, f: impl FnOnce() + Send + 'static) {
         *self.inner.export_page_hook.lock().unwrap() = Some(Box::new(f));
+    }
+
+    /// Tests: run `f` once, at the start of the next `prune_through_expecting`, before it
+    /// takes the log's lock (to make another prune commit first).
+    #[doc(hidden)]
+    pub fn on_next_prune(&self, f: impl FnOnce() + Send + 'static) {
+        *self.inner.prune_hook.lock().unwrap() = Some(Box::new(f));
+    }
+
+    pub(super) fn run_prune_hook(&self) {
+        let hook = self.inner.prune_hook.lock().unwrap().take();
+        if let Some(f) = hook {
+            f();
+        }
     }
 
     pub(super) fn run_export_page_hook(&self) {

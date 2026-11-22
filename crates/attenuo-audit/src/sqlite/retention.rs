@@ -870,6 +870,8 @@ impl SqliteAudit {
         limits: &PruneLimits,
         record: impl FnOnce(&Value) -> DecisionRecord,
     ) -> Result<PruneOutcome, AuditError> {
+        #[cfg(any(test, feature = "testing"))]
+        self.run_prune_hook();
         let c = self
             .inner
             .checkpointing

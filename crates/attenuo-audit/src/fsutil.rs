@@ -5,13 +5,18 @@ use std::io;
 use std::path::Path;
 
 /// Rename `from` to `to`, failing with [`io::ErrorKind::AlreadyExists`] if `to` exists, in
-/// one step (Linux `renameat2(RENAME_NOREPLACE)`). Elsewhere it fails with
-/// [`io::ErrorKind::Unsupported`].
+/// one step (Linux `renameat2(RENAME_NOREPLACE)`, macOS and iOS `renameatx_np(RENAME_EXCL)`).
+/// Elsewhere it fails with [`io::ErrorKind::Unsupported`].
 ///
 /// # Errors
 ///
 /// Whatever the rename fails with.
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+))]
 pub fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
     use rustix::fs::{renameat_with, RenameFlags, CWD};
     renameat_with(CWD, from, CWD, to, RenameFlags::NOREPLACE).map_err(io::Error::from)
@@ -22,7 +27,12 @@ pub fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
 /// # Errors
 ///
 /// Always [`io::ErrorKind::Unsupported`].
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+)))]
 pub fn rename_noreplace(_from: &Path, _to: &Path) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -95,7 +105,12 @@ mod tests {
         )));
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
     #[test]
     fn rename_noreplace_refuses_an_existing_name() {
         let dir = tempfile::tempdir().unwrap();
