@@ -2110,11 +2110,18 @@ pub async fn reload_agents(
         );
         return Err(audited_refusal(&state, who, TOOL, &path, refusal, now).await);
     }
-    // The file's lists under its own settings: would they be accepted after a restart?
+    // The file's lists under its own settings: would they be accepted after a restart? Both
+    // checks read each `ca_pem_path` file, so they run off the async workers.
     let own_rules = crate::clientauth::ClientRules::from_config(&file);
-    let own_check = (own_rules != state.client_rules)
-        .then(|| own_rules.check(&file.agents, &file.peps).map(|_| ()));
-    let (new, mut warnings) = match state.client_rules.check(&file.agents, &file.peps) {
+    let (agents_in, peps_in) = (file.agents.clone(), file.peps.clone());
+    let (own_check, checked) = state
+        .blocking(move |s| {
+            let own_check = (own_rules != s.client_rules)
+                .then(|| own_rules.check(&agents_in, &peps_in).map(|_| ()));
+            (own_check, s.client_rules.check(&agents_in, &peps_in))
+        })
+        .await;
+    let (new, mut warnings) = match checked {
         Ok(checked) => checked,
         Err(e) => {
             // A rule in force that the file changes: say so, as only a restart applies it.
