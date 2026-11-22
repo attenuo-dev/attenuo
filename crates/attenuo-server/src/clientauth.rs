@@ -12,16 +12,38 @@
 //!   ids and for entries without a secret, so timing does not reveal which ids exist.
 //! - **`private_key_jwt`** (RFC 7523 §2.2 and §3). `client_assertion_type` =
 //!   `urn:ietf:params:oauth:client-assertion-type:jwt-bearer` and `client_assertion` = a JWT
-//!   signed by one of the keys in the entry's `jwks`. See [`Clients::verify_assertion`] for the
-//!   checks. The assertion's `jti` is recorded in the replay store
-//!   ([`crate::replay::ReplayCache`]) when [`Authenticated::commit`] runs, so an assertion
-//!   authenticates one request, across restarts when the store is a database file.
+//!   signed by one of the entry's keys. See [`Clients::verify_assertion`] for the checks. The
+//!   assertion's `jti` is recorded in the replay store ([`crate::replay::ReplayCache`]) when
+//!   [`Authenticated::commit`] runs, so an assertion authenticates one request, across restarts
+//!   when the store is a database file.
 //!
 //! An entry may hold a secret, keys, or both; it can only be authenticated by what it holds.
 //! Sending a secret and an assertion together is `multiple_client_auth`.
+//!
+//! # Keys from a URL (`jwks_url`)
+//!
+//! An entry's keys are inline (`jwks`) or published by the client at `jwks_url`, never both,
+//! so one place says which keys are in force. Fetched keys pass the rules of inline ones
+//! ([`parse_client_jwk_set`]: a private member, a symmetric key or an oversized set refuses the
+//! whole document), except that a key the server does not use is skipped, and are checked the
+//! same way. They come through the cache and fetch rules of the `[[idps]]` keys
+//! ([`JwksCache`]): `https://` only (plain `http://` only to a loopback host), no redirects, a
+//! 256 KiB and 5 second bound, `ca_pem_path`, kept for `jwks_ttl_seconds`, fetched again at
+//! most once per 30 seconds on an unknown `kid`, and dropped when a refresh fails. Rules for
+//! clients only ([`FailurePolicy`]): after a failed fetch, the next starts only after
+//! [`CLIENT_JWKS_FAILURE_BACKOFF`]; a failed refetch for an unknown `kid` keeps the keys still
+//! within their TTL; and the cache logs each failed fetch once. Nothing is fetched at startup;
+//! a fetch is only ever for an id that is configured with `jwks_url`.
+//!
+//! Verification is synchronous (the AuthZEN endpoints and the exchange run on the blocking
+//! pool), so the keys are fetched first, on the async side, by [`Clients::fetch_key`], and the
+//! result is handed to [`Clients::authenticate_with`]. A client whose keys cannot be fetched
+//! gets the same answer as an unknown client (`client_authentication_failed`, SR-110); the
+//! cause is logged at warn level (`client JWKS unavailable`) once per failed fetch.
 
 use std::str::FromStr;
 use std::sync::{Arc, PoisonError, RwLock};
+use std::time::Duration;
 
 use axum::http::{header, HeaderMap, StatusCode};
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
@@ -36,6 +58,7 @@ pub(crate) use attenuo_token::client_assertion::CLIENT_ASSERTION_TYPE;
 
 use crate::config::{ActorAuth, AgentConfig, CLIENT_ASSERTION_ALGS};
 use crate::error::ApiError;
+use crate::idp::jwks::{FailurePolicy, JwksCache, JwksError};
 use crate::replay::{ReplayCache, ReplayRefusal};
 use crate::routes::admin::constant_time_eq;
 
@@ -212,6 +235,12 @@ pub struct Client {
     secret_sha256: Option<String>,
     /// The entry's `jwks`; empty when it has none.
     keys: Vec<ClientKey>,
+    /// The key cache of the entry's `jwks_url`, when it has one. Built anew by every check of
+    /// the lists, so an agents reload starts with no keys from before.
+    remote: Option<Arc<JwksCache<ClientKey>>>,
+    /// The SHA-256 (lowercase hex) of the entry's `ca_pem_path` file as it was read, for the
+    /// list digest and the changes of a reload.
+    ca_pem_sha256: Option<String>,
 }
 
 impl std::fmt::Debug for Client {
@@ -220,6 +249,7 @@ impl std::fmt::Debug for Client {
             .field("id", &self.id)
             .field("secret", &self.secret_sha256.is_some())
             .field("keys", &self.keys.len())
+            .field("jwks_url", &self.remote.is_some())
             .finish()
     }
 }
@@ -230,10 +260,92 @@ impl Client {
         self.secret_sha256.is_some()
     }
 
-    /// Whether the entry has keys for `private_key_jwt`.
+    /// Whether the entry has keys for `private_key_jwt`, inline or at a `jwks_url`.
     pub fn has_keys(&self) -> bool {
-        !self.keys.is_empty()
+        !self.keys.is_empty() || self.remote.is_some()
     }
+}
+
+/// How long the fetch of a client's `jwks_url` may take, as for the `[[idps]]` keys.
+const CLIENT_JWKS_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+/// Default `jwks_ttl_seconds` of an entry with `jwks_url`, as for `[[idps]]`.
+const DEFAULT_CLIENT_JWKS_TTL_SECONDS: u64 = 300;
+/// After a failed fetch of a client's `jwks_url`, how long until the next may start. Until
+/// then every assertion of that client is refused without a fetch, so a flood of assertions
+/// naming a client whose URL is down makes at most one fetch per this time.
+pub(crate) const CLIENT_JWKS_FAILURE_BACKOFF: Duration = Duration::from_secs(5);
+
+/// The key one client assertion is verified with, fetched by [`Clients::fetch_key`] before
+/// the (synchronous) check, for an entry with `jwks_url`. Empty for anything else.
+#[derive(Default)]
+pub(crate) struct FetchedKey(Option<Fetched>);
+
+struct Fetched {
+    /// The entry the assertion's `sub` named.
+    client: String,
+    /// That entry's cache, so that a key fetched for another list is never used.
+    cache: Arc<JwksCache<ClientKey>>,
+    outcome: Result<ClientKey, Unverified>,
+}
+
+impl FetchedKey {
+    /// No key fetched: for a request without an assertion, or lists without `jwks_url`.
+    pub(crate) fn none() -> Self {
+        Self(None)
+    }
+
+    /// The outcome fetched for `client`, whose cache is `cache`.
+    fn for_client(
+        &self,
+        client: &str,
+        cache: &Arc<JwksCache<ClientKey>>,
+    ) -> Option<&Result<ClientKey, Unverified>> {
+        self.0
+            .as_ref()
+            .filter(|f| f.client == client && Arc::ptr_eq(&f.cache, cache))
+            .map(|f| &f.outcome)
+    }
+}
+
+/// The key of `keys` an assertion with header `kid` and `alg` is checked with, the same for
+/// inline and fetched keys: the key the `kid` names, or without a `kid` the set's only key;
+/// it must be a key of `alg`. `Ok(None)`: the `kid` names none of the keys (for fetched keys,
+/// worth one refetch).
+fn pick_key<'a>(
+    keys: &'a [ClientKey],
+    kid: Option<&str>,
+    alg: Algorithm,
+) -> Result<Option<&'a ClientKey>, Unverified> {
+    let key = match kid {
+        None => match keys {
+            [only] => only,
+            _ => return Err(Unverified::UnknownKid),
+        },
+        Some(kid) => match keys.iter().find(|k| k.kid.as_deref() == Some(kid)) {
+            Some(k) => k,
+            None => return Ok(None),
+        },
+    };
+    if key.alg != alg {
+        return Err(Unverified::KeyAlgMismatch);
+    }
+    Ok(Some(key))
+}
+
+/// The keys of a fetched client JWK Set: [`parse_client_jwk_set`] with `skip_foreign`, so a
+/// key the server cannot use is left out instead of refusing the set.
+fn parse_fetched_client_jwks(doc: &Value, label: &str) -> Result<Vec<ClientKey>, String> {
+    parse_client_jwk_set(doc, Some(label))
+        .map_err(|e| format!("the client's key set is refused: {e}"))
+}
+
+/// What an assertion's header and payload say before any key is looked up, once the checks
+/// that do not depend on the client have passed (steps 1 to 3 of
+/// [`Clients::verify_assertion`]).
+struct Unverifiable<'a> {
+    sub: &'a str,
+    alg: Algorithm,
+    kid: Option<&'a str>,
 }
 
 /// What a client assertion must satisfy beyond its signature: the server's issuer identifier
@@ -307,7 +419,8 @@ impl Clients {
     }
 
     /// Validate a list at startup: ids non-empty and unique; at least one of
-    /// `secret_sha256` (64 hex characters) and `jwks` (see [`parse_client_jwks`]).
+    /// `secret_sha256` (64 hex characters) and keys, either `jwks` (see
+    /// [`parse_client_jwks`]) or `jwks_url` (see [`remote_keys`]), not both.
     pub(crate) fn from_config(
         kind: ClientKind,
         entries: &[AgentConfig],
@@ -315,6 +428,9 @@ impl Clients {
     ) -> anyhow::Result<Self> {
         let section = kind.section();
         let mut list: Vec<Client> = Vec::with_capacity(entries.len());
+        // One HTTP client for every entry with `jwks_url` and no `ca_pem_path`, made only
+        // when there is one.
+        let mut shared_client: Option<reqwest::Client> = None;
         for a in entries {
             if a.id.is_empty() {
                 anyhow::bail!("{section}: id must not be empty");
@@ -340,9 +456,14 @@ impl Clients {
                 Some(text) => parse_client_jwks(text)
                     .map_err(|e| anyhow::anyhow!("{section} `{}`: jwks: {e}", a.id))?,
             };
-            if secret_sha256.is_none() && keys.is_empty() {
+            let (remote, ca_pem_sha256) = match remote_keys(section, a, &mut shared_client)? {
+                Some((cache, ca)) => (Some(Arc::new(cache)), ca),
+                None => (None, None),
+            };
+            if secret_sha256.is_none() && keys.is_empty() && remote.is_none() {
                 anyhow::bail!(
-                    "{section} `{}`: set secret_sha256, jwks (private_key_jwt), or both",
+                    "{section} `{}`: set secret_sha256, jwks or jwks_url (private_key_jwt), or a \
+                     secret and keys",
                     a.id
                 );
             }
@@ -350,6 +471,8 @@ impl Clients {
                 id: a.id.clone(),
                 secret_sha256,
                 keys,
+                remote,
+                ca_pem_sha256,
             });
         }
         let decoys = parse_client_jwks(DECOY_JWKS)
@@ -381,6 +504,71 @@ impl Clients {
         self.list.iter().find(|c| c.id == id)
     }
 
+    /// The SHA-256 of the `ca_pem_path` file of entry `id`, as it was read when the list was
+    /// built.
+    fn ca_pem_sha256(&self, id: &str) -> Option<&str> {
+        self.find(id).and_then(|c| c.ca_pem_sha256.as_deref())
+    }
+
+    /// Whether an entry takes its keys from a `jwks_url`, so that an assertion needs
+    /// [`fetch_key`](Self::fetch_key) first. Without one, `fetch_key` does nothing.
+    pub(crate) fn fetches_keys(&self) -> bool {
+        self.list.iter().any(|c| c.remote.is_some())
+    }
+
+    /// Fetch, on the async side, the key `assertion` will be checked with, when its `sub`
+    /// names an entry with `jwks_url`; hand the result to
+    /// [`authenticate_with`](Self::authenticate_with). Nothing is fetched for an assertion
+    /// that fails a check made before the client lookup, nor for an id that is not configured
+    /// with `jwks_url`, and nothing here refuses the request: the check does, at its usual
+    /// step.
+    pub(crate) async fn fetch_key(&self, assertion: Option<&str>) -> FetchedKey {
+        let Some(assertion) = assertion.filter(|_| self.fetches_keys()) else {
+            return FetchedKey::none();
+        };
+        let Ok((header, payload)) = peek(assertion) else {
+            return FetchedKey::none();
+        };
+        let Ok(Unverifiable { sub, alg, kid }) = unverifiable(&header, &payload, None) else {
+            return FetchedKey::none();
+        };
+        let Some((client, cache)) = self
+            .find(sub)
+            .and_then(|c| c.remote.as_ref().map(|r| (c, r)))
+        else {
+            return FetchedKey::none();
+        };
+        let found = cache
+            .find(kid, |keys| match pick_key(keys, kid, alg) {
+                Ok(None) => Ok(None),
+                Ok(Some(k)) => Ok(Some(Ok(k.clone()))),
+                Err(why) => Ok(Some(Err(why))),
+            })
+            .await;
+        let outcome = match found {
+            Ok(picked) => picked,
+            Err(JwksError::Unavailable(detail)) => {
+                // The cache logged the failed fetch at warn level, once; a request answered
+                // with it, or with the stored failure during the backoff, is logged here at
+                // debug level only. The detail names the URL: logged, never answered (SR-17).
+                tracing::debug!(
+                    client = ?client.id,
+                    list = self.kind.section(),
+                    detail = ?detail,
+                    "client JWKS unavailable; assertion refused"
+                );
+                Err(Unverified::KeysUnavailable)
+            }
+            Err(JwksError::AlgMismatch { .. }) => Err(Unverified::KeyAlgMismatch),
+            Err(JwksError::UnknownKid | JwksError::MissingKid) => Err(Unverified::UnknownKid),
+        };
+        FetchedKey(Some(Fetched {
+            client: client.id.clone(),
+            cache: Arc::clone(cache),
+            outcome,
+        }))
+    }
+
     /// Verify `assertion` against the decoy key of `alg` and throw the outcome away: the work
     /// a refusal without a key of the client to verify with does instead (SR-110).
     fn decoy_verify(&self, alg: Algorithm, assertion: &str) {
@@ -410,6 +598,28 @@ impl Clients {
         assertion: Option<&str>,
         now: OffsetDateTime,
     ) -> Result<Authenticated, ApiError> {
+        self.authenticate_with(
+            headers,
+            body_id,
+            body_secret,
+            assertion,
+            &FetchedKey::none(),
+            now,
+        )
+    }
+
+    /// [`authenticate`](Self::authenticate) with the key [`fetch_key`](Self::fetch_key)
+    /// fetched for `assertion`. Without it, an assertion of an entry with `jwks_url` is
+    /// refused.
+    pub(crate) fn authenticate_with(
+        &self,
+        headers: &HeaderMap,
+        body_id: Option<&str>,
+        body_secret: Option<&str>,
+        assertion: Option<&str>,
+        fetched: &FetchedKey,
+        now: OffsetDateTime,
+    ) -> Result<Authenticated, ApiError> {
         let kind = self.kind;
         let (id_field, secret_field) = kind.fields();
         let basic = basic_credentials(headers)?;
@@ -426,7 +636,7 @@ impl Clients {
                     format!("no {} are configured", kind.section()),
                 ));
             }
-            let v = self.verify_assertion(assertion, body_id, now)?;
+            let v = self.verify_assertion(assertion, body_id, fetched, now)?;
             return Ok(Authenticated {
                 id: v.client,
                 method: ClientMethod::PrivateKeyJwt,
@@ -505,7 +715,9 @@ impl Clients {
     ///    present, is a string. These are server-wide, checked before the client is looked up.
     /// 4. `sub` names an entry with keys; the key is the one with the header's `kid`, or the
     ///    entry's only key when there is no `kid`; the key is for that `alg`; and the
-    ///    signature verifies with it. Every failure of this step is the same answer,
+    ///    signature verifies with it. For an entry with `jwks_url` the key is the one `fetched`
+    ///    holds ([`Clients::fetch_key`]), chosen by the same rule from the fetched set; a set
+    ///    that could not be fetched is a failure of this step too. Every failure of this step is the same answer,
     ///    `client_authentication_failed` as for a wrong secret, with the same `detail`, so a
     ///    caller that holds no key of the client cannot tell an unknown id, an id without
     ///    keys, an unknown `kid` or a key of another algorithm from a bad signature (SR-110);
@@ -522,44 +734,11 @@ impl Clients {
         &self,
         assertion: &str,
         body_id: Option<&str>,
+        fetched: &FetchedKey,
         now: OffsetDateTime,
     ) -> Result<VerifiedAssertion, AssertionError> {
         let (header, payload) = peek(assertion)?;
-        if let Some(typ) = header.get("typ").and_then(Value::as_str) {
-            if FOREIGN_TYPS.iter().any(|t| crate::idp::typ_is(typ, t)) {
-                return Err(AssertionError::Malformed("typ names another kind of token"));
-            }
-        }
-        let str_claim = |name: &str| {
-            payload
-                .get(name)
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-        };
-        let (Some(iss), Some(sub)) = (str_claim("iss"), str_claim("sub")) else {
-            return Err(AssertionError::SubjectMismatch("iss and sub are required"));
-        };
-        if iss != sub {
-            return Err(AssertionError::SubjectMismatch("iss and sub differ"));
-        }
-        if body_id.is_some_and(|id| id != sub) {
-            return Err(AssertionError::SubjectMismatch(
-                "the request's client id is not the assertion's sub",
-            ));
-        }
-        // Checks that do not depend on the client come before the lookup, so that their
-        // specific codes cannot tell which ids exist (SR-110). The algorithms are server-wide.
-        let alg = header
-            .get("alg")
-            .and_then(Value::as_str)
-            .and_then(|a| Algorithm::from_str(a).ok())
-            .filter(|a| allowed_alg(*a))
-            .ok_or(AssertionError::UnsupportedAlg)?;
-        let kid = match header.get("kid") {
-            None | Some(Value::Null) => None,
-            Some(Value::String(kid)) => Some(kid.as_str()),
-            Some(_) => return Err(AssertionError::Malformed("kid is not a string")),
-        };
+        let Unverifiable { sub, alg, kid } = unverifiable(&header, &payload, body_id)?;
 
         // From here until the signature has verified, every refusal is the same answer
         // (`client_authentication_failed`, as for a wrong secret), and one that has no key of
@@ -577,19 +756,25 @@ impl Clients {
         if !client.has_keys() {
             return Err(refuse(Unverified::NoKeys));
         }
-        let key = match kid {
-            None => match client.keys.as_slice() {
-                [only] => only,
-                _ => return Err(refuse(Unverified::UnknownKid)),
+        let key = match &client.remote {
+            None => match pick_key(&client.keys, kid, alg) {
+                Ok(Some(k)) => k,
+                Ok(None) => return Err(refuse(Unverified::UnknownKid)),
+                Err(why) => return Err(refuse(why)),
             },
-            Some(kid) => match client.keys.iter().find(|k| k.kid.as_deref() == Some(kid)) {
-                Some(k) => k,
-                None => return Err(refuse(Unverified::UnknownKid)),
+            Some(cache) => match fetched.for_client(&client.id, cache) {
+                Some(Ok(k)) => k,
+                Some(Err(why)) => return Err(refuse(*why)),
+                None => {
+                    // A caller that did not run `fetch_key` first: fail closed.
+                    tracing::warn!(
+                        client = ?client.id,
+                        "client assertion checked without fetching the client's keys"
+                    );
+                    return Err(refuse(Unverified::KeysUnavailable));
+                }
             },
         };
-        if key.alg != alg {
-            return Err(refuse(Unverified::KeyAlgMismatch));
-        }
 
         let claims = jsonwebtoken::decode::<Map<String, Value>>(
             assertion,
@@ -648,6 +833,69 @@ impl Clients {
     }
 }
 
+/// The key cache of an entry with `jwks_url`, checked as the `[[idps]]` key URLs are: the
+/// URL is `https://` (plain `http://` only to a loopback host), `jwks_ttl_seconds` is
+/// positive, and `ca_pem_path` names a readable PEM file of CA certificates. `jwks_url` and
+/// `jwks` together are refused, and so are `jwks_ttl_seconds` and `ca_pem_path` without
+/// `jwks_url`. Nothing is fetched here. `shared` is the HTTP client of the entries without
+/// `ca_pem_path`, made on first need. Returns the cache and the SHA-256 of the `ca_pem_path`
+/// file as it was read.
+fn remote_keys(
+    section: &str,
+    a: &AgentConfig,
+    shared: &mut Option<reqwest::Client>,
+) -> anyhow::Result<Option<(JwksCache<ClientKey>, Option<String>)>> {
+    let fail = |msg: String| anyhow::anyhow!("{section} `{}`: {msg}", a.id);
+    let Some(url) = &a.jwks_url else {
+        if a.jwks_ttl_seconds.is_some() || a.ca_pem_path.is_some() {
+            return Err(fail(
+                "jwks_ttl_seconds and ca_pem_path are only for keys fetched from jwks_url".into(),
+            ));
+        }
+        return Ok(None);
+    };
+    if a.jwks.is_some() {
+        return Err(fail(
+            "set jwks or jwks_url, not both: an entry takes its keys from one place, so that \
+             it is clear which keys are in force"
+                .into(),
+        ));
+    }
+    crate::idp::jwks::check_fetch_url(url).map_err(|e| fail(format!("jwks_url {url:?}: {e}")))?;
+    let ttl = a
+        .jwks_ttl_seconds
+        .unwrap_or(DEFAULT_CLIENT_JWKS_TTL_SECONDS);
+    if ttl == 0 {
+        return Err(fail("jwks_ttl_seconds must be positive".into()));
+    }
+    let shared = match shared {
+        Some(c) => c,
+        None => shared.insert(crate::idp::jwks::fetch_client(
+            CLIENT_JWKS_FETCH_TIMEOUT,
+            &[],
+        )?),
+    };
+    let (client, ca_pem_sha256) = crate::idp::jwks::entry_client_and_ca_digest(
+        shared,
+        a.ca_pem_path.as_deref(),
+        CLIENT_JWKS_FETCH_TIMEOUT,
+    )
+    .map_err(fail)?;
+    let cache = JwksCache::with_parser(
+        client,
+        format!("{section} `{}`", shown(&a.id)),
+        Some(url.clone()),
+        Duration::from_secs(ttl),
+        FailurePolicy {
+            backoff: CLIENT_JWKS_FAILURE_BACKOFF,
+            keep_fresh_keys: true,
+            warn: true,
+        },
+        parse_fetched_client_jwks,
+    );
+    Ok(Some((cache, ca_pem_sha256)))
+}
+
 /// The `[[agents]]` and `[[peps]]` in force, validated, with the entries they were built from
 /// (so that a reload can tell what it changed). Built at startup and by
 /// `POST /admin/agents/reload`, both through [`ClientRules::check`]; the set in force is a
@@ -680,7 +928,8 @@ pub struct ClientChanges {
     pub added: Vec<String>,
     /// Ids in the old list and not in the new one: their credentials stop working.
     pub removed: Vec<String>,
-    /// Ids in both whose `secret_sha256` or `jwks` differs.
+    /// Ids in both whose `secret_sha256`, `jwks`, `jwks_url`, `jwks_ttl_seconds` or
+    /// `ca_pem_path` differs, or whose `ca_pem_path` file holds other bytes.
     pub changed: Vec<String>,
 }
 
@@ -693,15 +942,26 @@ impl ClientSets {
     /// What changed from `self` to `new`: `(agents, peps)`.
     pub fn changes_to(&self, new: &Self) -> (ClientChanges, ClientChanges) {
         (
-            entry_changes(&self.agent_entries, &new.agent_entries),
-            entry_changes(&self.pep_entries, &new.pep_entries),
+            entry_changes(
+                (&self.agent_entries, &self.agents),
+                (&new.agent_entries, &new.agents),
+            ),
+            entry_changes(
+                (&self.pep_entries, &self.peps),
+                (&new.pep_entries, &new.peps),
+            ),
         )
     }
 }
 
-/// The changes from `old` to `new`, each list sorted. A digest is compared without regard to
-/// case and a `jwks` as JSON, so rewriting the same value differently is not a change.
-fn entry_changes(old: &[AgentConfig], new: &[AgentConfig]) -> ClientChanges {
+/// The changes from `old` to `new` (each the entries and the list built from them), each list
+/// sorted. A digest is compared without regard to case and a `jwks` as JSON, so rewriting the
+/// same value differently is not a change. The settings of a `jwks_url` are compared as
+/// [`remote_row`] gives them, so a new content of the `ca_pem_path` file is a change.
+fn entry_changes(
+    (old, old_built): (&[AgentConfig], &Clients),
+    (new, new_built): (&[AgentConfig], &Clients),
+) -> ClientChanges {
     let digest = |a: &AgentConfig| a.secret_sha256.as_deref().map(str::to_ascii_lowercase);
     let keys = |a: &AgentConfig| {
         a.jwks
@@ -712,7 +972,11 @@ fn entry_changes(old: &[AgentConfig], new: &[AgentConfig]) -> ClientChanges {
     for n in new {
         match old.iter().find(|o| o.id == n.id) {
             None => out.added.push(n.id.clone()),
-            Some(o) if digest(o) != digest(n) || keys(o) != keys(n) => {
+            Some(o)
+                if digest(o) != digest(n)
+                    || keys(o) != keys(n)
+                    || remote_row(o, old_built) != remote_row(n, new_built) =>
+            {
                 out.changed.push(n.id.clone());
             }
             Some(_) => {}
@@ -814,8 +1078,8 @@ impl ClientRules {
         }
         if self.actor_auth == ActorAuth::ActorToken && agent_list.iter().any(Client::has_keys) {
             warnings.push(
-                "[[agents]] entries have jwks but [token] actor_auth = \"actor_token\": client \
-                 assertions, like client secrets, are refused"
+                "[[agents]] entries have keys (jwks or jwks_url) but [token] actor_auth = \
+                 \"actor_token\": client assertions, like client secrets, are refused"
                     .into(),
             );
         }
@@ -838,8 +1102,8 @@ impl ClientRules {
                     .into(),
             );
         }
-        let agents_sha256 = list_sha256(agents);
-        let peps_sha256 = list_sha256(peps);
+        let agents_sha256 = list_sha256(agents, &agent_list);
+        let peps_sha256 = list_sha256(peps, &pep_list);
         Ok((
             ClientSets {
                 agents: agent_list,
@@ -890,10 +1154,15 @@ impl ClientRules {
 /// The SHA-256 (lowercase hex) of a list's canonical form: the compact JSON array of
 /// `[id, secret_sha256, thumbprints]` per entry, sorted by id, where `secret_sha256` is the
 /// lowercase digest or `null` and `thumbprints` the sorted RFC 7638 SHA-256 thumbprints
-/// (base64url) of the entry's `jwks` keys. Recorded in the reload's audit record, so that a
+/// (base64url) of the entry's `jwks` keys. An entry with `jwks_url` has four more members,
+/// [`remote_row`]: `[id, secret_sha256, [], jwks_url, jwks_ttl_seconds, ca_pem_path,
+/// ca_pem_sha256]`; an entry without one keeps three, so a list without `jwks_url` has the
+/// digest it had before the setting existed. The keys at a URL are not in it: they change
+/// without a reload. `built` is the list as built from `entries`, which holds the digest of
+/// each `ca_pem_path` file as it was read. Recorded in the reload's audit record, so that a
 /// config file can be shown to hold the lists that were put in force; no secret or key
 /// material goes into it beyond digests and thumbprints.
-pub(crate) fn list_sha256(entries: &[AgentConfig]) -> String {
+pub(crate) fn list_sha256(entries: &[AgentConfig], built: &Clients) -> String {
     let mut rows: Vec<Value> = entries
         .iter()
         .map(|a| {
@@ -907,17 +1176,40 @@ pub(crate) fn list_sha256(entries: &[AgentConfig]) -> String {
                 .map(jwk_thumbprint)
                 .collect();
             thumbprints.sort();
-            Value::Array(vec![
+            let mut row = vec![
                 Value::from(a.id.clone()),
                 a.secret_sha256
                     .as_deref()
                     .map_or(Value::Null, |d| Value::from(d.to_ascii_lowercase())),
                 Value::from(thumbprints),
-            ])
+            ];
+            row.extend(remote_row(a, built).into_iter().flatten());
+            Value::Array(row)
         })
         .collect();
     rows.sort_by(|x, y| x[0].as_str().cmp(&y[0].as_str()));
     hex::encode(Sha256::digest(Value::Array(rows).to_string().as_bytes()))
+}
+
+/// The settings of an entry's `jwks_url`, `None` without one: `[jwks_url, jwks_ttl_seconds,
+/// ca_pem_path, ca_pem_sha256]`, with the URL and the path as written, the TTL in force (the
+/// default when unset) and the lowercase hex SHA-256 of the CA file's bytes as `built` read
+/// them; the path and its digest are `null` without `ca_pem_path`.
+fn remote_row(a: &AgentConfig, built: &Clients) -> Option<[Value; 4]> {
+    let url = a.jwks_url.as_ref()?;
+    Some([
+        Value::from(url.clone()),
+        Value::from(
+            a.jwks_ttl_seconds
+                .unwrap_or(DEFAULT_CLIENT_JWKS_TTL_SECONDS),
+        ),
+        a.ca_pem_path
+            .as_ref()
+            .map_or(Value::Null, |p| Value::from(p.display().to_string())),
+        built
+            .ca_pem_sha256(&a.id)
+            .map_or(Value::Null, |d| Value::from(d.to_owned())),
+    ])
 }
 
 /// The RFC 7638 SHA-256 thumbprint (base64url) of a public JWK: the required members of its
@@ -1155,6 +1447,10 @@ pub(crate) enum Unverified {
     KeyAlgMismatch,
     /// The signature does not verify with the key.
     BadSignature,
+    /// The entry's keys are at a `jwks_url` that could not be fetched, or whose key set was
+    /// refused. Answered like the others, so it does not tell which ids exist (SR-110); the
+    /// cause is logged at warn level.
+    KeysUnavailable,
 }
 
 impl Unverified {
@@ -1166,6 +1462,7 @@ impl Unverified {
             Unverified::UnknownKid => "unknown_kid",
             Unverified::KeyAlgMismatch => "key_alg_mismatch",
             Unverified::BadSignature => "bad_signature",
+            Unverified::KeysUnavailable => "jwks_unavailable",
         }
     }
 }
@@ -1185,6 +1482,51 @@ impl From<AssertionError> for ApiError {
 }
 
 type JsonObject = Map<String, Value>;
+
+/// Steps 1 (after the decoding) to 3 of [`Clients::verify_assertion`]: the checks that do not
+/// depend on the client. They come before the lookup, so that their specific codes cannot
+/// tell which ids exist (SR-110).
+fn unverifiable<'a>(
+    header: &'a JsonObject,
+    payload: &'a JsonObject,
+    body_id: Option<&str>,
+) -> Result<Unverifiable<'a>, AssertionError> {
+    if let Some(typ) = header.get("typ").and_then(Value::as_str) {
+        if FOREIGN_TYPS.iter().any(|t| crate::idp::typ_is(typ, t)) {
+            return Err(AssertionError::Malformed("typ names another kind of token"));
+        }
+    }
+    let str_claim = |name: &str| {
+        payload
+            .get(name)
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+    };
+    let (Some(iss), Some(sub)) = (str_claim("iss"), str_claim("sub")) else {
+        return Err(AssertionError::SubjectMismatch("iss and sub are required"));
+    };
+    if iss != sub {
+        return Err(AssertionError::SubjectMismatch("iss and sub differ"));
+    }
+    if body_id.is_some_and(|id| id != sub) {
+        return Err(AssertionError::SubjectMismatch(
+            "the request's client id is not the assertion's sub",
+        ));
+    }
+    // The algorithms are server-wide.
+    let alg = header
+        .get("alg")
+        .and_then(Value::as_str)
+        .and_then(|a| Algorithm::from_str(a).ok())
+        .filter(|a| allowed_alg(*a))
+        .ok_or(AssertionError::UnsupportedAlg)?;
+    let kid = match header.get("kid") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(kid)) => Some(kid.as_str()),
+        Some(_) => return Err(AssertionError::Malformed("kid is not a string")),
+    };
+    Ok(Unverifiable { sub, alg, kid })
+}
 
 /// Decode header and payload without verifying anything.
 fn peek(token: &str) -> Result<(JsonObject, JsonObject), AssertionError> {
@@ -1217,6 +1559,18 @@ fn peek(token: &str) -> Result<(JsonObject, JsonObject), AssertionError> {
 /// listed twice, and a key without `kid` in a set of several.
 fn parse_client_jwks(text: &str) -> Result<Vec<ClientKey>, String> {
     let doc: Value = serde_json::from_str(text).map_err(|e| format!("not JSON ({e})"))?;
+    parse_client_jwk_set(&doc, None)
+}
+
+/// [`parse_client_jwks`] of a parsed document. `fetched` is the label of the cache of a key
+/// set fetched from a `jwks_url`, which is held to the same rules but for one thing: a key the
+/// server does not use (`use` other than `sig`, such as `enc`; a key type, curve or `alg`
+/// outside [`CLIENT_ASSERTION_ALGS`]; an RSA modulus under 2048 bits) is skipped, with one
+/// info line naming its `kid` and the reason, never the key. A set published for several
+/// consumers may hold such keys. Still refused whole: a private or symmetric member, a member
+/// that is not a JWK, more than [`MAX_CLIENT_KEYS`] keys, a `kid` listed twice among the keys
+/// kept, and a set with no key left.
+fn parse_client_jwk_set(doc: &Value, fetched: Option<&str>) -> Result<Vec<ClientKey>, String> {
     let keys = doc
         .get("keys")
         .and_then(Value::as_array)
@@ -1228,6 +1582,22 @@ fn parse_client_jwks(text: &str) -> Result<Vec<ClientKey>, String> {
         return Err(format!("at most {MAX_CLIENT_KEYS} keys"));
     }
     let mut out: Vec<ClientKey> = Vec::with_capacity(keys.len());
+    // A key the server does not use: refused in an inline `jwks`, skipped in a fetched set.
+    let foreign = |label: &str, kid: Option<&str>, why: String| -> Result<(), String> {
+        match fetched {
+            None => Err(format!("{label}{why}")),
+            Some(cache) => {
+                // Debug-formatted: the kid and the key type are the key host's text.
+                tracing::info!(
+                    client = %cache,
+                    kid = ?kid,
+                    reason = ?why.trim_start_matches([':', ' ']),
+                    "skipping a key of the fetched client key set"
+                );
+                Ok(())
+            }
+        }
+    };
     for (i, raw) in keys.iter().enumerate() {
         let obj = raw
             .as_object()
@@ -1254,14 +1624,38 @@ fn parse_client_jwks(text: &str) -> Result<Vec<ClientKey>, String> {
         {
             return Err(format!("{label}: kid must be a non-empty string"));
         }
+        let kid = obj.get("kid").and_then(Value::as_str);
+        let kty = obj.get("kty").and_then(Value::as_str);
+        if fetched.is_some() && kty.is_some_and(|t| !matches!(t, "RSA" | "EC" | "OKP")) {
+            foreign(
+                &label,
+                kid,
+                format!(
+                    " has the key type `{}`, which is not accepted",
+                    kty.unwrap_or_default()
+                ),
+            )?;
+            continue;
+        }
         let jwk: Jwk = serde_json::from_value(raw.clone())
             .map_err(|e| format!("{label} is not a JWK ({e})"))?;
-        if let Some(u) = obj.get("use") {
-            if u.as_str() != Some("sig") {
-                return Err(format!("{label}: use must be `sig`"));
+        match obj.get("use") {
+            None => {}
+            Some(Value::String(u)) if u == "sig" => {}
+            Some(Value::String(_)) => {
+                foreign(&label, kid, ": use must be `sig`".into())?;
+                continue;
             }
+            Some(_) => return Err(format!("{label}: use must be a string")),
         }
-        let alg = key_alg(obj, &jwk).map_err(|e| format!("{label}: {e}"))?;
+        let alg = match key_alg(obj, &jwk) {
+            Ok(alg) => alg,
+            Err(KeyProblem::Foreign(e)) => {
+                foreign(&label, kid, format!(": {e}"))?;
+                continue;
+            }
+            Err(KeyProblem::Malformed(e)) => return Err(format!("{label}: {e}")),
+        };
         let key =
             DecodingKey::from_jwk(&jwk).map_err(|e| format!("{label} is not usable ({e})"))?;
         let kid = jwk.common.key_id.clone();
@@ -1272,23 +1666,39 @@ fn parse_client_jwks(text: &str) -> Result<Vec<ClientKey>, String> {
         }
         out.push(ClientKey { kid, alg, key });
     }
+    if out.is_empty() {
+        return Err(format!(
+            "no key of the set is usable: the server accepts public keys of \
+             {CLIENT_ASSERTION_ALGS:?}, with use `sig` or no use"
+        ));
+    }
     if out.len() > 1 && out.iter().any(|k| k.kid.is_none()) {
         return Err("with more than one key, every key needs a kid".into());
     }
     Ok(out)
 }
 
+/// Why a JWK cannot be a client key.
+enum KeyProblem {
+    /// A key the server does not use: a type, curve, `alg` or size it does not accept.
+    Foreign(String),
+    /// A member that is not what a JWK holds.
+    Malformed(String),
+}
+
 /// The one algorithm a client key verifies: from its type and curve, which its `alg`, when
 /// present, must agree with.
-fn key_alg(obj: &Map<String, Value>, jwk: &Jwk) -> Result<Algorithm, String> {
+fn key_alg(obj: &Map<String, Value>, jwk: &Jwk) -> Result<Algorithm, KeyProblem> {
     let by_type = match &jwk.algorithm {
         AlgorithmParameters::RSA(rsa) => {
             let n = URL_SAFE_NO_PAD
                 .decode(&rsa.n)
-                .map_err(|_| "RSA n is not base64url".to_string())?;
+                .map_err(|_| KeyProblem::Malformed("RSA n is not base64url".into()))?;
             let len = n.iter().skip_while(|b| **b == 0).count();
             if len < MIN_RSA_MODULUS_BYTES {
-                return Err("RSA keys must be at least 2048 bits".into());
+                return Err(KeyProblem::Foreign(
+                    "RSA keys must be at least 2048 bits".into(),
+                ));
             }
             Algorithm::RS256
         }
@@ -1299,20 +1709,20 @@ fn key_alg(obj: &Map<String, Value>, jwk: &Jwk) -> Result<Algorithm, String> {
             Algorithm::EdDSA
         }
         _ => {
-            return Err(format!(
+            return Err(KeyProblem::Foreign(format!(
                 "unsupported key type or curve; accepted: RSA (RS256), EC P-256 (ES256), OKP \
                  Ed25519 (EdDSA), the server's algorithms {CLIENT_ASSERTION_ALGS:?}"
-            ))
+            )))
         }
     };
     match obj.get("alg") {
         None => Ok(by_type),
         Some(Value::String(a)) if Algorithm::from_str(a).is_ok_and(|x| x == by_type) => Ok(by_type),
-        Some(Value::String(a)) => Err(format!(
+        Some(Value::String(a)) => Err(KeyProblem::Foreign(format!(
             "alg `{a}` is not accepted for this key; the server accepts {CLIENT_ASSERTION_ALGS:?}, \
              each with its own key type"
-        )),
-        Some(_) => Err("alg must be a string".into()),
+        ))),
+        Some(_) => Err(KeyProblem::Malformed("alg must be a string".into())),
     }
 }
 
@@ -1499,6 +1909,215 @@ mod tests {
         assert!(parse_err(json!({ "keys": many })).contains("at most"));
     }
 
+    /// A fetched set leaves out the keys the server does not use, where an inline `jwks`
+    /// refuses them (above), and is still refused whole for anything else.
+    #[test]
+    fn a_fetched_set_skips_keys_the_server_does_not_use() {
+        let fetched = |doc: Value| parse_fetched_client_jwks(&doc, "[[agents]] `coder`");
+        let good = public(&ed_key(), Some("good"));
+        let mut enc = public(&ed_key(), Some("enc"));
+        enc["use"] = "enc".into();
+        let p384 = json!({"kty": "EC", "crv": "P-384", "kid": "p384", "x": "AA", "y": "AA"});
+        let mut ps = rsa_jwk("ps", 256);
+        ps["alg"] = "PS256".into();
+        let small = rsa_jwk("small", 128);
+        let other_type = json!({"kty": "AKP", "kid": "pq", "alg": "ML-DSA-44", "pub": "AA"});
+        // The same kid as a kept key, on a key that is skipped: not a duplicate.
+        let mut enc_twin = public(&ed_key(), Some("good"));
+        enc_twin["use"] = "enc".into();
+        let keys = fetched(json!({"keys": [
+            enc.clone(), p384, ps, small.clone(), other_type, good.clone(), enc_twin
+        ]}))
+        .unwrap();
+        let kids: Vec<_> = keys.iter().map(|k| k.kid.as_deref()).collect();
+        assert_eq!(kids, [Some("good")]);
+        // Inline, each of those is still a refusal.
+        assert!(parse_err(json!({"keys": [good.clone(), enc.clone()]})).contains("use must be"));
+        assert!(parse_err(json!({"keys": [good.clone(), small.clone()]})).contains("2048"));
+
+        let refused = |doc: Value, why: &str| {
+            let e = match fetched(doc.clone()) {
+                Ok(_) => panic!("accepted {doc}"),
+                Err(e) => e,
+            };
+            assert!(e.contains(why), "{why}: {e}");
+        };
+        refused(json!({"keys": [enc, small]}), "no key of the set is usable");
+        let private = ed_key().private_jwk();
+        refused(
+            json!({"keys": [good.clone(), private]}),
+            "private key member",
+        );
+        refused(
+            json!({"keys": [good.clone(), {"kty": "oct", "kid": "h", "k": "c2VjcmV0"}]}),
+            "symmetric",
+        );
+        refused(
+            json!({"keys": [good.clone(), "a string"]}),
+            "not a JSON object",
+        );
+        refused(
+            json!({"keys": [good.clone(), {"kty": "RSA", "kid": "r"}]}),
+            "not a JWK",
+        );
+        let mut odd_use = public(&ed_key(), Some("odd"));
+        odd_use["use"] = json!(1);
+        refused(json!({"keys": [good.clone(), odd_use]}), "not a JWK");
+        refused(
+            json!({"keys": [good.clone(), public(&ed_key(), Some("good"))]}),
+            "listed twice",
+        );
+        let many: Vec<Value> = (0..=MAX_CLIENT_KEYS)
+            .map(|i| public(&ed_key(), Some(&format!("k{i}"))))
+            .collect();
+        refused(json!({ "keys": many }), "at most");
+        refused(json!({"keys": []}), "empty");
+        refused(json!({"nokeys": []}), "JWK Set");
+    }
+
+    /// `jwks_url` is checked as an `[[idps]] jwks_url` is, and is not combined with `jwks`.
+    #[test]
+    fn jwks_url_entries_are_checked() {
+        let url = |u: &str| AgentConfig::with_jwks_url("coder", u);
+        let refused = |a: AgentConfig| Clients::agents(&[a], policy()).unwrap_err().to_string();
+        for ok in [
+            "https://keys.example/jwks.json",
+            "http://127.0.0.1:9/jwks",
+            "http://localhost/jwks",
+        ] {
+            let c = Clients::agents(&[url(ok)], policy()).unwrap();
+            assert!(c.fetches_keys());
+            assert!(c.iter().next().unwrap().has_keys());
+        }
+        assert!(!Clients::agents(&[], policy()).unwrap().fetches_keys());
+        let e = refused(url("http://keys.example/jwks"));
+        assert!(
+            e.starts_with(
+                "[[agents]] `coder`: jwks_url \"http://keys.example/jwks\": must be https://"
+            ),
+            "{e}"
+        );
+        assert!(refused(url("ftp://keys.example/jwks")).contains("must be https://"));
+        let both = AgentConfig {
+            jwks: Some(jwks(&[public(&ed_key(), None)])),
+            ..url("https://keys.example/jwks")
+        };
+        let e = Clients::peps(&[both], policy()).unwrap_err().to_string();
+        assert!(
+            e.starts_with("[[peps]] `coder`: set jwks or jwks_url, not both"),
+            "{e}"
+        );
+        let zero = AgentConfig {
+            jwks_ttl_seconds: Some(0),
+            ..url("https://keys.example/jwks")
+        };
+        assert!(refused(zero).contains("jwks_ttl_seconds must be positive"));
+        let stray = AgentConfig {
+            jwks_ttl_seconds: Some(60),
+            ..AgentConfig::with_secret_sha256("coder", sha("s"))
+        };
+        assert!(refused(stray).contains("only for keys fetched from jwks_url"));
+        let stray = AgentConfig {
+            ca_pem_path: Some("/nonexistent.pem".into()),
+            ..AgentConfig::with_secret_sha256("coder", sha("s"))
+        };
+        assert!(refused(stray).contains("only for keys fetched from jwks_url"));
+        let missing = AgentConfig {
+            ca_pem_path: Some("/nonexistent/ca.pem".into()),
+            ..url("https://keys.example/jwks")
+        };
+        let e = refused(missing);
+        assert!(
+            e.contains("ca_pem_path \"/nonexistent/ca.pem\": cannot read"),
+            "{e}"
+        );
+    }
+
+    /// A row of the canonical form gets the `jwks_url` as a fourth member; a row without one
+    /// keeps three, so the digest of a list without `jwks_url` does not change. A change of the
+    /// URL (or its settings) is a change of the entry.
+    #[test]
+    fn the_list_digest_and_the_changes_cover_jwks_url() {
+        /// A self-signed CA certificate, as PEM.
+        fn ca_pem(name: &str) -> String {
+            let key = rcgen::KeyPair::generate().unwrap();
+            let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+            params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            params
+                .distinguished_name
+                .push(rcgen::DnType::CommonName, name);
+            params.self_signed(&key).unwrap().pem()
+        }
+        let built = |list: &[AgentConfig]| Clients::agents(list, policy()).unwrap();
+        let sha256 = |list: &[AgentConfig]| list_sha256(list, &built(list));
+        let changed = |old: &[AgentConfig], new: &[AgentConfig]| {
+            entry_changes((old, &built(old)), (new, &built(new))).changed
+        };
+        let a = AgentConfig::with_jwks_url("coder", "https://keys.example/a");
+        let b = AgentConfig::with_jwks_url("coder", "https://keys.example/b");
+        let s = AgentConfig::with_secret_sha256("planner", sha("p"));
+        let digest = |rows: Value| hex::encode(Sha256::digest(rows.to_string().as_bytes()));
+        assert_eq!(
+            sha256(&[s.clone(), a.clone()]),
+            digest(json!([
+                ["coder", null, [], "https://keys.example/a", 300, null, null],
+                ["planner", sha("p"), []]
+            ]))
+        );
+        // An entry without jwks_url keeps its three members.
+        assert_eq!(
+            sha256(std::slice::from_ref(&s)),
+            digest(json!([["planner", sha("p"), []]]))
+        );
+        let one = std::slice::from_ref(&a);
+        assert_ne!(sha256(one), sha256(std::slice::from_ref(&b)));
+        assert_eq!(changed(&[a.clone(), s.clone()], &[b, s.clone()]), ["coder"]);
+        // The TTL in force: written as the default, it is no change.
+        let ttl = |t: u64| AgentConfig {
+            jwks_ttl_seconds: Some(t),
+            ..a.clone()
+        };
+        assert_eq!(changed(one, &[ttl(60)]), ["coder"]);
+        assert_ne!(sha256(one), sha256(&[ttl(60)]));
+        assert_eq!(sha256(one), sha256(&[ttl(300)]));
+        assert!(changed(one, &[ttl(300)]).is_empty());
+        assert_eq!(
+            entry_changes((one, &built(one)), (one, &built(one))),
+            ClientChanges::default()
+        );
+        // ca_pem_path: the path and the content of the file.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ca.pem");
+        std::fs::write(&path, ca_pem("first")).unwrap();
+        let with_ca = AgentConfig {
+            ca_pem_path: Some(path.clone()),
+            ..a.clone()
+        };
+        let ca = std::slice::from_ref(&with_ca);
+        let before = built(ca);
+        let file_sha = hex::encode(Sha256::digest(std::fs::read(&path).unwrap()));
+        assert_eq!(
+            list_sha256(ca, &before),
+            digest(json!([[
+                "coder",
+                null,
+                [],
+                "https://keys.example/a",
+                300,
+                path.display().to_string(),
+                file_sha
+            ]]))
+        );
+        assert_eq!(changed(one, ca), ["coder"]);
+        std::fs::write(&path, ca_pem("second")).unwrap();
+        let after = built(ca);
+        assert_ne!(list_sha256(ca, &before), list_sha256(ca, &after));
+        assert_eq!(
+            entry_changes((ca, &before), (ca, &after)).changed,
+            ["coder"]
+        );
+    }
+
     #[test]
     fn entries_need_a_secret_or_keys() {
         let only_keys = AgentConfig::with_jwks("coder", jwks(&[public(&ed_key(), None)]));
@@ -1509,6 +2128,9 @@ mod tests {
             id: "coder".into(),
             secret_sha256: None,
             jwks: None,
+            jwks_url: None,
+            jwks_ttl_seconds: None,
+            ca_pem_path: None,
         };
         let e = Clients::agents(&[neither], policy())
             .unwrap_err()
@@ -1571,6 +2193,9 @@ mod tests {
                     id: "both".into(),
                     secret_sha256: Some(sha("b0th")),
                     jwks: Some(jwks(&[public(&both, Some("b"))])),
+                    jwks_url: None,
+                    jwks_ttl_seconds: None,
+                    ca_pem_path: None,
                 },
             ],
             policy(),
@@ -1602,13 +2227,13 @@ mod tests {
         a: &str,
         body_id: Option<&str>,
     ) -> Result<VerifiedAssertion, &'static str> {
-        c.verify_assertion(a, body_id, now())
+        c.verify_assertion(a, body_id, &FetchedKey::none(), now())
             .map_err(|e| e.description())
     }
 
     /// The logged reason of a refusal that is `client_authentication_failed` (SR-110).
     fn unverified(c: &Clients, a: &str) -> Unverified {
-        match c.verify_assertion(a, None, now()) {
+        match c.verify_assertion(a, None, &FetchedKey::none(), now()) {
             Err(AssertionError::NotAuthenticated(why)) => why,
             other => panic!("expected NotAuthenticated, got {other:?}"),
         }

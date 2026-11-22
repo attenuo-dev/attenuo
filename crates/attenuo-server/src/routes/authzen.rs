@@ -81,11 +81,68 @@ pub async fn evaluation(
 ) -> Result<Json<EvaluationResponse>, Response> {
     // Token checks, lease lookups and the audit append all touch SQLite; keep them off the
     // async workers.
+    in_two_steps(state, headers, body, evaluate_bearer, evaluate).await
+}
+
+/// The first step of an AuthZEN request: what it read, and the bearer, checked.
+type FirstStep<P> = fn(&AppState, &HeaderMap, &Bytes) -> Result<(P, Option<Bearer>), ApiError>;
+/// The second step: the PEP's authentication and the decision.
+type SecondStep<P, R> =
+    fn(&AppState, &HeaderMap, P, Option<Bearer>, &PepKeys) -> Result<R, ApiError>;
+
+/// Run an AuthZEN request on the blocking pool in two steps around the fetch of a PEP's
+/// `jwks_url` keys, which is async: `first` parses the request and checks the bearer; only
+/// once it has passed are the keys of the PEP the request's assertion names fetched
+/// ([`PepKeys::fetch`]), and `second` authenticates the PEP and decides. So a request with a
+/// bad bearer, or with none while `[authzen] allow_unsigned_chain` is off, makes no fetch.
+// The `Err` is a full response, built once per refused request; boxing it buys nothing.
+#[allow(clippy::result_large_err)]
+async fn in_two_steps<P, R>(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+    first: FirstStep<P>,
+    second: SecondStep<P, R>,
+) -> Result<Json<R>, Response>
+where
+    P: Send + 'static,
+    R: Send + 'static,
+{
+    let refused = |e: ApiError| with_challenge(e.into_response());
+    let (h, b) = (headers.clone(), body.clone());
+    let (prepared, bearer) = state
+        .blocking(move |s| first(s, &h, &b))
+        .await
+        .map_err(refused)?;
+    // Between the bearer check and the decision there can now be a key fetch (at most 5
+    // seconds). That is safe: the bearer's signature and expiry were checked in `first`, and
+    // the decision in `second` looks up the chain's leases and their expiry again, as of its
+    // own time (a lease never outlives its token).
+    let wanted = bearer.is_some() || state.authzen_allow_unsigned_chain;
+    let peps = PepKeys::fetch(&state, &body, wanted).await;
     state
-        .blocking(move |s| evaluate(s, &headers, &body))
+        .blocking(move |s| second(s, &headers, prepared, bearer, &peps))
         .await
         .map(Json)
-        .map_err(|e| with_challenge(e.into_response()))
+        .map_err(refused)
+}
+
+/// Without a bearer, only a PEP with an unsigned chain may call, under `[authzen]
+/// allow_unsigned_chain`: refused before the PEP's credentials are looked at otherwise. The
+/// refusal is the one [`admit`] gives.
+fn caller_may_authenticate(state: &AppState, bearer: Option<&Bearer>) -> Result<(), ApiError> {
+    if bearer.is_none() && !state.authzen_allow_unsigned_chain {
+        return Err(missing_bearer());
+    }
+    Ok(())
+}
+
+fn missing_bearer() -> ApiError {
+    ApiError::unauthorized(
+        REASON_MISSING_TOKEN,
+        "a delegation token is required: send `Authorization: Bearer <token>` \
+         ([authzen] allow_unsigned_chain is off)",
+    )
 }
 
 /// `POST /access/v1/evaluations`: the AuthZEN "boxcar" form. Top-level `subject`, `action`,
@@ -113,20 +170,27 @@ pub async fn evaluations(
     headers: HeaderMap,
     Body(body): Body,
 ) -> Result<Json<Value>, Response> {
-    state
-        .blocking(move |s| evaluate_batch(s, &headers, &body))
-        .await
-        .map(Json)
-        .map_err(|e| with_challenge(e.into_response()))
+    in_two_steps(state, headers, body, batch_bearer, evaluate_batch).await
+}
+
+/// What [`batch_bearer`] read from a batch request: the body without `evaluations` and
+/// `options`, the entries, and the semantic (`None` for a request without entries, which is a
+/// single evaluation).
+struct Batch {
+    raw: Value,
+    items: Vec<Value>,
+    semantic: Option<Semantic>,
 }
 
 /// Error code when a batch carries more evaluations than `[authzen] max_batch`.
 pub const BATCH_TOO_LARGE: &str = "batch_too_large";
 
-fn evaluate_batch(state: &AppState, headers: &HeaderMap, body: &Bytes) -> Result<Value, ApiError> {
-    // One snapshot of `[[peps]]` for the whole request: a reload during a batch does not admit
-    // the PEP for some entries and refuse it for others.
-    let clients = state.clients.snapshot();
+/// The first step of a batch: parse it, check its size and semantic, and check the bearer.
+fn batch_bearer(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> Result<(Batch, Option<Bearer>), ApiError> {
     let mut raw: Value = parse_json(body)?;
     let Some(obj) = raw.as_object_mut() else {
         return Err(ApiError::bad_request(
@@ -149,16 +213,14 @@ fn evaluate_batch(state: &AppState, headers: &HeaderMap, body: &Bytes) -> Result
         // as a single Access Evaluation request, and so does its answer.
         obj.remove("options");
         let bearer = bearer_auth(state, headers, "/access/v1/evaluations")?;
-        let pep = pep_assertion(state, &clients.peps, headers, &mut raw)?;
-        let r = evaluate_value(
-            state,
-            &clients.peps,
-            headers,
-            bearer.as_ref(),
-            pep.as_deref(),
-            raw,
-        )?;
-        return serde_json::to_value(r).map_err(ApiError::internal);
+        return Ok((
+            Batch {
+                raw,
+                items,
+                semantic: None,
+            },
+            bearer,
+        ));
     }
     // Refuse before any evaluation runs, so an oversized batch writes nothing to the audit log.
     if items.len() > state.authzen_max_batch {
@@ -174,9 +236,47 @@ fn evaluate_batch(state: &AppState, headers: &HeaderMap, body: &Bytes) -> Result
     let semantic = Semantic::from_options(obj.get("options"))?;
     obj.remove("options");
     let bearer = bearer_auth(state, headers, "/access/v1/evaluations")?;
+    Ok((
+        Batch {
+            raw,
+            items,
+            semantic: Some(semantic),
+        },
+        bearer,
+    ))
+}
+
+fn evaluate_batch(
+    state: &AppState,
+    headers: &HeaderMap,
+    batch: Batch,
+    bearer: Option<Bearer>,
+    peps: &PepKeys,
+) -> Result<Value, ApiError> {
+    // One snapshot of `[[peps]]` for the whole request: a reload during a batch does not admit
+    // the PEP for some entries and refuse it for others.
+    let clients = &peps.clients;
+    let Batch {
+        mut raw,
+        items,
+        semantic,
+    } = batch;
+    caller_may_authenticate(state, bearer.as_ref())?;
+    let Some(semantic) = semantic else {
+        let pep = pep_assertion(state, &clients.peps, &peps.fetched, headers, &mut raw)?;
+        let r = evaluate_value(
+            state,
+            &clients.peps,
+            headers,
+            bearer.as_ref(),
+            pep.as_deref(),
+            raw,
+        )?;
+        return serde_json::to_value(r).map_err(ApiError::internal);
+    };
     // A PEP's client assertion authenticates the whole request once, like the bearer: its
     // `jti` can be used only once, so the entries cannot each check it.
-    let pep = pep_assertion(state, &clients.peps, headers, &mut raw)?;
+    let pep = pep_assertion(state, &clients.peps, &peps.fetched, headers, &mut raw)?;
     let Some(obj) = raw.as_object_mut() else {
         return Err(ApiError::internal("request body is no longer an object"));
     };
@@ -297,11 +397,15 @@ pub async fn search_action(
     headers: HeaderMap,
     Body(body): Body,
 ) -> Result<Json<Value>, Response> {
-    state
-        .blocking(move |s| search_actions(s, &headers, &body))
-        .await
-        .map(Json)
-        .map_err(|e| with_challenge(e.into_response()))
+    in_two_steps(state, headers, body, search_bearer, search_actions).await
+}
+
+/// What [`search_bearer`] read from a search request: the body, with the server as its
+/// `action`, the page and the server.
+struct Search {
+    raw: Value,
+    page: SearchPage,
+    server: String,
 }
 
 /// The `page` of a search request: where to start in the candidate list (a token not yet
@@ -395,8 +499,12 @@ fn search_server(resource: Option<&Value>) -> Result<String, ApiError> {
     Ok(server.to_string())
 }
 
-fn search_actions(state: &AppState, headers: &HeaderMap, body: &Bytes) -> Result<Value, ApiError> {
-    let clients = state.clients.snapshot();
+/// The first step of a search: parse it, read its page and server, and check the bearer.
+fn search_bearer(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> Result<(Search, Option<Bearer>), ApiError> {
     let mut raw: Value = parse_json(body)?;
     let Some(obj) = raw.as_object_mut() else {
         return Err(ApiError::bad_request(
@@ -414,7 +522,24 @@ fn search_actions(state: &AppState, headers: &HeaderMap, body: &Bytes) -> Result
         json!({ "name": "", "properties": { "server": server } }),
     );
     let bearer = bearer_auth(state, headers, SEARCH_ACTION_PATH)?;
-    let pep = pep_assertion(state, &clients.peps, headers, &mut raw)?;
+    Ok((Search { raw, page, server }, bearer))
+}
+
+fn search_actions(
+    state: &AppState,
+    headers: &HeaderMap,
+    search: Search,
+    bearer: Option<Bearer>,
+    peps: &PepKeys,
+) -> Result<Value, ApiError> {
+    let clients = &peps.clients;
+    let Search {
+        mut raw,
+        page,
+        server,
+    } = search;
+    caller_may_authenticate(state, bearer.as_ref())?;
+    let pep = pep_assertion(state, &clients.peps, &peps.fetched, headers, &mut raw)?;
     let a = admit(
         state,
         &clients.peps,
@@ -623,15 +748,27 @@ fn authorization(headers: &HeaderMap) -> Result<Option<(String, &str)>, ApiError
     }
 }
 
-fn evaluate(
+/// The first step of an evaluation: parse it and check the bearer.
+fn evaluate_bearer(
     state: &AppState,
     headers: &HeaderMap,
     body: &Bytes,
-) -> Result<EvaluationResponse, ApiError> {
-    let clients = state.clients.snapshot();
-    let mut value = parse_json(body)?;
+) -> Result<(Value, Option<Bearer>), ApiError> {
+    let value = parse_json(body)?;
     let bearer = bearer_auth(state, headers, "/access/v1/evaluation")?;
-    let pep = pep_assertion(state, &clients.peps, headers, &mut value)?;
+    Ok((value, bearer))
+}
+
+fn evaluate(
+    state: &AppState,
+    headers: &HeaderMap,
+    mut value: Value,
+    bearer: Option<Bearer>,
+    peps: &PepKeys,
+) -> Result<EvaluationResponse, ApiError> {
+    let clients = &peps.clients;
+    caller_may_authenticate(state, bearer.as_ref())?;
+    let pep = pep_assertion(state, &clients.peps, &peps.fetched, headers, &mut value)?;
     evaluate_value(
         state,
         &clients.peps,
@@ -650,6 +787,7 @@ fn evaluate(
 fn pep_assertion(
     state: &AppState,
     peps: &clientauth::Clients,
+    fetched: &clientauth::FetchedKey,
     headers: &HeaderMap,
     body: &mut Value,
 ) -> Result<Option<String>, ApiError> {
@@ -661,14 +799,47 @@ fn pep_assertion(
     };
     let field = |k: &str| obj.get(k).and_then(Value::as_str);
     let now = state.now();
-    let pep = peps.authenticate(
+    let pep = peps.authenticate_with(
         headers,
         field("pep_id"),
         field("pep_secret"),
         Some(&assertion),
+        fetched,
         now,
     )?;
     pep.commit(&state.replay, now).map(Some)
+}
+
+/// The `[[agents]]` and `[[peps]]` one AuthZEN request is checked against, and the key of its
+/// client assertion when the PEP's entry has `jwks_url`: fetched on the async side, before
+/// the request goes to the blocking pool, where it is checked ([`pep_assertion`]).
+struct PepKeys {
+    clients: Arc<clientauth::ClientSets>,
+    fetched: clientauth::FetchedKey,
+}
+
+impl PepKeys {
+    /// The lists in force, and the key of the body's assertion, fetched only when `wanted`.
+    async fn fetch(state: &AppState, body: &Bytes, wanted: bool) -> Self {
+        /// The top-level `client_assertion` of a body, the only place it may be.
+        #[derive(serde::Deserialize)]
+        struct Top {
+            client_assertion: Option<Value>,
+        }
+        let clients = state.clients.snapshot();
+        let fetched = if wanted && clients.peps.fetches_keys() {
+            // A body that does not parse is refused later, by the check that parses it.
+            let top = serde_json::from_slice::<Top>(body).ok();
+            let assertion = top
+                .as_ref()
+                .and_then(|t| t.client_assertion.as_ref())
+                .and_then(Value::as_str);
+            clients.peps.fetch_key(assertion).await
+        } else {
+            clientauth::FetchedKey::none()
+        };
+        Self { clients, fetched }
+    }
 }
 
 /// The bearer's chain and DPoP binding, checked once per HTTP request: a batch's entries share
@@ -788,11 +959,7 @@ fn admit(
         }
         None => {
             if !state.authzen_allow_unsigned_chain {
-                return Err(ApiError::unauthorized(
-                    REASON_MISSING_TOKEN,
-                    "a delegation token is required: send `Authorization: Bearer <token>` \
-                     ([authzen] allow_unsigned_chain is off)",
-                ));
+                return Err(missing_bearer());
             }
             let id = match pep_by_assertion {
                 Some(pep) => pep.to_owned(),

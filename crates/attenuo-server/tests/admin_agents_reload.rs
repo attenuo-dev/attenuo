@@ -508,7 +508,7 @@ async fn an_invalid_file_changes_nothing() {
         ),
         (
             ok.clone() + "[[agents]]\nid = \"empty\"\n" + &pep("gw1", "s"),
-            "[[agents]] `empty`: set secret_sha256, jwks (private_key_jwt), or both",
+            "[[agents]] `empty`: set secret_sha256, jwks or jwks_url (private_key_jwt), or a secret and keys",
         ),
         (
             ok.clone() + &agent("attenuo", "x") + &pep("gw1", "s"),

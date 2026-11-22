@@ -229,6 +229,11 @@ secret_sha256 = "a93d472e76b73bffcef69973eb463fb679b1365377e183a459d7f33c2ee97b7
 # `attenuo key gen --client planner.jwk` writes the private key and prints this line.
 # Up to 8 keys (RSA >= 2048 / RS256, P-256 / ES256, Ed25519 / EdDSA); give each a kid to rotate.
 # jwks = '''{"keys":[{"kty":"OKP","crv":"Ed25519","x":"<public key>","kid":"planner-1","alg":"EdDSA","use":"sig"}]}'''
+# Or the keys at a URL the agent publishes them at, so it can rotate them with no change here
+# (not with jwks). Fetched on first use, https:// only, no redirects, kept for
+# jwks_ttl_seconds and fetched again on an unknown kid. Optional ca_pem_path for a private CA.
+# jwks_url = "https://planner.example.com/.well-known/jwks.json"
+# jwks_ttl_seconds = 300
 
 # Agents also authenticate on every token exchange (hop n to n+1) as the `actor` they name.
 [[agents]]

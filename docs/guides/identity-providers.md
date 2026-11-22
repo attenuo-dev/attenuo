@@ -139,8 +139,25 @@ jwks = '''{"keys":[{"kty":"OKP","crv":"Ed25519","x":"…","kid":"planner-1","alg
 ```
 
 The private key file stays with the agent. On each request it sends `client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer` and `client_assertion`, a JWT with `iss` and `sub` = `planner`, `aud` = the server's `[issuer] issuer` (not the token endpoint URL), a short `exp` and a fresh `jti`; each assertion is accepted once. The CLI does this with `--client-key`, the SDKs with `DpopKey.client_assertion` (Python) and `clientAssertion` (TypeScript). Two refusals leave the assertion unused, because the client is told to send the same request again: `use_dpop_nonce` under `[token] dpop_nonce = "required"`, and `429 rate_limited` from `[limits] token_requests_per_minute`. The CLI and both SDKs send the same assertion on the nonce retry, and the SDKs on their opt-in load retry (`max_retries`, `maxRetries`); the integration tests check each against a real server. The load retry is not made when its wait (the `Retry-After`, up to a minute) would reach the assertion's `exp`: the SDK raises the 429 instead, and the agent mints a new assertion and calls again, or mints assertions with a `lifetime` that covers the waits, at most `[token] client_assertion_max_lifetime_seconds`. Treat an assertion as spent after any other answer. The full list of checks and refusal codes is in the [HTTP API reference](../reference/http-api.md#client-authentication). To rotate, add the new key with its own `kid` next to the old one, run `attenuo admin agent reload` (or restart), switch the agent, then remove the old key and reload again ([Deploying](deploying.md#adding-or-rotating-an-agent-without-a-restart)). A spent assertion stays spent across a reload.
+
 - The same `[[agents]]` entries authenticate sub-agents: a token exchange must authenticate as its `actor`. Give every agent that receives delegated tokens an entry, or a workload identity under [`[[actor_trust]]`](#workload-identity-for-sub-agents).
 - Each ID token or ID-JAG mints one root token. A second presentation, by any agent, is `invalid_grant` / `replayed` (keyed by `iss` and `jti`, or by the whole token when it has no `jti`). The root token expires no later than the credential, and a credential accepted only thanks to `clock_skew_seconds` is refused with `credential_expired`. The record of used credentials is kept in the server's database (`[audit] sqlite_path`), so it survives a restart; it is not shared with a server on another database file.
+
+### Keys at a URL the agent publishes
+
+Instead of `jwks`, an entry can name a URL where the agent (or its platform) publishes its public keys, as a JWK Set. The agent then rotates its keys itself, with no change to attenuo's config and no reload:
+
+```toml
+[[agents]]
+id = "planner"
+jwks_url = "https://planner.example.com/.well-known/jwks.json"
+# jwks_ttl_seconds = 300                     # default
+# ca_pem_path = "/etc/attenuo/planner-ca.pem" # for a private CA
+```
+
+The rules are those of the `[[idps]]` key URLs: `https://` only (plain `http://` only on loopback), no redirects, at most 256 KiB, 5 seconds, and `ca_pem_path` for a private CA ([private CAs for key URLs](#private-cas-for-key-urls)). The set must pass the rules of `jwks`, but keys for other uses (`use: "enc"`, a curve or algorithm attenuo does not accept) are skipped; a set with a private key in it is refused whole. Nothing is fetched at startup. Keys are kept for `jwks_ttl_seconds`; an assertion with a `kid` that is not in the set fetches it again at once, at most once per 30 seconds, so a new key works within 30 seconds at most. To rotate: publish the new key next to the old one, wait at least 30 seconds, switch the agent to it, then remove the old key. A removed key stops working at the latest `jwks_ttl_seconds` after the last fetch, so lower it if that must be sooner. One entry has `jwks` or `jwks_url`, never both.
+
+Whoever controls the URL controls the agent's identity at attenuo, so serve it from a place only the agent's owner can change. If attenuo cannot fetch the set, the agent is refused with the answer an unknown client gets (`client_authentication_failed`), and the server logs `client JWKS unavailable` at warn level with the cause. The full rules are in the [config reference](../reference/config.md#keys-from-a-url).
 
 ## `[[root_grants]]`
 

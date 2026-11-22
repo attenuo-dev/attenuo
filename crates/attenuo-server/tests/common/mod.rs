@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 
 use attenuo_server::config::AgentConfig;
 
+pub mod tls;
+
 /// Lower-case hex SHA-256 of `s`, the form of a `secret_sha256` in the server config.
 pub fn sha256_hex(s: &str) -> String {
     use sha2::Digest;

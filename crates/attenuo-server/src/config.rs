@@ -2865,9 +2865,10 @@ fn default_clock_skew() -> u64 {
 ///
 /// `id` is the `client_id` and becomes the root hop's agent id. The client authenticates with
 /// a secret (`secret_sha256`, the lowercase hex SHA-256 of the client secret:
-/// `printf %s "$SECRET" | sha256sum`), with a JWT signed by one of its keys (`jwks`,
-/// `private_key_jwt`, RFC 7523 §2.2; see `crate::clientauth`), or with either when both are
-/// set. At least one of the two is required.
+/// `printf %s "$SECRET" | sha256sum`), with a JWT signed by one of its keys (`private_key_jwt`,
+/// RFC 7523 §2.2; see `crate::clientauth`), or with either when both are set. The keys are
+/// inline (`jwks`) or fetched from a URL the client publishes them at (`jwks_url`), never
+/// both. At least one of a secret and keys is required.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentConfig {
@@ -2883,6 +2884,22 @@ pub struct AgentConfig {
     /// assertion.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jwks: Option<String>,
+    /// Where the client publishes its public keys for `private_key_jwt`, instead of `jwks`:
+    /// an `https://` URL (plain `http://` only to a loopback host, as for `[[idps]]
+    /// jwks_url`) serving a JWK Set that `jwks` would accept. Fetched on first use, cached for
+    /// `jwks_ttl_seconds`, and fetched again on an unknown `kid`, so the client can rotate its
+    /// keys with no change here. Not with `jwks`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwks_url: Option<String>,
+    /// How long keys fetched from `jwks_url` are used before they are fetched again. Default
+    /// 300; only with `jwks_url`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwks_ttl_seconds: Option<u64>,
+    /// PEM file of CA certificates trusted, for this entry's `jwks_url` only, in addition to
+    /// the built-in web PKI roots, as [`IdpConfig::ca_pem_path`]. Read at start and by an
+    /// agents reload; only with `jwks_url`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_pem_path: Option<PathBuf>,
 }
 
 impl AgentConfig {
@@ -2892,6 +2909,9 @@ impl AgentConfig {
             id: id.into(),
             secret_sha256: Some(secret_sha256.into()),
             jwks: None,
+            jwks_url: None,
+            jwks_ttl_seconds: None,
+            ca_pem_path: None,
         }
     }
 
@@ -2901,6 +2921,22 @@ impl AgentConfig {
             id: id.into(),
             secret_sha256: None,
             jwks: Some(jwks.into()),
+            jwks_url: None,
+            jwks_ttl_seconds: None,
+            ca_pem_path: None,
+        }
+    }
+
+    /// An entry that authenticates with `private_key_jwt` only, with the keys published at
+    /// `jwks_url`.
+    pub fn with_jwks_url(id: impl Into<String>, jwks_url: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            secret_sha256: None,
+            jwks: None,
+            jwks_url: Some(jwks_url.into()),
+            jwks_ttl_seconds: None,
+            ca_pem_path: None,
         }
     }
 }
