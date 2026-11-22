@@ -936,8 +936,63 @@ pub(crate) fn render_agents_reload(v: &Value) -> String {
     out
 }
 
-/// The warnings of an agents reload, one `warning:` line each, for stderr: those about the
-/// lists now in force (`warnings`), then those about the file's own settings, which a restart
+/// The answer of `POST /admin/keys/reload` (`attenuo admin key reload`): the signing key id
+/// before and after, the verifying key ids, each id added or removed, what stays keyed by the
+/// startup key, and the sections that need a restart. Key ids only: the answer holds no key.
+/// The warnings go to stderr ([`agents_reload_warnings`], which reads the same fields).
+pub(crate) fn render_keys_reload(v: &Value) -> String {
+    let strs = |key: &str| -> Vec<String> {
+        v[key]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|s| s.as_str().map(escape_controls))
+            .collect()
+    };
+    let one = |key: &str| escape_controls(v[key].as_str().unwrap_or("-"));
+    let (signing, before) = (one("signing_kid"), one("previous_signing_kid"));
+    let mut out = if v["changed"].as_bool() == Some(false) {
+        format!("signing key: {signing} (unchanged)\n")
+    } else if signing == before {
+        format!("signing key: {signing} (kept)\n")
+    } else {
+        format!("signing key: {before} -> {signing}\n")
+    };
+    let (kids, added, removed) = (strs("verifying_kids"), strs("added"), strs("removed"));
+    out.push_str(&format!(
+        "verifying keys: {} in force, {} added, {} removed\n",
+        kids.len(),
+        added.len(),
+        removed.len()
+    ));
+    for (verb, list) in [("added", &added), ("removed", &removed)] {
+        for kid in list {
+            out.push_str(&format!("  {verb:<8} {kid}\n"));
+        }
+    }
+    out.push_str(&format!(
+        "audit checkpoints signed by: {}\n",
+        one("audit_signing_kid")
+    ));
+    let kept = strs("kept_until_restart");
+    if !kept.is_empty() {
+        out.push_str(&format!(
+            "still keyed by the startup key (restart to re-key): {}\n",
+            kept.join(", ")
+        ));
+    }
+    let restart = strs("restart_needed");
+    if !restart.is_empty() {
+        out.push_str(&format!(
+            "not reloaded, differ from the running config (restart to apply): {}\n",
+            restart.join(", ")
+        ));
+    }
+    out
+}
+
+/// The warnings of an agents or keys reload, one `warning:` line each, for stderr: those about
+/// what is now in force (`warnings`), then those about the file's own settings, which a restart
 /// would apply (`restart_warnings`). Empty when there are none.
 pub(crate) fn agents_reload_warnings(v: &Value) -> String {
     let mut out = String::new();
@@ -1635,6 +1690,42 @@ would revoke 1 lease(s) if revoked now
             r" --x 'it'\''s a b'"
         );
         assert_eq!(repeat_flags(&[("--x", Some(String::new()))]), " --x ''");
+    }
+
+    #[test]
+    fn keys_reload_lists_the_kids_and_the_restart_notes() {
+        let out = super::render_keys_reload(&json!({
+            "signing_kid": "new", "previous_signing_kid": "old", "changed": true,
+            "verifying_kids": ["new", "old"], "added": ["new"], "removed": ["older"],
+            "audit_signing_kid": "new", "kept_until_restart": ["[token] dpop_nonce"],
+            "restart_needed": ["[server]"], "warnings": [], "audit_id": "x",
+        }));
+        assert_eq!(
+            out,
+            "signing key: old -> new\n\
+             verifying keys: 2 in force, 1 added, 1 removed\n\
+             \x20 added    new\n\
+             \x20 removed  older\n\
+             audit checkpoints signed by: new\n\
+             still keyed by the startup key (restart to re-key): [token] dpop_nonce\n\
+             not reloaded, differ from the running config (restart to apply): [server]\n"
+        );
+        let same = super::render_keys_reload(&json!({
+            "signing_kid": "k", "previous_signing_kid": "k", "changed": false,
+            "verifying_kids": ["k"], "added": [], "removed": [], "audit_signing_kid": "k",
+            "kept_until_restart": [], "restart_needed": [],
+        }));
+        assert_eq!(
+            same,
+            "signing key: k (unchanged)\n\
+             verifying keys: 1 in force, 0 added, 0 removed\n\
+             audit checkpoints signed by: k\n"
+        );
+        let kept = super::render_keys_reload(&json!({
+            "signing_kid": "k", "previous_signing_kid": "k", "changed": true,
+            "verifying_kids": ["k", "a"], "added": ["a"], "removed": [], "audit_signing_kid": "k",
+        }));
+        assert!(kept.starts_with("signing key: k (kept)\n"), "{kept}");
     }
 
     #[test]

@@ -49,8 +49,8 @@ use serde_json::{json, Map, Value};
 use time::OffsetDateTime;
 
 use cli::{
-    AdminCmd, AgentCmd, ApprovalCmd, AuditCmd, AuthzenCmd, BudgetCmd, Cli, Command, ExportFormat,
-    Field, HealthArgs, KeyCmd, LeaseCmd, OperatorCmd, PolicyCmd, TokenCmd,
+    AdminCmd, AdminKeyCmd, AgentCmd, ApprovalCmd, AuditCmd, AuthzenCmd, BudgetCmd, Cli, Command,
+    ExportFormat, Field, HealthArgs, KeyCmd, LeaseCmd, OperatorCmd, PolicyCmd, TokenCmd,
 };
 use client::{query_escape, Client};
 use prune_cmd::{audit_prune, PruneArgs};
@@ -846,6 +846,26 @@ async fn run(cli: Cli) -> Result<Outcome> {
                 print_json(&resp)?;
             } else {
                 out!("{}", render::render_agents_reload(&resp))?;
+            }
+            // The reload happened: exit 0, with each warning on stderr, in both modes.
+            err!("{}", render::agents_reload_warnings(&resp));
+            Ok(Outcome::Ok)
+        }
+        Command::Admin(AdminCmd::Key(AdminKeyCmd::Reload {
+            allow_drop_current,
+            allow_drop_audit_key,
+            allow_mismatch,
+        })) => {
+            let body = json!({
+                "allow_drop_current": allow_drop_current,
+                "allow_drop_audit_key": allow_drop_audit_key,
+                "allow_mismatch": allow_mismatch,
+            });
+            let resp = client?.admin_post("/admin/keys/reload", &body).await?;
+            if json {
+                print_json(&resp)?;
+            } else {
+                out!("{}", render::render_keys_reload(&resp))?;
             }
             // The reload happened: exit 0, with each warning on stderr, in both modes.
             err!("{}", render::agents_reload_warnings(&resp));
