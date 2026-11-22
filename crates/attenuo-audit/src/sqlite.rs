@@ -32,6 +32,7 @@ mod log;
 mod migrations;
 mod outbox;
 mod replay;
+mod retention;
 mod schema;
 #[cfg(test)]
 mod tests;
@@ -45,6 +46,10 @@ pub use leases::SqliteLeaseStore;
 pub use log::{AppendStats, SqliteAudit, DEFAULT_APPEND_QUEUE, DEFAULT_APPEND_TIMEOUT, MAX_BATCH};
 pub use migrations::{SchemaState, SCHEMA_VERSION};
 pub use outbox::{NewNotice, OutboxNotice};
+pub use retention::{
+    AnchorState, PlanBound, PlanGuards, PruneGuard, PruneLimits, PruneOutcome, PrunePlan,
+    PruneStep, SinkProgress, StoredAnchor,
+};
 pub use wal::{
     WalCheckpoint, WalStats, CHECKPOINT_PRESYNC_LEAD, DEFAULT_WAL_CHECKPOINT_INTERVAL,
     WAL_CHECKPOINT_COMMITS, WAL_WRITER_BACKSTOP_FRAMES,

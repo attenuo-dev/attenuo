@@ -108,6 +108,9 @@ pub struct AppState {
     pub checkpoint_sink: Option<crate::sink::CheckpointSink>,
     /// `[audit.sink] fail_readiness`.
     pub sink_fails_readiness: bool,
+    /// `[audit.retention]`: whether the admin may prune the log, the age floor and the rows
+    /// of one delete batch (ADR-0015).
+    pub retention: crate::config::RetentionSection,
     /// `[approvals] client_id`: the `aud` of approval ID tokens, when set.
     pub approvals_client_id: Option<String>,
     /// `[approvals.notify]`: the approval notifier; `None` when unset.
@@ -184,6 +187,7 @@ impl AppState {
         config.proxy.upstream_timeouts()?;
         config.limits.check()?;
         config.audit.append_limits()?;
+        config.check_retention()?;
         config.token.check_dpop()?;
         config.token.check_client_assertion()?;
         config.approvals.check()?;
@@ -246,6 +250,9 @@ impl AppState {
             metrics.clone(),
             checkpoint_sink.as_ref().map(|s| s.handle()),
         )?;
+        if let Some(sink) = &checkpoint_sink {
+            ship_unshipped_anchors(sink, &audit, clock.clone())?;
+        }
         // The DPoP restart fence, from the liveness marker in the same file; none in memory.
         let (dpop, dpop_heartbeat) = if store_fence.is_some() {
             let (dpop, heartbeat) = restart_fence(dpop, &leases, clock.clone())?;
@@ -418,6 +425,7 @@ impl AppState {
             dpop,
             checkpoint_sink,
             sink_fails_readiness: config.audit.sink.as_ref().is_some_and(|s| s.fail_readiness),
+            retention: config.audit.retention.clone(),
             approvals_client_id: config.approvals.client_id.clone(),
             approval_notifier,
             lease_notifier,
@@ -769,6 +777,46 @@ fn restart_fence(
     Ok((dpop.with_restart_fence(previous, liveness), heartbeat))
 }
 
+/// Record each anchor `[audit.sink]` delivers (`shipped_at`, ADR-0015), and queue again every
+/// anchor not delivered yet: one queued before a restart, or before the sink was set. Weak, so
+/// the sink's thread does not keep the store alive.
+fn ship_unshipped_anchors(
+    sink: &crate::sink::CheckpointSink,
+    audit: &Arc<SqliteAudit>,
+    clock: Arc<dyn attenuo_core::Clock>,
+) -> anyhow::Result<()> {
+    let weak = Arc::downgrade(audit);
+    sink.on_anchor_delivered(move |a| {
+        let Some(audit) = weak.upgrade() else { return };
+        if let Err(e) = audit.mark_anchor_shipped(a.through_seq, clock.now_utc()) {
+            // The anchor is queued again at the next start; a second copy is harmless.
+            tracing::error!(error = %e, through_seq = a.through_seq, "recording an anchor's delivery failed");
+        }
+    });
+    let unshipped = audit
+        .unshipped_anchors()
+        .context("reading the prune anchors not yet shipped")?;
+    let handle = sink.handle();
+    for a in &unshipped {
+        handle.push_anchor(&a.anchor);
+    }
+    if !unshipped.is_empty() {
+        tracing::warn!(
+            anchors = unshipped.len(),
+            "[audit.sink] queued again the prune anchors it had not delivered before the restart"
+        );
+    }
+    Ok(())
+}
+
+/// Report the database's size on the metrics (`audit_db_size_bytes`, `audit_db_free_bytes`),
+/// read at each scrape only when the store's reader is free, so a scrape never waits. Weak,
+/// as for the WAL source.
+fn watch_db_size(metrics: &Metrics, audit: &Arc<SqliteAudit>) {
+    let weak = Arc::downgrade(audit);
+    metrics.set_db_size_source(move || weak.upgrade().and_then(|a| a.try_db_size().ok().flatten()));
+}
+
 fn open_storage(
     cfg: &crate::config::AuditSection,
     signer: attenuo_token::DetachedSigner,
@@ -781,6 +829,13 @@ fn open_storage(
 )> {
     let (append_queue, append_timeout) = cfg.append_limits()?;
     let wal_metrics = Arc::clone(&metrics);
+    // A prune's anchor, after its commit, between the two checkpoints of the prune.
+    let anchor_sink = sink.clone();
+    let ship_anchor = move |a: &attenuo_audit::Anchor| {
+        if let Some(sink) = &anchor_sink {
+            sink.push_anchor(a);
+        }
+    };
     // Runs after the commit that wrote the checkpoint was synced (SR-50); the sink only queues.
     let count = move |cp: &attenuo_audit::Checkpoint| {
         metrics.audit_checkpoint();
@@ -796,9 +851,11 @@ fn open_storage(
             SqliteAudit::open_in_memory()?
                 .with_append_limits(append_queue, append_timeout)
                 .with_checkpointing(signer, cfg.checkpoint_every)
-                .with_checkpoint_hook(count),
+                .with_checkpoint_hook(count)
+                .with_anchor_hook(ship_anchor),
         );
         watch_append_shedding(&wal_metrics, &audit);
+        watch_db_size(&wal_metrics, &audit);
         return Ok((audit, Arc::new(SqliteLeaseStore::open_in_memory()?), None));
     }
     let p = Path::new(path);
@@ -828,6 +885,7 @@ fn open_storage(
             .with_append_limits(append_queue, append_timeout)
             .with_checkpointing(signer, cfg.checkpoint_every)
             .with_checkpoint_hook(count)
+            .with_anchor_hook(ship_anchor)
             .with_wal_checkpoints(wal_interval)
             .with_context(|| format!("starting the WAL checkpointer for {path}"))?,
     );
@@ -836,6 +894,7 @@ fn open_storage(
     let weak = Arc::downgrade(&audit);
     wal_metrics.set_wal_source(move || weak.upgrade().and_then(|a| a.wal_stats()));
     watch_append_shedding(&wal_metrics, &audit);
+    watch_db_size(&wal_metrics, &audit);
     let mut leases = SqliteLeaseStore::open_with(p, cfg.durability)
         .with_context(|| format!("opening lease store {path}"))?;
     if !wal_interval.is_zero() {

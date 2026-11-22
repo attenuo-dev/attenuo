@@ -1426,10 +1426,30 @@ fn tools_text(resp: &Value) -> PrintedText {
 fn verify_lines(resp: &Value) -> Vec<String> {
     let mut out = Vec::new();
     if resp["first_bad_seq"].is_null() {
-        out.push(format!(
-            "audit chain OK: {} entries verified",
-            resp["entries"]
-        ));
+        let anchors_ok = resp["bad_anchors"].as_array().is_none_or(Vec::is_empty);
+        match resp["pruned_through"].as_u64() {
+            Some(b) if anchors_ok => out.push(format!(
+                "audit chain OK: {} entries verified from seq {} (pruned through {b}; anchor \
+                 signature OK)",
+                resp["entries"],
+                b + 1
+            )),
+            Some(b) => out.push(format!(
+                "audit chain links: {} entries verified from seq {} (pruned through {b})",
+                resp["entries"],
+                b + 1
+            )),
+            None if anchors_ok => out.push(format!(
+                "audit chain OK: {} entries verified",
+                resp["entries"]
+            )),
+            // A prune anchor failed, so the walk ran from genesis: the rows link, but the
+            // log's start is not what its anchor says.
+            None => out.push(format!(
+                "audit chain links: {} entries verified from genesis (a prune anchor is INVALID)",
+                resp["entries"]
+            )),
+        }
     } else {
         out.push(format!(
             "audit chain BROKEN at seq {} ({} entries examined)",
@@ -1452,37 +1472,53 @@ fn verify_lines(resp: &Value) -> Vec<String> {
             bad["reason"].as_str().unwrap_or("unknown")
         ));
     }
+    for bad in resp["bad_anchors"].as_array().into_iter().flatten() {
+        out.push(format!(
+            "prune anchor through seq {} INVALID: {}",
+            bad["through_seq"],
+            bad["reason"].as_str().unwrap_or("unknown")
+        ));
+    }
     out
 }
 
 /// Request path of `audit export`.
-fn export_path(from: u64, to: Option<u64>, filter: &attenuo_audit::RecordFilter) -> String {
-    let mut path = format!("/admin/audit/export?from={from}");
+/// Without `from` the server starts at the first entry it holds (after a prune, one above the
+/// boundary).
+fn export_path(from: Option<u64>, to: Option<u64>, filter: &attenuo_audit::RecordFilter) -> String {
+    let mut params = Vec::new();
+    if let Some(from) = from {
+        params.push(format!("from={from}"));
+    }
     if let Some(to) = to {
-        path.push_str(&format!("&to={to}"));
+        params.push(format!("to={to}"));
     }
     if let Some(kind) = filter.kind {
-        path.push_str(&format!("&kind={kind}"));
+        params.push(format!("kind={kind}"));
     }
     if let Some(chain_id) = &filter.chain_id {
-        path.push_str(&format!("&chain_id={}", query_escape(chain_id)));
+        params.push(format!("chain_id={}", query_escape(chain_id)));
     }
     if let Some(tool) = &filter.tool {
-        path.push_str(&format!("&tool={}", query_escape(tool)));
+        params.push(format!("tool={}", query_escape(tool)));
     }
     match filter.decision {
-        Some(attenuo_core::Decision::Allow) => path.push_str("&decision=allow"),
-        Some(attenuo_core::Decision::Deny) => path.push_str("&decision=deny"),
+        Some(attenuo_core::Decision::Allow) => params.push("decision=allow".into()),
+        Some(attenuo_core::Decision::Deny) => params.push("decision=deny".into()),
         None => {}
     }
-    path
+    if params.is_empty() {
+        "/admin/audit/export".to_string()
+    } else {
+        format!("/admin/audit/export?{}", params.join("&"))
+    }
 }
 
 /// `audit export`: stream the server's JSON Lines to `out` (or stdout), or collect them into
 /// one JSON object for `--format json`.
 async fn audit_export(
     client: &Client,
-    from: u64,
+    from: Option<u64>,
     to: Option<u64>,
     filter: &attenuo_audit::RecordFilter,
     format: ExportFormat,
@@ -1627,7 +1663,13 @@ fn export_lines(v: &Value) -> Vec<String> {
             v["unsigned_tail"]
         ));
     }
-    if v["from_genesis"] == false && v["first_seq"].is_u64() {
+    if v["from_anchor"] == true {
+        out.push(format!(
+            "the file continues a pruned log: its first entry links to the signed anchor in its \
+             header (entries before seq {} were pruned; check them in the archive)",
+            v["first_seq"]
+        ));
+    } else if v["from_genesis"] == false && v["first_seq"].is_u64() {
         out.push(format!(
             "note: the file does not start at the first entry of the log; entries before seq {} are not covered",
             v["first_seq"]
@@ -1813,6 +1855,57 @@ mod tests {
         assert_eq!(refund_refusal(&anyhow::anyhow!("no route"), "D1"), None);
     }
 
+    /// A pruned log (`[audit.retention]`): the live verify names the boundary and the anchor,
+    /// and an export from B + 1 says it continues the pruned log.
+    #[test]
+    fn verify_and_export_lines_name_the_prune_anchor() {
+        let v = json!({"entries": 15, "ok": true, "first_bad_seq": null, "checkpoints": 2,
+                       "last_signed_seq": 36, "unsigned_tail": 0, "bad_checkpoints": [],
+                       "pruned_through": 20, "anchors": 1, "bad_anchors": []});
+        let lines = verify_lines(&v);
+        assert_eq!(
+            lines[0],
+            "audit chain OK: 15 entries verified from seq 21 (pruned through 20; anchor signature OK)"
+        );
+        let bad = json!({"entries": 15, "ok": false, "first_bad_seq": null, "checkpoints": 2,
+                         "last_signed_seq": 36, "unsigned_tail": 0, "bad_checkpoints": [],
+                         "pruned_through": 20, "anchors": 1,
+                         "bad_anchors": [{"through_seq": 20, "reason": "bad signature"}]});
+        let lines = verify_lines(&bad);
+        assert!(!lines[0].contains("signature OK"), "{lines:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l == "prune anchor through seq 20 INVALID: bad signature"),
+            "{lines:?}"
+        );
+        // The anchor failed, so the server walked from genesis and found the rows intact:
+        // the first line must not say OK.
+        let genesis = json!({"entries": 36, "ok": false, "first_bad_seq": null,
+                             "checkpoints": 2, "last_signed_seq": 36, "unsigned_tail": 0,
+                             "bad_checkpoints": [], "pruned_through": null, "anchors": 1,
+                             "bad_anchors": [{"through_seq": 20, "reason": "bad signature"}]});
+        let lines = verify_lines(&genesis);
+        assert_eq!(
+            lines[0],
+            "audit chain links: 36 entries verified from genesis (a prune anchor is INVALID)"
+        );
+        let e = json!({"entries": 15, "ok": true, "first_bad_seq": null, "checkpoints": 2,
+                       "last_signed_seq": 36, "unsigned_tail": 0, "bad_checkpoints": [],
+                       "first_seq": 21, "last_seq": 36, "from_genesis": false,
+                       "from_anchor": true, "truncated": false, "outside_range": 0,
+                       "unsigned_tail_rejected": false, "pruned_through": 20});
+        let lines = export_lines(&e);
+        assert!(
+            lines.iter().any(|l| l.contains("continues a pruned log")),
+            "{lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("not covered")),
+            "{lines:?}"
+        );
+    }
+
     #[test]
     fn export_lines_describe_coverage_and_problems() {
         let v = json!({"entries": 5, "ok": false, "first_bad_seq": null, "checkpoints": 1,
@@ -1875,8 +1968,16 @@ mod tests {
     fn export_path_carries_range_and_escaped_filters() {
         use attenuo_audit::RecordFilter;
         assert_eq!(
-            export_path(1, None, &RecordFilter::default()),
+            export_path(Some(1), None, &RecordFilter::default()),
             "/admin/audit/export?from=1"
+        );
+        assert_eq!(
+            export_path(None, None, &RecordFilter::default()),
+            "/admin/audit/export"
+        );
+        assert_eq!(
+            export_path(None, Some(9), &RecordFilter::default()),
+            "/admin/audit/export?to=9"
         );
         let f = RecordFilter {
             kind: Some(attenuo_core::RecordKind::LeaseRenew),
@@ -1884,7 +1985,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            export_path(5, Some(9), &f),
+            export_path(Some(5), Some(9), &f),
             "/admin/audit/export?from=5&to=9&kind=lease_renew&chain_id=l%201%26x%3D%C3%A9"
         );
         let f = RecordFilter {
@@ -1893,7 +1994,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            export_path(1, None, &f),
+            export_path(Some(1), None, &f),
             "/admin/audit/export?from=1&tool=token.exchange&decision=deny"
         );
     }

@@ -426,6 +426,26 @@ def test_an_envelope_that_disagrees_with_its_checkpoint_is_reported() -> None:
     assert "unsupported format `v0`" in cross(objs, [json.dumps(env)]).mismatches[0].reason
 
 
+ANCHOR_LINE = (
+    '{"anchor":{"archive_sha256":null,"at":"2026-10-24T00:00:00Z","kid":"k",'
+    '"previous_through_seq":null,"prune_entry_hash":"' + "ab" * 32 + '","prune_seq":7,'
+    '"signature":"s","through_hash":"' + "cd" * 32 + '","through_seq":3},'
+    '"anchor_sha256":"' + "ef" * 32 + '","format":"attenuo-shipped-anchor-v1","kid":"k",'
+    '"public_url":null,"signature":"s"}\n'
+)
+
+
+def test_a_prune_anchor_line_in_the_shipped_file_is_skipped() -> None:
+    objs = make_export()
+    shipped = shipped_lines(checkpoints_of(objs))
+    with_anchor = [shipped[0], ANCHOR_LINE, shipped[1]]
+    parsed = parse_shipped(with_anchor)
+    # The anchor is not a checkpoint; the lines after it keep their own numbers.
+    assert [p.line for p in parsed] == [1, 3]
+    r = cross(objs, with_anchor)
+    assert r.ok and r.shipped == 2 and r.matched == 2
+
+
 def test_shipped_checkpoints_past_the_export_are_counted_not_checked() -> None:
     objs = make_export()
     log = make_export(n=9, cps=(3, 6, 9))

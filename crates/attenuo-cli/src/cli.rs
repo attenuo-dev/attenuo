@@ -1120,9 +1120,10 @@ pub(crate) enum AuditCmd {
     /// Export entries `--from` to `--to` (inclusive) and the checkpoints inside that range.
     /// Defaults to the whole log. Writes to stdout unless `--out` is given.
     Export {
-        /// First sequence number.
-        #[arg(long, default_value_t = 1)]
-        from: u64,
+        /// First sequence number. Default: the first entry of the log (1, or one above the
+        /// boundary of a prune, whose export then carries the signed anchor).
+        #[arg(long)]
+        from: Option<u64>,
         /// Last sequence number. Default: the head of the log.
         #[arg(long)]
         to: Option<u64>,

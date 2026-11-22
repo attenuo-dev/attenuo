@@ -40,3 +40,4 @@ rustix = { workspace = true }
 attenuo-audit = { path = ".", features = ["testing"] }
 tempfile = { workspace = true }
 proptest = { workspace = true }
+uuid = { workspace = true }

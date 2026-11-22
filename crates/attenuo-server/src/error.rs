@@ -13,7 +13,7 @@
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use serde_json::json;
+use serde_json::{json, Value};
 
 pub use attenuo_core::error_codes::{ErrorCode, ERROR_CODES};
 
@@ -62,7 +62,12 @@ pub struct ApiError {
     pub decision_id: Option<uuid::Uuid>,
     /// Seconds the client should wait before it retries, sent as `Retry-After` when set (a
     /// shed request, a timed-out handler, a rate limit; see [`crate::config::LimitsSection`]).
-    pub retry_after: Option<u64>,
+    /// A `u32`, which holds any wait the server asks for, so that an `ApiError` stays small.
+    pub retry_after: Option<u32>,
+    /// More members of the body, next to `error`, `code` and `detail`: the prune boundary
+    /// of a 410 `audit_pruned` (`pruned_through`, `prune_seq`, `first`).
+    /// Boxed: most answers have none, and an `ApiError` stays small.
+    pub extra: Option<Box<serde_json::Map<String, Value>>>,
 }
 
 impl ApiError {
@@ -99,12 +104,31 @@ impl ApiError {
             code_only: false,
             decision_id: None,
             retry_after: None,
+            extra: None,
         }
+    }
+
+    /// Add the member `key` to the body (never one of `error`, `code`, `detail`,
+    /// `error_description` or `decision_id`, which keep their values).
+    pub fn with_member(mut self, key: &str, value: impl Into<Value>) -> Self {
+        self.extra
+            .get_or_insert_with(Box::default)
+            .insert(key.to_owned(), value.into());
+        self
+    }
+
+    /// A 410 `audit_pruned`: `detail`, and the prune boundary (`pruned_through`, the prune
+    /// record's `prune_seq` and the first retained seq `first`).
+    pub fn audit_pruned(detail: impl Into<String>, boundary: &attenuo_audit::Anchor) -> Self {
+        Self::new(StatusCode::GONE, "audit_pruned", detail)
+            .with_member("pruned_through", boundary.through_seq)
+            .with_member("prune_seq", boundary.prune_seq)
+            .with_member("first", boundary.through_seq + 1)
     }
 
     /// Ask the client to wait `seconds` (at least 1) before it retries (`Retry-After`).
     pub fn with_retry_after(mut self, seconds: u64) -> Self {
-        self.retry_after = Some(seconds.max(1));
+        self.retry_after = Some(u32::try_from(seconds.max(1)).unwrap_or(u32::MAX));
         self
     }
 
@@ -186,6 +210,11 @@ impl IntoResponse for ApiError {
         self.debug_check();
         let code = self.stable_code();
         let mut body = json!({ "error": self.code, "code": code, "detail": self.detail });
+        for (k, v) in self.extra.map(|m| *m).into_iter().flatten() {
+            if let Some(obj) = body.as_object_mut() {
+                obj.entry(k).or_insert(v);
+            }
+        }
         if let Some(d) = self.description.filter(|_| !self.code_only) {
             body["error_description"] = d.into();
         }
@@ -251,6 +280,7 @@ impl IntoResponse for ApiError {
 /// | `LeaseRevoked` | 409 | `lease_revoked` |
 /// | `ChargeRefunded` | 409 | `already_refunded` |
 /// | `TooManyPendingApprovals` | 429 | `too_many_pending_approvals` |
+/// | `PruneRefused` | 409, or 410 for `audit_pruned` | the guard's code (`prune_too_recent`, ...) |
 /// | storage, lock, encoding, `BindingConflict`, `NoCheckpointSigner`, `Export`, `Jwks` | 500 | `server_error`, no detail (SR-43) |
 ///
 /// A route whose answer depends on more than the variant keeps its own arm before falling back
@@ -297,6 +327,23 @@ impl From<attenuo_audit::AuditError> for ApiError {
                 "too_many_pending_approvals",
                 format!("the run already has {max} pending approvals"),
             ),
+            E::PruneRefused { guard, detail } => {
+                use attenuo_audit::PruneGuard as G;
+                // Spelled out, so that the codes are the server's (and in ERROR_CODES).
+                match guard {
+                    G::NotAtCheckpoint => {
+                        ApiError::new(StatusCode::CONFLICT, "prune_not_at_checkpoint", detail)
+                    }
+                    G::TooRecent => ApiError::new(StatusCode::CONFLICT, "prune_too_recent", detail),
+                    G::LiveRun => ApiError::new(StatusCode::CONFLICT, "prune_live_run", detail),
+                    G::SinkBehind => ApiError::new(StatusCode::CONFLICT, "sink_behind", detail),
+                    G::InProgress => {
+                        ApiError::new(StatusCode::CONFLICT, "prune_in_progress", detail)
+                    }
+                    G::Conflict => ApiError::new(StatusCode::CONFLICT, "prune_conflict", detail),
+                    G::AlreadyPruned => ApiError::new(StatusCode::GONE, "audit_pruned", detail),
+                }
+            }
             // Listed one by one so that a new variant needs a decision here.
             e @ (E::Sqlite(_)
             | E::Serde(_)
@@ -726,6 +773,10 @@ mod tests {
                 holder: Some(42),
             },
             E::Overloaded("the audit writer's queue is full"),
+            E::PruneRefused {
+                guard: attenuo_audit::PruneGuard::TooRecent,
+                detail: "the entry at 20 is too recent".into(),
+            },
             E::SchemaTooNew {
                 found: 2,
                 supported: 1,
@@ -770,10 +821,11 @@ mod tests {
                 E::TooManyPendingApprovals { .. } => (18, false),
                 E::Fenced { .. } => (19, true),
                 E::Overloaded(_) => (20, true),
+                E::PruneRefused { .. } => (21, false),
                 // Only at start-up, which it stops.
-                E::SchemaTooNew { .. } => (21, true),
+                E::SchemaTooNew { .. } => (22, true),
                 // Only at start-up, which it stops.
-                E::NetworkFilesystem { .. } => (22, true),
+                E::NetworkFilesystem { .. } => (23, true),
             }
         }
         let all = one_of_each_audit_error();

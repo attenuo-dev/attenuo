@@ -133,6 +133,18 @@ allow_network_filesystem = false
 # max_lag_seconds = 300
 # queue_capacity = 1024
 
+# Pruning the oldest audit entries behind a signed anchor (ADR-0015). "off" (the default)
+# never prunes. "manual" lets the admin prune through GET /admin/audit/prune/plan and
+# POST /admin/audit/prune, after exporting and keeping the archive; it needs [audit.sink] and a
+# file sqlite_path ("auto" is not built). Nothing younger than min_age_seconds is pruned, and
+# it may not be below [leases] retention_seconds + run_state_retention_seconds, nor below
+# [leases] user_window_retention_seconds (at most 100 years). The rows are deleted afterwards,
+# batch_rows per transaction (1 to 1000000), by the maintenance task.
+[audit.retention]
+prune = "off"
+min_age_seconds = 7776000
+batch_rows = 10000
+
 # MCP servers (Streamable HTTP), mounted at /mcp/<name>. `name` is the server part of
 # capabilities, e.g. "github:read_file".
 [[upstreams]]
@@ -280,8 +292,8 @@ ttl_seconds = 120
 # Seconds a chain's leases (with their recorded users and bindings) are kept once every lease
 # in the chain is revoked or expired. Keep it above the longest token lifetime you issue: an
 # expired lease can be renewed while its token is valid. A pruned chain is no longer found by
-# revoke-by-user or shown in the console; the audit log keeps every decision. 0 keeps every
-# lease.
+# revoke-by-user or shown in the console; the audit log keeps every decision unless pruned
+# ([audit.retention]). 0 keeps every lease.
 retention_seconds = 604800
 # Seconds a session binding (revoke by session) is kept after its chain's root lease expired;
 # a revoked chain's bindings go at the next pass (every minute by default). Keep it above the longest
@@ -291,7 +303,7 @@ session_retention_seconds = 86400
 # Seconds a run's run-limit counters, charge log and approvals are kept once the run's leases
 # are gone from the registry (after retention_seconds); nothing of a run still in the registry
 # is deleted. After it, an operator refund of the run's decisions answers 410 charge_pruned; the audit log
-# keeps every record. 0 keeps everything.
+# keeps every record unless pruned ([audit.retention]). 0 keeps everything.
 run_state_retention_seconds = 2592000
 # The task that prunes the three above runs every maintenance_interval_seconds (at least 1), in
 # passes of maintenance_batch_rows rows (1 to 100000), one write transaction each, and at most

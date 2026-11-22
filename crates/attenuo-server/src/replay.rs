@@ -247,6 +247,7 @@ mod tests {
                     code_only: false,
                     decision_id: None,
                     retry_after: None,
+                    extra: None,
                 }
             );
             assert_eq!(
@@ -259,6 +260,7 @@ mod tests {
                     code_only: false,
                     decision_id: None,
                     retry_after: None,
+                    extra: None,
                 }
             );
         }

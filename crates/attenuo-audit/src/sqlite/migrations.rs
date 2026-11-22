@@ -36,14 +36,15 @@ use super::connection::{file_of, WriteGate};
 use super::outbox::OUTBOX_SCHEMA;
 use super::replay::REPLAY_SCHEMA;
 use super::schema::{
-    create_record_id_index, AUDIT_SCHEMA, CHECKPOINT_SCHEMA, LEASE_SCHEMA, META_SCHEMA,
+    create_record_id_index, ANCHOR_SCHEMA, AUDIT_SCHEMA, CHECKPOINT_SCHEMA, LEASE_SCHEMA,
+    META_SCHEMA,
 };
 use crate::error::AuditError;
 use crate::log::ENTRY_HASH_VERSION;
 
 /// The schema version this build writes and reads: the number of the last migration in the
 /// crate's list. A file above it is refused ([`AuditError::SchemaTooNew`]).
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// One step of the schema: from version `version - 1` to `version`.
 pub(super) struct Migration {
@@ -83,6 +84,13 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         description: "lease subjects get the originating user's `issuer` (nullable text), so \
                       the admin lease tree can show the run's user's per-user windows",
         apply: v4_lease_subject_issuer,
+    },
+    Migration {
+        version: 5,
+        description: "audit retention: `audit_anchors`, one signed anchor per prune of the log \
+                      (the last seq pruned, its hash, the prune record, the archive digest, the \
+                      deletion state); empty until the first prune",
+        apply: v5_audit_anchors,
     },
 ];
 
@@ -295,6 +303,17 @@ fn v3_used_credentials(conn: &Connection) -> Result<(), AuditError> {
 /// shown rather than guessed from a configured issuer).
 fn v4_lease_subject_issuer(conn: &Connection) -> Result<(), AuditError> {
     conn.execute_batch("ALTER TABLE lease_subjects ADD COLUMN issuer TEXT NULL;")?;
+    Ok(())
+}
+
+/// Migration 5: the `audit_anchors` table of audit retention (ADR-0015). One row per prune:
+/// the signed [`Anchor`](crate::checkpoint::Anchor) that says the log starts after
+/// `through_seq`, and `state`, `deleting` until the batched deletes of the rows at or below
+/// `through_seq` are done, then `done`; and `shipped_at`, the time `[audit.sink]` delivered the
+/// anchor, null until then (the server queues an anchor again while it is null). It starts empty, and no existing row changes: a file
+/// that is never pruned keeps its chain and checkpoints exactly as they were.
+fn v5_audit_anchors(conn: &Connection) -> Result<(), AuditError> {
+    conn.execute_batch(ANCHOR_SCHEMA)?;
     Ok(())
 }
 
@@ -532,15 +551,16 @@ mod tests {
         assert!(!object_exists(&conn, "a"));
     }
 
-    /// A build from before migration 4 (its list ends at 3) refuses a file this build
-    /// migrated, before reading or writing anything; this build finds it current.
+    /// A build from before migration 5 (its list ends at 4) refuses a file this build
+    /// migrated, before reading or writing anything; this build finds it current. So a build
+    /// that does not know anchors never opens, and never reports as broken, a pruned log.
     #[test]
-    fn a_build_before_migration_4_refuses_a_migrated_file() {
+    fn a_build_before_migration_5_refuses_a_migrated_file() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("v4.sqlite");
+        let path = dir.path().join("v5.sqlite");
         let mut conn = Connection::open(&path).unwrap();
-        assert_eq!(migrate(&mut conn).unwrap().version, 4);
-        let older: Vec<Migration> = MIGRATIONS[..3]
+        assert_eq!(migrate(&mut conn).unwrap().version, 5);
+        let older: Vec<Migration> = MIGRATIONS[..4]
             .iter()
             .map(|m| Migration {
                 version: m.version,
@@ -550,11 +570,11 @@ mod tests {
             .collect();
         match run(&mut conn, &older).unwrap_err() {
             AuditError::SchemaTooNew { found, supported } => {
-                assert_eq!((found, supported), (4, 3));
+                assert_eq!((found, supported), (5, 4));
             }
             other => panic!("expected SchemaTooNew, got {other:?}"),
         }
-        assert_eq!(version(&conn), 4);
+        assert_eq!(version(&conn), 5);
         let mut second = Connection::open(&path).unwrap();
         assert_eq!(migrate(&mut second).unwrap().migrated_from, None);
     }

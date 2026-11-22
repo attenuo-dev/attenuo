@@ -856,10 +856,11 @@ fn sqlite_store_from_before_subjects_gains_the_table_at_open() {
         let s = SqliteLeaseStore::open(&path).unwrap();
         tree(&s);
         s.with_connection(|c| {
-            // An older server's file: no table, no replay table (schema version 3), and no
-            // schema version.
+            // An older server's file: no table, no replay table (schema version 3), no anchor
+            // table (version 5), and no schema version.
             c.execute_batch(
-                "DROP TABLE lease_subjects; DROP TABLE used_credentials; PRAGMA user_version = 0;",
+                "DROP TABLE lease_subjects; DROP TABLE used_credentials; \
+                 DROP TABLE audit_anchors; PRAGMA user_version = 0;",
             )?;
             Ok(())
         })
@@ -1032,10 +1033,10 @@ fn sqlite_store_from_before_sessions_gains_the_table_at_open() {
         two_users(&s);
         s.with_connection(|c| {
             // An older server's file: no table, no replay table (schema version 3), no
-            // subject issuer (version 4), and no schema version.
+            // subject issuer (version 4), no anchor table (version 5), and no schema version.
             c.execute_batch(
                 "DROP TABLE lease_sessions; DROP TABLE used_credentials; \
-                 ALTER TABLE lease_subjects DROP COLUMN issuer; PRAGMA user_version = 0;",
+                 DROP TABLE audit_anchors; ALTER TABLE lease_subjects DROP COLUMN issuer; PRAGMA user_version = 0;",
             )?;
             Ok(())
         })

@@ -152,6 +152,15 @@ impl std::fmt::Debug for AppendSource {
     }
 }
 
+/// Reads the audit database's size at render time (see [`Metrics::set_db_size_source`]).
+struct DbSizeSource(Box<dyn Fn() -> Option<(u64, u64)> + Send + Sync>);
+
+impl std::fmt::Debug for DbSizeSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DbSizeSource")
+    }
+}
+
 /// All server metrics. Cheap to share: clone the `Arc`.
 #[derive(Debug)]
 pub struct Metrics {
@@ -224,6 +233,13 @@ pub struct Metrics {
     wal: OnceLock<WalSource>,
     /// The audit store's shed appends ([`attenuo_audit::SqliteAudit::append_stats`]).
     append: OnceLock<AppendSource>,
+    /// The audit database's size, read at render time when the store is free.
+    db_size: OnceLock<DbSizeSource>,
+    /// The last size read: `page_count * page_size` and `freelist_count * page_size`.
+    audit_db_size_bytes: AtomicU64,
+    audit_db_free_bytes: AtomicU64,
+    /// Audit entries deleted by prunes of the log (`[audit.retention]`).
+    audit_pruned_entries: AtomicU64,
     /// `GET` listen streams ended, by [`StreamEndCause::index`].
     streams_ended: [AtomicU64; StreamEndCause::ALL.len()],
     /// `stream.end` records not written, by [`StreamEndCause::index`] of the reason (only the
@@ -287,6 +303,10 @@ impl Default for Metrics {
             run_lock_wait: Histogram::new(&STAGE_BUCKETS),
             wal: OnceLock::new(),
             append: OnceLock::new(),
+            db_size: OnceLock::new(),
+            audit_db_size_bytes: AtomicU64::default(),
+            audit_db_free_bytes: AtomicU64::default(),
+            audit_pruned_entries: AtomicU64::default(),
             streams_ended: Default::default(),
             stream_end_suppressed: Default::default(),
             lease_refusal_suppressed: Mutex::default(),
@@ -534,6 +554,22 @@ impl Metrics {
         let _ = self.wal.set(WalSource(Box::new(source)));
     }
 
+    /// Read the audit database's size, `(page_count * page_size, freelist_count *
+    /// page_size)`, through `source` at every render (`audit_db_size_bytes`,
+    /// `audit_db_free_bytes`). Set once; later calls are ignored. When `source` returns
+    /// `None` (the store is busy) the last size read is shown; 0 until the first.
+    pub fn set_db_size_source(
+        &self,
+        source: impl Fn() -> Option<(u64, u64)> + Send + Sync + 'static,
+    ) {
+        let _ = self.db_size.set(DbSizeSource(Box::new(source)));
+    }
+
+    /// Count `n` audit entries deleted by a prune of the log (`audit_pruned_entries_total`).
+    pub fn audit_pruned_entries(&self, n: u64) {
+        self.audit_pruned_entries.fetch_add(n, Ordering::Relaxed);
+    }
+
     /// Read the audit store's shed appends through `source` at every render
     /// (`audit_append_shed_total`). Set once; later calls are ignored. Until it is set, or
     /// when `source` returns `None`, the series read zero.
@@ -764,6 +800,30 @@ impl Metrics {
         if let Some(stats) = self.wal.get().and_then(|w| (w.0)()) {
             render_wal(&mut out, &stats);
         }
+        if let Some((size, free)) = self.db_size.get().and_then(|d| (d.0)()) {
+            self.audit_db_size_bytes.store(size, Ordering::Relaxed);
+            self.audit_db_free_bytes.store(free, Ordering::Relaxed);
+        }
+        simple_gauge(
+            &mut out,
+            "audit_db_size_bytes",
+            "Size of the SQLite database file of the audit log and lease registry, in bytes \
+             (page_count * page_size), WAL not included.",
+            &self.audit_db_size_bytes,
+        );
+        simple_gauge(
+            &mut out,
+            "audit_db_free_bytes",
+            "Bytes of that file on SQLite's free list (freelist_count * page_size): freed by \
+             deletes and reused by new rows; the file does not shrink without VACUUM.",
+            &self.audit_db_free_bytes,
+        );
+        simple_counter(
+            &mut out,
+            "audit_pruned_entries_total",
+            "Audit entries deleted by prunes of the log ([audit.retention]).",
+            &self.audit_pruned_entries,
+        );
         simple_counter(
             &mut out,
             "audit_sink_delivered_total",

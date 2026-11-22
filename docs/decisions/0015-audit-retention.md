@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted (2026-11-22)
 date: 2026-11-13
 decision-makers: []
 consulted: []
@@ -48,12 +48,12 @@ Chosen: (a), as a manual, admin-only operation in phase 1 (`POST /admin/audit/pr
 - Bad, because a prune by a legitimate admin destroys the entries on the host. If the archive is lost, the record of what was in it is gone; the anchor and shipped checkpoints prove only that a prefix of a stated length and hash existed.
 - Bad, because `DELETE` does not shrink a SQLite file: freed pages are reused for new rows, so the file stops growing once pruning keeps pace, but it does not get smaller without `VACUUM`, which rewrites the whole file while holding the write lock. Shrinking is deferred.
 - Bad, because answers that read old records change: a refund of a decision whose record was pruned can no longer be told apart from an unknown decision (today's 410 `charge_pruned` versus 404), and `GET /admin/audit/entries/{seq}` for a pruned seq answers 410 `audit_pruned` instead of the entry. The age guard (below) makes this happen only after run state is gone anyway.
-- Neutral, because the schema goes to version 4 (one new table, `audit_anchors`), so a binary from before this change refuses the file, as for every migration; that also keeps an old binary from reporting a pruned log as broken.
+- Neutral, because the schema goes to version 4 (one new table, `audit_anchors`), so a binary from before this change refuses the file, as for every migration; that also keeps an old binary from reporting a pruned log as broken. (Note, 2026-11-22: as built it is version 5, since version 4 was taken by another change first.)
 - Neutral, because statements that the audit log is never pruned (threat model, configuration reference, concepts page) stay true while `prune = "off"` and must say "unless pruned" once this is built.
 
 ### Confirmation
 
-Planned, not written: the tests listed in the design note's [test plan](../design/audit-retention.md#10-test-plan). The security-relevant ones are: a prefix deleted through `with_connection` without an anchor reports a broken chain at the first retained seq; a hand-written anchor row with a copied checkpoint and no valid anchor signature fails; a valid anchor with one more row deleted after `B + 1` fails; a crash at each step of the prune leaves either the old log or the anchored log, never a third state; the archive and the retained export each verify strictly, and the pair verifies as one chain.
+Written for phase 1a (the server and the store), from the design note's [test plan](../design/audit-retention.md#10-test-plan), in `crates/attenuo-audit/tests/retention.rs` and `crates/attenuo-server/tests/audit_retention.rs`. The security-relevant ones: a prefix deleted through `with_connection` without an anchor reports a broken chain at the first retained seq (`a_prefix_deleted_without_an_anchor_is_a_broken_chain_at_the_first_retained_seq`); a hand-written anchor row with a copied checkpoint and no valid anchor signature fails (`a_forged_anchor_row_with_a_copied_checkpoint_fails`, and `an_anchor_by_another_key_fails`); a valid anchor with one more row deleted after `B + 1` fails (`a_genuine_anchor_then_one_more_row_deleted_fails`); a crash at each step of the prune leaves the old log, and a stop between delete batches leaves the anchored log, never a third state (`a_crash_at_each_step_of_the_transaction_leaves_the_old_log`, `a_stop_between_delete_batches_resumes_after_reopen`); the archive and the retained export each verify strictly, and they link (`two_prunes_in_a_row_link_and_their_archives_verify`). Checking the pair as one chain in one command waits for the multi-file `audit verify`, which is not built; the test checks the link itself.
 
 ## Pros and Cons of the Options
 

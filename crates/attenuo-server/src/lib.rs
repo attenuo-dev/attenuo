@@ -28,6 +28,8 @@
 //! | `GET /admin/audit`, `/admin/audit/verify`, `/admin/audit/checkpoint` | admin | audit |
 //! | `GET /admin/audit/entries/{seq}`, `/admin/audit/records/{id}`, `/admin/audit/checkpoints` | admin | one entry with its context; stored checkpoints (read-only) |
 //! | `GET /admin/audit/export?from&to` | admin | stream a verifiable slice of the log as JSON Lines |
+//! | `GET /admin/audit/prune/plan?through` or `?before`, `POST /admin/audit/prune` | admin | plan and commit a prune of the oldest entries behind a signed anchor, with `[audit.retention] prune = "manual"` ([`routes::retention`]) |
+//! | `GET /admin/audit/anchors` | admin | the signed anchors of past prunes, newest first (read-only) |
 //! | `POST /admin/policies/reload` | admin | hot-reload the Cedar policy file |
 //! | `POST /admin/operators/reload` | admin | re-read `[[admin.operators]]` from the config file and swap them in ([`routes::admin::reload_operators`]) |
 //! | `GET /admin/policies` | admin | the policy set in force: ids, text, file digest, load time ([`routes::policies`]) |
@@ -310,7 +312,7 @@ pub fn admin_router(state: Arc<AppState>) -> Router {
 /// Every `/admin/*` route of the table above, behind [`routes::admin::require_admin`]. Mounted
 /// on the main listener ([`router`]) or on its own ([`admin_router`]), never on both.
 fn admin_routes(state: &Arc<AppState>) -> Router<Arc<AppState>> {
-    use routes::{admin, approvals, dev_root, policies};
+    use routes::{admin, approvals, dev_root, policies, retention};
 
     let mut admin_routes = Router::new()
         .route("/admin/whoami", get(admin::whoami))
@@ -326,6 +328,9 @@ fn admin_routes(state: &Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/admin/audit/checkpoints", get(admin::audit_checkpoints))
         .route("/admin/audit/checkpoint", get(admin::audit_checkpoint))
         .route("/admin/audit/export", get(admin::audit_export))
+        .route("/admin/audit/prune/plan", get(retention::prune_plan))
+        .route("/admin/audit/prune", post(retention::prune))
+        .route("/admin/audit/anchors", get(retention::anchors))
         .route("/admin/policies", get(policies::get_policies))
         .route("/admin/policies/check", get(policies::check_policies))
         .route(
@@ -571,10 +576,52 @@ pub async fn prune_user_windows(state: &Arc<AppState>) -> u64 {
     .await
 }
 
+/// One run of the deletes of a committed prune of the audit log (`[audit.retention]`,
+/// ADR-0015): transactions of `[audit.retention] batch_rows` rows each, at most `[leases]
+/// maintenance_max_passes` of them, yielding between them so appends take the write gate in
+/// between. The state is in the file, so a restart resumes where the last batch stopped; the
+/// last batch sets the anchor `done`. Counts what it deleted in `audit_pruned_entries_total`
+/// and returns it; 0 when no prune is deleting.
+pub async fn prune_audit_log(state: &Arc<AppState>) -> u64 {
+    let batch = usize::try_from(state.retention.batch_rows).unwrap_or(usize::MAX);
+    let mut total = 0;
+    let mut through = None;
+    for _ in 0..state.lease_maintenance.max_passes {
+        match state.blocking(move |s| s.audit.prune_step(batch)).await {
+            Ok(step) => {
+                total += step.deleted;
+                state.metrics.audit_pruned_entries(step.deleted);
+                through = step.through_seq.or(through);
+                if step.done {
+                    if let Some(b) = step.through_seq {
+                        tracing::info!(
+                            through = b,
+                            "audit prune done: every pruned row is deleted"
+                        );
+                    }
+                    break;
+                }
+                if step.through_seq.is_none() {
+                    break;
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "deleting pruned audit rows failed");
+                break;
+            }
+        }
+        tokio::task::yield_now().await;
+    }
+    if total > 0 {
+        tracing::info!(deleted = total, through = ?through, "deleted pruned audit rows");
+    }
+    total
+}
+
 /// Start the lease maintenance ticker: every `[leases] maintenance_interval_seconds`,
 /// [`prune_session_bindings`], then [`prune_lease_registry`], then [`prune_run_state`], then
-/// [`prune_user_windows`] (each
-/// does nothing when its retention is 0). Sessions go first, so a binding whose chain is about
+/// [`prune_user_windows`], then [`prune_audit_log`] (each
+/// does nothing when its retention is 0, or when no prune of the audit log is deleting). Sessions go first, so a binding whose chain is about
 /// to be pruned is counted as a session; run state goes last, since it is only pruned once
 /// its leases are gone. Dropping the handle does not stop it; abort it to stop. [`run`] stops
 /// its own ticker between runs instead.
@@ -598,6 +645,7 @@ async fn maintenance_ticks(state: Arc<AppState>, stop: impl std::future::Future<
         prune_lease_registry(&state).await;
         prune_run_state(&state).await;
         prune_user_windows(&state).await;
+        prune_audit_log(&state).await;
     }
 }
 
@@ -720,10 +768,19 @@ pub async fn run(
             }),
         ));
     }
+    // A prune's deletes resume after a restart even if `prune` was turned off since.
+    let prune_deleting = state
+        .audit
+        .newest_anchor()
+        .ok()
+        .flatten()
+        .is_some_and(|a| a.state == attenuo_audit::AnchorState::Deleting);
     if state.session_retention.is_some()
         || state.lease_retention.is_some()
         || state.run_state_retention.is_some()
         || state.user_window_retention.is_some()
+        || state.retention.prune != config::PruneMode::Off
+        || prune_deleting
     {
         let ticks = maintenance_ticks(state.clone(), stopped());
         tasks.push((

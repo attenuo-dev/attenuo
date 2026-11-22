@@ -9,6 +9,7 @@ pub mod ops;
 pub mod page;
 pub mod policies;
 pub mod renew;
+pub mod retention;
 pub mod token;
 pub mod wellknown;
 
@@ -158,8 +159,27 @@ pub(crate) fn audit_admin(
     arguments: Value,
     now: OffsetDateTime,
 ) -> Result<uuid::Uuid, ApiError> {
+    let record = admin_record(actor, tool, decision, reason, leases, arguments, now);
+    let id = record.id;
+    state
+        .metrics
+        .time_audit_append(|| attenuo_audit::AuditSink::append(state.audit.as_ref(), record))?;
+    Ok(id)
+}
+
+/// The record [`audit_admin`] appends, built without appending it: the prune of the audit log
+/// writes its record inside its own transaction (`POST /admin/audit/prune`).
+pub(crate) fn admin_record(
+    actor: &AdminIdentity,
+    tool: &str,
+    decision: Decision,
+    reason: &str,
+    leases: Vec<LeaseId>,
+    arguments: Value,
+    now: OffsetDateTime,
+) -> DecisionRecord {
     let call = ToolCall::new(AUDIT_SERVER, tool, arguments);
-    let record = DecisionRecord {
+    DecisionRecord {
         id: uuid::Uuid::new_v4(),
         at: now,
         kind: if tool == "admin.lease.revoke" {
@@ -189,12 +209,7 @@ pub(crate) fn audit_admin(
         usage: None,
         search: None,
         id_jag_ceiling: None,
-    };
-    let id = record.id;
-    state
-        .metrics
-        .time_audit_append(|| attenuo_audit::AuditSink::append(state.audit.as_ref(), record))?;
-    Ok(id)
+    }
 }
 
 /// Record a token issuance in the audit log.

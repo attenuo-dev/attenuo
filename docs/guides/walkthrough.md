@@ -163,7 +163,7 @@ curl -s $SRV/admin/audit/verify -H "Authorization: Bearer $ADMIN"
 ```
 
 ```json
-{"entries":8,"ok":true,"first_bad_seq":null,"checkpoints":0,"last_signed_seq":null,"unsigned_tail":8,"bad_checkpoints":[]}
+{"entries":8,"ok":true,"first_bad_seq":null,"checkpoints":0,"last_signed_seq":null,"unsigned_tail":8,"bad_checkpoints":[],"pruned_through":null,"anchors":0,"bad_anchors":[]}
 ```
 
 ```sh

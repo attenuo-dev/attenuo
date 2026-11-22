@@ -88,6 +88,8 @@ pub enum List {
     /// by a [`SearchBinding`]: the position is the index of the next candidate tool, an offset
     /// (see `routes::authzen::search_action`).
     ActionSearch = 4,
+    /// `GET /admin/audit/anchors`.
+    Anchors = 5,
 }
 
 impl List {
@@ -96,7 +98,7 @@ impl List {
     fn cursor_bytes(self) -> usize {
         match self {
             Self::ActionSearch => BOUND_CURSOR_BYTES,
-            Self::Audit | Self::Checkpoints | Self::Approvals => CURSOR_BYTES,
+            Self::Audit | Self::Checkpoints | Self::Approvals | Self::Anchors => CURSOR_BYTES,
         }
     }
 }
@@ -362,7 +364,12 @@ mod tests {
 
     #[test]
     fn round_trip_and_opaque_shape() {
-        for list in [List::Audit, List::Checkpoints, List::Approvals] {
+        for list in [
+            List::Audit,
+            List::Checkpoints,
+            List::Approvals,
+            List::Anchors,
+        ] {
             for dir in [Direction::Ascending, Direction::Descending] {
                 for pos in [1, 2, 4096, u64::MAX] {
                     let c = encode(list, dir, pos);
@@ -512,7 +519,12 @@ mod tests {
         // A search token is refused by every admin list, and an admin cursor by search.
         let b = SearchBinding::new(&chain("L1"), "github", None);
         let search = encode_search(2, &b);
-        for list in [List::Audit, List::Checkpoints, List::Approvals] {
+        for list in [
+            List::Audit,
+            List::Checkpoints,
+            List::Approvals,
+            List::Anchors,
+        ] {
             for dir in [Direction::Ascending, Direction::Descending] {
                 let e = decode(Some(&search), list, dir).unwrap_err();
                 assert_eq!(code(&e), INVALID_CURSOR);

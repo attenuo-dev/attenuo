@@ -1,6 +1,6 @@
 # Audit retention: design
 
-- Status: proposed, not built. Decision record: [ADR-0015](../decisions/0015-audit-retention.md). Nothing here changes what the server does today: the audit log is never pruned, and every statement elsewhere that it keeps every record holds.
+- Status: phase 1a (the server and the store) built on 2026-11-22; see [As built](#11-as-built). Decision record: [ADR-0015](../decisions/0015-audit-retention.md). With the default `prune = "off"` the audit log is never pruned, and every statement elsewhere that it keeps every record holds. Sections 1 to 10 are the design as proposed and keep their code references to the base commit.
 - Date: 2026-11-13. Base: `main` at 7493efb. Every code reference below is to that commit.
 - Finding: O-4 of the 2026-11-07 audit, "no audit retention or rotation, so the file grows without bound".
 
@@ -260,3 +260,35 @@ Server and CLI tests:
 - Concurrent appends during a prune: every append either lands before H or after P, none is lost or denied under the default batch size (with the batch size taken from the measurement above).
 - Refund of a decision whose charge and record were both pruned: 404 naming the boundary.
 - `GET /admin/audit/entries/{seq}` for a pruned seq: 410 `audit_pruned`; `GET /admin/audit` with a cursor below the boundary resumes at B + 1.
+
+## 11. As built
+
+Phase 1a, 2026-11-22: the server and the store. The owner's answers to the open questions: 90 days for `min_age_seconds` (1); `prune = "manual"` requires `[audit.sink]` (2); the signed digest is enough (3); no index of pruned record ids, so a pruned id is a 404 whose message names the boundary (4); the checkpoints below B are dropped with the last delete batch (5). For (6) the anchor has its own envelope, `attenuo-shipped-anchor-v1`, sent through the same sink: in a file sink it is one more line of the same file, told apart by its `anchor` member. The shipped file's lines carry no type tag (a checkpoint line is recognised by its members), and an older `parse_shipped` errors on a line it cannot read, so a new line type in the checkpoint format would break older readers anyway; a separate format at least names itself, and `parse_shipped` now skips anchor lines. An older CLI's `--checkpoints` cross-check still errors on a file that holds an anchor line, which only happens once a prune was made. In S3 it is its own object, `<prefix>anchor-<through_seq>-<sha16>.json`.
+
+What was built, against section 4:
+
+- Schema version 5 adds `audit_anchors` as in section 8, with `state` `deleting` or `done`.
+- The anchor is signed under `attenuo-audit-anchor-v1` next to the checkpoint signing (`Anchor` in `crates/attenuo-audit/src/checkpoint.rs`). The prune record is an `admin` record of tool `admin.audit.prune` whose arguments are `{through_seq, through_hash, previous_through_seq, archive_sha256}`, built as `audit_admin` builds its record.
+- `SqliteAudit::prune_through` writes the "before" checkpoint, the prune record, the anchor, the "after" checkpoint and the anchor row in one `IMMEDIATE` transaction with `synchronous=FULL`; the hooks fire after the commit, so the sink queues both checkpoints and the anchor. `prune_step` deletes `batch_rows` rows per transaction; the maintenance ticker runs it, also when `prune` was turned off after a prune, and a restart resumes it.
+- Every read clamps to the newest anchor in SQL, so a prune is visible to reads as soon as it commits. `head_link` on an empty table falls back to the anchor's prune record. Verify walks from the newest anchor (`Start::Anchored`) and reports `pruned_through`, `anchors` and `bad_anchors`; an older anchor is checked for its signature and its `previous_through_seq` link only, since its checkpoint and record may be gone.
+- The guards are checked in this order: already pruned (410 `audit_pruned`), a prune still deleting (`prune_in_progress`), the checkpoint at B and its hash (`prune_not_at_checkpoint`), the age of the entry at B (`prune_too_recent`), the first record of a chain whose root lease is still in the registry (`prune_live_run`), and the sink (`sink_behind`: the previous anchor not delivered, degraded, or `delivered_through` below B, counted from the server's start). One code was added to the design's list: `prune_conflict` (409) for the same `through` with another `archive_sha256`.
+- The routes of section 6.2 are admin role only, and not on the console listener. `GET /admin/audit` gained `first`; the export defaults `from` to B + 1 and puts the anchor in its header from there, and the CLI `audit export` no longer sends `from=1` by default.
+- Metrics: `audit_pruned_entries_total`, and the gauges `audit_db_size_bytes` and `audit_db_free_bytes`, read at a scrape only when the store's reader is free.
+- Measured: one delete batch of 10000 rows on a 200,000-row file (266 MB) took 0.33 to 0.38 s in a release build (1000 rows about 0.06 s, 20000 rows 0.36 to 0.53 s), far below the 10 s append timeout, so `batch_rows` stays 10000. The test is `measure_a_delete_batch` in `crates/attenuo-audit/tests/retention.rs` (ignored by default).
+
+After the first review (same day):
+
+- The anchor is never dropped from a full sink queue (the oldest checkpoint goes instead). `audit_anchors` has `shipped_at`, set when the sink delivers the anchor; the server queues every anchor with no `shipped_at` again at start-up and on a repeated request, and refuses the next prune with `sink_behind` while the newest anchor is not delivered. There is no give-up path. Section 7's `shipped: false` became, in the POST answer, `shipped: {queued, delivered_through, anchor_shipped_at, anchor_pending}` (null without a sink), and `GET /admin/audit/anchors` shows each anchor's `shipped_at`. The plan's guards gained `anchor_undelivered`, and `limited_by` can be `"before"`, which is not a refusal code.
+- The Python and TypeScript readers of the shipped file skip anchor lines, as `parse_shipped` does.
+- The live-run lookup is one search of `audit_chain_id_idx` per root lease in the registry (the chain's first record), not a read of every record of every live chain; a test pins its plan. On 10000 live chains it took 4.5 ms (10 records each) and 8.4 ms (40 each) for a whole plan, where the old query took 7.0 ms and 13.8 ms.
+- `min_age_seconds` is at most 100 years, and the cutoff is computed with checked arithmetic, so a huge value cannot panic under the writer's lock. Start-up warns when `[leases] retention_seconds = 0`.
+- The plan finds the newest entry that is old enough (and older than `before`) by a binary search on seq before it scans checkpoints, so a busy log with more than 100,000 checkpoints above the cutoff still gets a boundary.
+- `head_link` on an empty table of a pruned log falls back to the larger of the newest anchor's prune record and the newest stored checkpoint. A log never pruned starts at genesis as before.
+- The plain `verify_chain` of a pruned log says, in `VerifyReport::unauthenticated_start`, that it walked from an anchor row whose signature it did not check. No server or CLI path calls it; `/admin/audit/verify` uses the signed verify.
+- A signed verify that fails walks once more from a new snapshot when the anchors changed meanwhile (a prune's deletes overlapping the walk). An export that streams while a prune commits above its position ends with an error rather than a file with a gap.
+- The maintenance tick checks for a deleting anchor on the reader first, so with nothing to delete it opens no write transaction. The entry reads with the retained clause keep the index they used before (a test pins two plans and checks the rest); the entry count is two counts, so it keeps its covering index.
+- A 410 `audit_pruned` from `POST /admin/audit/prune` carries `pruned_through`, `prune_seq` and `first`, as the others do.
+- Second PR: the CLI cross-check does not yet check shipped anchors, and does not print `below_range`.
+
+Not built yet: the CLI `attenuo audit prune`, `audit verify` over several files, the SDK verifiers' knowledge of the anchor (they read the header and ignore the member, so a retained export verifies there as a window), the console, `prune = "auto"` and `VACUUM`.
+

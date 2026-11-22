@@ -46,8 +46,8 @@ pub use approval::{
 };
 pub use budget::{ChargeOutcome, CounterSummary, HopLimit};
 pub use checkpoint::{
-    verify_with_checkpoints, BadCheckpoint, Checkpoint, CheckpointKeys, SignedVerifyReport, Start,
-    CHECKPOINT_CONTEXT,
+    verify_with_checkpoints, Anchor, BadAnchor, BadCheckpoint, Checkpoint, CheckpointKeys,
+    SignedVerifyReport, Start, ANCHOR_CONTEXT, CHECKPOINT_CONTEXT, PRUNE_TOOL,
 };
 pub use error::AuditError;
 pub use export::{
@@ -68,10 +68,15 @@ pub use memory::MemoryAudit;
 pub use query::{EntryFilter, Order};
 pub use replay::{ReplayOutcome, ReplayStore, REPLAY_PRUNE_BATCH};
 pub use shipped::{
-    checkpoint_sha256, cross_check, parse_shipped, CrossCheckReport, ShippedCheckpoint,
-    ShippedLine, ShippedMismatch, SHIPPED_FORMAT,
+    checkpoint_sha256, cross_check, parse_shipped, parse_shipped_anchors, CrossCheckReport,
+    ShippedAnchor, ShippedCheckpoint, ShippedLine, ShippedMismatch, SHIPPED_ANCHOR_FORMAT,
+    SHIPPED_FORMAT,
 };
 pub use spans::{SpanHit, MAX_SEQS_PER_PROBE, MAX_SPANS_PER_RUN};
+pub use sqlite::{
+    AnchorState, PlanBound, PlanGuards, PruneGuard, PruneLimits, PruneOutcome, PrunePlan,
+    PruneStep, SinkProgress, StoredAnchor,
+};
 pub use sqlite::{
     AppendStats, Durability, Filesystem, NewNotice, OutboxNotice, SchemaState, SqliteAudit,
     SqliteLeaseStore, WalCheckpoint, WalStats, WriterFence, CHECKPOINT_PRESYNC_LEAD,

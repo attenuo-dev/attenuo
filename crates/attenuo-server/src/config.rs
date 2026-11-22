@@ -841,6 +841,104 @@ pub struct AuditSection {
     /// Unset by default.
     #[serde(default)]
     pub sink: Option<SinkSection>,
+    /// `[audit.retention]`: whether and how the admin may prune the oldest part of the log
+    /// behind a signed anchor (ADR-0015). Off by default: the log is never pruned.
+    #[serde(default)]
+    pub retention: RetentionSection,
+}
+
+/// `[audit.retention] prune`: who may prune the audit log.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PruneMode {
+    /// Never pruned (the default). The prune routes answer 409 `prune_disabled`.
+    #[default]
+    Off,
+    /// Pruned only when the admin asks (`POST /admin/audit/prune`).
+    Manual,
+}
+
+impl<'de> Deserialize<'de> for PruneMode {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        match s.as_str() {
+            "off" => Ok(Self::Off),
+            "manual" => Ok(Self::Manual),
+            "auto" => Err(serde::de::Error::custom(
+                "[audit.retention] prune = \"auto\" is not built yet: use \"manual\" (the admin \
+                 prunes through POST /admin/audit/prune) or \"off\"",
+            )),
+            other => Err(serde::de::Error::custom(format!(
+                "[audit.retention] prune must be \"off\" or \"manual\", not {other:?}"
+            ))),
+        }
+    }
+}
+
+impl std::fmt::Display for PruneMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Off => "off",
+            Self::Manual => "manual",
+        })
+    }
+}
+
+/// Default `[audit.retention] min_age_seconds`: 90 days.
+pub const DEFAULT_PRUNE_MIN_AGE_SECONDS: u64 = 7_776_000;
+/// Default `[audit.retention] batch_rows`, from a measurement: one batch of 10000 rows took
+/// about 0.35 s on a 200000-row file, far below `[audit] append_timeout_seconds`.
+pub const DEFAULT_PRUNE_BATCH_ROWS: u64 = 10_000;
+/// Largest `[audit.retention] batch_rows`.
+pub const MAX_PRUNE_BATCH_ROWS: u64 = 1_000_000;
+/// Largest `[audit.retention] min_age_seconds`: 100 years (of 365 days).
+pub const MAX_PRUNE_MIN_AGE_SECONDS: u64 = 3_153_600_000;
+
+/// `[audit.retention]`: pruning the oldest entries of the audit log (ADR-0015). A prune
+/// writes a signed anchor naming the last pruned seq and its hash, so the retained log still
+/// verifies; the pruned rows are then deleted in batches by the maintenance task. See
+/// `docs/design/audit-retention.md`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetentionSection {
+    /// `"off"` (default) or `"manual"`. `"auto"` is not built and is refused.
+    #[serde(default)]
+    pub prune: PruneMode,
+    /// Nothing younger than this, in seconds, is pruned: the entry at the boundary must be
+    /// older. Default 7776000 (90 days), at most 3153600000 (100 years). May not be below the
+    /// run-state retentions of `[leases]`.
+    #[serde(default = "default_prune_min_age_seconds")]
+    pub min_age_seconds: u64,
+    /// Rows deleted per transaction once a prune is committed. Default 10000, between 1 and
+    /// 1000000.
+    #[serde(default = "default_prune_batch_rows")]
+    pub batch_rows: u64,
+}
+
+fn default_prune_min_age_seconds() -> u64 {
+    DEFAULT_PRUNE_MIN_AGE_SECONDS
+}
+fn default_prune_batch_rows() -> u64 {
+    DEFAULT_PRUNE_BATCH_ROWS
+}
+
+impl Default for RetentionSection {
+    fn default() -> Self {
+        Self {
+            prune: PruneMode::Off,
+            min_age_seconds: DEFAULT_PRUNE_MIN_AGE_SECONDS,
+            batch_rows: DEFAULT_PRUNE_BATCH_ROWS,
+        }
+    }
+}
+
+impl RetentionSection {
+    /// `min_age_seconds` as a duration, at most [`MAX_PRUNE_MIN_AGE_SECONDS`] (start-up
+    /// refuses more).
+    pub fn min_age(&self) -> time::Duration {
+        let secs = self.min_age_seconds.min(MAX_PRUNE_MIN_AGE_SECONDS);
+        time::Duration::seconds(i64::try_from(secs).unwrap_or(i64::MAX))
+    }
 }
 
 /// Where `[audit.sink]` ships checkpoints.
@@ -1106,6 +1204,7 @@ impl Default for AuditSection {
             append_timeout_seconds: default_append_timeout_seconds(),
             allow_network_filesystem: false,
             sink: None,
+            retention: RetentionSection::default(),
         }
     }
 }
@@ -3261,6 +3360,75 @@ impl Config {
         )
     }
 
+    /// Startup check of `[audit.retention]`, which needs the other sections: with `prune`
+    /// other than `"off"`, refuse `sqlite_path = ":memory:"`, a log without `[audit.sink]`
+    /// (the anchor must leave the host, ADR-0015), and a `min_age_seconds` below the run-state
+    /// retentions (`[leases] retention_seconds + run_state_retention_seconds`, each term only
+    /// when not 0, and `user_window_retention_seconds`), so that a record is never pruned
+    /// before the run state that might need it. `batch_rows` is checked whatever `prune` is.
+    ///
+    /// # Errors
+    ///
+    /// The message names the setting and the bound.
+    pub fn check_retention(&self) -> anyhow::Result<()> {
+        let r = &self.audit.retention;
+        if !(1..=MAX_PRUNE_BATCH_ROWS).contains(&r.batch_rows) {
+            anyhow::bail!(
+                "[audit.retention] batch_rows must be between 1 and {MAX_PRUNE_BATCH_ROWS}, not {}",
+                r.batch_rows
+            );
+        }
+        if r.min_age_seconds > MAX_PRUNE_MIN_AGE_SECONDS {
+            anyhow::bail!(
+                "[audit.retention] min_age_seconds must be at most {MAX_PRUNE_MIN_AGE_SECONDS} \
+                 (100 years), not {}",
+                r.min_age_seconds
+            );
+        }
+        if r.prune == PruneMode::Off {
+            return Ok(());
+        }
+        if self.leases.retention_seconds == 0 {
+            tracing::warn!(
+                "[audit.retention] prune = \"{}\" with [leases] retention_seconds = 0: every \
+                 lease tree stays in the registry, so the prune_live_run guard refuses any \
+                 boundary at or above the first record of a chain that was ever issued; set \
+                 retention_seconds to let old trees go",
+                r.prune
+            );
+        }
+        if self.audit.sqlite_path == ":memory:" {
+            anyhow::bail!(
+                "[audit.retention] prune = \"{}\" needs a file: [audit] sqlite_path is \
+                 \":memory:\", which keeps nothing to prune",
+                r.prune
+            );
+        }
+        if self.audit.sink.is_none() {
+            anyhow::bail!(
+                "[audit.retention] prune = \"{}\" needs [audit.sink]: the signed anchor of a \
+                 prune must be shipped off the host with the checkpoints",
+                r.prune
+            );
+        }
+        let runs = self
+            .leases
+            .retention_seconds
+            .saturating_add(self.leases.run_state_retention_seconds);
+        let floor = runs.max(self.leases.user_window_retention_seconds);
+        if r.min_age_seconds < floor {
+            anyhow::bail!(
+                "[audit.retention] min_age_seconds = {} is below the run-state retention of \
+                 [leases] ({floor}: retention_seconds + run_state_retention_seconds = {runs}, \
+                 user_window_retention_seconds = {}): a record could be pruned while run state \
+                 still points to it. Use at least {floor}",
+                r.min_age_seconds,
+                self.leases.user_window_retention_seconds
+            );
+        }
+        Ok(())
+    }
+
     /// Apply environment overrides: [`ADMIN_TOKEN_ENV`] replaces `[admin] token`.
     pub fn apply_env(&mut self) {
         if let Some(t) = std::env::var(ADMIN_TOKEN_ENV)
@@ -3719,6 +3887,82 @@ mod tests {
     use super::*;
 
     /// The `[limits]` defaults: a cap, the three deadlines, and every rate limit off.
+    /// `[audit.retention]`: off by default, `"auto"` refused as not built, and the start-up
+    /// refusals of a prune setting that cannot work (ADR-0015).
+    #[test]
+    fn audit_retention_defaults_and_startup_refusals() {
+        let cfg = Config::from_toml("").unwrap();
+        let r = &cfg.audit.retention;
+        assert_eq!(
+            (r.prune, r.min_age_seconds, r.batch_rows),
+            (PruneMode::Off, 7_776_000, 10_000)
+        );
+        cfg.check_retention().unwrap();
+        let e = Config::from_toml("[audit.retention]\nprune = \"auto\"\n").unwrap_err();
+        assert!(e.to_string().contains("not built"), "{e}");
+        let e = Config::from_toml("[audit.retention]\nprune = \"daily\"\n").unwrap_err();
+        assert!(e.to_string().contains("\"off\" or \"manual\""), "{e}");
+        assert!(Config::from_toml("[audit.retention]\nkeep_seconds = 1\n").is_err());
+
+        let manual = |extra: &str| {
+            Config::from_toml(&format!(
+                "[audit]\nsqlite_path = \"/var/lib/attenuo/a.sqlite\"\n\
+                 [audit.sink]\nkind = \"file\"\npath = \"/mnt/s/c.jsonl\"\n\
+                 [audit.retention]\nprune = \"manual\"\n{extra}"
+            ))
+            .unwrap()
+        };
+        manual("").check_retention().unwrap();
+        // In memory: nothing to prune.
+        let mut c = manual("");
+        c.audit.sqlite_path = ":memory:".into();
+        let e = c.check_retention().unwrap_err().to_string();
+        assert!(e.contains(":memory:"), "{e}");
+        // No sink: the anchor would never leave the host.
+        let mut c = manual("");
+        c.audit.sink = None;
+        let e = c.check_retention().unwrap_err().to_string();
+        assert!(e.contains("[audit.sink]"), "{e}");
+        // Below the run-state retention: a week of leases plus 30 days of run state.
+        let e = manual("min_age_seconds = 3196799\n")
+            .check_retention()
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("3196800"), "{e}");
+        manual("min_age_seconds = 3196800\n")
+            .check_retention()
+            .unwrap();
+        // The per-user window retention counts too, and a retention of 0 drops its term.
+        let mut c = manual("min_age_seconds = 3196800\n");
+        c.leases.user_window_retention_seconds = 4_000_000;
+        assert!(c.check_retention().is_err());
+        let mut c = manual("min_age_seconds = 3024000\n");
+        c.leases.retention_seconds = 0;
+        c.check_retention().unwrap();
+        // batch_rows is checked whatever prune is.
+        let e = Config::from_toml("[audit.retention]\nbatch_rows = 0\n")
+            .unwrap()
+            .check_retention()
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("batch_rows"), "{e}");
+        // So is a min_age_seconds that would not fit below the clock.
+        let e = Config::from_toml("[audit.retention]\nmin_age_seconds = 9223372036854775807\n")
+            .unwrap()
+            .check_retention()
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("at most 3153600000"), "{e}");
+        let huge = RetentionSection {
+            min_age_seconds: u64::MAX,
+            ..RetentionSection::default()
+        };
+        assert_eq!(
+            huge.min_age(),
+            time::Duration::seconds(i64::try_from(MAX_PRUNE_MIN_AGE_SECONDS).unwrap())
+        );
+    }
+
     #[test]
     fn limits_defaults() {
         let l = Config::from_toml("").unwrap().limits;
