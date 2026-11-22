@@ -544,7 +544,7 @@ The filters combine, and apply inside `--from`/`--to`. A refused exchange or ren
 
 ### `audit prune`
 
-Prune the start of the audit log through a checkpoint, after archiving it. The server must set `[audit.retention] prune = "manual"` (otherwise the plan is refused with `prune_disabled`). Needs the admin token.
+Prune the start of the audit log through a checkpoint, after archiving it. The server must set `[audit.retention] prune = "manual"` or `"auto"` (otherwise the plan is refused with `prune_disabled`). Needs the admin token.
 
 ```sh
 attenuo audit prune --before 2026-08-01T00:00:00Z --archive /mnt/archive/attenuo-0001.jsonl
@@ -554,7 +554,7 @@ attenuo audit prune --before 2026-08-01T00:00:00Z --dry-run
 
 The command runs these steps, and stops at the first that fails:
 
-1. Plan: `GET /admin/audit/prune/plan?before=` (or `?through=`). The server answers the largest boundary its guards allow at or below the request. With `--dry-run` the plan is printed and the command stops. When nothing can be pruned, the plan and the guard that limited it are printed and the command exits 2.
+1. Plan: `GET /admin/audit/prune/plan?before=` (or `?through=`). The server answers the largest boundary its guards allow at or below the request. With `--dry-run` the plan is printed and the command stops. With `prune = "auto"` the printed plan also names the automatic prune's settings (and its `archive_dir`, if any) and its last run. When nothing can be pruned, the plan and the guard that limited it are printed and the command exits 2.
 2. Export `from..=through` to a temporary file next to `--archive` (`.<name>.partial-<pid>-<random>`), created with mode 0600 on Unix and flushed to disk. An `--archive` that exists is refused before anything is exported. The plan must name the checkpoint's hash; a plan without it is an error.
 3. Verify the file strictly with the issuer keys (`--jwks`, else `/.well-known/jwks.json` from `--server`), as `audit verify --file` does, and check that it is the plan's range, that it starts where the log now starts, that its last entry is the one the plan's checkpoint signs, and, when it does not start at seq 1, that its header anchor is the server's newest anchor. A file that does not pass is removed, and the command exits 2.
 4. Move the file to `--archive` (with a hard link, so a file that appeared meanwhile is never overwritten; where hard links are not supported, with `renameat2(RENAME_NOREPLACE)` on Linux, and on other systems the command stops with an error and keeps the verified temporary file), sync the directory (a directory that cannot be synced stops the command before the request), and take the SHA-256 of its bytes. The archive keeps mode 0600.
