@@ -7,10 +7,16 @@
 //! 0. Look at the clocks: when the wall clock moved more than [`CLOCK_JUMP_SLACK`] away from
 //!    the monotonic clock since the last run (or since start), the run is `skipped`
 //!    (`clock_jump`) with a warning. The next run, with the clocks in step again, goes on.
-//! 1. Plan, as `GET /admin/audit/prune/plan` does with no bound, but with `keep_seconds` as the
-//!    age floor ([`attenuo_audit::SqliteAudit::prune_plan`]), measured back from the time of
-//!    the newest entry when that is earlier than now, so that a clock that jumps ahead with no
-//!    new entries makes nothing old enough. Every guard of a manual prune
+//!    This is the visible signal only; what keeps a jump from pruning early is the cutoff.
+//!    The monotonic clock does not count a suspend or a VM pause (on Linux), so after one
+//!    this check can report a jump that was none.
+//! 1. Plan, as `GET /admin/audit/prune/plan` does with no bound, but with only entries older
+//!    than the run's cutoff old enough ([`attenuo_audit::SqliteAudit::prune_plan`]). The
+//!    cutoff is `min(now, newest entry, bound) - keep_seconds`. The newest entry is the
+//!    newest one that is not a prune record, so on an idle server the last `keep_seconds`
+//!    before it stay. The bound is the wall time at start plus the monotonic time since, so
+//!    inside one process a wall clock that jumps ahead never makes more old enough than the
+//!    real time that passed, with or without new entries. Every guard of a manual prune
 //!    applies: a signed checkpoint at the boundary, no live run below it, and `[audit.sink]`
 //!    caught up (not degraded, a checkpoint at or past the boundary delivered since start, the
 //!    anchor of the prune before delivered). Nothing allowed: the run is `skipped`, with the
@@ -30,11 +36,13 @@
 //!    to disk and then linked into place, with the directory flushed after. The file is then
 //!    read back and verified: from genesis or from the newest anchor, to the boundary's hash,
 //!    every entry signed, the same bytes in both passes. A file of that name is never
-//!    replaced: one that passes the same check is used as it is (its own digest is signed),
-//!    any other fails the run (`archive_exists`). Any failure fails the run
+//!    replaced: one that passes the same check, and whose bytes are the export of the range
+//!    made again with its own `exported_at`, is used as it is (its own digest is signed); any
+//!    other fails the run (`archive_exists`). Any failure fails the run
 //!    (`archive_write_failed`, `archive_exists`, `archive_verify_failed`), or skips it
 //!    (`concurrent_prune`) when another prune moved the boundary meanwhile, and nothing is
-//!    pruned. A file this run wrote and no prune used is removed again.
+//!    pruned. A file this run wrote is removed again when the prune was refused; after a
+//!    store error, which may come after the commit, it stays for the next run.
 //! 4. Prune ([`attenuo_audit::SqliteAudit::prune_through_expecting`]), with the plan's first
 //!    seq and the boundary's hash as the expected archive, so a prune that something else made
 //!    in between refuses this one. The guards are checked again inside the transaction. The
@@ -161,23 +169,38 @@ pub struct AutoPruneRun {
 /// The last run, kept for `GET /admin/audit/prune/plan`. Lost at a restart. Also: the lock
 /// that keeps two runs of this process apart (the timer never overlaps its own runs, but a
 /// direct call of [`auto_prune_once`] could), so that two runs never write in `archive_dir` at
-/// once; the clock readings of the last run, for the clock-jump check; and the files of
-/// `archive_dir` already warned about.
+/// once; the clock readings at start, which bound how far the cutoff can move; the clock
+/// readings of the last run, for the clock-jump check; and the files of `archive_dir` already
+/// looked at.
 #[derive(Debug, Default)]
 pub struct AutoPruneStatus {
     last: Mutex<Option<AutoPruneRun>>,
     running: Arc<tokio::sync::Mutex<()>>,
+    start: Option<(Instant, OffsetDateTime)>,
     clocks: Mutex<Option<(Instant, OffsetDateTime)>>,
-    warned: Mutex<HashSet<String>>,
+    seen: Mutex<HashSet<String>>,
 }
 
 impl AutoPruneStatus {
-    /// A status whose clock-jump check starts from `wall`, read now.
-    pub fn starting_at(wall: OffsetDateTime) -> Self {
+    /// A status that starts now by `clock`: the monotonic and the wall reading it takes here
+    /// are where the cutoff's bound and the clock-jump check start from.
+    pub fn starting_at(clock: &dyn attenuo_core::Clock) -> Self {
+        let now = (clock.now(), clock.now_utc());
         Self {
-            clocks: Mutex::new(Some((Instant::now(), wall))),
+            start: Some(now),
+            clocks: Mutex::new(Some(now)),
             ..Self::default()
         }
+    }
+
+    /// The latest wall time the cutoff may be measured from at `mono`: the wall time at
+    /// start plus the monotonic time since. A wall clock that jumps ahead in this process does
+    /// not move it. The monotonic clock does not count a suspend or a VM pause (on Linux),
+    /// which only holds it back, so pruning comes later, never sooner. `None` without a start.
+    fn bound_at(&self, mono: Instant) -> Option<OffsetDateTime> {
+        let (m0, w0) = self.start?;
+        let passed = mono.saturating_duration_since(m0);
+        Some(w0.saturating_add(time::Duration::try_from(passed).unwrap_or(time::Duration::MAX)))
     }
 
     /// The last run this process made, if any.
@@ -211,9 +234,9 @@ impl AutoPruneStatus {
         })
     }
 
-    /// Whether `key` is warned about for the first time in this process.
-    fn first_warning(&self, key: String) -> bool {
-        self.warned
+    /// Whether `key` is looked at for the first time in this process.
+    fn first_look(&self, key: String) -> bool {
+        self.seen
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(key)
@@ -241,7 +264,7 @@ fn rfc3339(t: OffsetDateTime) -> String {
 pub async fn auto_prune_once(state: &Arc<AppState>) -> AutoPruneRun {
     let _one = state.auto_prune.running.lock().await;
     let started = state.now();
-    if let Some(detail) = state.auto_prune.clock_jump(Instant::now(), started) {
+    if let Some(detail) = state.auto_prune.clock_jump(state.clock.now(), started) {
         let run = run_of(started, OUTCOME_SKIPPED, RUN_CLOCK_JUMP, None, Some(detail));
         return finish(state, run);
     }
@@ -298,6 +321,8 @@ pub struct Prepared {
     pub through_hash: String,
     /// The archive file, with `archive_dir`.
     pub archive: Option<Archive>,
+    /// The cutoff the run planned with: only entries older than it are old enough.
+    pub cutoff: OffsetDateTime,
 }
 
 /// An archive file in `archive_dir`, verified as the prefix.
@@ -320,7 +345,18 @@ pub struct Archive {
 #[doc(hidden)]
 pub async fn auto_prune_prepare(state: &Arc<AppState>) -> Result<Prepared, Box<AutoPruneRun>> {
     let _one = state.auto_prune.running.lock().await;
-    prepare(state, state.now()).await
+    let started = state.now();
+    let keep = state.retention.keep().unwrap_or(time::Duration::ZERO);
+    let cutoff = cutoff_of(state, keep).await.map_err(|e| {
+        Box::new(run_of(
+            started,
+            OUTCOME_FAILED,
+            RUN_ERROR,
+            None,
+            Some(e.to_string()),
+        ))
+    })?;
+    prepare(state, started, cutoff).await
 }
 
 fn run_of(
@@ -341,28 +377,76 @@ fn run_of(
     }
 }
 
-/// The limits of an automatic prune: those of a manual one with `keep` as the age, measured
-/// back from the time of the newest entry when that is before now. A wall clock that jumps
-/// ahead with no new entries then makes nothing older than it was.
-fn auto_limits(s: &AppState, keep: time::Duration) -> Result<PruneLimits, AuditError> {
-    let mut limits = crate::routes::retention::limits(s, keep);
-    if let Some(newest) = s.audit.head()? {
-        let behind = limits.now - newest.record.at;
-        if behind.is_positive() {
-            limits.min_age = keep.saturating_add(behind);
+/// How many entries below the head [`newest_entry_at`] looks at for one that is not a
+/// prune record.
+const NEWEST_LOOKBACK: usize = 64;
+
+/// The time of the newest entry that is not a prune record (the automatic prune's own, or an
+/// admin's): those are stamped by the server's clock when it prunes, so they say nothing about
+/// how old the rest of the log is. When the last [`NEWEST_LOOKBACK`] entries are all prune
+/// records, the oldest of them. `None` for an empty log.
+fn newest_entry_at(s: &AppState) -> Result<Option<OffsetDateTime>, AuditError> {
+    let Some(mut e) = s.audit.head()? else {
+        return Ok(None);
+    };
+    for _ in 0..NEWEST_LOOKBACK {
+        let prune =
+            e.record.tool == PRUNE_TOOL || e.record.originating_subject == AUTO_PRUNE_SUBJECT;
+        if !prune {
+            break;
+        }
+        match e
+            .seq
+            .checked_sub(1)
+            .map(|p| s.audit.entry_at(p))
+            .transpose()?
+            .flatten()
+        {
+            Some(below) => e = below,
+            None => break,
         }
     }
-    Ok(limits)
+    Ok(Some(e.record.at))
+}
+
+/// The cutoff of this run: entries older than it may be pruned. It is
+/// `min(now, newest entry, bound) - keep`, where the newest entry ignores prune records
+/// ([`newest_entry_at`]) and the bound is the wall time at start plus the monotonic time since
+/// (`AutoPruneStatus::bound_at`). So on an idle server the last `keep` before the newest entry
+/// stay, and inside one process a wall clock that jumps ahead, with or without new entries,
+/// never makes more eligible than the real time that passed.
+async fn cutoff_of(
+    state: &Arc<AppState>,
+    keep: time::Duration,
+) -> Result<OffsetDateTime, AuditError> {
+    let newest = state.blocking(newest_entry_at).await?;
+    let now = state.now();
+    let bound = state.auto_prune.bound_at(state.clock.now()).unwrap_or(now);
+    let from = [Some(now), newest, Some(bound)]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(now);
+    Ok(from.saturating_sub(keep))
+}
+
+/// The limits of an automatic prune: those of a manual one, with the age floor set so that
+/// only what is older than `cutoff` is old enough (never less than `keep`).
+fn auto_limits(s: &AppState, keep: time::Duration, cutoff: OffsetDateTime) -> PruneLimits {
+    let mut limits = crate::routes::retention::limits(s, keep);
+    limits.min_age = keep.max(limits.now - cutoff);
+    limits
 }
 
 async fn plan_at(
     state: &Arc<AppState>,
     keep: time::Duration,
+    cutoff: OffsetDateTime,
     bound: u64,
 ) -> Result<PrunePlan, AuditError> {
     state
         .blocking(move |s| {
-            let limits = auto_limits(s, keep)?;
+            let limits = auto_limits(s, keep, cutoff);
             s.audit.prune_plan(PlanBound::Through(bound), &limits)
         })
         .await
@@ -374,6 +458,7 @@ async fn plan_at(
 async fn capped(
     state: &Arc<AppState>,
     keep: time::Duration,
+    cutoff: OffsetDateTime,
     plan: PrunePlan,
     max: u64,
 ) -> Result<PrunePlan, AuditError> {
@@ -384,7 +469,7 @@ async fn capped(
         return Ok(plan);
     }
     let bound = plan.from.saturating_sub(1).saturating_add(max);
-    let inside = plan_at(state, keep, bound).await?;
+    let inside = plan_at(state, keep, cutoff, bound).await?;
     if inside.through.is_some_and(|t| t >= plan.from) && inside.from == plan.from {
         return Ok(inside);
     }
@@ -396,7 +481,7 @@ async fn capped(
         let Some(c) = next.filter(|c| c.seq < through) else {
             break;
         };
-        let p = plan_at(state, keep, c.seq).await?;
+        let p = plan_at(state, keep, cutoff, c.seq).await?;
         if p.through == Some(c.seq) && p.from == plan.from {
             return Ok(p);
         }
@@ -408,6 +493,7 @@ async fn capped(
 async fn prepare(
     state: &Arc<AppState>,
     started: OffsetDateTime,
+    cutoff: OffsetDateTime,
 ) -> Result<Prepared, Box<AutoPruneRun>> {
     let run = |outcome, reason, through, detail| {
         Box::new(run_of(started, outcome, reason, through, detail))
@@ -417,21 +503,29 @@ async fn prepare(
     };
     let failed = |e: AuditError| run(OUTCOME_FAILED, RUN_ERROR, None, Some(e.to_string()));
     // 1. The plan, with the keep window as the age floor, at most `max_entries_per_run`.
-    let plan = plan_at(state, keep, u64::MAX).await.map_err(failed)?;
+    let plan = plan_at(state, keep, cutoff, u64::MAX)
+        .await
+        .map_err(failed)?;
     if plan.through.is_none() {
         let reason = plan.guards.limited_by.unwrap_or(RUN_NOTHING_TO_PRUNE);
         return Err(run(OUTCOME_SKIPPED, reason, None, None));
     }
-    let mut plan = capped(state, keep, plan, state.retention.max_entries_per_run())
-        .await
-        .map_err(failed)?;
+    let mut plan = capped(
+        state,
+        keep,
+        cutoff,
+        plan,
+        state.retention.max_entries_per_run(),
+    )
+    .await
+    .map_err(failed)?;
     let mut through = plan.through.unwrap_or(0);
     // An archive a run left for a smaller boundary from the same first seq: use it.
     if let Some(dir) = state.retention.archive_dir.clone() {
         let from = plan.from;
         let left = state.blocking(move |_| leftover_archives(&dir, from)).await;
         for &x in left.iter().filter(|&&x| x < through) {
-            let again = plan_at(state, keep, x).await.map_err(failed)?;
+            let again = plan_at(state, keep, cutoff, x).await.map_err(failed)?;
             if again.through == Some(x) && again.from == from {
                 through = x;
                 plan = again;
@@ -550,18 +644,32 @@ async fn prepare(
         through,
         through_hash: cp.head_hash,
         archive,
+        cutoff,
     })
 }
 
 async fn attempt(state: &Arc<AppState>, started: OffsetDateTime) -> AutoPruneRun {
-    let prepared = match prepare(state, started).await {
-        Ok(p) => p,
-        Err(run) => return *run,
-    };
     let Some(keep) = state.retention.keep() else {
         return run_of(started, OUTCOME_SKIPPED, "prune_disabled", None, None);
     };
+    let cutoff = match cutoff_of(state, keep).await {
+        Ok(c) => c,
+        Err(e) => {
+            return run_of(
+                started,
+                OUTCOME_FAILED,
+                RUN_ERROR,
+                None,
+                Some(e.to_string()),
+            )
+        }
+    };
+    let prepared = match prepare(state, started, cutoff).await {
+        Ok(p) => p,
+        Err(run) => return *run,
+    };
     let through = prepared.through;
+    let floor = prepared.from.checked_sub(1).filter(|&b| b > 0);
     let name = prepared.archive.as_ref().map(|a| a.name.clone());
     let run = |outcome, reason, detail| AutoPruneRun {
         archive: name.clone(),
@@ -569,7 +677,7 @@ async fn attempt(state: &Arc<AppState>, started: OffsetDateTime) -> AutoPruneRun
     };
 
     // 4. The prune, as `POST /admin/audit/prune` makes it. The guards are checked again in
-    // its transaction with the sink's progress and the time now.
+    // its transaction with the sink's progress and the time now, against the same cutoff.
     let expect = PruneExpect {
         from: Some(prepared.from),
         through_hash: Some(prepared.through_hash.clone()),
@@ -577,9 +685,10 @@ async fn attempt(state: &Arc<AppState>, started: OffsetDateTime) -> AutoPruneRun
     let digest = prepared.archive.as_ref().map(|a| a.sha256.clone());
     let done = state
         .blocking(move |s| {
-            let limits = auto_limits(s, keep)?;
+            let limits = auto_limits(s, keep, cutoff);
             let now = limits.now;
-            s.audit
+            let out = s
+                .audit
                 .prune_through_expecting(through, digest, &expect, &limits, |args| {
                     let mut r = admin_record(
                         &AdminIdentity::legacy(),
@@ -593,11 +702,15 @@ async fn attempt(state: &Arc<AppState>, started: OffsetDateTime) -> AutoPruneRun
                     // Made by the server, not by an operator.
                     r.originating_subject = AUTO_PRUNE_SUBJECT.to_string();
                     r
-                })
+                });
+            // A refusal because another prune committed after the archive was written.
+            let moved = matches!(out, Err(AuditError::PruneRefused { .. }))
+                && s.audit.pruned_through().ok() != Some(floor);
+            (out, moved)
         })
         .await;
-    let out = match done {
-        Ok(out) if !out.already => {
+    let (out, removable) = match done {
+        (Ok(out), _) if !out.already => {
             let a = &out.anchor.anchor;
             if let Ok(t) = OffsetDateTime::parse(&a.at, &Rfc3339) {
                 state
@@ -609,30 +722,52 @@ async fn attempt(state: &Arc<AppState>, started: OffsetDateTime) -> AutoPruneRun
                 ..run(OUTCOME_PRUNED, RUN_OK, None)
             };
         }
-        // The same prune was made already (by a run that raced this one).
-        Ok(_) => run(OUTCOME_SKIPPED, RUN_CONCURRENT_PRUNE, None),
-        Err(AuditError::PruneRefused { guard, detail }) => {
-            run(OUTCOME_SKIPPED, guard.code(), Some(detail))
+        // The same prune, with the same archive, was made already (by a run that raced this
+        // one): its anchor names the file.
+        (Ok(_), _) => (run(OUTCOME_SKIPPED, RUN_CONCURRENT_PRUNE, None), false),
+        (Err(e), moved) => {
+            let removable = unused_after(&e);
+            let out = match e {
+                AuditError::PruneRefused { detail, .. } if moved => run(
+                    OUTCOME_SKIPPED,
+                    RUN_CONCURRENT_PRUNE,
+                    Some(format!("another prune committed first: {detail}")),
+                ),
+                AuditError::PruneRefused { guard, detail } => {
+                    run(OUTCOME_SKIPPED, guard.code(), Some(detail))
+                }
+                e => run(OUTCOME_FAILED, RUN_ERROR, Some(e.to_string())),
+            };
+            (out, removable)
         }
-        Err(e) => run(OUTCOME_FAILED, RUN_ERROR, Some(e.to_string())),
     };
-    // No prune used the archive: a file this run wrote goes again, unless an anchor names it.
-    if let Some(a) = prepared.archive.filter(|a| !a.reused) {
+    // A file this run wrote that no prune can have used goes again. After any other error
+    // the prune may have committed after all: the file stays, and the next run checks it and
+    // uses it, or warns about it.
+    if let Some(a) = prepared.archive.filter(|a| !a.reused && removable) {
         state.blocking(move |s| a.remove_unused(s)).await;
     }
     out
+}
+
+/// Whether the prune that ended with `e` certainly did not commit, so that an archive no
+/// other prune names can be removed: only a refusal (a guard, or a prune that something else
+/// made first) is that certain. A store error can come after the commit.
+fn unused_after(e: &AuditError) -> bool {
+    matches!(e, AuditError::PruneRefused { .. })
 }
 
 impl Archive {
     /// Remove this file, which this run wrote and no prune used, unless the newest anchor
     /// names its digest after all.
     fn remove_unused(&self, s: &AppState) {
-        let named = s
-            .audit
-            .newest_anchor()
-            .ok()
-            .flatten()
-            .is_some_and(|a| a.anchor.archive_sha256.as_deref() == Some(self.sha256.as_str()));
+        let named = match s.audit.newest_anchor() {
+            Ok(a) => {
+                a.is_some_and(|a| a.anchor.archive_sha256.as_deref() == Some(self.sha256.as_str()))
+            }
+            // Not known: keep it.
+            Err(_) => true,
+        };
         if named {
             return;
         }
@@ -773,7 +908,19 @@ impl ArchiveJob {
         if !meta.file_type().is_file() {
             return Err(refuse("not a regular file".to_string()));
         }
-        let sha256 = self.check(s, target, None).map_err(refuse)?;
+        let (sha256, exported_at) = self.check(s, target, None).map_err(refuse)?;
+        // The check covers the chain, not every byte: an unknown field, a repeated key or a
+        // line the verifier skips would pass it. So the export of the same range is made
+        // again, with the file's own `exported_at` (the only header value not taken from the
+        // log), and its bytes must be the file's.
+        let again = self.export_digest(s, exported_at).map_err(refuse)?;
+        if again != sha256 {
+            return Err(refuse(format!(
+                "its bytes are not the export of seq {}..{} (sha256 {sha256}, the export's \
+                 {again})",
+                self.from, self.cp.seq
+            )));
+        }
         std::fs::File::open(target)
             .and_then(|f| f.sync_all())
             .and_then(|()| sync_dir(&self.dir))
@@ -792,14 +939,31 @@ impl ArchiveJob {
         })
     }
 
-    /// Remove the temporary files of earlier runs (a crash while one was written).
+    /// The SHA-256 of the export of this prefix with `exported_at` in its header, made
+    /// again from the log without writing it anywhere.
+    fn export_digest(&self, s: &AppState, exported_at: String) -> Result<String, String> {
+        use sha2::Digest;
+        let mut out = Hashing {
+            inner: std::io::sink(),
+            hasher: sha2::Sha256::new(),
+        };
+        s.audit
+            .write_export(self.from, self.cp.seq, exported_at, &mut out)
+            .map_err(|e| format!("the export could not be made again: {e}"))?;
+        Ok(hex::encode(out.hasher.finalize()))
+    }
+
+    /// Remove the temporary files of earlier runs (a crash while one was written): regular
+    /// files named as this server names them ([`is_temporary`]), nothing else.
     fn remove_temporaries(&self) {
         let Ok(list) = std::fs::read_dir(&self.dir) else {
             return;
         };
         for e in list.flatten() {
-            let n = e.file_name().to_string_lossy().into_owned();
-            if n.starts_with(".audit-") && n.ends_with(".tmp") {
+            let ours = is_temporary(&e.file_name().to_string_lossy());
+            let regular =
+                std::fs::symlink_metadata(e.path()).is_ok_and(|m| m.file_type().is_file());
+            if ours && regular {
                 let _ = std::fs::remove_file(e.path());
             }
         }
@@ -808,13 +972,15 @@ impl ArchiveJob {
     /// Warn, once per file in this process, about archive files no prune used: from this
     /// run's first seq but for another boundary, or for a range at or below the boundary of
     /// the log that no anchor names. They are not part of the log and are never deleted here.
+    /// A file below the boundary is looked up once per process: the anchors there do not
+    /// change.
     fn warn_strays(&self, s: &AppState, through: u64) {
         let floor = self.from.saturating_sub(1);
         for (f, t) in archive_files(&self.dir) {
             let name = archive_file_name(f, t);
             let stray = if f == self.from {
-                t != through
-            } else if t <= floor {
+                t != through && s.auto_prune.first_look(name.clone())
+            } else if t <= floor && s.auto_prune.first_look(name.clone()) {
                 // The anchor with the largest boundary at or below `t`.
                 !s.audit
                     .anchors_before(t.saturating_add(1), 1)
@@ -827,7 +993,7 @@ impl ArchiveJob {
             } else {
                 false
             };
-            if stray && s.auto_prune.first_warning(name.clone()) {
+            if stray {
                 tracing::warn!(
                     file = %self.dir.join(&name).display(),
                     "[audit.retention] archive_dir holds an archive file that no prune used: it \
@@ -888,8 +1054,14 @@ impl ArchiveJob {
     /// Read the file at `target` and check that it is this prefix's archive: it verifies
     /// strictly, from genesis or from the newest anchor (the header's anchor equal to it),
     /// holds exactly `from..=through`, ends at the boundary's checkpoint and hash, and, when
-    /// `written` is given, has that digest. Answers its digest, or what is wrong.
-    fn check(&self, s: &AppState, target: &Path, written: Option<&str>) -> Result<String, String> {
+    /// `written` is given, has that digest. Answers its digest and its header's `exported_at`,
+    /// or what is wrong.
+    fn check(
+        &self,
+        s: &AppState,
+        target: &Path,
+        written: Option<&str>,
+    ) -> Result<(String, String), String> {
         let through = self.cp.seq;
         let keys = s.keys();
         let got = attenuo_audit::verify_export_file(
@@ -942,12 +1114,28 @@ impl ArchiveJob {
                 got.sha256
             ));
         }
+        if got.header.filter.is_some() {
+            problems.push("it is a filtered export".to_string());
+        }
         if problems.is_empty() {
-            Ok(got.sha256)
+            Ok((got.sha256, got.header.exported_at))
         } else {
             Err(problems.join("; "))
         }
     }
+}
+
+/// Whether `name` is a temporary file of an archive as [`ArchiveJob`] names it:
+/// `.audit-<from>-<through>.jsonl.<pid>.tmp`, each number of the archive's name 20 digits and
+/// the process id digits.
+fn is_temporary(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix('.').and_then(|n| n.strip_suffix(".tmp")) else {
+        return false;
+    };
+    let Some((archive, pid)) = rest.rsplit_once('.') else {
+        return false;
+    };
+    !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()) && archive_range(archive).is_some()
 }
 
 /// Create `path` for writing, failing if it exists; readable and writable by the owner only
@@ -1014,6 +1202,43 @@ pub(crate) async fn auto_prune_ticks(
                     archive: None,
                 },
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_this_servers_temporary_names_match() {
+        let name = archive_file_name(1, 20);
+        assert!(is_temporary(&format!(".{name}.4242.tmp")));
+        for other in [
+            format!("{name}.4242.tmp"),
+            format!(".{name}.tmp"),
+            format!(".{name}.42x.tmp"),
+            format!(".{name}.4242.tmp.bak"),
+            ".audit-1-20.jsonl.4242.tmp".to_string(),
+            ".audit-notes.tmp".to_string(),
+            name,
+        ] {
+            assert!(!is_temporary(&other), "{other}");
+        }
+    }
+
+    #[test]
+    fn an_archive_is_removed_only_after_a_prune_that_certainly_did_not_commit() {
+        let refused = AuditError::PruneRefused {
+            guard: attenuo_audit::PruneGuard::Conflict,
+            detail: "pruned already".into(),
+        };
+        assert!(unused_after(&refused));
+        for e in [
+            AuditError::Storage("disk I/O error at commit".into()),
+            AuditError::Poisoned,
+        ] {
+            assert!(!unused_after(&e), "{e:?}");
         }
     }
 }

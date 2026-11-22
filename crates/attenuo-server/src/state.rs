@@ -429,7 +429,7 @@ impl AppState {
             checkpoint_sink,
             sink_fails_readiness: config.audit.sink.as_ref().is_some_and(|s| s.fail_readiness),
             retention: config.audit.retention.clone(),
-            auto_prune: crate::auto_prune::AutoPruneStatus::starting_at(clock.now_utc()),
+            auto_prune: crate::auto_prune::AutoPruneStatus::starting_at(clock.as_ref()),
             approvals_client_id: config.approvals.client_id.clone(),
             approval_notifier,
             lease_notifier,

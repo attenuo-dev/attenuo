@@ -32,6 +32,12 @@ const ADMIN: &str = "admin";
 /// 90 days, the `min_age_seconds` default: records written 200 days ago are older.
 const KEEP: u64 = 7_776_000;
 
+/// Change the first byte of the entry hash of seq 5 to another value. (Writing a fixed `ff`
+/// left the hash as it was when it began with `ff`, one run in 256.)
+const TAMPER_SEQ_5: &str =
+    "UPDATE audit SET entry_hash = CASE WHEN substr(entry_hash, 1, 2) = 'ff' \
+     THEN '00' ELSE 'ff' END || substr(entry_hash, 3) WHERE seq = 5";
+
 /// A file-backed config with a checkpoint every 10 entries, a file sink and `prune = "auto"`
 /// keeping 90 days, with an interval long enough that the timer never fires in a test that
 /// calls [`auto_prune_once`] itself.
@@ -391,10 +397,7 @@ async fn a_prefix_that_does_not_verify_is_kept_and_a_failed_run_is_retried() {
             let h: String = c.query_row("SELECT entry_hash FROM audit WHERE seq = 5", [], |r| {
                 r.get(0)
             })?;
-            c.execute(
-                "UPDATE audit SET entry_hash = 'ff' || substr(entry_hash, 3) WHERE seq = 5",
-                [],
-            )?;
+            c.execute(TAMPER_SEQ_5, [])?;
             Ok(h)
         })
         .unwrap();
@@ -468,10 +471,7 @@ async fn the_timer_prunes_keeps_going_after_failures_and_stops_at_shutdown() {
             let h: String = c.query_row("SELECT entry_hash FROM audit WHERE seq = 5", [], |r| {
                 r.get(0)
             })?;
-            c.execute(
-                "UPDATE audit SET entry_hash = 'ff' || substr(entry_hash, 3) WHERE seq = 5",
-                [],
-            )?;
+            c.execute(TAMPER_SEQ_5, [])?;
             Ok(h)
         })
         .unwrap();
@@ -496,10 +496,17 @@ async fn the_timer_prunes_keeps_going_after_failures_and_stops_at_shutdown() {
             Ok(())
         })
         .unwrap();
+    // Wait on the run's own record, which is set after its commit, not on the log.
     let s = state.clone();
-    wait_for(move || s.audit.pruned_through().ok().flatten() == Some(20)).await;
+    wait_for(move || {
+        s.auto_prune
+            .last()
+            .is_some_and(|r| r.outcome == OUTCOME_PRUNED)
+    })
+    .await;
     let last = state.auto_prune.last().unwrap();
-    assert_eq!(last.outcome, OUTCOME_PRUNED, "{last:?}");
+    assert_eq!(last.through, Some(20), "{last:?}");
+    assert_eq!(state.audit.pruned_through().unwrap(), Some(20));
 
     // Shutdown: `run` returns promptly and the state is released, so no tick runs after.
     tokio::time::timeout(StdDuration::from_secs(20), running.stop(state))
@@ -867,23 +874,39 @@ async fn max_entries_per_run_splits_a_long_prefix() {
     h.verify_ok();
 }
 
-/// A wall clock the test can step, either way, while the monotonic clock runs on.
+/// A clock the test moves: [`Stepped::step`] steps the wall clock alone, either way (a clock
+/// jump), and [`Stepped::pass`] moves both clocks ahead (time that really passed). Both run on
+/// in real time besides.
 #[derive(Debug, Default)]
-struct Stepped(std::sync::atomic::AtomicI64);
+struct Stepped {
+    wall: std::sync::atomic::AtomicI64,
+    mono: std::sync::atomic::AtomicU64,
+}
 
 impl Stepped {
     fn step(&self, by: Duration) {
-        self.0.fetch_add(by.whole_seconds(), Ordering::SeqCst);
+        self.wall.fetch_add(by.whole_seconds(), Ordering::SeqCst);
+    }
+
+    fn pass(&self, by: Duration) {
+        self.step(by);
+        self.mono
+            .fetch_add(by.whole_seconds().unsigned_abs(), Ordering::SeqCst);
     }
 }
 
 impl attenuo_core::Clock for Stepped {
     fn now_utc(&self) -> OffsetDateTime {
-        OffsetDateTime::now_utc() + Duration::seconds(self.0.load(Ordering::SeqCst))
+        OffsetDateTime::now_utc() + Duration::seconds(self.wall.load(Ordering::SeqCst))
     }
     fn now(&self) -> std::time::Instant {
-        std::time::Instant::now()
+        std::time::Instant::now() + StdDuration::from_secs(self.mono.load(Ordering::SeqCst))
     }
+}
+
+/// Append one record stamped with the server's clock now (traffic).
+fn touch(state: &AppState) {
+    state.audit.append(record(0, state.now())).unwrap();
 }
 
 async fn start_with_clock(dir: tempfile::TempDir, cfg: Config, clock: Arc<Stepped>) -> Harness {
@@ -1056,30 +1079,31 @@ async fn a_prune_during_the_archive_write_is_a_concurrent_skip() {
     h.verify_ok();
 }
 
-/// An archive this run wrote that no prune used (the prune transaction failed) is removed
-/// again; the next run writes it anew and prunes.
+/// A store error in the prune transaction: the prune may have committed for all the run
+/// can tell, so the archive it wrote stays; the next run checks it, uses it as it is, and
+/// signs its digest.
 #[tokio::test]
-async fn an_archive_no_prune_used_is_removed() {
+async fn an_archive_is_kept_after_a_store_error_and_used_by_the_next_run() {
     let dir = tempfile::tempdir().unwrap();
     let (cfg, archive) = with_archive(&dir);
     let h = start(dir, cfg).await;
     fill(&h.state, 25, old()).await;
     h.state.audit.fail_prune_at_step(3);
+    let name = archive_file_name(1, 20);
     let run = auto_prune_once(&h.state).await;
     assert_eq!(
         (run.outcome, run.reason, run.archive.as_deref()),
-        (
-            OUTCOME_FAILED,
-            "error",
-            Some(archive_file_name(1, 20).as_str())
-        ),
+        (OUTCOME_FAILED, "error", Some(name.as_str())),
         "{run:?}"
     );
-    assert!(names(&archive).is_empty(), "{:?}", names(&archive));
+    assert_eq!(names(&archive), vec![name.clone()]);
+    let sha = sha256_hex(&archive.join(&name));
     h.state.audit.fail_prune_at_step(0);
     let run = auto_prune_once(&h.state).await;
     assert_eq!(run.outcome, OUTCOME_PRUNED, "{run:?}");
-    assert_eq!(names(&archive), vec![archive_file_name(1, 20)]);
+    assert_eq!(names(&archive), vec![name.clone()]);
+    let a = h.state.audit.newest_anchor().unwrap().unwrap().anchor;
+    assert_eq!(a.archive_sha256.as_deref(), Some(sha.as_str()));
 }
 
 /// Files in `archive_dir` from an earlier run or from someone else:
@@ -1173,4 +1197,263 @@ async fn files_left_in_archive_dir_are_checked_used_or_left_alone() {
     let a = state.audit.newest_anchor().unwrap().unwrap().anchor;
     assert_eq!(a.archive_sha256.as_deref(), Some(written.sha256.as_str()));
     assert_eq!(names(&archive), vec![written.name.clone()]);
+}
+
+/// The wall clock jumps 400 days ahead, and then traffic comes, stamped with the jumped
+/// clock. The newest entry no longer holds the cutoff back, but the cutoff cannot move faster
+/// than the monotonic clock, so the entries written 10 days ago stay through every later run.
+#[tokio::test]
+async fn after_a_clock_jump_traffic_makes_no_young_entry_old_enough() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(Stepped::default());
+    let cfg = config(&dir);
+    let h = start_with_clock(dir, cfg, clock.clone()).await;
+    fill(&h.state, 25, old()).await;
+    let run = auto_prune_once(&h.state).await;
+    assert_eq!(run.through, Some(20), "{run:?}");
+    settle(&h.state).await;
+    fill(&h.state, 10, recent()).await;
+    clock.step(Duration::days(400));
+    let run = auto_prune_once(&h.state).await;
+    assert_eq!(run.reason, "clock_jump", "{run:?}");
+    let now = h.state.now();
+    fill(&h.state, 10, now).await;
+    for _ in 0..3 {
+        let run = auto_prune_once(&h.state).await;
+        assert_eq!(
+            (run.outcome, run.reason),
+            (OUTCOME_SKIPPED, "prune_too_recent"),
+            "{run:?}"
+        );
+        touch(&h.state);
+    }
+    assert_eq!(h.state.audit.pruned_through().unwrap(), Some(20));
+    assert_eq!(h.state.audit.first_retained_seq().unwrap(), 21);
+    h.verify_ok();
+}
+
+/// An idle server whose wall clock jumps 400 days ahead: 25 old entries, then 10 entries 10
+/// days old. The prune of the old ones is right. Its own record, stamped with the jumped
+/// clock, does not count as the newest entry, so the runs after it keep the 10-day-old
+/// entries: on an idle server the last `keep_seconds` before the newest entry stay.
+#[tokio::test]
+async fn after_a_clock_jump_an_idle_server_keeps_its_young_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(Stepped::default());
+    let cfg = config(&dir);
+    let h = start_with_clock(dir, cfg, clock.clone()).await;
+    fill(&h.state, 25, old()).await;
+    fill(&h.state, 10, recent()).await;
+    clock.step(Duration::days(400));
+    let run = auto_prune_once(&h.state).await;
+    assert_eq!(run.reason, "clock_jump", "{run:?}");
+    let run = auto_prune_once(&h.state).await;
+    assert_eq!(
+        (run.outcome, run.through),
+        (OUTCOME_PRUNED, Some(20)),
+        "{run:?}"
+    );
+    settle(&h.state).await;
+    for _ in 0..3 {
+        let run = auto_prune_once(&h.state).await;
+        assert_eq!(
+            (run.outcome, run.reason),
+            (OUTCOME_SKIPPED, "prune_too_recent"),
+            "{run:?}"
+        );
+    }
+    assert_eq!(h.state.audit.pruned_through().unwrap(), Some(20));
+    assert_eq!(h.state.audit.first_retained_seq().unwrap(), 21);
+    h.verify_ok();
+}
+
+/// Steps of 59 minutes, each under the clock-jump slack, one per run, that add up to more
+/// than 80 days, then traffic at the stepped clock: no step is seen as a jump, and still
+/// nothing 10 days old is pruned.
+#[tokio::test]
+async fn small_clock_steps_that_add_up_prune_nothing_young() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(Stepped::default());
+    let cfg = config(&dir);
+    let h = start_with_clock(dir, cfg, clock.clone()).await;
+    fill(&h.state, 10, recent()).await;
+    for _ in 0..1_960 {
+        clock.step(Duration::minutes(59));
+        let run = auto_prune_once(&h.state).await;
+        assert_eq!(
+            (run.outcome, run.reason),
+            (OUTCOME_SKIPPED, "prune_too_recent"),
+            "{run:?}"
+        );
+    }
+    touch(&h.state);
+    let run = auto_prune_once(&h.state).await;
+    assert_eq!(
+        (run.outcome, run.reason),
+        (OUTCOME_SKIPPED, "prune_too_recent"),
+        "{run:?}"
+    );
+    assert_eq!(h.state.audit.pruned_through().unwrap(), None);
+    let text = h.state.metrics.render();
+    assert_eq!(runs(&text, "skipped", "clock_jump"), 0, "{text}");
+}
+
+/// Time that really passes (both clocks move 20 days) makes entries 85 days old older than
+/// the window, and the next run prunes them.
+#[tokio::test]
+async fn time_that_really_passes_still_prunes() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(Stepped::default());
+    let cfg = config(&dir);
+    let h = start_with_clock(dir, cfg, clock.clone()).await;
+    fill(&h.state, 25, OffsetDateTime::now_utc() - Duration::days(85)).await;
+    let run = auto_prune_once(&h.state).await;
+    assert_eq!(
+        (run.outcome, run.reason),
+        (OUTCOME_SKIPPED, "prune_too_recent"),
+        "{run:?}"
+    );
+    clock.pass(Duration::days(20));
+    touch(&h.state);
+    let run = auto_prune_once(&h.state).await;
+    assert_eq!(
+        (run.outcome, run.through),
+        (OUTCOME_PRUNED, Some(20)),
+        "{run:?}"
+    );
+    h.verify_ok();
+}
+
+/// A step back of two hours, with traffic: entries 30 minutes past the window are not old
+/// enough by the slow clock, so pruning waits. Once the clock is set right, the next run
+/// prunes them.
+#[tokio::test]
+async fn after_a_step_back_pruning_waits_and_then_resumes() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(Stepped::default());
+    let cfg = config(&dir);
+    let h = start_with_clock(dir, cfg, clock.clone()).await;
+    let at = OffsetDateTime::now_utc() - Duration::seconds(KEEP as i64) - Duration::minutes(30);
+    fill(&h.state, 25, at).await;
+    clock.step(-Duration::hours(2));
+    let run = auto_prune_once(&h.state).await;
+    assert_eq!(run.reason, "clock_jump", "{run:?}");
+    touch(&h.state);
+    let run = auto_prune_once(&h.state).await;
+    assert_eq!(
+        (run.outcome, run.reason),
+        (OUTCOME_SKIPPED, "prune_too_recent"),
+        "{run:?}"
+    );
+    clock.step(Duration::hours(2));
+    let run = auto_prune_once(&h.state).await;
+    assert_eq!(run.reason, "clock_jump", "{run:?}");
+    touch(&h.state);
+    let run = auto_prune_once(&h.state).await;
+    assert_eq!(
+        (run.outcome, run.through),
+        (OUTCOME_PRUNED, Some(20)),
+        "{run:?}"
+    );
+    h.verify_ok();
+}
+
+/// Write a valid archive of 1..=20 with a prepare, stop the server, change the file with
+/// `tamper`, start again and run: the run must refuse the file (`archive_exists`), leave it
+/// as it is, and prune nothing. Answers the run's detail.
+async fn planted(tamper: impl FnOnce(&str) -> String) -> String {
+    let dir = tempfile::tempdir().unwrap();
+    let (cfg, _archive) = with_archive(&dir);
+    let (router, state) = attenuo_server::build(&cfg).unwrap();
+    let server = spawn_router(router).await.unwrap();
+    fill(&state, 25, old()).await;
+    let written = auto_prune_prepare(&state)
+        .await
+        .expect("prepared")
+        .archive
+        .unwrap();
+    drop(server);
+    let released = state.released();
+    drop(state);
+    tokio::time::timeout(StdDuration::from_secs(10), released)
+        .await
+        .expect("the first server let go of its state");
+    let text = std::fs::read_to_string(&written.path).unwrap();
+    let forged = tamper(&text);
+    assert_ne!(forged, text);
+    std::fs::write(&written.path, &forged).unwrap();
+
+    let (router, state) = attenuo_server::build(&cfg).unwrap();
+    let _server = spawn_router(router).await.unwrap();
+    fill(&state, 10, recent()).await;
+    let run = auto_prune_once(&state).await;
+    assert_eq!(
+        (run.outcome, run.reason, run.through),
+        (OUTCOME_FAILED, "archive_exists", Some(20)),
+        "{run:?}"
+    );
+    assert_eq!(state.audit.newest_anchor().unwrap(), None, "nothing signed");
+    assert_eq!(state.audit.pruned_through().unwrap(), None);
+    assert_eq!(std::fs::read_to_string(&written.path).unwrap(), forged);
+    run.detail.unwrap_or_default()
+}
+
+/// A valid archive with content the hash chain does not cover is never signed: fields added
+/// to records and to the header, a key given twice, or lines added at the end.
+#[tokio::test]
+async fn a_planted_archive_with_extra_content_is_refused_not_signed() {
+    let detail = planted(|text| {
+        text.replacen(
+            "\"record\":{",
+            "\"record\":{\"note\":\"FORGED: approved by nobody\",",
+            3,
+        )
+        .replacen(
+            "{\"type\":\"header\",",
+            "{\"type\":\"header\",\"comment\":\"planted\",",
+            1,
+        )
+    })
+    .await;
+    assert!(detail.contains("never replaced"), "{detail}");
+    planted(|text| text.replacen("\"record\":{", "\"record\":{\"reason\":\"forged\",", 1)).await;
+    planted(|text| format!("{text}{{\"type\":\"note\",\"text\":\"forged\"}}\n")).await;
+    planted(|text| format!("{text}\n")).await;
+}
+
+/// A manual prune that commits after the archive is written and checked, just before the
+/// automatic prune's transaction: the run is skipped as `concurrent_prune`, and the file it
+/// wrote, which no prune can have used, is removed.
+#[tokio::test]
+async fn a_prune_just_before_the_commit_is_a_concurrent_skip() {
+    let dir = tempfile::tempdir().unwrap();
+    let (cfg, archive) = with_archive(&dir);
+    let h = start(dir, cfg).await;
+    fill(&h.state, 25, old()).await;
+    let audit = h.state.audit.clone();
+    h.state.audit.on_next_prune(move || {
+        let limits = attenuo_audit::PruneLimits {
+            min_age: Duration::ZERO,
+            sink: None,
+            now: OffsetDateTime::now_utc(),
+        };
+        audit
+            .prune_through(10, Some("ab".repeat(32)), &limits, |args| {
+                let call = ToolCall::new("attenuo", PRUNE_TOOL, args.clone());
+                let mut r = record(0, OffsetDateTime::now_utc());
+                r.tool = call.tool.clone();
+                r.arguments_digest = call.arguments_digest();
+                r
+            })
+            .unwrap();
+    });
+    let run = auto_prune_once(&h.state).await;
+    assert_eq!(
+        (run.outcome, run.reason, run.through),
+        (OUTCOME_SKIPPED, "concurrent_prune", Some(20)),
+        "{run:?}"
+    );
+    assert_eq!(h.state.audit.pruned_through().unwrap(), Some(10));
+    assert!(names(&archive).is_empty(), "{:?}", names(&archive));
+    h.verify_ok();
 }
