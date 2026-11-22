@@ -72,7 +72,7 @@ type AfterVacuum = Box<dyn FnOnce(&Connection) -> rusqlite::Result<()>>;
 
 /// The steps after `VACUUM`, in order (a failure at any of them is
 /// [`CompactError::Unverified`]); tests inject a fault at one
-/// ([`CompactOptions::fail_after_vacuum_at`]).
+/// (`CompactOptions::fail_after_vacuum_at`, behind the `testing` feature).
 pub const AFTER_VACUUM_STEPS: &[&str] = &[
     "reading the journal mode",
     "the WAL checkpoint",
