@@ -145,9 +145,21 @@ pub async fn exchange(
         Some(token) => Some((state.actor_trust.verify(&token, now).await?, token)),
         None => None,
     };
+    // A client assertion's key, for an agent with `jwks_url`, is fetched here too; the
+    // request is checked against the same snapshot of the lists. Not when client credentials
+    // are refused anyway.
+    let clients = state.clients.snapshot();
+    let assertion = value
+        .get("client_assertion")
+        .and_then(Value::as_str)
+        .filter(|_| state.actor_auth != ActorAuth::ActorToken);
+    let fetched = clients.agents.fetch_key(assertion).await;
     // Lease lookups, registration and the audit append are SQLite calls: off the async workers.
     state
-        .blocking(move |s| exchange_sync(s, &headers, value, actor, mark.as_ref(), now))
+        .blocking(move |s| {
+            let client_keys = (&clients.agents, &fetched);
+            exchange_sync(s, &headers, value, actor, client_keys, mark.as_ref(), now)
+        })
         .await
 }
 
@@ -297,6 +309,7 @@ fn exchange_sync(
     headers: &HeaderMap,
     value: Value,
     actor: Option<(VerifiedActor, String)>,
+    (agents, fetched): (&clientauth::Clients, &clientauth::FetchedKey),
     mark: Option<&CallerMark>,
     now: OffsetDateTime,
 ) -> Result<Response, ApiError> {
@@ -347,11 +360,12 @@ fn exchange_sync(
                 format!("an actor_token (actor_token_type `{ACTOR_TOKEN_TYPE}`) is required"),
             ));
         }
-        let client = state.clients.snapshot().agents.authenticate(
+        let client = agents.authenticate_with(
             headers,
             client_id.as_deref(),
             client_secret.as_deref(),
             assertion.as_deref(),
+            fetched,
             now,
         )?;
         let method = client.method();

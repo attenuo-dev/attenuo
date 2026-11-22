@@ -64,7 +64,7 @@ use time::{Duration, OffsetDateTime};
 use super::JWT_BEARER_GRANT_TYPE;
 use super::{claims, CredentialKind, IntakeError, ID_JAG_TOKEN_TYPE, ID_TOKEN_TYPE};
 use crate::actor::{VerifiedActor, ACTOR_TOKEN_TYPE};
-use crate::clientauth::{self, invalid_request, Authenticated, Clients};
+use crate::clientauth::{self, invalid_request, Authenticated, Clients, FetchedKey};
 use crate::config::{capability_set, ActorAuth, RootGrant};
 use crate::error::{
     limit_conflict_detail, limit_split_detail, size_code, ApiError, LIMIT_CONFLICT_AT_ROOT,
@@ -142,12 +142,20 @@ pub(crate) async fn handle(
         Some(token) => Some((state.actor_trust.verify(&token, now).await?, token)),
         None => None,
     };
+    // A client assertion's key, for an agent with `jwks_url`, is fetched before the check,
+    // which uses the same snapshot of the lists. Not when client credentials are refused
+    // anyway.
+    let clients = state.clients.snapshot();
+    let fetched = match state.actor_auth {
+        ActorAuth::ActorToken => FetchedKey::none(),
+        _ => clients.agents.fetch_key(assertion.as_deref()).await,
+    };
     let (agent, agent_auth, client) = authenticate_agent(
-        &state.clients.snapshot().agents,
+        &clients.agents,
         state.actor_auth,
         headers,
         &req,
-        assertion.as_deref(),
+        assertion.as_deref().map(|a| (a, &fetched)),
         actor.as_ref().map(|(v, _)| v),
         now,
     )?;
@@ -698,14 +706,20 @@ fn authenticate_client(
     agents: &Clients,
     headers: &HeaderMap,
     req: &IntakeRequest,
-    assertion: Option<&str>,
+    assertion: Option<(&str, &FetchedKey)>,
     now: OffsetDateTime,
 ) -> Result<Authenticated, ApiError> {
-    agents.authenticate(
+    let none = FetchedKey::none();
+    let (assertion, fetched) = match assertion {
+        Some((a, f)) => (Some(a), f),
+        None => (None, &none),
+    };
+    agents.authenticate_with(
         headers,
         req.client_id.as_deref(),
         req.client_secret.as_deref(),
         assertion,
+        fetched,
         now,
     )
 }
@@ -724,11 +738,15 @@ fn authenticate_agent(
     mode: ActorAuth,
     headers: &HeaderMap,
     req: &IntakeRequest,
-    assertion: Option<&str>,
+    assertion: Option<(&str, &FetchedKey)>,
     actor: Option<&VerifiedActor>,
     now: OffsetDateTime,
 ) -> Result<AgentAuth, ApiError> {
-    let presented = clientauth::presented(headers, req.client_secret.as_deref(), assertion)?;
+    let presented = clientauth::presented(
+        headers,
+        req.client_secret.as_deref(),
+        assertion.map(|(a, _)| a),
+    )?;
     if presented && mode == ActorAuth::ActorToken {
         return Err(invalid_request(
             "client_auth_not_accepted",
@@ -920,6 +938,9 @@ mod tests {
             id: "a".into(),
             secret_sha256: None,
             jwks: None,
+            jwks_url: None,
+            jwks_ttl_seconds: None,
+            ca_pem_path: None,
         };
         let e = validate_agents(&[neither]).err().unwrap().to_string();
         assert!(e.contains("set secret_sha256, jwks"), "{e}");
@@ -1031,8 +1052,17 @@ mod tests {
         };
         let h = HeaderMap::new();
         let auth = |mode, a: &str, actor: Option<&VerifiedActor>| {
-            authenticate_agent(&agents, mode, &h, &req(None, None), Some(a), actor, now())
-                .map(|(a, how, c)| (a, how, c.is_some()))
+            let none = FetchedKey::none();
+            authenticate_agent(
+                &agents,
+                mode,
+                &h,
+                &req(None, None),
+                Some((a, &none)),
+                actor,
+                now(),
+            )
+            .map(|(a, how, c)| (a, how, c.is_some()))
         };
         let desc = |r: Result<(String, &'static str, bool), ApiError>| r.unwrap_err().description;
         assert_eq!(

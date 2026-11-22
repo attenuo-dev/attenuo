@@ -140,11 +140,17 @@ scopes = { "repo.read" = ["github:read_file"] }
 id = "planner"
 secret_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
 jwks = "{}"
+jwks_url = "https://keys.example/planner.json"
+jwks_ttl_seconds = 300
+ca_pem_path = "/etc/attenuo/client-ca.pem"
 
 [[peps]]
 id = "pep"
 secret_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
 jwks = "{}"
+jwks_url = "https://keys.example/pep.json"
+jwks_ttl_seconds = 300
+ca_pem_path = "/etc/attenuo/client-ca.pem"
 
 [[root_grants]]
 issuer = "https://idp.example"
