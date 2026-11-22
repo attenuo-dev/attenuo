@@ -14,6 +14,10 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 - Admin console: the Verify page shows the automatic prune when `[audit.retention] prune = "auto"`, to the `admin` role only: `keep_seconds` and `interval_seconds` in days, hours or seconds, the most entries per run, the archive directory (with a warning when there is none: the records are deleted without a copy), and the last run (time, outcome, reason, boundary, prune record, archive file name). To serve it, the console listener now mounts `GET /admin/audit/prune/plan`, a read that needs the `admin` role as on the admin API. `POST /admin/audit/prune` and `GET /admin/audit/anchors` stay off the console listener.
 - On the console listener, `GET /admin/whoami` adds `console: {"allow_write": <bool>, "audit_prune": "off" | "manual" | "auto"}`, so the console knows at login whether to offer writes and whether there is an automatic prune to show. The admin API's answer is unchanged.
 
+### Fixed
+
+- Docker image build: each target architecture now has its own cargo registry and target caches. The multi-arch release build runs amd64 and arm64 at once, and with shared caches the two could unpack the same crate at the same time (the build failed with "File exists"), or one could overwrite the other's binaries before they were copied out.
+
 ## [0.2.0] - 2026-11-22
 
 ### Highlights
