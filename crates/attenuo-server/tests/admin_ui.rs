@@ -1038,6 +1038,52 @@ async fn the_prune_plan_is_a_read_route_of_the_console_for_the_admin_role() {
         let (status, _) = console_get(&console, "/admin/audit/prune/plan", None).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
 
+        // The plan path answers GET only: another method is refused (405, or 404 where the
+        // console has no route for it) and writes nothing, the audit head and anchors included.
+        let head = |c: &Spawned| {
+            let url = c.url("/admin/audit?order=desc&limit=1");
+            async move {
+                let v: Value = Harness::client()
+                    .get(url)
+                    .bearer_auth(ADMIN)
+                    .send()
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                v["head"].as_u64().unwrap()
+            }
+        };
+        let before = head(&console).await;
+        assert!(state.audit.newest_anchor().unwrap().is_none());
+        for method in [
+            reqwest::Method::POST,
+            reqwest::Method::PUT,
+            reqwest::Method::DELETE,
+        ] {
+            let r = Harness::client()
+                .request(method.clone(), console.url("/admin/audit/prune/plan"))
+                .bearer_auth(ADMIN)
+                .json(&json!({"through": 1}))
+                .send()
+                .await
+                .unwrap();
+            assert!(
+                r.status() == StatusCode::METHOD_NOT_ALLOWED || r.status() == StatusCode::NOT_FOUND,
+                "{method} /admin/audit/prune/plan: {}",
+                r.status()
+            );
+            assert_security_headers(r.headers());
+        }
+        assert_eq!(
+            head(&console).await,
+            before,
+            "a refused method wrote to the log"
+        );
+        assert!(state.audit.newest_anchor().unwrap().is_none());
+        assert_eq!(state.audit.pruned_through().unwrap(), None);
+
         // Never the prune, never the anchors.
         let r = Harness::client()
             .post(console.url("/admin/audit/prune"))

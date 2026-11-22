@@ -1295,6 +1295,83 @@ test('reload page: issuer keys, a refused rotation, then a rotation with an over
   }
 });
 
+test('reload dialogs: Cancel has the focus, a reload in flight cannot be dismissed, and its outcome is always shown', async () => {
+  const p = await openAt(E.autoUi, E.adminToken, '#/reload');
+  const route = '**/admin/operators/reload';
+  /** Hold the next reload request until the returned function is called with what to do. */
+  const hold = async () => {
+    let release;
+    const held = new Promise((r) => { release = r; });
+    await p.page.route(route, async (r) => {
+      const act = await held;
+      await act(r);
+    }, { times: 1 });
+    return release;
+  };
+  const open = async () => {
+    await p.page.locator('#reload-operators').getByRole('button', { name: 'Reload operators…' }).click();
+    const dialog = p.page.locator('dialog[open]');
+    await dialog.locator('h2').waitFor();
+    return dialog;
+  };
+  try {
+    await p.page.locator('#reload-operators').waitFor();
+    let dialog = await open();
+    assert.equal(await p.page.evaluate(() => document.activeElement?.textContent), 'Cancel', 'Cancel does not have the focus');
+
+    // In flight: Cancel is disabled and Escape (twice) leaves the dialog open; the answer then
+    // closes it and draws the result.
+    let release = await hold();
+    await dialog.getByRole('button', { name: 'Reload', exact: true }).click();
+    await p.page.waitForFunction(() => [...document.querySelectorAll('dialog[open] button')].find((b) => b.textContent === 'Cancel')?.disabled);
+    await p.page.keyboard.press('Escape');
+    await p.page.keyboard.press('Escape');
+    // Chromium may close a dialog on a repeated Escape without a cancelable event; the console
+    // then shows it again at once, so it is open (and still in the page) a moment later.
+    await p.page.waitForFunction(() => document.querySelectorAll('dialog[open]').length === 1, null, { timeout: 2000 });
+    assert.equal(await p.page.locator('dialog').count(), 1, 'Escape removed a dialog whose reload is in flight');
+    assert.equal(await dialog.getByRole('button', { name: 'Reload', exact: true }).isDisabled(), true, 'a second reload can start');
+    release((r) => r.continue());
+    await p.page.waitForFunction(() => document.querySelectorAll('dialog').length === 0);
+    assert.equal(await resultValue(p, 'operators', 'Added'), 'none');
+
+    // The page changes while a reload runs: the router removes the dialog, and the outcome
+    // still reaches the status line.
+    dialog = await open();
+    release = await hold();
+    await dialog.getByRole('button', { name: 'Reload', exact: true }).click();
+    await p.page.waitForFunction(() => [...document.querySelectorAll('dialog[open] button')].find((b) => b.textContent === 'Cancel')?.disabled);
+    await p.go('#/audit');
+    await p.page.waitForFunction(() => document.querySelectorAll('dialog').length === 0);
+    release((r) => r.fulfill({ status: 422, contentType: 'application/json', body: JSON.stringify({ error: 'invalid_request', code: 'operators_invalid', detail: 'stubbed refusal' }) }));
+    await p.page.locator('#status', { hasText: 'Admin operators reload: refused, operators_invalid: stubbed refusal. Nothing was changed.' }).waitFor();
+
+    // No answer, and a 5xx: the outcome is unknown, not "nothing changed".
+    await p.go('#/reload');
+    dialog = await open();
+    await p.page.route(route, (r) => r.abort('connectionreset'), { times: 1 });
+    await dialog.getByRole('button', { name: 'Reload', exact: true }).click();
+    let text = await refusalText(dialog, 'operators');
+    assert.match(text, /No answer: network/);
+    assert.match(text, /The result is unknown: the reload may or may not have happened\. The audit log shows whether it did/);
+    assert.doesNotMatch(text, /Nothing was changed/);
+    await p.page.route(route, (r) => r.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ error: 'server_error', code: 'server_error', detail: 'stubbed failure' }) }), { times: 1 });
+    await dialog.getByRole('button', { name: 'Reload', exact: true }).click();
+    await dialog.locator('#reload-operators-error', { hasText: 'HTTP 500' }).waitFor();
+    text = await refusalText(dialog, 'operators');
+    assert.match(text, /No answer: server_error \(HTTP 500\)/);
+    assert.match(text, /stubbed failure/);
+    assert.match(text, /The result is unknown/);
+    assert.doesNotMatch(text, /Nothing was changed/);
+    await bothThemes('reload-unknown-outcome', p);
+    await dialog.getByRole('button', { name: 'Cancel' }).click();
+    // Only the stubbed failures: the 422 and 500 answers and the reset connection.
+    assert.deepEqual((await p.allProblems()).filter((x) => !/\b(422|500)\b|ERR_CONNECTION_RESET|request failed/.test(x)), []);
+  } finally {
+    await p.close();
+  }
+});
+
 test('policy page: reload through the confirmation, then a file that does not load is refused', async () => {
   const p = await openAt(E.autoUi, E.adminToken, '#/policy');
   const policyFile = nodePath.join(E.autoDir, 'policy.cedar');
@@ -1308,12 +1385,16 @@ test('policy page: reload through the confirmation, then a file that does not lo
     const reload = p.page.getByRole('button', { name: 'Reload…', exact: true });
     await reload.click();
     let dialog = p.page.locator('dialog[open]');
+    await dialog.locator('h2').waitFor();
+    assert.equal(await p.page.evaluate(() => document.activeElement?.textContent), 'Cancel', 'Cancel does not have the focus');
     assert.match(await dialog.locator('h2').innerText(), /^Reload the policy file\?$/);
     assert.match(await dialog.innerText(), /If it does not load, the old policies stay in force/);
     await dialog.getByRole('button', { name: 'Reload', exact: true }).click();
     const result = p.page.locator('#policy-reload-result');
     await result.locator('dl.kv').waitFor();
     const loaded = await adminAt(E.autoUi, '/admin/policies');
+    // A reload waits for the next check, as before the confirmation existed.
+    assert.equal(await reload.isDisabled(), true, 'Reload… is enabled right after a reload');
     assert.match(await kvValue(result, 'Policies'), new RegExp(`^${loaded.policies.length}: `));
     assert.equal(await kvValue(result, 'sha256'), loaded.sha256);
     const auditId = (await kvValue(result, 'Audit record')).trim();
