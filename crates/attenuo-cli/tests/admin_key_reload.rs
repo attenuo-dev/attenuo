@@ -48,7 +48,8 @@ async fn key_reload_prints_the_kids() {
             .collect();
         format!(
             "[issuer]\nprivate_key_pem_path = \"{}\"\nprevious_key_paths = [{}]\n\n[audit]\n\
-             sqlite_path = \"{}\"\n\n[admin]\ntoken = \"{LEGACY}\"\n",
+             sqlite_path = \"{}\"\n\n[admin]\ntoken = \"{LEGACY}\"\n\n[logging]\n\
+             redact_subjects = true\n",
             key(signing).display(),
             prev.join(", "),
             dir.path().join("audit.sqlite").display(),
@@ -92,7 +93,10 @@ async fn key_reload_prints_the_kids() {
              audit checkpoints signed by: {kid2}\n"
         )
     );
-    assert_eq!(text(&out.stderr), "");
+    // The subject digests keep the startup key: a warning on stderr, not in the report.
+    let kept = "warning: still keyed by the startup key (restart to re-key): subject digests \
+                ([telemetry], [logging] redact_subjects)\n";
+    assert_eq!(text(&out.stderr), kept);
     // No key material is printed.
     assert!(!text(&out.stdout).contains("PRIVATE"));
 
@@ -103,6 +107,7 @@ async fn key_reload_prints_the_kids() {
     assert_eq!(v["changed"], false, "{v}");
     assert_eq!(v["signing_kid"], kid2.as_str(), "{v}");
     assert_eq!(v["verifying_kids"], serde_json::json!([kid2, kid1]), "{v}");
+    assert_eq!(text(&out.stderr), kept, "the same warning in --json mode");
 
     // k3 without k2 in previous_key_paths: refused, exit 1, the code on stderr.
     std::fs::write(&path, file("k3.pem", &["k1.pem"])).unwrap();
@@ -138,7 +143,8 @@ async fn key_reload_prints_the_kids() {
     let err = text(&out.stderr);
     assert!(
         err.contains(&format!(
-            "warning: tokens signed by kid `{kid2}` no longer verify"
+            "warning: tokens signed by kid `{kid2}`, or rooted under it (ou_kid), no longer \
+             verify"
         )),
         "{err}"
     );

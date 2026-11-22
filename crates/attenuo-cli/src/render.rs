@@ -937,9 +937,9 @@ pub(crate) fn render_agents_reload(v: &Value) -> String {
 }
 
 /// The answer of `POST /admin/keys/reload` (`attenuo admin key reload`): the signing key id
-/// before and after, the verifying key ids, each id added or removed, what stays keyed by the
-/// startup key, and the sections that need a restart. Key ids only: the answer holds no key.
-/// The warnings go to stderr ([`agents_reload_warnings`], which reads the same fields).
+/// before and after, the verifying key ids, each id added or removed, and the sections that
+/// need a restart. Key ids only: the answer holds no key. What stays keyed by the startup key
+/// and the warnings go to stderr ([`keys_reload_warnings`]).
 pub(crate) fn render_keys_reload(v: &Value) -> String {
     let strs = |key: &str| -> Vec<String> {
         v[key]
@@ -974,13 +974,6 @@ pub(crate) fn render_keys_reload(v: &Value) -> String {
         "audit checkpoints signed by: {}\n",
         one("audit_signing_kid")
     ));
-    let kept = strs("kept_until_restart");
-    if !kept.is_empty() {
-        out.push_str(&format!(
-            "still keyed by the startup key (restart to re-key): {}\n",
-            kept.join(", ")
-        ));
-    }
     let restart = strs("restart_needed");
     if !restart.is_empty() {
         out.push_str(&format!(
@@ -994,6 +987,26 @@ pub(crate) fn render_keys_reload(v: &Value) -> String {
 /// The warnings of an agents or keys reload, one `warning:` line each, for stderr: those about
 /// what is now in force (`warnings`), then those about the file's own settings, which a restart
 /// would apply (`restart_warnings`). Empty when there are none.
+/// The stderr lines of `attenuo admin key reload`, in both modes: one `warning:` line for
+/// what stays keyed by the startup key (`kept_until_restart`), then the answer's `warnings`.
+pub(crate) fn keys_reload_warnings(v: &Value) -> String {
+    let kept: Vec<String> = v["kept_until_restart"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|s| s.as_str().map(escape_controls))
+        .collect();
+    let mut out = String::new();
+    if !kept.is_empty() {
+        out.push_str(&format!(
+            "warning: still keyed by the startup key (restart to re-key): {}\n",
+            kept.join(", ")
+        ));
+    }
+    out.push_str(&agents_reload_warnings(v));
+    out
+}
+
 pub(crate) fn agents_reload_warnings(v: &Value) -> String {
     let mut out = String::new();
     for w in ["warnings", "restart_warnings"]
@@ -1707,7 +1720,6 @@ would revoke 1 lease(s) if revoked now
              \x20 added    new\n\
              \x20 removed  older\n\
              audit checkpoints signed by: new\n\
-             still keyed by the startup key (restart to re-key): [token] dpop_nonce\n\
              not reloaded, differ from the running config (restart to apply): [server]\n"
         );
         let same = super::render_keys_reload(&json!({
@@ -1726,6 +1738,17 @@ would revoke 1 lease(s) if revoked now
             "verifying_kids": ["k", "a"], "added": ["a"], "removed": [], "audit_signing_kid": "k",
         }));
         assert!(kept.starts_with("signing key: k (kept)\n"), "{kept}");
+        assert_eq!(
+            super::keys_reload_warnings(&json!({
+                "kept_until_restart": ["[token] dpop_nonce"], "warnings": ["w1"],
+            })),
+            "warning: still keyed by the startup key (restart to re-key): [token] dpop_nonce\n\
+             warning: w1\n"
+        );
+        assert_eq!(
+            super::keys_reload_warnings(&json!({"kept_until_restart": []})),
+            ""
+        );
     }
 
     #[test]

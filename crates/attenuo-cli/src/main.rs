@@ -868,7 +868,7 @@ async fn run(cli: Cli) -> Result<Outcome> {
                 out!("{}", render::render_keys_reload(&resp))?;
             }
             // The reload happened: exit 0, with each warning on stderr, in both modes.
-            err!("{}", render::agents_reload_warnings(&resp));
+            err!("{}", render::keys_reload_warnings(&resp));
             Ok(Outcome::Ok)
         }
         Command::Admin(AdminCmd::Operator(OperatorCmd::Reload)) => {
