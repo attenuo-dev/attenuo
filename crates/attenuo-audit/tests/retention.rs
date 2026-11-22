@@ -1681,8 +1681,8 @@ fn golden_issuer() -> Issuer {
 /// pruned); `shipped-bad-signature.jsonl`, `shipped.jsonl` with the second anchor's signature
 /// changed (the envelope made again around it, so only the signature check fails); and
 /// `shipped-other-anchor.jsonl`, `shipped.jsonl` with another valid anchor for the first
-/// boundary in place of the one in `archive-2.jsonl`'s header. Last, `cross-checks.json` holds
-/// what the Rust cross-checks answer for each export and shipped file, for the other suites.
+/// boundary in place of the one in `archive-2.jsonl`'s header. Last come the files
+/// [`write_derived_golden_files`] makes from these.
 ///
 /// Run it with `cargo test -p attenuo-audit --test retention write_golden_files -- --ignored`
 /// after a change of the formats, then commit the files.
@@ -1790,15 +1790,65 @@ fn write_golden_files() {
     ] {
         std::fs::write(dir.join(name), text).unwrap();
     }
+    write_derived_golden_files();
+}
+
+/// Writes the golden files made from the committed ones, so they can change without new
+/// uuids everywhere: `shipped-relabelled.jsonl` (see [`relabelled_checkpoint`]), then
+/// `cross-checks.json`, what the Rust cross-checks answer for each export and shipped file, for
+/// the other suites.
+///
+/// [`write_golden_files`] runs it; run it alone with `cargo test -p attenuo-audit --test
+/// retention write_derived_golden_files -- --ignored`.
+#[test]
+#[ignore = "writes the golden files; run by hand"]
+fn write_derived_golden_files() {
+    let dir = golden_dir();
+    let shipped = std::fs::read_to_string(dir.join("shipped.jsonl")).unwrap();
+    std::fs::write(dir.join(GOLDEN_RELABELLED), relabelled_checkpoint(&shipped)).unwrap();
     let checks = serde_json::to_string_pretty(&golden_checks()).unwrap() + "\n";
     std::fs::write(dir.join(GOLDEN_CHECKS), checks).unwrap();
+}
+
+/// A shipped file with a checkpoint envelope relabelled as an anchor.
+const GOLDEN_RELABELLED: &str = "shipped-relabelled.jsonl";
+
+/// `shipped` with one more line after its checkpoints: the last checkpoint's envelope with its
+/// `head_hash` zeroed and its `format` changed to the anchor format, but no `anchor` member. A
+/// reader that skipped lines by their format alone would miss the forged checkpoint; it is an
+/// envelope whose format is not the checkpoint format, so the cross-check reports it.
+fn relabelled_checkpoint(shipped: &str) -> String {
+    let lines: Vec<&str> = shipped.lines().collect();
+    let last_cp = lines
+        .iter()
+        .rposition(|l| l.contains("\"checkpoint\":"))
+        .unwrap();
+    let mut v: Value = serde_json::from_str(lines[last_cp]).unwrap();
+    v["checkpoint"]["head_hash"] = json!("0".repeat(64));
+    v["format"] = json!(attenuo_audit::SHIPPED_ANCHOR_FORMAT);
+    let forged = serde_json::to_string(&v).unwrap();
+    let mut out: Vec<&str> = lines[..=last_cp].to_vec();
+    out.push(&forged);
+    out.extend(&lines[last_cp + 1..]);
+    out.join("\n") + "\n"
+}
+
+/// The committed relabelled file is the one [`relabelled_checkpoint`] makes now.
+#[test]
+fn the_golden_relabelled_file_is_current() {
+    let dir = golden_dir();
+    let read = |n: &str| std::fs::read_to_string(dir.join(n)).unwrap();
+    assert_eq!(
+        read(GOLDEN_RELABELLED),
+        relabelled_checkpoint(&read("shipped.jsonl"))
+    );
 }
 
 /// The file of the verdicts the Rust cross-checks give on the golden files.
 const GOLDEN_CHECKS: &str = "cross-checks.json";
 
 /// The export and shipped file of each verdict in [`GOLDEN_CHECKS`].
-const GOLDEN_PAIRS: [(&str, &str); 8] = [
+const GOLDEN_PAIRS: [(&str, &str); 9] = [
     ("archive-1.jsonl", "shipped.jsonl"),
     ("archive-2.jsonl", "shipped.jsonl"),
     ("retained.jsonl", "shipped.jsonl"),
@@ -1807,6 +1857,7 @@ const GOLDEN_PAIRS: [(&str, &str); 8] = [
     ("archive-2.jsonl", "shipped-bad-signature.jsonl"),
     ("retained.jsonl", "shipped-bad-signature.jsonl"),
     ("archive-2.jsonl", "shipped-other-anchor.jsonl"),
+    ("retained.jsonl", GOLDEN_RELABELLED),
 ];
 
 /// What `cross_check` and `cross_check_anchors` answer for each of [`GOLDEN_PAIRS`], as the
@@ -1948,6 +1999,21 @@ fn the_golden_negative_cases_fail_the_anchor_cross_check() {
     assert_eq!(r.len(), 1, "{r:?}");
     assert_eq!(r[0].0, 5);
     assert!(r[0].2.contains("another anchor for this boundary"), "{r:?}");
+    // A forged checkpoint envelope relabelled with the anchor format: the checkpoint check
+    // reports it, the anchors still match.
+    let text = read(GOLDEN_RELABELLED);
+    let r = cross_check(&retained, &parse_shipped(&text).unwrap(), &keys);
+    assert!(!r.ok);
+    assert_eq!(r.mismatches.len(), 1, "{r:?}");
+    assert_eq!((r.mismatches[0].seq, r.mismatches[0].line), (14, 5));
+    assert!(
+        r.mismatches[0].reason.contains("unsupported format"),
+        "{r:?}"
+    );
+    assert!(attenuo_audit::cross_check_anchors(&retained, &anchors(GOLDEN_RELABELLED), &keys).ok);
+    // A bare line with the anchor format and no `anchor` is not skipped either.
+    let bare = read("shipped.jsonl") + "{\"format\":\"attenuo-shipped-anchor-v1\"}\n";
+    assert!(parse_shipped(&bare).is_err());
     // S3 objects joined with no newline parse as the same anchors.
     let joined = read("shipped.jsonl").replace('\n', "");
     let a = attenuo_audit::parse_shipped_anchors(&joined).unwrap();

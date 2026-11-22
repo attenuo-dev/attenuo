@@ -20,7 +20,14 @@ import {
   type ShippedMismatch,
   type VerifyExportOptions,
 } from "../src/index.js";
-import { entryHash, EXPORT_FORMAT, GENESIS_HASH } from "../src/audit.js";
+import {
+  entryHash,
+  EXPORT_FORMAT,
+  GENESIS_HASH,
+  isBlank,
+  lastShippedSeq,
+  type ShippedLine,
+} from "../src/audit.js";
 import { canonicalize } from "../src/jcs.js";
 import { b64 } from "./helpers.js";
 
@@ -500,7 +507,7 @@ describe("crossCheck", () => {
     expect([w.inRange, w.mismatches.map((m) => m.seq)]).toEqual([1, [6]]);
   });
 
-  it("skips a prune anchor line in the shipped file", async () => {
+  it("checks a prune anchor line in the shipped file as an anchor", async () => {
     const objs = await makeExport();
     const shipped = await shippedLines(checkpointsOf(objs));
     const anchor =
@@ -1140,5 +1147,117 @@ describe("shipped anchors", () => {
       "the export starts right after this shipped anchor's boundary, but its header carries " +
         "no anchor",
     ]);
+  });
+});
+
+// ---- what the readers skip and refuse, as the Rust readers do -----------------------------
+
+describe.skipIf(!existsSync(GOLDEN))("reading shipped files as Rust does", () => {
+  it("reports a checkpoint envelope relabelled as an anchor", async () => {
+    // The golden file has the last checkpoint again, its head_hash zeroed and its format the
+    // anchor format, with no `anchor` member. Rust reads it as a checkpoint envelope with an
+    // unsupported format, so it is not skipped.
+    const r = await goldenCross("retained.jsonl", "shipped-relabelled.jsonl");
+    expect(r.ok).toBe(false);
+    expect(r.anchors.ok).toBe(true);
+    expect(r.mismatches).toEqual([
+      {
+        seq: 14,
+        line: 5,
+        reason: "shipped envelope is inconsistent: unsupported format `attenuo-shipped-anchor-v1`",
+      },
+    ]);
+    const parsed = await parseShipped({ path: join(GOLDEN, "shipped-relabelled.jsonl") });
+    expect(parsed.map((p) => [p.line, p.checkpoint.seq]).at(-1)).toEqual([5, 14]);
+  });
+
+  it.each([
+    '{"format":"attenuo-shipped-anchor-v1"}',
+    '{"format":"attenuo-shipped-anchor-v1","kid":"k"}',
+  ])("does not skip %s, a line with the anchor format and no anchor", async (line) => {
+    const text = goldenText("shipped.jsonl") + line + "\n";
+    await expect(parseShipped([text])).rejects.toThrow("shipped checkpoints, line 7");
+    await expect(goldenCross("retained.jsonl", [text])).rejects.toThrow(
+      "shipped checkpoints, line 7",
+    );
+  });
+
+  it("takes as blank only the lines Rust's trim makes empty", async () => {
+    const text = goldenText("shipped.jsonl");
+    // Unicode White_Space, which Rust's `trim` strips, is a blank line.
+    expect(await parseShipped([text + " \t\u00a0\u3000\u2028\u0085\n"])).toHaveLength(4);
+    expect((await goldenCross("retained.jsonl", [text + "\u0085\n"])).ok).toBe(true);
+    // U+FEFF is not White_Space, though JavaScript's `trim` strips it; nor is U+001F.
+    for (const bad of ["\ufeff", "\u001c\u001d\u001e\u001f"]) {
+      await expect(parseShipped([text + bad + "\n"])).rejects.toThrow("line 7");
+      await expect(goldenCross("retained.jsonl", [text + bad + "\n"])).rejects.toThrow("line 7");
+    }
+    const exp = goldenText("retained.jsonl");
+    expect((await verifyExport([exp + "\u0085\n"], goldenOpts())).ok).toBe(true);
+    await expect(verifyExport([exp + "\ufeff\n"], goldenOpts())).rejects.toThrow("line");
+    expect(isBlank("\u2000\u200a\u202f\u205f\v\f\r")).toBe(true);
+    expect(isBlank("\u200b")).toBe(false);
+  });
+
+  // Rust reads these fields as u64 and refuses `10.0` or `1e1`, and so does Python. A double
+  // cannot tell them from `10`, so the parser marks where it read one.
+  const written = (v: number): string[] => [`${v}.0`, `${v / 10}e1`, `${v}E0`];
+
+  it.each(written(10))("refuses a shipped checkpoint seq written as %s", async (form) => {
+    const text = goldenText("shipped.jsonl").replace('"seq":10,', `"seq":${form},`);
+    await expect(parseShipped([text])).rejects.toThrow(
+      "line 1: `seq` must be a non-negative integer",
+    );
+  });
+
+  it.each(written(5))("refuses a shipped anchor through_seq written as %s", async (form) => {
+    const text = goldenText("shipped.jsonl").replace('"through_seq":5', `"through_seq":${form}`);
+    await expect(parseShippedAnchors([text])).rejects.toThrow(
+      "`through_seq` must be a non-negative integer",
+    );
+  });
+
+  it.each(written(11))("refuses an export header from written as %s", async (form) => {
+    const text = goldenText("retained.jsonl").replace('"from":11', `"from":${form}`);
+    expect(text).not.toEqual(goldenText("retained.jsonl"));
+    await expect(verifyExport([text], goldenOpts())).rejects.toThrow(
+      "`from` must be a non-negative integer",
+    );
+  });
+
+  it.each(written(5))("refuses a header previous_through_seq written as %s", async (form) => {
+    const text = goldenText("retained.jsonl").replace(
+      '"previous_through_seq":5',
+      `"previous_through_seq":${form}`,
+    );
+    await expect(verifyExport([text], goldenOpts())).rejects.toThrow("previous_through_seq");
+  });
+
+  it("still reads integers written as integers, and fractions in a record", async () => {
+    expect((await goldenCross("retained.jsonl", "shipped.jsonl")).ok).toBe(true);
+    // The last entry's record holds a fraction written with an exponent; its checkpoint goes.
+    const objs = (await makeExport()).filter((o) => !(o.type === "checkpoint" && o.seq === 6));
+    const last = objs.find((o) => o.type === "entry" && o.seq === 6) as Obj;
+    last.record = { ...last.record, ratio: 0.5 };
+    last.entry_hash = await entryHash(6, last.prev_hash as string, last.record);
+    const text = lines(objs).map((l) => l.replace('"ratio":0.5', '"ratio":5.0e-1'));
+    expect(text.some((l) => l.includes("5.0e-1"))).toBe(true);
+    const r = await verifyExport(text, { checkpointPublicKeys: jwks, allowUnsignedTail: true });
+    expect(r).toMatchObject({ ok: true, entries: 6, firstBadSeq: undefined });
+  });
+});
+
+describe("lastShippedSeq", () => {
+  it("handles more lines than a spread can pass as arguments", () => {
+    const n = 300_000;
+    const many: ShippedLine[] = Array.from({ length: n }, (_, i) => ({
+      line: i + 1,
+      checkpoint: { seq: (i * 7919) % n, head_hash: "", at: "", kid: "", signature: "" },
+      inconsistency: undefined,
+    }));
+    const seqs = many.map((s) => s.checkpoint.seq);
+    expect(() => Math.max(...seqs)).toThrow(RangeError);
+    expect(lastShippedSeq(many)).toBe(n - 1);
+    expect(lastShippedSeq([])).toBeUndefined();
   });
 });

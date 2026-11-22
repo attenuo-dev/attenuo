@@ -444,7 +444,7 @@ ANCHOR_LINE = (
 )
 
 
-def test_a_prune_anchor_line_in_the_shipped_file_is_skipped() -> None:
+def test_a_prune_anchor_line_in_the_shipped_file_is_checked_as_an_anchor() -> None:
     objs = make_export()
     shipped = shipped_lines(checkpoints_of(objs))
     with_anchor = [shipped[0], ANCHOR_LINE, shipped[1]]
@@ -1030,3 +1030,78 @@ def test_the_shipped_checkpoint_at_the_anchor_boundary_must_name_its_hash() -> N
         "the export starts right after this shipped anchor's boundary, but its header carries "
         "no anchor"
     ]
+
+
+# ---- what the readers skip, as the Rust readers do ----------------------------------------
+
+
+@needs_golden
+def test_a_checkpoint_envelope_relabelled_as_an_anchor_is_reported() -> None:
+    # The golden file has the last checkpoint again, its head_hash zeroed and its format the
+    # anchor format, with no `anchor` member. Rust reads it as a checkpoint envelope with an
+    # unsupported format, so it is not skipped.
+    r = golden_cross("retained.jsonl", "shipped-relabelled.jsonl")
+    assert not r.ok and r.anchors.ok
+    assert r.mismatches == (
+        ShippedMismatch(
+            14,
+            5,
+            "shipped envelope is inconsistent: unsupported format `attenuo-shipped-anchor-v1`",
+        ),
+    )
+    lines = parse_shipped(golden("shipped-relabelled.jsonl"))
+    assert [(p.line, p.checkpoint["seq"]) for p in lines][-1] == (5, 14)
+
+
+@needs_golden
+@pytest.mark.parametrize(
+    "line",
+    [
+        '{"format":"attenuo-shipped-anchor-v1"}',
+        '{"format":"attenuo-shipped-anchor-v1","kid":"k"}',
+    ],
+)
+def test_a_line_with_the_anchor_format_and_no_anchor_is_not_skipped(line: str) -> None:
+    text = golden("shipped.jsonl").read_text() + line + "\n"
+    with pytest.raises(ExportError, match="shipped checkpoints, line 7"):
+        parse_shipped([text])
+    with pytest.raises(ExportError, match="shipped checkpoints, line 7"):
+        golden_cross("retained.jsonl", [text])
+
+
+@needs_golden
+def test_only_what_rust_trims_makes_a_line_blank() -> None:
+    text = golden("shipped.jsonl").read_text()
+    # Unicode White_Space, which Rust's `trim` strips, is a blank line.
+    assert len(parse_shipped([text + " \t\xa0\u3000\u2028\x85\n"])) == 4
+    assert golden_cross("retained.jsonl", [text + "\xa0\n"]).ok
+    # U+001C..U+001F are not White_Space, though `str.strip()` strips them: Rust reads the line
+    # as JSON and fails, and so does the SDK.
+    for bad in ("\x1c", "\x1d\x1e\x1f"):
+        with pytest.raises(ExportError, match="line 7"):
+            parse_shipped([text + bad + "\n"])
+        with pytest.raises(ExportError, match="line 7"):
+            golden_cross("retained.jsonl", [text + bad + "\n"])
+    export = golden("retained.jsonl").read_text()
+    jwks = golden_jwks()
+    assert verify_export([export + "\u3000\n"], checkpoint_public_keys=jwks).ok
+    with pytest.raises(ExportError, match="line"):
+        verify_export([export + "\x1f\n"], checkpoint_public_keys=jwks)
+
+
+@pytest.mark.parametrize("written", ["10.0", "1e1", "1.0e1"])
+def test_an_unsigned_integer_written_with_a_fraction_or_exponent_is_refused(
+    written: str,
+) -> None:
+    # Rust reads `seq` and the anchor's seqs as u64 and refuses these; so does the SDK.
+    objs = make_export()
+    cp = checkpoints_of(objs)[0]
+    line = rfc8785.dumps(envelope(cp)).decode().replace(f'"seq":{cp["seq"]}', f'"seq":{written}')
+    with pytest.raises(ExportError, match="`seq` must be a non-negative integer"):
+        parse_shipped([line])
+    anchor_line = ANCHOR_LINE.replace('"through_seq":3', f'"through_seq":{written}')
+    with pytest.raises(ExportError, match="`through_seq` must be a non-negative integer"):
+        parse_shipped_anchors([anchor_line])
+    header = json.dumps(objs[0]).replace('"from": 1', f'"from": {written}')
+    with pytest.raises(ExportError, match="`from` must be a non-negative integer"):
+        verify_export([header + "\n", *lines(objs[1:])], checkpoint_public_keys=JWKS)

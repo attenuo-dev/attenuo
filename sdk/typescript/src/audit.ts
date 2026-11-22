@@ -34,7 +34,13 @@
  */
 
 import { AttenuoError } from "./errors.js";
-import { canonicalize, parseJson, parseJsonValues, type JsonValue } from "./jcs.js";
+import {
+  canonicalize,
+  parseJson,
+  parseJsonValues,
+  type FractionMarks,
+  type JsonValue,
+} from "./jcs.js";
 import { b64urlDecode } from "./token.js";
 
 /** First element of the array the entry hash covers. */
@@ -583,9 +589,11 @@ const sameCheckpoint = (a: CheckpointFields, b: CheckpointFields): boolean =>
  * A line is the sink's envelope (`format`, `checkpoint`, `kid`, `signature`,
  * `checkpoint_sha256`) or a bare checkpoint (an export's `checkpoint` line, or
  * `GET /admin/audit/checkpoint` saved by an operator's own job). Blank lines are skipped, and
- * so are lines whose `format` is `attenuo-shipped-anchor-v1` (the signed anchor of a prune,
- * which the sink ships with the checkpoints); anything else throws `ExportError`. An envelope that disagrees with its own checkpoint is not
- * an error here: the line carries `inconsistency` and `crossCheck` reports it.
+ * so are values that have an `anchor` member and the format `attenuo-shipped-anchor-v1` (the
+ * signed anchor of a prune, which the sink ships with the checkpoints; `parseShippedAnchors`
+ * reads them). Anything else throws `ExportError`. An envelope that disagrees with its own
+ * checkpoint is not an error here: the line carries `inconsistency` and `crossCheck` reports it.
+ * A checkpoint envelope relabelled with the anchor format is such a disagreement.
  */
 export async function parseShipped(source: ExportSource): Promise<ShippedLine[]> {
   return shippedLines(await readText(source));
@@ -595,11 +603,12 @@ async function shippedLines(text: string): Promise<ShippedLine[]> {
   const out: ShippedLine[] = [];
   for (const [n, raw] of text.split("\n").entries()) {
     const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
-    if (line.trim() === "") continue;
+    if (isBlank(line)) continue;
     const where = `shipped checkpoints, line ${n + 1}`;
     for (const obj of lineValues(line, where)) {
       if (!isObj(obj)) throw new ExportError(`${where}: not a JSON object`);
-      if (obj.format === SHIPPED_ANCHOR_FORMAT) continue;
+      // As Rust: only a value with an `anchor` member and the anchor format is an anchor line.
+      if ("anchor" in obj && obj.format === SHIPPED_ANCHOR_FORMAT) continue;
       if ("checkpoint" in obj) {
         need(obj, where, { format: "str", kid: "str", signature: "str", checkpoint_sha256: "str" });
         checkPublicUrl(obj, where);
@@ -612,6 +621,8 @@ async function shippedLines(text: string): Promise<ShippedLine[]> {
         if (type !== undefined && type !== "checkpoint") {
           throw new ExportError(`${where}: not a checkpoint line (type ${JSON.stringify(type)})`);
         }
+        const objMarks = FRACTIONS.get(obj);
+        if (objMarks !== undefined) FRACTIONS.set(rest, objMarks);
         out.push({
           line: n + 1,
           checkpoint: cp5(toCheckpoint(rest, where)),
@@ -626,7 +637,7 @@ async function shippedLines(text: string): Promise<ShippedLine[]> {
 /** The JSON values of one line: usually one, or several objects written back to back. */
 function lineValues(line: string, where: string): JsonValue[] {
   try {
-    return parseJsonValues(line);
+    return parseJsonValues(line, FRACTIONS);
   } catch (e) {
     throw new ExportError(`${where}: ${(e as Error).message}`);
   }
@@ -660,10 +671,10 @@ function shippedAnchors(text: string): ShippedAnchor[] {
   const out: ShippedAnchor[] = [];
   for (const [n, raw] of text.split("\n").entries()) {
     const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
-    if (line.trim() === "") continue;
+    if (isBlank(line)) continue;
     let values: JsonValue[];
     try {
-      values = parseJsonValues(line);
+      values = parseJsonValues(line, FRACTIONS);
     } catch {
       continue;
     }
@@ -842,8 +853,7 @@ export async function crossCheck(
     inRange,
     matched,
     beyondRange: beyond,
-    lastShippedSeq:
-      shipped.length > 0 ? Math.max(...shipped.map((s) => s.checkpoint.seq)) : undefined,
+    lastShippedSeq: lastShippedSeq(shipped),
     mismatches,
     ok: mismatches.length === 0 && anchors.ok,
     belowRange: below,
@@ -999,10 +1009,43 @@ const isObj = (v: unknown): v is Obj => typeof v === "object" && v !== null && !
 const isUint = (v: unknown): v is number =>
   typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
 
+/**
+ * Where the parsed shipped and export data wrote a number with a fraction or an exponent. Rust
+ * reads these fields as `u64` and refuses `10.0` or `1e1`, and so does Python. A double alone
+ * cannot tell them from `10`.
+ */
+const FRACTIONS: FractionMarks = new WeakMap();
+
+/** `o[name]` is an unsigned integer written as one (not `10.0` or `1e1`). */
+const uintAt = (o: Obj, name: string): boolean =>
+  isUint(o[name]) && FRACTIONS.get(o)?.has(name) !== true;
+
+/**
+ * The characters Rust's `str::trim` strips (Unicode White_Space), which decide a blank line in
+ * the Rust readers. JavaScript's `trim` strips another set (it adds U+FEFF and leaves U+0085),
+ * so the readers use this one.
+ */
+const RUST_WS =
+  "\\t\\n\\v\\f\\r \\u0085\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000";
+const RUST_BLANK = new RegExp(`^[${RUST_WS}]*$`);
+const RUST_WS_START = new RegExp(`^[${RUST_WS}]+`);
+
+/** A blank line, as Rust's `line.trim().is_empty()` decides it. */
+export const isBlank = (line: string): boolean => RUST_BLANK.test(line);
+
+/** The largest `seq` of the shipped lines, found by a loop: a spread can overflow the stack. */
+export function lastShippedSeq(lines: readonly ShippedLine[]): number | undefined {
+  let last: number | undefined;
+  for (const s of lines) {
+    if (last === undefined || s.checkpoint.seq > last) last = s.checkpoint.seq;
+  }
+  return last;
+}
+
 function need(o: Obj, where: string, spec: Record<string, "uint" | "str">): void {
   for (const [name, kind] of Object.entries(spec)) {
     const v = o[name];
-    if (kind === "uint" ? !isUint(v) : typeof v !== "string") {
+    if (kind === "uint" ? !uintAt(o, name) : typeof v !== "string") {
       throw new ExportError(
         `${where}: \`${name}\` must be ${kind === "uint" ? "a non-negative integer" : "a string"}`,
       );
@@ -1012,7 +1055,7 @@ function need(o: Obj, where: string, spec: Record<string, "uint" | "str">): void
 
 function parseLine(text: string, where: string): JsonValue {
   try {
-    return parseJson(text);
+    return parseJson(text, FRACTIONS);
   } catch (e) {
     throw new ExportError(`${where}: ${(e as Error).message}`);
   }
@@ -1023,9 +1066,9 @@ function parse(text: string): Parsed {
   const entries: Entry[] = [];
   const checkpoints: Checkpoint[] = [];
   let whole: JsonValue | undefined;
-  if (text.trimStart().startsWith("{")) {
+  if (text.replace(RUST_WS_START, "").startsWith("{")) {
     try {
-      whole = parseJson(text);
+      whole = parseJson(text, FRACTIONS);
     } catch {
       whole = undefined;
     }
@@ -1042,7 +1085,7 @@ function parse(text: string): Parsed {
   } else {
     for (const [n, raw] of text.split("\n").entries()) {
       const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
-      if (line.trim() === "") continue;
+      if (isBlank(line)) continue;
       const where = `line ${n + 1}`;
       const obj = parseLine(line, where);
       if (!isObj(obj)) throw new ExportError(`${where}: not a JSON object`);
@@ -1111,7 +1154,7 @@ function checkAnchor(a: unknown, where = "header anchor"): void {
     signature: "str",
   });
   const prev = a.previous_through_seq;
-  if (prev !== undefined && prev !== null && !isUint(prev)) {
+  if (prev !== undefined && prev !== null && !uintAt(a, "previous_through_seq")) {
     throw new ExportError(
       `${where}: \`previous_through_seq\` must be a non-negative integer or null`,
     );
@@ -1146,10 +1189,9 @@ function b64urlStrict(text: string): Uint8Array | undefined {
   } catch {
     return undefined;
   }
-  const again = btoa(String.fromCharCode(...raw))
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/, "");
+  let binary = "";
+  for (const b of raw) binary += String.fromCharCode(b);
+  const again = btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
   return again === text ? raw : undefined;
 }
 

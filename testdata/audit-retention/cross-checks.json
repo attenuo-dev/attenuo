@@ -210,6 +210,34 @@
       },
       "export": "archive-2.jsonl",
       "shipped": "shipped-other-anchor.jsonl"
+    },
+    {
+      "anchors": {
+        "beyond_range": 0,
+        "checked": 2,
+        "matched": 2,
+        "mismatches": [],
+        "ok": true,
+        "shipped": 2
+      },
+      "checkpoints": {
+        "below_range": 1,
+        "beyond_range": 0,
+        "in_range": 3,
+        "last_shipped_seq": 14,
+        "matched": 3,
+        "mismatches": [
+          {
+            "line": 5,
+            "reason": "shipped envelope is inconsistent: unsupported format `attenuo-shipped-anchor-v1`",
+            "seq": 14
+          }
+        ],
+        "ok": false,
+        "shipped": 5
+      },
+      "export": "retained.jsonl",
+      "shipped": "shipped-relabelled.jsonl"
     }
   ]
 }

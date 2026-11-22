@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { canonicalize, parseJson, parseJsonValues } from "../src/jcs.js";
+import { canonicalize, parseJson, parseJsonValues, type FractionMarks } from "../src/jcs.js";
 
 // The known answers are the RFC 8785 examples (sections 3.2.2, 3.2.3 and Appendix B), the same
 // ones crates/attenuo-core/src/jcs.rs checks against the Rust implementation.
@@ -167,5 +167,32 @@ describe("parseJsonValues", () => {
     expect(() => parseJsonValues('{"a":1}{"a":1,"a":2}')).toThrow("duplicate member");
     expect(() => parseJsonValues('{"a":1}x')).toThrow("unexpected character");
     expect(() => parseJson('{"a":1}{"b":2}')).toThrow("trailing characters");
+  });
+});
+
+describe("fraction marks", () => {
+  it("records where a number was written with a fraction or an exponent", () => {
+    const marks: FractionMarks = new WeakMap();
+    const v = parseJson(
+      '{"a":10,"b":10.0,"c":1e1,"d":[1,2.5,3E0],"e":{"f":-0.0,"g":7}}',
+      marks,
+    ) as {
+      d: number[];
+      e: object;
+    };
+    expect(v).toEqual({ a: 10, b: 10, c: 10, d: [1, 2.5, 3], e: { f: -0, g: 7 } });
+    expect([...(marks.get(v) ?? [])]).toEqual(["b", "c"]);
+    expect([...(marks.get(v.d) ?? [])]).toEqual([1, 2]);
+    expect([...(marks.get(v.e) ?? [])]).toEqual(["f"]);
+    // A container that holds a marked number is not marked itself.
+    expect(marks.get(v)?.has("d")).toBe(false);
+    expect(marks.get(v)?.has("e")).toBe(false);
+    const vs = parseJsonValues('{"x":1.0}{"x":1}', marks);
+    expect(marks.get(vs[0] as object)?.has("x")).toBe(true);
+    expect(marks.get(vs[1] as object)).toBeUndefined();
+  });
+
+  it("is optional", () => {
+    expect(parseJson('{"b":10.0}')).toEqual({ b: 10 });
   });
 });

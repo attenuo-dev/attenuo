@@ -583,11 +583,12 @@ def parse_shipped(
     A line is the sink's envelope (``format``, ``checkpoint``, ``kid``, ``signature``,
     ``checkpoint_sha256``) or a bare checkpoint (an export's ``checkpoint`` line, or
     ``GET /admin/audit/checkpoint`` saved by an operator's own job). Blank lines are skipped,
-    and so are lines whose ``format`` is ``attenuo-shipped-anchor-v1`` (the signed anchor of a
-    prune, which the sink ships with the checkpoints); anything else raises
-    :class:`ExportError`. An envelope that disagrees with its own
-    checkpoint is not an error here: the line carries ``inconsistency`` and
-    :func:`cross_check` reports it.
+    and so are values that have an ``anchor`` member and the format
+    ``attenuo-shipped-anchor-v1`` (the signed anchor of a prune, which the sink ships with the
+    checkpoints; :func:`parse_shipped_anchors` reads them). Anything else raises
+    :class:`ExportError`. An envelope that disagrees with its own checkpoint is not an error
+    here: the line carries ``inconsistency`` and :func:`cross_check` reports it. A checkpoint
+    envelope relabelled with the anchor format is such a disagreement.
     """
     return _shipped_lines(_read_text(path_or_lines))
 
@@ -596,7 +597,7 @@ def _shipped_lines(text: str) -> list[ShippedLine]:
     out: list[ShippedLine] = []
     for n, raw in enumerate(text.split("\n"), start=1):
         line = raw.removesuffix("\r")
-        if not line.strip():
+        if _is_blank(line):
             continue
         where = f"shipped checkpoints, line {n}"
         try:
@@ -606,7 +607,8 @@ def _shipped_lines(text: str) -> list[ShippedLine]:
         for obj in values:
             if not isinstance(obj, dict):
                 raise ExportError(f"{where}: not a JSON object")
-            if obj.get("format") == SHIPPED_ANCHOR_FORMAT:
+            # As Rust: only a value with an `anchor` member and the anchor format is an anchor.
+            if "anchor" in obj and obj.get("format") == SHIPPED_ANCHOR_FORMAT:
                 continue
             if "checkpoint" in obj:
                 _need(obj, where, format="str", kid="str", signature="str", checkpoint_sha256="str")
@@ -642,7 +644,7 @@ def _shipped_anchors(text: str) -> list[ShippedAnchor]:
     out: list[ShippedAnchor] = []
     for n, raw in enumerate(text.split("\n"), start=1):
         line = raw.removesuffix("\r")
-        if not line.strip():
+        if _is_blank(line):
             continue
         try:
             values = _line_values(line)
@@ -1012,6 +1014,19 @@ def _loads(text: str) -> Any:
     return json.loads(text, object_pairs_hook=_no_dupes, parse_constant=_no_const)
 
 
+# The characters Rust's `str::trim` strips (Unicode White_Space), which decide a blank line in
+# the Rust readers. `str.strip()` with no argument also strips U+001C..U+001F.
+_RUST_WS = (
+    "\t\n\x0b\x0c\r \x85\xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007"
+    "\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000"
+)
+
+
+def _is_blank(line: str) -> bool:
+    """A blank line, as Rust's ``line.trim().is_empty()`` decides it."""
+    return not line.strip(_RUST_WS)
+
+
 _DECODER = json.JSONDecoder(object_pairs_hook=_no_dupes, parse_constant=_no_const)
 _JSON_WS = " \t\n\r"
 
@@ -1048,7 +1063,7 @@ def _parse(text: str) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[s
     entries: list[dict[str, Any]] = []
     cps: list[dict[str, Any]] = []
     whole: Any = None
-    if text.lstrip().startswith("{"):
+    if text.lstrip(_RUST_WS).startswith("{"):
         try:
             whole = _loads(text)
         except ValueError:
@@ -1064,7 +1079,7 @@ def _parse(text: str) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[s
     else:
         for n, line in enumerate(text.split("\n"), start=1):
             line = line.removesuffix("\r")
-            if not line.strip():
+            if _is_blank(line):
                 continue
             where = f"line {n}"
             try:
