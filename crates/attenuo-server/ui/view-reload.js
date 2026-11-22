@@ -2,14 +2,16 @@
 // reload route: the admin operators, the agents and PEPs, and the issuer keys, each behind a
 // confirmation dialog whose risky options start unchecked; the policy file is reloaded from the
 // Policy page, after a check. The result shows what changed, as the server answered it; a
-// refusal shows the server's code and message, and nothing changed.
+// refusal (4xx) shows the server's code and message, and nothing changed; a network error or a
+// 5xx says the outcome is unknown. While a reload is in flight its dialog cannot be dismissed,
+// and only one reload of a kind runs at a time.
 //
 // The routes need the admin role and `[admin_ui] allow_write`. Without the role the buttons
 // are disabled; on a listener without writes they are not shown at all.
 'use strict';
 
 import { h, append, replace, link, mono, short, kv, table, time, modal } from './dom.js';
-import { api, showNotice, needsRole, roleAllows, writesAllowed } from './api.js';
+import { api, showNotice, showError, needsRole, roleAllows, writesAllowed } from './api.js';
 
 /** The reloads this page offers, in the order shown. */
 const RELOADS = [
@@ -114,7 +116,7 @@ function reloadPanel(spec, writes) {
   let note = null;
   if (writes !== false) {
     button = needsRole(h('button', {
-      type: 'button', class: 'primary', on: { click: () => openReload(spec, out) },
+      type: 'button', class: 'primary', on: { click: () => openReload(spec, out, button) },
     }), 'admin');
     append(button, [spec.button]);
     note = roleAllows('admin') ? null : h('p', { class: 'small muted' }, 'Reloading needs the admin role.');
@@ -131,17 +133,22 @@ function reloadPanel(spec, writes) {
     out);
 }
 
+/** The kinds of reload with a request in flight: one of each kind at a time. */
+export const inFlight = new Set();
+
 /** The confirmation: what the reload does, its options (all off), then Reload or Cancel. */
-function openReload(spec, out) {
+function openReload(spec, out, opener) {
+  if (inFlight.has(spec.id)) return;
   const boxes = spec.options.map((o) => {
     const id = `reload-opt-${o.name}`;
-    const input = h('input', { type: 'checkbox', id, name: o.name });
+    const helpId = `${id}-help`;
+    const input = h('input', { type: 'checkbox', id, name: o.name, 'aria-describedby': helpId });
     return {
       name: o.name,
       input,
       node: h('div', { class: 'reload-option' },
         h('label', { class: 'check', for: id }, input, o.label, ' ', mono(o.name)),
-        h('p', { class: 'small muted' }, o.help)),
+        h('p', { class: 'small muted', id: helpId }, o.help)),
     };
   });
   const risky = h('p', { class: 'callout warn' }, 'A safety check is off for this reload: the server will not refuse what that check catches.');
@@ -152,7 +159,16 @@ function openReload(spec, out) {
   const err = h('div', { class: 'callout bad', role: 'alert', id: `reload-${spec.id}-error` });
   err.hidden = true;
   const go = h('button', { type: 'submit', class: 'primary' }, 'Reload');
+  const cancel = h('button', { type: 'button', on: { click: () => { if (!inFlight.has(spec.id)) close(); } } }, 'Cancel');
   const titleId = `reload-${spec.id}-title`;
+  const busy = (on) => {
+    if (on) inFlight.add(spec.id);
+    else inFlight.delete(spec.id);
+    go.disabled = on;
+    cancel.disabled = on;
+    if (opener && !opener.dataset.role) opener.disabled = on;
+    for (const b of boxes) b.input.disabled = on;
+  };
 
   let close = () => {};
   let dialog = null;
@@ -160,20 +176,27 @@ function openReload(spec, out) {
     on: {
       submit: async (ev) => {
         ev.preventDefault();
-        go.disabled = true;
+        if (inFlight.has(spec.id)) return;
+        busy(true);
         err.hidden = true;
         const body = {};
         for (const b of boxes) if (b.input.checked) body[b.name] = true;
         let r;
         try {
-          r = await api(spec.path, { method: 'POST', body, quiet: [400, 403, 404, 409, 422, 500] });
+          r = await api(spec.path, { method: 'POST', body, quiet: QUIET });
         } catch (e) {
-          if (e.status === 401 || !dialog.isConnected) return;
-          replace(err, refusal(e));
-          err.hidden = false;
-          go.disabled = false;
+          busy(false);
+          if (e.status === 401) return;
+          if (dialog.isConnected) {
+            replace(err, refusal(e));
+            err.hidden = false;
+          } else {
+            // The page changed while the request ran: the outcome still reaches the operator.
+            showError(`${spec.title} reload: ${refusalLine(e)}`);
+          }
           return;
         }
+        busy(false);
         close();
         replace(out, h('h3', null, 'Last reload ', h('span', { class: 'small muted' }, time(new Date().toISOString()))),
           spec.result(r));
@@ -186,15 +209,42 @@ function openReload(spec, out) {
   boxes.length ? h('fieldset', { class: 'reload-options' }, h('legend', null, 'Safety checks you may turn off'), boxes.map((b) => b.node)) : null,
   risky,
   err,
-  h('div', { class: 'buttons' }, h('button', { type: 'button', on: { click: () => close() } }, 'Cancel'), go));
-  ({ dialog, close } = modal(titleId, form));
-  go.focus();
+  h('div', { class: 'buttons' }, cancel, go));
+  ({ dialog, close } = modal(titleId, form, { busy: () => inFlight.has(spec.id) }));
+  // Cancel, not Reload, has the focus: a held Enter must not confirm.
+  cancel.focus();
 }
 
-/** A refused reload: the server's code and message. Nothing changed. */
+/** The statuses a reload shows in its dialog instead of the status line. */
+export const QUIET = [400, 403, 404, 409, 422, 500, 502, 503, 504];
+
+/** Whether the server's answer is a refusal (nothing changed), not an unknown outcome. */
+function refused(e) {
+  return e.status >= 400 && e.status < 500;
+}
+
+/** A failed reload in one line, for the status line. */
+export function refusalLine(e) {
+  return refused(e)
+    ? `refused, ${e.code}: ${e.message}. Nothing was changed.`
+    : `${e.code}: ${e.message}. The result is unknown: check the audit log to see whether the reload happened.`;
+}
+
+/**
+ * A failed reload. A 4xx is a refusal: the server's code and message, and nothing changed.
+ * A network error (status 0) or a 5xx leaves the outcome unknown, and says so. A 404 is
+ * explained as writes being off only when this listener said so at login.
+ */
 export function refusal(e) {
-  if (e.status === 404 && (e.code === 'not_found' || e.code === 'http_404')) {
+  if (e.status === 404 && writesAllowed() === false) {
     return h('p', null, 'Writes are disabled on this listener ([admin_ui] allow_write is off). Use the attenuo CLI against the admin API.');
+  }
+  if (!refused(e)) {
+    return [
+      h('p', null, h('strong', null, 'No answer: '), mono(e.code), e.status ? ` (HTTP ${e.status})` : ''),
+      h('p', null, e.message),
+      h('p', { class: 'small' }, 'The result is unknown: the reload may or may not have happened. The audit log shows whether it did; check it before trying again.'),
+    ];
   }
   return [
     h('p', null, h('strong', null, 'Refused: '), mono(e.code), ` (HTTP ${e.status})`),

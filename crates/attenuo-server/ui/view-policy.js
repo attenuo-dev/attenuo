@@ -6,8 +6,8 @@
 import {
   h, append, replace, mono, time, pill, decisionPill, table, empty, loading, kv, explainReason, jsonTree, modal,
 } from './dom.js';
-import { api, showNotice, roleAllows, writesAllowed } from './api.js';
-import { refusal, auditLink } from './view-reload.js';
+import { api, showNotice, showError, roleAllows, writesAllowed } from './api.js';
+import { refusal, refusalLine, auditLink, inFlight, QUIET } from './view-reload.js';
 
 // GET /admin/policies, fetched once per login. Lock forgets it with the token.
 let cached = null;
@@ -71,12 +71,14 @@ function checkPanel(afterReload) {
       : 'Reloading needs the admin role.');
   const reloadBtn = writes === false
     ? null
-    : h('button', { type: 'button', class: 'primary', disabled: true, on: { click: () => confirmReload(checked, done) } }, 'Reload…');
+    : h('button', { type: 'button', class: 'primary', disabled: true, on: { click: () => confirmReload(checked, done, reloadBtn) } }, 'Reload…');
   const checkBtn = h('button', { type: 'button', on: { click: check } }, 'Check file on disk');
   // The answer of the last check, which the confirmation shows.
   let checked = null;
 
   function done(r) {
+    // Reloaded: the next reload waits for the next check, as before the confirmation existed.
+    if (reloadBtn) reloadBtn.disabled = true;
     replace(result, h('h3', null, 'Last reload'), reloadResult(r));
     afterReload();
   }
@@ -123,29 +125,45 @@ function checkPanel(afterReload) {
 }
 
 /** The confirmation of a policy reload, after a clean check (`c`), then the reload itself. */
-function confirmReload(c, done) {
+function confirmReload(c, done, opener) {
+  if (inFlight.has('policies')) return;
   const err = h('div', { class: 'callout bad', role: 'alert', id: 'policy-reload-error' });
   err.hidden = true;
   const go = h('button', { type: 'submit', class: 'primary' }, 'Reload');
+  const cancel = h('button', { type: 'button', on: { click: () => { if (!inFlight.has('policies')) close(); } } }, 'Cancel');
+  const busy = (on) => {
+    if (on) inFlight.add('policies');
+    else inFlight.delete('policies');
+    go.disabled = on;
+    cancel.disabled = on;
+    if (opener) opener.disabled = on || opener.disabled;
+  };
   let close = () => {};
   let dialog = null;
   const form = h('form', {
     on: {
       submit: async (ev) => {
         ev.preventDefault();
-        go.disabled = true;
+        if (inFlight.has('policies')) return;
+        busy(true);
         err.hidden = true;
         let r;
         try {
-          r = await api('/admin/policies/reload', { method: 'POST', body: {}, quiet: [403, 404, 409, 422, 500] });
+          r = await api('/admin/policies/reload', { method: 'POST', body: {}, quiet: QUIET });
         } catch (e) {
-          if (e.status === 401 || !dialog.isConnected) return;
-          replace(err, refusal(e));
-          if (e.code === 'policy_invalid') append(err, [h('p', { class: 'small' }, 'The old policies stay in force.')]);
-          err.hidden = false;
-          go.disabled = false;
+          busy(false);
+          if (e.status === 401) return;
+          const stays = e.code === 'policy_invalid' ? ' The old policies stay in force.' : '';
+          if (dialog.isConnected) {
+            replace(err, refusal(e));
+            if (stays) append(err, [h('p', { class: 'small' }, stays.trim())]);
+            err.hidden = false;
+          } else {
+            showError(`Policy reload: ${refusalLine(e)}${stays}`);
+          }
           return;
         }
+        busy(false);
         close();
         showNotice(`Reloaded: ${r.policy_ids.length} polic${r.policy_ids.length === 1 ? 'y' : 'ies'}, sha256 ${r.sha256.slice(0, 12)}…`);
         done(r);
@@ -157,9 +175,10 @@ function confirmReload(c, done) {
   c ? kv([['File', mono(c.path)], ['sha256 checked', mono(c.sha256)]]) : null,
   h('p', { class: 'small muted' }, 'The server reads the file again when you press Reload: if it changed after the check, the new content is what loads.'),
   err,
-  h('div', { class: 'buttons' }, h('button', { type: 'button', on: { click: () => close() } }, 'Cancel'), go));
-  ({ dialog, close } = modal('policy-reload-title', form));
-  go.focus();
+  h('div', { class: 'buttons' }, cancel, go));
+  ({ dialog, close } = modal('policy-reload-title', form, { busy: () => inFlight.has('policies') }));
+  // Cancel, not Reload, has the focus: a held Enter must not confirm.
+  cancel.focus();
 }
 
 /** What a policy reload answered: the policy ids, the file's digest, warnings, the record. */
