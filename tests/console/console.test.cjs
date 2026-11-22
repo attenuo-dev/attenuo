@@ -961,7 +961,7 @@ test('a pruned log, from stubbed answers: the explorer line, a pruned seq, the p
     const gone = probe.page.locator('section.panel', { has: probe.page.locator('h1', { hasText: 'was pruned' }) });
     await gone.waitFor();
     assert.match(await gone.locator('h1').innerText(), /^Entry #5 was pruned$/);
-    assert.match(await gone.locator('.callout.warn').innerText(), /This entry was pruned: the server deleted the start of the audit log through seq 20\. A prune by an admin archives the entries first; the automatic prune does only when \[audit\.retention\] archive_dir is set\./);
+    assert.match(await gone.locator('.callout.warn').innerText(), /This entry was pruned: the server deleted the start of the audit log through seq 20\. attenuo audit prune archives the entries before it prunes, and the automatic prune does when \[audit\.retention\] archive_dir is set; a prune made another way may have kept no copy\./);
     assert.equal(await kvValue(gone, 'Pruned through'), '20');
     assert.equal(await kvValue(gone, 'Prune record'), 'seq 24');
     assert.equal(await kvValue(gone, 'First retained seq'), 'seq 21');

@@ -1019,6 +1019,14 @@ async fn export_out_writes_links_and_devices_directly() {
     no_partial_files(s.dir.path());
 }
 
+/// Append one record written ten days ago: inside the keep window, and the newest entry, which
+/// the automatic prune measures the window back from.
+fn recent_entry(state: &AppState) {
+    let mut r = audit_common::record(0);
+    r.at = OffsetDateTime::now_utc() - Duration::days(10);
+    state.audit.append(r).unwrap();
+}
+
 /// Rows at or below seq 20 still in the table, deleted by a prune or not.
 fn rows_through_20(state: &AppState) -> i64 {
     state
@@ -1066,6 +1074,8 @@ async fn an_automatic_prune_and_a_restart_keep_the_files_verifiable_as_one_log()
         r.at = OffsetDateTime::now_utc() - Duration::days(200);
         state.audit.append(r).unwrap();
     }
+    // The automatic prune measures the window back from the newest entry: one recent one.
+    recent_entry(&state);
     let sink = state.checkpoint_sink.as_ref().unwrap();
     wait_for(|| sink.delivered_through() >= Some(20)).await;
 
@@ -1179,6 +1189,7 @@ async fn two_automatic_prunes_with_archive_dir_leave_files_that_verify_as_one_lo
         dir,
     };
     s.fill(25).await;
+    recent_entry(&s.state);
     let first = attenuo_server::auto_prune_once(&s.state).await;
     assert_eq!(
         (first.outcome, first.through),
@@ -1187,6 +1198,7 @@ async fn two_automatic_prunes_with_archive_dir_leave_files_that_verify_as_one_lo
     );
     s.settle().await;
     s.fill(20).await;
+    recent_entry(&s.state);
     let second = attenuo_server::auto_prune_once(&s.state).await;
     assert_eq!(
         (second.outcome, second.through),

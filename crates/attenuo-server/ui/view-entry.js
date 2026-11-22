@@ -59,7 +59,7 @@ function prunedPanel(seq, body) {
     h('p', { class: 'callout warn' },
       'This entry was pruned: the server deleted the start of the audit log',
       through !== null ? [' through seq ', mono(through)] : null,
-      '. A prune by an admin archives the entries first; the automatic prune does only when [audit.retention] archive_dir is set. The entry is not on the server.'),
+      '. attenuo audit prune archives the entries before it prunes, and the automatic prune does when [audit.retention] archive_dir is set; a prune made another way may have kept no copy. The entry is not on the server.'),
     kv([
       ['Pruned through', through !== null ? mono(through) : undefined],
       ['Prune record', pruneSeq !== null ? link(['entry', pruneSeq], `seq ${pruneSeq}`) : undefined],
@@ -91,7 +91,7 @@ function pruneRecordInfo(entry) {
   return box;
 }
 
-const PRUNE_EXPLAIN = 'A prune of the start of the audit log, made by an admin: the entries up to the boundary were archived, then deleted. The boundary, its hash and the archive’s SHA-256 are in the prune’s signed anchor.';
+const PRUNE_EXPLAIN = 'A prune of the start of the audit log, made by an admin: the entries up to the boundary were deleted. attenuo audit prune archives them first; a prune made another way may have kept no copy. The boundary, its hash and the archive’s SHA-256, if one was given, are in the prune’s signed anchor.';
 // The record of an automatic prune names the server's own subject, not an operator.
 const AUTO_PRUNE_SUBJECT = 'urn:attenuo:retention';
 const AUTO_PRUNE_EXPLAIN = 'An automatic prune of the start of the audit log ([audit.retention] prune = "auto"), made by the server: the entries up to the boundary were older than the keep window and their checkpoint had left the host, so they were deleted. With [audit.retention] archive_dir set, the server wrote them to an archive file there first; without it, no copy was kept. The boundary, its hash and the archive’s digest, if any, are in the prune’s signed anchor.';

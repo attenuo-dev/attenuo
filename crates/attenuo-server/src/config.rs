@@ -3924,7 +3924,20 @@ fn check_archive_dir(dir: &std::path::Path) -> anyhow::Result<()> {
             "[audit.retention] archive_dir {shown} is not writable: {e}; the automatic prune \
              writes each pruned prefix there before it prunes"
         )
-    })
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if meta.permissions().mode() & 0o022 != 0 {
+            tracing::warn!(
+                "[audit.retention] archive_dir {shown} is writable by its group or by everyone \
+                 (mode {:o}): another account could put files there or remove the archives. \
+                 Make it writable by the server's account only",
+                meta.permissions().mode() & 0o7777
+            );
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

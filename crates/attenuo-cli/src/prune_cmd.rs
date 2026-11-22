@@ -450,7 +450,7 @@ fn place(tmp: &Path, archive: &Path) -> Result<()> {
             let _ = std::fs::remove_file(tmp);
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Err(exists()),
-        Err(link_err) => rename_noreplace(tmp, archive).map_err(|e| {
+        Err(link_err) => attenuo_audit::fsutil::rename_noreplace(tmp, archive).map_err(|e| {
             if e.kind() == std::io::ErrorKind::AlreadyExists {
                 exists()
             } else {
@@ -466,20 +466,6 @@ fn place(tmp: &Path, archive: &Path) -> Result<()> {
     sync_parent(archive)
         .with_context(|| format!("flushing the directory of {} to disk", archive.display()))?;
     Ok(())
-}
-
-#[cfg(any(target_os = "linux", target_os = "android"))]
-fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
-    use rustix::fs::{renameat_with, RenameFlags, CWD};
-    renameat_with(CWD, from, CWD, to, RenameFlags::NOREPLACE).map_err(std::io::Error::from)
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn rename_noreplace(_from: &Path, _to: &Path) -> std::io::Result<()> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "no rename that refuses to replace on this platform",
-    ))
 }
 
 /// Check the anchor the server answered against the archive: its signature, its boundary and
@@ -814,12 +800,12 @@ mod tests {
         plan["auto"]["archive_dir"] = Value::Null;
         plan["auto"]["last_run"] = json!({"at": "2026-01-01T00:00:00Z", "outcome": "pruned",
                                           "reason": "ok", "through": 20, "prune_seq": 26,
-                                          "detail": null, "archive": "audit-1-20.jsonl"});
+                                          "detail": null, "archive": "audit-00000000000000000001-00000000000000000020.jsonl"});
         let text = plan_lines(&plan).join("\n");
         for want in [
             "no archive is kept",
             "last automatic run: pruned at 2026-01-01T00:00:00Z (ok), through seq 20, archive \
-             audit-1-20.jsonl",
+             audit-00000000000000000001-00000000000000000020.jsonl",
         ] {
             assert!(text.contains(want), "{want} not in {text}");
         }

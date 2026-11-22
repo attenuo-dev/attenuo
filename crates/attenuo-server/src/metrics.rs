@@ -589,14 +589,14 @@ impl Metrics {
     }
 
     /// Count one run of the automatic prune, by `outcome` (`pruned`, `skipped` or `failed`)
-    /// and `reason`, and note that it ran now (`audit_auto_prune_runs_total`,
+    /// and `reason`, and note that it ran at `at_unix` (`audit_auto_prune_runs_total`,
     /// `audit_auto_prune_last_run_timestamp_seconds`).
-    pub fn audit_auto_prune_run(&self, outcome: &'static str, reason: &'static str) {
+    pub fn audit_auto_prune_run(&self, outcome: &'static str, reason: &'static str, at_unix: u64) {
         if let Ok(mut m) = self.audit_auto_prune_runs.lock() {
             *m.entry((outcome, reason)).or_default() += 1;
         }
         self.audit_auto_prune_last_run_unix
-            .store(unix_secs(std::time::SystemTime::now()), Ordering::Relaxed);
+            .store(at_unix, Ordering::Relaxed);
     }
 
     /// Read the audit store's shed appends through `source` at every render
