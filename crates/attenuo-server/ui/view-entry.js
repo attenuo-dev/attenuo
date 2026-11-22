@@ -7,9 +7,8 @@ import {
   h, append, replace, link, mono, short, time, recordPill, leaseStatePill, table,
   empty, loading, kv, explainReason, jsonTree,
 } from './dom.js';
-import { api, qs } from './api.js';
+import { api, qs, newestPrune, PRUNE_TOOL } from './api.js';
 import { loadPolicies } from './view-policy.js';
-import { newestPruneSeq, PRUNE_TOOL } from './view-audit.js';
 
 const TIMELINE_LIMIT = 200;
 
@@ -71,23 +70,28 @@ function prunedPanel(seq, body) {
 
 // A prune's own record (`admin`, tool `admin.audit.prune`). Its arguments are only a digest,
 // like every record's; the boundary, its hash and the archive digest are in the signed anchor.
-// For the newest prune the boundary is one below the first retained seq.
+// The newest prune is found exactly: the entry just below the first retained seq answers 410
+// `audit_pruned` naming it. Anything else says where the boundary is, nothing more.
 function pruneRecordInfo(entry) {
   const box = h('span', { class: 'muted' }, 'looking up the boundary…');
-  Promise.all([api('/admin/audit?order=desc&limit=1'), newestPruneSeq()]).then(([top, newest]) => {
-    const first = Number.isInteger(top.first) ? top.first : 1;
-    if (newest === entry.seq && first > 1) {
-      replace(box, h('span', null, 'the newest prune: entries before ',
-        link(['entry', first], `seq ${first}`), ` were pruned (boundary seq ${first - 1})`));
-    } else {
-      replace(box, h('span', null, 'an earlier prune; its boundary is in its signed anchor (',
-        mono('attenuo audit verify'), ' checks every anchor)'));
-    }
-  }).catch((e) => replace(box, h('span', { class: 'muted' }, `could not look it up: ${e.message}`)));
+  const inAnchor = () => h('span', null, 'the boundary is in its signed anchor (', mono('attenuo audit verify'), ' checks every anchor)');
+  api('/admin/audit?order=desc&limit=1', { quiet: [400, 404, 429, 500, 502, 503, 504] })
+    .then((top) => newestPrune(top.first))
+    .then((newest) => {
+      if (newest && newest.prune_seq === entry.seq) {
+        replace(box, h('span', null, `the newest prune: entries through seq ${newest.pruned_through} were pruned; the log now starts at `,
+          link(['entry', newest.first], `seq ${newest.first}`)));
+      } else if (newest) {
+        replace(box, h('span', null, 'an earlier prune (the newest is recorded at ', link(['entry', newest.prune_seq], `seq ${newest.prune_seq}`), '); ', inAnchor()));
+      } else {
+        replace(box, inAnchor());
+      }
+    })
+    .catch(() => replace(box, inAnchor()));
   return box;
 }
 
-const PRUNE_EXPLAIN = 'A prune of the start of the audit log, made with the admin token: the entries up to the boundary were archived, then deleted. The boundary, its hash and the archive’s SHA-256 are in the prune’s signed anchor.';
+const PRUNE_EXPLAIN = 'A prune of the start of the audit log, made by an admin: the entries up to the boundary were archived, then deleted. The boundary, its hash and the archive’s SHA-256 are in the prune’s signed anchor.';
 
 function isPruneRecord(r) {
   return r.kind === 'admin' && r.tool === PRUNE_TOOL;
