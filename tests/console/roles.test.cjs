@@ -1,5 +1,5 @@
 // Browser smoke test of the console's named operators (ADR-0016): who is logged in, what the
-// role allows, the expiry in the header, and the login error for an expired token. Run it with
+// role allows (the lease, approval, policy and Reload page buttons), the expiry in the header, and the login error for an expired token. Run it with
 // scripts/console-smoke.sh, which configures the `[[admin.operators]]` these tests log in as
 // and passes their tokens in CONSOLE_SMOKE_* variables. It runs after console.test.cjs, on the
 // same server.
@@ -90,8 +90,22 @@ async function reloadButton(c) {
   await check.click();
   await c.page.locator('.pill.big', { hasText: /^ok$/ }).waitFor();
   const panel = c.page.locator('section.panel', { has: c.page.locator('h2', { hasText: 'Check and reload' }) });
-  const reload = panel.getByRole('button', { name: 'Reload', exact: true });
+  const reload = panel.getByRole('button', { name: 'Reload…', exact: true });
   return { disabled: await reload.isDisabled(), title: await reload.getAttribute('title'), note: await panel.innerText() };
+}
+
+const RELOADS = { operators: 'Reload operators…', agents: 'Reload agents and PEPs…', keys: 'Reload issuer keys…' };
+
+/** The Reload page's buttons, as {panel: [disabled, title]}. Nothing is pressed. */
+async function reloadPage(c) {
+  await c.go('#/reload');
+  await c.page.locator('#reload-keys').waitFor();
+  const out = {};
+  for (const [id, name] of Object.entries(RELOADS)) {
+    const b = c.page.locator(`#reload-${id}`).getByRole('button', { name, exact: true });
+    out[id] = [await b.isDisabled(), await b.getAttribute('title')];
+  }
+  return out;
 }
 
 const all = (obj, v) => Object.fromEntries(Object.keys(obj).map((k) => [k, v]));
@@ -110,6 +124,7 @@ test('the [admin] token logs in as admin · admin with every action enabled', as
     assert.equal(reload.disabled, false, 'Reload is disabled for admin after a clean check');
     assert.match(reload.note, /Reload is enabled after a check with no errors/);
     await checkPage(c, 'role-admin-policy');
+    assert.deepEqual(await reloadPage(c), { operators: [false, null], agents: [false, null], keys: [false, null] });
   });
 });
 
@@ -128,6 +143,9 @@ test('a viewer sees its name and role, and every action button is disabled', asy
     const reload = await reloadButton(c);
     assert.equal(reload.disabled, true, 'Reload is enabled for a viewer');
     assert.match(reload.note, /Reloading needs the admin role/);
+    const viewerReloads = await reloadPage(c);
+    assert.deepEqual(viewerReloads, all(viewerReloads, [true, 'Needs the admin role; you are viewer.']));
+    await checkPage(c, 'role-viewer-reload');
 
     const lease = await leaseButtons(c);
     assert.deepEqual(lease, all(lease, true));
@@ -146,6 +164,8 @@ test('an operator may revoke and decide approvals, but not reload the policy', a
     const reload = await reloadButton(c);
     assert.equal(reload.disabled, true, 'Reload is enabled for an operator');
     assert.match(reload.note, /Reloading needs the admin role/);
+    const operatorReloads = await reloadPage(c);
+    assert.deepEqual(operatorReloads, all(operatorReloads, [true, 'Needs the admin role; you are operator.']));
 
     const lease = await leaseButtons(c);
     assert.deepEqual(lease, all(lease, false));
