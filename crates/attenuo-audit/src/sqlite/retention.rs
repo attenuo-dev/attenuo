@@ -1047,6 +1047,80 @@ impl SqliteAudit {
         self.verify_signed_from(upper, &checkpoints, &anchors, keys)
     }
 
+    /// Write the export of `from..=through` to `out`, a page of entries at a time, in the
+    /// format of `GET /admin/audit/export` (the same [`header_line`](crate::header_line),
+    /// [`entry_line`](crate::entry_line) and [`checkpoint_line`](crate::checkpoint_line)):
+    /// the header (with the newest anchor when `from` is the first retained seq), the
+    /// entries, then the checkpoints inside the range. `exported_at` goes in the header as
+    /// given, so two writes of the same range with the same `exported_at` give the same
+    /// bytes. Answers the number of entries written.
+    ///
+    /// # Errors
+    ///
+    /// [`AuditError::Export`] when `from` is 0, `through` is below `from` or above the head,
+    /// `from` is at or below a prune's boundary, or a prune commits while the export is
+    /// written (the rows it covers would be missing); [`AuditError::Storage`] when `out`
+    /// fails; and the errors of the reads.
+    pub fn write_export(
+        &self,
+        from: u64,
+        through: u64,
+        exported_at: String,
+        out: &mut impl std::io::Write,
+    ) -> Result<u64, AuditError> {
+        const PAGE: usize = 1_000;
+        let io = |e: std::io::Error| AuditError::Storage(format!("writing the export: {e}"));
+        let head = crate::log::AuditSink::head(self)?.map_or(0, |h| h.seq);
+        if from == 0 || through < from || through > head {
+            return Err(AuditError::Export(format!(
+                "cannot export seq {from}..={through} of a log whose head is {head}"
+            )));
+        }
+        let anchor = self.newest_anchor()?.map(|a| a.anchor);
+        let floor = anchor.as_ref().map(|a| a.through_seq);
+        if floor.is_some_and(|f| from <= f) {
+            return Err(AuditError::Export(format!(
+                "seq {from} is pruned: the log starts after seq {}",
+                floor.unwrap_or(0)
+            )));
+        }
+        let header_anchor = anchor.filter(|a| from == a.through_seq + 1);
+        let header =
+            crate::ExportHeader::new(from, through, exported_at).with_anchor(header_anchor);
+        out.write_all(crate::header_line(&header).as_bytes())
+            .map_err(io)?;
+        let all = crate::RecordFilter::default();
+        let mut next = from;
+        let mut written = 0u64;
+        while next <= through {
+            let want = usize::try_from(through - next + 1)
+                .unwrap_or(PAGE)
+                .min(PAGE);
+            let page = self.range_filtered(next, through, &all, want)?;
+            if self.pruned_through()? != floor {
+                return Err(AuditError::Export(
+                    "the log was pruned while the export was written".to_string(),
+                ));
+            }
+            let Some(last) = page.last().map(|e| e.seq) else {
+                break;
+            };
+            let mut text = String::new();
+            for e in page.iter().filter(|e| e.seq <= through) {
+                text.push_str(&crate::entry_line(e));
+                written += 1;
+            }
+            out.write_all(text.as_bytes()).map_err(io)?;
+            next = last + 1;
+        }
+        let mut text = String::new();
+        for c in self.checkpoints_between(from, through)? {
+            text.push_str(&crate::checkpoint_line(&c));
+        }
+        out.write_all(text.as_bytes()).map_err(io)?;
+        Ok(written)
+    }
+
     /// One batch of the deletes of the prune that is `deleting`, if any: at most
     /// `batch_rows` entries at or below its boundary, in one short transaction under the
     /// write gate. The batch that finds no more rows also deletes the checkpoints below the

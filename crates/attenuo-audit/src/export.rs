@@ -353,6 +353,22 @@ pub fn verify_export_with(
     options: VerifyOptions,
 ) -> Result<ExportReport, AuditError> {
     let header = export.header.as_ref().ok_or_else(missing_header)?;
+    refuse_filtered(header)?;
+    let mut facts = EntryFacts::default();
+    for e in &export.entries {
+        facts.observe(header, e);
+    }
+    verify_parts(
+        header,
+        facts,
+        export.entries.iter().cloned().map(Ok),
+        &export.checkpoints,
+        keys,
+        options,
+    )
+}
+
+fn refuse_filtered(header: &ExportHeader) -> Result<(), AuditError> {
     if header.filter.is_some() {
         return Err(bad(
             "the export is filtered (its header has a `filter`), so its hash chain has gaps \
@@ -360,9 +376,62 @@ pub fn verify_export_with(
              --chain-id, --tool or --decision, then filter that",
         ));
     }
-    let first_seq = export.entries.first().map(|e| e.seq);
-    let last_seq = export.entries.last().map(|e| e.seq);
-    let from_genesis = first_seq == Some(1) && export.entries[0].prev_hash == crate::GENESIS_HASH;
+    Ok(())
+}
+
+/// What [`verify_parts`] needs to know about the entries before it walks them: gathered in
+/// one pass, so that a file can be checked without holding its entries in memory.
+#[derive(Default)]
+struct EntryFacts {
+    /// Seq and `prev_hash` of the first entry.
+    first: Option<(u64, String)>,
+    /// Seq and entry hash of the last entry.
+    last: Option<(u64, String)>,
+    /// Entries outside the header's range.
+    outside_range: u64,
+    /// The first entry at the header anchor's `prune_seq`, if any.
+    prune_entry: Option<AuditEntry>,
+    /// Entries seen.
+    count: u64,
+}
+
+impl EntryFacts {
+    fn observe(&mut self, header: &ExportHeader, e: &AuditEntry) {
+        if self.first.is_none() {
+            self.first = Some((e.seq, e.prev_hash.clone()));
+        }
+        self.last = Some((e.seq, e.entry_hash.clone()));
+        if e.seq < header.from || e.seq > header.to {
+            self.outside_range += 1;
+        }
+        if self.prune_entry.is_none()
+            && header.anchor.as_ref().is_some_and(|a| a.prune_seq == e.seq)
+        {
+            self.prune_entry = Some(e.clone());
+        }
+        self.count += 1;
+    }
+}
+
+/// The checks of [`verify_export_with`], on a header, the facts of a first pass over the
+/// entries, the entries again (in file order) and the checkpoints.
+fn verify_parts<I>(
+    header: &ExportHeader,
+    facts: EntryFacts,
+    entries: I,
+    checkpoints: &[Checkpoint],
+    keys: &CheckpointKeys,
+    options: VerifyOptions,
+) -> Result<ExportReport, AuditError>
+where
+    I: IntoIterator<Item = Result<AuditEntry, AuditError>>,
+{
+    let first_seq = facts.first.as_ref().map(|(s, _)| *s);
+    let last_seq = facts.last.as_ref().map(|(s, _)| *s);
+    let from_genesis = facts
+        .first
+        .as_ref()
+        .is_some_and(|(s, prev)| *s == 1 && prev == crate::GENESIS_HASH);
     // An anchor in the header: checked here, and the walk starts where it says.
     let mut bad_anchors = Vec::new();
     let anchor = header.anchor.as_ref();
@@ -378,7 +447,7 @@ pub fn verify_export_with(
                 "the header's anchor is through seq {}, but the export starts at {}",
                 a.through_seq, header.from
             )));
-        } else if let Some(p) = export.entries.iter().find(|e| e.seq == a.prune_seq) {
+        } else if let Some(p) = &facts.prune_entry {
             if let Err(reason) = a.check_prune_record(p) {
                 bad_anchors.push(fail(reason));
             }
@@ -394,26 +463,20 @@ pub fn verify_export_with(
         None => Start::Window,
     };
     let from_anchor = anchored.is_some_and(|a| {
-        export.entries.first().is_some_and(|e| {
-            Some(e.seq) == a.through_seq.checked_add(1) && e.prev_hash == a.through_hash
+        facts.first.as_ref().is_some_and(|(s, prev)| {
+            Some(*s) == a.through_seq.checked_add(1) && *prev == a.through_hash
         })
     });
     // Checkpoints beyond the window cannot be matched to an entry; only those inside count.
     let (lo, hi) = (first_seq.unwrap_or(0), last_seq.unwrap_or(0));
-    let inside: Vec<Checkpoint> = export
-        .checkpoints
+    let inside: Vec<Checkpoint> = checkpoints
         .iter()
         .filter(|c| c.seq >= lo && c.seq <= hi)
         .cloned()
         .collect();
-    let mut report =
-        verify_with_checkpoints(export.entries.iter().cloned().map(Ok), &inside, keys, start)?;
+    let mut report = verify_with_checkpoints(entries, &inside, keys, start)?;
     // Outside the window: still check the signature so a forged one is not silently dropped.
-    for cp in export
-        .checkpoints
-        .iter()
-        .filter(|c| c.seq < lo || c.seq > hi)
-    {
+    for cp in checkpoints.iter().filter(|c| c.seq < lo || c.seq > hi) {
         if let Err(reason) = keys.verify(cp) {
             report
                 .bad_checkpoints
@@ -424,7 +487,7 @@ pub fn verify_export_with(
             report.ok = false;
         }
     }
-    report.checkpoints = export.checkpoints.len() as u64;
+    report.checkpoints = checkpoints.len() as u64;
     report.anchors = u64::from(anchor.is_some());
     if !bad_anchors.is_empty() {
         report.ok = false;
@@ -436,11 +499,7 @@ pub fn verify_export_with(
         (Some(f), Some(l)) => f != header.from || l < header.to,
         _ => header.to >= header.from && header.to > 0,
     };
-    let outside_range = export
-        .entries
-        .iter()
-        .filter(|e| e.seq < header.from || e.seq > header.to)
-        .count() as u64;
+    let outside_range = facts.outside_range;
     let unsigned_tail_rejected = report.unsigned_tail > 0 && !options.allow_unsigned_tail;
     if truncated || outside_range > 0 || unsigned_tail_rejected {
         report.ok = false;
@@ -454,6 +513,128 @@ pub fn verify_export_with(
         truncated,
         outside_range,
         unsigned_tail_rejected,
+    })
+}
+
+/// What [`verify_export_file`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportFileReport {
+    /// The report [`verify_export_with`] gives for the same file.
+    pub report: ExportReport,
+    /// The file's header.
+    pub header: ExportHeader,
+    /// SHA-256 of the file's bytes, lower-case hex.
+    pub sha256: String,
+    /// Entry hash of the file's last entry, if any.
+    pub last_entry_hash: Option<String>,
+    /// Entries in the file.
+    pub entries: u64,
+}
+
+/// [`verify_export_with`] on a JSON Lines export file, without loading its entries into
+/// memory: one pass reads the header and the checkpoints, takes the SHA-256 of the bytes and
+/// notes what the checks need of the entries, and a second pass walks the entries. Only the
+/// checkpoints are held. The header must be the first line (as every export this crate and
+/// the server write has it); the single-object JSON form is not read here.
+///
+/// # Errors
+///
+/// [`AuditError::Storage`] when the file cannot be read; [`AuditError::Export`] when a line
+/// does not parse (as for [`parse_export`]), the first line is not a header, or the header
+/// carries a `filter`.
+pub fn verify_export_file(
+    path: &std::path::Path,
+    keys: &CheckpointKeys,
+    options: VerifyOptions,
+) -> Result<ExportFileReport, AuditError> {
+    use sha2::{Digest, Sha256};
+    use std::io::BufRead;
+
+    let io = |e: std::io::Error| AuditError::Storage(format!("reading {}: {e}", path.display()));
+    let open = || {
+        std::fs::File::open(path)
+            .map(|f| std::io::BufReader::with_capacity(1 << 16, f))
+            .map_err(io)
+    };
+    // Pass 1: the header, the checkpoints, the digest and the facts.
+    let mut reader = open()?;
+    let mut hasher = Sha256::new();
+    let mut line = String::new();
+    let mut n = 0usize;
+    let mut header: Option<ExportHeader> = None;
+    let mut checkpoints = Vec::new();
+    let mut facts = EntryFacts::default();
+    loop {
+        line.clear();
+        if reader.read_line(&mut line).map_err(io)? == 0 {
+            break;
+        }
+        n += 1;
+        hasher.update(line.as_bytes());
+        if line.trim().is_empty() {
+            continue;
+        }
+        let at = |e: serde_json::Error| bad(format!("line {n}: {e}"));
+        let v: Value = serde_json::from_str(&line).map_err(at)?;
+        match (v.get("type").and_then(Value::as_str), &header) {
+            (Some("header"), None) => header = Some(serde_json::from_value(v).map_err(at)?),
+            (Some("header"), Some(_)) => return Err(bad(format!("line {n}: second header"))),
+            (_, None) => {
+                return Err(bad(format!(
+                    "line {n}: the first line of the file is not its header"
+                )))
+            }
+            (Some("entry"), Some(h)) => {
+                let e: AuditEntry = serde_json::from_value(v).map_err(at)?;
+                facts.observe(h, &e);
+            }
+            (Some("checkpoint"), Some(_)) => {
+                checkpoints.push(serde_json::from_value(v).map_err(at)?);
+            }
+            (other, Some(_)) => return Err(bad(format!("line {n}: unknown line type {other:?}"))),
+        }
+    }
+    let export = Export {
+        header,
+        entries: Vec::new(),
+        checkpoints: Vec::new(),
+    };
+    check_header(&export)?;
+    let header = export.header.ok_or_else(missing_header)?;
+    refuse_filtered(&header)?;
+    let sha256 = hex::encode(hasher.finalize());
+    let last_entry_hash = facts.last.as_ref().map(|(_, h)| h.clone());
+    let entries = facts.count;
+    // Pass 2: the entries, one at a time.
+    let mut reader = open()?;
+    let mut n = 0usize;
+    let walk = std::iter::from_fn(move || loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => return None,
+            Ok(_) => {}
+            Err(e) => return Some(Err(io(e))),
+        }
+        n += 1;
+        if line.trim().is_empty() {
+            continue;
+        }
+        // Pass 1 parsed every line; the header and the checkpoints are passed over.
+        let v: Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(e) => return Some(Err(bad(format!("line {n}: {e}")))),
+        };
+        if v.get("type").and_then(Value::as_str) == Some("entry") {
+            return Some(serde_json::from_value(v).map_err(|e| bad(format!("line {n}: {e}"))));
+        }
+    });
+    let report = verify_parts(&header, facts, walk, &checkpoints, keys, options)?;
+    Ok(ExportFileReport {
+        report,
+        header,
+        sha256,
+        last_entry_hash,
+        entries,
     })
 }
 
