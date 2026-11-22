@@ -378,15 +378,31 @@ scopes = { "repo.read" = ["github:read_file", "github:list_*"] }
 
 Agents (OAuth clients) that may present user credentials at `POST /token`, and that authenticate as the `actor` of an exchange with client credentials. With none configured, every request that authenticates with client credentials is rejected (`no_agents_configured`); an agent that authenticates with an `actor_token` from `[[actor_trust]]` needs no entry here.
 
-An entry holds a secret, public keys, or both; the server refuses to start with an entry that has neither. The agent can only authenticate with what its entry holds: a secret sent for a key-only agent, or an assertion for a secret-only agent, is `client_authentication_failed`. One request uses one method; a secret and an assertion together are `multiple_client_auth`.
+An entry holds a secret, public keys (`jwks` or `jwks_url`), or both; the server refuses to start with an entry that has neither. The agent can only authenticate with what its entry holds: a secret sent for a key-only agent, or an assertion for a secret-only agent, is `client_authentication_failed`. One request uses one method; a secret and an assertion together are `multiple_client_auth`.
 
 | Key | Meaning |
 | --- | --- |
 | `id` | Client id. Must match the `actor` if one is sent. |
 | `secret_sha256` | Optional. SHA-256 of the client secret, in hex. Make it with `printf %s "$SECRET" \| sha256sum`. |
 | `jwks` | Optional. The agent's public keys for `private_key_jwt` (RFC 7523 §2.2) client assertions: a JWK Set as JSON text, usually in a TOML literal string (`jwks = '''{"keys": [...]}'''`). `attenuo key gen --client <path>` writes a new key and prints this line. Read at start and by an [agents reload](#reloading-agents-and-peps). See below. |
+| `jwks_url` | Optional, instead of `jwks`. A URL where the agent publishes its public keys, as a JWK Set that `jwks` would accept. The agent can then rotate its keys itself, with no change here and no reload. See [keys from a URL](#keys-from-a-url). |
+| `jwks_ttl_seconds` | Optional, default `300`, only with `jwks_url`. How long fetched keys are used before they are fetched again. Must be positive. |
+| `ca_pem_path` | Optional, only with `jwks_url`. A PEM file of CA certificates trusted for this entry's `jwks_url` only, in addition to the built-in web PKI roots, as for [`[[idps]]`](#idps). Read at start and by an agents reload. |
 
-A `jwks` must hold 1 to 8 public signing keys: RSA (2048 bits or more; `RS256`), EC P-256 (`ES256`) or OKP Ed25519 (`EdDSA`), the asymmetric algorithms the server accepts from identity providers. A key's `alg`, if given, must be that of its type; `use`, if given, must be `sig`. With more than one key every key needs a distinct `kid`. The server refuses to start, naming the entry and the key, on: text that is not a JWK Set, an empty set, a key with a private member (`d`, `p`, `q`, `dp`, `dq`, `qi`, `oth`; the message names the member, never its value), a symmetric (`oct`) key, another algorithm or curve, a short RSA modulus, or a `kid` listed twice. To rotate, add the new key with a new `kid` and reload (or restart), move the agent to it, then remove the old key and reload again. Keys are never fetched from a URL.
+A `jwks` must hold 1 to 8 public signing keys: RSA (2048 bits or more; `RS256`), EC P-256 (`ES256`) or OKP Ed25519 (`EdDSA`), the asymmetric algorithms the server accepts from identity providers. A key's `alg`, if given, must be that of its type; `use`, if given, must be `sig`. With more than one key every key needs a distinct `kid`. The server refuses to start, naming the entry and the key, on: text that is not a JWK Set, an empty set, a key with a private member (`d`, `p`, `q`, `dp`, `dq`, `qi`, `oth`; the message names the member, never its value), a symmetric (`oct`) key, another algorithm or curve, a short RSA modulus, or a `kid` listed twice. To rotate, add the new key with a new `kid` and reload (or restart), move the agent to it, then remove the old key and reload again.
+
+### Keys from a URL
+
+With `jwks_url` the agent's keys are fetched from the URL, by the same rules as the `[[idps]]` keys:
+
+- The URL must be `https://`. Plain `http://` is accepted only for a loopback host (`localhost`, `127.0.0.0/8`, `[::1]`), for local development and tests. Redirects are not followed, so give the final URL. A URL that breaks the scheme rule refuses to start (and an agents reload).
+- `jwks` and `jwks_url` together on one entry refuse to start, and a reload with them is refused (`agents_invalid`): an entry takes its keys from one place, so it is always clear which keys are in force. `jwks_ttl_seconds` or `ca_pem_path` without `jwks_url` is refused too.
+- Nothing is fetched at start, and an unreachable URL does not stop the server from starting. The keys are fetched on the first assertion that names the entry, and only for an id that is configured with `jwks_url`.
+- Fetched keys are used for `jwks_ttl_seconds`. An assertion whose `kid` is not in the set fetches it again at once, at most once per 30 seconds per entry. So a new key works at once, and a key removed from the set stops working at the latest `jwks_ttl_seconds` after the last fetch.
+- The fetched set must pass the rules of `jwks` above. A set with a private or symmetric key, more than 8 keys, a short RSA key, or that is not a JWK Set is refused whole, as is a body over 256 KiB or a fetch that takes over 5 seconds.
+- A failed fetch drops the cached keys: no stale keys are used. The next fetch starts 5 seconds later at the earliest, and until then the agent is refused without a fetch.
+- A client whose keys cannot be fetched gets the same answer as an unknown client, 401 `client_authentication_failed`, so the answer does not tell which ids exist. The server logs the cause at warn level, `client JWKS unavailable`, with the entry's id and the URL (a password in the URL is masked); never a key.
+- An agents reload builds every entry's key cache anew: keys from before the reload are not used, also when the URL did not change. They are fetched again on next use.
 
 A client assertion is checked as [the HTTP API](http-api.md#client-authentication) describes: signed by one of these keys, `iss` = `sub` = `id`, `aud` = `[issuer] issuer` and nothing else, a bounded `exp` (`[token] client_assertion_max_lifetime_seconds`), and a `jti` used once.
 
@@ -413,13 +429,14 @@ A capability table may also carry `limits`. A limit there is copied into the req
 
 ## `[[peps]]`
 
-Policy enforcement points that call the AuthZEN endpoints. Same shape as `[[agents]]`, including `jwks` for `private_key_jwt`; `attenuo` is reserved as an id.
+Policy enforcement points that call the AuthZEN endpoints. Same shape as `[[agents]]`, including `jwks` or `jwks_url` for `private_key_jwt`; `attenuo` is reserved as an id.
 
 | Key | Meaning |
 | --- | --- |
 | `id` | PEP id, sent as the HTTP Basic user or as `pep_id` in an evaluation body, or as the `sub` of a client assertion. |
 | `secret_sha256` | Optional. SHA-256 of the PEP's secret, in hex. |
 | `jwks` | Optional. The PEP's public keys for client assertions, as for `[[agents]]`. A PEP sends `client_assertion_type` and `client_assertion` at the top level of the evaluation body; one assertion authenticates one HTTP request (a whole batch). |
+| `jwks_url`, `jwks_ttl_seconds`, `ca_pem_path` | Optional. The PEP's keys at a URL instead of `jwks`, as for `[[agents]]` ([keys from a URL](#keys-from-a-url)). |
 
 A request that authenticates as a PEP gets `context.diagnostics` under `[authzen] diagnostics = "peps"`, and only such a request may send an unsigned chain when `[authzen] allow_unsigned_chain = true` (the server refuses to start with that set and no `[[peps]]`).
 
@@ -428,6 +445,7 @@ A request that authenticates as a PEP gets `context.diagnostics` under `[authzen
 `[[agents]]` and `[[peps]]` are read at start, and again by `POST /admin/agents/reload` (`attenuo admin agent reload`, role `admin`). It re-reads the config file the server was started with, checks both lists with the startup rules above, against the other settings in force (`[token]`, `[authzen]`, `[[idps]]`, `[[actor_trust]]`, `[issuer] issuer`), and swaps both in at once. On any error both lists stay as they were. The [HTTP reference](http-api.md#agents-reload) has the answer and the error codes.
 
 - A new agent or PEP can authenticate with its next request. A removed one, an old secret and an old key are refused from the next request on. Each request authenticates against one snapshot of both lists.
+- Keys fetched from a `jwks_url` before the reload are dropped, so a changed URL takes effect at once, with no TTL to wait for. Each entry's keys are fetched again on its next assertion.
 - Removing an agent stops its secret and keys, not every way to a new token: with `[token] require_actor_auth = false` an exchange can still name it as the actor, and an `[[actor_trust]]` entry that maps a workload to its id still accepts its actor token. Both need a restart to change, and the reload answers a warning for each.
 - A file that empties a list in force, or whose `[issuer]` or `[audit]` differs from the running config, is refused unless `allow_empty` or `allow_mismatch` is sent (`--allow-empty`, `--allow-mismatch`): it is most likely an empty, cut-off or wrong file.
 - The lists are also checked against the file's own settings, as a restart would apply them. Lists those settings would refuse are reloaded (they pass the rules in force) and named in `restart_warnings`.
