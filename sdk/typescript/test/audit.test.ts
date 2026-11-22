@@ -4,10 +4,12 @@ import { join } from "node:path";
 import { beforeAll, describe, expect, it } from "vitest";
 import {
   ExportError,
+  PRUNE_TOOL,
   SHIPPED_FORMAT,
   crossCheck,
   parseShipped,
   verifyExport,
+  verifyExports,
   type CrossCheckReport,
   type ExportReport,
   type VerifyExportOptions,
@@ -547,5 +549,222 @@ describe("crossCheck", () => {
     await expect(cross(objs.slice(1), [])).rejects.toThrow("no header");
     const o = { checkpointPublicKeys: { [KID]: "AAAA" } };
     await expect(crossCheck(lines(objs), [], o)).rejects.toThrow("32 bytes");
+  });
+});
+
+// ---- a pruned log: the header anchor and several files ------------------------------------
+
+async function signAnchor(a: Obj, key?: CryptoKey): Promise<string> {
+  const ctx = new TextEncoder().encode("attenuo-audit-anchor-v1");
+  const payload = new TextEncoder().encode(
+    canonicalize([
+      a.through_seq,
+      a.through_hash,
+      a.prune_seq,
+      a.prune_entry_hash,
+      a.previous_through_seq,
+      a.archive_sha256,
+      a.at,
+      a.kid,
+    ]),
+  );
+  const msg = new Uint8Array(4 + ctx.length + payload.length);
+  new DataView(msg.buffer).setUint32(0, ctx.length);
+  msg.set(ctx, 4);
+  msg.set(payload, 4 + ctx.length);
+  return b64(new Uint8Array(await crypto.subtle.sign("Ed25519", key ?? priv, msg)));
+}
+
+/**
+ * A log of 13 entries pruned through 10 by the record at 11: the archive (1..=10, ending at a
+ * checkpoint) and the retained export (11..=13, its header carrying the anchor).
+ */
+async function prunedLog(
+  digest: string | null = "ab".repeat(32),
+): Promise<{ archive: Obj[]; retained: Obj[] }> {
+  const entries: Obj[] = [];
+  let prev = GENESIS_HASH;
+  for (let seq = 1; seq <= 13; seq++) {
+    let rec = record(seq);
+    if (seq === 11) {
+      const args = {
+        through_seq: 10,
+        through_hash: entries[9]!.entry_hash,
+        previous_through_seq: null,
+        archive_sha256: digest,
+      };
+      rec = {
+        ...GOLDEN_RECORD,
+        kind: "admin",
+        server: "attenuo",
+        tool: PRUNE_TOOL,
+        decision: "allow",
+        reason: "admin_action",
+        arguments_digest: await sha256Hex(canonicalize(args)),
+      };
+    }
+    const h = await entryHash(seq, prev, rec);
+    entries.push({ type: "entry", seq, prev_hash: prev, record: rec, entry_hash: h });
+    prev = h;
+  }
+  const hashOf = (s: number): string => entries[s - 1]!.entry_hash as string;
+  const anchor: Obj = {
+    through_seq: 10,
+    through_hash: hashOf(10),
+    prune_seq: 11,
+    prune_entry_hash: hashOf(11),
+    previous_through_seq: null,
+    archive_sha256: digest,
+    at: "2026-10-24T00:00:00Z",
+    kid: KID,
+  };
+  anchor.signature = await signAnchor(anchor);
+  const header = (from: number, to: number, extra: Obj = {}): Obj => ({
+    type: "header",
+    format: EXPORT_FORMAT,
+    from,
+    to,
+    exported_at: "2026-10-24T00:00:00Z",
+    ...extra,
+  });
+  const cps = async (...seqs: number[]): Promise<Obj[]> => {
+    const out: Obj[] = [];
+    for (const s of seqs) out.push({ type: "checkpoint", ...(await sign(s, hashOf(s))) });
+    return out;
+  };
+  return {
+    archive: [header(1, 10), ...entries.slice(0, 10), ...(await cps(5, 10))],
+    retained: [header(11, 13, { anchor }), ...entries.slice(10), ...(await cps(11, 13))],
+  };
+}
+
+const copy = (objs: Obj[]): Obj[] => JSON.parse(JSON.stringify(objs)) as Obj[];
+
+async function withAnchor(objs: Obj[], changes: Obj, key?: CryptoKey): Promise<Obj[]> {
+  const out = copy(objs);
+  const a = out[0]!.anchor as Obj;
+  Object.assign(a, changes);
+  a.signature = await signAnchor(a, key);
+  return out;
+}
+
+describe("a pruned log", () => {
+  it("starts the retained export from its signed anchor", async () => {
+    const { archive, retained } = await prunedLog();
+    const r = await verify(retained);
+    expect(r.ok).toBe(true);
+    expect([r.fromAnchor, r.fromGenesis, r.prunedThrough, r.anchors]).toEqual([true, false, 10, 1]);
+    expect(r.badAnchors).toEqual([]);
+    expect((await verify((await prunedLog(null)).retained)).ok).toBe(true);
+    const a = await verify(archive);
+    expect([a.ok, a.fromGenesis, a.fromAnchor, a.anchors]).toEqual([true, true, false, 0]);
+  });
+
+  it("verifies the retained export as a window without its anchor", async () => {
+    const { retained } = await prunedLog();
+    const bare = copy(retained);
+    delete bare[0]!.anchor;
+    const r = await verify(bare);
+    expect([r.ok, r.fromAnchor, r.prunedThrough, r.anchors]).toEqual([true, false, undefined, 0]);
+  });
+
+  it("reports a header anchor that does not verify or does not fit", async () => {
+    const { retained } = await prunedLog();
+    const other = (
+      (await crypto.subtle.generateKey("Ed25519", true, ["sign", "verify"])) as CryptoKeyPair
+    ).privateKey;
+    const cases: [Obj[], string][] = [
+      [await withAnchor(retained, {}, other), "signature does not verify"],
+      [await withAnchor(retained, { kid: "k9" }), "unknown signing key `k9`"],
+      [await withAnchor(retained, { through_seq: 9 }), "the header's anchor is through seq 9"],
+      [
+        await withAnchor(retained, { prune_entry_hash: "00".repeat(32) }),
+        "does not hash to prune_entry_hash",
+      ],
+      [
+        await withAnchor(retained, { archive_sha256: "cd".repeat(32) }),
+        "arguments digest does not match",
+      ],
+    ];
+    for (const [objs, reason] of cases) {
+      const r = await verify(objs);
+      expect(r.ok, reason).toBe(false);
+      expect(r.fromAnchor, reason).toBe(false);
+      expect(r.badAnchors.length, reason).toBe(1);
+      expect(r.badAnchors[0]!.reason).toContain(reason);
+    }
+  });
+
+  it("refuses a malformed header anchor", async () => {
+    const { retained } = await prunedLog();
+    const bad = copy(retained);
+    bad[0]!.anchor.through_seq = "10";
+    await expect(verify(bad)).rejects.toThrow(/through_seq/);
+    bad[0]!.anchor = "anchor";
+    await expect(verify(bad)).rejects.toThrow(ExportError);
+  });
+
+  it("verifies archives and the retained export as one log", async () => {
+    const { archive, retained } = await prunedLog();
+    const dir = mkdtempSync(join(tmpdir(), "attenuo-audit-"));
+    try {
+      const a = join(dir, "archive.jsonl");
+      const b = join(dir, "retained.jsonl");
+      writeFileSync(a, lines(archive).join(""));
+      writeFileSync(b, lines(retained).join(""));
+      const opts = { checkpointPublicKeys: jwks };
+      const r = await verifyExports([{ path: a }, { path: b }], opts);
+      expect(r.ok).toBe(true);
+      expect(r.links).toEqual([]);
+      expect(r.files[1]!.fromAnchor).toBe(true);
+
+      const back = await verifyExports([{ path: b }, { path: a }], opts);
+      expect(back.ok).toBe(false);
+      expect(back.links[0]).toEqual({
+        earlier: 0,
+        later: 1,
+        reason:
+          "the seqs are not contiguous: the earlier file ends at seq 13, the later one starts at seq 1",
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+    const opts = { checkpointPublicKeys: jwks };
+    const short = archive.filter((o) => !(o.type === "checkpoint" && o.seq === 10));
+    const r = await verifyExports([lines(short), lines(retained)], opts);
+    expect(r.links.some((p) => p.reason.includes("does not end at a checkpoint"))).toBe(true);
+    for (const [which, seq] of [
+      [0, 4],
+      [1, 12],
+    ] as const) {
+      const files = [copy(archive), copy(retained)];
+      const e = files[which]!.find((o) => o.type === "entry" && o.seq === seq)!;
+      e.record.reason += "x";
+      const v = await verifyExports(
+        files.map((f) => lines(f)),
+        opts,
+      );
+      expect(v.ok).toBe(false);
+      expect(v.files[which]!.firstBadSeq).toBe(seq);
+    }
+    const openTail = retained.slice(0, -1);
+    const tail = { checkpointPublicKeys: jwks, allowUnsignedTail: true };
+    expect((await verifyExports([lines(archive), lines(openTail)], tail)).ok).toBe(true);
+    const first = (await verifyExports([lines(openTail), lines(archive)], tail)).files[0]!;
+    expect([first.ok, first.unsignedTailRejected]).toEqual([false, true]);
+  });
+
+  it("names a header anchor that is not the earlier file's end", async () => {
+    const { archive, retained } = await prunedLog();
+    const cut = archive.filter(
+      (o) => !((o.type === "entry" || o.type === "checkpoint") && o.seq === 10),
+    );
+    cut[0] = { ...cut[0], to: 9 };
+    const r = await verifyExports([lines(cut), lines(retained)], { checkpointPublicKeys: jwks });
+    expect(
+      r.links.some((p) =>
+        p.reason.includes("header anchor is through seq 10, not the earlier file's end at seq 9"),
+      ),
+    ).toBe(true);
   });
 });

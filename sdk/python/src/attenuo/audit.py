@@ -22,6 +22,18 @@ the same ``seq`` and reason in both::
     cross = cross_check("audit.jsonl", "shipped.jsonl", checkpoint_public_keys=jwks)
     assert cross.ok, cross.mismatches
 
+An export taken after a prune starts at the first retained entry, and its header carries the
+prune's signed ``anchor``. ``verify_export`` checks the anchor's signature, that the file starts
+right after it, and the prune record when it is in the file, then reports ``from_anchor`` and
+``pruned_through``, as the Rust check does. ``verify_exports`` verifies several files, oldest
+first (the archives of the prunes, then the retained export), and checks that they link into
+one log, as ``attenuo audit verify --file a --file b`` does::
+
+    from attenuo.audit import verify_exports
+
+    report = verify_exports(["archive-1.jsonl", "retained.jsonl"], checkpoint_public_keys=jwks)
+    assert report.ok, (report.files, report.links)
+
 A file that fails verification gives a report with ``ok == False``; a file that cannot be read
 as an export at all (no header, the wrong format, a filtered export, a line that is not JSON)
 raises :class:`ExportError`. The Ed25519 check needs the ``cryptography`` package
@@ -53,17 +65,22 @@ __all__ = [
     "ENTRY_HASH_VERSION",
     "EXPORT_FORMAT",
     "GENESIS_HASH",
+    "PRUNE_TOOL",
     "SHIPPED_FORMAT",
+    "BadAnchor",
     "BadCheckpoint",
     "CrossCheckReport",
     "ExportError",
     "ExportReport",
+    "ExportsReport",
+    "LinkProblem",
     "ShippedLine",
     "ShippedMismatch",
     "cross_check",
     "entry_hash",
     "parse_shipped",
     "verify_export",
+    "verify_exports",
 ]
 
 #: First element of the array the entry hash covers.
@@ -74,10 +91,13 @@ GENESIS_HASH = "0" * 64
 EXPORT_FORMAT = "attenuo-audit-export-v2"
 #: Value of a shipped checkpoint's ``format`` member.
 SHIPPED_FORMAT = "attenuo-shipped-checkpoint-v1"
+#: The tool of a prune's own audit record.
+PRUNE_TOOL = "admin.audit.prune"
 # The envelope of a prune's signed anchor, shipped through the same sink (ADR-0015). Skipped
-# by `parse_shipped`: this package does not check anchors yet.
+# by `parse_shipped`: this package checks the anchor in an export's header, not shipped ones.
 _SHIPPED_ANCHOR_FORMAT = "attenuo-shipped-anchor-v1"
 _CHECKPOINT_CONTEXT = "attenuo-checkpoint-v1"
+_ANCHOR_CONTEXT = "attenuo-audit-anchor-v1"
 _CP_FIELDS = ("seq", "head_hash", "at", "kid", "signature")
 _U64_MAX = 2**64 - 1
 _B64URL = re.compile(r"[A-Za-z0-9_-]*")
@@ -90,6 +110,15 @@ class ExportError(AttenuoError):
 @dataclass(frozen=True)
 class BadCheckpoint:
     seq: int
+    reason: str
+
+
+@dataclass(frozen=True)
+class BadAnchor:
+    """A prune anchor that failed verification."""
+
+    #: The ``through_seq`` the anchor claims.
+    through_seq: int
     reason: str
 
 
@@ -121,6 +150,39 @@ class ExportReport:
     outside_range: int = 0
     #: Failed only because of an unsigned tail that ``allow_unsigned_tail`` did not accept.
     unsigned_tail_rejected: bool = False
+    #: The header carries a prune anchor whose signature verifies, and the file starts right
+    #: after it (its first entry is ``through_seq + 1`` with ``prev_hash`` equal to
+    #: ``through_hash``): the entries before were pruned through the server.
+    from_anchor: bool = False
+    #: The anchor's ``through_seq`` when the walk started from a valid header anchor.
+    pruned_through: int | None = None
+    #: Anchors in the header (0 or 1).
+    anchors: int = 0
+    #: The header's anchor, when it does not verify or does not fit the file.
+    bad_anchors: tuple[BadAnchor, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
+class LinkProblem:
+    """Why two files given in a row to :func:`verify_exports` do not form one log."""
+
+    #: Index of the earlier file, from 0, in the order given.
+    earlier: int
+    #: Index of the later file (``earlier + 1``).
+    later: int
+    reason: str
+
+
+@dataclass(frozen=True)
+class ExportsReport:
+    """The verdict of :func:`verify_exports`."""
+
+    #: Every file verifies and every pair of neighbours links.
+    ok: bool
+    #: Each file's own report, in the order given.
+    files: tuple[ExportReport, ...]
+    #: Each pair of neighbouring files that does not link.
+    links: tuple[LinkProblem, ...]
 
 
 @dataclass(frozen=True)
@@ -203,13 +265,120 @@ def verify_export(
     its newest checkpoint).
     """
     keys = _load_keys(checkpoint_public_keys)
-    export = _parse(_read_text(path_or_lines))
+    return _verify_parsed(
+        _parse(_read_text(path_or_lines)), keys, allow_unsigned_tail=allow_unsigned_tail
+    )
+
+
+def verify_exports(
+    paths_or_lines: Iterable[str | os.PathLike[str] | Iterable[str | bytes]],
+    *,
+    checkpoint_public_keys: Mapping[str, Any],
+    allow_unsigned_tail: bool = False,
+) -> ExportsReport:
+    """Verify several exports, oldest first, as one log: ``attenuo audit verify --file a
+    --file b``.
+
+    Each item is what :func:`verify_export` takes. Each file is verified strictly on its own
+    (``allow_unsigned_tail`` applies to the last file only), then each file and the next must
+    link: both hold entries, the seqs are contiguous, the later file's first ``prev_hash`` is
+    the earlier file's last entry hash, the earlier file has a checkpoint at its last seq naming
+    that hash, and an anchor in the later file's header names the earlier file's end.
+    """
+    keys = _load_keys(checkpoint_public_keys)
+    parsed = [_parse(_read_text(src)) for src in paths_or_lines]
+    files = tuple(
+        _verify_parsed(p, keys, allow_unsigned_tail=allow_unsigned_tail and i == len(parsed) - 1)
+        for i, p in enumerate(parsed)
+    )
+    links = tuple(_link(parsed))
+    return ExportsReport(ok=all(f.ok for f in files) and not links, files=files, links=links)
+
+
+def _link(
+    parsed: list[tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]],
+) -> list[LinkProblem]:
+    out: list[LinkProblem] = []
+    for i in range(len(parsed) - 1):
+        (_, a_entries, a_cps), (b_header, b_entries, _) = parsed[i], parsed[i + 1]
+
+        def fail(reason: str, i: int = i) -> None:
+            out.append(LinkProblem(i, i + 1, reason))
+
+        if not a_entries or not b_entries:
+            fail(
+                "the earlier file holds no entries"
+                if not a_entries
+                else "the later file holds no entries"
+            )
+            continue
+        last, first = a_entries[-1], b_entries[0]
+        if last["seq"] + 1 != first["seq"]:
+            fail(
+                f"the seqs are not contiguous: the earlier file ends at seq {last['seq']}, the "
+                f"later one starts at seq {first['seq']}"
+            )
+        elif first["prev_hash"] != last["entry_hash"]:
+            fail(
+                f"the later file's first entry (seq {first['seq']}) does not link to the earlier "
+                f"file's last (its prev_hash is not the entry hash at seq {last['seq']})"
+            )
+        cp = next((c for c in a_cps if c["seq"] == last["seq"]), None)
+        if cp is None:
+            fail(
+                f"the earlier file does not end at a checkpoint: none at its last seq {last['seq']}"
+            )
+        elif cp["head_hash"] != last["entry_hash"]:
+            fail(
+                f"the earlier file's checkpoint at its last seq {last['seq']} names another hash "
+                "than its entry"
+            )
+        an = b_header.get("anchor")
+        if an is not None and (
+            an["through_seq"] != last["seq"] or an["through_hash"] != last["entry_hash"]
+        ):
+            fail(
+                f"the later file's header anchor is through seq {an['through_seq']}, not the "
+                f"earlier file's end at seq {last['seq']} and its hash"
+            )
+    return out
+
+
+def _verify_parsed(
+    export: tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]],
+    keys: dict[str, bytes],
+    *,
+    allow_unsigned_tail: bool,
+) -> ExportReport:
     header, entries, cps = export
 
     first_seq = entries[0]["seq"] if entries else None
     last_seq = entries[-1]["seq"] if entries else None
     from_genesis = first_seq == 1 and entries[0]["prev_hash"] == GENESIS_HASH
-    anchored = first_seq == 1
+    # An anchor in the header: checked here, and the walk starts where it says.
+    anchor = header.get("anchor")
+    bad_anchors: list[BadAnchor] = []
+    if anchor is not None:
+        reason = _verify_anchor(anchor, keys)
+        if reason is None and anchor["through_seq"] + 1 != header["from"]:
+            reason = (
+                f"the header's anchor is through seq {anchor['through_seq']}, but the export "
+                f"starts at {header['from']}"
+            )
+        if reason is None:
+            record = next((e for e in entries if e["seq"] == anchor["prune_seq"]), None)
+            if record is not None:
+                reason = _check_prune_record(anchor, record)
+        if reason is not None:
+            bad_anchors.append(BadAnchor(anchor["through_seq"], reason))
+    start_anchor = anchor if anchor is not None and not bad_anchors else None
+    genesis = start_anchor is None and first_seq == 1
+    from_anchor = (
+        start_anchor is not None
+        and bool(entries)
+        and entries[0]["seq"] == start_anchor["through_seq"] + 1
+        and entries[0]["prev_hash"] == start_anchor["through_hash"]
+    )
     lo, hi = first_seq or 0, last_seq or 0
     inside = [c for c in cps if lo <= c["seq"] <= hi]
 
@@ -221,9 +390,12 @@ def verify_export(
     last_ok: int | None = None
     first_bad: int | None = None
     expected_seq, expected_prev = 1, GENESIS_HASH
+    if start_anchor is not None:
+        expected_seq = start_anchor["through_seq"] + 1
+        expected_prev = start_anchor["through_hash"]
     for i, e in enumerate(entries):
         count += 1
-        if i == 0 and not anchored:
+        if i == 0 and not genesis and start_anchor is None:
             expected_seq, expected_prev = e["seq"], e["prev_hash"]
         good = (
             e["seq"] < _U64_MAX
@@ -250,7 +422,7 @@ def verify_export(
             bad.append(BadCheckpoint(cp["seq"], reason))
             continue
         if cp["seq"] == 0:
-            actual = GENESIS_HASH if anchored else None
+            actual: str | None = GENESIS_HASH if genesis else None
         else:
             actual = ok_hashes.get(cp["seq"])
         if actual is not None and actual == cp["head_hash"]:
@@ -279,7 +451,14 @@ def verify_export(
         truncated = header["to"] >= header["from"] and header["to"] > 0
     outside = sum(1 for e in entries if e["seq"] < header["from"] or e["seq"] > header["to"])
     tail_rejected = unsigned_tail > 0 and not allow_unsigned_tail
-    ok = chain_ok and not bad and not truncated and outside == 0 and not tail_rejected
+    ok = (
+        chain_ok
+        and not bad
+        and not bad_anchors
+        and not truncated
+        and outside == 0
+        and not tail_rejected
+    )
     return ExportReport(
         ok=ok,
         entries=count,
@@ -294,6 +473,10 @@ def verify_export(
         truncated=truncated,
         outside_range=outside,
         unsigned_tail_rejected=tail_rejected,
+        from_anchor=from_anchor,
+        pruned_through=start_anchor["through_seq"] if start_anchor is not None else None,
+        anchors=0 if anchor is None else 1,
+        bad_anchors=tuple(bad_anchors),
     )
 
 
@@ -592,7 +775,31 @@ def _check_header(h: Any) -> dict[str, Any]:
             "nothing proves it is complete; verify an export taken without kind, chain_id, tool or "
             "decision filters, then filter that"
         )
+    if h.get("anchor") is not None:
+        _anchor(h["anchor"])
     return h
+
+
+def _anchor(a: Any) -> dict[str, Any]:
+    if not isinstance(a, dict):
+        raise ExportError("header: `anchor` must be an object")
+    where = "header anchor"
+    _need(
+        a,
+        where,
+        through_seq="uint",
+        through_hash="str",
+        prune_seq="uint",
+        prune_entry_hash="str",
+        at="str",
+        kid="str",
+        signature="str",
+    )
+    if a.get("previous_through_seq") is not None and not _is_uint(a["previous_through_seq"]):
+        raise ExportError(f"{where}: `previous_through_seq` must be a non-negative integer or null")
+    if a.get("archive_sha256") is not None and not isinstance(a["archive_sha256"], str):
+        raise ExportError(f"{where}: `archive_sha256` must be a string or null")
+    return a
 
 
 def _entry(e: Any, where: str) -> dict[str, Any]:
@@ -651,9 +858,70 @@ def _raw_key(kid: str, v: Any) -> bytes:
 
 def _verify_checkpoint(cp: Mapping[str, Any], keys: dict[str, bytes]) -> str | None:
     """``None`` when the signature verifies, else why not."""
-    key = keys.get(cp["kid"])
+    payload = b"[%d,%s,%s,%s]" % (
+        cp["seq"],
+        rfc8785.dumps(cp["head_hash"]),
+        rfc8785.dumps(cp["at"]),
+        rfc8785.dumps(cp["kid"]),
+    )
+    return _verify_signed(cp["kid"], _CHECKPOINT_CONTEXT, payload, cp["signature"], keys)
+
+
+def _opt_uint(v: Any) -> bytes:
+    return b"null" if v is None else b"%d" % v
+
+
+def _verify_anchor(a: Mapping[str, Any], keys: dict[str, bytes]) -> str | None:
+    """``None`` when the anchor's signature verifies, else why not. The payload is the RFC 8785
+    JSON of ``[through_seq, through_hash, prune_seq, prune_entry_hash, previous_through_seq,
+    archive_sha256, at, kid]``, framed with the anchor context."""
+    payload = b"[%d,%s,%d,%s,%s,%s,%s,%s]" % (
+        a["through_seq"],
+        rfc8785.dumps(a["through_hash"]),
+        a["prune_seq"],
+        rfc8785.dumps(a["prune_entry_hash"]),
+        _opt_uint(a.get("previous_through_seq")),
+        rfc8785.dumps(a.get("archive_sha256")),
+        rfc8785.dumps(a["at"]),
+        rfc8785.dumps(a["kid"]),
+    )
+    return _verify_signed(a["kid"], _ANCHOR_CONTEXT, payload, a["signature"], keys)
+
+
+def _check_prune_record(a: Mapping[str, Any], e: Mapping[str, Any]) -> str | None:
+    """``None`` when ``e`` is the anchor's prune record: at ``prune_seq``, hashing to
+    ``prune_entry_hash`` (the file's hash, which the chain walk checks), an allowed admin record
+    of :data:`PRUNE_TOOL` by the server, whose ``arguments_digest`` is that of the anchor's
+    values."""
+    r = e["record"]
+    if e["seq"] != a["prune_seq"] or e["entry_hash"] != a["prune_entry_hash"]:
+        return "the entry at prune_seq does not hash to prune_entry_hash"
+    if (
+        r.get("kind") != "admin"
+        or r.get("tool") != PRUNE_TOOL
+        or r.get("server") != "attenuo"
+        or r.get("decision") != "allow"
+    ):
+        return f"the entry at prune_seq is not an allowed `{PRUNE_TOOL}` admin record"
+    # `sha256_json` of {through_seq, through_hash, previous_through_seq, archive_sha256}, keys
+    # in RFC 8785 order; the integers written by hand as in `entry_hash`.
+    args = b'{"archive_sha256":%s,"previous_through_seq":%s,"through_hash":%s,"through_seq":%d}' % (
+        rfc8785.dumps(a.get("archive_sha256")),
+        _opt_uint(a.get("previous_through_seq")),
+        rfc8785.dumps(a["through_hash"]),
+        a["through_seq"],
+    )
+    if r.get("arguments_digest") != hashlib.sha256(args).hexdigest():
+        return "the prune record's arguments digest does not match the anchor"
+    return None
+
+
+def _verify_signed(
+    kid: str, context: str, payload: bytes, signature: str, keys: dict[str, bytes]
+) -> str | None:
+    key = keys.get(kid)
     if key is None:
-        return f"unknown signing key `{cp['kid']}`"
+        return f"unknown signing key `{kid}`"
     try:
         from cryptography.exceptions import InvalidSignature
         from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
@@ -662,14 +930,8 @@ def _verify_checkpoint(cp: Mapping[str, Any], keys: dict[str, bytes]) -> str | N
             "checking checkpoint signatures needs the `cryptography` package "
             "(pip install 'attenuo[verify]')"
         ) from e
-    sig = _b64url_decode(cp["signature"])
-    ctx = _CHECKPOINT_CONTEXT.encode()
-    payload = b"[%d,%s,%s,%s]" % (
-        cp["seq"],
-        rfc8785.dumps(cp["head_hash"]),
-        rfc8785.dumps(cp["at"]),
-        rfc8785.dumps(cp["kid"]),
-    )
+    sig = _b64url_decode(signature)
+    ctx = context.encode()
     try:
         Ed25519PublicKey.from_public_bytes(key).verify(
             sig or b"", struct.pack(">I", len(ctx)) + ctx + payload

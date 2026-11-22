@@ -16,13 +16,17 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from attenuo.audit import (
     EXPORT_FORMAT,
     GENESIS_HASH,
+    PRUNE_TOOL,
     SHIPPED_FORMAT,
     CrossCheckReport,
     ExportError,
+    ExportsReport,
+    LinkProblem,
     cross_check,
     entry_hash,
     parse_shipped,
     verify_export,
+    verify_exports,
 )
 
 from .helpers import b64
@@ -493,3 +497,220 @@ def test_cross_check_refuses_what_verify_export_refuses() -> None:
         cross(objs[1:], [])
     with pytest.raises(ExportError, match="32 bytes"):
         cross_check(lines(objs), [], checkpoint_public_keys={KID: "AAAA"})
+
+
+# ---- a pruned log: the header anchor and several files ------------------------------------
+
+ANCHOR_CONTEXT = b"attenuo-audit-anchor-v1"
+
+
+def _opt(v: int | None) -> bytes:
+    return b"null" if v is None else b"%d" % v
+
+
+def sign_anchor(a: dict[str, Any], key: Ed25519PrivateKey = KEY) -> str:
+    payload = b"[%d,%s,%d,%s,%s,%s,%s,%s]" % (
+        a["through_seq"],
+        rfc8785.dumps(a["through_hash"]),
+        a["prune_seq"],
+        rfc8785.dumps(a["prune_entry_hash"]),
+        _opt(a["previous_through_seq"]),
+        rfc8785.dumps(a["archive_sha256"]),
+        rfc8785.dumps(a["at"]),
+        rfc8785.dumps(a["kid"]),
+    )
+    ctx = ANCHOR_CONTEXT
+    return b64(key.sign(struct.pack(">I", len(ctx)) + ctx + payload))
+
+
+def prune_record(through_seq: int, through_hash: str, digest: str | None) -> dict[str, Any]:
+    args: dict[str, Any] = {
+        "through_seq": through_seq,
+        "through_hash": through_hash,
+        "previous_through_seq": None,
+        "archive_sha256": digest,
+    }
+    return {
+        **GOLDEN_RECORD,
+        "kind": "admin",
+        "server": "attenuo",
+        "tool": PRUNE_TOOL,
+        "decision": "allow",
+        "reason": "admin_action",
+        "arguments_digest": hashlib.sha256(rfc8785.dumps(args)).hexdigest(),
+    }
+
+
+def pruned_log(
+    digest: str | None = "ab" * 32,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    """A log of 13 entries pruned through 10 by the record at 11: the archive (1..=10, ending
+    at a checkpoint), the retained export (11..=13, its header carrying the anchor), and the
+    anchor."""
+    entries: list[dict[str, Any]] = []
+    prev = GENESIS_HASH
+    for seq in range(1, 14):
+        rec = record(seq) if seq != 11 else prune_record(10, entries[9]["entry_hash"], digest)
+        h = entry_hash(seq, prev, rec)
+        entries.append(
+            {"type": "entry", "seq": seq, "prev_hash": prev, "record": rec, "entry_hash": h}
+        )
+        prev = h
+    by_seq = {e["seq"]: e["entry_hash"] for e in entries}
+    anchor: dict[str, Any] = {
+        "through_seq": 10,
+        "through_hash": by_seq[10],
+        "prune_seq": 11,
+        "prune_entry_hash": by_seq[11],
+        "previous_through_seq": None,
+        "archive_sha256": digest,
+        "at": "2026-10-24T00:00:00Z",
+        "kid": KID,
+    }
+    anchor["signature"] = sign_anchor(anchor)
+
+    def header(lo: int, hi: int, **extra: Any) -> dict[str, Any]:
+        return {
+            "type": "header",
+            "format": EXPORT_FORMAT,
+            "from": lo,
+            "to": hi,
+            "exported_at": "2026-10-24T00:00:00Z",
+            **extra,
+        }
+
+    def cps(*seqs: int) -> list[dict[str, Any]]:
+        return [{"type": "checkpoint", **sign(s, by_seq[s])} for s in seqs]
+
+    archive = [header(1, 10), *entries[:10], *cps(5, 10)]
+    retained = [header(11, 13, anchor=anchor), *entries[10:], *cps(11, 13)]
+    return archive, retained, anchor
+
+
+def with_anchor(objs: list[dict[str, Any]], **changes: Any) -> list[dict[str, Any]]:
+    """`objs` with the header's anchor changed (and signed again unless `signature` is given)."""
+    out: list[dict[str, Any]] = json.loads(json.dumps(objs))
+    a = out[0]["anchor"]
+    a.update({k: v for k, v in changes.items() if k != "signature"})
+    a["signature"] = changes.get("signature", sign_anchor(a))
+    return out
+
+
+def test_an_export_after_a_prune_starts_from_its_signed_anchor() -> None:
+    archive, retained, _ = pruned_log()
+    r = verify(retained)
+    assert r.ok, r
+    assert (r.from_anchor, r.from_genesis, r.pruned_through, r.anchors) == (True, False, 10, 1)
+    assert r.bad_anchors == ()
+    # Without an archive digest too.
+    assert verify(pruned_log(None)[1]).ok
+    # The archive is an ordinary export from genesis.
+    a = verify(archive)
+    assert a.ok and a.from_genesis and not a.from_anchor and a.anchors == 0
+
+
+def test_without_its_anchor_the_retained_export_is_a_window() -> None:
+    _, retained, _ = pruned_log()
+    bare = json.loads(json.dumps(retained))
+    del bare[0]["anchor"]
+    r = verify(bare)
+    assert r.ok and not r.from_anchor and r.pruned_through is None and r.anchors == 0
+
+
+def test_a_header_anchor_that_does_not_verify_or_fit_is_reported() -> None:
+    _, retained, _ = pruned_log()
+    other = Ed25519PrivateKey.generate()
+    forged = with_anchor(retained)
+    forged[0]["anchor"]["signature"] = sign_anchor(forged[0]["anchor"], other)
+    cases = [
+        (forged, "signature does not verify"),
+        (with_anchor(retained, kid="k9"), "unknown signing key `k9`"),
+        (with_anchor(retained, through_seq=9), "the header's anchor is through seq 9"),
+        (
+            with_anchor(retained, prune_entry_hash="00" * 32),
+            "does not hash to prune_entry_hash",
+        ),
+        (
+            with_anchor(retained, archive_sha256="cd" * 32),
+            "arguments digest does not match",
+        ),
+    ]
+    for objs, reason in cases:
+        r = verify(objs)
+        assert not r.ok and not r.from_anchor, (reason, r)
+        assert len(r.bad_anchors) == 1 and reason in r.bad_anchors[0].reason, (reason, r)
+
+
+def test_an_anchor_for_another_hash_is_bad_and_the_file_is_a_window() -> None:
+    _, retained, _ = pruned_log()
+    # Signed again, so the signature verifies; the prune record in the file names the real
+    # hash, so the anchor fails there and the walk falls back to a window, as in Rust.
+    r = verify(with_anchor(retained, through_hash="00" * 32))
+    assert not r.ok and not r.from_anchor and r.pruned_through is None
+    assert r.first_bad_seq is None
+    assert "arguments digest does not match" in r.bad_anchors[0].reason
+
+
+def test_a_malformed_header_anchor_raises() -> None:
+    _, retained, _ = pruned_log()
+    bad = json.loads(json.dumps(retained))
+    bad[0]["anchor"]["through_seq"] = "10"
+    with pytest.raises(ExportError, match="through_seq"):
+        verify(bad)
+    bad[0]["anchor"] = "anchor"
+    with pytest.raises(ExportError, match="anchor"):
+        verify(bad)
+
+
+def test_archives_and_the_retained_export_verify_as_one_log(tmp_path: Path) -> None:
+    archive, retained, _ = pruned_log()
+    a, b = tmp_path / "archive.jsonl", tmp_path / "retained.jsonl"
+    a.write_text("".join(lines(archive)))
+    b.write_text("".join(lines(retained)))
+    r = verify_exports([a, b], checkpoint_public_keys=JWKS)
+    assert isinstance(r, ExportsReport)
+    assert r.ok and r.links == () and r.files[1].from_anchor, r
+
+    # Out of order.
+    r = verify_exports([b, a], checkpoint_public_keys=JWKS)
+    assert not r.ok
+    assert r.links[0] == LinkProblem(
+        0,
+        1,
+        "the seqs are not contiguous: the earlier file ends at seq 13, "
+        "the later one starts at seq 1",
+    )
+    # An archive that does not end at a checkpoint.
+    short = [o for o in archive if not (o["type"] == "checkpoint" and o["seq"] == 10)]
+    r = verify_exports([lines(short), lines(retained)], checkpoint_public_keys=JWKS)
+    assert any("does not end at a checkpoint" in p.reason for p in r.links), r
+    # One changed byte in either file is reported at its seq in that file.
+    for which, seq in ((0, 4), (1, 12)):
+        files = [json.loads(json.dumps(archive)), json.loads(json.dumps(retained))]
+        e = next(o for o in files[which] if o.get("seq") == seq and o["type"] == "entry")
+        e["record"]["reason"] = e["record"]["reason"] + "x"
+        r = verify_exports([lines(f) for f in files], checkpoint_public_keys=JWKS)
+        assert not r.ok and r.files[which].first_bad_seq == seq, r
+    # The unsigned tail is accepted only in the last file.
+    open_tail = [*retained[:-1]]
+    r = verify_exports(
+        [lines(archive), lines(open_tail)], checkpoint_public_keys=JWKS, allow_unsigned_tail=True
+    )
+    assert r.ok, r
+    r = verify_exports(
+        [lines(open_tail), lines(archive)], checkpoint_public_keys=JWKS, allow_unsigned_tail=True
+    )
+    assert not r.files[0].ok and r.files[0].unsigned_tail_rejected
+
+
+def test_a_header_anchor_that_does_not_name_the_earlier_file_end_is_a_link_problem() -> None:
+    archive, retained, _ = pruned_log()
+    # A window export starting at 11 with an anchor for another boundary would fail on its
+    # own; here the archive is cut at 9 so its end is not the anchor's boundary.
+    cut = [o for o in archive if not (o["type"] in ("entry", "checkpoint") and o["seq"] == 10)]
+    cut[0] = {**cut[0], "to": 9}
+    r = verify_exports([lines(cut), lines(retained)], checkpoint_public_keys=JWKS)
+    reasons = [p.reason for p in r.links]
+    assert any(
+        "header anchor is through seq 10, not the earlier file's end at seq 9" in x for x in reasons
+    ), reasons
