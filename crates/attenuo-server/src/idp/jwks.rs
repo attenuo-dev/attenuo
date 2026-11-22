@@ -86,8 +86,46 @@ pub(crate) fn fetch_client(
 /// A message, without the path (callers name it), when the file cannot be read, is not PEM,
 /// or holds no certificate.
 pub(crate) fn read_ca_pem(path: &std::path::Path) -> Result<Vec<reqwest::Certificate>, String> {
-    let pem = std::fs::read(path).map_err(|e| format!("cannot read the file ({e})"))?;
-    ca_pem_certs(&pem)
+    ca_pem_certs(&read_ca_file(path)?)
+}
+
+/// Largest `ca_pem_path` file read, as for a key file
+/// ([`crate::issuer_keys::MAX_KEY_FILE_BYTES`]): room for dozens of CA certificates. The
+/// file adds roots to the built-in ones, so it needs only the private CAs.
+pub(crate) const MAX_CA_FILE_BYTES: u64 = 64 * 1024;
+
+/// The bytes of a `ca_pem_path` file: a regular file of at most [`MAX_CA_FILE_BYTES`],
+/// checked before reading and again while reading, in case it grows in between.
+///
+/// # Errors
+///
+/// A message, without the path (callers name it).
+fn read_ca_file(path: &std::path::Path) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let unreadable = |e: std::io::Error| format!("cannot read the file ({e})");
+    let too_big = || {
+        format!(
+            "the file is larger than {} KiB; list only the private CA certificates (the \
+             built-in web PKI roots are trusted already)",
+            MAX_CA_FILE_BYTES / 1024
+        )
+    };
+    let file = std::fs::File::open(path).map_err(unreadable)?;
+    let meta = file.metadata().map_err(unreadable)?;
+    if !meta.is_file() {
+        return Err("not a regular file".into());
+    }
+    if meta.len() > MAX_CA_FILE_BYTES {
+        return Err(too_big());
+    }
+    let mut pem = Vec::new();
+    file.take(MAX_CA_FILE_BYTES + 1)
+        .read_to_end(&mut pem)
+        .map_err(unreadable)?;
+    if pem.len() as u64 > MAX_CA_FILE_BYTES {
+        return Err(too_big());
+    }
+    Ok(pem)
 }
 
 /// [`read_ca_pem`] of the bytes of the file.
@@ -133,7 +171,7 @@ pub(crate) fn entry_client_and_ca_digest(
         return Ok((shared.clone(), None));
     };
     let fail = |e: String| format!("ca_pem_path {:?}: {e}", path.display().to_string());
-    let pem = std::fs::read(path).map_err(|e| fail(format!("cannot read the file ({e})")))?;
+    let pem = read_ca_file(path).map_err(fail)?;
     let roots = ca_pem_certs(&pem).map_err(fail)?;
     let client = fetch_client(timeout, &roots).map_err(|e| {
         fail(format!(
@@ -443,6 +481,7 @@ impl<K: Clone + Send + Sync + 'static> JwksCache<K> {
                             start = Some(self.begin_fetch(&mut st, true));
                         }
                     } else if !st.fetching {
+                        // Within the backoff the stored failure is the answer: fail closed.
                         if let Some((at, e)) = &st.failed {
                             if at.elapsed() < inner.on_failure.backoff {
                                 return Err(e.clone());
@@ -734,6 +773,23 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// How long a test waits for anything that waits on another task: a fetch, a join.
+    const BOUND: Duration = Duration::from_secs(10);
+
+    /// `.bounded()` on a future: its output, or a panic after [`BOUND`], so a bug that leaves
+    /// a caller waiting fails the test at once instead of hanging the run.
+    trait Bounded: std::future::Future + Sized {
+        fn bounded(self) -> impl std::future::Future<Output = Self::Output> {
+            async move {
+                tokio::time::timeout(BOUND, self)
+                    .await
+                    .expect("waited longer than the test bound: a caller was left waiting")
+            }
+        }
+    }
+
+    impl<F: std::future::Future> Bounded for F {}
+
     fn ed_jwk(kid: &str) -> Value {
         json!({"kty": "OKP", "crv": "Ed25519", "alg": "EdDSA", "use": "sig", "kid": kid,
                "x": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"})
@@ -852,11 +908,13 @@ mod tests {
         // Plain http on loopback is the development escape: the direct URL works.
         cache("i", Some(format!("{base}/jwks")))
             .key_for(Some("a"), Algorithm::EdDSA)
+            .bounded()
             .await
             .unwrap();
         for path in ["/moved", "/away"] {
             let Err(JwksError::Unavailable(msg)) = cache("i", Some(format!("{base}{path}")))
                 .key_for(Some("a"), Algorithm::EdDSA)
+                .bounded()
                 .await
             else {
                 panic!("{path}: a redirect must fail the fetch");
@@ -871,6 +929,7 @@ mod tests {
     async fn plain_http_off_loopback_is_refused_before_connecting_s8() {
         let Err(JwksError::Unavailable(msg)) = cache("i", Some("http://keys.example/jwks".into()))
             .key_for(Some("a"), Algorithm::EdDSA)
+            .bounded()
             .await
         else {
             panic!("plain http off loopback must fail");
@@ -880,6 +939,7 @@ mod tests {
         let base = key_server().await;
         let Err(JwksError::Unavailable(msg)) = cache(&base, None)
             .key_for(Some("a"), Algorithm::EdDSA)
+            .bounded()
             .await
         else {
             panic!("a discovered http jwks_uri off loopback must fail");
@@ -952,6 +1012,7 @@ mod tests {
             Some(format!("http://keys:s3cret@127.0.0.1:{port}/jwks")),
         )
         .key_for(Some("a"), Algorithm::EdDSA)
+        .bounded()
         .await
         else {
             panic!("the fetch must fail");
@@ -1013,11 +1074,11 @@ mod tests {
         let tasks: Vec<_> = (0..20)
             .map(|_| {
                 let c = c.clone();
-                tokio::spawn(async move { c.key_for(Some("a"), Algorithm::EdDSA).await })
+                tokio::spawn(async move { c.key_for(Some("a"), Algorithm::EdDSA).bounded().await })
             })
             .collect();
         for t in tasks {
-            t.await.unwrap().unwrap();
+            t.bounded().await.unwrap().unwrap();
         }
         assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
@@ -1029,10 +1090,13 @@ mod tests {
         use std::sync::atomic::Ordering;
         let (url, hits, _) = slow_key_server(Duration::from_secs(3)).await;
         let c = std::sync::Arc::new(cache("i", Some(url)));
-        c.key_for(Some("a"), Algorithm::EdDSA).await.unwrap();
+        c.key_for(Some("a"), Algorithm::EdDSA)
+            .bounded()
+            .await
+            .unwrap();
         let unknown = {
             let c = c.clone();
-            tokio::spawn(async move { c.key_for(Some("zzz"), Algorithm::EdDSA).await })
+            tokio::spawn(async move { c.key_for(Some("zzz"), Algorithm::EdDSA).bounded().await })
         };
         // Wait until the refetch has reached the server.
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -1040,12 +1104,18 @@ mod tests {
             assert!(Instant::now() < deadline, "the refetch never started");
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        c.key_for(Some("a"), Algorithm::EdDSA).await.unwrap();
+        c.key_for(Some("a"), Algorithm::EdDSA)
+            .bounded()
+            .await
+            .unwrap();
         assert!(
             !unknown.is_finished(),
             "the cached key was answered only after the refetch ended"
         );
-        assert!(matches!(unknown.await.unwrap(), Err(JwksError::UnknownKid)));
+        assert!(matches!(
+            unknown.bounded().await.unwrap(),
+            Err(JwksError::UnknownKid)
+        ));
     }
 
     /// With a failure backoff, a failed fetch is the answer until it has passed: no new fetch.
@@ -1069,7 +1139,7 @@ mod tests {
         );
         let pick = |keys: &[CachedKey]| select(keys, Some("a"), Algorithm::EdDSA);
         for _ in 0..5 {
-            let Err(e) = backoff.find(Some("a"), pick).await else {
+            let Err(e) = backoff.find(Some("a"), pick).bounded().await else {
                 panic!("the fetch must fail");
             };
             assert!(
@@ -1080,12 +1150,20 @@ mod tests {
         assert_eq!(hits.load(Ordering::SeqCst), 1);
         let plain = cache("i", Some(url));
         for _ in 0..3 {
-            assert!(plain.key_for(Some("a"), Algorithm::EdDSA).await.is_err());
+            assert!(plain
+                .key_for(Some("a"), Algorithm::EdDSA)
+                .bounded()
+                .await
+                .is_err());
         }
         assert_eq!(hits.load(Ordering::SeqCst), 4);
         // Back up: the cache without a backoff recovers on the next request.
         down.store(false, Ordering::SeqCst);
-        plain.key_for(Some("a"), Algorithm::EdDSA).await.unwrap();
+        plain
+            .key_for(Some("a"), Algorithm::EdDSA)
+            .bounded()
+            .await
+            .unwrap();
     }
 
     /// What one made-up fetch does.
@@ -1152,6 +1230,7 @@ mod tests {
             .find(Some(kid), |keys| {
                 Ok(keys.iter().copied().find(|k| *k == kid))
             })
+            .bounded()
             .await
     }
 
@@ -1159,6 +1238,27 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(20);
         while calls.load(std::sync::atomic::Ordering::SeqCst) < n {
             assert!(Instant::now() < deadline, "fetch {n} never started");
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Wait until `n` callers wait for a fetch of `cache` (each holds a receiver of its end).
+    async fn callers_wait(cache: &JwksCache<&'static str>, n: usize) {
+        let deadline = Instant::now() + BOUND;
+        while cache.inner.done.receiver_count() < n {
+            assert!(Instant::now() < deadline, "{n} callers never waited");
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// The task of the fetch running in `cache`, once its spawn has stored it.
+    async fn fetch_task(cache: &JwksCache<&'static str>) -> tokio::task::AbortHandle {
+        let deadline = Instant::now() + BOUND;
+        loop {
+            if let Some(task) = cache.inner.lock().task.take() {
+                return task;
+            }
+            assert!(Instant::now() < deadline, "no fetch task was stored");
             tokio::task::yield_now().await;
         }
     }
@@ -1194,7 +1294,7 @@ mod tests {
             "the caller took the end of fetch 1 for the end of its own"
         );
         steps.send(keys(&["a"])).unwrap();
-        assert_eq!(second.await.unwrap(), Ok("a"));
+        assert_eq!(second.bounded().await.unwrap(), Ok("a"));
     }
 
     /// A caller that waited for a fetch takes the set it got, even when the TTL has passed by
@@ -1255,7 +1355,9 @@ mod tests {
     }
 
     /// A fetch task that panics ends its fetch: the waiters get an error, and the next call
-    /// fetches again.
+    /// fetches again. The panic is sent only once all four callers wait for fetch 1: a caller
+    /// that came later would rightly start fetch 2, which waits for a step this script sends
+    /// only after every caller has its answer.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_fetch_task_that_panics_ends_the_fetch() {
         let (cache, calls, steps) = scripted(Duration::from_secs(300), FailurePolicy::default());
@@ -1267,9 +1369,10 @@ mod tests {
             })
             .collect();
         calls_reach(&calls, 1).await;
+        callers_wait(&cache, 4).await;
         steps.send(Step::Panic).unwrap();
         for w in waiters {
-            let Err(JwksError::Unavailable(msg)) = w.await.unwrap() else {
+            let Err(JwksError::Unavailable(msg)) = w.bounded().await.unwrap() else {
                 panic!("a waiter of a panicked fetch must get an error");
             };
             assert!(msg.contains("stopped"), "{msg}");
@@ -1290,9 +1393,8 @@ mod tests {
             tokio::spawn(async move { lookup(&cache, "a").await })
         };
         calls_reach(&calls, 1).await;
-        let task = cache.inner.lock().task.take().expect("a fetch task");
-        task.abort();
-        let Err(JwksError::Unavailable(msg)) = waiter.await.unwrap() else {
+        fetch_task(&cache).await.abort();
+        let Err(JwksError::Unavailable(msg)) = waiter.bounded().await.unwrap() else {
             panic!("a waiter of a stopped fetch must get an error");
         };
         assert!(msg.contains("stopped"), "{msg}");
@@ -1342,6 +1444,29 @@ mod tests {
             panic!("a fetch the runtime dropped must fail: {out:?}");
         };
         assert!(msg.contains("stopped"), "{msg}");
+    }
+
+    /// A `ca_pem_path` file over 64 KiB, or one that is not a regular file, is refused with
+    /// a message that says why; one at the limit is read.
+    #[test]
+    fn the_ca_file_read_is_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ca.pem");
+        let limit = usize::try_from(MAX_CA_FILE_BYTES).unwrap();
+        std::fs::write(&path, vec![b' '; limit + 1]).unwrap();
+        let e = read_ca_pem(&path).unwrap_err();
+        assert!(e.contains("larger than 64 KiB"), "{e}");
+        let shared = reqwest::Client::new();
+        let e = entry_client(&shared, Some(&path), Duration::from_secs(1)).unwrap_err();
+        assert!(
+            e.contains("ca.pem") && e.contains("larger than 64 KiB"),
+            "{e}"
+        );
+        // At the limit the size is not the problem: an empty (all-space) file is.
+        std::fs::write(&path, vec![b' '; limit]).unwrap();
+        assert!(read_ca_pem(&path).unwrap_err().contains("empty"));
+        let e = read_ca_pem(dir.path()).unwrap_err();
+        assert!(e.contains("not a regular file"), "{e}");
     }
 
     #[test]
