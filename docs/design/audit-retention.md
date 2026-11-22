@@ -279,7 +279,7 @@ What was built, against section 4:
 After the first review (same day):
 
 - The anchor is never dropped from a full sink queue (the oldest checkpoint goes instead). `audit_anchors` has `shipped_at`, set when the sink delivers the anchor; the server queues every anchor with no `shipped_at` again at start-up and on a repeated request, and refuses the next prune with `sink_behind` while the newest anchor is not delivered. There is no give-up path. Section 7's `shipped: false` became, in the POST answer, `shipped: {queued, delivered_through, anchor_shipped_at, anchor_pending}` (null without a sink), and `GET /admin/audit/anchors` shows each anchor's `shipped_at`. The plan's guards gained `anchor_undelivered`, and `limited_by` can be `"before"`, which is not a refusal code.
-- The Python and TypeScript readers of the shipped file skip anchor lines, as `parse_shipped` does.
+- The Python and TypeScript readers of the shipped file skip anchor lines, as `parse_shipped` does. (Changed since: the SDKs now check them.)
 - The live-run lookup is one search of `audit_chain_id_idx` per root lease in the registry (the chain's first record), not a read of every record of every live chain; a test pins its plan. On 10000 live chains it took 4.5 ms (10 records each) and 8.4 ms (40 each) for a whole plan, where the old query took 7.0 ms and 13.8 ms.
 - `min_age_seconds` is at most 100 years, and the cutoff is computed with checked arithmetic, so a huge value cannot panic under the writer's lock. Start-up warns when `[leases] retention_seconds = 0`.
 - The plan finds the newest entry that is old enough (and older than `before`) by a binary search on seq before it scans checkpoints, so a busy log with more than 100,000 checkpoints above the cutoff still gets a boundary.
