@@ -610,32 +610,48 @@ pub struct SinkHandle {
 /// Told of each anchor the sink delivered ([`CheckpointSink::on_anchor_delivered`]).
 type AnchorDelivered = Box<dyn Fn(&Anchor) + Send + Sync>;
 
-/// What became of the anchors pushed: the ones queued and not yet delivered, and who to tell
-/// of a delivery (the audit log, which records `shipped_at`).
+/// What became of the anchors pushed: the ones queued and not yet delivered, the ones this
+/// process delivered, and who to tell of a delivery (the audit log, which records
+/// `shipped_at`).
 #[derive(Default)]
 struct AnchorTracking {
-    pending: Mutex<std::collections::BTreeSet<u64>>,
+    sets: Mutex<AnchorSets>,
     on_delivered: std::sync::OnceLock<AnchorDelivered>,
+}
+
+/// Anchors by `through_seq`. An anchor is in at most one set, and moves from `pending` to
+/// `delivered` in one step, so a push never finds it in neither while it is on its way: a
+/// repeated prune, or the prune's own hook after a repeat queued the anchor first, cannot
+/// ship it a second time. `delivered` holds one number per prune of this process's life.
+#[derive(Debug, Default)]
+struct AnchorSets {
+    pending: std::collections::BTreeSet<u64>,
+    delivered: std::collections::BTreeSet<u64>,
 }
 
 impl std::fmt::Debug for AnchorTracking {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AnchorTracking")
-            .field("pending", &self.pending)
+            .field("sets", &self.sets)
             .finish_non_exhaustive()
     }
 }
 
 impl AnchorTracking {
-    /// The hook first (the server records `shipped_at`), then the anchor stops being pending:
-    /// whoever finds it not pending can read whether it was shipped
-    /// ([`SinkHandle::push_anchor_unless`]).
+    /// The sets; nothing that can panic runs under the lock, and a poisoned one is still
+    /// read rather than answered wrongly.
+    fn lock(&self) -> std::sync::MutexGuard<'_, AnchorSets> {
+        self.sets.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn delivered(&self, a: &Anchor) {
+        {
+            let mut t = self.lock();
+            t.pending.remove(&a.through_seq);
+            t.delivered.insert(a.through_seq);
+        }
         if let Some(f) = self.on_delivered.get() {
             f(a);
-        }
-        if let Ok(mut p) = self.pending.lock() {
-            p.remove(&a.through_seq);
         }
     }
 }
@@ -649,30 +665,14 @@ impl SinkHandle {
         )));
     }
 
-    /// Queue a prune's anchor for delivery, unless it is queued already and not yet
-    /// delivered. Never blocks on the network or on disk, and the anchor is never dropped
+    /// Queue a prune's anchor for delivery, unless it is queued already or this process
+    /// delivered it (an anchor delivered before a restart and not recorded is queued again
+    /// at start-up). Never blocks on the network or on disk, and the anchor is never dropped
     /// from a full queue ([`QueueItem::keep`]). True when it was queued now.
     pub fn push_anchor(&self, a: &Anchor) -> bool {
-        self.push_anchor_unless(a, || false)
-    }
-
-    /// [`SinkHandle::push_anchor`] for a caller that read "not shipped" a moment ago (a
-    /// repeated prune): `shipped` is asked again while the pending set is held, and a true
-    /// answer queues nothing. A delivery records `shipped_at` before the anchor stops being
-    /// pending, so an anchor that is neither pending nor shipped here was never queued by
-    /// this process, or its delivery could not be recorded; without the second look, a
-    /// delivery that ends between the caller's read and this call ships the anchor twice.
-    /// `shipped` may read the audit log (call this off the async threads).
-    pub fn push_anchor_unless(&self, a: &Anchor, shipped: impl FnOnce() -> bool) -> bool {
-        let fresh = match self.anchors.pending.lock() {
-            Ok(mut p) => {
-                if p.contains(&a.through_seq) || shipped() {
-                    false
-                } else {
-                    p.insert(a.through_seq)
-                }
-            }
-            Err(_) => true,
+        let fresh = {
+            let mut t = self.anchors.lock();
+            !t.delivered.contains(&a.through_seq) && t.pending.insert(a.through_seq)
         };
         if fresh {
             self.queue.push(Shipped::Anchor(ShippedAnchor::new(
@@ -685,10 +685,7 @@ impl SinkHandle {
 
     /// The anchor through `through_seq` is queued and not yet delivered.
     pub fn anchor_pending(&self, through_seq: u64) -> bool {
-        self.anchors
-            .pending
-            .lock()
-            .is_ok_and(|p| p.contains(&through_seq))
+        self.anchors.lock().pending.contains(&through_seq)
     }
 
     /// The highest checkpoint seq delivered since start; `None` before the first. The prune's
@@ -1755,11 +1752,11 @@ mod tests {
         sink.shutdown(Duration::from_secs(1));
     }
 
-    /// A repeated prune that read "not shipped" just before the delivery ended does not ship
-    /// the anchor again: the delivery is recorded before the anchor stops being pending, and
-    /// `push_anchor_unless` looks again while it holds the pending set.
+    /// An anchor this process delivered is not queued again: a repeated prune that read
+    /// "not shipped" just before the delivery was recorded, or the prune's own hook after a
+    /// repeat queued the anchor first, would otherwise ship it twice.
     #[test]
-    fn an_anchor_delivered_meanwhile_is_not_queued_again() {
+    fn a_delivered_anchor_is_not_queued_again() {
         let fake = Arc::new(Fake::default());
         let sink = CheckpointSink::with_deliver(
             Box::new(FakeRef(fake.clone())),
@@ -1768,32 +1765,22 @@ mod tests {
             Metrics::new(),
         )
         .unwrap();
-        // The hook stands for the audit log's `shipped_at`; while it runs the anchor is
-        // still pending.
-        let shipped: Arc<Mutex<Vec<u64>>> = Arc::default();
-        let (seen, probe) = (shipped.clone(), sink.handle());
-        let pending_in_hook = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let flag = pending_in_hook.clone();
-        sink.on_anchor_delivered(move |a| {
-            flag.store(probe.anchor_pending(a.through_seq), Ordering::SeqCst);
-            seen.lock().unwrap().push(a.through_seq);
-        });
+        // When the hook runs (the audit log records `shipped_at`), a push is already
+        // refused: there is no moment at which the anchor is neither pending nor delivered.
+        let probe = sink.handle();
+        let pushed_in_hook: Arc<Mutex<Vec<bool>>> = Arc::default();
+        let seen = pushed_in_hook.clone();
+        sink.on_anchor_delivered(move |a| seen.lock().unwrap().push(probe.push_anchor(a)));
         let h = sink.handle();
         assert!(h.push_anchor(&anchor(20)));
-        wait_until(|| !h.anchor_pending(20));
-        assert!(pending_in_hook.load(Ordering::SeqCst));
-        // Not pending, and recorded as shipped: nothing is queued.
-        let is_shipped = || shipped.lock().unwrap().contains(&20);
-        assert!(!h.push_anchor_unless(&anchor(20), is_shipped));
-        // Pending: the question is not even asked.
-        fake.fail.store(true, Ordering::SeqCst);
+        wait_until(|| pushed_in_hook.lock().unwrap().len() == 1);
+        assert_eq!(*pushed_in_hook.lock().unwrap(), vec![false]);
+        assert!(!sink.anchor_pending(20));
+        assert!(!h.push_anchor(&anchor(20)), "delivered by this process");
+        // Another boundary is another anchor.
         assert!(h.push_anchor(&anchor(30)));
-        assert!(!h.push_anchor_unless(&anchor(30), || panic!("asked while pending")));
-        // Neither pending nor shipped (queued before a restart that lost it): queued.
-        assert!(h.push_anchor_unless(&anchor(40), || false));
-        fake.fail.store(false, Ordering::SeqCst);
-        wait_until(|| h.delivered() == 3);
-        assert_eq!(*fake.got.lock().unwrap(), vec![1020, 1030, 1040]);
+        wait_until(|| h.delivered() == 2);
+        assert_eq!(*fake.got.lock().unwrap(), vec![1020, 1030]);
         sink.shutdown(Duration::from_secs(1));
     }
 
@@ -1836,8 +1823,8 @@ mod tests {
         assert_eq!(*fake.got.lock().unwrap(), vec![1, 1020, 1030, 1040]);
         assert_eq!(*delivered.lock().unwrap(), vec![20, 30, 40]);
         assert!(!sink.anchor_pending(20));
-        // Delivered: it can be queued again (a repeated prune of an anchor not yet recorded).
-        assert!(h.push_anchor(&anchor(20)));
+        // Delivered: it is not queued again.
+        assert!(!h.push_anchor(&anchor(20)));
         assert!(metrics
             .render()
             .contains("attenuo_audit_sink_dropped_total 4\n"));

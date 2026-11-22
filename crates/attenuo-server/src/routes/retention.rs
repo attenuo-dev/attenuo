@@ -244,41 +244,17 @@ pub async fn prune(
     // A repeat finds the anchor queued, or queues it again if it is neither delivered nor
     // queued (it was queued before a restart that lost it, and the restart queued it, but a
     // repeat costs nothing). The anchor is never dropped from the queue.
-    // The delivery may end between the prune's read of `shipped_at` and here, so the sink
-    // looks again before it queues (`push_anchor_unless`); what is answered is read after.
-    let (queued, shipped_at) =
-        if out.already && out.anchor.shipped_at.is_none() && state.checkpoint_sink.is_some() {
-            let anchor = a.clone();
-            state
-                .blocking(move |s| {
-                    let through = anchor.through_seq;
-                    let unshipped = || {
-                        s.audit
-                            .unshipped_anchors()
-                            .map(|u| u.iter().any(|x| x.anchor.through_seq == through))
-                    };
-                    let queued = s.checkpoint_sink.as_ref().is_some_and(|sink| {
-                        // A failed read queues: a second copy is harmless, a missing one is not.
-                        sink.handle()
-                            .push_anchor_unless(&anchor, || matches!(unshipped(), Ok(false)))
-                    });
-                    let shipped_at = s
-                        .audit
-                        .newest_anchor()?
-                        .filter(|n| n.anchor.through_seq == through)
-                        .and_then(|n| n.shipped_at);
-                    Ok::<_, ApiError>((queued, shipped_at))
-                })
-                .await?
-        } else {
-            (!out.already, out.anchor.shipped_at)
-        };
     let shipped = state.checkpoint_sink.as_ref().map(|s| {
+        let queued = if out.already && out.anchor.shipped_at.is_none() {
+            s.handle().push_anchor(a)
+        } else {
+            !out.already
+        };
         json!({
             "queued": queued,
             "delivered_through": s.delivered_through(),
-            "anchor_shipped_at": shipped_at,
-            "anchor_pending": shipped_at.is_none() && s.anchor_pending(a.through_seq),
+            "anchor_shipped_at": out.anchor.shipped_at,
+            "anchor_pending": out.anchor.shipped_at.is_none() && s.anchor_pending(a.through_seq),
         })
     });
     Ok(Json(json!({
