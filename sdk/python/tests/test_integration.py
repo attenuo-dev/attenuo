@@ -2150,6 +2150,69 @@ def tls_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Stack]:
 CODER_SECRET_SHA256 = hashlib.sha256(CODER_SECRET.encode()).hexdigest()
 
 
+CODER_SPIFFE_ID = "spiffe://example.org/ns/agents/sa/coder"
+
+
+@pytest.fixture(scope="module")
+def pki_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Stack]:
+    """The stack on a TLS listener with ``coder`` known by a CA-issued certificate
+    (``tls_client_auth``): its SPIFFE ID under the agents' root CA, in place of its secret.
+    ``coder-chain.crt`` holds the leaf and the intermediate that issued it, ``coder-leaf.crt``
+    the leaf alone."""
+    from .tlsutil import Ca
+
+    work = tmp_path_factory.mktemp("attenuo-it-pki")
+    ca = Ca("it-ca")
+    cert, key = ca.leaf(["127.0.0.1"])
+    (work / "server.crt").write_bytes(cert)
+    (work / "server.key").write_bytes(key)
+    (work / "server.key").chmod(0o600)
+    (work / "ca.pem").write_bytes(ca.pem)
+    root = Ca("agents root CA")
+    mid = Ca("agents intermediate CA", issuer=root)
+    (work / "agents-ca.pem").write_bytes(root.pem)
+    leaf, leaf_key = mid.client(CODER_SPIFFE_ID)
+    (work / "coder-chain.crt").write_bytes(leaf + mid.pem)
+    (work / "coder-leaf.crt").write_bytes(leaf)
+    (work / "coder.key").write_bytes(leaf_key)
+    (work / "coder.key").chmod(0o600)
+    by_ca = (
+        f'tls_client_ca_pem_path = "{work / "agents-ca.pem"}"\n'
+        f'tls_client_auth_san_uri = "{CODER_SPIFFE_ID}"'
+    )
+    yield from run_stack(
+        work,
+        tls=(work / "server.crt", work / "server.key", work / "ca.pem"),
+        edits={f'secret_sha256 = "{CODER_SECRET_SHA256}"': by_ca},
+    )
+
+
+def test_exchange_with_a_ca_issued_certificate_and_its_intermediate(pki_stack: Stack) -> None:
+    """A certificate file with the leaf and then its intermediate authenticates ``coder``;
+    the leaf alone does not (the server cannot build the path), and gets the same 401."""
+    work = pki_stack.work
+    ca = work / "ca.pem"
+    with AdminClient(pki_stack.url, ADMIN_TOKEN, tls_ca_cert=ca) as admin:
+        root = admin.mint_root_dev("alice", "https://idp.example", "assistant", ["github:*"])
+    caps = [Capability("github", "read_file")]
+    key = work / "coder.key"
+    with Client(
+        pki_stack.url, tls_ca_cert=ca, tls_client_cert=work / "coder-chain.crt", tls_client_key=key
+    ) as ob:
+        assert ob.exchange(root, "coder", caps).agent == "coder"
+    with (
+        Client(
+            pki_stack.url,
+            tls_ca_cert=ca,
+            tls_client_cert=work / "coder-leaf.crt",
+            tls_client_key=key,
+        ) as ob,
+        pytest.raises(ApiError) as e,
+    ):
+        ob.exchange(root, "coder", caps)
+    assert e.value.status == 401
+
+
 def test_exchange_with_a_tls_client_certificate(tls_stack: Stack) -> None:
     """The ``coder`` agent authenticates with its certificate alone: the client sends
     ``client_id`` and no secret. Without the certificate the same exchange is refused, and a

@@ -39,15 +39,19 @@ def _dates(b: x509.CertificateBuilder) -> x509.CertificateBuilder:
 
 
 class Ca:
-    """A CA that signs server certificates."""
+    """A CA that signs server and client certificates: a root, or an intermediate under
+    ``issuer``."""
 
-    def __init__(self, name: str) -> None:
+    key: ec.EllipticCurvePrivateKey
+    cert: x509.Certificate
+
+    def __init__(self, name: str, issuer: Ca | None = None) -> None:
         self.key = ec.generate_private_key(ec.SECP256R1())
         pub = self.key.public_key()
         b = (
             _dates(x509.CertificateBuilder())
             .subject_name(_name(name))
-            .issuer_name(_name(name))
+            .issuer_name(issuer.cert.subject if issuer else _name(name))
             .public_key(pub)
             .serial_number(x509.random_serial_number())
             .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
@@ -67,8 +71,33 @@ class Ca:
             )
             .add_extension(x509.SubjectKeyIdentifier.from_public_key(pub), critical=False)
         )
-        self.cert = b.sign(self.key, hashes.SHA256())
+        if issuer is not None:
+            b = b.add_extension(
+                x509.AuthorityKeyIdentifier.from_issuer_public_key(issuer.key.public_key()), False
+            )
+        self.cert = b.sign(issuer.key if issuer else self.key, hashes.SHA256())
         self.pem = self.cert.public_bytes(PEM)
+
+    def client(self, uri: str) -> tuple[bytes, bytes]:
+        """A client certificate (``CA:FALSE``, ``clientAuth``) whose SAN is ``uri``, and its
+        key, as PEM."""
+        key = ec.generate_private_key(ec.SECP256R1())
+        b = (
+            _dates(x509.CertificateBuilder())
+            .subject_name(_name(uri.rsplit("/", 1)[-1]))
+            .issuer_name(self.cert.subject)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+            .add_extension(
+                x509.SubjectAlternativeName([x509.UniformResourceIdentifier(uri)]), False
+            )
+            .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.CLIENT_AUTH]), False)
+            .add_extension(
+                x509.AuthorityKeyIdentifier.from_issuer_public_key(self.key.public_key()), False
+            )
+        )
+        return b.sign(self.key, hashes.SHA256()).public_bytes(PEM), _key_pem(key)
 
     def leaf(self, names: list[str]) -> tuple[bytes, bytes]:
         """A server certificate for ``names`` (IP addresses or DNS names) and its key, as PEM."""

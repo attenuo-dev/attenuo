@@ -17,15 +17,16 @@ attenuo server's certificate, and the TLS client certificate it presents to the 
   private key is refused. ``repr`` shows paths only.
 
 The standard library loads a client certificate from paths only (``SSLContext.load_cert_chain``).
-On Linux the checked bytes are handed to it through memory files (``memfd_create``), so OpenSSL
-never reads the files again. Elsewhere it is given the paths, and reads the two client files a
-second time, after the checks.
+On Linux, when memory files are available (``memfd_create``), the checked bytes are handed to
+it through them, so OpenSSL never reads the files again. Otherwise it is given the paths, and
+reads the two client files a second time, after the checks (logged at debug level).
 """
 
 from __future__ import annotations
 
 import base64
 import binascii
+import logging
 import os
 import re
 import ssl
@@ -43,6 +44,8 @@ MAX_CLIENT_BYTES = 1 << 20
 
 #: A file path: ``str`` or ``os.PathLike``.
 PathArg = Union[str, "os.PathLike[str]"]
+
+log = logging.getLogger("attenuo.tls")
 
 CA = "tls_ca_cert"
 CERT = "tls_client_cert"
@@ -258,6 +261,11 @@ def _load_cert_chain(
                     view = view[os.write(fd, view) :]
             paths = [f"/proc/self/fd/{fd}" for fd in fds]
         except OSError:
+            log.debug(
+                "no memory files here: %s and %s are loaded from their paths, read again",
+                CERT,
+                KEY,
+            )
             paths = [cert, key_path]
         ctx.load_cert_chain(paths[0], paths[1], password=_no_password)
     finally:

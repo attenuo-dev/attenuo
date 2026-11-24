@@ -23,7 +23,7 @@ export function tempDir(): { dir: string; remove: () => void } {
 
 const EC = ["-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes"];
 
-/** A CA in `dir`: `<name>.pem` and `<name>.key`. */
+/** A CA in `dir`: `<name>.pem` and `<name>.key`; a root, or an intermediate under `issuer`. */
 export class Ca {
   readonly pem: string;
   readonly certPath: string;
@@ -32,45 +32,44 @@ export class Ca {
   constructor(
     readonly dir: string,
     readonly name: string,
+    issuer?: Ca,
   ) {
     this.certPath = join(dir, `${name}.pem`);
     this.keyPath = join(dir, `${name}.key`);
-    openssl(
-      [
-        "req",
-        "-x509",
-        ...EC,
-        "-keyout",
-        this.keyPath,
-        "-out",
-        this.certPath,
-        "-days",
-        "30",
-        "-subj",
-        `/CN=${name}`,
-        "-addext",
-        "basicConstraints=critical,CA:TRUE",
-        "-addext",
-        "keyUsage=critical,keyCertSign,cRLSign",
-      ],
-      dir,
-    );
+    const ca = ["basicConstraints=critical,CA:TRUE", "keyUsage=critical,keyCertSign,cRLSign"];
+    if (issuer) {
+      issuer.sign(name, this.keyPath, this.certPath, [
+        ...ca,
+        "authorityKeyIdentifier=keyid",
+        "subjectKeyIdentifier=hash",
+      ]);
+    } else {
+      openssl(
+        [
+          "req",
+          "-x509",
+          ...EC,
+          "-keyout",
+          this.keyPath,
+          "-out",
+          this.certPath,
+          "-days",
+          "30",
+          "-subj",
+          `/CN=${name}`,
+          ...ca.flatMap((e) => ["-addext", e]),
+        ],
+        dir,
+      );
+    }
     this.pem = readFileSync(this.certPath, "utf8");
   }
 
-  /** A server certificate for `names` (`IP:127.0.0.1`, `DNS:other.test`) signed by this CA. */
-  leaf(
-    names: string[],
-    name: string,
-  ): { cert: string; key: string; certPath: string; keyPath: string } {
-    const keyPath = join(this.dir, `${name}.key`);
+  /** A new key in `keyPath` and a certificate for it in `certPath`, signed by this CA. */
+  private sign(name: string, keyPath: string, certPath: string, ext: string[]): void {
     const csr = join(this.dir, `${name}.csr`);
-    const certPath = join(this.dir, `${name}.crt`);
-    const ext = join(this.dir, `${name}.ext`);
-    writeFileSync(
-      ext,
-      `basicConstraints=critical,CA:FALSE\nsubjectAltName=${names.join(",")}\nextendedKeyUsage=serverAuth\nauthorityKeyIdentifier=keyid\nsubjectKeyIdentifier=hash\n`,
-    );
+    const extFile = join(this.dir, `${name}.ext`);
+    writeFileSync(extFile, ext.join("\n") + "\n");
     openssl(
       ["req", "-new", ...EC, "-keyout", keyPath, "-out", csr, "-subj", `/CN=${name}`],
       this.dir,
@@ -91,11 +90,31 @@ export class Ca {
         "-days",
         "30",
         "-extfile",
-        ext,
+        extFile,
       ],
       this.dir,
     );
     chmodSync(keyPath, 0o600);
+  }
+
+  /**
+   * A certificate for `names` (`IP:127.0.0.1`, `DNS:other.test`, `URI:spiffe://…`) signed by
+   * this CA: a server certificate, or a client one with `usage` `clientAuth`.
+   */
+  leaf(
+    names: string[],
+    name: string,
+    usage: "serverAuth" | "clientAuth" = "serverAuth",
+  ): { cert: string; key: string; certPath: string; keyPath: string } {
+    const keyPath = join(this.dir, `${name}.key`);
+    const certPath = join(this.dir, `${name}.crt`);
+    this.sign(name, keyPath, certPath, [
+      "basicConstraints=critical,CA:FALSE",
+      `subjectAltName=${names.join(",")}`,
+      `extendedKeyUsage=${usage}`,
+      "authorityKeyIdentifier=keyid",
+      "subjectKeyIdentifier=hash",
+    ]);
     return {
       cert: readFileSync(certPath, "utf8"),
       key: readFileSync(keyPath, "utf8"),

@@ -1826,3 +1826,67 @@ describe.skipIf(!enabled)("a TLS client certificate against the real server", ()
     await expect(refused.exchange(root, "coder", caps)).rejects.toBeInstanceOf(TransportError);
   });
 });
+
+describe.skipIf(!enabled)("a CA-issued client certificate against the real server", () => {
+  const spiffeId = "spiffe://example.org/ns/agents/sa/coder";
+  let stack: { url: string; work: string; procs: ChildProcess[] } | undefined;
+  let tls: { dir: string; remove: () => void } | undefined;
+  let ca = "";
+  let chainPath = "";
+  let leafPath = "";
+  let keyPath = "";
+
+  beforeAll(async () => {
+    tls = tempDir();
+    const authority = new Ca(tls.dir, "it-ca");
+    const server = authority.leaf(["IP:127.0.0.1"], "server");
+    ca = authority.certPath;
+    // The agents' root CA, an intermediate under it, and coder's certificate from the
+    // intermediate: the server trusts the root only.
+    const root = new Ca(tls.dir, "agents-root");
+    const mid = new Ca(tls.dir, "agents-mid", root);
+    const leaf = mid.leaf([`URI:${spiffeId}`], "coder", "clientAuth");
+    leafPath = leaf.certPath;
+    keyPath = leaf.keyPath;
+    chainPath = join(tls.dir, "coder-chain.crt");
+    writeFileSync(chainPath, leaf.cert + mid.pem);
+    const coderSecretSha256 = createHash("sha256").update(CODER_SECRET).digest("hex");
+    stack = await startStack("", [], {
+      tls: { cert: server.certPath, key: server.keyPath, ca },
+      edits: {
+        [`secret_sha256 = "${coderSecretSha256}"`]:
+          `tls_client_ca_pem_path = "${root.certPath}"\n` +
+          `tls_client_auth_san_uri = "${spiffeId}"`,
+      },
+    });
+  }, 60_000);
+
+  afterAll(async () => {
+    if (stack) await stopStack(stack.procs, stack.work);
+    tls?.remove();
+  });
+
+  it("exchanges with the leaf and its intermediate, and is refused with the leaf alone", async () => {
+    const url = stack!.url;
+    const admin = new AdminClient(url, ADMIN_TOKEN, { tlsCaCert: ca });
+    const root = await admin.mintRootDev("alice", "https://idp.example", "assistant", {
+      capabilities: ["github:*"],
+    });
+    const caps = [capability("github", "read_file")];
+    const withChain = new AttenuoClient(url, {
+      tlsCaCert: ca,
+      tlsClientCert: chainPath,
+      tlsClientKey: keyPath,
+    });
+    expect((await withChain.exchange(root, "coder", caps)).agent).toBe("coder");
+
+    const leafOnly = new AttenuoClient(url, {
+      tlsCaCert: ca,
+      tlsClientCert: leafPath,
+      tlsClientKey: keyPath,
+    });
+    const e = await leafOnly.exchange(root, "coder", caps).catch((x: unknown) => x);
+    expect(e).toBeInstanceOf(ApiError);
+    expect((e as ApiError).status).toBe(401);
+  });
+});

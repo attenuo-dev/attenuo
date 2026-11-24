@@ -473,6 +473,36 @@ def test_a_begin_line_that_is_not_read_is_refused(tmp_path: Path, ca: Ca) -> Non
         Client("https://a.test", tls_ca_cert=odd)
 
 
+def test_lone_cr_line_ends_and_non_ascii_space_are_refused(
+    tmp_path: Path, ca: Ca, client_cert: ClientCert
+) -> None:
+    # The same rules as the TypeScript SDK: lines end in \n or \r\n, and only
+    # ASCII white space may stand around a BEGIN line.
+    _, key = client_cert.write(tmp_path, "planner")
+    lone_cr = write(tmp_path / "cr.pem", client_cert.pem.replace(b"\n", b"\r"))
+    nbsp = write(
+        tmp_path / "nbsp.pem",
+        client_cert.pem.replace(b"CERTIFICATE-----\n", b"CERTIFICATE-----\xc2\xa0\n", 1),
+    )
+    for bad in (lone_cr, nbsp):
+        with pytest.raises(ValueError, match="is not a readable PEM file"):
+            Client("https://a.test", tls_ca_cert=bad)
+        with pytest.raises(ValueError, match="must hold the client certificate in PEM"):
+            Client("https://a.test", tls_client_cert=bad, tls_client_key=key)
+    for name, data in (
+        ("cr-key.pem", client_cert.pem + client_cert.key_pem.replace(b"\n", b"\r")),
+        (
+            "nbsp-key.pem",
+            client_cert.pem + client_cert.key_pem.replace(b"KEY-----\n", b"KEY-----\xc2\xa0\n", 1),
+        ),
+    ):
+        hidden = write(tmp_path / name, data)
+        with pytest.raises(ValueError, match="holds a private key"):
+            Client("https://a.test", tls_ca_cert=hidden)
+        with pytest.raises(ValueError, match="holds a private key"):
+            Client("https://a.test", tls_client_cert=hidden, tls_client_key=key)
+
+
 class ConnectProxy:
     """A local HTTP CONNECT proxy that records the targets it tunnels to."""
 

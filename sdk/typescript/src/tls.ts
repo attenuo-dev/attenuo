@@ -58,8 +58,13 @@ const CA = "tlsCaCert";
 const CERT = "tlsClientCert";
 const KEY = "tlsClientKey";
 
-// Any white space but a newline around the BEGIN line: OpenSSL accepts `\f` and `\v` there too.
-const BEGIN = /^[^\S\n]*-----BEGIN ([^\r\n]*?)-----[^\S\n]*$/gm;
+// The Python SDK's rules exactly, so both accept and refuse the same files: lines end at `\n`
+// (a `\r` before it is white space), white space is ASCII only (` \t\r\f\v`; OpenSSL accepts
+// `\f` and `\v` around the BEGIN line too), and a line starts at the start or after a `\n`.
+const BEGIN = /(?<![^\n])[ \t\r\f\v]*-----BEGIN ([^\r\n]*?)-----[ \t\r\f\v]*(?![^\n])/g;
+const ASCII_WS = /[ \t\n\r\f\v]+/g;
+/** `s` without ASCII white space at either end (Python's `bytes.strip()`). */
+const strip = (s: string) => s.replace(/^[ \t\n\r\f\v]+|[ \t\n\r\f\v]+$/g, "");
 const SUPPORTED_KEYS = ["PRIVATE KEY", "EC PRIVATE KEY", "RSA PRIVATE KEY"];
 
 interface Node {
@@ -146,13 +151,13 @@ function readFile(n: Node, option: string, path: string, max: number): Buffer {
     throw new TypeError(`${option} ${path} is larger than ${max} bytes`);
   }
   const out = buf.subarray(0, len);
-  if (out.toString("latin1").trim() === "") throw new TypeError(`${option} ${path} is empty`);
+  if (strip(out.toString("latin1")) === "") throw new TypeError(`${option} ${path} is empty`);
   return out;
 }
 
 /** The labels of the PEM `BEGIN` lines. Only compared, never shown: they come from the file. */
 function labels(text: string): string[] {
-  return [...text.matchAll(BEGIN)].map((m) => m[1]!.trim());
+  return [...text.matchAll(BEGIN)].map((m) => strip(m[1]!));
 }
 
 /**
@@ -169,14 +174,14 @@ const allBeginsRead = (text: string) =>
 /** The DER of each `CERTIFICATE` block; undefined when a block cannot be read. */
 function certificates(n: Node, text: string): Buffer[] | undefined {
   const out: Buffer[] = [];
-  const re = new RegExp(BEGIN.source, "gm");
+  const re = new RegExp(BEGIN.source, "g");
   for (let m = re.exec(text); m !== null; m = re.exec(text)) {
-    const label = m[1]!.trim();
+    const label = strip(m[1]!);
     const endMarker = `-----END ${label}-----`;
     const end = text.indexOf(endMarker, re.lastIndex);
     if (end < 0) return undefined;
     if (label === "CERTIFICATE") {
-      const body = text.slice(re.lastIndex, end).replace(/\s+/g, "");
+      const body = text.slice(re.lastIndex, end).replace(ASCII_WS, "");
       if (body === "" || !/^[A-Za-z0-9+/]+={0,2}$/.test(body)) return undefined;
       const der = Buffer.from(body, "base64");
       try {
@@ -230,7 +235,7 @@ function readClient(n: Node, cert: string, key: string): { cert: string; key: Bu
   const found = labels(head);
   const encrypted =
     found.some((l) => l.startsWith("ENCRYPTED")) ||
-    /^Proc-Type:[ \t]*4,[ \t]*ENCRYPTED/m.test(head);
+    /(?<![^\n])Proc-Type:[ \t]*4,[ \t]*ENCRYPTED/.test(head);
   let error: string | undefined;
   if (encrypted) {
     error = `${KEY} ${key} is an encrypted private key; it must be unencrypted (for example \`openssl pkey -in <key> -out <plain key>\`, then chmod 600)`;
@@ -363,7 +368,10 @@ class TlsSettings {
 }
 
 /** `init.body` as something `node:https` can write. */
-async function bodyBytes(body: RequestInit["body"]): Promise<Uint8Array | string | undefined> {
+async function bodyBytes(
+  body: RequestInit["body"],
+  signal: AbortSignal | undefined,
+): Promise<Uint8Array | string | undefined> {
   if (body === undefined || body === null) return undefined;
   if (typeof body === "string") return body;
   if (body instanceof URLSearchParams) return body.toString();
@@ -373,7 +381,29 @@ async function bodyBytes(body: RequestInit["body"]): Promise<Uint8Array | string
   }
   if (body instanceof Blob) return new Uint8Array(await body.arrayBuffer());
   if (body instanceof ReadableStream) {
-    return new Uint8Array(await new Response(body).arrayBuffer());
+    // Read here, so an abort can cancel the read (and the stream's source).
+    const reader = (body as ReadableStream<Uint8Array>).getReader();
+    const onAbort = () => void reader.cancel(signal?.reason).catch(() => undefined);
+    signal?.addEventListener("abort", onAbort, { once: true });
+    try {
+      const chunks: Uint8Array[] = [];
+      let size = 0;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        size += value.byteLength;
+      }
+      const out = new Uint8Array(size);
+      let at = 0;
+      for (const c of chunks) {
+        out.set(c, at);
+        at += c.byteLength;
+      }
+      return out;
+    } finally {
+      signal?.removeEventListener("abort", onAbort);
+    }
   }
   throw new TypeError("tlsFetch: unsupported request body type");
 }
@@ -409,8 +439,8 @@ function toResponse(res: IncomingMessage, method: string, abortReason: () => unk
   for (let i = 0; i + 1 < raw.length; i += 2) headers.append(raw[i]!, raw[i + 1]!);
   const status = res.statusCode ?? 0;
   const init = { status, statusText: res.statusMessage ?? "", headers };
-  const encoding = (headers.get("content-encoding") ?? "identity").trim().toLowerCase();
-  if (encoding !== "identity") {
+  const encoding = strip(headers.get("content-encoding") ?? "").toLowerCase();
+  if (encoding !== "" && encoding !== "identity") {
     // Asked for `identity` only: a body in another encoding is not handed on undecoded.
     throw new Error("the server answered with a content-encoding that was not asked for");
   }
@@ -485,7 +515,13 @@ function abortable<T>(p: Promise<T>, signal: AbortSignal | undefined): Promise<T
 }
 
 /** A `fetch` over `node:https` with the agents of `tls`. Redirects are not followed. */
-function httpsFetch(n: Node, tls: TlsSettings): FetchLike {
+/**
+ * How long a request without a `signal` waits for the answer's headers (global `fetch` waits
+ * 300 s too). A caller's `signal` replaces it.
+ */
+export const HEADERS_TIMEOUT_MS = 300_000;
+
+function httpsFetch(n: Node, tls: TlsSettings, headersTimeoutMs: number): FetchLike {
   return async (input, init = {}) => {
     const url = requestUrl(input);
     if (url.protocol !== "https:") {
@@ -505,7 +541,7 @@ function httpsFetch(n: Node, tls: TlsSettings): FetchLike {
     });
     // The body is handed on as the server sent it, so only `identity` is asked for.
     headers["accept-encoding"] = "identity";
-    const data = await abortable(bodyBytes(init.body), signal);
+    const data = await abortable(bodyBytes(init.body, signal), signal);
     signal?.throwIfAborted();
     if (data !== undefined) {
       headers["content-length"] = String(
@@ -515,7 +551,9 @@ function httpsFetch(n: Node, tls: TlsSettings): FetchLike {
     return await new Promise<Response>((resolve, reject) => {
       let aborted = false;
       let done = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
       const settle = (f: () => void) => {
+        if (timer !== undefined) clearTimeout(timer);
         if (done) return;
         done = true;
         f();
@@ -573,6 +611,14 @@ function httpsFetch(n: Node, tls: TlsSettings): FetchLike {
         onAbort();
         return;
       }
+      if (signal === undefined) {
+        timer = setTimeout(() => {
+          req.destroy();
+          settle(() => reject(failed(new Error(`no answer within ${headersTimeoutMs} ms`))));
+        }, headersTimeoutMs);
+        // Never what keeps the process alive.
+        timer.unref?.();
+      }
       req.end(data);
     });
   };
@@ -587,8 +633,17 @@ function httpsFetch(n: Node, tls: TlsSettings): FetchLike {
  * The files are read and checked here, once; an error names the option and the path only.
  */
 export function tlsFetch(serverUrl: string, opts: TlsOptions): FetchLike {
+  return tlsFetchWith(serverUrl, opts, HEADERS_TIMEOUT_MS);
+}
+
+/** `tlsFetch` with another headers timeout (for tests; not exported from the package). */
+export function tlsFetchWith(
+  serverUrl: string,
+  opts: TlsOptions,
+  headersTimeoutMs: number,
+): FetchLike {
   const tls = new TlsSettings(serverUrl, opts);
-  return httpsFetch(node(), tls);
+  return httpsFetch(node(), tls, headersTimeoutMs);
 }
 
 /** `tlsFetch` when any option is given, else undefined. */

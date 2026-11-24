@@ -246,7 +246,7 @@ const ob = new AttenuoClient("https://attenuo.example.com:8443", {
 const planner = await ob.exchange(idToken, "planner", ["github:*"]);
 ```
 
-The TypeScript options need Node.js 20.16 or later. The SDKs have no PEP mode either, and they do not read the `ATTENUO_TLS_*` variables. The details are in the [Python](https://github.com/attenuo-dev/attenuo/blob/main/sdk/python/README.md#tls-a-private-ca-and-a-client-certificate) and [TypeScript](https://github.com/attenuo-dev/attenuo/blob/main/sdk/typescript/README.md#tls-a-private-ca-and-a-client-certificate) READMEs.
+The SDKs work the same way with a certificate from a CA ([below](#tls-client-certificates-from-a-ca-spiffe)): put the intermediate CA certificates after the client certificate in the `tls_client_cert` (`tlsClientCert`) file, at most 4. Both SDKs' integration tests run an exchange with such a file against the server, and check that the client certificate alone, without its intermediate, gets `401`. The TypeScript options need Node.js 20.16 or later. The SDKs have no PEP mode either, and they do not read the `ATTENUO_TLS_*` variables. The details are in the [Python](https://github.com/attenuo-dev/attenuo/blob/main/sdk/python/README.md#tls-a-private-ca-and-a-client-certificate) and [TypeScript](https://github.com/attenuo-dev/attenuo/blob/main/sdk/typescript/README.md#tls-a-private-ca-and-a-client-certificate) READMEs.
 
 **4. Rotate.** An entry takes up to 8 thumbprints. Add the new certificate's thumbprint next to the old one and run `attenuo admin agent reload`. Move the client to the new certificate. Then remove the old thumbprint and reload again. A removed thumbprint stops working on the next request, also on a connection that is already open.
 

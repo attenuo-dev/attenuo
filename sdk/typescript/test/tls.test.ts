@@ -19,7 +19,7 @@ import {
   mcpFetch,
   tlsFetch,
 } from "../src/index.js";
-import { MAX_CA_BYTES, origin } from "../src/tls.js";
+import { HEADERS_TIMEOUT_MS, MAX_CA_BYTES, origin, tlsFetchWith } from "../src/tls.js";
 import { exchangeBody, TYPE_ID_TOKEN, TYPE_JWT } from "../src/wire.js";
 import { Signer } from "./helpers.js";
 import { Ca, ClientCert, TlsServer, tempDir } from "./tlsutil.js";
@@ -492,6 +492,90 @@ describe("answers and requests tlsFetch must not mishandle", () => {
     expect(() => new AttenuoClient("https://a.test", { tlsCaCert: odd })).toThrow(
       /is not a readable PEM file/,
     );
+  });
+
+  it("refuses lone CR line ends and non-ASCII space, as the Python SDK does", () => {
+    const loneCr = write("cr.pem", client.pem.replaceAll("\n", "\r"));
+    const nbsp = write("nbsp.pem", client.pem.replace("CERTIFICATE-----\n", "CERTIFICATE----- \n"));
+    for (const bad of [loneCr, nbsp]) {
+      expect(() => new AttenuoClient("https://a.test", { tlsCaCert: bad })).toThrow(
+        /is not a readable PEM file/,
+      );
+      expect(
+        () =>
+          new AttenuoClient("https://a.test", { tlsClientCert: bad, tlsClientKey: client.keyPath }),
+      ).toThrow(/must hold the client certificate in PEM/);
+    }
+    for (const [name, data] of [
+      ["cr-key.pem", client.pem + client.keyPem.replaceAll("\n", "\r")],
+      ["nbsp-key.pem", client.pem + client.keyPem.replace("KEY-----\n", "KEY----- \n")],
+    ] as const) {
+      const hidden = write(name, data);
+      expect(() => new AttenuoClient("https://a.test", { tlsCaCert: hidden })).toThrow(
+        /holds a private key/,
+      );
+      expect(
+        () =>
+          new AttenuoClient("https://a.test", {
+            tlsClientCert: hidden,
+            tlsClientKey: client.keyPath,
+          }),
+      ).toThrow(/holds a private key/);
+    }
+  });
+
+  it("accepts an empty content-encoding as identity", async () => {
+    const s = await server(ca);
+    s.raw = "HTTP/1.1 200 OK\r\ncontent-encoding: \r\ncontent-length: 2\r\n\r\nok";
+    const f = tlsFetch(s.url, { tlsCaCert: caFile });
+    expect(await (await f(`${s.url}/x`)).text()).toBe("ok");
+  });
+
+  it("gives up on headers after the default timeout when no signal is given", async () => {
+    expect(HEADERS_TIMEOUT_MS).toBe(300_000);
+    const s = await server(ca);
+    s.hang = true;
+    const f = tlsFetchWith(s.url, { tlsCaCert: caFile }, 200);
+    const e = await f(`${s.url}/x`).catch((x: unknown) => x);
+    expect(e).toBeInstanceOf(TypeError);
+    expect((e as Error).message).toBe("fetch failed");
+    expect((e as Error).cause).toBeInstanceOf(Error);
+    // A caller's signal replaces the default: no timer of its own then.
+    const ctl = new AbortController();
+    const p = f(`${s.url}/x`, { signal: ctl.signal });
+    const raced = await Promise.race([
+      p.then(
+        () => "done",
+        () => "rejected",
+      ),
+      new Promise((r) => setTimeout(() => r("pending"), 500)),
+    ]);
+    expect(raced).toBe("pending");
+    ctl.abort(new Error("stop"));
+    await expect(p).rejects.toThrow("stop");
+  });
+
+  it("cancels the request body stream on abort", async () => {
+    const s = await server(ca);
+    const f = tlsFetch(s.url, { tlsCaCert: caFile });
+    const ctl = new AbortController();
+    let cancelled: unknown;
+    const body = new ReadableStream<Uint8Array>({
+      pull: () => new Promise(() => {}),
+      cancel: (reason) => {
+        cancelled = reason;
+      },
+    });
+    const p = f(`${s.url}/x`, {
+      method: "POST",
+      body,
+      signal: ctl.signal,
+      duplex: "half",
+    } as RequestInit);
+    const reason = new Error("stop");
+    ctl.abort(reason);
+    await expect(p).rejects.toThrow("stop");
+    expect(cancelled).toBe(reason);
   });
 
   it("refuses a key of another type than the certificate", () => {
