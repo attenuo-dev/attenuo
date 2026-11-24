@@ -677,11 +677,18 @@ impl Dpop {
             }
             return Ok(false);
         };
+        // A token bound to a certificate is never taken on a DPoP proof: its binding is
+        // checked by `crate::cert_binding`, which does not call this for it.
+        let Some(jkt) = cnf.key_thumbprint() else {
+            return Err(DpopFailure::Invalid(
+                "the token is bound to a TLS client certificate, not to a key".into(),
+            ));
+        };
         let proof = proof.ok_or_else(|| {
             DpopFailure::Required("the token is bound to a key: send a DPoP proof".into())
         })?;
         let verified = self.check(proof, method, url, Some(token), now)?;
-        if verified.jkt != cnf.jkt {
+        if verified.jkt != jkt {
             // Checked before the `jti` is recorded: the holder of a stolen token, who can make
             // proofs only with keys of its own, must not be able to fill the cache (SR-41).
             return Err(DpopError::KeyMismatch.into());
@@ -788,6 +795,13 @@ impl Dpop {
         let Some(parent) = parent_cnf else {
             return self.bind_new(header, "POST", url, now);
         };
+        // A certificate-bound parent has its own rule (`crate::cert_binding::bind_exchange`),
+        // which does not call this for it.
+        let Some(parent_jkt) = parent.key_thumbprint() else {
+            return Err(DpopFailure::Invalid(
+                "the subject token is bound to a TLS client certificate, not to a key".into(),
+            ));
+        };
         let Some(header) = header else {
             return Err(DpopFailure::Required(
                 "the subject token is bound to a key: send a DPoP proof, and the new token is \
@@ -796,7 +810,7 @@ impl Dpop {
             ));
         };
         let child = self.check(header, "POST", url, None, now)?;
-        if child.jkt == parent.jkt {
+        if child.jkt == parent_jkt {
             // One proof by the parent's key: it must cover the subject token.
             if !child.covers(subject_token) {
                 return Err(DpopError::AthMismatch.into());
@@ -815,7 +829,7 @@ impl Dpop {
             })?;
             let parent_proof =
                 self.check_without_nonce(proof, "POST", url, Some(subject_token), now)?;
-            if parent_proof.jkt != parent.jkt {
+            if parent_proof.jkt != parent_jkt {
                 return Err(DpopError::KeyMismatch.into());
             }
             if parent_proof.child_jkt.as_deref() != Some(child.jkt.as_str())

@@ -377,7 +377,8 @@ fuzz_target!(|input: Input| {
                 let expected = c.chain_id == chain_id
                     && c.lease == lease
                     && c.ch == ch
-                    && c.cnf.as_ref().map(|k| k.jkt.as_str()) == jkt.as_deref();
+                    // An approval is bound to a key only: a certificate binding matches nothing.
+                    && c.cnf.as_ref().map(|k| k.key_thumbprint()) == jkt.as_deref().map(Some);
                 assert_eq!(ok, expected, "check_binding disagrees with the claims");
             }
             // An approval token is never a delegation token.

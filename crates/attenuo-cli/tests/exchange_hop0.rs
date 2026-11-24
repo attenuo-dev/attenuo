@@ -344,7 +344,7 @@ async fn a_bound_id_jag_with_a_client_key_becomes_a_bound_root_token() {
     assert_eq!(root.chain.originating_user.subject, "alice");
     assert_eq!(root.chain.hops[0].agent.0, "planner");
     assert_eq!(
-        root.claims.cnf.map(|c| c.jkt).as_deref(),
+        root.claims.cnf.as_ref().and_then(|c| c.key_thumbprint()),
         Some(dpop.thumbprint())
     );
 }

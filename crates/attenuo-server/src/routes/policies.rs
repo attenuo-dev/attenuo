@@ -224,7 +224,10 @@ pub async fn evaluate_policies(
                 .map_err(|e| ApiError::bad_request("invalid_token", e.to_string()))?;
             super::authzen::attach_chain(&mut req, &v.chain)?;
             let (chain, call) = chain_and_call(&req)?;
-            let call = call.with_dpop_bound(v.claims.cnf.is_some());
+            let binding = crate::cert_binding::Binding::of(v.claims.cnf.as_ref());
+            let call = call
+                .with_dpop_bound(binding.dpop())
+                .with_cert_bound(binding.cert());
             (chain, call, CHAIN_SOURCE_TOKEN, expired)
         }
         None => {

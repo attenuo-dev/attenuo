@@ -180,6 +180,14 @@ pub(crate) async fn handle(
     // are recorded together once the root token is issued. The rate limit and a DPoP proof
     // that will be refused come first, so that a request the client is told to send again
     // does not use its assertion up (SR-108, SR-111).
+    // `[token] tls_client_certificate_bound_access_tokens`: the certificate the root token is
+    // bound to, when the agent authenticated with one (`crate::cert_binding`). A `DPoP`
+    // header would bind it a second time: refused before anything is used up.
+    let issuing =
+        crate::cert_binding::issuing_cert(state.cert_bound_tokens, client.as_ref()).cloned();
+    if issuing.is_some() && crate::dpop::header_proof(headers)?.is_some() {
+        return Err(crate::cert_binding::CertFailure::WithDpop { issuing: true }.into());
+    }
     if let Some(client) = client {
         client.check_before_commit(state, headers, mark, now)?;
         state
@@ -189,14 +197,18 @@ pub(crate) async fn handle(
     // `[limits] token_requests_per_minute`: before the DPoP proof, the IdP credential, the
     // lease registration, signing and the audit append.
     state.limits.admit_agent(mark, &agent)?;
-    // DPoP (SR-24): bind the root token to the proof's key, per `[token] dpop`.
-    let cnf = state.dpop.bind_new(
+    // DPoP (SR-24): bind the root token to the proof's key, per `[token] dpop`; or to the
+    // agent's certificate (RFC 8705 §3), per `[token]
+    // tls_client_certificate_bound_access_tokens`.
+    let cnf = crate::cert_binding::bind_root(
+        &state.dpop,
+        issuing.as_ref(),
         crate::dpop::header_proof(headers)?,
-        "POST",
         &state.dpop.expected_url_for(headers, "/token"),
         now,
     )?;
-    let dpop_bound = cnf.is_some();
+    let binding = crate::cert_binding::Binding::of(cnf.as_ref());
+    let dpop_bound = binding.dpop();
     let requested: CapabilitySet = req
         .authorization_details
         .iter()
@@ -224,8 +236,20 @@ pub(crate) async fn handle(
         // a DPoP proof by the key in `cnf.jkt`, and the root token is then bound to that key.
         if let Some(jkt) = &jag.cnf_jkt {
             match &cnf {
-                Some(c) if c.jkt == *jkt => {}
-                Some(_) => return Err(IntakeError::PopMismatch.into()),
+                Some(c) if c.key_thumbprint() == Some(jkt.as_str()) => {}
+                Some(attenuo_token::Confirmation::Jkt(_)) => {
+                    return Err(IntakeError::PopMismatch.into())
+                }
+                // Bound to the agent's certificate: the ID-JAG's key binding cannot be kept.
+                Some(attenuo_token::Confirmation::X5tS256(_)) => {
+                    return Err(IntakeError::PopRequired(
+                        "the ID-JAG is bound to a DPoP key, and this server binds tokens of \
+                         agents that authenticate with a certificate to the certificate \
+                         ([token] tls_client_certificate_bound_access_tokens)"
+                            .into(),
+                    )
+                    .into())
+                }
                 None => {
                     return Err(IntakeError::PopRequired(
                         if state.dpop.mode() == crate::config::DpopMode::Off {
@@ -372,6 +396,7 @@ pub(crate) async fn handle(
                 "agent_auth": agent_auth,
                 "dpop_bound": dpop_bound,
             });
+            binding.add_to(&mut args);
             // Present only under `[idps.id_jag_ceiling]`, so the digest of every other
             // record is unchanged: the claims that narrowed the root grant (empty when the
             // ID-JAG carried none of them).
@@ -392,7 +417,7 @@ pub(crate) async fn handle(
                 "token.root",
                 &issued.chain,
                 args,
-                dpop_bound,
+                binding,
                 ceiling_record,
                 now,
             ) {

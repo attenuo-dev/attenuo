@@ -113,6 +113,7 @@ fn tool_call() -> impl Strategy<Value = ToolCall> {
             arguments,
             session_id: None,
             dpop_bound: false,
+            cert_bound: false,
         })
 }
 

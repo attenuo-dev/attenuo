@@ -24,6 +24,10 @@ pub struct ToolCall {
     /// token with `cnf.jkt`, SR-24). Recorded in the audit log; not part of the policy input.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub dpop_bound: bool,
+    /// The request showed the TLS client certificate its token is bound to (a token with
+    /// `cnf.x5t#S256`, RFC 8705 §3). Recorded in the audit log; not part of the policy input.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cert_bound: bool,
 }
 
 impl ToolCall {
@@ -39,12 +43,19 @@ impl ToolCall {
             arguments,
             session_id: None,
             dpop_bound: false,
+            cert_bound: false,
         }
     }
 
     /// Mark whether the request carried a verified DPoP proof for a bound token.
     pub fn with_dpop_bound(mut self, bound: bool) -> Self {
         self.dpop_bound = bound;
+        self
+    }
+
+    /// Mark whether the request showed the TLS client certificate its token is bound to.
+    pub fn with_cert_bound(mut self, bound: bool) -> Self {
+        self.cert_bound = bound;
         self
     }
 

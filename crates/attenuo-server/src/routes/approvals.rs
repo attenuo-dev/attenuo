@@ -361,7 +361,8 @@ pub async fn user_decide(
 
 /// `GET /approvals/{id}`: the approval, for its originating user (ID token, not used up) or
 /// for an agent of the same delegation run (its delegation token, with a DPoP proof when the
-/// token is bound). Anyone else gets 404, as for an unknown approval.
+/// token is bound to a key, or over a connection that shows the certificate it is bound to).
+/// Anyone else gets 404, as for an unknown approval.
 ///
 /// # Errors
 ///
@@ -374,6 +375,7 @@ pub async fn user_get(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     headers: HeaderMap,
+    extensions: axum::http::Extensions,
 ) -> Result<Json<Value>, ApiError> {
     let token = required_bearer(&headers)?.to_owned();
     let now = state.now();
@@ -385,14 +387,23 @@ pub async fn user_get(
             .verifier
             .verify(&token, now)
             .map_err(|e| ApiError::bad_token(&e))?;
-        state.dpop.check_presented(
-            verified.claims.cnf.as_ref(),
-            &token,
-            crate::dpop::header_proof(&headers)?,
-            "GET",
-            &state
-                .dpop
-                .expected_url_for(&headers, &format!("/approvals/{id}")),
+        // A token bound to a TLS client certificate needs the request's certificate
+        // (`crate::cert_binding`).
+        crate::cert_binding::check_presented(
+            &state.dpop,
+            &crate::cert_binding::Presented {
+                cnf: verified.claims.cnf.as_ref(),
+                token: &token,
+                proof: crate::dpop::header_proof(&headers)?,
+                dpop_scheme: crate::cert_binding::dpop_scheme(&headers),
+                cert: extensions
+                    .get::<crate::client_cert::ClientCertificate>()
+                    .map(crate::client_cert::ClientCertificate::sha256),
+                method: "GET",
+                url: &state
+                    .dpop
+                    .expected_url_for(&headers, &format!("/approvals/{id}")),
+            },
             now,
         )?;
         if attenuo_core::chain_id_of(&verified.chain).as_deref() != Some(a.chain_id.0.as_str()) {

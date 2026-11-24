@@ -133,7 +133,13 @@ impl ApprovalClaims {
         if self.ch != call_hash {
             return Err(ApprovalMismatch::CallHash);
         }
-        if self.cnf.as_ref().map(|c| c.jkt.as_str()) != jkt {
+        // An approval is bound to a key only, never to a certificate.
+        let bound = match &self.cnf {
+            None => None,
+            Some(Confirmation::Jkt(k)) => Some(k.as_str()),
+            Some(Confirmation::X5tS256(_)) => return Err(ApprovalMismatch::Key),
+        };
+        if bound != jkt {
             return Err(ApprovalMismatch::Key);
         }
         Ok(())
@@ -207,10 +213,19 @@ impl Verifier {
         if claims.exp <= now.unix_timestamp() {
             return Err(TokenError::Expired);
         }
-        if claims.cnf.as_ref().is_some_and(|c| !c.is_well_formed()) {
-            return Err(TokenError::Malformed(
-                "`cnf.jkt` is not a SHA-256 thumbprint".into(),
-            ));
+        match &claims.cnf {
+            Some(c @ Confirmation::Jkt(_)) if !c.is_well_formed() => {
+                return Err(TokenError::Malformed(
+                    "`cnf.jkt` is not a SHA-256 thumbprint".into(),
+                ));
+            }
+            // This server never binds an approval to a certificate.
+            Some(Confirmation::X5tS256(_)) => {
+                return Err(TokenError::Malformed(
+                    "an approval token is never bound to a certificate (`cnf.x5t#S256`)".into(),
+                ));
+            }
+            _ => {}
         }
         Ok(claims)
     }
@@ -266,7 +281,7 @@ mod tests {
         assert_eq!(c.iss, "https://attenuo.test");
         assert_eq!(c.aud, "attenuo");
         assert_eq!(c.by, "user");
-        assert_eq!(c.cnf.as_ref().unwrap().jkt, JKT);
+        assert_eq!(c.cnf.as_ref().unwrap().key_thumbprint(), Some(JKT));
         assert_eq!(c.check_binding("L0", "L1", "ch1", Some(JKT)), Ok(()));
         assert_eq!(
             c.check_binding("L9", "L1", "ch1", Some(JKT)),
@@ -293,6 +308,15 @@ mod tests {
             bearer.check_binding("L0", "L1", "ch1", Some(JKT)),
             Err(ApprovalMismatch::Key)
         );
+        // An approval bound to a certificate matches no call, with a key or without one.
+        let mut cert = bearer.clone();
+        cert.cnf = Some(Confirmation::x5t_s256(JKT));
+        for jkt in [None, Some(JKT)] {
+            assert_eq!(
+                cert.check_binding("L0", "L1", "ch1", jkt),
+                Err(ApprovalMismatch::Key)
+            );
+        }
     }
 
     #[test]

@@ -118,7 +118,7 @@ fn mint_root_sync(
         &state.dpop.expected_url_for(headers, "/admin/root-token"),
         now,
     )?;
-    let dpop_bound = cnf.is_some();
+    let binding = crate::cert_binding::Binding::of(cnf.as_ref());
     let ttl = req
         .ttl_seconds
         .map(|s| Duration::seconds(i64::try_from(s).unwrap_or(i64::MAX)));
@@ -161,8 +161,8 @@ fn mint_root_sync(
         "agent": req.agent,
         "lease": issued.lease,
     });
-    let recorded = audit_issuance(state, "token.root", &issued.chain, args, dpop_bound, now)
-        .and_then(|_| {
+    let recorded =
+        audit_issuance(state, "token.root", &issued.chain, args, binding, now).and_then(|_| {
             audit_admin(
                 state,
                 who,

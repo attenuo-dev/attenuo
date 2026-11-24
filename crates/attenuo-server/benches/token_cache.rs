@@ -129,6 +129,8 @@ fn bench_token_cache(c: &mut Criterion) {
             path: "/mcp/github",
             host: Some("attenuo.example"),
             url: None,
+            dpop_scheme: false,
+            client_cert: None,
         };
         // The first call verifies and fills the cache; every timed call is a hit.
         let first = rt.block_on(auth.authenticate_request(&req, now)).unwrap();

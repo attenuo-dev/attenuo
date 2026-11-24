@@ -35,10 +35,13 @@ pub struct IssueOptions {
     /// exchange) the parent's expiry; for example the `exp` of the actor token that
     /// authenticated the exchange. At or before `now` fails with [`TokenError::NoLifetimeLeft`].
     pub not_after: Option<OffsetDateTime>,
-    /// Bind the new token to a key (`cnf`, RFC 9449). The caller has verified a DPoP proof
-    /// for it. For an exchange of a bound parent this is mandatory
-    /// ([`TokenError::BindingRequired`]); whoever calls [`Issuer::exchange_with`] must also
-    /// have checked possession of the parent's key, since the issuer cannot see the request.
+    /// Bind the new token (`cnf`): to a key (`jkt`, RFC 9449), for which the caller has verified
+    /// a DPoP proof, or to a TLS client certificate (`x5t#S256`, RFC 8705 §3), which the caller
+    /// has seen on the request. For an exchange of a bound parent this is mandatory
+    /// ([`TokenError::BindingRequired`]) and of the parent's kind
+    /// ([`TokenError::BindingMismatch`]); whoever calls [`Issuer::exchange_with`] must also have
+    /// checked possession of the parent's key or certificate, since the issuer cannot see the
+    /// request.
     pub cnf: Option<Confirmation>,
 }
 
@@ -330,16 +333,18 @@ impl Issuer {
     }
 
     /// [`Issuer::exchange`] with [`IssueOptions`]: `may_act` for the child, an expiry cap
-    /// applied on top of the parent's expiry, and a key binding (`cnf`). A bound parent
-    /// (`cnf.jkt`) needs a bound child: without `options.cnf` this fails with
-    /// [`TokenError::BindingRequired`]. The child may be bound to another key than the
-    /// parent's; checking that the requester holds the parent's key is the caller's job.
+    /// applied on top of the parent's expiry, and a binding (`cnf`). A bound parent needs a
+    /// bound child: without `options.cnf` this fails with [`TokenError::BindingRequired`]. A
+    /// key-bound parent (`cnf.jkt`) needs a key-bound child, which may be bound to another key
+    /// than the parent's; a certificate-bound parent (`cnf.x5t#S256`) needs a child bound to
+    /// the same certificate. Any other binding fails with [`TokenError::BindingMismatch`].
+    /// Checking that the requester holds the parent's key or certificate is the caller's job.
     ///
     /// # Errors
     ///
     /// Any error of [`Verifier::verify`] for `parent_token` at `now`;
     /// [`TokenError::ActorNotPermitted`]; [`TokenError::BindingRequired`];
-    /// [`TokenError::NoLifetimeLeft`] when `options.not_after` leaves under a second;
+    /// [`TokenError::BindingMismatch`]; [`TokenError::NoLifetimeLeft`] when `options.not_after` leaves under a second;
     /// [`TokenError::Chain`] from [`DelegationChain::extend`] (not covered, too deep, a duplicate
     /// agent, an empty actor); and [`TokenError::Malformed`] for an ill-formed `options.cnf`.
     pub fn exchange_with(
@@ -357,9 +362,7 @@ impl Issuer {
                 return Err(TokenError::ActorNotPermitted(actor.0));
             }
         }
-        if parent.claims.cnf.is_some() && options.cnf.is_none() {
-            return Err(TokenError::BindingRequired);
-        }
+        check_child_binding(parent.claims.cnf.as_ref(), options.cnf.as_ref())?;
         let lease = new_lease();
         let chain = parent.chain.extend(
             actor,
@@ -391,9 +394,10 @@ impl Issuer {
     ) -> Result<IssuedToken, TokenError> {
         if let Some(cnf) = &options.cnf {
             if !cnf.is_well_formed() {
-                return Err(TokenError::Malformed(
-                    "cnf.jkt must be a base64url SHA-256 thumbprint".into(),
-                ));
+                return Err(TokenError::Malformed(format!(
+                    "cnf.{} must be a base64url SHA-256 thumbprint",
+                    cnf.member()
+                )));
             }
         }
         let expires_at = chain
@@ -430,6 +434,21 @@ impl Issuer {
             lease,
             cnf: options.cnf.clone(),
         })
+    }
+}
+
+/// The binding rule of an exchange: a bound parent has a bound child of the same kind, and a
+/// certificate-bound parent's child is bound to the same certificate.
+fn check_child_binding(
+    parent: Option<&Confirmation>,
+    child: Option<&Confirmation>,
+) -> Result<(), TokenError> {
+    match (parent, child) {
+        (None, _) => Ok(()),
+        (Some(_), None) => Err(TokenError::BindingRequired),
+        (Some(Confirmation::Jkt(_)), Some(Confirmation::Jkt(_))) => Ok(()),
+        (Some(Confirmation::X5tS256(p)), Some(Confirmation::X5tS256(c))) if p == c => Ok(()),
+        (Some(_), Some(_)) => Err(TokenError::BindingMismatch),
     }
 }
 

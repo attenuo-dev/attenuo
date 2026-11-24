@@ -122,6 +122,7 @@ function verdict(entry) {
       ['Record id', mono(r.id)],
       ['Session', r.session_id ? mono(r.session_id) : undefined],
       ['DPoP-bound', r.dpop_bound ? 'yes' : 'no'],
+      ['Certificate-bound', r.cert_bound ? 'yes' : undefined],
       ['Run tainted by', taintedBy(r.labels)],
       ['Untrusted arguments', untrustedArgs(r.labels && r.labels.untrusted_args)],
       ['Action search', searchCounts(r.search)],

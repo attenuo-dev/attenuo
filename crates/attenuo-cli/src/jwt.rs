@@ -195,7 +195,11 @@ pub(crate) fn verify_approval_with_jwks(
     differs(binding.lease, &c.lease, "lease")?;
     differs(binding.call_hash, &c.ch, "ch")?;
     if let Some(want) = binding.jkt {
-        let got = c.cnf.as_ref().map(|k| k.jkt.as_str());
+        // The verifier refuses an approval bound to anything but a key.
+        let got = c
+            .cnf
+            .as_ref()
+            .and_then(attenuo_token::Confirmation::key_thumbprint);
         if got != want {
             bail!(
                 "`cnf.jkt` is {}, expected {}",

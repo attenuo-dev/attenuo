@@ -196,6 +196,10 @@ async fn authenticate_forwarded(
         path: "",
         host: None,
         url: entry.dpop_url.as_deref(),
+        dpop_scheme: super::dpop_scheme_of(headers),
+        // The connection is the gateway's: any certificate on it is the gateway's, not the
+        // agent's. A token bound to a certificate is refused on this route.
+        client_cert: None,
     };
     state.authorizer.authenticate_request(&req, now).await
 }

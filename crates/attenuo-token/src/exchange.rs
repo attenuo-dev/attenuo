@@ -231,7 +231,8 @@ pub struct ExchangeResponse {
     pub access_token: String,
     /// Always `urn:ietf:params:oauth:token-type:jwt`.
     pub issued_token_type: String,
-    /// `DPoP` for a sender-constrained token (RFC 9449 §5), `Bearer` otherwise.
+    /// `DPoP` for a token bound to a DPoP key (RFC 9449 §5), `Bearer` otherwise: a token bound
+    /// to a TLS client certificate is sent as a bearer token over mutual TLS (RFC 8705 §3).
     pub token_type: String,
     /// Seconds until `access_token` expires, measured from the exchange time.
     pub expires_in: u64,
@@ -246,7 +247,11 @@ impl ExchangeResponse {
         Self {
             access_token: issued.token.clone(),
             issued_token_type: JWT_TOKEN_TYPE_URN.to_owned(),
-            token_type: if issued.cnf.is_some() {
+            token_type: if issued
+                .cnf
+                .as_ref()
+                .is_some_and(|c| c.key_thumbprint().is_some())
+            {
                 "DPoP"
             } else {
                 "Bearer"

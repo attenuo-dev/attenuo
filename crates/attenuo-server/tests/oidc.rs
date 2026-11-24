@@ -1071,7 +1071,11 @@ async fn id_jag_bound_to_a_dpop_key_needs_its_proof() {
         )
         .unwrap();
     assert_eq!(
-        verified.claims.cnf.map(|c| c.jkt).as_deref(),
+        verified
+            .claims
+            .cnf
+            .as_ref()
+            .and_then(|c| c.key_thumbprint()),
         Some(key.thumbprint())
     );
     // An unbound ID-JAG still works without a proof.
@@ -1129,7 +1133,11 @@ async fn id_jag_dpop_proofs_follow_draft_06_section_9_11() {
         .verify(body["access_token"].as_str().unwrap(), now())
         .unwrap();
     assert_eq!(
-        verified.claims.cnf.map(|c| c.jkt).as_deref(),
+        verified
+            .claims
+            .cnf
+            .as_ref()
+            .and_then(|c| c.key_thumbprint()),
         Some(key.thumbprint())
     );
     // The same proof again (no `cnf`, and with `cnf`): refused as replayed.

@@ -101,7 +101,12 @@ fn cert(extensions: &axum::http::Extensions) -> Option<ClientCertificate> {
 }
 
 /// The first step of an AuthZEN request: what it read, and the bearer, checked.
-type FirstStep<P> = fn(&AppState, &HeaderMap, &Bytes) -> Result<(P, Option<Bearer>), ApiError>;
+type FirstStep<P> = fn(
+    &AppState,
+    &HeaderMap,
+    Option<&ClientCertificate>,
+    &Bytes,
+) -> Result<(P, Option<Bearer>), ApiError>;
 /// The second step: the PEP's authentication and the decision.
 type SecondStep<P, R> =
     fn(&AppState, &HeaderMap, P, Option<Bearer>, &PepKeys) -> Result<R, ApiError>;
@@ -126,9 +131,9 @@ where
     R: Send + 'static,
 {
     let refused = |e: ApiError| with_challenge(e.into_response());
-    let (h, b) = (headers.clone(), body.clone());
+    let (h, b, c) = (headers.clone(), body.clone(), cert.clone());
     let (prepared, bearer) = state
-        .blocking(move |s| first(s, &h, &b))
+        .blocking(move |s| first(s, &h, c.as_ref(), &b))
         .await
         .map_err(refused)?;
     // Between the bearer check and the decision there can now be a key fetch (at most 5
@@ -215,6 +220,7 @@ pub const BATCH_TOO_LARGE: &str = "batch_too_large";
 fn batch_bearer(
     state: &AppState,
     headers: &HeaderMap,
+    cert: Option<&ClientCertificate>,
     body: &Bytes,
 ) -> Result<(Batch, Option<Bearer>), ApiError> {
     let mut raw: Value = parse_json(body)?;
@@ -238,7 +244,7 @@ fn batch_bearer(
         // AuthZEN 1.0 section 7.1: without `evaluations` (absent or empty) the request behaves
         // as a single Access Evaluation request, and so does its answer.
         obj.remove("options");
-        let bearer = bearer_auth(state, headers, "/access/v1/evaluations")?;
+        let bearer = bearer_auth(state, headers, cert, "/access/v1/evaluations")?;
         return Ok((
             Batch {
                 raw,
@@ -261,7 +267,7 @@ fn batch_bearer(
     }
     let semantic = Semantic::from_options(obj.get("options"))?;
     obj.remove("options");
-    let bearer = bearer_auth(state, headers, "/access/v1/evaluations")?;
+    let bearer = bearer_auth(state, headers, cert, "/access/v1/evaluations")?;
     Ok((
         Batch {
             raw,
@@ -554,6 +560,7 @@ fn search_server(resource: Option<&Value>) -> Result<String, ApiError> {
 fn search_bearer(
     state: &AppState,
     headers: &HeaderMap,
+    cert: Option<&ClientCertificate>,
     body: &Bytes,
 ) -> Result<(Search, Option<Bearer>), ApiError> {
     let mut raw: Value = parse_json(body)?;
@@ -572,7 +579,7 @@ fn search_bearer(
         "action".into(),
         json!({ "name": "", "properties": { "server": server } }),
     );
-    let bearer = bearer_auth(state, headers, SEARCH_ACTION_PATH)?;
+    let bearer = bearer_auth(state, headers, cert, SEARCH_ACTION_PATH)?;
     Ok((Search { raw, page, server }, bearer))
 }
 
@@ -811,10 +818,11 @@ fn authorization(headers: &HeaderMap) -> Result<Option<(String, &str)>, ApiError
 fn evaluate_bearer(
     state: &AppState,
     headers: &HeaderMap,
+    cert: Option<&ClientCertificate>,
     body: &Bytes,
 ) -> Result<(Value, Option<Bearer>), ApiError> {
     let value = parse_json(body)?;
-    let bearer = bearer_auth(state, headers, "/access/v1/evaluation")?;
+    let bearer = bearer_auth(state, headers, cert, "/access/v1/evaluation")?;
     Ok((value, bearer))
 }
 
@@ -978,13 +986,19 @@ struct Bearer {
     dpop_bound: bool,
     /// The token's `cnf.jkt` when `dpop_bound`.
     jkt: Option<String>,
+    /// The token is bound to a TLS client certificate and the request showed it.
+    cert_bound: bool,
 }
 
 /// Verify the `Authorization: Bearer` (or `DPoP`) token and its DPoP proof, if the request has
-/// one. `Ok(None)` without a bearer (no header, or HTTP Basic for a PEP).
+/// one, or, for a token bound to a TLS client certificate, that `cert` (the request's
+/// certificate) is that one. A PEP that calls with its own certificate cannot present such a
+/// token for an agent: the certificate it shows is its own. `Ok(None)` without a bearer (no
+/// header, or HTTP Basic for a PEP).
 fn bearer_auth(
     state: &AppState,
     headers: &HeaderMap,
+    cert: Option<&ClientCertificate>,
     path: &str,
 ) -> Result<Option<Bearer>, ApiError> {
     let auth = authorization(headers)?;
@@ -1005,21 +1019,33 @@ fn bearer_auth(
         .verifier
         .verify(token, now)
         .map_err(|e| ApiError::bad_token(&e))?;
-    let dpop_bound = state.dpop.check_presented(
-        v.claims.cnf.as_ref(),
-        token,
-        crate::dpop::header_proof(headers)?,
-        "POST",
-        &state.dpop.expected_url_for(headers, path),
+    let binding = crate::cert_binding::check_presented(
+        &state.dpop,
+        &crate::cert_binding::Presented {
+            cnf: v.claims.cnf.as_ref(),
+            token,
+            proof: crate::dpop::header_proof(headers)?,
+            dpop_scheme: crate::cert_binding::dpop_scheme(headers),
+            cert: cert.map(ClientCertificate::sha256),
+            method: "POST",
+            url: &state.dpop.expected_url_for(headers, path),
+        },
         now,
     )?;
+    let dpop_bound = binding.dpop();
     let jkt = dpop_bound
-        .then(|| v.claims.cnf.as_ref().map(|c| c.jkt.clone()))
+        .then(|| {
+            v.claims
+                .cnf
+                .as_ref()
+                .and_then(|c| c.key_thumbprint().map(str::to_owned))
+        })
         .flatten();
     Ok(Some(Bearer {
         chain: v.chain,
         dpop_bound,
         jkt,
+        cert_bound: binding.cert(),
     }))
 }
 
@@ -1137,7 +1163,9 @@ fn admit(
         })?;
         tracing::debug!(pep = ?pep, "AuthZEN body chain accepted from an authenticated PEP");
     }
-    let call = call.with_dpop_bound(bearer.is_some_and(|b| b.dpop_bound));
+    let call = call
+        .with_dpop_bound(bearer.is_some_and(|b| b.dpop_bound))
+        .with_cert_bound(bearer.is_some_and(|b| b.cert_bound));
     Ok(Admitted {
         req,
         chain: chain_value,

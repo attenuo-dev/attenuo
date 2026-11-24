@@ -21,8 +21,8 @@ use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::auth::{
-    AuthError, Authenticated, Authorizer, CallContext, RequestAuth, META_APPROVAL_KEY,
-    REASON_APPROVAL_REQUIRED,
+    AuthError, Authenticated, Authorizer, CallContext, ClientCertThumbprint, RequestAuth,
+    META_APPROVAL_KEY, REASON_APPROVAL_REQUIRED,
 };
 use crate::config::ProxyConfig;
 use crate::filter::{list_kinds_by_shape, ListFilter, ListKind};
@@ -180,6 +180,7 @@ impl AppState {
         )
         .with_clock(self.clock.clone())
         .recording(server, session_id, who.dpop_bound)
+        .with_cert_bound(who.cert_bound)
     }
 }
 
@@ -308,6 +309,15 @@ fn bearer_of(headers: &HeaderMap) -> Result<&str, AuthError> {
         .ok_or_else(|| AuthError::InvalidToken("expected `Bearer <token>`".into()))
 }
 
+/// Whether the `Authorization` header names the `DPoP` scheme (in any letter case).
+pub(crate) fn dpop_scheme_of(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split_once(' '))
+        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("dpop"))
+}
+
 /// The request's `DPoP` header: none, or exactly one ASCII value (RFC 9449 §4.3).
 fn dpop_of(headers: &HeaderMap) -> Result<Option<&str>, AuthError> {
     let mut values = headers.get_all("dpop").iter();
@@ -330,6 +340,7 @@ async fn authenticate(
     method: &Method,
     uri: &axum::http::Uri,
     headers: &HeaderMap,
+    client_cert: Option<ClientCertThumbprint>,
     now: OffsetDateTime,
 ) -> Result<Authenticated, AuthError> {
     let req = RequestAuth {
@@ -339,6 +350,8 @@ async fn authenticate(
         path: uri.path(),
         host: header_str(headers, header::HOST.as_str()),
         url: None,
+        dpop_scheme: dpop_scheme_of(headers),
+        client_cert: client_cert.map(|c| c.0),
     };
     state.authorizer.authenticate_request(&req, now).await
 }
@@ -483,8 +496,9 @@ async fn record_lease_refusal(
         }
         Admission::Record { .. } => {}
     }
-    let mut call =
-        ToolCall::new(server, tool, serde_json::json!({})).with_dpop_bound(who.dpop_bound);
+    let mut call = ToolCall::new(server, tool, serde_json::json!({}))
+        .with_dpop_bound(who.dpop_bound)
+        .with_cert_bound(who.cert_bound);
     if let Some(sid) = session_id {
         call = call.with_session(session_tag(sid));
     }
@@ -633,6 +647,7 @@ async fn authenticate_traced(
     method: &Method,
     uri: &axum::http::Uri,
     headers: &HeaderMap,
+    client_cert: Option<ClientCertThumbprint>,
     now: OffsetDateTime,
 ) -> Result<Authenticated, AuthError> {
     let span = tracing::info_span!(
@@ -642,7 +657,7 @@ async fn authenticate_traced(
         attenuo.dpop_bound = tracing::field::Empty,
         attenuo.reason = tracing::field::Empty,
     );
-    let out = authenticate(state, method, uri, headers, now)
+    let out = authenticate(state, method, uri, headers, client_cert, now)
         .instrument(span.clone())
         .await;
     match &out {
@@ -795,7 +810,8 @@ async fn session_gate(
             let tag = session_tag(sid);
             let call = ToolCall::new(server, format!("http.{method}"), serde_json::json!({}))
                 .with_session(tag.clone())
-                .with_dpop_bound(who.dpop_bound);
+                .with_dpop_bound(who.dpop_bound)
+                .with_cert_bound(who.cert_bound);
             let id = state
                 .authorizer
                 .record_rejection(chain, &call, REASON_SESSION_MISMATCH, now)
@@ -1103,16 +1119,20 @@ async fn handle_passthrough(
     ServerName(server): ServerName,
     OriginalUri(uri): OriginalUri,
     method: Method,
+    cert: Option<axum::Extension<ClientCertThumbprint>>,
     headers: HeaderMap,
     body: Body,
 ) -> Response {
+    let cert = cert.map(|c| c.0);
     let Some(upstream) = state.upstreams.get(&server).cloned() else {
         return unknown_server(&server);
     };
     let otel = otel_request_span(&state, &method, &server, &headers);
-    let response = passthrough_request(&state, &otel, upstream, server, uri, method, headers, body)
-        .instrument(otel.clone())
-        .await;
+    let response = passthrough_request(
+        &state, &otel, upstream, server, uri, method, headers, cert, body,
+    )
+    .instrument(otel.clone())
+    .await;
     otel.record(
         "http.response.status_code",
         i64::from(response.status().as_u16()),
@@ -1130,11 +1150,12 @@ async fn passthrough_request(
     uri: axum::http::Uri,
     method: Method,
     headers: HeaderMap,
+    cert: Option<ClientCertThumbprint>,
     body: Body,
 ) -> Response {
     let state = state.clone();
     let now = state.clock.now_utc();
-    let who = match authenticate_traced(&state, otel, &method, &uri, &headers, now).await {
+    let who = match authenticate_traced(&state, otel, &method, &uri, &headers, cert, now).await {
         Ok(a) => a,
         Err(e) => return unauthorized(e),
     };
@@ -1379,16 +1400,18 @@ async fn handle_post(
     State(state): State<Arc<AppState>>,
     ServerName(server): ServerName,
     OriginalUri(uri): OriginalUri,
+    cert: Option<axum::Extension<ClientCertThumbprint>>,
     headers: HeaderMap,
     body: Body,
 ) -> Response {
+    let cert = cert.map(|c| c.0);
     let started = Instant::now();
     let Some(upstream) = state.upstreams.get(&server) else {
         return unknown_server(&server);
     };
     let otel = otel_request_span(&state, &Method::POST, &server, &headers);
     let response = post_request(
-        &state, &otel, upstream, &server, &uri, &headers, body, started,
+        &state, &otel, upstream, &server, &uri, &headers, cert, body, started,
     )
     .instrument(otel.clone())
     .await;
@@ -1408,11 +1431,12 @@ async fn post_request(
     server: &str,
     uri: &axum::http::Uri,
     headers: &HeaderMap,
+    cert: Option<ClientCertThumbprint>,
     body: Body,
     started: Instant,
 ) -> Response {
     let now = state.clock.now_utc();
-    let who = match authenticate_traced(state, otel, &Method::POST, uri, headers, now).await {
+    let who = match authenticate_traced(state, otel, &Method::POST, uri, headers, cert, now).await {
         Ok(a) => a,
         Err(e) => return unauthorized(e),
     };
@@ -1952,7 +1976,9 @@ async fn screen_message(
         ),
     };
 
-    let mut call = ToolCall::new(server, tool.clone(), arguments).with_dpop_bound(who.dpop_bound);
+    let mut call = ToolCall::new(server, tool.clone(), arguments)
+        .with_dpop_bound(who.dpop_bound)
+        .with_cert_bound(who.cert_bound);
     if let Some(sid) = session_id {
         // Policy and the audit log see a stable hash prefix, not the session id (SR-11).
         call = call.with_session(session_tag(sid));
@@ -2063,8 +2089,9 @@ async fn refuse_call(
     now: OffsetDateTime,
     out: &mut Screened,
 ) {
-    let mut call =
-        ToolCall::new(server, name, serde_json::json!({})).with_dpop_bound(who.dpop_bound);
+    let mut call = ToolCall::new(server, name, serde_json::json!({}))
+        .with_dpop_bound(who.dpop_bound)
+        .with_cert_bound(who.cert_bound);
     if let Some(sid) = session_id {
         call = call.with_session(session_tag(sid));
     }

@@ -350,6 +350,9 @@ pub(crate) fn render_entry_view(v: &Value) -> String {
     if r["dpop_bound"] == true {
         out.push_str("dpop        bound\n");
     }
+    if r["cert_bound"] == true {
+        out.push_str("certificate bound\n");
+    }
     out.push_str(&format!("hash        {}\n", s(e, "entry_hash")));
     out.push_str(&format!("prev hash   {}\n", s(e, "prev_hash")));
     let leases = v["lease_states"].as_array().cloned().unwrap_or_default();

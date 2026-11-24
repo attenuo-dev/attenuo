@@ -1812,6 +1812,11 @@ impl Authenticated {
         self.method
     }
 
+    /// The TLS client certificate that authenticated the client; `None` for any other method.
+    pub(crate) fn client_cert(&self) -> Option<&ClientCertificate> {
+        self.client_cert.as_ref()
+    }
+
     /// For a client authenticated by its TLS client certificate, the `client_cert` member of
     /// the audit record's arguments ([`ClientCertificate::audit_value`]); `None` otherwise, so
     /// the records of other requests digest as before.
