@@ -224,6 +224,8 @@ struct Opts {
     forwarded: bool,
     /// `[token] dpop`.
     dpop: &'static str,
+    /// More sections, as TOML.
+    extra: &'static str,
 }
 
 impl Default for Opts {
@@ -233,6 +235,7 @@ impl Default for Opts {
             main_tls: true,
             forwarded: true,
             dpop: "optional",
+            extra: "",
         }
     }
 }
@@ -267,7 +270,7 @@ fn write_config(
             "{server}[issuer]\nissuer = \"{ISSUER}\"\nprivate_key_pem_path = \"{}\"\n\n\
              [audit]\nsqlite_path = \"{}\"\n\n\
              [admin]\ntoken = \"{ADMIN}\"\n\n\
-             [dev]\nallow_root_mint = true\n\n\
+             [dev]\nallow_root_mint = true\n\n{}\
              [token]\ndpop = \"{}\"\ntls_client_certificate_bound_access_tokens = {}\n\n\
              [[idps]]\nissuer = \"{IDP}\"\njwks_url = \"{}\"\nallowed_algs = [\"EdDSA\"]\n\
              client_ids = {{ planner = \"{CLIENT_AUD}\", \"pki-coder\" = \"{CLIENT_AUD}\", \
@@ -279,6 +282,7 @@ fn write_config(
              [[root_grants]]\nissuer = \"{IDP}\"\nagent = \"both\"\ncapabilities = [\"github:*\"]\n\n{}",
             dir.join("keys/issuer.pem").display(),
             dir.join("audit.sqlite").display(),
+            opts.extra,
             opts.dpop,
             opts.bound,
             idp.server.url("/jwks"),
@@ -1686,6 +1690,76 @@ async fn actor_tokens_and_the_certificate_binding() {
         h.x5t(a.body["access_token"].as_str().unwrap()),
         Some(c.coder.x5t_s256())
     );
+    h.stop().await;
+}
+
+/// `[limits] token_requests_per_minute` counts an exchange refused for its certificate binding
+/// before the client credential is used, as it counts any other exchange: repeated refusals
+/// reach 429. An exchange that passes that check is counted once, not twice.
+#[tokio::test]
+async fn binding_refusals_are_counted_by_the_agent_rate_limit() {
+    let h = Harness::start(Opts {
+        extra: "[limits]\ntoken_requests_per_minute = 2\n\n",
+        ..Opts::default()
+    })
+    .await;
+    let c = &h.certs;
+    let secret = |id: &str| json!({"client_id": id, "client_secret": format!("{id}-secret")});
+    // Refused for the binding, twice; the third is over the limit.
+    let parent = h.bound_to(Via::Native(Some(&c.coder)), "coder").await;
+    for _ in 0..2 {
+        h.token(
+            Via::Native(Some(&c.planner)),
+            &exchange_body(&parent, "reviewer", secret("reviewer")),
+            &[],
+        )
+        .await
+        .refused(MISMATCH, "reviewer over planner's certificate");
+    }
+    let a = h
+        .token(
+            Via::Native(Some(&c.planner)),
+            &exchange_body(&parent, "reviewer", secret("reviewer")),
+            &[],
+        )
+        .await;
+    assert_eq!(a.status, StatusCode::TOO_MANY_REQUESTS, "{}", a.body);
+    assert_eq!(a.code(), "rate_limited", "{}", a.body);
+    // Over the limit even with the right certificate.
+    let a = h
+        .token(
+            Via::Native(Some(&c.coder)),
+            &exchange_body(&parent, "reviewer", secret("reviewer")),
+            &[],
+        )
+        .await;
+    assert_eq!(a.status, StatusCode::TOO_MANY_REQUESTS, "{}", a.body);
+
+    // Exchanges that pass the check: two fit in the limit of two, so each counts once.
+    let p1 = h
+        .bound_to(Via::Native(Some(&c.pki_coder)), "pki-coder")
+        .await;
+    let p2 = h
+        .bound_to(Via::Native(Some(&c.pki_coder)), "pki-coder")
+        .await;
+    for p in [&p1, &p2] {
+        let a = h
+            .token(
+                Via::Native(Some(&c.pki_coder)),
+                &exchange_body(p, "both", secret("both")),
+                &[],
+            )
+            .await;
+        assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    }
+    let a = h
+        .token(
+            Via::Native(Some(&c.pki_coder)),
+            &exchange_body(&p1, "both", secret("both")),
+            &[],
+        )
+        .await;
+    assert_eq!(a.status, StatusCode::TOO_MANY_REQUESTS, "{}", a.body);
     h.stop().await;
 }
 

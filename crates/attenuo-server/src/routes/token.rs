@@ -434,11 +434,17 @@ fn exchange_sync(
                 .as_ref()
                 .and_then(attenuo_token::Confirmation::cert_thumbprint)
             {
-                crate::cert_binding::check_exchange_of_cert_bound(
+                if let Err(refused) = crate::cert_binding::check_exchange_of_cert_bound(
                     bound,
                     crate::dpop::header_proof(headers)?.is_some() || subject_proof.is_some(),
                     cert.map(ClientCertificate::sha256),
-                )?;
+                ) {
+                    // Counted by `[limits] token_requests_per_minute` as the refusals after
+                    // the commit are, so that this check costs the agent its budget too: over
+                    // the limit the answer is the usual 429. The assertion is not used up.
+                    state.limits.admit_agent(mark, client.id())?;
+                    return Err(refused.into());
+                }
             }
         }
         // Past that, an assertion authenticates this one request, whatever its outcome: its
@@ -460,7 +466,9 @@ fn exchange_sync(
         };
         caller = Some(agent);
     }
-    // Before the subject token, the lease lookups, signing and the audit append.
+    // Before the subject token, the lease lookups, signing and the audit append. A request
+    // the early certificate-binding check refused was counted there and does not get here,
+    // so each request is counted once.
     if let Some(agent) = &caller {
         state.limits.admit_agent(mark, agent)?;
     }
