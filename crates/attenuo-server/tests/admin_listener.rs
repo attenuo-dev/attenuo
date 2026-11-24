@@ -13,34 +13,6 @@ use serde_json::{json, Value};
 
 const ADMIN: &str = "admin-listener-test-token-0123456789abcdef";
 
-/// A free loopback port, for a listener `run` binds itself.
-///
-/// The port is released before `run` binds it, so it must be one no other test can be given
-/// in between. A `127.0.0.1:0` bind takes its port from the system's ephemeral range, and
-/// the tests in this binary run in parallel and bind that way all the time: one of them
-/// could get the port just released, and the request meant for this server would reach
-/// that one. So the port comes from below the ephemeral range, and a counter keeps two
-/// calls in this process apart.
-fn free_port() -> std::net::SocketAddr {
-    use std::sync::atomic::{AtomicU16, Ordering};
-    const FIRST: u16 = 20_000;
-    const COUNT: u16 = 12_000;
-    static NEXT: AtomicU16 = AtomicU16::new(0);
-    // Start at a different place in each process, so two test binaries do not walk the same ports.
-    let start = u16::try_from(std::process::id() % u32::from(COUNT)).unwrap_or(0);
-    for _ in 0..COUNT {
-        let step = NEXT.fetch_add(1, Ordering::Relaxed) % COUNT;
-        let port = FIRST + (start + step) % COUNT;
-        if let Ok(l) = std::net::TcpListener::bind(("127.0.0.1", port)) {
-            return l.local_addr().unwrap();
-        }
-    }
-    panic!(
-        "no free loopback port between {FIRST} and {}",
-        FIRST + COUNT - 1
-    );
-}
-
 fn config(dir: &std::path::Path) -> Config {
     let mut cfg = Config::default();
     cfg.audit.sqlite_path = dir.join("audit.sqlite").to_string_lossy().into_owned();
@@ -135,7 +107,7 @@ async fn answer(
 async fn admin_paths_on_the_main_listener_answer_as_unknown_paths_do() {
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = config(dir.path());
-    cfg.admin.listen = Some(free_port());
+    cfg.admin.listen = Some(common::free_port());
     let (router, _state) = attenuo_server::build(&cfg).unwrap();
     let main = spawn_router(router).await.unwrap();
     let base = main.url("");
@@ -200,7 +172,7 @@ async fn on_loopback_the_admin_api_stays_on_the_main_listener_by_default() {
 async fn the_admin_listener_serves_the_admin_api_behind_the_admin_bearer() {
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = config(dir.path());
-    cfg.admin.listen = Some(free_port());
+    cfg.admin.listen = Some(common::free_port());
     let (_router, state) = attenuo_server::build(&cfg).unwrap();
     let admin = spawn_router(attenuo_server::admin_router(state))
         .await
@@ -245,8 +217,8 @@ async fn the_admin_listener_serves_the_admin_api_behind_the_admin_bearer() {
 async fn run_serves_the_admin_listener_next_to_the_main_one_and_the_console() {
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = config(dir.path());
-    let admin_addr = free_port();
-    let console_addr = free_port();
+    let admin_addr = common::free_port();
+    let console_addr = common::free_port();
     cfg.admin.listen = Some(admin_addr);
     cfg.admin_ui.enabled = true;
     cfg.admin_ui.listen = console_addr;

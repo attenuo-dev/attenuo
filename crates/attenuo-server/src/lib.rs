@@ -1097,7 +1097,9 @@ mod shutdown_tests {
         const COUNT: u16 = 12_000;
         static NEXT: AtomicU16 = AtomicU16::new(0);
         // Start at a different place in each process, so two test binaries do not walk the same ports.
-        let start = u16::try_from(std::process::id() % u32::from(COUNT)).unwrap_or(0);
+        // The odd factor spreads neighbouring process ids apart.
+        let start =
+            u16::try_from(u64::from(std::process::id()) * 7919 % u64::from(COUNT)).unwrap_or(0);
         for _ in 0..COUNT {
             let step = NEXT.fetch_add(1, Ordering::Relaxed) % COUNT;
             let port = FIRST + (start + step) % COUNT;
