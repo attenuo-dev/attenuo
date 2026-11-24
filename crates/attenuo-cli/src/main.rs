@@ -154,13 +154,16 @@ async fn run(cli: Cli) -> Result<Outcome> {
     )?;
     // Read and checked before anything is sent, whatever the command: a client certificate
     // without its key, or a file that cannot be read, is an error here.
-    let tls = tls::Tls::load(
+    let tls = tls::Tls::from_flags(
         cli.tls_ca_cert.as_deref(),
         cli.tls_client_cert.as_deref(),
         cli.tls_client_key.as_deref(),
     )?;
     // An empty `ATTENUO_ADMIN_SERVER` (a compose file's `${VAR:-}`) counts as unset.
     let admin_server = cli.admin_server.as_deref().filter(|s| !s.is_empty());
+    if let Some(warning) = tls.check_targets(&cli.server, admin_server)? {
+        errln!("{warning}");
+    }
     let client = Client::new(&cli.server, admin_server, admin_token, &tls);
     match cli.command {
         Command::Token(TokenCmd::Inspect(args)) => inspect(client.ok(), args, json).await,
@@ -556,7 +559,9 @@ async fn run(cli: Cli) -> Result<Outcome> {
         Command::Approval(ApprovalCmd::Decline { id }) => {
             approval_decide(&client?, &id, "decline", json).await
         }
-        Command::Approval(ApprovalCmd::Verify(args)) => approval_verify(client, args, json).await,
+        Command::Approval(ApprovalCmd::Verify(args)) => {
+            approval_verify(client, &tls, args, json).await
+        }
         Command::Budget(BudgetCmd::Refund {
             decision_id,
             reason,
@@ -1280,6 +1285,7 @@ async fn approval_decide(client: &Client, id: &str, decision: &str, json: bool) 
 /// `approval verify`: check an approval token offline against the issuer's JWKS.
 async fn approval_verify(
     client: Result<Client>,
+    tls: &tls::Tls,
     args: cli::ApprovalVerifyArgs,
     json: bool,
 ) -> Result<Outcome> {
@@ -1293,12 +1299,11 @@ async fn approval_verify(
     let (header, claims) = jwt::decode_approval_unverified(&token)?;
     let jwks: Value = match args.jwks.as_deref() {
         Some(u) if u.starts_with("http://") || u.starts_with("https://") => {
-            // The `--server` client (its CA and client certificate) only for a URL on the
-            // same origin as `--server`; any other host gets the built-in roots and no
-            // certificate.
-            let http = match client.as_ref().ok().and_then(|c| c.http_for_url(u)) {
-                Some(http) => http,
-                None => client::http_client()?,
+            // `--tls-ca-cert` applies, and the client certificate only for a URL on the
+            // origin of `--server`. Without a valid `--server`, no certificate at all.
+            let http = match client.as_ref() {
+                Ok(c) => c.http_for_url(u)?,
+                Err(_) => tls.build(tls::Target::Admin, client::client_builder())?,
             };
             let resp = http
                 .get(u)

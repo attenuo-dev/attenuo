@@ -4,20 +4,30 @@
 //!
 //! The rules:
 //!
+//! - Each option comes from its flag, else from its environment variable
+//!   (`ATTENUO_TLS_CA_CERT`, `ATTENUO_TLS_CLIENT_CERT`, `ATTENUO_TLS_CLIENT_KEY`). An empty
+//!   environment variable is unset; an empty flag value is a usage error.
 //! - With `--tls-ca-cert`, the certificates in that file are the only roots trusted for
-//!   `--server` and `--admin-server`: the public web PKI roots built into the CLI are not
-//!   trusted next to them. Without it, the built-in roots are used, as before.
-//! - `--tls-client-cert` and `--tls-client-key` go together. The certificate is presented
-//!   on connections to `--server` only: never to `--admin-server` (a listener that does not
-//!   read it) and never to any other URL (an `approval verify --jwks` URL on another host).
-//!   The clients follow no redirect (SR-112), so a certificate cannot be carried to a host
-//!   named in a `Location` either.
-//! - Every file is read once, before any request is sent. A file that cannot be read, is
-//!   empty, or does not hold what its flag needs is an error that names the flag and the
-//!   path, and nothing else: no parser message, which could quote the file (a key file's
-//!   line, for instance), goes into it.
-//! - The private key's bytes are held in buffers that are zeroed when dropped, and no
-//!   `Debug` output shows them.
+//!   `--server`, `--admin-server` and an `approval verify --jwks` URL: the public web PKI roots
+//!   built into the CLI are not trusted next to them. Without it, the built-in roots are used,
+//!   as before.
+//! - `--tls-client-cert` and `--tls-client-key` go together, and need an `https://`
+//!   `--server`. The certificate is presented on connections to the origin of `--server`
+//!   only (`Client::client_for`): never to an `--admin-server` or a `--jwks` URL on another
+//!   origin. The clients follow no redirect (SR-112), so it cannot be carried to a host named
+//!   in a `Location` either. One exception: with an `https://` proxy in `HTTPS_PROXY`, reqwest
+//!   uses these settings for the TLS connection to the proxy too, so the proxy's certificate
+//!   must chain to `--tls-ca-cert`, and the client certificate is offered to the proxy if it
+//!   asks for one. An `http://` proxy (a CONNECT tunnel) sees neither.
+//! - Every file is read once, before any request is sent. Anything but a regular file (a
+//!   FIFO, a directory) is refused before it is read. A file that cannot be read, is empty,
+//!   or does not hold what its flag needs is an error that names the flag and the path, and
+//!   nothing else: no parser message, which could quote the file (a key file's line, for
+//!   instance), goes into it.
+//! - The CLI's own buffers for the key file are sized from the file's length, so reading does
+//!   not reallocate them, and are zeroed when dropped. reqwest and rustls keep their own copy
+//!   of the key in memory for as long as the process runs; that copy is not zeroed by the
+//!   CLI. No `Debug` output shows key bytes.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -68,18 +78,26 @@ pub(crate) enum Target {
 }
 
 impl Tls {
-    /// Read and check the three options. `None` (or an empty value, as a compose file's
-    /// `${VAR:-}` gives) is unset.
+    /// Read and check the three options, each from its flag or else its environment
+    /// variable ([`resolve`]).
+    pub(crate) fn from_flags(
+        ca_cert: Option<&Path>,
+        client_cert: Option<&Path>,
+        client_key: Option<&Path>,
+    ) -> Result<Self> {
+        let env = |name: &str| std::env::var_os(name);
+        let ca = resolve(ca_cert, env(CA_ENV));
+        let cert = resolve(client_cert, env(CERT_ENV));
+        let key = resolve(client_key, env(KEY_ENV));
+        Self::load(ca.as_deref(), cert.as_deref(), key.as_deref())
+    }
+
+    /// Read and check the three options. `None` is unset.
     pub(crate) fn load(
         ca_cert: Option<&Path>,
         client_cert: Option<&Path>,
         client_key: Option<&Path>,
     ) -> Result<Self> {
-        fn given(p: Option<&Path>) -> Option<&Path> {
-            p.filter(|p| !p.as_os_str().is_empty())
-        }
-        let (ca_cert, client_cert, client_key) =
-            (given(ca_cert), given(client_cert), given(client_key));
         // The pairing is checked before any file is read.
         let pair = match (client_cert, client_key) {
             (Some(c), Some(k)) => Some((c, k)),
@@ -126,6 +144,32 @@ impl Tls {
         Ok(tls)
     }
 
+    /// Check the options against the URLs they are for: a client certificate needs an
+    /// `https://` `--server` (an error, before any request). A CA with no `https://` URL to
+    /// apply to does nothing, which the returned warning says.
+    pub(crate) fn check_targets(
+        &self,
+        server: &str,
+        admin: Option<&str>,
+    ) -> Result<Option<String>> {
+        let https = |u: &str| u.trim_start().to_ascii_lowercase().starts_with("https://");
+        if self.client.is_some() && !https(server) {
+            bail!(
+                "--tls-client-cert and --tls-client-key (or ATTENUO_TLS_CLIENT_CERT and \
+                 ATTENUO_TLS_CLIENT_KEY) need an https:// --server; a client certificate cannot \
+                 be sent over plain HTTP"
+            );
+        }
+        if self.roots.is_some() && !https(server) && !admin.is_some_and(https) {
+            return Ok(Some(
+                "warning: --tls-ca-cert (or ATTENUO_TLS_CA_CERT) is set, but neither --server \
+                 nor --admin-server is https://, so it is not used"
+                    .to_owned(),
+            ));
+        }
+        Ok(None)
+    }
+
     /// Whether a client certificate is presented to `--server`.
     pub(crate) fn has_client_cert(&self) -> bool {
         self.client.is_some()
@@ -166,15 +210,50 @@ impl Tls {
     }
 }
 
-/// Read at most `max` bytes of `path` for `flag`; more is an error, and so is a file with
-/// nothing but white space.
+/// The environment variables of the three options.
+const CA_ENV: &str = "ATTENUO_TLS_CA_CERT";
+const CERT_ENV: &str = "ATTENUO_TLS_CLIENT_CERT";
+const KEY_ENV: &str = "ATTENUO_TLS_CLIENT_KEY";
+
+/// The flag's path, else the environment variable's when it is not empty (a compose file's
+/// `${VAR:-}` gives an empty one). An empty flag value never gets here: clap refuses it.
+fn resolve(flag: Option<&Path>, env: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    flag.map(Path::to_path_buf)
+        .or_else(|| env.filter(|v| !v.is_empty()).map(PathBuf::from))
+}
+
+/// Open `path` for reading without blocking on a FIFO or a device: on Unix with
+/// `O_NONBLOCK`, which a regular file ignores.
+fn open(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // `O_NONBLOCK` is a small positive flag; the cast cannot change it.
+        #[allow(clippy::cast_possible_wrap)]
+        options.custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32);
+    }
+    options.open(path)
+}
+
+/// Read at most `max` bytes of `path` for `flag`. Anything but a regular file is refused
+/// before it is read, as checked on the open handle; a larger file is an error, and so is
+/// one with nothing but white space. The buffer is sized from the file's length, so it is not
+/// reallocated (and an old copy left behind) while it is read.
 fn read_file(flag: &str, path: &Path, max: u64) -> Result<Zeroizing<Vec<u8>>> {
-    let file = std::fs::File::open(path)
-        .map_err(|e| anyhow!("cannot read {flag} {}: {}", path.display(), e))?;
-    let mut buf = Zeroizing::new(Vec::new());
-    file.take(max + 1)
-        .read_to_end(&mut buf)
-        .map_err(|e| anyhow!("cannot read {flag} {}: {}", path.display(), e))?;
+    let cannot = |e: std::io::Error| anyhow!("cannot read {flag} {}: {e}", path.display());
+    let file = open(path).map_err(cannot)?;
+    let meta = file.metadata().map_err(cannot)?;
+    if !meta.is_file() {
+        bail!("{flag} {} is not a regular file", path.display());
+    }
+    if meta.len() > max {
+        bail!("{flag} {} is larger than {max} bytes", path.display());
+    }
+    let len = usize::try_from(meta.len()).unwrap_or(0);
+    let mut buf = Zeroizing::new(Vec::with_capacity(len));
+    file.take(max + 1).read_to_end(&mut buf).map_err(cannot)?;
     if buf.len() as u64 > max {
         bail!("{flag} {} is larger than {max} bytes", path.display());
     }
@@ -203,6 +282,26 @@ fn sections(
     Ok(out)
 }
 
+/// The labels of the PEM `BEGIN` lines of `bytes` (`CERTIFICATE`, `PRIVATE KEY`, ...),
+/// whether or not rustls knows them. Only compared, never shown: they come from the file.
+fn begin_labels(bytes: &[u8]) -> Vec<&[u8]> {
+    bytes
+        .split(|b| *b == b'\n')
+        .filter_map(|line| {
+            let line = line.trim_ascii();
+            line.strip_prefix(b"-----BEGIN ")?.strip_suffix(b"-----")
+        })
+        .collect()
+}
+
+/// Whether any `BEGIN` line of `bytes` starts a private key of any kind, including those
+/// rustls does not read (`ENCRYPTED PRIVATE KEY`, `OPENSSH PRIVATE KEY`, `DSA PRIVATE KEY`).
+fn has_any_private_key(bytes: &[u8]) -> bool {
+    begin_labels(bytes)
+        .iter()
+        .any(|l| l.ends_with(b"PRIVATE KEY"))
+}
+
 fn is_private_key(kind: SectionKind) -> bool {
     matches!(
         kind,
@@ -214,6 +313,12 @@ fn is_private_key(kind: SectionKind) -> bool {
 fn read_ca(path: &Path) -> Result<Vec<Certificate>> {
     const FLAG: &str = "--tls-ca-cert";
     let bytes = read_file(FLAG, path, MAX_CA_BYTES)?;
+    if has_any_private_key(&bytes) {
+        bail!(
+            "{FLAG} {} holds a private key; it must hold only the CA certificates",
+            path.display()
+        );
+    }
     let sections = sections(FLAG, path, &bytes)?;
     if sections.iter().any(|(k, _)| is_private_key(*k)) {
         bail!(
@@ -245,6 +350,12 @@ fn read_identity(cert: &Path, key: &Path) -> Result<Identity> {
     const CERT: &str = "--tls-client-cert";
     const KEY: &str = "--tls-client-key";
     let cert_bytes = read_file(CERT, cert, MAX_CLIENT_BYTES)?;
+    if has_any_private_key(&cert_bytes) {
+        bail!(
+            "{CERT} {} holds a private key; give the key in {KEY} and only the certificate here",
+            cert.display()
+        );
+    }
     let cert_sections = sections(CERT, cert, &cert_bytes)?;
     if cert_sections.iter().any(|(k, _)| is_private_key(*k)) {
         bail!(
@@ -264,6 +375,25 @@ fn read_identity(cert: &Path, key: &Path) -> Result<Identity> {
         );
     }
     let key_bytes = read_file(KEY, key, MAX_CLIENT_BYTES)?;
+    let labels = begin_labels(&key_bytes);
+    if labels.iter().any(|l| l.starts_with(b"ENCRYPTED")) {
+        bail!(
+            "{KEY} {} is an encrypted private key; the CLI needs it unencrypted (for \
+             example `openssl pkey -in <key> -out <plain key>`, then chmod 600)",
+            key.display()
+        );
+    }
+    let supported: [&[u8]; 3] = [b"PRIVATE KEY", b"EC PRIVATE KEY", b"RSA PRIVATE KEY"];
+    if labels
+        .iter()
+        .any(|l| l.ends_with(b"PRIVATE KEY") && !supported.contains(l))
+    {
+        bail!(
+            "{KEY} {} holds a kind of private key the CLI cannot read; it needs PEM `BEGIN \
+             PRIVATE KEY` (PKCS#8), `BEGIN EC PRIVATE KEY` or `BEGIN RSA PRIVATE KEY`",
+            key.display()
+        );
+    }
     let key_sections = sections(KEY, key, &key_bytes)?;
     let keys = key_sections
         .iter()
@@ -325,10 +455,96 @@ mod tests {
     fn nothing_given_is_the_default() {
         let tls = Tls::load(None, None, None).unwrap();
         assert!(tls.roots.is_none() && !tls.has_client_cert());
-        // Empty values (`${VAR:-}`) count as unset.
-        let empty = Path::new("");
-        let tls = Tls::load(Some(empty), Some(empty), Some(empty)).unwrap();
-        assert!(tls.roots.is_none() && !tls.has_client_cert());
+    }
+
+    #[test]
+    fn the_flag_wins_and_an_empty_environment_variable_is_unset() {
+        let flag = Path::new("/flag.pem");
+        let env = |v: &str| Some(std::ffi::OsString::from(v));
+        assert_eq!(resolve(Some(flag), env("/env.pem")).unwrap(), flag);
+        assert_eq!(
+            resolve(None, env("/env.pem")).unwrap(),
+            Path::new("/env.pem")
+        );
+        // A compose file's `${VAR:-}`.
+        assert_eq!(resolve(None, env("")), None);
+        assert_eq!(resolve(None, None), None);
+    }
+
+    #[test]
+    fn a_client_certificate_needs_an_https_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, key) = client_pair();
+        let c = write(dir.path(), "c.pem", &cert);
+        let k = write(dir.path(), "k.pem", &key);
+        let ca = write(dir.path(), "ca.pem", &ca_pem());
+        let tls = Tls::load(None, Some(&c), Some(&k)).unwrap();
+        for http in ["http://attenuo.test", "HTTP://attenuo.test"] {
+            let e = format!("{:#}", tls.check_targets(http, None).unwrap_err());
+            assert!(
+                e.starts_with("--tls-client-cert and --tls-client-key"),
+                "{e}"
+            );
+        }
+        // An https admin server does not make an http --server fine: the certificate goes
+        // to --server only.
+        assert!(tls
+            .check_targets("http://a.test", Some("https://adm.test"))
+            .is_err());
+        assert_eq!(tls.check_targets("https://a.test", None).unwrap(), None);
+        assert_eq!(
+            tls.check_targets("HTTPS://a.test", Some("http://adm.test"))
+                .unwrap(),
+            None
+        );
+
+        // A CA alone with no https:// URL: a warning, not an error.
+        let tls = Tls::load(Some(&ca), None, None).unwrap();
+        let w = tls.check_targets("http://a.test", None).unwrap().unwrap();
+        assert!(w.starts_with("warning: --tls-ca-cert"), "{w}");
+        assert!(tls
+            .check_targets("http://a.test", Some("http://adm.test"))
+            .unwrap()
+            .is_some());
+        for (server, admin) in [
+            ("https://a.test", None),
+            ("http://a.test", Some("https://adm.test")),
+        ] {
+            assert_eq!(tls.check_targets(server, admin).unwrap(), None);
+        }
+        // Nothing set: nothing to say.
+        assert_eq!(
+            Tls::default().check_targets("http://a.test", None).unwrap(),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_or_a_directory_is_refused_without_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("fifo.pem");
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            &fifo,
+            rustix::fs::Mode::from_raw_mode(0o600),
+        )
+        .unwrap();
+        let (cert, _) = client_pair();
+        let c = write(dir.path(), "c.pem", &cert);
+        // Nothing ever writes to the FIFO: a blocking open would hang the test.
+        let e = err(Tls::load(Some(&fifo), None, None));
+        assert!(e.ends_with("is not a regular file"), "{e}");
+        let e = err(Tls::load(None, Some(&c), Some(&fifo)));
+        assert!(
+            e.starts_with("--tls-client-key ") && e.ends_with("is not a regular file"),
+            "{e}"
+        );
+        let e = err(Tls::load(Some(dir.path()), None, None));
+        assert!(
+            e.ends_with("is not a regular file") || e.starts_with("cannot read"),
+            "{e}"
+        );
     }
 
     #[test]
@@ -342,15 +558,6 @@ mod tests {
         let e = err(Tls::load(None, None, Some(Path::new("/nonexistent/k.pem"))));
         assert!(
             e.starts_with("--tls-client-key needs --tls-client-cert"),
-            "{e}"
-        );
-        let e = err(Tls::load(
-            None,
-            Some(Path::new("/nonexistent/c.pem")),
-            Some(Path::new("")),
-        ));
-        assert!(
-            e.starts_with("--tls-client-cert needs --tls-client-key"),
             "{e}"
         );
     }
@@ -461,13 +668,37 @@ mod tests {
         let e = err(Tls::load(Some(&both), None, None));
         assert!(e.contains("holds a private key"), "{e}");
         // The key file holds one key and nothing else.
-        for bad in [&both, &two_keys, &encrypted, &c] {
+        for bad in [&both, &two_keys, &c] {
             let e = err(Tls::load(None, Some(&c), Some(bad)));
             assert!(
                 e.contains("exactly one unencrypted private key"),
                 "{bad:?}: {e}"
             );
         }
+        let e = err(Tls::load(None, Some(&c), Some(&encrypted)));
+        assert!(e.contains("is an encrypted private key"), "{e}");
+
+        // A key rustls does not read, in any file: never accepted, never quoted.
+        for label in [
+            "ENCRYPTED PRIVATE KEY",
+            "OPENSSH PRIVATE KEY",
+            "DSA PRIVATE KEY",
+        ] {
+            let pem = format!("-----BEGIN {label}-----\nU0VDUkVUS0VZ\n-----END {label}-----\n");
+            let f = write(dir.path(), "odd.pem", &format!("{cert}{pem}"));
+            let e = err(Tls::load(Some(&f), None, None));
+            assert!(e.contains("holds a private key"), "{label}: {e}");
+            let e = err(Tls::load(None, Some(&f), Some(&k)));
+            assert!(e.contains("holds a private key"), "{label}: {e}");
+            let f = write(dir.path(), "odd.key", &pem);
+            let e = err(Tls::load(None, Some(&c), Some(&f)));
+            assert!(
+                e.contains("encrypted private key") || e.contains("kind of private key"),
+                "{label}: {e}"
+            );
+            assert!(!e.contains("U0VDUkVUS0VZ") && !e.contains(label), "{e}");
+        }
+
         // A key that is not the certificate's.
         let e = err(Tls::load(None, Some(&c), Some(&other)));
         assert!(

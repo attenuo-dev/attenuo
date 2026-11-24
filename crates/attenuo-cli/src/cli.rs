@@ -28,37 +28,22 @@ pub(crate) struct Cli {
 
     /// PEM file of the CA certificates to trust for the server's TLS certificate, for a server
     /// whose certificate comes from a private CA. When set, only these are trusted for
-    /// `--server` and `--admin-server`, not the public roots built into the CLI.
-    #[arg(
-        long,
-        global = true,
-        env = "ATTENUO_TLS_CA_CERT",
-        value_name = "PATH",
-        value_parser = path_or_empty()
-    )]
+    /// `--server`, `--admin-server` and `--jwks` URLs, not the public roots built into the
+    /// CLI. Without the flag, `ATTENUO_TLS_CA_CERT` is used (empty counts as unset).
+    #[arg(long, global = true, value_name = "PATH")]
     pub tls_ca_cert: Option<std::path::PathBuf>,
 
-    /// PEM file of a TLS client certificate to present to `--server` (never to
-    /// `--admin-server`), for an agent pinned with `tls_client_cert_sha256`. Needs
-    /// `--tls-client-key`.
-    #[arg(
-        long,
-        global = true,
-        env = "ATTENUO_TLS_CLIENT_CERT",
-        value_name = "PATH",
-        value_parser = path_or_empty()
-    )]
+    /// PEM file of a TLS client certificate to present to the origin of an `https://`
+    /// `--server` (never to an `--admin-server` on another origin), for an agent pinned with
+    /// `tls_client_cert_sha256`. Needs `--tls-client-key`. Without the flag, `ATTENUO_TLS_CLIENT_CERT` is used (empty counts
+    /// as unset).
+    #[arg(long, global = true, value_name = "PATH")]
     pub tls_client_cert: Option<std::path::PathBuf>,
 
     /// PEM file of the private key of `--tls-client-cert` (unencrypted). Needs
-    /// `--tls-client-cert`.
-    #[arg(
-        long,
-        global = true,
-        env = "ATTENUO_TLS_CLIENT_KEY",
-        value_name = "PATH",
-        value_parser = path_or_empty()
-    )]
+    /// `--tls-client-cert`. Without the flag, `ATTENUO_TLS_CLIENT_KEY` is used (empty counts
+    /// as unset).
+    #[arg(long, global = true, value_name = "PATH")]
     pub tls_client_key: Option<std::path::PathBuf>,
 
     /// Bearer token for `/admin/*` (token root, lease, audit, policy). Without this flag,
@@ -88,13 +73,6 @@ pub(crate) struct Cli {
 
     #[command(subcommand)]
     pub command: Command,
-}
-
-/// A path that may be empty, so that an empty environment variable (a compose file's
-/// `${VAR:-}`) reaches the code that treats it as unset instead of failing to parse.
-fn path_or_empty() -> impl clap::builder::TypedValueParser<Value = std::path::PathBuf> {
-    use clap::builder::TypedValueParser;
-    clap::builder::OsStringValueParser::new().map(std::path::PathBuf::from)
 }
 
 /// Warning printed when a subcommand is given its deprecated `--server` (audit K-13).

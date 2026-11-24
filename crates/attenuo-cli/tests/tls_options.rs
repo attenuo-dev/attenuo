@@ -183,7 +183,17 @@ async fn health_needs_the_ca_of_a_private_ca_server() {
     let err = failed(&run(c).await);
     assert!(err.to_lowercase().contains("certificate"), "{err}");
 
-    // Another CA: refused the same way.
+    // An empty value on the command line is a usage error, not "unset".
+    for flag in ["--tls-ca-cert", "--tls-client-cert", "--tls-client-key"] {
+        let out = run(s.cli(&[flag, "", "health"])).await;
+        assert_eq!(out.status.code(), Some(1), "{flag}: {out:?}");
+        assert!(text(&out.stderr).contains("a value is required"), "{out:?}");
+    }
+
+    // Another CA: refused the same way. With --tls-ca-cert, only its certificates are
+    // trusted; that the built-in public roots are then off is not shown by a request here
+    // (it would need a server with a public certificate, so the network): the code turns
+    // them off in `Tls::apply` (`tls_built_in_root_certs(false)`).
     let other = Ca::new("another CA").write(s.dir.path(), "other-ca.pem");
     let err = failed(&run(s.cli(&["--tls-ca-cert", other.to_str().unwrap(), "health"])).await);
     assert!(err.to_lowercase().contains("certificate"), "{err}");
@@ -280,6 +290,7 @@ async fn bad_options_are_refused_before_any_request() {
     let (_, other_key) = write_client(dir.path(), &ClientCert::new("other"), "other");
     let empty = dir.path().join("empty.pem");
     std::fs::write(&empty, "").unwrap();
+    let ca = Ca::new("unused CA").write(dir.path(), "ca.pem");
     let garbage = dir.path().join("garbage.key");
     std::fs::write(
         &garbage,
@@ -339,16 +350,53 @@ async fn bad_options_are_refused_before_any_request() {
         ),
         (vec!["--tls-ca-cert".into(), p(&empty)], "is empty"),
         (vec!["--tls-ca-cert".into(), p(&key)], "holds a private key"),
+        (
+            vec!["--tls-ca-cert".into(), p(dir.path())],
+            "is not a regular file",
+        ),
     ];
+    // `policy show` with an admin token: it would send a request if nothing stopped it.
     for (args, want) in cases {
         for cmd in [vec!["health"], vec!["policy", "show"]] {
             let mut c = attenuo();
-            c.args(["--server", &url]).args(&args).args(&cmd);
+            c.env("ATTENUO_ADMIN_TOKEN", ADMIN)
+                .args(["--server", &url])
+                .args(&args)
+                .args(&cmd);
             let err = failed(&run(c).await);
             assert!(err.contains(want), "{args:?}: {err}");
             assert!(!err.contains("TOPSECRET"), "{err}");
         }
     }
+    // A FIFO that nobody writes to is refused at once instead of hanging the CLI.
+    #[cfg(unix)]
+    {
+        let fifo = dir.path().join("fifo.key");
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            &fifo,
+            rustix::fs::Mode::from_raw_mode(0o600),
+        )
+        .unwrap();
+        let mut c = attenuo();
+        c.args(["--server", &url, "--tls-client-cert"])
+            .arg(&cert)
+            .arg("--tls-client-key")
+            .arg(&fifo)
+            .arg("health");
+        let err = failed(&run(c).await);
+        assert!(err.contains("is not a regular file"), "{err}");
+    }
+    // A client certificate with an http:// --server: refused, naming the options.
+    let http = url.replacen("https://", "http://", 1);
+    let mut c = attenuo();
+    c.args(["--server", &http, "--tls-client-cert"])
+        .arg(&cert)
+        .arg("--tls-client-key")
+        .arg(&key)
+        .arg("health");
+    let err = failed(&run(c).await);
+    assert!(err.contains("need an https:// --server"), "{err}");
     // The cert-without-key rule holds for the environment variables too.
     let mut c = attenuo();
     c.args(["--server", &url, "health"])
@@ -361,6 +409,17 @@ async fn bad_options_are_refused_before_any_request() {
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
         other => panic!("a connection was made: {other:?}"),
     }
+
+    // --tls-ca-cert alone with only http:// URLs: a warning, and the command runs.
+    let mut c = attenuo();
+    c.args(["--server", &http, "--tls-ca-cert"])
+        .arg(&ca)
+        .args(["health", "--timeout", "1"]);
+    let out = run(c).await;
+    assert!(
+        text(&out.stderr).starts_with("warning: --tls-ca-cert"),
+        "{out:?}"
+    );
 }
 
 /// What the recording server saw: the path of each request and the SHA-256 of the client
@@ -509,9 +568,10 @@ async fn recording_server(ca: &Ca) -> (String, Seen, tokio::task::JoinHandle<()>
     (url, seen, task)
 }
 
-/// The client certificate goes to --server only: an `/admin/*` request sent to
-/// --admin-server carries none, while the CA applies to both. Without --admin-server, the
-/// admin request goes to --server, with the certificate.
+/// The client certificate goes to the origin of --server only: an `/admin/*` request sent
+/// to --admin-server carries none, also when the base URLs have a path prefix, while the CA
+/// applies to both. Without --admin-server, the admin request goes to --server, with the
+/// certificate. A `--jwks` URL on another origin gets the CA and no certificate.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_client_certificate_goes_to_server_and_not_to_admin_server() {
     let dir = tempfile::tempdir().unwrap();
@@ -520,6 +580,7 @@ async fn the_client_certificate_goes_to_server_and_not_to_admin_server() {
     let ca_path = ca_path.to_str().unwrap();
     let client = ClientCert::new("coder");
     let (cert, key) = write_client(dir.path(), &client, "coder");
+    // Both servers have a certificate from the CA, and ask every client for a certificate.
     let (main, main_seen, main_task) = recording_server(&ca).await;
     let (admin, admin_seen, admin_task) = recording_server(&ca).await;
     let flags = [
@@ -530,34 +591,56 @@ async fn the_client_certificate_goes_to_server_and_not_to_admin_server() {
         "--tls-client-key",
         key.to_str().unwrap(),
     ];
+    let with_cert = Some(client.sha256_hex());
+    let take = |seen: &Seen| std::mem::take(&mut *seen.lock().unwrap());
+    let policy_show = |server: String, admin: Option<String>| {
+        let mut c = attenuo();
+        c.env("ATTENUO_ADMIN_TOKEN", ADMIN)
+            .args(["--server", &server]);
+        if let Some(a) = admin {
+            c.args(["--admin-server", &a]);
+        }
+        c.args(flags).args(["--json", "policy", "show"]);
+        c
+    };
 
-    let mut c = attenuo();
-    c.env("ATTENUO_ADMIN_TOKEN", ADMIN)
-        .args(["--server", &main, "--admin-server", &admin])
-        .args(flags)
-        .args(["--json", "policy", "show"]);
-    ok(&run(c).await);
-    assert_eq!(
-        admin_seen.lock().unwrap().clone(),
-        vec![("/admin/policies".to_owned(), None)]
-    );
-    assert!(main_seen.lock().unwrap().is_empty());
+    // --admin-server on another origin, with and without a path prefix on either URL.
+    for (server, adm, path) in [
+        (main.clone(), admin.clone(), "/admin/policies"),
+        (
+            format!("{main}/pfx"),
+            format!("{admin}/pfx"),
+            "/pfx/admin/policies",
+        ),
+        (main.clone(), format!("{admin}/pfx"), "/pfx/admin/policies"),
+        (format!("{main}/pfx"), admin.clone(), "/admin/policies"),
+    ] {
+        ok(&run(policy_show(server.clone(), Some(adm.clone()))).await);
+        assert_eq!(
+            take(&admin_seen),
+            vec![(path.to_owned(), None)],
+            "{server} {adm}"
+        );
+        assert!(take(&main_seen).is_empty(), "{server} {adm}");
+    }
 
-    // No --admin-server: `/admin/*` goes to --server, the same host, with the certificate.
-    let mut c = attenuo();
-    c.env("ATTENUO_ADMIN_TOKEN", ADMIN)
-        .args(["--server", &main])
-        .args(flags)
-        .args(["--json", "policy", "show"]);
-    ok(&run(c).await);
-    assert_eq!(
-        main_seen.lock().unwrap().clone(),
-        vec![("/admin/policies".to_owned(), Some(client.sha256_hex()))]
-    );
+    // No --admin-server: `/admin/*` goes to --server, the same host, with the certificate;
+    // a prefixed --server too.
+    for (server, path) in [
+        (main.clone(), "/admin/policies"),
+        (format!("{main}/pfx"), "/pfx/admin/policies"),
+    ] {
+        ok(&run(policy_show(server.clone(), None)).await);
+        assert_eq!(
+            take(&main_seen),
+            vec![(path.to_owned(), with_cert.clone())],
+            "{server}"
+        );
+    }
 
-    // `approval verify --jwks URL`: on the --server origin, the --server client (the CA and
-    // the certificate); on another host, the built-in roots (which do not have this CA) and no
-    // certificate, so the handshake fails and nothing is recorded.
+    // `approval verify --jwks URL`: on the --server origin, the certificate goes; on another
+    // origin, whose certificate the CA trusts and which asks for a client certificate, the
+    // handshake succeeds and no certificate is presented.
     let approval = "eyJhbGciOiJFZERTQSJ9.e30.AA";
     let verify = |jwks: String| {
         let mut c = attenuo();
@@ -569,14 +652,17 @@ async fn the_client_certificate_goes_to_server_and_not_to_admin_server() {
     let out = run(verify(format!("{main}/jwks"))).await;
     assert_ne!(out.status.code(), Some(0), "{out:?}");
     assert_eq!(
-        main_seen.lock().unwrap().last().cloned(),
-        Some(("/jwks".to_owned(), Some(client.sha256_hex()))),
+        take(&main_seen),
+        vec![("/jwks".to_owned(), with_cert.clone())],
         "{out:?}"
     );
-    let err = failed(&run(verify(format!("{admin}/jwks"))).await);
-    assert!(err.contains("fetching the JWKS"), "{err}");
-    assert!(err.to_lowercase().contains("certificate"), "{err}");
-    assert_eq!(admin_seen.lock().unwrap().len(), 1);
+    let out = run(verify(format!("{admin}/jwks"))).await;
+    assert_ne!(out.status.code(), Some(0), "{out:?}");
+    assert_eq!(
+        take(&admin_seen),
+        vec![("/jwks".to_owned(), None)],
+        "{out:?}"
+    );
 
     main_task.abort();
     admin_task.abort();
