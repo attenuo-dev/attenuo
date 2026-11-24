@@ -140,11 +140,12 @@ The server reads both files once, at start. A renewed certificate needs a restar
 
 #### Client certificates
 
-With `client_certificates = "optional"` in `[server.tls]`, agents and PEPs can authenticate with a self-signed TLS client certificate instead of a secret or a key (RFC 8705 `self_signed_tls_client_auth`). [Identity providers](identity-providers.md#tls-client-certificates) shows how to make one and configure it.
+With `client_certificates = "optional"` in `[server.tls]`, agents and PEPs can authenticate with a TLS client certificate instead of a secret or a key: a self-signed one pinned by its thumbprint (RFC 8705 `self_signed_tls_client_auth`), or one a CA issued, such as a SPIFFE X.509-SVID (`tls_client_auth`). [Identity providers](identity-providers.md#tls-client-certificates) shows how to set up both.
 
 - "Optional" means the server asks every client for a certificate and never requires one. A client without a certificate connects as before.
 - The handshake only proves that the client holds the certificate's private key. It does not check a chain, an issuer or the dates. Each request then decides, against the lists in force, whether the certificate authenticates the client its `client_id` (or `pep_id`) names. So `attenuo admin agent reload` also applies to connections that are already open.
-- The default is `"off"`: the server asks for nothing. A `tls_client_cert_sha256` on an entry refuses to start unless the listener asks for certificates.
+- The default is `"off"`: the server asks for nothing. A `tls_client_cert_sha256` or `tls_client_ca_pem_path` on an entry refuses to start unless the listener asks for certificates.
+- With a CA, attenuo reads the CA file at start and at every `attenuo admin agent reload`. When SPIRE (or your CA) rotates its CA certificates, write the new bundle to the file and reload.
 - **A proxy that ends TLS hides the certificate.** attenuo never reads `Client-Cert`, `X-Forwarded-Client-Cert` or any other header for it. Clients must reach attenuo's own TLS listener: directly, or through a load balancer or ingress that passes TCP through (layer 4, TLS pass-through).
 - There is no CRL or OCSP check, and tokens are not bound to the certificate.
 - A certificate on the connection makes a `client_id` (or `pep_id`) a client credential. So under `[token] actor_auth = "actor_token"`, a request that sends `client_id` over a connection with any certificate is refused with `client_auth_not_accepted`. Under `"either"`, a request that sends an actor token and `client_id` is refused with `client_authentication_failed` when the certificate is not pinned for that id. A client that uses an actor token should leave `client_id` out, or not present a certificate.

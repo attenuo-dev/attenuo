@@ -4,7 +4,7 @@
 //! exchange) and for PEPs at the AuthZEN endpoints (an unsigned body chain with
 //! `[authzen] allow_unsigned_chain`, or diagnostics).
 //!
-//! A client authenticates in exactly one of three ways per request (RFC 6749 §2.3):
+//! A client authenticates in exactly one of four ways per request (RFC 6749 §2.3):
 //!
 //! - **Client secret.** HTTP Basic (RFC 6749 §2.3.1: id and secret form-encoded, then base64)
 //!   or two body fields, never both. Secrets are stored as the lowercase hex SHA-256 of the
@@ -27,9 +27,16 @@
 //!   when it names extended key usages). A certificate comes only from the connection, never
 //!   from a header. With a secret or an assertion in the request, that credential decides and
 //!   the certificate is ignored.
+//! - **`tls_client_auth`** (RFC 8705 §2.1). The same request shape, but the certificate is
+//!   issued by a CA: it must chain, through the intermediates the client sent, to a CA of the
+//!   entry's `tls_client_ca_pem_path`, be usable for client authentication at the request's
+//!   time, and carry the entry's `tls_client_auth_san_uri` or `tls_client_auth_san_dns`
+//!   ([`crate::client_pki`]). No revocation check.
 //!
-//! An entry may hold a secret, keys and certificates, in any mix; it can only be authenticated
-//! by what it holds. Sending a secret and an assertion together is `multiple_client_auth`.
+//! An entry may hold a secret, keys and certificate settings, in any mix, except that it
+//! checks certificates one way: `tls_client_cert_sha256` or `tls_client_ca_pem_path`, not
+//! both. It can only be authenticated by what it holds. Sending a secret and an assertion
+//! together is `multiple_client_auth`.
 //!
 //! # Keys from a URL (`jwks_url`)
 //!
@@ -52,6 +59,7 @@
 //! gets the same answer as an unknown client (`client_authentication_failed`, SR-110); the
 //! cause is logged at warn level (`client JWKS unavailable`) once per failed fetch.
 
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
@@ -68,6 +76,7 @@ use time::OffsetDateTime;
 pub(crate) use attenuo_token::client_assertion::CLIENT_ASSERTION_TYPE;
 
 use crate::client_cert::ClientCertificate;
+use crate::client_pki::Pki;
 use crate::config::{ActorAuth, AgentConfig, CLIENT_ASSERTION_ALGS};
 use crate::error::ApiError;
 use crate::idp::jwks::{FailurePolicy, JwksCache, JwksError};
@@ -124,15 +133,19 @@ pub(crate) enum ClientMethod {
     PrivateKeyJwt,
     /// A self-signed TLS client certificate pinned by its thumbprint (RFC 8705 §2.2).
     SelfSignedTls,
+    /// A TLS client certificate issued by a CA, matched by a name (RFC 8705 §2.1).
+    Tls,
 }
 
 impl ClientMethod {
-    /// `client_secret`, `private_key_jwt` or `self_signed_tls_client_auth`.
+    /// `client_secret`, `private_key_jwt`, `self_signed_tls_client_auth` or
+    /// `tls_client_auth`.
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             ClientMethod::Secret => "client_secret",
             ClientMethod::PrivateKeyJwt => "private_key_jwt",
             ClientMethod::SelfSignedTls => "self_signed_tls_client_auth",
+            ClientMethod::Tls => "tls_client_auth",
         }
     }
 
@@ -142,6 +155,7 @@ impl ClientMethod {
             ClientMethod::Secret => "actor_token+client_secret",
             ClientMethod::PrivateKeyJwt => "actor_token+private_key_jwt",
             ClientMethod::SelfSignedTls => "actor_token+self_signed_tls_client_auth",
+            ClientMethod::Tls => "actor_token+tls_client_auth",
         }
     }
 }
@@ -265,6 +279,9 @@ pub struct Client {
     ca_pem_sha256: Option<String>,
     /// The entry's `tls_client_cert_sha256`, decoded; empty when it has none.
     cert_sha256: Vec<[u8; 32]>,
+    /// The entry's `tls_client_auth` settings: its CA file, read when the list was built, and
+    /// the name its certificate must carry. Never together with `cert_sha256`.
+    pki: Option<Arc<Pki>>,
 }
 
 impl std::fmt::Debug for Client {
@@ -275,6 +292,7 @@ impl std::fmt::Debug for Client {
             .field("keys", &self.keys.len())
             .field("jwks_url", &self.remote.is_some())
             .field("certificates", &self.cert_sha256.len())
+            .field("pki", &self.pki)
             .finish()
     }
 }
@@ -290,9 +308,19 @@ impl Client {
         !self.keys.is_empty() || self.remote.is_some()
     }
 
-    /// Whether the entry accepts client certificates (`tls_client_cert_sha256`).
+    /// Whether the entry accepts client certificates (`tls_client_cert_sha256` or
+    /// `tls_client_ca_pem_path`).
     pub fn has_certificates(&self) -> bool {
-        !self.cert_sha256.is_empty()
+        !self.cert_sha256.is_empty() || self.pki.is_some()
+    }
+
+    /// The key that gives the entry its certificate settings, for a message.
+    fn certificate_key(&self) -> &'static str {
+        if self.pki.is_some() {
+            "tls_client_ca_pem_path"
+        } else {
+            "tls_client_cert_sha256"
+        }
     }
 }
 
@@ -410,6 +438,20 @@ pub struct Clients {
     policy: AssertionPolicy,
     /// [`DECOY_JWKS`], parsed.
     decoys: Vec<ClientKey>,
+    /// The `tls_client_auth` names of the list (URI as written, DNS in lowercase), each to the
+    /// index of its entry in `list`: a certificate that carries the name of another entry is
+    /// refused ([`Clients::authenticate_pki`]).
+    pki_names: HashMap<PkiNameKey, usize>,
+}
+
+/// A key of [`Clients::pki_names`]: (`true` for a DNS name, the name).
+type PkiNameKey = (bool, String);
+
+fn pki_name_key(name: &crate::client_pki::SanName) -> PkiNameKey {
+    (
+        matches!(name, crate::client_pki::SanName::Dns(_)),
+        name.value().to_owned(),
+    )
 }
 
 /// Most keys one entry's `jwks` may hold.
@@ -446,7 +488,7 @@ impl Clients {
     ///
     /// As [`Clients::from_config`].
     pub fn agents(entries: &[AgentConfig], policy: AssertionPolicy) -> anyhow::Result<Self> {
-        Self::from_config(ClientKind::Agent, entries, policy)
+        Self::from_config(ClientKind::Agent, entries, policy, &mut Vec::new())
     }
 
     /// Validate the `[[peps]]` entries.
@@ -455,23 +497,29 @@ impl Clients {
     ///
     /// As [`Clients::from_config`].
     pub fn peps(entries: &[AgentConfig], policy: AssertionPolicy) -> anyhow::Result<Self> {
-        Self::from_config(ClientKind::Pep, entries, policy)
+        Self::from_config(ClientKind::Pep, entries, policy, &mut Vec::new())
     }
 
     /// Validate a list at startup: ids non-empty and unique; at least one of
     /// `secret_sha256` (64 hex characters), keys, either `jwks` (see
     /// [`parse_client_jwks`]) or `jwks_url` (see [`remote_keys`]), not both, and
-    /// `tls_client_cert_sha256` (see [`client_cert_pins`]); no thumbprint on two entries.
+    /// certificate settings, either `tls_client_cert_sha256` (see [`client_cert_pins`]) or
+    /// `tls_client_ca_pem_path` with one name (see [`client_pki_settings`]), not both; no
+    /// thumbprint and no name on two entries. A CA file is read once per path: `ca_files`
+    /// holds the files already read, by path, and is shared by the agents and PEPs of one
+    /// start or reload, so both lists see the same bytes.
     pub(crate) fn from_config(
         kind: ClientKind,
         entries: &[AgentConfig],
         policy: AssertionPolicy,
+        ca_files: &mut crate::client_pki::CaFiles,
     ) -> anyhow::Result<Self> {
         let section = kind.section();
         let mut list: Vec<Client> = Vec::with_capacity(entries.len());
         // One HTTP client for every entry with `jwks_url` and no `ca_pem_path`, made only
         // when there is one.
         let mut shared_client: Option<reqwest::Client> = None;
+        let mut pki_names: HashMap<PkiNameKey, usize> = HashMap::new();
         for a in entries {
             if a.id.is_empty() {
                 anyhow::bail!("{section}: id must not be empty");
@@ -502,17 +550,33 @@ impl Clients {
                 None => (None, None),
             };
             let cert_sha256 = client_cert_pins(section, a)?;
+            let pki = client_pki_settings(section, a, ca_files)?.map(Arc::new);
             if secret_sha256.is_none()
                 && keys.is_empty()
                 && remote.is_none()
                 && cert_sha256.is_empty()
+                && pki.is_none()
             {
                 anyhow::bail!(
                     "{section} `{}`: set secret_sha256, jwks or jwks_url (private_key_jwt), or \
-                     tls_client_cert_sha256 (a TLS client certificate); several may be set \
-                     together",
+                     tls_client_cert_sha256 or tls_client_ca_pem_path (a TLS client \
+                     certificate); several may be set together",
                     a.id
                 );
+            }
+            // One name, one client: a certificate from a shared CA would otherwise
+            // authenticate both entries.
+            if let Some(p) = &pki {
+                if let Some(&other) = pki_names.get(&pki_name_key(&p.name)) {
+                    anyhow::bail!(
+                        "{section} `{}`: its {} is also the name of `{}`; one certificate name \
+                         may authenticate only one client",
+                        a.id,
+                        p.name.key(),
+                        list[other].id
+                    );
+                }
+                pki_names.insert(pki_name_key(&p.name), list.len());
             }
             // One certificate, one client: the certificate alone would otherwise not say
             // which entry it stands for.
@@ -534,6 +598,7 @@ impl Clients {
                 remote,
                 ca_pem_sha256,
                 cert_sha256,
+                pki,
             });
         }
         let decoys = parse_client_jwks(DECOY_JWKS)
@@ -543,6 +608,7 @@ impl Clients {
             list,
             policy,
             decoys,
+            pki_names,
         })
     }
 
@@ -793,6 +859,11 @@ impl Clients {
     /// `detail`; the reason (`unknown_client`, `no_certificate_settings`,
     /// `thumbprint_mismatch`, `certificate_expired`, `certificate_not_yet_valid`,
     /// `certificate_not_usable`) goes to the debug log only (SR-110).
+    ///
+    /// An entry with `tls_client_ca_pem_path` is checked by
+    /// [`authenticate_pki`](Self::authenticate_pki) instead. That check takes longer than a
+    /// refusal here, so timing can tell an id with CA settings from other ids; ids are not
+    /// secret, and the answer is the same.
     fn authenticate_certificate(
         &self,
         id: &str,
@@ -805,8 +876,11 @@ impl Clients {
                 format!("no {} are configured", self.kind.section()),
             ));
         }
-        let usable = cert.check_usable(now);
         let known = self.find(id);
+        if let Some((c, pki)) = known.and_then(|c| c.pki.as_ref().map(|p| (c, p))) {
+            return self.authenticate_pki(c, pki, cert, now);
+        }
+        let usable = cert.check_usable(now);
         let pins = known.map_or(&[][..], |c| c.cert_sha256.as_slice());
         let mut matched = false;
         for i in 0..MAX_CLIENT_CERTS {
@@ -818,7 +892,7 @@ impl Clients {
         }
         let refused = match (known, usable) {
             (None, _) => Some("unknown_client"),
-            (Some(c), _) if !c.has_certificates() => Some("no_certificate_settings"),
+            (Some(c), _) if c.cert_sha256.is_empty() => Some("no_certificate_settings"),
             (Some(_), _) if !matched => Some("thumbprint_mismatch"),
             (Some(_), Err(why)) => Some(why.reason()),
             (Some(_), Ok(())) => None,
@@ -836,6 +910,65 @@ impl Clients {
                     client = ?id,
                     list = self.kind.section(),
                     x5t_s256 = %cert.x5t_s256(),
+                    "TLS client certificate refused"
+                );
+                Err(invalid_client("client_authentication_failed", CERT_REFUSED))
+            }
+        }
+    }
+
+    /// Authenticate entry `c` by the TLS client certificate `cert` issued by one of its CAs
+    /// (RFC 8705 §2.1, [`crate::client_pki::verify`]). A refusal is the answer of every other
+    /// refused certificate; the reason (`too_many_intermediates`, `certificate_not_usable`,
+    /// `certificate_expired`, `certificate_not_yet_valid`, `chain_invalid`, `uri_san_count`,
+    /// `san_mismatch`, `certificate_names_several_clients`) and the certificate's names,
+    /// escaped, go to the debug log only (SR-110, SR-18).
+    ///
+    /// A certificate whose path and name are good is still refused when it also carries the
+    /// `tls_client_auth_san_uri` or `tls_client_auth_san_dns` of another entry of this list:
+    /// one certificate never authenticates two clients of a list. (An agent and a PEP may
+    /// share a name: they are told apart by the endpoint.) The work is one lookup per name of
+    /// the certificate.
+    fn authenticate_pki(
+        &self,
+        c: &Client,
+        pki: &Pki,
+        cert: &ClientCertificate,
+        now: OffsetDateTime,
+    ) -> Result<Authenticated, ApiError> {
+        let outcome = crate::client_pki::verify(pki, cert, now).and_then(|()| {
+            let names = crate::client_pki::names(cert);
+            let keys = names
+                .uris
+                .iter()
+                .map(|n| (false, n))
+                .chain(names.dns.iter().map(|n| (true, n)));
+            for (dns, name) in keys {
+                if let Some(&i) = self.pki_names.get(&(dns, name.clone())) {
+                    if self.list[i].id != c.id {
+                        return Err(crate::client_pki::Refused {
+                            reason: "certificate_names_several_clients",
+                            names: vec![format!("{} is the name of {:?}", name, self.list[i].id)],
+                        });
+                    }
+                }
+            }
+            Ok(())
+        });
+        match outcome {
+            Ok(()) => Ok(Authenticated {
+                id: c.id.clone(),
+                method: ClientMethod::Tls,
+                replay: None,
+                client_cert: Some(cert.clone()),
+            }),
+            Err(why) => {
+                tracing::debug!(
+                    reason = why.reason,
+                    client = ?c.id,
+                    list = self.kind.section(),
+                    x5t_s256 = %cert.x5t_s256(),
+                    names = ?why.names,
                     "TLS client certificate refused"
                 );
                 Err(invalid_client("client_authentication_failed", CERT_REFUSED))
@@ -1011,6 +1144,83 @@ fn client_cert_pins(section: &str, a: &AgentConfig) -> anyhow::Result<Vec<[u8; 3
     Ok(out)
 }
 
+/// The entry's `tls_client_auth` settings: `None` when it has none of
+/// `tls_client_ca_pem_path`, `tls_client_auth_san_uri` and `tls_client_auth_san_dns`.
+/// Otherwise the CA file and exactly one name are required ([`crate::client_pki::san_uri`],
+/// [`crate::client_pki::san_dns`], [`crate::client_pki::read_ca_file`]), and
+/// `tls_client_cert_sha256` is refused next to them. `ca_files` holds the files already read
+/// for this start or reload, by path, so each is read once. A refusal names the entry, the key
+/// and the problem, never a name's value or the file's content.
+fn client_pki_settings(
+    section: &str,
+    a: &AgentConfig,
+    ca_files: &mut crate::client_pki::CaFiles,
+) -> anyhow::Result<Option<Pki>> {
+    let fail = |msg: String| anyhow::anyhow!("{section} `{}`: {msg}", a.id);
+    let name = match (&a.tls_client_auth_san_uri, &a.tls_client_auth_san_dns) {
+        (None, None) => None,
+        (Some(_), Some(_)) => {
+            return Err(fail(
+                "set tls_client_auth_san_uri or tls_client_auth_san_dns, not both: a client \
+                 certificate is matched by one name"
+                    .into(),
+            ))
+        }
+        (Some(uri), None) => Some(
+            crate::client_pki::san_uri(uri)
+                .map_err(|e| fail(format!("tls_client_auth_san_uri {e}")))?,
+        ),
+        (None, Some(dns)) => Some(
+            crate::client_pki::san_dns(dns)
+                .map_err(|e| fail(format!("tls_client_auth_san_dns {e}")))?,
+        ),
+    };
+    let (path, name) = match (&a.tls_client_ca_pem_path, name) {
+        (None, None) => return Ok(None),
+        (Some(_), None) => {
+            return Err(fail(
+                "tls_client_ca_pem_path needs tls_client_auth_san_uri or \
+                 tls_client_auth_san_dns: the name the client's certificate must carry"
+                    .into(),
+            ))
+        }
+        (None, Some(name)) => {
+            return Err(fail(format!(
+                "{} needs tls_client_ca_pem_path: the CA certificates that issue the client's \
+                 certificate",
+                name.key()
+            )))
+        }
+        (Some(path), Some(name)) => (path, name),
+    };
+    if a.tls_client_cert_sha256.is_some() {
+        return Err(fail(
+            "set tls_client_cert_sha256 (a self-signed certificate) or tls_client_ca_pem_path \
+             (certificates from a CA), not both: an entry checks client certificates one way"
+                .into(),
+        ));
+    }
+    let ca = match ca_files.iter().find(|(p, _)| p == path) {
+        Some((_, ca)) => ca.clone(),
+        None => {
+            let ca = crate::client_pki::read_ca_file(path).map_err(|e| {
+                fail(format!(
+                    "tls_client_ca_pem_path {:?}: {e}",
+                    path.display().to_string()
+                ))
+            })?;
+            let ca = Arc::new(ca);
+            ca_files.push((path.clone(), ca.clone()));
+            ca
+        }
+    };
+    Ok(Some(Pki {
+        ca_path: path.clone(),
+        ca,
+        name,
+    }))
+}
+
 /// The key cache of an entry with `jwks_url`, checked as the `[[idps]]` key URLs are: the
 /// URL is `https://` (plain `http://` only to a loopback host), `jwks_ttl_seconds` is
 /// positive, and `ca_pem_path` names a readable PEM file of CA certificates. `jwks_url` and
@@ -1107,8 +1317,9 @@ pub struct ClientChanges {
     /// Ids in the old list and not in the new one: their credentials stop working.
     pub removed: Vec<String>,
     /// Ids in both whose `secret_sha256`, `jwks`, `jwks_url`, `jwks_ttl_seconds`,
-    /// `ca_pem_path` or `tls_client_cert_sha256` (as a set) differs, or whose `ca_pem_path`
-    /// file holds other bytes.
+    /// `ca_pem_path`, `tls_client_cert_sha256` (as a set), `tls_client_ca_pem_path` or
+    /// certificate name differs, or whose `ca_pem_path` or `tls_client_ca_pem_path` file
+    /// holds other bytes.
     pub changed: Vec<String>,
 }
 
@@ -1138,7 +1349,8 @@ impl ClientSets {
 /// same value differently is not a change. The settings of a `jwks_url` are compared as
 /// [`remote_row`] gives them, so a new content of the `ca_pem_path` file is a change. The
 /// thumbprints of `tls_client_cert_sha256` are compared as a set ([`cert_row`]), so a new order
-/// is not a change.
+/// is not a change. The `tls_client_auth` settings are compared as [`pki_row`] gives them, so
+/// a new content of the `tls_client_ca_pem_path` file is a change.
 fn entry_changes(
     (old, old_built): (&[AgentConfig], &Clients),
     (new, new_built): (&[AgentConfig], &Clients),
@@ -1157,7 +1369,8 @@ fn entry_changes(
                 if digest(o) != digest(n)
                     || keys(o) != keys(n)
                     || remote_row(o, old_built) != remote_row(n, new_built)
-                    || cert_row(o) != cert_row(n) =>
+                    || cert_row(o) != cert_row(n)
+                    || pki_row(o, old_built) != pki_row(n, new_built) =>
             {
                 out.changed.push(n.id.clone());
             }
@@ -1194,7 +1407,7 @@ pub(crate) struct ClientRules {
     actor_trust: Vec<Option<Vec<String>>>,
     allow_unsigned_chain: bool,
     /// `[server.tls] client_certificates = "optional"`: the listener asks for client
-    /// certificates, so `tls_client_cert_sha256` can be used.
+    /// certificates, so `tls_client_cert_sha256` and `tls_client_ca_pem_path` can be used.
     client_certificates: bool,
 }
 
@@ -1241,7 +1454,8 @@ impl ClientRules {
     ///
     /// As [`crate::config::check_reserved_client_ids`] and [`Clients::from_config`], when
     /// `[authzen] allow_unsigned_chain = true` and `peps` is empty, and when an entry has
-    /// `tls_client_cert_sha256` while the listener asks for no client certificate (no
+    /// `tls_client_cert_sha256` or `tls_client_ca_pem_path` while the listener asks for no
+    /// client certificate (no
     /// `[server.tls]`, or `client_certificates` is not `"optional"`): such a setting could
     /// never be used. The message is the one startup fails with.
     pub(crate) fn check(
@@ -1250,17 +1464,26 @@ impl ClientRules {
         peps: &[AgentConfig],
     ) -> anyhow::Result<(ClientSets, Vec<String>)> {
         crate::config::check_reserved_client_ids(agents, peps)?;
-        let agent_list = Clients::agents(agents, self.policy.clone())?;
-        let pep_list = Clients::peps(peps, self.policy.clone())?;
+        // One read of each CA file for both lists.
+        let mut ca_files = Vec::new();
+        let agent_list = Clients::from_config(
+            ClientKind::Agent,
+            agents,
+            self.policy.clone(),
+            &mut ca_files,
+        )?;
+        let pep_list =
+            Clients::from_config(ClientKind::Pep, peps, self.policy.clone(), &mut ca_files)?;
         if !self.client_certificates {
             for list in [&agent_list, &pep_list] {
                 if let Some(c) = list.iter().find(|c| c.has_certificates()) {
                     anyhow::bail!(
-                        "{} `{}`: tls_client_cert_sha256 needs [server.tls] with \
-                         client_certificates = \"optional\"; without it the server asks for no \
-                         client certificate, so this entry's certificates could never be used",
+                        "{} `{}`: {} needs [server.tls] with client_certificates = \
+                         \"optional\"; without it the server asks for no client certificate, \
+                         so this entry's certificates could never be used",
                         list.kind.section(),
-                        c.id
+                        c.id,
+                        c.certificate_key()
                     );
                 }
             }
@@ -1288,9 +1511,9 @@ impl ClientRules {
             && agent_list.iter().any(Client::has_certificates)
         {
             warnings.push(
-                "[[agents]] entries have tls_client_cert_sha256 but [token] actor_auth = \
-                 \"actor_token\": TLS client certificates, like client secrets, are refused at \
-                 POST /token"
+                "[[agents]] entries have tls_client_cert_sha256 or tls_client_ca_pem_path but \
+                 [token] actor_auth = \"actor_token\": TLS client certificates, like client \
+                 secrets, are refused at POST /token"
                     .into(),
             );
         }
@@ -1370,7 +1593,9 @@ impl ClientRules {
 /// ca_pem_sha256]`; an entry without one keeps three, so a list without `jwks_url` has the
 /// digest it had before the setting existed. An entry with `tls_client_cert_sha256` has one
 /// more member after those, [`cert_row`]: `{"tls_client_cert_sha256": [sorted thumbprints]}`;
-/// an entry without it has none, so a list without certificates keeps its digest too. The keys
+/// an entry without it has none, so a list without certificates keeps its digest too. An
+/// entry with `tls_client_ca_pem_path` has one more member instead, [`pki_row`]; an entry
+/// without it has none, so lists without it keep their digest as well. The keys
 /// at a URL are not in it: they change without a reload. `built` is the list as built from `entries`, which holds the digest of
 /// each `ca_pem_path` file as it was read. Recorded in the reload's audit record, so that a
 /// config file can be shown to hold the lists that were put in force; no secret or key
@@ -1398,6 +1623,7 @@ pub(crate) fn list_sha256(entries: &[AgentConfig], built: &Clients) -> String {
             ];
             row.extend(remote_row(a, built).into_iter().flatten());
             row.extend(cert_row(a));
+            row.extend(pki_row(a, built));
             Value::Array(row)
         })
         .collect();
@@ -1433,6 +1659,29 @@ fn cert_row(a: &AgentConfig) -> Option<Value> {
     let mut pins = a.tls_client_cert_sha256.clone()?;
     pins.sort();
     Some(serde_json::json!({ "tls_client_cert_sha256": pins }))
+}
+
+/// The `tls_client_auth` settings of an entry, `None` without them: the object
+/// `{"tls_client_ca_pem_path": <path as written>, "tls_client_ca_pem_sha256": <the lowercase
+/// hex SHA-256 of the file's bytes as built read them>, <name key>: <name>}`, where the name
+/// key is `tls_client_auth_san_uri` (the URI as written) or `tls_client_auth_san_dns` (the
+/// name in lowercase).
+fn pki_row(a: &AgentConfig, built: &Clients) -> Option<Value> {
+    let pki = built.find(&a.id)?.pki.as_ref()?;
+    let mut row = Map::new();
+    row.insert(
+        "tls_client_ca_pem_path".into(),
+        Value::from(pki.ca_path.display().to_string()),
+    );
+    row.insert(
+        "tls_client_ca_pem_sha256".into(),
+        Value::from(pki.ca.sha256().to_owned()),
+    );
+    row.insert(
+        pki.name.key().into(),
+        Value::from(pki.name.value().to_owned()),
+    );
+    Some(Value::Object(row))
 }
 
 /// The RFC 7638 SHA-256 thumbprint (base64url) of a public JWK: the required members of its
@@ -2367,6 +2616,9 @@ mod tests {
             jwks_ttl_seconds: None,
             ca_pem_path: None,
             tls_client_cert_sha256: None,
+            tls_client_ca_pem_path: None,
+            tls_client_auth_san_uri: None,
+            tls_client_auth_san_dns: None,
         };
         let e = Clients::agents(&[neither], policy())
             .unwrap_err()
@@ -2765,6 +3017,610 @@ mod tests {
         );
     }
 
+    // --- TLS client certificates from a CA (RFC 8705 tls_client_auth) ---------------------
+
+    const CODER_ID: &str = "spiffe://example.org/ns/agents/sa/coder";
+    const REVIEWER_ID: &str = "spiffe://example.org/ns/agents/sa/reviewer";
+
+    /// A CA for the `tls_client_auth` tests, its certificate written to a file.
+    struct TestCa {
+        params: rcgen::CertificateParams,
+        key: rcgen::KeyPair,
+        pem: String,
+    }
+
+    impl TestCa {
+        fn new(name: &str) -> Self {
+            let key = rcgen::KeyPair::generate().unwrap();
+            let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+            params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            params
+                .distinguished_name
+                .push(rcgen::DnType::CommonName, name);
+            let pem = params.self_signed(&key).unwrap().pem();
+            Self { params, key, pem }
+        }
+
+        fn write(&self, dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+            let path = dir.join(name);
+            std::fs::write(&path, &self.pem).unwrap();
+            path
+        }
+
+        /// A client certificate with these names, valid around [`now`].
+        fn client(&self, names: Vec<rcgen::SanType>) -> ClientCertificate {
+            let key = rcgen::KeyPair::generate().unwrap();
+            let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+            params.subject_alt_names = names;
+            params.not_before = now() - time::Duration::days(1);
+            params.not_after = now() + time::Duration::days(1);
+            params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+            let issuer = rcgen::Issuer::from_params(&self.params, &self.key);
+            ClientCertificate::new(params.signed_by(&key, &issuer).unwrap().der().clone())
+        }
+    }
+
+    fn uri(s: &str) -> rcgen::SanType {
+        rcgen::SanType::URI(s.try_into().unwrap())
+    }
+
+    fn dns(s: &str) -> rcgen::SanType {
+        rcgen::SanType::DnsName(s.try_into().unwrap())
+    }
+
+    #[test]
+    fn tls_client_auth_settings_are_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = TestCa::new("agents CA").write(dir.path(), "ca.pem");
+        let refused = |a: AgentConfig| Clients::agents(&[a], policy()).unwrap_err().to_string();
+        let entry = AgentConfig::with_tls_client_auth_san_uri("coder", &ca, CODER_ID);
+        let c = Clients::agents(std::slice::from_ref(&entry), policy()).unwrap();
+        let built = c.iter().next().unwrap();
+        assert!(built.has_certificates() && !built.has_secret() && !built.has_keys());
+        assert_eq!(built.certificate_key(), "tls_client_ca_pem_path");
+        let by_dns = AgentConfig::with_tls_client_auth_san_dns("coder", &ca, "Coder.Agents");
+        Clients::peps(std::slice::from_ref(&by_dns), policy()).unwrap();
+
+        // A CA file without a name, a name without a CA file, two names.
+        let e = refused(AgentConfig {
+            tls_client_auth_san_uri: None,
+            ..entry.clone()
+        });
+        assert!(
+            e.starts_with(
+                "[[agents]] `coder`: tls_client_ca_pem_path needs tls_client_auth_san_uri or \
+                 tls_client_auth_san_dns"
+            ),
+            "{e}"
+        );
+        for name in [
+            AgentConfig {
+                tls_client_ca_pem_path: None,
+                ..entry.clone()
+            },
+            AgentConfig {
+                tls_client_ca_pem_path: None,
+                ..by_dns.clone()
+            },
+        ] {
+            let e = refused(name);
+            assert!(e.contains("needs tls_client_ca_pem_path"), "{e}");
+        }
+        let e = refused(AgentConfig {
+            tls_client_auth_san_dns: Some("coder.agents".into()),
+            ..entry.clone()
+        });
+        assert!(
+            e.contains("set tls_client_auth_san_uri or tls_client_auth_san_dns, not both"),
+            "{e}"
+        );
+        // Not with pins; with a secret, fine.
+        let e = refused(AgentConfig {
+            tls_client_cert_sha256: Some(vec!["ab".repeat(32)]),
+            ..entry.clone()
+        });
+        assert!(
+            e.contains(
+                "set tls_client_cert_sha256 (a self-signed certificate) or \
+                        tls_client_ca_pem_path (certificates from a CA), not both"
+            ),
+            "{e}"
+        );
+        Clients::agents(
+            &[AgentConfig {
+                secret_sha256: Some(sha("s")),
+                ..entry.clone()
+            }],
+            policy(),
+        )
+        .unwrap();
+        // Bad names: the message names the key, never the value.
+        for (uri_value, dns_value) in [
+            (Some("spiffe://Example.org/x"), None),
+            (Some("not a uri"), None),
+            (None, Some("*.agents.internal")),
+            (None, Some("10.0.0.1")),
+        ] {
+            let e = refused(AgentConfig {
+                tls_client_auth_san_uri: uri_value.map(Into::into),
+                tls_client_auth_san_dns: dns_value.map(Into::into),
+                ..entry.clone()
+            });
+            let (key, value) = match (uri_value, dns_value) {
+                (Some(v), _) => ("tls_client_auth_san_uri", v),
+                (_, Some(v)) => ("tls_client_auth_san_dns", v),
+                _ => unreachable!(),
+            };
+            assert!(e.starts_with(&format!("[[agents]] `coder`: {key} ")), "{e}");
+            assert!(!e.contains(value), "{e}");
+        }
+        // A file that is not a CA file.
+        let bad = dir.path().join("leaf.pem");
+        std::fs::write(
+            &bad,
+            "-----BEGIN PRIVATE KEY-----\nc2VjcmV0\n-----END PRIVATE KEY-----\n",
+        )
+        .unwrap();
+        let e = refused(AgentConfig::with_tls_client_auth_san_uri(
+            "coder", &bad, CODER_ID,
+        ));
+        assert!(
+            e.contains("tls_client_ca_pem_path") && e.contains("holds a private key"),
+            "{e}"
+        );
+        assert!(!e.contains("c2VjcmV0"), "{e}");
+        let e = refused(AgentConfig::with_tls_client_auth_san_uri(
+            "coder",
+            dir.path().join("missing.pem"),
+            CODER_ID,
+        ));
+        assert!(e.contains("cannot read the file"), "{e}");
+        // One name, one client: the same name on two entries of a list is refused (a DNS name
+        // without regard to case), on an agent and a PEP it is not.
+        let e = Clients::agents(
+            &[
+                entry.clone(),
+                AgentConfig::with_tls_client_auth_san_uri("other", &ca, CODER_ID),
+            ],
+            policy(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.starts_with(
+                "[[agents]] `other`: its tls_client_auth_san_uri is also the name of `coder`"
+            ),
+            "{e}"
+        );
+        let e = Clients::peps(
+            &[
+                by_dns.clone(),
+                AgentConfig::with_tls_client_auth_san_dns("gw", &ca, "coder.AGENTS"),
+            ],
+            policy(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.contains("tls_client_auth_san_dns is also the name of `coder`"),
+            "{e}"
+        );
+        Clients::agents(
+            &[
+                entry.clone(),
+                AgentConfig::with_tls_client_auth_san_uri("reviewer", &ca, REVIEWER_ID),
+                AgentConfig::with_tls_client_auth_san_dns("dns", &ca, "coder.agents"),
+            ],
+            policy(),
+        )
+        .unwrap();
+        // The TOML keys parse into the fields.
+        let cfg = crate::config::Config::from_toml(&format!(
+            "[[agents]]\nid = \"coder\"\ntls_client_ca_pem_path = \"{}\"\n\
+             tls_client_auth_san_uri = \"{CODER_ID}\"\n\n\
+             [[peps]]\nid = \"gw\"\ntls_client_ca_pem_path = \"ca.pem\"\n\
+             tls_client_auth_san_dns = \"gw.peps\"\n",
+            ca.display()
+        ))
+        .unwrap();
+        assert_eq!(cfg.agents[0], entry);
+        assert_eq!(
+            cfg.peps[0].tls_client_auth_san_dns.as_deref(),
+            Some("gw.peps")
+        );
+    }
+
+    #[test]
+    fn a_certificate_from_the_ca_authenticates_its_client_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents_ca = TestCa::new("agents CA");
+        let ca = agents_ca.write(dir.path(), "ca.pem");
+        let other_ca = TestCa::new("other CA");
+        let (pinned_cert, pinned_hex) = client_cert();
+        let c = Clients::agents(
+            &[
+                AgentConfig::with_tls_client_auth_san_uri("coder", &ca, CODER_ID),
+                AgentConfig::with_tls_client_auth_san_uri("reviewer", &ca, REVIEWER_ID),
+                AgentConfig::with_tls_client_auth_san_dns("builder", &ca, "builder.agents"),
+                pinned("pinned", &[&pinned_hex]),
+                AgentConfig::with_secret_sha256("planner", sha("p")),
+            ],
+            policy(),
+        )
+        .unwrap();
+        let h = HeaderMap::new();
+        let coder = agents_ca.client(vec![uri(CODER_ID)]);
+        let auth = c
+            .authenticate(&h, Some("coder"), None, None, Some(&coder), now())
+            .unwrap();
+        assert_eq!((auth.id(), auth.method()), ("coder", ClientMethod::Tls));
+        assert_eq!(
+            auth.client_cert_audit(),
+            Some(json!({"x5t#S256": coder.x5t_s256(), "source": "tls"}))
+        );
+        assert!(auth.replay.is_none());
+        let builder = agents_ca.client(vec![dns("BUILDER.agents")]);
+        assert_eq!(
+            c.authenticate(&h, Some("builder"), None, None, Some(&builder), now())
+                .unwrap()
+                .method(),
+            ClientMethod::Tls
+        );
+        // Both methods in one list.
+        assert_eq!(
+            c.authenticate(&h, Some("pinned"), None, None, Some(&pinned_cert), now())
+                .unwrap()
+                .method(),
+            ClientMethod::SelfSignedTls
+        );
+
+        // Every refusal is the answer of any refused certificate.
+        let pin_refusal = c
+            .authenticate(&h, Some("pinned"), None, None, Some(&coder), now())
+            .unwrap_err();
+        let refusals = [
+            // Another agent's certificate from the same CA, both ways.
+            c.authenticate(&h, Some("reviewer"), None, None, Some(&coder), now()),
+            c.authenticate(
+                &h,
+                Some("coder"),
+                None,
+                None,
+                Some(&agents_ca.client(vec![uri(REVIEWER_ID)])),
+                now(),
+            ),
+            // The right name from another CA.
+            c.authenticate(
+                &h,
+                Some("coder"),
+                None,
+                None,
+                Some(&other_ca.client(vec![uri(CODER_ID)])),
+                now(),
+            ),
+            // Expired, and not yet valid.
+            c.authenticate(
+                &h,
+                Some("coder"),
+                None,
+                None,
+                Some(&coder),
+                now() + time::Duration::days(2),
+            ),
+            c.authenticate(
+                &h,
+                Some("coder"),
+                None,
+                None,
+                Some(&coder),
+                now() - time::Duration::days(2),
+            ),
+            // A wildcard name for an exact one.
+            c.authenticate(
+                &h,
+                Some("builder"),
+                None,
+                None,
+                Some(&agents_ca.client(vec![dns("*.agents")])),
+                now(),
+            ),
+            // A self-signed certificate pinned for another entry, sent for a CA entry.
+            c.authenticate(&h, Some("coder"), None, None, Some(&pinned_cert), now()),
+            // A CA-issued certificate for an entry with a secret only, or for nobody.
+            c.authenticate(&h, Some("planner"), None, None, Some(&coder), now()),
+            c.authenticate(&h, Some("nobody"), None, None, Some(&coder), now()),
+        ];
+        for r in refusals {
+            assert_eq!(r.unwrap_err(), pin_refusal);
+        }
+        assert_eq!(pin_refusal.code, "invalid_client");
+        assert_eq!(
+            pin_refusal.description,
+            Some("client_authentication_failed")
+        );
+        assert_eq!(pin_refusal.detail, CERT_REFUSED);
+    }
+
+    #[test]
+    fn a_body_credential_wins_over_a_certificate_from_the_ca() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents_ca = TestCa::new("agents CA");
+        let ca = agents_ca.write(dir.path(), "ca.pem");
+        let entry = AgentConfig {
+            secret_sha256: Some(sha("s3cret")),
+            ..AgentConfig::with_tls_client_auth_san_uri("coder", &ca, CODER_ID)
+        };
+        let c = Clients::agents(&[entry], policy()).unwrap();
+        let h = HeaderMap::new();
+        let cert = agents_ca.client(vec![uri(CODER_ID)]);
+        let a = c
+            .authenticate(&h, Some("coder"), Some("s3cret"), None, Some(&cert), now())
+            .unwrap();
+        assert_eq!(a.method(), ClientMethod::Secret);
+        assert_eq!(a.client_cert_audit(), None);
+        assert_eq!(
+            code(c.authenticate(&h, Some("coder"), Some("nope"), None, Some(&cert), now())),
+            "client_authentication_failed"
+        );
+        assert_eq!(
+            c.authenticate(&h, Some("coder"), None, None, Some(&cert), now())
+                .unwrap()
+                .method(),
+            ClientMethod::Tls
+        );
+    }
+
+    /// A certificate that carries the configured name of another entry of the same list is
+    /// refused for every entry, with the answer of any refused certificate. A name no entry
+    /// uses is fine, and an agent and a PEP may share a name.
+    #[test]
+    fn one_certificate_never_authenticates_two_clients_of_a_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents_ca = TestCa::new("agents CA");
+        let ca = agents_ca.write(dir.path(), "ca.pem");
+        let entries = [
+            AgentConfig::with_tls_client_auth_san_dns("builder", &ca, "builder.agents"),
+            AgentConfig::with_tls_client_auth_san_dns("tester", &ca, "tester.agents"),
+            AgentConfig::with_tls_client_auth_san_uri("coder", &ca, CODER_ID),
+            AgentConfig::with_tls_client_auth_san_uri("web", &ca, "https://agents.example/web"),
+            AgentConfig::with_secret_sha256("planner", sha("p")),
+        ];
+        let c = Clients::agents(&entries, policy()).unwrap();
+        let h = HeaderMap::new();
+        let auth = |id: &str, cert: &ClientCertificate| {
+            c.authenticate(&h, Some(id), None, None, Some(cert), now())
+        };
+        let refusal = auth("builder", &agents_ca.client(vec![dns("tester.agents")])).unwrap_err();
+        assert_eq!(refusal.description, Some("client_authentication_failed"));
+        assert_eq!(refusal.detail, CERT_REFUSED);
+        let refused = |id: &str, cert: &ClientCertificate| {
+            assert_eq!(auth(id, cert).unwrap_err(), refusal, "{id}");
+        };
+
+        // Two DNS names, each another agent's: refused for both.
+        let both = agents_ca.client(vec![dns("builder.agents"), dns("TESTER.agents")]);
+        refused("builder", &both);
+        refused("tester", &both);
+        // A SPIFFE ID and the DNS name of another entry.
+        let spiffe_and_dns = agents_ca.client(vec![uri(CODER_ID), dns("builder.agents")]);
+        refused("coder", &spiffe_and_dns);
+        refused("builder", &spiffe_and_dns);
+        // Two URI names, the second another entry's.
+        let two_uris = agents_ca.client(vec![uri("https://agents.example/web"), uri(CODER_ID)]);
+        refused("web", &two_uris);
+        // A wildcard name never stands for an entry, so it does not refuse either.
+        let wildcard = agents_ca.client(vec![dns("builder.agents"), dns("*.agents")]);
+        assert_eq!(auth("builder", &wildcard).unwrap().id(), "builder");
+        // Extra names that no entry uses are fine.
+        let extra = agents_ca.client(vec![
+            dns("builder.agents"),
+            dns("builder.internal"),
+            uri("https://agents.example/other"),
+        ]);
+        assert_eq!(auth("builder", &extra).unwrap().id(), "builder");
+        let extra = agents_ca.client(vec![uri(CODER_ID), dns("coder.internal")]);
+        assert_eq!(auth("coder", &extra).unwrap().id(), "coder");
+        // The same again on that connection (the cached answer) still checks the other names.
+        refused("builder", &both);
+        refused("builder", &both);
+
+        // The rule is per list: a PEP may carry an agent's name.
+        let peps = Clients::peps(
+            &[AgentConfig::with_tls_client_auth_san_dns(
+                "gateway",
+                &ca,
+                "gateway.peps",
+            )],
+            policy(),
+        )
+        .unwrap();
+        let shared = agents_ca.client(vec![dns("gateway.peps"), dns("builder.agents")]);
+        assert_eq!(
+            peps.authenticate(&h, Some("gateway"), None, None, Some(&shared), now())
+                .unwrap()
+                .id(),
+            "gateway"
+        );
+        let builder_peps = Clients::peps(
+            &[AgentConfig::with_tls_client_auth_san_dns(
+                "builder",
+                &ca,
+                "builder.agents",
+            )],
+            policy(),
+        )
+        .unwrap();
+        let builder = agents_ca.client(vec![dns("builder.agents")]);
+        assert_eq!(auth("builder", &builder).unwrap().id(), "builder");
+        assert_eq!(
+            builder_peps
+                .authenticate(&h, Some("builder"), None, None, Some(&builder), now())
+                .unwrap()
+                .id(),
+            "builder"
+        );
+    }
+
+    #[test]
+    fn tls_client_auth_method_strings() {
+        assert_eq!(ClientMethod::Tls.as_str(), "tls_client_auth");
+        assert_eq!(
+            ClientMethod::Tls.with_actor_token(),
+            "actor_token+tls_client_auth"
+        );
+    }
+
+    /// The digest of lists without `tls_client_auth` settings does not change (the fixed
+    /// value of the test above); an entry with them gets one more member, with the CA file's
+    /// digest; a new file content, a new name or a new path is a change, rewriting the same
+    /// DNS name in another case is not.
+    #[test]
+    fn the_list_digest_and_the_changes_cover_tls_client_auth() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = TestCa::new("first");
+        let ca = first.write(dir.path(), "ca.pem");
+        let built = |list: &[AgentConfig]| Clients::agents(list, policy()).unwrap();
+        let s = AgentConfig::with_secret_sha256("planner", sha("p"));
+        assert_eq!(
+            list_sha256(std::slice::from_ref(&s), &built(std::slice::from_ref(&s))),
+            "2344eebf03579c4299b82a1cbadce9f3e3c2dbc0fa2758e713d38b3353821746"
+        );
+        let coder = AgentConfig::with_tls_client_auth_san_uri("coder", &ca, CODER_ID);
+        let list = [s.clone(), coder.clone()];
+        let old = built(&list);
+        let digest = |rows: Value| hex::encode(Sha256::digest(rows.to_string().as_bytes()));
+        let file_sha = hex::encode(Sha256::digest(first.pem.as_bytes()));
+        assert_eq!(
+            list_sha256(&list, &old),
+            digest(json!([
+                ["coder", null, [], {
+                    "tls_client_ca_pem_path": ca.display().to_string(),
+                    "tls_client_ca_pem_sha256": file_sha,
+                    "tls_client_auth_san_uri": CODER_ID,
+                }],
+                ["planner", sha("p"), []]
+            ]))
+        );
+        let changed = |old: (&[AgentConfig], &Clients), new: (&[AgentConfig], &Clients)| {
+            entry_changes(old, new).changed
+        };
+        // The same file: no change.
+        let again = built(&list);
+        assert!(changed((&list, &old), (&list, &again)).is_empty());
+        assert_eq!(list_sha256(&list, &old), list_sha256(&list, &again));
+        // Another CA in the same file: a change, and another digest.
+        std::fs::write(&ca, TestCa::new("second").pem).unwrap();
+        let rotated = built(&list);
+        assert_eq!(changed((&list, &old), (&list, &rotated)), ["coder"]);
+        assert_ne!(list_sha256(&list, &old), list_sha256(&list, &rotated));
+        // Another name.
+        let renamed = [
+            s.clone(),
+            AgentConfig::with_tls_client_auth_san_uri("coder", &ca, REVIEWER_ID),
+        ];
+        assert_eq!(
+            changed((&list, &rotated), (&renamed, &built(&renamed))),
+            ["coder"]
+        );
+        // A DNS name in another case is the same name.
+        let lower = [AgentConfig::with_tls_client_auth_san_dns(
+            "coder",
+            &ca,
+            "coder.agents",
+        )];
+        let upper = [AgentConfig::with_tls_client_auth_san_dns(
+            "coder",
+            &ca,
+            "CODER.Agents",
+        )];
+        assert!(changed((&lower, &built(&lower)), (&upper, &built(&upper))).is_empty());
+        assert_eq!(
+            list_sha256(&lower, &built(&lower)),
+            list_sha256(&upper, &built(&upper))
+        );
+        // From a secret to CA settings, and back.
+        assert_eq!(
+            changed(
+                (std::slice::from_ref(&s), &built(std::slice::from_ref(&s))),
+                (
+                    &[AgentConfig::with_tls_client_auth_san_uri(
+                        "planner", &ca, CODER_ID
+                    )],
+                    &built(&[AgentConfig::with_tls_client_auth_san_uri(
+                        "planner", &ca, CODER_ID
+                    )])
+                )
+            ),
+            ["planner"]
+        );
+    }
+
+    /// `tls_client_ca_pem_path` needs a listener that asks for client certificates, at start
+    /// and at reload, like `tls_client_cert_sha256`; with actor_auth = "actor_token" it is a
+    /// warning.
+    #[test]
+    fn tls_client_auth_needs_a_listener_that_asks_for_certificates() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = TestCa::new("agents CA").write(dir.path(), "ca.pem");
+        let mut config = crate::config::Config::default();
+        let agent = [AgentConfig::with_tls_client_auth_san_uri(
+            "coder", &ca, CODER_ID,
+        )];
+        let pep = [AgentConfig::with_tls_client_auth_san_dns(
+            "gw", &ca, "gw.peps",
+        )];
+        let e = ClientRules::from_config(&config)
+            .check(&agent, &[])
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            e.starts_with(
+                "[[agents]] `coder`: tls_client_ca_pem_path needs [server.tls] with \
+                 client_certificates = \"optional\""
+            ),
+            "{e}"
+        );
+        let e = ClientRules::from_config(&config)
+            .check(&[], &pep)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            e.starts_with("[[peps]] `gw`: tls_client_ca_pem_path needs"),
+            "{e}"
+        );
+        config.server.public_url = Some("https://localhost:8443".into());
+        config.server.tls = Some(crate::config::ServerTlsSection {
+            cert_pem_path: "c".into(),
+            key_pem_path: "k".into(),
+            client_certificates: crate::config::ClientCertificates::Off,
+        });
+        assert!(ClientRules::from_config(&config)
+            .check(&agent, &pep)
+            .is_err());
+        config.server.tls.as_mut().unwrap().client_certificates =
+            crate::config::ClientCertificates::Optional;
+        let (sets, warnings) = ClientRules::from_config(&config)
+            .check(&agent, &pep)
+            .unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        // The agents and the PEPs of one start or reload read a shared CA file once: both
+        // lists hold the same file.
+        let ca_of = |c: &Clients| c.iter().next().unwrap().pki.as_ref().unwrap().ca.clone();
+        assert!(Arc::ptr_eq(&ca_of(&sets.agents), &ca_of(&sets.peps)));
+        config.token.actor_auth = ActorAuth::ActorToken;
+        let (_, warnings) = ClientRules::from_config(&config)
+            .check(&agent, &pep)
+            .unwrap();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("tls_client_ca_pem_path") && w.contains("actor_token")),
+            "{warnings:?}"
+        );
+    }
+
     // --- assertions ---------------------------------------------------------------------
 
     struct Signer {
@@ -2818,6 +3674,9 @@ mod tests {
                     jwks_ttl_seconds: None,
                     ca_pem_path: None,
                     tls_client_cert_sha256: None,
+                    tls_client_ca_pem_path: None,
+                    tls_client_auth_san_uri: None,
+                    tls_client_auth_san_dns: None,
                 },
             ],
             policy(),

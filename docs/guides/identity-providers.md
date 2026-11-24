@@ -235,6 +235,84 @@ Notes:
 
 The full rules are in the [config reference](../reference/config.md#tls-client-certificates).
 
+### TLS client certificates from a CA (SPIFFE)
+
+Instead of pinning each certificate, an entry can trust a CA and one name (RFC 8705 `tls_client_auth`). The CA issues and renews certificates, and attenuo's config does not change. This fits SPIFFE: SPIRE gives each workload an X.509-SVID whose only URI name is its SPIFFE ID.
+
+The listener rules above still apply: `client_certificates = "optional"`, and a direct connection or a TCP pass-through.
+
+**1. A CA and a client certificate.** With SPIRE, the workload already has its SVID, its key and the trust bundle. Without SPIRE, `openssl` can play the CA. These commands make a CA and a certificate for the agent `coder` with its SPIFFE ID:
+
+```sh
+# The CA. Keep agents-ca.key away from attenuo.
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+  -keyout agents-ca.key -out agents-ca.pem -days 365 -subj "/CN=agents CA" \
+  -addext "basicConstraints=critical,CA:TRUE" \
+  -addext "keyUsage=critical,keyCertSign,cRLSign"
+
+# A key and a request for the agent.
+openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+  -keyout coder.key -out coder.csr -subj "/CN=coder"
+chmod 600 coder.key
+
+# The CA signs it, with the SPIFFE ID as the only URI name.
+cat > coder.ext <<'END'
+basicConstraints = critical, CA:FALSE
+keyUsage = critical, digitalSignature
+extendedKeyUsage = clientAuth
+subjectAltName = URI:spiffe://example.org/ns/agents/sa/coder
+END
+openssl x509 -req -in coder.csr -CA agents-ca.pem -CAkey agents-ca.key \
+  -CAcreateserial -days 30 -extfile coder.ext -out coder.crt
+```
+
+For a DNS name, use `subjectAltName = DNS:coder.agents.internal` instead. If an intermediate CA signs the certificate, the client must send it too: put it after the client certificate in the file the client presents.
+
+**2. Configure.** Put only the CA certificate on the server, never its key:
+
+```toml
+[server.tls]
+cert_pem_path = "/etc/attenuo/tls/server.crt"
+key_pem_path = "/etc/attenuo/tls/server.key"
+client_certificates = "optional"
+
+[[agents]]
+id = "coder"
+tls_client_ca_pem_path = "/etc/attenuo/agents-ca.pem"
+tls_client_auth_san_uri = "spiffe://example.org/ns/agents/sa/coder"
+# or: tls_client_auth_san_dns = "coder.agents.internal"
+```
+
+Each agent gets its own entry with its own name. Many entries can name the same CA file. A certificate for `reviewer` from the same CA never authenticates as `coder`.
+
+**3. Call.** The client sends its certificate and `client_id`, with no secret. Here, an exchange:
+
+```sh
+curl --cert coder.crt --key coder.key --cacert server-ca.pem \
+  https://attenuo.example.com:8443/token \
+  -d grant_type=urn:ietf:params:oauth:grant-type:token-exchange \
+  -d subject_token="$PARENT_TOKEN" -d subject_token_type=urn:ietf:params:oauth:token-type:jwt \
+  -d actor=coder -d client_id=coder \
+  --data-urlencode 'authorization_details=[{"type":"attenuo_capabilities","capabilities":[{"server":"github","tool":"read_file"}]}]'
+```
+
+The audit record says `actor_auth` = `tls_client_auth`. The same call with a certificate for `spiffe://example.org/ns/agents/sa/reviewer` gets `401 client_authentication_failed`, and the server's debug log says `reason="san_mismatch"` with the name it found.
+
+**4. Rotate.** A new certificate from the same CA with the same name works at once, with no change. When the CA itself changes (SPIRE rotates its bundle), write the new CA certificates to the file, old and new together during the change, and run `attenuo admin agent reload`. The file may hold up to 16 CA certificates.
+
+Notes:
+
+- Only these names are matched: one URI (exactly, case-sensitive) or one DNS name (any case, never through a wildcard). The subject DN, its common name, IP addresses and e-mail addresses are not matched.
+- For a `spiffe://` name, the certificate must carry exactly one URI name, as an X.509-SVID does.
+- The dates of the certificate and its intermediates are checked on every request.
+- The client may send at most 4 intermediate CA certificates. If it needs cross-certificates, it sends the one its path uses first: only the first one with a given subject is used.
+- A certificate that also carries the name of another agent (or, for a PEP, another PEP) is refused. Extra names that no entry uses are fine. So adding an entry whose name is an extra SAN in another client's certificate (for example one of SPIRE's `dns_names`) makes that certificate be refused for both entries; the debug log says `certificate_names_several_clients`.
+- A key-rollover link certificate (the new root signed by the old one) that the client sends is ignored, because it is self-issued: put the new root in the CA file.
+- There is no CRL or OCSP check. To stop a certificate before it expires, remove the CA or change the name on the entry and reload. Short-lived certificates make this matter less.
+- A CA you list can make a certificate for any name. List a CA only on the entries it should vouch for.
+
+The full rules are in the [config reference](../reference/config.md#tls-client-certificates-from-a-ca).
+
 ## `[[root_grants]]`
 
 ```toml
