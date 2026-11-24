@@ -1,7 +1,8 @@
 //! A test certificate authority and an HTTPS key server whose certificate it issued, for the
 //! key URL tests with `ca_pem_path` (`key_url_ca.rs`, `client_jwks_uri.rs`), the server
 //! certificate files and TLS clients of the `[server.tls]` tests (`server_tls.rs`), and
-//! self-signed client certificates for the mTLS client authentication tests (`mtls.rs`).
+//! client certificates for the mTLS client authentication tests (`mtls.rs`): self-signed
+//! ones, and ones a CA or an intermediate CA issued.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -11,16 +12,31 @@ use std::sync::{Arc, Mutex};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-/// A certificate authority made for one test.
+/// A certificate authority made for one test: a root, or an intermediate CA another one
+/// issued.
 pub struct Ca {
     pub cert: rcgen::Certificate,
     params: rcgen::CertificateParams,
     key: rcgen::KeyPair,
+    /// What a client sends after a certificate this CA issued: nothing for a root, this
+    /// certificate and those above it (roots left out) for an intermediate.
+    above: Vec<rustls::pki_types::CertificateDer<'static>>,
 }
 
 impl Ca {
     pub fn new(name: &str) -> Self {
         let key = rcgen::KeyPair::generate().unwrap();
+        let params = Self::ca_params(name);
+        let cert = params.self_signed(&key).unwrap();
+        Self {
+            cert,
+            params,
+            key,
+            above: Vec::new(),
+        }
+    }
+
+    fn ca_params(name: &str) -> rcgen::CertificateParams {
         let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
         params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         params
@@ -30,8 +46,62 @@ impl Ca {
             rcgen::KeyUsagePurpose::KeyCertSign,
             rcgen::KeyUsagePurpose::CrlSign,
         ];
-        let cert = params.self_signed(&key).unwrap();
-        Self { cert, params, key }
+        params
+    }
+
+    /// An intermediate CA this CA issues.
+    pub fn intermediate(&self, name: &str) -> Self {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let params = Self::ca_params(name);
+        let cert = params
+            .signed_by(&key, &rcgen::Issuer::from_params(&self.params, &self.key))
+            .unwrap();
+        let mut above = vec![cert.der().clone()];
+        above.extend(self.above.iter().cloned());
+        Self {
+            cert,
+            params,
+            key,
+            above,
+        }
+    }
+
+    /// A client certificate this CA issues: valid from a day ago for 30 days, `CA:FALSE`,
+    /// extended key usage `clientAuth`, no names, then `edit`. It is sent with the
+    /// intermediates up to the root, as a client sends its chain.
+    pub fn client(&self, edit: impl FnOnce(&mut rcgen::CertificateParams)) -> ClientCert {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let now = time::OffsetDateTime::now_utc();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "client");
+        params.not_before = now - time::Duration::days(1);
+        params.not_after = now + time::Duration::days(30);
+        params.is_ca = rcgen::IsCa::ExplicitNoCa;
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+        edit(&mut params);
+        let cert = params
+            .signed_by(&key, &rcgen::Issuer::from_params(&self.params, &self.key))
+            .unwrap();
+        ClientCert {
+            der: cert.der().clone(),
+            cert_pem: cert.pem(),
+            key_pem: key.serialize_pem(),
+            key_der: key.serialize_der(),
+            chain: self.above.clone(),
+        }
+    }
+
+    /// The CA's own certificate and key, presented as a client certificate.
+    pub fn as_client(&self) -> ClientCert {
+        ClientCert {
+            der: self.cert.der().clone(),
+            cert_pem: self.cert.pem(),
+            key_pem: self.key.serialize_pem(),
+            key_der: self.key.serialize_der(),
+            chain: self.above.clone(),
+        }
     }
 
     /// Write the CA certificate as PEM into `dir`.
@@ -110,19 +180,6 @@ impl Ca {
     /// key into `dir` as PEM files, the key with mode 0600. Returns the two paths.
     pub fn write_server_files(&self, dir: &Path, names: &[&str]) -> (PathBuf, PathBuf) {
         let (cert, key) = self.leaf(names);
-        let pem = |label: &str, der: &[u8]| {
-            use base64::Engine as _;
-            let b64 = base64::engine::general_purpose::STANDARD.encode(der);
-            let lines: Vec<&str> = b64
-                .as_bytes()
-                .chunks(64)
-                .map(|c| std::str::from_utf8(c).unwrap())
-                .collect();
-            format!(
-                "-----BEGIN {label}-----\n{}\n-----END {label}-----\n",
-                lines.join("\n")
-            )
-        };
         let cert_path = dir.join("server.crt");
         let key_path = dir.join("server.key");
         std::fs::write(
@@ -140,14 +197,16 @@ impl Ca {
     }
 }
 
-/// A self-signed client certificate and its key, as an agent or a PEP makes one for RFC 8705
-/// `self_signed_tls_client_auth`.
+/// A client certificate and its key: self-signed, as an agent or a PEP makes one for RFC 8705
+/// `self_signed_tls_client_auth`, or issued by a [`Ca`] for `tls_client_auth`.
 #[derive(Clone)]
 pub struct ClientCert {
     pub der: rustls::pki_types::CertificateDer<'static>,
     pub cert_pem: String,
     pub key_pem: String,
     key_der: Vec<u8>,
+    /// The certificates the client sends after its own (intermediate CAs).
+    pub chain: Vec<rustls::pki_types::CertificateDer<'static>>,
 }
 
 impl std::fmt::Debug for ClientCert {
@@ -201,6 +260,15 @@ impl ClientCert {
             cert_pem: cert.pem(),
             key_pem: key.serialize_pem(),
             key_der: key.serialize_der(),
+            chain: Vec::new(),
+        }
+    }
+
+    /// The same certificate, sent with no intermediates.
+    pub fn without_chain(&self) -> Self {
+        Self {
+            chain: Vec::new(),
+            ..self.clone()
         }
     }
 
@@ -218,9 +286,10 @@ impl ClientCert {
             .encode(sha2::Sha256::digest(self.der.as_ref()))
     }
 
-    /// For a reqwest client.
+    /// For a reqwest client: the certificate, the intermediates, the key.
     pub fn identity(&self) -> reqwest::Identity {
-        reqwest::Identity::from_pem(format!("{}{}", self.cert_pem, self.key_pem).as_bytes())
+        let chain: String = self.chain.iter().map(|c| pem("CERTIFICATE", c)).collect();
+        reqwest::Identity::from_pem(format!("{}{chain}{}", self.cert_pem, self.key_pem).as_bytes())
             .unwrap()
     }
 
@@ -237,11 +306,27 @@ impl ClientCert {
     ) -> Arc<dyn rustls::client::ResolvesClientCert> {
         let key = rustls::pki_types::PrivateKeyDer::Pkcs8(other.key_der.clone().into());
         let signing = rustls::crypto::ring::sign::any_supported_type(&key).unwrap();
+        let mut certs = vec![self.der.clone()];
+        certs.extend(self.chain.iter().cloned());
         Arc::new(Fixed(Arc::new(rustls::sign::CertifiedKey::new(
-            vec![self.der.clone()],
-            signing,
+            certs, signing,
         ))))
     }
+}
+
+/// `der` as a PEM block with `label`.
+pub fn pem(label: &str, der: &[u8]) -> String {
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(der);
+    let lines: Vec<&str> = b64
+        .as_bytes()
+        .chunks(64)
+        .map(|c| std::str::from_utf8(c).unwrap())
+        .collect();
+    format!(
+        "-----BEGIN {label}-----\n{}\n-----END {label}-----\n",
+        lines.join("\n")
+    )
 }
 
 /// A client certificate resolver that always presents the same certificate and key, whether

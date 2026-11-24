@@ -508,7 +508,7 @@ async fn an_invalid_file_changes_nothing() {
         ),
         (
             ok.clone() + "[[agents]]\nid = \"empty\"\n" + &pep("gw1", "s"),
-            "[[agents]] `empty`: set secret_sha256, jwks or jwks_url (private_key_jwt), or tls_client_cert_sha256 (a TLS client certificate); several may be set together",
+            "[[agents]] `empty`: set secret_sha256, jwks or jwks_url (private_key_jwt), or tls_client_cert_sha256 or tls_client_ca_pem_path (a TLS client certificate); several may be set together",
         ),
         (
             ok.clone() + &agent("attenuo", "x") + &pep("gw1", "s"),

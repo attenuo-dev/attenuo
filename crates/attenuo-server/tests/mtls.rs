@@ -3,6 +3,9 @@
 //! over the native listener with `[server.tls] client_certificates = "optional"`. Real TLS
 //! handshakes through [`attenuo_server::run`], the code `serve` runs.
 //!
+//! RFC 8705 `tls_client_auth` (the `pki_` tests at the end): certificates a CA issued, with
+//! `tls_client_ca_pem_path` and a SPIFFE ID or a DNS name.
+//!
 //! Covers hop 0, an exchange and the AuthZEN endpoints; the refusals as one answer (SR-110);
 //! a certificate sent without its private key; a body credential next to a certificate; an
 //! entry with a secret only; `client_certificates = "off"`; forwarded-certificate headers,
@@ -184,6 +187,8 @@ struct Opts {
     actor_auth: &'static str,
     /// More sections, before the lists.
     extra: String,
+    /// The `[[agents]]` and `[[peps]]`, instead of the self-signed ones of [`Certs::lists`].
+    lists: Option<String>,
 }
 
 impl Default for Opts {
@@ -193,6 +198,7 @@ impl Default for Opts {
             client_certificates: "optional",
             actor_auth: "either",
             extra: String::new(),
+            lists: None,
         }
     }
 }
@@ -263,7 +269,9 @@ impl Harness {
         let server_files = ca.write_server_files(dir.path(), &["127.0.0.1"]);
         let issuers = Issuers::start().await;
         let certs = Certs::new();
-        let lists = if opts.tls && opts.client_certificates == "optional" {
+        let lists = if let Some(lists) = &opts.lists {
+            lists.clone()
+        } else if opts.tls && opts.client_certificates == "optional" {
             certs.lists(&[&certs.coder, &certs.coder_next])
         } else {
             Certs::plain_lists()
@@ -1630,5 +1638,692 @@ async fn a_plain_server_is_unchanged() {
         h.last_digest("token.exchange").await,
         exchange_digest("reviewer", &lease, "client_secret", None, false)
     );
+    h.stop().await;
+}
+
+// --- tls_client_auth: certificates from a CA ----------------------------------------------
+
+const PKI_METHOD: &str = "tls_client_auth";
+const TRUST_DOMAIN: &str = "spiffe://example.org/ns/agents/sa";
+
+fn spiffe(agent: &str) -> String {
+    format!("{TRUST_DOMAIN}/{agent}")
+}
+
+fn uri_san(s: &str) -> rcgen::SanType {
+    rcgen::SanType::URI(s.try_into().unwrap())
+}
+
+fn dns_san(s: &str) -> rcgen::SanType {
+    rcgen::SanType::DnsName(s.try_into().unwrap())
+}
+
+/// The CAs of the `tls_client_auth` tests: the agents' root CA (in `agents-ca.pem`), an
+/// intermediate CA under it, and a CA nobody trusts. Their files live in a directory of their
+/// own, so the server's lists can name them before the harness starts.
+struct Pki {
+    dir: tempfile::TempDir,
+    root: Ca,
+    mid: Ca,
+    other: Ca,
+    /// A self-signed certificate pinned for `pinned`, so both methods share one list.
+    pinned: ClientCert,
+}
+
+impl Pki {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Ca::new("agents root CA");
+        let mid = root.intermediate("agents intermediate CA");
+        root.write(dir.path(), "agents-ca.pem");
+        Self {
+            dir,
+            root,
+            mid,
+            other: Ca::new("another CA"),
+            pinned: ClientCert::new("pinned"),
+        }
+    }
+
+    fn ca_path(&self) -> PathBuf {
+        self.dir.path().join("agents-ca.pem")
+    }
+
+    /// `coder` and `reviewer` by SPIFFE ID, `planner` by DNS name, `both` by SPIFFE ID and a
+    /// secret, `pinned` by thumbprint, `secretive` by a secret only; the PEP `gateway` by DNS
+    /// name. `coder` has `coder_san` (a `tls_client_auth_san_*` line) instead of its SPIFFE ID
+    /// when given.
+    fn lists(&self, coder_san: Option<&str>) -> String {
+        let ca = self.ca_path().display().to_string();
+        let coder = coder_san.map_or_else(
+            || format!("tls_client_auth_san_uri = \"{}\"", spiffe("coder")),
+            str::to_owned,
+        );
+        format!(
+            "[[agents]]\nid = \"coder\"\ntls_client_ca_pem_path = \"{ca}\"\n{coder}\n\n\
+             [[agents]]\nid = \"reviewer\"\ntls_client_ca_pem_path = \"{ca}\"\n\
+             tls_client_auth_san_uri = \"{}\"\n\n\
+             [[agents]]\nid = \"planner\"\ntls_client_ca_pem_path = \"{ca}\"\n\
+             tls_client_auth_san_dns = \"planner.agents.internal\"\n\n\
+             [[agents]]\nid = \"both\"\nsecret_sha256 = \"{}\"\ntls_client_ca_pem_path = \"{ca}\"\n\
+             tls_client_auth_san_uri = \"{}\"\n\n\
+             [[agents]]\nid = \"pinned\"\ntls_client_cert_sha256 = [\"{}\"]\n\n\
+             [[agents]]\nid = \"secretive\"\nsecret_sha256 = \"{}\"\n\n\
+             [[peps]]\nid = \"gateway\"\ntls_client_ca_pem_path = \"{ca}\"\n\
+             tls_client_auth_san_dns = \"gateway.peps.internal\"\n\n\
+             [[peps]]\nid = \"pep-secret\"\nsecret_sha256 = \"{}\"\n",
+            spiffe("reviewer"),
+            sha256_hex("both-secret"),
+            spiffe("both"),
+            self.pinned.sha256_hex(),
+            sha256_hex("secretive-secret"),
+            sha256_hex("pep-secret"),
+        )
+    }
+
+    /// A certificate from the root CA with these names.
+    fn client(&self, names: Vec<rcgen::SanType>) -> ClientCert {
+        self.root.client(|p| p.subject_alt_names = names)
+    }
+
+    async fn harness(&self, opts: Opts) -> Harness {
+        Harness::start(Opts {
+            lists: Some(self.lists(None)),
+            ..opts
+        })
+        .await
+    }
+}
+
+impl Harness {
+    /// Rewrite the config file with `lists` and reload them.
+    async fn reload_lists(&self, lists: &str) -> Answer {
+        write_config(
+            self.dir.path(),
+            &self.server_files,
+            &self.issuers,
+            &self.opts,
+            lists,
+        );
+        self.reload_coder_raw().await
+    }
+}
+
+/// Hop 0 by DNS name (in another case), an exchange by SPIFFE ID (with the root CA, and
+/// through an intermediate the client sends), with an actor token too, and a PEP by DNS name:
+/// served, and the records say `tls_client_auth` and carry the certificate's thumbprint.
+#[tokio::test]
+async fn pki_agents_and_peps_authenticate_by_name() {
+    let pki = Pki::new();
+    let h = pki.harness(Opts::default()).await;
+
+    // Hop 0, by DNS name, written in another case in the certificate.
+    let planner = pki.client(vec![dns_san("Planner.Agents.INTERNAL")]);
+    let a = h
+        .post(
+            Some(&planner),
+            "/token",
+            &intake_body(
+                &h.issuers.id_token("alice"),
+                json!({"client_id": "planner"}),
+            ),
+        )
+        .await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    let verified = h
+        .state
+        .keys()
+        .verifier
+        .verify(a.body["access_token"].as_str().unwrap(), now())
+        .unwrap();
+    let requested = verified.chain.hops[0].capabilities.clone();
+    let args = json!({"agent": "planner", "requested": requested, "credential": "id_token",
+                      "idp": IDP, "agent_auth": PKI_METHOD, "dpop_bound": false,
+                      "client_cert": client_cert_member(&planner)});
+    assert_eq!(
+        h.last_digest("token.root").await,
+        attenuo_core::ToolCall::new("attenuo", "token.root", args).arguments_digest()
+    );
+
+    // An exchange by SPIFFE ID: from the root CA, and from the intermediate with its chain.
+    let coder = pki.client(vec![uri_san(&spiffe("coder"))]);
+    let via_mid = pki
+        .mid
+        .client(|p| p.subject_alt_names = vec![uri_san(&spiffe("coder"))]);
+    assert_eq!(via_mid.chain.len(), 1);
+    for cert in [&coder, &via_mid] {
+        let (root, lease) = h.root().await;
+        let a = h
+            .post(
+                Some(cert),
+                "/token",
+                &exchange_body(&root, "coder", json!({"client_id": "coder"})),
+            )
+            .await;
+        assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+        assert_eq!(
+            h.last_digest("token.exchange").await,
+            exchange_digest("coder", &lease, PKI_METHOD, Some(cert), false)
+        );
+    }
+    // With an actor token too, under "either": both are checked.
+    let (root, lease) = h.root().await;
+    let a = h
+        .post(
+            Some(&coder),
+            "/token",
+            &exchange_body(
+                &root,
+                "coder",
+                json!({"client_id": "coder", "actor_token": h.issuers.actor_token("coder"),
+                       "actor_token_type": JWT}),
+            ),
+        )
+        .await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert_eq!(
+        h.last_digest("token.exchange").await,
+        exchange_digest(
+            "coder",
+            &lease,
+            "actor_token+tls_client_auth",
+            Some(&coder),
+            true
+        )
+    );
+
+    // A PEP by DNS name, single and batch.
+    let gateway = pki.client(vec![dns_san("gateway.peps.internal")]);
+    let body = h.evaluation(json!({"pep_id": "gateway"})).await;
+    let a = h.post(Some(&gateway), "/access/v1/evaluation", &body).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    let mut batch = body.clone();
+    batch["evaluations"] = json!([{}, {}, {}]);
+    let a = h
+        .post(Some(&gateway), "/access/v1/evaluations", &batch)
+        .await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert_eq!(a.body["evaluations"].as_array().unwrap().len(), 3);
+    // An agent's certificate from the same CA is not the PEP's.
+    let a = h.post(Some(&coder), "/access/v1/evaluation", &body).await;
+    assert_eq!(a.code(), ("invalid_client", "client_authentication_failed"));
+    h.stop().await;
+}
+
+/// Every certificate that must not authenticate gets the one answer the self-signed method
+/// gives (SR-110), and none issues a token or writes a record: another agent's certificate
+/// from the same CA (both ways), a certificate from another CA, expired and not yet valid,
+/// `CA:TRUE`, the CA's own certificate, server use only, two URI names for a SPIFFE ID, a
+/// wildcard DNS name for an exact one, a self-signed certificate with the right name, an
+/// intermediate's certificate sent without the intermediate, five intermediates, a
+/// certificate that also carries another entry's name, and certificates for an unknown id and
+/// for an entry with a secret only. A certificate with no extended key usage at all
+/// authenticates, and so do four intermediates and a name no entry uses.
+#[tokio::test]
+async fn pki_refusals_are_one_answer() {
+    let pki = Pki::new();
+    let h = pki.harness(Opts::default()).await;
+    let (root, _) = h.root().await;
+    let records = h.audit().await.len();
+    let day = time::Duration::days(1);
+    let coder_name = || vec![uri_san(&spiffe("coder"))];
+    let send = |cert: ClientCert, id: &'static str| {
+        let body = exchange_body(&root, id, json!({"client_id": id}));
+        let h = &h;
+        async move { h.post(Some(&cert), "/token", &body).await }
+    };
+
+    // The self-signed method's refusal, as the reference.
+    let reference = send(ClientCert::new("stranger"), "pinned").await;
+    assert_eq!(
+        reference.status,
+        StatusCode::UNAUTHORIZED,
+        "{}",
+        reference.body
+    );
+    assert_eq!(
+        reference.code(),
+        ("invalid_client", "client_authentication_failed")
+    );
+    assert!(reference.challenge.is_some());
+
+    let self_signed = ClientCert::made("coder", |p| p.subject_alt_names = coder_name());
+    let cases: Vec<(&str, ClientCert, &'static str)> = vec![
+        (
+            "reviewer's certificate as coder",
+            pki.client(vec![uri_san(&spiffe("reviewer"))]),
+            "coder",
+        ),
+        (
+            "coder's certificate as reviewer",
+            pki.client(coder_name()),
+            "reviewer",
+        ),
+        (
+            "another CA",
+            pki.other.client(|p| p.subject_alt_names = coder_name()),
+            "coder",
+        ),
+        (
+            "expired",
+            pki.root.client(|p| {
+                p.subject_alt_names = coder_name();
+                p.not_before = now() - day * 30;
+                p.not_after = now() - day;
+            }),
+            "coder",
+        ),
+        (
+            "not yet valid",
+            pki.root.client(|p| {
+                p.subject_alt_names = coder_name();
+                p.not_before = now() + day;
+                p.not_after = now() + day * 30;
+            }),
+            "coder",
+        ),
+        (
+            "CA:TRUE",
+            pki.root.client(|p| {
+                p.subject_alt_names = coder_name();
+                p.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            }),
+            "coder",
+        ),
+        ("the CA itself", pki.root.as_client(), "coder"),
+        ("the intermediate CA itself", pki.mid.as_client(), "coder"),
+        (
+            "server use only",
+            pki.root.client(|p| {
+                p.subject_alt_names = coder_name();
+                p.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+            }),
+            "coder",
+        ),
+        (
+            "two URI names",
+            pki.client(vec![
+                uri_san(&spiffe("coder")),
+                uri_san(&spiffe("reviewer")),
+            ]),
+            "coder",
+        ),
+        (
+            "a wildcard DNS name",
+            pki.client(vec![dns_san("*.agents.internal")]),
+            "planner",
+        ),
+        (
+            "a DNS name as a URI",
+            pki.client(vec![uri_san("dns:planner.agents.internal")]),
+            "planner",
+        ),
+        ("self-signed with the right name", self_signed, "coder"),
+        (
+            "no intermediate sent",
+            pki.mid
+                .client(|p| p.subject_alt_names = coder_name())
+                .without_chain(),
+            "coder",
+        ),
+        (
+            "five intermediates sent",
+            {
+                let mut c = pki.mid.client(|p| p.subject_alt_names = coder_name());
+                let mid = c.chain[0].clone();
+                c.chain.extend(std::iter::repeat_n(mid, 4));
+                assert_eq!(c.chain.len(), 5);
+                c
+            },
+            "coder",
+        ),
+        (
+            "coder's name and planner's",
+            pki.client(vec![
+                uri_san(&spiffe("coder")),
+                dns_san("planner.agents.internal"),
+            ]),
+            "coder",
+        ),
+        (
+            "planner's name and coder's",
+            pki.client(vec![
+                dns_san("planner.agents.internal"),
+                uri_san(&spiffe("coder")),
+            ]),
+            "planner",
+        ),
+        ("an unknown id", pki.client(coder_name()), "nobody"),
+        (
+            "an entry with a secret only",
+            pki.client(coder_name()),
+            "secretive",
+        ),
+        ("a pinned entry", pki.client(coder_name()), "pinned"),
+    ];
+    for (what, cert, id) in cases {
+        let a = send(cert, id).await;
+        assert_eq!(a, reference, "{what}");
+    }
+    assert_eq!(h.audit().await.len(), records, "a refusal wrote a record");
+
+    // No extended key usage and no basicConstraints at all: usable.
+    let bare = pki.root.client(|p| {
+        p.subject_alt_names = coder_name();
+        p.extended_key_usages = vec![];
+        p.is_ca = rcgen::IsCa::NoCa;
+    });
+    let a = send(bare, "coder").await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    // Four intermediates, the one the path needs and three copies: copies are dropped.
+    let mut four = pki.mid.client(|p| p.subject_alt_names = coder_name());
+    let mid = four.chain[0].clone();
+    four.chain.extend(std::iter::repeat_n(mid, 3));
+    // A name that no entry uses next to coder's.
+    let extra = pki.client(vec![
+        uri_san(&spiffe("coder")),
+        dns_san("coder.elsewhere.internal"),
+    ]);
+    for cert in [four, extra] {
+        // Each exchange needs a root token of its own.
+        let (root, _) = h.root().await;
+        let body = exchange_body(&root, "coder", json!({"client_id": "coder"}));
+        let a = h.post(Some(&cert), "/token", &body).await;
+        assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    }
+    // No certificate: no credential.
+    let a = h
+        .post(
+            None,
+            "/token",
+            &exchange_body(&root, "coder", json!({"client_id": "coder"})),
+        )
+        .await;
+    assert_eq!(a.code(), ("invalid_client", "client_auth_missing"));
+    h.stop().await;
+}
+
+/// A body credential decides when a CA certificate is on the connection too, and
+/// `[token] actor_auth = "actor_token"` refuses a CA certificate with a `client_id`, as for
+/// the self-signed method.
+#[tokio::test]
+async fn pki_body_credentials_and_actor_auth_work_as_for_pins() {
+    let pki = Pki::new();
+    let h = pki.harness(Opts::default()).await;
+    let both = pki.client(vec![uri_san(&spiffe("both"))]);
+    let (root, lease) = h.root().await;
+    let a = h
+        .post(
+            Some(&both),
+            "/token",
+            &exchange_body(
+                &root,
+                "both",
+                json!({"client_id": "both", "client_secret": "wrong"}),
+            ),
+        )
+        .await;
+    assert_eq!(a.code(), ("invalid_client", "client_authentication_failed"));
+    let a = h
+        .post(
+            Some(&both),
+            "/token",
+            &exchange_body(
+                &root,
+                "both",
+                json!({"client_id": "both", "client_secret": "both-secret"}),
+            ),
+        )
+        .await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert_eq!(
+        h.last_digest("token.exchange").await,
+        exchange_digest("both", &lease, "client_secret", None, false)
+    );
+    let (root, lease) = h.root().await;
+    let a = h
+        .post(
+            Some(&both),
+            "/token",
+            &exchange_body(&root, "both", json!({"client_id": "both"})),
+        )
+        .await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert_eq!(
+        h.last_digest("token.exchange").await,
+        exchange_digest("both", &lease, PKI_METHOD, Some(&both), false)
+    );
+    h.stop().await;
+
+    let h = pki
+        .harness(Opts {
+            actor_auth: "actor_token",
+            ..Opts::default()
+        })
+        .await;
+    let coder = pki.client(vec![uri_san(&spiffe("coder"))]);
+    let (root, lease) = h.root().await;
+    let a = h
+        .post(
+            Some(&coder),
+            "/token",
+            &exchange_body(&root, "coder", json!({"client_id": "coder"})),
+        )
+        .await;
+    assert_eq!(a.code(), ("invalid_request", "client_auth_not_accepted"));
+    let a = h
+        .post(
+            Some(&coder),
+            "/token",
+            &exchange_body(
+                &root,
+                "coder",
+                json!({"actor_token": h.issuers.actor_token("coder"), "actor_token_type": JWT}),
+            ),
+        )
+        .await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert_eq!(
+        h.last_digest("token.exchange").await,
+        exchange_digest("coder", &lease, "actor_token", None, true)
+    );
+    h.stop().await;
+}
+
+/// Bad `tls_client_auth` settings stop the server: a pin and a CA on one entry, a CA without
+/// a listener that asks for certificates (`"off"`, or no `[server.tls]`), a CA file that holds
+/// a client certificate, and a name without a CA file. The message never quotes the file.
+#[tokio::test]
+async fn pki_settings_are_refused_at_start() {
+    let pki = Pki::new();
+    let dir = tempfile::tempdir().unwrap();
+    let ca = Ca::new("mtls test CA");
+    let files = ca.write_server_files(dir.path(), &["127.0.0.1"]);
+    let issuers = Issuers::start().await;
+    let leaf = pki.client(vec![uri_san(&spiffe("coder"))]);
+    let leaf_file = pki.dir.path().join("leaf.pem");
+    std::fs::write(&leaf_file, &leaf.cert_pem).unwrap();
+    let ca_path = pki.ca_path().display().to_string();
+    let coder = |extra: &str| {
+        format!(
+            "[[agents]]\nid = \"coder\"\n{extra}\n[[agents]]\nid = \"planner\"\nsecret_sha256 = \"{}\"\n",
+            sha256_hex("p")
+        )
+    };
+    let by_ca = format!(
+        "tls_client_ca_pem_path = \"{ca_path}\"\ntls_client_auth_san_uri = \"{}\"\n",
+        spiffe("coder")
+    );
+    let cases: Vec<(Opts, String, String)> = vec![
+        (
+            Opts::default(),
+            coder(&format!(
+                "{by_ca}tls_client_cert_sha256 = [\"{}\"]\n",
+                leaf.sha256_hex()
+            )),
+            "set tls_client_cert_sha256 (a self-signed certificate) or tls_client_ca_pem_path \
+             (certificates from a CA), not both"
+                .into(),
+        ),
+        (
+            Opts {
+                client_certificates: "off",
+                ..Opts::default()
+            },
+            coder(&by_ca),
+            "tls_client_ca_pem_path needs [server.tls] with client_certificates = \"optional\""
+                .into(),
+        ),
+        (
+            Opts {
+                tls: false,
+                ..Opts::default()
+            },
+            coder(&by_ca),
+            "tls_client_ca_pem_path needs [server.tls] with client_certificates = \"optional\""
+                .into(),
+        ),
+        (
+            Opts::default(),
+            coder(&format!(
+                "tls_client_ca_pem_path = \"{}\"\ntls_client_auth_san_uri = \"{}\"\n",
+                leaf_file.display(),
+                spiffe("coder")
+            )),
+            "certificate 1 of the file is not a CA certificate".into(),
+        ),
+        (
+            Opts::default(),
+            coder("tls_client_auth_san_dns = \"coder.agents.internal\"\n"),
+            "tls_client_auth_san_dns needs tls_client_ca_pem_path".into(),
+        ),
+        (
+            Opts::default(),
+            coder(&format!("tls_client_ca_pem_path = \"{ca_path}\"\n")),
+            "tls_client_ca_pem_path needs tls_client_auth_san_uri or tls_client_auth_san_dns"
+                .into(),
+        ),
+    ];
+    for (opts, lists, want) in cases {
+        let path = write_config(dir.path(), &files, &issuers, &opts, &lists);
+        let cfg = Config::load(&path).unwrap();
+        let err = attenuo_server::build(&cfg).err().expect("refused");
+        let msg = format!("{err:#}");
+        assert!(msg.contains(&want), "{want}: {msg}");
+        assert!(msg.contains("[[agents]] `coder`"), "{msg}");
+        let body_line = leaf.cert_pem.lines().nth(1).unwrap();
+        assert!(!msg.contains(body_line), "{msg}");
+    }
+}
+
+/// An exchange for `coder` with `client_id`, on `conn`.
+async fn send(
+    h: &Harness,
+    conn: &mut tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
+) -> (u16, Value) {
+    let (root, _) = h.root().await;
+    let body = exchange_body(&root, "coder", json!({"client_id": "coder"}));
+    request_on(conn, "POST", "/token", None, Some(&body))
+        .await
+        .unwrap()
+}
+
+/// A reload applies to connections already open: a new content of the CA file (another CA)
+/// is a change, and the open connection's certificate stops working on its next request;
+/// the file back, it works again; a new name for the entry stops it again; and so does
+/// removing the CA settings. Lists without CA settings keep their digest.
+#[tokio::test]
+async fn pki_a_reload_applies_to_open_connections() {
+    let pki = Pki::new();
+    let h = pki.harness(Opts::default()).await;
+    let coder = pki.client(vec![uri_san(&spiffe("coder"))]);
+    let mut conn = connect(&h, Some(coder.resolver()), None).await.unwrap();
+    let ok = |(status, v): (u16, Value)| assert_eq!(status, 200, "{v}");
+    let refused = |(status, v): (u16, Value)| {
+        assert_eq!(
+            (status, v["error_description"].as_str()),
+            (401, Some("client_authentication_failed")),
+            "{v}"
+        );
+    };
+    ok(send(&h, &mut conn).await);
+
+    // The same lists and files: no change, same digest.
+    let first = h.reload_lists(&pki.lists(None)).await;
+    assert_eq!(first.status, StatusCode::OK, "{}", first.body);
+    assert_eq!(first.body["agents"]["changed"], json!([]), "{}", first.body);
+    ok(send(&h, &mut conn).await);
+
+    // Another CA in the same file: every entry that names it changed.
+    pki.other.write(pki.dir.path(), "agents-ca.pem");
+    let r = h.reload_lists(&pki.lists(None)).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert_eq!(
+        r.body["agents"]["changed"],
+        json!(["both", "coder", "planner", "reviewer"]),
+        "{}",
+        r.body
+    );
+    assert_eq!(r.body["peps"]["changed"], json!(["gateway"]), "{}", r.body);
+    assert_ne!(r.body["agents"]["sha256"], first.body["agents"]["sha256"]);
+    refused(send(&h, &mut conn).await);
+
+    // The file back: the same digest as before, and the open connection works again.
+    pki.root.write(pki.dir.path(), "agents-ca.pem");
+    let r = h.reload_lists(&pki.lists(None)).await;
+    assert_eq!(r.body["agents"]["changed"].as_array().unwrap().len(), 4);
+    assert_eq!(r.body["agents"]["sha256"], first.body["agents"]["sha256"]);
+    ok(send(&h, &mut conn).await);
+
+    // Another name for coder.
+    let r = h
+        .reload_lists(&pki.lists(Some(&format!(
+            "tls_client_auth_san_uri = \"{}\"",
+            spiffe("coder-v2")
+        ))))
+        .await;
+    assert_eq!(r.body["agents"]["changed"], json!(["coder"]), "{}", r.body);
+    refused(send(&h, &mut conn).await);
+    // A certificate with the new name works at once, on a new connection.
+    let v2 = pki.client(vec![uri_san(&spiffe("coder-v2"))]);
+    let mut conn2 = connect(&h, Some(v2.resolver()), None).await.unwrap();
+    ok(send(&h, &mut conn2).await);
+
+    // No CA settings any more (a secret only): the certificate stops working.
+    let lists = pki.lists(None).replace(
+        &format!(
+            "id = \"coder\"\ntls_client_ca_pem_path = \"{}\"\ntls_client_auth_san_uri = \"{}\"",
+            pki.ca_path().display(),
+            spiffe("coder")
+        ),
+        &format!(
+            "id = \"coder\"\nsecret_sha256 = \"{}\"",
+            sha256_hex("coder-secret")
+        ),
+    );
+    assert!(!lists.contains(&spiffe("coder\"")), "{lists}");
+    let r = h.reload_lists(&lists).await;
+    assert_eq!(r.body["agents"]["changed"], json!(["coder"]), "{}", r.body);
+    refused(send(&h, &mut conn2).await);
+
+    // A reload with a bad CA file is refused, and the lists in force stay.
+    std::fs::write(pki.ca_path(), &coder.cert_pem).unwrap();
+    let r = h.reload_lists(&pki.lists(None)).await;
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", r.body);
+    assert!(
+        r.body.to_string().contains("not a CA certificate"),
+        "{}",
+        r.body
+    );
+    let reviewer = pki.client(vec![uri_san(&spiffe("reviewer"))]);
+    let (root, _) = h.root().await;
+    let a = h
+        .post(
+            Some(&reviewer),
+            "/token",
+            &exchange_body(&root, "reviewer", json!({"client_id": "reviewer"})),
+        )
+        .await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
     h.stop().await;
 }

@@ -156,7 +156,7 @@ fn read_certs(path: &Path, key_path: &Path) -> Result<Vec<CertificateDer<'static
 /// Whether the bytes `PRIVATE KEY` appear anywhere in `pem`: a key section of any kind
 /// (`PRIVATE KEY`, `EC PRIVATE KEY`, `RSA PRIVATE KEY`, `ENCRYPTED PRIVATE KEY`, ...), well
 /// formed or not, on a line of its own or run together with others. Nothing is decoded.
-fn mentions_private_key(pem: &[u8]) -> bool {
+pub(crate) fn mentions_private_key(pem: &[u8]) -> bool {
     const NEEDLE: &[u8] = b"PRIVATE KEY";
     pem.windows(NEEDLE.len()).any(|w| w == NEEDLE)
 }
@@ -194,12 +194,14 @@ fn read_key(path: &Path) -> Result<PrivateKeyDer<'static>, String> {
 
 /// The bytes of a regular file of at most `max` bytes, checked before reading and again while
 /// reading, as `ca_pem_path` files are read. For a `secret` file on Unix, the open file must
-/// not be readable or writable by its group or by others.
-fn read_file(path: &Path, max: u64, secret: bool) -> Result<Vec<u8>, String> {
+/// not be readable or writable by its group or by others. The file is opened without blocking
+/// ([`open_nonblocking`]) and its type is checked on the open handle, so a FIFO is refused
+/// rather than waited on.
+pub(crate) fn read_file(path: &Path, max: u64, secret: bool) -> Result<Vec<u8>, String> {
     use std::io::Read;
     let unreadable = |e: std::io::Error| format!("cannot read the file ({e})");
     let too_big = || format!("the file is larger than {} KiB", max / 1024);
-    let file = std::fs::File::open(path).map_err(unreadable)?;
+    let file = open_nonblocking(path).map_err(unreadable)?;
     let meta = file.metadata().map_err(unreadable)?;
     if !meta.is_file() {
         return Err("not a regular file".into());
@@ -218,6 +220,21 @@ fn read_file(path: &Path, max: u64, secret: bool) -> Result<Vec<u8>, String> {
         return Err(too_big());
     }
     Ok(bytes)
+}
+
+/// Open `path` for reading without blocking on a FIFO or a device: on Unix with
+/// `O_NONBLOCK`, which a regular file ignores.
+fn open_nonblocking(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // `O_NONBLOCK` is a small positive flag; the cast cannot change it.
+        #[allow(clippy::cast_possible_wrap)]
+        options.custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32);
+    }
+    options.open(path)
 }
 
 /// On Unix, the rule of [`key_mode_ok`] for the open file and this process: the owner and
@@ -845,5 +862,28 @@ mod tests {
         let key = write(dir.path(), "ok.key", &key_pem, 0o600);
         let cert = write(dir.path(), "open.crt", &cert_pem, 0o666);
         server_config(&section(&cert, &key)).unwrap();
+    }
+
+    /// A FIFO is refused without waiting for a writer: nothing ever writes to this one, so a
+    /// blocking open would hang the test (and a server's start or reload).
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_is_refused_without_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("fifo.pem");
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            &fifo,
+            rustix::fs::Mode::from_raw_mode(0o600),
+        )
+        .unwrap();
+        for secret in [false, true] {
+            assert_eq!(
+                read_file(&fifo, 1024, secret).unwrap_err(),
+                "not a regular file"
+            );
+        }
+        let ca = crate::client_pki::read_ca_file(&fifo).unwrap_err();
+        assert_eq!(ca, "not a regular file");
     }
 }

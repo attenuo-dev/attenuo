@@ -80,6 +80,7 @@ pub mod auto_prune;
 pub mod authz;
 pub(crate) mod client_cert;
 pub(crate) mod client_cert_verifier;
+pub(crate) mod client_pki;
 pub(crate) mod clientauth;
 pub mod config;
 // Used by the fuzz targets.
@@ -108,9 +109,11 @@ pub(crate) mod state;
 pub mod telemetry;
 pub(crate) mod tls;
 
-/// Thin wrappers over the crate-private `[idps.id_jag_ceiling]` code, for the cargo-fuzz target
-/// `idjag_ceiling` (`fuzz/`). **Not a public API**: behind the `fuzzing` feature, which only
-/// `fuzz/Cargo.toml` enables, hidden from the docs, and free to change or go with any release.
+/// Thin wrappers over crate-private code for the cargo-fuzz targets (`fuzz/`): the
+/// `[idps.id_jag_ceiling]` code for `idjag_ceiling`, and the DER reads of the TLS client
+/// certificate check (`client_pki`) for `client_pki_der`. **Not a public API**: behind the
+/// `fuzzing` feature, which only `fuzz/Cargo.toml` enables, hidden from the docs, and free to
+/// change or go with any release.
 /// Each wrapper calls the server's own function; none holds logic of its own.
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
@@ -182,6 +185,39 @@ pub mod fuzzing {
             requested,
         )
         .map(|n| n.capabilities)
+    }
+
+    /// `client_pki::is_ca`: whether a certificate's `basicConstraints` says `CA:TRUE`, in DER.
+    pub fn pki_is_ca(cert: &[u8]) -> bool {
+        crate::client_pki::is_ca(cert)
+    }
+
+    /// `client_pki::uri_name_count`: the URI names of a certificate's `subjectAltName`.
+    pub fn pki_uri_name_count(cert: &[u8]) -> Option<usize> {
+        crate::client_pki::uri_name_count(cert)
+    }
+
+    /// The contents of a certificate's issuer and subject names (`client_pki::tbs`).
+    pub fn pki_issuer_subject(cert: &[u8]) -> Option<(&[u8], &[u8])> {
+        crate::client_pki::tbs(cert).map(|t| (t.issuer, t.subject))
+    }
+
+    /// `client_pki::not_after`: a certificate's `notAfter`, in Unix seconds.
+    pub fn pki_not_after(cert: &[u8]) -> Option<i64> {
+        crate::client_pki::not_after(cert)
+    }
+
+    /// `client_pki::useful_intermediates`: the intermediates of `sent` kept for path building
+    /// for the client certificate `leaf`.
+    pub fn pki_useful_intermediates(leaf: &[u8], sent: &[Vec<u8>]) -> Vec<Vec<u8>> {
+        let sent: Vec<_> = sent
+            .iter()
+            .map(|c| rustls::pki_types::CertificateDer::from(c.as_slice()))
+            .collect();
+        crate::client_pki::useful_intermediates(leaf, &sent)
+            .into_iter()
+            .map(|c| c.as_ref().to_vec())
+            .collect()
     }
 }
 

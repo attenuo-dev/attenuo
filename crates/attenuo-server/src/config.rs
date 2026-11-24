@@ -538,7 +538,8 @@ pub struct ServerTlsSection {
     /// owns the file.
     pub key_pem_path: PathBuf,
     /// Whether the listener asks clients for a certificate, for RFC 8705
-    /// `self_signed_tls_client_auth` (`[[agents]]` and `[[peps]]` `tls_client_cert_sha256`).
+    /// `self_signed_tls_client_auth` (`[[agents]]` and `[[peps]]` `tls_client_cert_sha256`)
+    /// and `tls_client_auth` (`tls_client_ca_pem_path`).
     /// `"off"` (the default): no certificate is asked for. `"optional"`: one is asked for and
     /// never required, so clients without one connect as before.
     #[serde(default)]
@@ -554,7 +555,8 @@ pub enum ClientCertificates {
     Off,
     /// The listener asks for a client certificate and accepts a connection without one. A
     /// certificate whose handshake signature verifies is taken to the request; whether it
-    /// authenticates anyone is decided there, against `tls_client_cert_sha256`.
+    /// authenticates anyone is decided there, against `tls_client_cert_sha256` or
+    /// `tls_client_ca_pem_path`.
     Optional,
 }
 
@@ -3059,6 +3061,26 @@ pub struct AgentConfig {
     /// setting. Two values let a client rotate its certificate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_client_cert_sha256: Option<Vec<String>>,
+    /// RFC 8705 `tls_client_auth`: a PEM file of the CA certificates that issue this client's
+    /// TLS certificate (at most 16, each with `basicConstraints` `CA:TRUE`, nothing else in
+    /// the file). The client presents its certificate, and any intermediates, in the TLS
+    /// handshake of `[server.tls]` with `client_certificates = "optional"`, and names itself
+    /// with `client_id` (`pep_id`). The certificate must chain to one of these CAs and carry
+    /// the name of `tls_client_auth_san_uri` or `tls_client_auth_san_dns` (exactly one of
+    /// them). Read at start and by an agents reload. Not with `tls_client_cert_sha256`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_client_ca_pem_path: Option<PathBuf>,
+    /// With `tls_client_ca_pem_path`: the URI the certificate must carry as a subject
+    /// alternative name, compared exactly (case-sensitive). A `spiffe://` value must be a
+    /// valid SPIFFE ID, and the certificate must then carry exactly one URI name (an
+    /// X.509-SVID).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_client_auth_san_uri: Option<String>,
+    /// With `tls_client_ca_pem_path`: the DNS name the certificate must carry as a subject
+    /// alternative name, compared without regard to ASCII case. No wildcard here, and a
+    /// wildcard name in the certificate never matches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_client_auth_san_dns: Option<String>,
 }
 
 impl AgentConfig {
@@ -3072,6 +3094,9 @@ impl AgentConfig {
             jwks_ttl_seconds: None,
             ca_pem_path: None,
             tls_client_cert_sha256: None,
+            tls_client_ca_pem_path: None,
+            tls_client_auth_san_uri: None,
+            tls_client_auth_san_dns: None,
         }
     }
 
@@ -3085,6 +3110,54 @@ impl AgentConfig {
             jwks_ttl_seconds: None,
             ca_pem_path: None,
             tls_client_cert_sha256: None,
+            tls_client_ca_pem_path: None,
+            tls_client_auth_san_uri: None,
+            tls_client_auth_san_dns: None,
+        }
+    }
+
+    /// An entry that authenticates with a client certificate issued by a CA only (RFC 8705
+    /// `tls_client_auth`): the CA file `ca_pem_path` and the URI the certificate must carry.
+    pub fn with_tls_client_auth_san_uri(
+        id: impl Into<String>,
+        ca_pem_path: impl Into<PathBuf>,
+        san_uri: impl Into<String>,
+    ) -> Self {
+        Self {
+            tls_client_ca_pem_path: Some(ca_pem_path.into()),
+            tls_client_auth_san_uri: Some(san_uri.into()),
+            ..Self::bare(id.into())
+        }
+    }
+
+    /// An entry that authenticates with a client certificate issued by a CA only (RFC 8705
+    /// `tls_client_auth`): the CA file `ca_pem_path` and the DNS name the certificate must
+    /// carry.
+    pub fn with_tls_client_auth_san_dns(
+        id: impl Into<String>,
+        ca_pem_path: impl Into<PathBuf>,
+        san_dns: impl Into<String>,
+    ) -> Self {
+        Self {
+            tls_client_ca_pem_path: Some(ca_pem_path.into()),
+            tls_client_auth_san_dns: Some(san_dns.into()),
+            ..Self::bare(id.into())
+        }
+    }
+
+    /// An entry with an id and no credential.
+    fn bare(id: String) -> Self {
+        Self {
+            id,
+            secret_sha256: None,
+            jwks: None,
+            jwks_url: None,
+            jwks_ttl_seconds: None,
+            ca_pem_path: None,
+            tls_client_cert_sha256: None,
+            tls_client_ca_pem_path: None,
+            tls_client_auth_san_uri: None,
+            tls_client_auth_san_dns: None,
         }
     }
 
@@ -3102,6 +3175,9 @@ impl AgentConfig {
             jwks_ttl_seconds: None,
             ca_pem_path: None,
             tls_client_cert_sha256: Some(thumbprints.into_iter().map(Into::into).collect()),
+            tls_client_ca_pem_path: None,
+            tls_client_auth_san_uri: None,
+            tls_client_auth_san_dns: None,
         }
     }
 
@@ -3116,6 +3192,9 @@ impl AgentConfig {
             jwks_ttl_seconds: None,
             ca_pem_path: None,
             tls_client_cert_sha256: None,
+            tls_client_ca_pem_path: None,
+            tls_client_auth_san_uri: None,
+            tls_client_auth_san_dns: None,
         }
     }
 }

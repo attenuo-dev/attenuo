@@ -104,14 +104,16 @@ pub(crate) async fn serve(
                         _ = stop.changed() => return,
                     };
                     // The end-entity certificate, when the client sent one: its handshake
-                    // signature verified (`crate::client_cert_verifier`). Only this loop sets
-                    // it; the requests of this connection all carry it.
+                    // signature verified (`crate::client_cert_verifier`). The certificates
+                    // the client sent after it are kept as intermediates (bounded,
+                    // `crate::client_cert::MAX_INTERMEDIATES`) for the CA check of
+                    // `tls_client_auth`. Only this loop sets it; the requests of this
+                    // connection all carry it.
                     service.client_cert = stream
                         .get_ref()
                         .1
                         .peer_certificates()
-                        .and_then(<[_]>::first)
-                        .map(|der| ClientCertificate::new(der.clone().into_owned()));
+                        .and_then(ClientCertificate::from_handshake);
                     serve_connection(stream, service, header_read_timeout, &mut stop).await;
                 }
             }
