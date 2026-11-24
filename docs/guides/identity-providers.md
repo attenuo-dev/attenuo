@@ -305,6 +305,8 @@ Notes:
 - Only these names are matched: one URI (exactly, case-sensitive) or one DNS name (any case, never through a wildcard). The subject DN, its common name, IP addresses and e-mail addresses are not matched.
 - For a `spiffe://` name, the certificate must carry exactly one URI name, as an X.509-SVID does.
 - The dates of the certificate and its intermediates are checked on every request.
+- The client may send at most 4 intermediate CA certificates. If it needs cross-certificates, it sends the one its path uses first: only the first one with a given subject is used.
+- A certificate that also carries the name of another agent (or, for a PEP, another PEP) is refused. Extra names that no entry uses are fine.
 - There is no CRL or OCSP check. To stop a certificate before it expires, remove the CA or change the name on the entry and reload. Short-lived certificates make this matter less.
 - A CA you list can make a certificate for any name. List a CA only on the entries it should vouch for.
 

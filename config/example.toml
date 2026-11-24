@@ -38,8 +38,9 @@ listen = "127.0.0.1:8080"
 # key_pem_path = "/etc/attenuo/tls/server.key"
 # # "off" (default): ask for no client certificate. "optional": ask for one, never require
 # # one, so agents and PEPs with tls_client_cert_sha256 (a self-signed certificate) or
-# # tls_client_ca_pem_path (a certificate from a CA) can authenticate with it (RFC 8705). A proxy that ends TLS in front hides it: needs a direct
-# # connection or TCP pass-through. There is no "required".
+# # tls_client_ca_pem_path (a certificate from a CA) can authenticate with it (RFC 8705).
+# # A proxy that ends TLS in front hides it: needs a direct connection or TCP pass-through.
+# # There is no "required".
 # client_certificates = "off"
 
 [issuer]
@@ -261,10 +262,12 @@ secret_sha256 = "a93d472e76b73bffcef69973eb463fb679b1365377e183a459d7f33c2ee97b7
 # tls_client_cert_sha256 = ["<64 lowercase hex characters>"]
 # Or TLS client certificates from a CA (RFC 8705 tls_client_auth): the CA file and exactly
 # one name the certificate must carry, a URI (a SPIFFE ID: then its only URI name) or a DNS
-# name (no wildcard). Not with tls_client_cert_sha256. No CRL or OCSP check.
+# name (no wildcard). Not with tls_client_cert_sha256. No CRL or OCSP check. The agent may
+# send at most 4 intermediate CA certificates after its own.
 # tls_client_ca_pem_path = "/etc/attenuo/agents-ca.pem"
 # tls_client_auth_san_uri = "spiffe://example.org/ns/agents/sa/planner"
-# tls_client_auth_san_dns = "planner.agents.internal"
+# # or, instead of the URI:
+# # tls_client_auth_san_dns = "planner.agents.internal"
 
 # Agents also authenticate on every token exchange (hop n to n+1) as the `actor` they name.
 [[agents]]

@@ -24,9 +24,28 @@
 //!
 //! The CA file is read at start and by an agents reload, with the size and file-type rules of
 //! the other CA files. No error shows a part of the file: every message is a fixed text.
+//!
+//! ## Cost before authentication
+//!
+//! The path check runs before the client is authenticated, on certificates the client chose.
+//! What bounds it:
+//!
+//! - At most [`MAX_INTERMEDIATES`](crate::client_cert::MAX_INTERMEDIATES) certificates after
+//!   the client's own; a chain with more is refused without a path check.
+//! - [`useful_intermediates`], once per connection, drops the intermediates that cannot help
+//!   a path: unreadable ones, a copy of the client's certificate, self-issued ones (subject =
+//!   issuer; a path ends at a CA of the file, never at one the client sent) and every one after
+//!   the first with a given subject. With one intermediate per subject, each step of path
+//!   building has at most one intermediate to try, so the work is linear in the four, not the
+//!   number of paths through them.
+//! - rustls-webpki's own limits: at most six CA certificates between the client's and the
+//!   trust anchor, and at most 100 signature checks per verification.
+//! - A per-connection cache ([`PerConnection`]): a request on a connection whose certificate
+//!   already passed (or failed on its names) for the same CA file and name is answered from
+//!   it, while the answer still holds.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 
 use rustls::pki_types::pem::{PemObject, SectionKind};
 use rustls::pki_types::{CertificateDer, TrustAnchor, UnixTime};
@@ -45,6 +64,12 @@ const MAX_SAN_DNS_BYTES: usize = 253;
 /// Most names of a refused certificate written to the debug log, and the longest one.
 const LOGGED_NAMES: usize = 8;
 const LOGGED_NAME_CHARS: usize = 256;
+/// Most answers one connection keeps ([`PerConnection`]): one per CA file and name it was
+/// checked against, the oldest dropped first.
+const CACHED_ANSWERS: usize = 8;
+/// The refusals that depend on nothing but the certificate's names, once its path was
+/// accepted: true at any later time, so kept for the connection.
+const NAME_REFUSALS: [&str; 2] = ["uri_san_count", "san_mismatch"];
 
 /// The CA certificates of one `tls_client_ca_pem_path` file, as trust anchors.
 pub(crate) struct CaFile {
@@ -73,6 +98,10 @@ impl CaFile {
         self.anchors.len()
     }
 }
+
+/// The CA files read for one start or reload, by path, so that each is read once and the
+/// agents and the PEPs that name one see the same bytes.
+pub(crate) type CaFiles = Vec<(PathBuf, Arc<CaFile>)>;
 
 /// The name a client's certificate must carry.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -267,13 +296,175 @@ impl Refused {
     }
 }
 
+/// The per-connection state of the CA check, kept with a [`ClientCertificate`] and shared by
+/// the requests of its connection.
+///
+/// The cache holds, per CA file and name, the last answer that is still known to hold:
+///
+/// - The key is the identity of the CA file in force (the `Arc` the entry holds; a reload
+///   reads the file again into a new one, so its old answers never match again) and the
+///   configured name. Two entries with different names never share an answer. The cache holds
+///   the old file only weakly, so its address is not reused while an answer names it.
+/// - An accepted path is kept with the time it was checked and the earliest `notAfter` of the
+///   client's certificate and the intermediates kept: it is used only from that time (a clock
+///   set back checks again) up to that `notAfter`. An expired certificate is checked again,
+///   and refused.
+/// - A refusal of the name ([`NAME_REFUSALS`]) holds at any time, since it came after an
+///   accepted path. Every other refusal (dates, path, usage) is checked again on the next
+///   request: a certificate that is not yet valid may become valid.
+/// - At most [`CACHED_ANSWERS`] answers.
+pub(crate) struct PerConnection {
+    /// The earliest `notAfter` of the client's certificate and the intermediates kept, in
+    /// Unix seconds; `None` when one cannot be read, and then nothing is cached.
+    not_after: Option<i64>,
+    names: OnceLock<CertNames>,
+    cache: Mutex<Vec<Cached>>,
+}
+
+impl std::fmt::Debug for PerConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PerConnection").finish_non_exhaustive()
+    }
+}
+
+struct Cached {
+    ca: Weak<CaFile>,
+    name: SanName,
+    answer: Answer,
+}
+
+enum Answer {
+    /// A path checked at `from`, good until `until` (Unix seconds).
+    Accepted { from: i64, until: i64 },
+    /// A refusal of the name.
+    Refused(Refused),
+}
+
+impl PerConnection {
+    /// The state for a client certificate `leaf` and the intermediates kept of it (`None`
+    /// when the client sent too many).
+    pub(crate) fn new(leaf: &[u8], intermediates: Option<&[CertificateDer<'_>]>) -> Self {
+        let not_after = intermediates.and_then(|kept| {
+            kept.iter()
+                .map(|c| not_after(c.as_ref()))
+                .chain(std::iter::once(not_after(leaf)))
+                .try_fold(i64::MAX, |min, t| t.map(|t| min.min(t)))
+        });
+        Self {
+            not_after,
+            names: OnceLock::new(),
+            cache: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn cached(&self, pki: &Pki, now: i64) -> Option<Result<(), Refused>> {
+        let cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
+        let hit = cache
+            .iter()
+            .find(|c| std::ptr::eq(c.ca.as_ptr(), Arc::as_ptr(&pki.ca)) && c.name == pki.name)?;
+        match &hit.answer {
+            Answer::Accepted { from, until } => (*from <= now && now <= *until).then_some(Ok(())),
+            Answer::Refused(r) => Some(Err(r.clone())),
+        }
+    }
+
+    fn remember(&self, pki: &Pki, now: i64, outcome: &Result<(), Refused>) {
+        let answer = match outcome {
+            Ok(()) => match self.not_after {
+                Some(until) if now <= until => Answer::Accepted { from: now, until },
+                _ => return,
+            },
+            Err(r) if NAME_REFUSALS.contains(&r.reason) => Answer::Refused(r.clone()),
+            Err(_) => return,
+        };
+        let mut cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
+        cache.retain(|c| {
+            !(std::ptr::eq(c.ca.as_ptr(), Arc::as_ptr(&pki.ca)) && c.name == pki.name)
+                && c.ca.strong_count() > 0
+        });
+        if cache.len() >= CACHED_ANSWERS {
+            cache.remove(0);
+        }
+        cache.push(Cached {
+            ca: Arc::downgrade(&pki.ca),
+            name: pki.name.clone(),
+            answer,
+        });
+    }
+
+    #[cfg(test)]
+    fn cached_answers(&self) -> usize {
+        self.cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+}
+
+/// The URI and DNS names of a client certificate, as rustls-webpki reads them; DNS names in
+/// lowercase. Wildcard DNS names are kept: no configured name equals one.
+#[derive(Debug, Default)]
+pub(crate) struct CertNames {
+    pub(crate) uris: Vec<String>,
+    pub(crate) dns: Vec<String>,
+}
+
+/// The names of `cert`, read once per connection. Empty when the certificate cannot be read.
+pub(crate) fn names(cert: &ClientCertificate) -> &CertNames {
+    cert.pki_state().names.get_or_init(|| {
+        let Ok(ee) = webpki::EndEntityCert::try_from(cert.der()) else {
+            return CertNames::default();
+        };
+        CertNames {
+            uris: ee.valid_uri_names().map(str::to_owned).collect(),
+            dns: ee
+                .valid_dns_names()
+                .map(|n| n.to_ascii_lowercase())
+                .collect(),
+        }
+    })
+}
+
+/// The intermediates of `sent` worth giving to path building for the client certificate
+/// `leaf`, in the order sent: each one readable, not a copy of `leaf`, not self-issued
+/// (subject = issuer), and the first one sent with its subject. See the module docs for why.
+pub(crate) fn useful_intermediates(
+    leaf: &[u8],
+    sent: &[CertificateDer<'_>],
+) -> Vec<CertificateDer<'static>> {
+    let mut subjects: Vec<&[u8]> = Vec::with_capacity(sent.len());
+    let mut kept = Vec::with_capacity(sent.len());
+    for c in sent {
+        let Some(t) = tbs(c.as_ref()) else { continue };
+        if c.as_ref() == leaf || t.subject == t.issuer || subjects.contains(&t.subject) {
+            continue;
+        }
+        subjects.push(t.subject);
+        kept.push(c.clone().into_owned());
+    }
+    kept
+}
+
 /// Whether `cert` authenticates an entry with these settings at `now`: the path to one of its
-/// CAs (see the module docs), then the name.
+/// CAs (see the module docs), then the name. Answered from the connection's cache when it
+/// holds an answer still true at `now` ([`PerConnection`]).
 pub(crate) fn verify(
     pki: &Pki,
     cert: &ClientCertificate,
     now: OffsetDateTime,
 ) -> Result<(), Refused> {
+    let secs = now.unix_timestamp();
+    let state = cert.pki_state();
+    if let Some(answer) = state.cached(pki, secs) {
+        return answer;
+    }
+    let outcome = verify_now(pki, cert, now);
+    state.remember(pki, secs, &outcome);
+    outcome
+}
+
+/// [`verify`] without the cache.
+fn verify_now(pki: &Pki, cert: &ClientCertificate, now: OffsetDateTime) -> Result<(), Refused> {
     let Some(intermediates) = cert.intermediates() else {
         return Err(Refused::because("too_many_intermediates"));
     };
@@ -384,6 +575,76 @@ fn expect(input: &[u8], want: u8) -> Option<(&[u8], &[u8])> {
 
 const SEQUENCE: u8 = 0x30;
 
+/// The parts of a certificate's `tbsCertificate` used here: the contents of the issuer and
+/// subject names and of the validity.
+pub(crate) struct Tbs<'a> {
+    pub(crate) issuer: &'a [u8],
+    pub(crate) validity: &'a [u8],
+    pub(crate) subject: &'a [u8],
+}
+
+pub(crate) fn tbs(cert: &[u8]) -> Option<Tbs<'_>> {
+    let (cert, _) = expect(cert, SEQUENCE)?;
+    let (mut tbs, _) = expect(cert, SEQUENCE)?;
+    if tbs.first() == Some(&0xa0) {
+        tbs = element(tbs)?.2; // version [0] EXPLICIT
+    }
+    let (_, tbs) = expect(tbs, 0x02)?; // serialNumber
+    let (_, tbs) = expect(tbs, SEQUENCE)?; // signature
+    let (issuer, tbs) = expect(tbs, SEQUENCE)?;
+    let (validity, tbs) = expect(tbs, SEQUENCE)?;
+    let (subject, _) = expect(tbs, SEQUENCE)?;
+    Some(Tbs {
+        issuer,
+        validity,
+        subject,
+    })
+}
+
+/// A certificate's `notAfter`, in Unix seconds.
+pub(crate) fn not_after(cert: &[u8]) -> Option<i64> {
+    let validity = tbs(cert)?.validity;
+    let (_, rest) = time_of(validity)?;
+    let (t, rest) = time_of(rest)?;
+    rest.is_empty().then_some(t)
+}
+
+/// One DER `Time` (RFC 5280 §4.1.2.5): `UTCTime` `YYMMDDHHMMSSZ` (years 1950 to 2049) or
+/// `GeneralizedTime` `YYYYMMDDHHMMSSZ`, in Unix seconds, and the rest of the input.
+fn time_of(input: &[u8]) -> Option<(i64, &[u8])> {
+    let (tag, value, rest) = element(input)?;
+    let digits = |b: &[u8]| -> Option<u16> {
+        b.iter().try_fold(0u16, |acc, &d| {
+            d.is_ascii_digit().then(|| acc * 10 + u16::from(d - b'0'))
+        })
+    };
+    let (year, value) = match (tag, value.len()) {
+        (0x17, 13) => {
+            let yy = digits(&value[..2])?;
+            (if yy < 50 { 2000 + yy } else { 1900 + yy }, &value[2..])
+        }
+        (0x18, 15) => (digits(&value[..4])?, &value[4..]),
+        _ => return None,
+    };
+    if value[10] != b'Z' {
+        return None;
+    }
+    let two = |i: usize| digits(&value[i..i + 2]).and_then(|v| u8::try_from(v).ok());
+    let date = time::Date::from_calendar_date(
+        i32::from(year),
+        time::Month::try_from(two(0)?).ok()?,
+        two(2)?,
+    )
+    .ok()?;
+    let at = time::Time::from_hms(two(4)?, two(6)?, two(8)?).ok()?;
+    Some((
+        time::PrimitiveDateTime::new(date, at)
+            .assume_utc()
+            .unix_timestamp(),
+        rest,
+    ))
+}
+
 /// The `extnValue` contents of the extension `oid` of a certificate: `Some(None)` when the
 /// certificate has no such extension.
 fn extension<'a>(cert: &'a [u8], oid: &[u8]) -> Option<Option<&'a [u8]>> {
@@ -413,24 +674,30 @@ fn extension<'a>(cert: &'a [u8], oid: &[u8]) -> Option<Option<&'a [u8]>> {
     Some(None)
 }
 
-/// Whether a certificate's `basicConstraints` (2.5.29.19) says `cA` TRUE.
-fn is_ca(cert: &[u8]) -> bool {
-    let ca = || -> Option<bool> {
-        let Some(value) = extension(cert, &[0x55, 0x1d, 0x13])? else {
-            return Some(false);
-        };
-        let (bc, _) = expect(value, SEQUENCE)?;
-        match expect(bc, 0x01) {
-            Some((flag, _)) => Some(flag == [0xff]),
-            None => Some(false),
+/// Whether a certificate's `basicConstraints` (2.5.29.19) says `cA` TRUE, in DER: one
+/// `SEQUENCE` and nothing after it, holding the `BOOLEAN` `0xff`, then at most one `INTEGER`
+/// (`pathLenConstraint`) and nothing else. Anything else, a malformed extension included, is
+/// "not a CA", so the file is refused.
+pub(crate) fn is_ca(cert: &[u8]) -> bool {
+    let ca = || -> Option<()> {
+        let value = extension(cert, &[0x55, 0x1d, 0x13])??;
+        let (bc, after) = expect(value, SEQUENCE)?;
+        let (flag, rest) = expect(bc, 0x01)?;
+        if !after.is_empty() || flag != [0xff] {
+            return None;
         }
+        if rest.is_empty() {
+            return Some(());
+        }
+        let (len, rest) = expect(rest, 0x02)?;
+        (!len.is_empty() && rest.is_empty()).then_some(())
     };
-    ca().unwrap_or(false)
+    ca().is_some()
 }
 
-/// How many `uniformResourceIdentifier` names (tag `[6]`) a certificate's
-/// `subjectAltName` (2.5.29.17) holds; `None` when it cannot be read.
-fn uri_name_count(cert: &[u8]) -> Option<usize> {
+/// How many `uniformResourceIdentifier` names (`[6]`, primitive or constructed) a
+/// certificate's `subjectAltName` (2.5.29.17) holds; `None` when it cannot be read.
+pub(crate) fn uri_name_count(cert: &[u8]) -> Option<usize> {
     let Some(value) = extension(cert, &[0x55, 0x1d, 0x11])? else {
         return Some(0);
     };
@@ -439,7 +706,9 @@ fn uri_name_count(cert: &[u8]) -> Option<usize> {
     while !names.is_empty() {
         let (tag, _, rest) = element(names)?;
         names = rest;
-        if tag == 0x86 {
+        // The class and number bits: a constructed [6] (0xa6) counts as well, so that an
+        // encoding rustls-webpki skips still makes a SPIFFE matcher refuse.
+        if tag & 0xdf == 0x86 {
             count += 1;
         }
     }
@@ -725,6 +994,199 @@ mod tests {
         assert_eq!(check(&pki, leaf, &many), Err("too_many_intermediates"));
     }
 
+    /// A CA certificate with the name `subject`, signed by a new key under the name `issuer`:
+    /// self-issued when they are equal.
+    fn crafted(subject: &str, issuer: &str) -> CertificateDer<'static> {
+        let issuer = Authority::new(issuer, None);
+        Authority::new(subject, Some(&issuer)).cert.der().clone()
+    }
+
+    /// Chains built to make path building try many paths are cut down before it runs: each
+    /// step then has at most one intermediate to try. The bound is checked on what is kept,
+    /// not by timing.
+    #[test]
+    fn crafted_chains_are_cut_down_before_path_building() {
+        use crate::client_cert::MAX_INTERMEDIATES;
+        let root = Authority::new("root", None);
+        let pki = root.pki(san_uri(CODER).unwrap());
+        let named = |p: &mut rcgen::CertificateParams| p.subject_alt_names = vec![uri(CODER)];
+        // Self-issued "X" certificates, each with its own key, and a client certificate
+        // issued by "X": every one could issue every other.
+        let x = Authority::new("X", None);
+        let leaf = x.issue(named);
+        let self_issued: Vec<_> = (0..MAX_INTERMEDIATES).map(|_| crafted("X", "X")).collect();
+        assert!(useful_intermediates(&leaf, &self_issued).is_empty());
+        assert_eq!(
+            check(&pki, leaf.clone(), &self_issued),
+            Err("chain_invalid")
+        );
+        let mut five = self_issued.clone();
+        five.push(crafted("X", "X"));
+        assert_eq!(
+            check(&pki, leaf.clone(), &five),
+            Err("too_many_intermediates")
+        );
+
+        // "X" by "Y" and "Y" by "X", twice each: one of each subject is kept.
+        let crossed = vec![
+            crafted("X", "Y"),
+            crafted("Y", "X"),
+            crafted("X", "Y"),
+            crafted("Y", "X"),
+        ];
+        let kept = useful_intermediates(&leaf, &crossed);
+        assert_eq!(kept, vec![crossed[0].clone(), crossed[1].clone()]);
+        assert_eq!(check(&pki, leaf.clone(), &crossed), Err("chain_invalid"));
+
+        // Copies of one intermediate, the client's own certificate and unreadable bytes are
+        // dropped; the path still builds.
+        let mid = Authority::new("mid", Some(&root));
+        let good = mid.issue(named);
+        let sent = vec![
+            good.clone(),
+            mid.cert.der().clone(),
+            CertificateDer::from(b"junk".to_vec()),
+            mid.cert.der().clone(),
+        ];
+        assert_eq!(
+            useful_intermediates(&good, &sent),
+            vec![mid.cert.der().clone()]
+        );
+        assert_eq!(check(&pki, good.clone(), &sent), Ok(()));
+        // A second intermediate with the subject of one sent before it is dropped: the client
+        // sends the one its path needs first.
+        let decoy = crafted("mid", "elsewhere");
+        let first = vec![mid.cert.der().clone(), decoy.clone()];
+        assert_eq!(check(&pki, good.clone(), &first), Ok(()));
+        let second = vec![decoy, mid.cert.der().clone()];
+        assert_eq!(check(&pki, good, &second), Err("chain_invalid"));
+    }
+
+    /// A cached answer holds only while it is true: an accepted path until the earliest
+    /// `notAfter` of the certificates kept, and from the time it was checked; a refusal for
+    /// the dates is never kept.
+    #[test]
+    fn the_cache_answers_only_while_true() {
+        let root = Authority::new("root", None);
+        let pki = root.pki(san_uri(CODER).unwrap());
+        let leaf = root.issue(|p| p.subject_alt_names = vec![uri(CODER)]);
+        let cert = ClientCertificate::from_handshake(&[leaf]).unwrap();
+        let state = cert.pki_state();
+        assert_eq!(verify(&pki, &cert, at(NOW)), Ok(()));
+        assert_eq!(state.cached_answers(), 1);
+        assert_eq!(verify(&pki, &cert, at(NOW + 3600)), Ok(()));
+        let r = verify(&pki, &cert, at(NOW + 3601)).unwrap_err();
+        assert_eq!(r.reason, "certificate_expired");
+        // A clock set back before the certificate is valid checks again.
+        let r = verify(&pki, &cert, at(NOW - 3601)).unwrap_err();
+        assert_eq!(r.reason, "certificate_not_yet_valid");
+        assert_eq!(verify(&pki, &cert, at(NOW)), Ok(()));
+
+        // Not yet valid is not a lasting refusal.
+        let early = root.issue(|p| {
+            p.subject_alt_names = vec![uri(CODER)];
+            p.not_before = at(NOW + 10);
+        });
+        let early = ClientCertificate::from_handshake(&[early]).unwrap();
+        let r = verify(&pki, &early, at(NOW)).unwrap_err();
+        assert_eq!(r.reason, "certificate_not_yet_valid");
+        assert_eq!(early.pki_state().cached_answers(), 0);
+        assert_eq!(verify(&pki, &early, at(NOW + 10)), Ok(()));
+
+        // An intermediate that expires before the client's certificate ends the answer.
+        let mid = Authority::new("mid", Some(&root));
+        let long = mid.issue(|p| {
+            p.subject_alt_names = vec![uri(CODER)];
+            p.not_after = at(NOW + 3 * 86_400);
+        });
+        let long = ClientCertificate::from_handshake(&[long, mid.cert.der().clone()]).unwrap();
+        assert_eq!(verify(&pki, &long, at(NOW)), Ok(()));
+        assert_eq!(verify(&pki, &long, at(NOW + 86_400)), Ok(()));
+        let r = verify(&pki, &long, at(NOW + 86_401)).unwrap_err();
+        assert_eq!(r.reason, "certificate_expired");
+    }
+
+    /// A cached answer is for one CA file and one name: a CA file read again (a reload), a
+    /// CA that is gone, another name and another entry are checked afresh.
+    #[test]
+    fn the_cache_never_carries_an_answer_to_another_ca_or_name() {
+        let root = Authority::new("root", None);
+        let other = Authority::new("other", None);
+        let a = root.pki(san_uri(CODER).unwrap());
+        let leaf = root.issue(|p| p.subject_alt_names = vec![uri(CODER)]);
+        let cert = ClientCertificate::from_handshake(&[leaf]).unwrap();
+        assert_eq!(verify(&a, &cert, at(NOW)), Ok(()));
+
+        // Entry B, the same CA file (the same `Arc`) and another name.
+        let b = Pki {
+            ca_path: a.ca_path.clone(),
+            ca: a.ca.clone(),
+            name: san_uri("spiffe://example.org/ns/agents/sa/reviewer").unwrap(),
+        };
+        assert_eq!(
+            verify(&b, &cert, at(NOW)).unwrap_err().reason,
+            "san_mismatch"
+        );
+        // Its refusal is kept, and does not change A's answer.
+        assert_eq!(
+            verify(&b, &cert, at(NOW)).unwrap_err().reason,
+            "san_mismatch"
+        );
+        assert_eq!(verify(&a, &cert, at(NOW)), Ok(()));
+
+        // A reload that keeps the name and puts another CA in the file.
+        let reloaded = Pki {
+            ca_path: a.ca_path.clone(),
+            ca: other.pki(san_uri(CODER).unwrap()).ca,
+            name: a.name.clone(),
+        };
+        assert_eq!(
+            verify(&reloaded, &cert, at(NOW)).unwrap_err().reason,
+            "chain_invalid"
+        );
+        // A reload that changes only the name.
+        let renamed = Pki {
+            ca_path: a.ca_path.clone(),
+            ca: a.ca.clone(),
+            name: san_dns("coder.agents").unwrap(),
+        };
+        assert_eq!(
+            verify(&renamed, &cert, at(NOW)).unwrap_err().reason,
+            "san_mismatch"
+        );
+        // The same file read again: a new `Arc`, checked again, and accepted again.
+        let same = root.pki(san_uri(CODER).unwrap());
+        assert!(!Arc::ptr_eq(&same.ca, &a.ca));
+        assert_eq!(verify(&same, &cert, at(NOW)), Ok(()));
+
+        // Bounded, and answers for a CA file no one holds any more are dropped.
+        drop(reloaded);
+        for i in 0..20 {
+            let name = san_uri(&format!("spiffe://example.org/n{i}")).unwrap();
+            let pki = Pki {
+                ca_path: a.ca_path.clone(),
+                ca: a.ca.clone(),
+                name,
+            };
+            assert!(verify(&pki, &cert, at(NOW)).is_err());
+        }
+        assert!(cert.pki_state().cached_answers() <= CACHED_ANSWERS);
+    }
+
+    /// rustls-webpki does not read the client certificate's `keyUsage`: one without
+    /// `digitalSignature` is accepted (ADR-0020 lists this as a known limit). The TLS
+    /// handshake has already checked a signature made with the key.
+    #[test]
+    fn key_usage_is_not_checked() {
+        let root = Authority::new("root", None);
+        let pki = root.pki(san_uri(CODER).unwrap());
+        let no_signing = root.issue(|p| {
+            p.subject_alt_names = vec![uri(CODER)];
+            p.key_usages = vec![rcgen::KeyUsagePurpose::KeyEncipherment];
+        });
+        assert_eq!(check(&pki, no_signing, &[]), Ok(()));
+    }
+
     #[test]
     fn the_path_rules_hold() {
         let root = Authority::new("root", None);
@@ -869,7 +1331,10 @@ mod tests {
             check(&pki, with(vec![dns("coder"), uri(CODER)]), &[]),
             Ok(())
         );
-        // A URI that is not a SPIFFE ID: any of the names may match.
+        // A URI that is not a SPIFFE ID: any of the names may match here. (When another name
+        // is the configured name of another entry of the list, client authentication refuses
+        // the certificate after this check: see `clientauth`'s
+        // `one_certificate_never_authenticates_two_clients_of_a_list`.)
         let plain = root.pki(san_uri("https://agents.example/coder").unwrap());
         assert_eq!(
             check(
@@ -949,6 +1414,12 @@ mod tests {
         let leaf = root.issue(|p| p.subject_alt_names = vec![uri(CODER), dns("x"), uri("urn:a")]);
         assert!(!is_ca(&leaf));
         assert_eq!(uri_name_count(&leaf), Some(2));
+        assert_eq!(not_after(&leaf), Some(NOW + 3600));
+        assert_eq!(not_after(root.cert.der()), Some(NOW + 86_400));
+        let t = tbs(&leaf).unwrap();
+        assert_ne!(t.issuer, t.subject);
+        let far = root.issue(|p| p.not_after = at(4_102_444_800)); // 2100, GeneralizedTime
+        assert_eq!(not_after(&far), Some(4_102_444_800));
         let bare = root.issue(|p| p.is_ca = rcgen::IsCa::NoCa);
         assert!(!is_ca(&bare));
         assert_eq!(uri_name_count(&bare), Some(0));
@@ -961,6 +1432,48 @@ mod tests {
         ] {
             assert!(!is_ca(junk));
             assert_eq!(uri_name_count(junk), None);
+        }
+        // A constructed [6] counts as a URI name too.
+        let san = |content: Vec<u8>| {
+            root.issue(|p| {
+                p.custom_extensions = vec![rcgen::CustomExtension::from_oid_content(
+                    &[2, 5, 29, 17],
+                    content,
+                )];
+            })
+        };
+        let constructed = san(b"\x30\x08\xa6\x03\x16\x01a\x86\x01b".to_vec());
+        assert_eq!(uri_name_count(&constructed), Some(2));
+        let empty = san(b"\x30\x00".to_vec());
+        assert_eq!(uri_name_count(&empty), Some(0));
+        assert_eq!(uri_name_count(&san(b"\x30\x03\x86\x05a".to_vec())), None);
+        // A malformed basicConstraints is never a CA.
+        let bc = |content: &[u8]| {
+            let key = rcgen::KeyPair::generate().unwrap();
+            let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+            params.is_ca = rcgen::IsCa::NoCa;
+            params.custom_extensions = vec![rcgen::CustomExtension::from_oid_content(
+                &[2, 5, 29, 19],
+                content.to_vec(),
+            )];
+            params.self_signed(&key).unwrap().der().clone()
+        };
+        assert!(is_ca(&bc(b"\x30\x03\x01\x01\xff")));
+        assert!(is_ca(&bc(b"\x30\x06\x01\x01\xff\x02\x01\x00")));
+        for bad in [
+            &b"\x30\x00"[..],
+            b"\x30\x03\x01\x01\x01",
+            b"\x30\x03\x01\x01\x00",
+            b"\x30\x04\x01\x02\xff\xff",
+            b"\x30\x03\x01\x01\xff\x00",
+            b"\x30\x05\x01\x01\xff\x02\x00",
+            b"\x30\x08\x01\x01\xff\x02\x01\x00\x05\x00",
+            b"\x30\x04\x01\x01\xff",
+            b"\x31\x03\x01\x01\xff",
+            b"\x01\x01\xff",
+            b"",
+        ] {
+            assert!(!is_ca(&bc(bad)), "{bad:02x?}");
         }
         assert_eq!(element(b"\x04\x84\xff\xff\xff\xff"), None);
         assert_eq!(

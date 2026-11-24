@@ -1855,9 +1855,10 @@ async fn pki_agents_and_peps_authenticate_by_name() {
 /// from the same CA (both ways), a certificate from another CA, expired and not yet valid,
 /// `CA:TRUE`, the CA's own certificate, server use only, two URI names for a SPIFFE ID, a
 /// wildcard DNS name for an exact one, a self-signed certificate with the right name, an
-/// intermediate's certificate sent without the intermediate, and certificates for an unknown
-/// id and for an entry with a secret only. A certificate with no extended key usage at all
-/// authenticates.
+/// intermediate's certificate sent without the intermediate, five intermediates, a
+/// certificate that also carries another entry's name, and certificates for an unknown id and
+/// for an entry with a secret only. A certificate with no extended key usage at all
+/// authenticates, and so do four intermediates and a name no entry uses.
 #[tokio::test]
 async fn pki_refusals_are_one_answer() {
     let pki = Pki::new();
@@ -1965,6 +1966,33 @@ async fn pki_refusals_are_one_answer() {
                 .without_chain(),
             "coder",
         ),
+        (
+            "five intermediates sent",
+            {
+                let mut c = pki.mid.client(|p| p.subject_alt_names = coder_name());
+                let mid = c.chain[0].clone();
+                c.chain.extend(std::iter::repeat_n(mid, 4));
+                assert_eq!(c.chain.len(), 5);
+                c
+            },
+            "coder",
+        ),
+        (
+            "coder's name and planner's",
+            pki.client(vec![
+                uri_san(&spiffe("coder")),
+                dns_san("planner.agents.internal"),
+            ]),
+            "coder",
+        ),
+        (
+            "planner's name and coder's",
+            pki.client(vec![
+                dns_san("planner.agents.internal"),
+                uri_san(&spiffe("coder")),
+            ]),
+            "planner",
+        ),
         ("an unknown id", pki.client(coder_name()), "nobody"),
         (
             "an entry with a secret only",
@@ -1987,6 +2015,22 @@ async fn pki_refusals_are_one_answer() {
     });
     let a = send(bare, "coder").await;
     assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    // Four intermediates, the one the path needs and three copies: copies are dropped.
+    let mut four = pki.mid.client(|p| p.subject_alt_names = coder_name());
+    let mid = four.chain[0].clone();
+    four.chain.extend(std::iter::repeat_n(mid, 3));
+    // A name that no entry uses next to coder's.
+    let extra = pki.client(vec![
+        uri_san(&spiffe("coder")),
+        dns_san("coder.elsewhere.internal"),
+    ]);
+    for cert in [four, extra] {
+        // Each exchange needs a root token of its own.
+        let (root, _) = h.root().await;
+        let body = exchange_body(&root, "coder", json!({"client_id": "coder"}));
+        let a = h.post(Some(&cert), "/token", &body).await;
+        assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    }
     // No certificate: no credential.
     let a = h
         .post(

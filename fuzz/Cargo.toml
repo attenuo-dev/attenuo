@@ -193,3 +193,10 @@ path = "fuzz_targets/idjag_ceiling.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "client_pki_der"
+path = "fuzz_targets/client_pki_der.rs"
+test = false
+doc = false
+bench = false
