@@ -55,7 +55,8 @@ listen = "127.0.0.1:8080"
 # [server.forwarded_client_cert]
 # # Not the address of any other listener. Bind it where only the proxy can reach it.
 # listen = "127.0.0.1:8444"
-# # The proxy's addresses: IPs or CIDRs, required, not empty, nothing wider than /8.
+# # The proxy's addresses: IPs or CIDRs, required, not empty, nothing wider than /8
+# # (IPv6: /32), no link-local IPv6 address.
 # trusted_peers = ["127.0.0.1/32"]
 
 [issuer]

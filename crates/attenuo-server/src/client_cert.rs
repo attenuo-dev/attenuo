@@ -64,8 +64,8 @@ struct Inner {
     /// [`MAX_INTERMEDIATES`].
     intermediates: Option<Vec<CertificateDer<'static>>>,
     /// The CA check's names and answers for this connection (for a forwarded certificate,
-    /// for this request).
-    pki: crate::client_pki::PerConnection,
+    /// shared with the requests that forward the same certificate and intermediates).
+    pki: Arc<crate::client_pki::PerConnection>,
 }
 
 impl std::fmt::Debug for ClientCertificate {
@@ -135,13 +135,39 @@ impl ClientCertificate {
         Self::with_intermediates(leaf, intermediates, source)
     }
 
+    /// A certificate from the forwarding listener: as [`Self::from_chain`] with source
+    /// [`CertSource::Forwarded`], with the CA check's state from `shared`, so that requests
+    /// forwarding the same certificate and intermediates share its answers.
+    pub(crate) fn forwarded(
+        leaf: CertificateDer<'static>,
+        rest: &[CertificateDer<'_>],
+        shared: &crate::client_pki::SharedStates,
+    ) -> Self {
+        let intermediates = (rest.len() <= MAX_INTERMEDIATES)
+            .then(|| crate::client_pki::useful_intermediates(leaf.as_ref(), rest));
+        let pki = shared.state(leaf.as_ref(), intermediates.as_deref());
+        Self::with_state(leaf, intermediates, CertSource::Forwarded, pki)
+    }
+
     fn with_intermediates(
         der: CertificateDer<'static>,
         intermediates: Option<Vec<CertificateDer<'static>>>,
         source: CertSource,
     ) -> Self {
+        let pki = Arc::new(crate::client_pki::PerConnection::new(
+            der.as_ref(),
+            intermediates.as_deref(),
+        ));
+        Self::with_state(der, intermediates, source, pki)
+    }
+
+    fn with_state(
+        der: CertificateDer<'static>,
+        intermediates: Option<Vec<CertificateDer<'static>>>,
+        source: CertSource,
+        pki: Arc<crate::client_pki::PerConnection>,
+    ) -> Self {
         let sha256 = Sha256::digest(der.as_ref()).into();
-        let pki = crate::client_pki::PerConnection::new(der.as_ref(), intermediates.as_deref());
         Self(Arc::new(Inner {
             der,
             source,

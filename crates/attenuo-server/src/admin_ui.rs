@@ -312,7 +312,7 @@ pub fn router(state: Arc<AppState>, config: &Config) -> Router {
                 .route_layer(middleware::from_fn(require_json)),
         );
     }
-    let forwarded = state.forwarded.is_some();
+    let forwarded = state.forwarded.as_ref().map(|f| f.pki.clone());
     // `require_admin` is added last so it runs first: no bearer is 401 before anything else.
     let api = api
         .layer(axum::Extension(ConsoleSettings {
@@ -331,10 +331,12 @@ pub fn router(state: Arc<AppState>, config: &Config) -> Router {
 
     let app = api.merge(assets).fallback(not_found);
     // With `[server.forwarded_client_cert]`: a `Client-Cert` header here is refused (400).
-    let app = if forwarded {
-        app.layer(middleware::from_fn(crate::forwarded::headers))
-    } else {
-        app
+    let app = match forwarded {
+        Some(pki) => app.layer(middleware::from_fn_with_state(
+            pki,
+            crate::forwarded::headers,
+        )),
+        None => app,
     };
     app.layer(middleware::from_fn(security_headers))
         // The span records the route template, never the URI (SR-90).

@@ -214,6 +214,8 @@ struct Opts {
     actor_auth: &'static str,
     /// The `[[agents]]` and `[[peps]]`, instead of [`Certs::lists`].
     lists: Option<String>,
+    /// More sections, as TOML.
+    extra: &'static str,
 }
 
 impl Default for Opts {
@@ -225,6 +227,7 @@ impl Default for Opts {
             other_listeners: false,
             actor_auth: "either",
             lists: None,
+            extra: "",
         }
     }
 }
@@ -283,7 +286,7 @@ fn write_config(
             "{server}[issuer]\nissuer = \"{ISSUER}\"\nprivate_key_pem_path = \"{}\"\n\n\
              [audit]\nsqlite_path = \"{}\"\n\n\
              [admin]\ntoken = \"{ADMIN}\"\n{admin_listen}\n\
-             {others}\
+             {others}{}\
              [dev]\nallow_root_mint = true\n\n\
              [authzen]\nallow_unsigned_chain = true\n\n\
              [token]\nactor_auth = \"{}\"\n\n\
@@ -294,6 +297,7 @@ fn write_config(
              subject_to_agent = \"sub\"\nallowed_algs = [\"EdDSA\"]\n\n{lists}",
             dir.join("keys/issuer.pem").display(),
             dir.join("audit.sqlite").display(),
+            opts.extra,
             opts.actor_auth,
             issuers.server.url("/jwks"),
             issuers.server.url("/actor-jwks"),
@@ -1424,6 +1428,27 @@ async fn the_admin_api_is_not_on_the_forwarding_listener() {
             }
         }
     }
+    // The listed routes are there.
+    for path in [
+        "/healthz",
+        "/readyz",
+        "/.well-known/jwks.json",
+        "/.well-known/authzen-configuration",
+    ] {
+        let a = plain_client().get(h.fwd_url(path)).send().await.unwrap();
+        assert_eq!(a.status(), StatusCode::OK, "{path}");
+    }
+    for path in [
+        "/token",
+        "/token/renew",
+        "/access/v1/evaluation",
+        "/mcp/github",
+    ] {
+        // Answered by the route (`/mcp/github` names no upstream here: the proxy's own 404,
+        // with a body), not the bare 404 of a path that is not served.
+        let got = unknown(reqwest::Method::POST, path, false).await;
+        assert_ne!(got, none, "{path}");
+    }
     // On the main listener they are there.
     let a = plain_client()
         .get(h.main_url("/admin/whoami"))
@@ -1432,6 +1457,89 @@ async fn the_admin_api_is_not_on_the_forwarding_listener() {
         .await
         .unwrap();
     assert_eq!(a.status(), StatusCode::OK);
+    h.stop().await;
+}
+
+/// `[limits] token_unauthenticated_requests_per_minute` on the forwarding listener: every
+/// peer there is the proxy, so the minute is counted per forwarded certificate, and requests
+/// without one are not counted (the proxy must limit those). Anonymous requests and another
+/// certificate's failures do not lock a certificate client out; a certificate's own failures
+/// do.
+#[tokio::test]
+async fn one_client_behind_the_proxy_cannot_use_up_the_minute_of_the_others() {
+    let h = Harness::start(Opts {
+        extra: "[limits]\ntoken_unauthenticated_requests_per_minute = 3\n\n",
+        ..Opts::default()
+    })
+    .await;
+    let anonymous = || async {
+        let mut conn = tcp(h.ports.forwarded, None).await.unwrap();
+        request_on(&mut conn, "POST", "/token", &[], None)
+            .await
+            .unwrap()
+            .0
+    };
+    for _ in 0..6 {
+        assert_ne!(anonymous().await, 429);
+    }
+    let exchange = |cert: &'static str| {
+        let h = &h;
+        async move {
+            let cert = match cert {
+                "coder" => &h.certs.coder,
+                _ => &h.certs.stranger,
+            };
+            let (root, _) = h.root().await;
+            let body = exchange_body(&root, "coder", json!({"client_id": "coder"}));
+            h.fwd(Some(cert), "/token", &body, &[]).await
+        }
+    };
+    assert_eq!(exchange("coder").await.status, StatusCode::OK);
+    // The stranger's certificate fails three times, then its minute is used up.
+    for _ in 0..3 {
+        assert_eq!(exchange("stranger").await.status, StatusCode::UNAUTHORIZED);
+    }
+    let a = exchange("stranger").await;
+    assert_eq!(a.status, StatusCode::TOO_MANY_REQUESTS, "{}", a.body);
+    // Not anyone else's: coder's certificate and anonymous requests go on.
+    assert_eq!(exchange("coder").await.status, StatusCode::OK);
+    assert_ne!(anonymous().await, 429);
+    h.stop().await;
+}
+
+/// The other direction: on the native TLS listener the minute stays per peer address, so a
+/// peer that used it up gets no new one by presenting a certificate it made up, nor with a
+/// pinned one.
+#[tokio::test]
+async fn a_new_certificate_gives_a_native_peer_no_new_minute() {
+    let h = Harness::start(Opts {
+        main_tls: true,
+        extra: "[limits]\ntoken_unauthenticated_requests_per_minute = 3\n\n",
+        ..Opts::default()
+    })
+    .await;
+    let c = &h.certs;
+    for _ in 0..3 {
+        let a = h.native(None, "/token", &json!({})).await;
+        assert_ne!(a.status, StatusCode::TOO_MANY_REQUESTS, "{}", a.body);
+    }
+    for cert in [ClientCert::new("made up"), ClientCert::new("another")] {
+        let (root, _) = h.root().await;
+        let body = exchange_body(&root, "coder", json!({"client_id": "coder"}));
+        let a = h.native(Some(&cert), "/token", &body).await;
+        assert_eq!(a.status, StatusCode::TOO_MANY_REQUESTS, "{}", a.body);
+    }
+    let (root, _) = h.root().await;
+    let body = exchange_body(&root, "coder", json!({"client_id": "coder"}));
+    let a = h.native(Some(&c.coder), "/token", &body).await;
+    assert_eq!(a.status, StatusCode::TOO_MANY_REQUESTS, "{}", a.body);
+    // The forwarding listener's table is apart: coder through the proxy goes on.
+    let (root, _) = h.root().await;
+    let body = exchange_body(&root, "coder", json!({"client_id": "coder"}));
+    assert_eq!(
+        h.fwd(Some(&c.coder), "/token", &body, &[]).await.status,
+        StatusCode::OK
+    );
     h.stop().await;
 }
 
@@ -1449,16 +1557,32 @@ async fn malformed_headers_are_refused() {
     let b64 = &leaf[1..leaf.len() - 1];
     let five = vec![mid.clone(); 5].join(", ");
     let big = sf_binary(&vec![0x30; 70 * 1024]);
+    // A certificate whose base64 has padding and uses `+` or `/`, so that dropping the padding
+    // and the URL-safe alphabet really change the value (a fixed certificate would not be
+    // enough: a DER length that is a multiple of 3 has no padding).
+    let odd = (0..64)
+        .map(|_| ClientCert::new("odd"))
+        .find(|c| {
+            let e = base64::engine::general_purpose::STANDARD.encode(c.der.as_ref());
+            e.ends_with('=') && (e.contains('+') || e.contains('/'))
+        })
+        .expect("a certificate with padded base64 and + or /");
+    let odd_b64 = base64::engine::general_purpose::STANDARD.encode(odd.der.as_ref());
+    let unpadded = odd_b64.trim_end_matches('=');
+    let url_safe = odd_b64.replace('+', "-").replace('/', "_");
+    assert_ne!(unpadded, odd_b64);
+    assert_ne!(url_safe, odd_b64);
     let cases: Vec<Vec<(&str, String)>> = vec![
         vec![("Client-Cert", b64.to_owned())],
+        // An empty value, as a proxy that sets the header for a client without a certificate
+        // would send: refused, never read as "no certificate".
+        vec![("Client-Cert", String::new())],
+        vec![("Client-Cert", " ".into())],
         vec![("Client-Cert", format!("{leaf};sha256=abc"))],
         vec![("Client-Cert", format!("{leaf}, {leaf}"))],
         vec![("Client-Cert", leaf.clone()), ("Client-Cert", leaf.clone())],
-        vec![("Client-Cert", format!(":{}:", b64.trim_end_matches('=')))],
-        vec![(
-            "Client-Cert",
-            format!(":{}:", b64.replace('+', "-").replace('/', "_")),
-        )],
+        vec![("Client-Cert", format!(":{unpadded}:"))],
+        vec![("Client-Cert", format!(":{url_safe}:"))],
         vec![("Client-Cert", "::".into())],
         vec![(
             "Client-Cert",
@@ -1527,6 +1651,12 @@ async fn malformed_headers_are_refused() {
             .count(),
         1
     );
+    // The odd certificate itself, padded and in the standard alphabet, is a well-formed
+    // header: it is not pinned, so the answer is the usual refusal, not 400.
+    let (root, _) = h.root().await;
+    let odd_body = exchange_body(&root, "coder", json!({"client_id": "coder"}));
+    let a = h.fwd(Some(&odd), "/token", &odd_body, &[]).await;
+    assert_eq!(a.status, StatusCode::UNAUTHORIZED, "{}", a.body);
     h.stop().await;
 }
 
@@ -1832,11 +1962,13 @@ async fn bad_configs_refuse_to_start() {
     );
     for (server, want) in [
         (fwd("127.0.0.1:18444", "[]"), "trusted_peers is empty"),
+        (fwd("127.0.0.1:18444", "[\"0.0.0.0/0\"]"), "wider than /8"),
+        (fwd("127.0.0.1:18444", "[\"::/0\"]"), "wider than /32"),
         (
-            fwd("127.0.0.1:18444", "[\"0.0.0.0/0\"]"),
+            fwd("127.0.0.1:18444", "[\"0.0.0.0\"]"),
             "unspecified address",
         ),
-        (fwd("127.0.0.1:18444", "[\"::/0\"]"), "unspecified address"),
+        (fwd("127.0.0.1:18444", "[\"fe80::1\"]"), "link-local"),
         (fwd("127.0.0.1:18444", "[\"10.0.0.0/4\"]"), "wider than /8"),
         (
             fwd("127.0.0.1:18444", "[\"proxy.internal\"]"),
@@ -1903,4 +2035,47 @@ fn an_environment_override_cannot_enable_the_section() {
             "{e}"
         );
     }
+}
+
+/// The HAProxy recipe in the deploying guide is `deploy/haproxy/forwarded-client-cert.cfg` as
+/// it is, and the file runs HAProxy in HTTP mode with the lines that remove the client's own
+/// headers, so the copy people paste is the one `scripts/haproxy-forwarded-smoke.sh` ran.
+#[test]
+fn the_guide_shows_the_haproxy_recipe_file_as_it_is() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let file =
+        std::fs::read_to_string(root.join("deploy/haproxy/forwarded-client-cert.cfg")).unwrap();
+    let guide = std::fs::read_to_string(root.join("docs/guides/deploying.md")).unwrap();
+    let section = &guide[guide.find("#### HAProxy").expect("the HAProxy section")..];
+    let start = section.find("```haproxy\n").expect("the recipe block") + "```haproxy\n".len();
+    let block = &section[start..start + section[start..].find("```").unwrap()];
+    assert_eq!(
+        block, file,
+        "docs/guides/deploying.md and deploy/haproxy/forwarded-client-cert.cfg differ"
+    );
+    let lines: Vec<&str> = file
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with('#'))
+        .collect();
+    for want in [
+        "mode http",
+        "http-request del-header Client-Cert",
+        "http-request del-header Client-Cert-Chain",
+    ] {
+        assert!(lines.contains(&want), "{want}");
+    }
+    assert!(!lines.iter().any(|l| l.contains("mode tcp")));
+    // The defaults section and the frontend and backend each say `mode http`.
+    assert_eq!(lines.iter().filter(|l| **l == "mode http").count(), 3);
+    // Removing comes before setting.
+    let del = lines
+        .iter()
+        .position(|l| *l == "http-request del-header Client-Cert")
+        .unwrap();
+    let set = lines
+        .iter()
+        .position(|l| l.starts_with("http-request set-header Client-Cert "))
+        .unwrap();
+    assert!(del < set);
 }

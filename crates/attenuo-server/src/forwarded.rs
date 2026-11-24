@@ -25,10 +25,12 @@
 //!    rustls-webpki can read. Anything else is `400 client_cert_header_malformed`, with a
 //!    fixed text that never echoes the header.
 //! 6. The certificate becomes the [`ClientCertificate`] the handshake path makes, marked
-//!    [`CertSource::Forwarded`], and goes through the same client authentication
-//!    ([`crate::clientauth`]). It is made anew for every request, so the CA check's cache
-//!    ([`crate::client_pki::PerConnection`]) is never shared between two certificates that a
-//!    proxy sends on one kept-alive connection.
+//!    [`CertSource::Forwarded`](crate::client_cert::CertSource::Forwarded), and goes
+//!    through the same client authentication ([`crate::clientauth`]). It is made anew for every request. The CA check's answers
+//!    ([`crate::client_pki::PerConnection`]) are shared only by requests that forward the
+//!    same certificate and the same intermediates ([`crate::client_pki::SharedStates`]),
+//!    never by two certificates a proxy sends on one kept-alive connection.
+//! 7. Only the routes in [`SERVED_ROUTES`] answer there ([`only_served_routes`]).
 //!
 //! The listener and `trusted_peers` are read at start only; a reload does not change them.
 
@@ -42,7 +44,7 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
 use rustls::pki_types::CertificateDer;
 
-use crate::client_cert::{CertSource, ClientCertificate, MAX_INTERMEDIATES};
+use crate::client_cert::{ClientCertificate, MAX_INTERMEDIATES};
 use crate::config::Config;
 use crate::error::ApiError;
 use crate::listen::ServedForwarded;
@@ -68,8 +70,11 @@ const MAX_LEAF_VALUE_BYTES: usize = MAX_ITEM_CHARS + 16;
 const MAX_CHAIN_VALUE_BYTES: usize = MAX_INTERMEDIATES * (MAX_ITEM_CHARS + 4) + 16;
 /// Most entries of `trusted_peers`.
 pub(crate) const MAX_TRUSTED_PEERS: usize = 64;
-/// The widest network `trusted_peers` may name, for IPv4 and for IPv6: `/8`.
-const MIN_PREFIX: u8 = 8;
+/// The widest IPv4 network `trusted_peers` may name: `/8`.
+const MIN_PREFIX_V4: u8 = 8;
+/// The widest IPv6 network `trusted_peers` may name: `/32`, the size of a large provider's
+/// whole allocation. A proxy's addresses fit in far less.
+const MIN_PREFIX_V6: u8 = 32;
 
 /// The `detail` of `400 client_cert_header_malformed`. Fixed: the header is never echoed.
 pub(crate) const MALFORMED_DETAIL: &str = "the Client-Cert or Client-Cert-Chain header is not a \
@@ -90,10 +95,12 @@ pub(crate) struct Net {
 
 impl Net {
     /// Read `a.b.c.d`, `a.b.c.d/n`, an IPv6 address, or an IPv6 address with `/n`. Refused:
-    /// anything else, a prefix longer than the address, a prefix with a sign or a leading
-    /// zero, bits set after the prefix, a prefix shorter than [`MIN_PREFIX`] (so `/0`), an
-    /// unspecified address (`0.0.0.0`, `::`), and an IPv4-mapped IPv6 address (write it as
-    /// IPv4).
+    /// anything else (a zone such as `%eth0` too), a prefix longer than the address, a prefix
+    /// with a sign or a leading zero, a prefix shorter than [`MIN_PREFIX_V4`] or
+    /// [`MIN_PREFIX_V6`] (so `/0`), bits set after the prefix, the unspecified address
+    /// (`0.0.0.0`, `::`) or a network that starts at it, an IPv4-mapped IPv6 address (write it
+    /// as IPv4), and an IPv6 link-local address (`fe80::/10`: the peer's zone is not compared,
+    /// so the entry would match that address on every interface).
     pub(crate) fn parse(s: &str) -> Result<Self, String> {
         let (addr, prefix) = match s.split_once('/') {
             Some((a, p)) => (a, Some(p)),
@@ -116,18 +123,37 @@ impl Net {
                 }
             }
         };
+        let min = if addr.is_ipv4() {
+            MIN_PREFIX_V4
+        } else {
+            MIN_PREFIX_V6
+        };
+        if prefix < min {
+            return Err(format!(
+                "is wider than /{min} (the widest {} network allowed): name the proxy's own \
+                 addresses",
+                if addr.is_ipv4() { "IPv4" } else { "IPv6" }
+            ));
+        }
         if addr.is_unspecified() {
-            return Err("is the unspecified address, which would trust every peer".into());
+            return Err(if prefix == bits {
+                "is the unspecified address, which is never a peer's address".into()
+            } else {
+                "is a network at the unspecified address, not a proxy's network".into()
+            });
         }
         if let IpAddr::V6(v6) = addr {
             if v6.to_ipv4_mapped().is_some() {
                 return Err("is an IPv4-mapped IPv6 address: write it as IPv4".into());
             }
-        }
-        if prefix < MIN_PREFIX {
-            return Err(format!(
-                "is wider than /{MIN_PREFIX}: name the proxy's own addresses"
-            ));
+            if v6.segments()[0] & 0xffc0 == 0xfe80 {
+                return Err(
+                    "is an IPv6 link-local address: its zone is not compared, so it would \
+                     match that address on every interface. Use a global or unique local \
+                     address"
+                        .into(),
+                );
+            }
         }
         let net = Self { addr, prefix };
         if net.network() != addr {
@@ -234,6 +260,10 @@ pub(crate) struct Settings {
     pub(crate) listen: SocketAddr,
     /// `trusted_peers`.
     pub(crate) peers: Arc<TrustedPeers>,
+    /// The CA check's answers for the certificates forwarded lately, shared by the requests
+    /// that forward the same certificate and intermediates
+    /// ([`crate::client_pki::SharedStates`]).
+    pub(crate) pki: Arc<crate::client_pki::SharedStates>,
 }
 
 /// Whether two listen addresses would be the same socket: the same port (not 0) and the same
@@ -304,6 +334,7 @@ impl Settings {
         Ok(Some(Self {
             listen,
             peers: Arc::new(peers),
+            pki: Arc::new(crate::client_pki::SharedStates::new()),
         }))
     }
 }
@@ -317,7 +348,10 @@ impl Settings {
 /// As [`parse_values`], and when either header appears on more than one line, a value holds
 /// a byte that is not visible ASCII, a space or a tab, or a certificate is not DER that
 /// rustls-webpki can read.
-pub(crate) fn parse(headers: &HeaderMap) -> Result<Option<ClientCertificate>, &'static str> {
+pub(crate) fn parse(
+    headers: &HeaderMap,
+    pki: &crate::client_pki::SharedStates,
+) -> Result<Option<ClientCertificate>, &'static str> {
     let one = |name: &str, repeated: &'static str| {
         let mut all = headers.get_all(name).iter();
         match (all.next(), all.next()) {
@@ -341,11 +375,7 @@ pub(crate) fn parse(headers: &HeaderMap) -> Result<Option<ClientCertificate>, &'
             return Err("not_a_certificate");
         }
     }
-    Ok(Some(ClientCertificate::from_chain(
-        leaf,
-        &chain,
-        CertSource::Forwarded,
-    )))
+    Ok(Some(ClientCertificate::forwarded(leaf, &chain, pki)))
 }
 
 /// The DER of a `Client-Cert` and of each `Client-Cert-Chain` member, in order.
@@ -358,7 +388,8 @@ pub(crate) type Parsed = (Vec<u8>, Vec<Vec<u8>>);
 /// - `Client-Cert` is one Byte Sequence (`:` base64 `:`) with no parameters; spaces before
 ///   and after it are allowed.
 /// - `Client-Cert-Chain` is a List of such items, separated by `,` with optional spaces or
-///   tabs around it, at most [`MAX_INTERMEDIATES`] of them, none empty, no trailing comma.
+///   tabs around it (only spaces before the first and after the last), at most
+///   [`MAX_INTERMEDIATES`] of them, none empty, no trailing comma.
 ///   It needs a `Client-Cert`.
 /// - The base64 is the standard alphabet with padding, canonical (no stray bits), and not
 ///   empty. Each certificate is at most [`MAX_CERT_DER_BYTES`], all of them together at most
@@ -398,8 +429,13 @@ pub(crate) fn parse_values(
         if members.len() > MAX_INTERMEDIATES {
             return Err("too_many_intermediates");
         }
-        for m in members {
-            let der = byte_sequence(trim(m, b" \t"))?;
+        let last = members.len() - 1;
+        for (i, m) in members.into_iter().enumerate() {
+            // RFC 8941 §4.2.1: only SP before the first member and after the last (cut
+            // above); SP or HTAB on either side of a comma.
+            let m = if i > 0 { trim_start(m, b" \t") } else { m };
+            let m = if i < last { trim_end(m, b" \t") } else { m };
+            let der = byte_sequence(m)?;
             total += der.len();
             certs.push(der);
         }
@@ -411,13 +447,23 @@ pub(crate) fn parse_values(
 }
 
 /// `v` without the bytes of `what` at either end.
-fn trim<'a>(mut v: &'a [u8], what: &[u8]) -> &'a [u8] {
+fn trim<'a>(v: &'a [u8], what: &[u8]) -> &'a [u8] {
+    trim_end(trim_start(v, what), what)
+}
+
+/// `v` without the bytes of `what` at its start.
+fn trim_start<'a>(mut v: &'a [u8], what: &[u8]) -> &'a [u8] {
     while let Some((first, rest)) = v.split_first() {
         if !what.contains(first) {
             break;
         }
         v = rest;
     }
+    v
+}
+
+/// `v` without the bytes of `what` at its end.
+fn trim_end<'a>(mut v: &'a [u8], what: &[u8]) -> &'a [u8] {
     while let Some((last, rest)) = v.split_last() {
         if !what.contains(last) {
             break;
@@ -537,6 +583,7 @@ fn peer(req: &axum::extract::Request) -> String {
 ///   client_cert_header_not_accepted`, logged at warn with the peer address (throttled,
 ///   [`Throttle`]).
 pub(crate) async fn headers(
+    axum::extract::State(pki): axum::extract::State<Arc<crate::client_pki::SharedStates>>,
     mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
@@ -573,7 +620,7 @@ pub(crate) async fn headers(
             .into_response();
     }
     if has_headers {
-        match parse(req.headers()) {
+        match parse(req.headers(), &pki) {
             Ok(Some(cert)) => {
                 req.extensions_mut().insert(cert);
             }
@@ -605,15 +652,74 @@ pub(crate) async fn headers(
     next.run(req).await
 }
 
-/// Layer of the `/admin/*` routes on the main router when `[server.forwarded_client_cert]` is
-/// set: on the forwarding listener they answer as a path the router does not know (`404`,
-/// empty body), for every method. The admin API is never served there.
-pub(crate) async fn not_on_forwarding_listener(
+/// The routes of the main router that the forwarding listener serves, by the template axum
+/// matched, each with why a client reaches it through the proxy. Every other route answers
+/// there as a path the router does not know ([`only_served_routes`]). A new route is not
+/// served until it is listed here; a test fails until it is listed here or in
+/// [`NOT_SERVED_ROUTES`] / [`NOT_SERVED_PREFIXES`].
+pub(crate) const SERVED_ROUTES: &[(&str, &str)] = &[
+    (
+        "/token",
+        "agents exchange tokens, authenticated by the forwarded certificate",
+    ),
+    ("/token/renew", "agents renew the tokens they got there"),
+    (
+        "/access/v1/evaluation",
+        "PEPs, authenticated by the forwarded certificate",
+    ),
+    ("/access/v1/evaluations", "PEPs, as above"),
+    ("/access/v1/search/action", "PEPs, as above"),
+    (
+        "/mcp/{server}",
+        "agents call MCP servers through attenuo at its public URL",
+    ),
+    (
+        "/approvals/{id}",
+        "the approver opens the approval link, which names the public URL",
+    ),
+    (
+        "/.well-known/jwks.json",
+        "token verifiers read the keys at the public URL",
+    ),
+    (
+        "/.well-known/authzen-configuration",
+        "PEPs discover the endpoints at the public URL",
+    ),
+    ("/healthz", "the proxy's health check"),
+    ("/readyz", "the proxy's readiness check"),
+];
+
+/// Routes of the main router that the forwarding listener never serves, each with why.
+// Read by the route test only: [`only_served_routes`] serves nothing it does not list.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const NOT_SERVED_ROUTES: &[(&str, &str)] = &[(
+    "/ext-authz/v1/mcp/{server}",
+    "a gateway calls it directly, with the agent's request headers copied into its check; \
+     on this listener a copied Client-Cert would be read as one the proxy checked",
+)];
+
+/// Path prefixes the forwarding listener never serves: the admin API (operators use the main
+/// or the `[admin] listen` listener).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const NOT_SERVED_PREFIXES: &[&str] = &["/admin/"];
+
+/// Outermost layer of the main router when `[server.forwarded_client_cert]` is set: on the
+/// forwarding listener ([`ServedForwarded`]) a request whose matched route is not in
+/// [`SERVED_ROUTES`] answers as a path the router does not know (`404`, empty body), for
+/// every method, before any other layer runs. Elsewhere it does nothing. One router serves
+/// both listeners, so MCP sessions and limits stay shared.
+pub(crate) async fn only_served_routes(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     if req.extensions().get::<ServedForwarded>().is_some() {
-        return StatusCode::NOT_FOUND.into_response();
+        let served = req
+            .extensions()
+            .get::<axum::extract::MatchedPath>()
+            .is_some_and(|p| SERVED_ROUTES.iter().any(|(r, _)| *r == p.as_str()));
+        if !served {
+            return StatusCode::NOT_FOUND.into_response();
+        }
     }
     next.run(req).await
 }
@@ -640,6 +746,7 @@ pub(crate) static UNTRUSTED: Throttle = Throttle::new();
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client_cert::CertSource;
 
     fn b64(der: &[u8]) -> String {
         format!(":{}:", STANDARD.encode(der))
@@ -647,6 +754,11 @@ mod tests {
 
     fn values(leaf: Option<&str>, chain: Option<&str>) -> Result<Option<Parsed>, &'static str> {
         parse_values(leaf.map(str::as_bytes), chain.map(str::as_bytes))
+    }
+
+    /// [`super::parse`] with a cache of its own.
+    fn parse(h: &HeaderMap) -> Result<Option<ClientCertificate>, &'static str> {
+        super::parse(h, &crate::client_pki::SharedStates::new())
     }
 
     fn nets(entries: &[&str]) -> anyhow::Result<TrustedPeers> {
@@ -659,7 +771,7 @@ mod tests {
             "127.0.0.1/32",
             "10.1.0.0/16",
             "::1",
-            "fd00::/8",
+            "fd00::/32",
             "192.0.2.7",
         ])
         .unwrap();
@@ -667,7 +779,7 @@ mod tests {
             "127.0.0.1",
             "10.1.200.3",
             "::1",
-            "fd12::1",
+            "fd00:0:12::1",
             "192.0.2.7",
             "::ffff:10.1.0.1",
         ] {
@@ -678,6 +790,7 @@ mod tests {
             "10.2.0.1",
             "::2",
             "fe80::1",
+            "fd01::1",
             "192.0.2.8",
             "::ffff:127.0.0.2",
         ] {
@@ -686,17 +799,26 @@ mod tests {
         // A v4 entry never holds a v6 peer that is not mapped, nor the reverse.
         let v4 = nets(&["127.0.0.0/8"]).unwrap();
         assert!(!v4.contains("::7f00:1".parse().unwrap()));
-        assert!(nets(&["10.0.0.0/8", "128.0.0.0/8", "2001:db8::/32"]).is_ok());
+        assert!(nets(&["10.0.0.0/8", "128.0.0.0/8", "2001:db8::/32", "fd00::/48"]).is_ok());
 
         for (entry, why) in [
-            ("0.0.0.0/0", "unspecified"),
-            ("0.0.0.0", "unspecified"),
-            ("::/0", "unspecified"),
-            ("::", "unspecified"),
-            ("0.0.0.0/8", "unspecified"),
+            (
+                "0.0.0.0/0",
+                "wider than /8 (the widest IPv4 network allowed)",
+            ),
+            ("0.0.0.0", "is the unspecified address"),
+            ("::/0", "wider than /32 (the widest IPv6 network allowed)"),
+            ("::/8", "wider than /32"),
+            ("::", "is the unspecified address"),
+            ("0.0.0.0/8", "a network at the unspecified address"),
+            ("::/32", "a network at the unspecified address"),
             ("128.0.0.0/1", "wider than /8"),
             ("10.0.0.0/7", "wider than /8"),
-            ("fd00::/7", "wider than /8"),
+            ("fd00::/8", "wider than /32"),
+            ("2001:db8::/31", "wider than /32"),
+            ("fe80::1", "link-local"),
+            ("fe80::/64", "link-local"),
+            ("febf:ffff::/32", "link-local"),
             ("10.0.0.1/8", "bits set after the prefix: write 10.0.0.0/8"),
             ("127.0.0.1/33", "prefix length over 32"),
             ("::1/129", "prefix length over 128"),
@@ -746,6 +868,13 @@ mod tests {
             values(
                 Some(&format!("  {}  ", b64(&leaf))),
                 Some(&format!(" {} ,\t{}", b64(&a), b64(&b)))
+            ),
+            Ok(Some((leaf.clone(), vec![a.clone(), b.clone()])))
+        );
+        assert_eq!(
+            values(
+                Some(&b64(&leaf)),
+                Some(&format!("{}\t, \t{}  ", b64(&a), b64(&b)))
             ),
             Ok(Some((leaf.clone(), vec![a.clone(), b.clone()])))
         );
@@ -806,6 +935,28 @@ mod tests {
                 "empty_item",
             ),
             (Some(leaf.as_str()), Some(&format!("{a};x")), "parameters"),
+            // Only SP before the first member and after the last (RFC 8941 §4.2.1).
+            (
+                Some(leaf.as_str()),
+                Some(&format!("\t{a}")),
+                "not_a_byte_sequence",
+            ),
+            (
+                Some(leaf.as_str()),
+                Some(&format!(" \t{a}, {a}")),
+                "not_a_byte_sequence",
+            ),
+            (
+                Some(leaf.as_str()),
+                Some(&format!("{a}\t")),
+                "trailing_data",
+            ),
+            (
+                Some(leaf.as_str()),
+                Some(&format!("{a}, {a}\t")),
+                "trailing_data",
+            ),
+            (Some(&format!("{leaf}\t")), None, "trailing_data"),
             (
                 Some(leaf.as_str()),
                 Some(&format!("{a} {a}")),
@@ -901,16 +1052,222 @@ mod tests {
         assert_eq!(cert.intermediates(), Some(&[][..]));
     }
 
-    /// Two parses of the same header are two certificates with state of their own: the CA
-    /// check's cache is per request on this listener.
+    /// Each parse is a certificate of its own. Two parses of the same certificate and
+    /// intermediates kept share the CA check's state; another certificate has its own.
     #[test]
     fn each_parse_is_a_new_certificate() {
+        let shared = crate::client_pki::SharedStates::new();
         let leaf = b64(&self_signed());
+        let (m1, m2) = (b64(&self_signed()), b64(&self_signed()));
         let h = header_map(&[("Client-Cert", &leaf)]);
-        let a = parse(&h).unwrap().unwrap();
-        let b = parse(&h).unwrap().unwrap();
+        let a = super::parse(&h, &shared).unwrap().unwrap();
+        let b = super::parse(&h, &shared).unwrap().unwrap();
         assert_eq!(a.sha256(), b.sha256());
-        assert!(!std::ptr::eq(a.pki_state(), b.pki_state()));
+        assert!(std::ptr::eq(a.pki_state(), b.pki_state()));
+        let with = |m: &str| {
+            super::parse(
+                &header_map(&[("Client-Cert", &leaf), ("Client-Cert-Chain", m)]),
+                &shared,
+            )
+            .unwrap()
+            .unwrap()
+        };
+        // The key is the intermediates kept: a self-signed one is dropped (it cannot help a
+        // path), so these share the state of the certificate alone. Kept intermediates make
+        // another key (`client_pki` tests).
+        let (c, d) = (with(&m1), with(&m2));
+        assert!(std::ptr::eq(a.pki_state(), c.pki_state()));
+        assert!(std::ptr::eq(c.pki_state(), d.pki_state()));
+        let other = b64(&self_signed());
+        let e = super::parse(&header_map(&[("Client-Cert", &other)]), &shared)
+            .unwrap()
+            .unwrap();
+        assert!(!std::ptr::eq(a.pki_state(), e.pki_state()));
+    }
+
+    /// Every route the main router mounts (in `lib.rs` and the MCP proxy's router) is either
+    /// served on the forwarding listener or explicitly not, so a new route forces a decision;
+    /// and every listed route exists.
+    #[test]
+    fn every_route_is_decided_for_the_forwarding_listener() {
+        let sources = [
+            include_str!("lib.rs"),
+            include_str!("../../attenuo-proxy/src/proxy.rs"),
+        ];
+        let mut found = Vec::new();
+        for src in sources {
+            // Not the test modules.
+            let src = src.split("\n#[cfg(test)]\nmod ").next().unwrap();
+            let mut rest = src;
+            while let Some(at) = rest.find(".route(") {
+                rest = &rest[at + ".route(".len()..];
+                let t = rest.trim_start();
+                let Some(after) = t.strip_prefix('"') else {
+                    panic!("a route whose path is not a string literal: {:?}", &t[..40]);
+                };
+                found.push(after[..after.find('"').unwrap()].to_owned());
+            }
+        }
+        assert!(found.len() > 20, "{found:?}");
+        for path in &found {
+            let served = SERVED_ROUTES.iter().any(|(r, _)| r == path);
+            let not = NOT_SERVED_ROUTES.iter().any(|(r, _)| r == path)
+                || NOT_SERVED_PREFIXES.iter().any(|p| path.starts_with(p));
+            assert!(
+                served != not,
+                "{path}: add it to SERVED_ROUTES or NOT_SERVED_ROUTES in forwarded.rs (and to \
+                 the list in docs/reference/http-api.md)"
+            );
+        }
+        for (r, _) in SERVED_ROUTES.iter().chain(NOT_SERVED_ROUTES) {
+            assert!(
+                found.iter().any(|f| f == r),
+                "{r} is listed but not mounted"
+            );
+        }
+    }
+
+    /// A router with a served route, a route that is not served, an admin route and a handler
+    /// that reports what it sees, behind [`only_served_routes`] and [`headers`], with the
+    /// forwarding marker set or not.
+    fn marked_router(forwarded: bool) -> axum::Router {
+        use axum::routing::{get, post};
+        let seen = |req: axum::extract::Request| async move {
+            let h = req.headers();
+            format!(
+                "client-cert={} chain={} cert={}",
+                h.contains_key(CLIENT_CERT),
+                h.contains_key(CLIENT_CERT_CHAIN),
+                req.extensions()
+                    .get::<ClientCertificate>()
+                    .map_or("none".into(), |c| c.source().as_str().to_owned())
+            )
+        };
+        let app = axum::Router::new()
+            .route("/token", post(seen))
+            .route("/mcp/{server}", post(seen))
+            .route("/ext-authz/v1/mcp/{server}", post(seen))
+            .route("/admin/whoami", get(seen))
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::new(crate::client_pki::SharedStates::new()),
+                headers,
+            ))
+            .layer(axum::middleware::from_fn(only_served_routes));
+        if forwarded {
+            app.layer(axum::middleware::from_fn(
+                |mut req: axum::extract::Request, next: axum::middleware::Next| async move {
+                    req.extensions_mut().insert(ServedForwarded);
+                    next.run(req).await
+                },
+            ))
+        } else {
+            app
+        }
+    }
+
+    async fn send(
+        app: &axum::Router,
+        method: &str,
+        path: &str,
+        hs: &[(&str, &str)],
+    ) -> (StatusCode, String) {
+        use tower::ServiceExt as _;
+        let mut req = axum::http::Request::builder().method(method).uri(path);
+        for (k, v) in hs {
+            req = req.header(*k, *v);
+        }
+        let res = app
+            .clone()
+            .oneshot(req.body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = res.status();
+        let body = axum::body::to_bytes(res.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    /// On the forwarding listener only the listed routes answer; the others, and unknown
+    /// paths, are one bare 404 for every method. Elsewhere nothing changes.
+    #[tokio::test]
+    async fn the_forwarding_listener_serves_the_listed_routes_only() {
+        let fwd = marked_router(true);
+        let unknown = send(&fwd, "GET", "/no/such/path", &[]).await;
+        assert_eq!(unknown, (StatusCode::NOT_FOUND, String::new()));
+        for (method, path) in [
+            ("POST", "/ext-authz/v1/mcp/github"),
+            ("GET", "/ext-authz/v1/mcp/github"),
+            ("GET", "/admin/whoami"),
+            ("POST", "/admin/whoami"),
+            ("DELETE", "/admin/whoami"),
+        ] {
+            assert_eq!(
+                send(&fwd, method, path, &[]).await,
+                unknown,
+                "{method} {path}"
+            );
+        }
+        assert_eq!(send(&fwd, "POST", "/token", &[]).await.0, StatusCode::OK);
+        assert_eq!(
+            send(&fwd, "POST", "/mcp/github", &[]).await.0,
+            StatusCode::OK
+        );
+        // A served path with a method it does not take is the router's 405, as elsewhere.
+        assert_eq!(
+            send(&fwd, "GET", "/token", &[]).await.0,
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+        let main = marked_router(false);
+        for (method, path) in [
+            ("POST", "/ext-authz/v1/mcp/github"),
+            ("GET", "/admin/whoami"),
+            ("POST", "/token"),
+        ] {
+            assert_eq!(
+                send(&main, method, path, &[]).await.0,
+                StatusCode::OK,
+                "{path}"
+            );
+        }
+    }
+
+    /// The headers are read and taken off the request before any handler (the MCP proxy's
+    /// too) sees it; the handler sees the certificate only as the request's extension.
+    #[tokio::test]
+    async fn the_headers_are_gone_before_a_handler_sees_the_request() {
+        let fwd = marked_router(true);
+        let leaf = b64(&self_signed());
+        let chain = b64(&self_signed());
+        for path in ["/token", "/mcp/github"] {
+            let (status, body) = send(
+                &fwd,
+                "POST",
+                path,
+                &[("Client-Cert", &leaf), ("Client-Cert-Chain", &chain)],
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{path}");
+            assert_eq!(
+                body, "client-cert=false chain=false cert=forwarded",
+                "{path}"
+            );
+        }
+        // An empty `Client-Cert`, as a proxy that sets it for a client without a certificate
+        // would send, is refused: never read as "no certificate".
+        let (status, body) = send(&fwd, "POST", "/token", &[("Client-Cert", "")]).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("client_cert_header_malformed"), "{body}");
+        // Elsewhere the headers are refused before the handler.
+        let (status, body) = send(
+            &marked_router(false),
+            "POST",
+            "/token",
+            &[("Client-Cert", &leaf)],
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("client_cert_header_not_accepted"), "{body}");
     }
 
     #[test]
@@ -962,7 +1319,7 @@ mod tests {
             ),
             (
                 format!("{URL}{}", section("127.0.0.1:8444", "[\"0.0.0.0/0\"]")),
-                "unspecified address",
+                "wider than /8",
             ),
             (
                 format!("{URL}{}", section("127.0.0.1:8080", "[\"127.0.0.1\"]")),

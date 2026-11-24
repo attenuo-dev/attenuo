@@ -225,53 +225,106 @@ public_url = "https://attenuo.example.com"
 [server.forwarded_client_cert]
 # Plain HTTP. Bind it where only the proxy can reach it.
 listen = "127.0.0.1:8444"
-# The proxy's own addresses. Required. Nothing wider than /8, never 0.0.0.0/0.
+# The proxy's own addresses. Required. Nothing wider than /8 (IPv6: /32).
 trusted_peers = ["127.0.0.1/32"]
 ```
 
 The fences:
 
-- **A listener of its own.** The headers are read on `listen` only. It serves the same routes as the main listener (token, AuthZEN, approvals, discovery, health, the MCP proxy), but never `/admin/*`, the console or metrics. Point the proxy's backend at it.
+- **A listener of its own.** The headers are read on `listen` only. It serves only these routes: `POST /token`, `POST /token/renew`, `POST /access/v1/evaluation`, `POST /access/v1/evaluations`, `POST /access/v1/search/action`, `/mcp/{server}`, `/approvals/{id}`, `GET /.well-known/jwks.json`, `GET /.well-known/authzen-configuration`, `GET /healthz` and `GET /readyz`. Every other path, `/admin/*` and `/ext-authz/v1/mcp/{server}` included, answers there as an unknown path (`404`). The console and metrics are never there. Point the proxy's backend at it.
 - **Listed peers only.** A connection whose TCP peer address is not in `trusted_peers` gets `403 forwarded_peer_not_trusted` for every request, before routing, and is closed. `X-Forwarded-For` and similar headers are not read for this.
 - **Refused everywhere else.** While the section is set, a request with either header on the main, admin, console or metrics listener is refused with `400 client_cert_header_not_accepted` and logged at warn. A client that tries to claim a certificate there, or a proxy pointed at the wrong port, shows up at once. Without the section the headers are ignored, as before.
 - **One source per listener.** The forwarding listener never speaks TLS; the TLS listener never reads the headers. You may set both `[server.tls]` and this section: each request has one possible source.
-- **Strict headers.** One `Client-Cert` line with one `:base64:` item, an optional `Client-Cert-Chain` line with at most 4 items, standard base64, at most 16 KiB per certificate. Anything else is `400 client_cert_header_malformed`.
+- **Strict headers.** One `Client-Cert` line with one `:base64:` item, an optional `Client-Cert-Chain` line with at most 4 items, standard base64, at most 16 KiB per certificate. Anything else is `400 client_cert_header_malformed`, an empty `Client-Cert:` too: a proxy must leave the header out for a client without a certificate, or every such request is refused.
 - **The same checks.** The certificate is checked exactly as one from attenuo's own handshake: `tls_client_cert_sha256` or `tls_client_ca_pem_path` on the entry, the same one answer for every refusal. Audit records say `"source": "forwarded"`.
 - **Not from the environment.** No key of the section can be set by an `ATTENUO__...` variable. `listen` and `trusted_peers` are read at start only; changing them needs a restart.
 
-**The proxy MUST** remove any `Client-Cert` and `Client-Cert-Chain` header the client sent, and set them only from its own TLS handshake, only when the client presented a certificate. A proxy that passes on the client's copy lets anyone be anyone. attenuo cannot tell.
+**The proxy MUST** run in HTTP mode, remove every `Client-Cert` and `Client-Cert-Chain` header the client sent, and set them only from its own TLS handshake, only when the client presented a certificate. A proxy that passes on the client's copy lets anyone be anyone, and attenuo cannot tell. A proxy in TCP mode (layer 4) that ends TLS passes the client's bytes as they are, headers included: then **every client can claim any certificate**. The same is true when the lines that remove the headers are left out or do not run. attenuo cannot detect either mistake: a marker header the proxy adds could be sent by the client too, on a TCP-mode proxy.
 
 **What a reachable forwarding listener means.** Every process that can open a connection from a listed address can claim any certificate. With `127.0.0.1/32` that is every process on the host, not only the proxy. So run attenuo and the proxy where nothing else runs, or bind the listener to an address only the proxy reaches (a private interface, or the pod network of a sidecar proxy), and list only the proxy's address. A compromised proxy is a compromise of every certificate client.
 
 Other things change behind a proxy:
 
-- The per-peer limits (`[limits] token_unauthenticated_requests_per_minute`, SR-109) see the proxy's address for every client.
-- The CA check for `tls_client_ca_pem_path` runs on every request, because one proxy connection carries many clients. The native listener keeps the answer per connection.
+- **Rate limits.** On the forwarding listener every client has the proxy's address. So there `[limits] token_unauthenticated_requests_per_minute` counts per forwarded certificate (SHA-256), in a table of its own, and does not count requests without a certificate. One client cannot use up the minute of the others; but anyone can make new certificates, so this does not slow down an attacker. **Rate-limit `/token` per client address at the proxy.** On every other listener the limit stays per peer address, whatever certificate a request carries.
+- **CA check cost.** The CA check for `tls_client_ca_pem_path` keeps its answers per certificate and intermediates, shared by the requests that forward exactly the same bytes (at most 256 certificates, the oldest dropped first), with the same rules as the native listener's per-connection cache.
 - `[server] public_url` must be the proxy's `https://` URL.
+- **ext_authz.** With the section set, a gateway that calls `/ext-authz/v1/mcp/{server}` on the main listener and copies the agent's `Client-Cert` header into its check request gets `400 client_cert_header_not_accepted`. Do not forward that header in the check (in agentgateway, leave it out of `includeRequestHeaders`). `/ext-authz/...` is not served on the forwarding listener.
 
 #### HAProxy
 
-Tested here with HAProxy 2.8.30 (Ubuntu 24.04) against `attenuo-server`, for a pinned self-signed certificate and for a certificate from an intermediate CA:
+The recipe is [`deploy/haproxy/forwarded-client-cert.cfg`](https://github.com/attenuo-dev/attenuo/blob/main/deploy/haproxy/forwarded-client-cert.cfg). Use it as it is and set its four environment variables. It is shown here in full; a test checks that this copy and the file are the same.
 
-```text
+```haproxy
+# HAProxy in front of attenuo's [server.forwarded_client_cert] listener: HAProxy ends TLS,
+# asks each client for a certificate, and forwards the one from its handshake in the RFC 9440
+# Client-Cert header. See docs/guides/deploying.md, "Forwarded client certificates".
+#
+# Use this file as it is and set these environment variables (HAProxy reads them in the
+# quoted strings below):
+#
+#   ATTENUO_PROXY_BIND   where clients connect, for example :443
+#   ATTENUO_PROXY_PEM    the proxy's own certificate and private key, in one PEM file
+#   ATTENUO_CLIENT_CA    a PEM file of CA certificates: HAProxy names them to clients when it
+#                        asks for a certificate. It accepts any certificate; attenuo decides
+#                        whether it authenticates anyone.
+#   ATTENUO_FORWARDING   attenuo's [server.forwarded_client_cert] listen address, for example
+#                        127.0.0.1:8444
+#
+# Check it before use:  haproxy -c -f forwarded-client-cert.cfg
+# A warning that "http-request" rules are ignored means the lines that remove the client's
+# own Client-Cert headers are not running: then every client can claim any certificate.
+
+global
+    log stderr format short local0 info
+
+defaults
+    # HTTP mode is required. In TCP mode HAProxy passes the client's bytes as they are,
+    # Client-Cert headers included, and ignores every http-request line below.
+    mode http
+    log global
+    option httplog
+    timeout connect 5s
+    timeout client 30s
+    timeout server 30s
+    timeout http-request 10s
+
 frontend attenuo_tls
+    mode http
     # Ask for a client certificate and require none. The handshake proves that the client
-    # holds the key; attenuo decides whether the certificate authenticates anyone.
-    bind :443 ssl crt /etc/haproxy/attenuo.pem verify optional ca-file /etc/haproxy/agents-ca.pem ca-ignore-err all crt-ignore-err all
-    # MUST: drop any copy the client sent.
+    # holds the certificate's key; attenuo checks the certificate itself.
+    bind "${ATTENUO_PROXY_BIND}" ssl crt "${ATTENUO_PROXY_PEM}" alpn h2,http/1.1 verify optional ca-file "${ATTENUO_CLIENT_CA}" ca-ignore-err all crt-ignore-err all
+    # Required: remove every copy of both headers the client sent itself.
     http-request del-header Client-Cert
     http-request del-header Client-Cert-Chain
-    # Set it from this handshake only, and only when there was a certificate.
+    # Set Client-Cert from this connection's handshake, only when the client sent a
+    # certificate. A client without one gets no Client-Cert at all: attenuo refuses an empty
+    # one (400). HAProxy cannot send the intermediates as an RFC 9440 list, so no
+    # Client-Cert-Chain is set: put the issuing CA itself in the agent's CA file.
     http-request set-header Client-Cert :%[ssl_c_der,base64]: if { ssl_c_used } { ssl_c_der -m found }
     default_backend attenuo_forwarding
 
 backend attenuo_forwarding
-    server attenuo 127.0.0.1:8444
+    mode http
+    server attenuo "${ATTENUO_FORWARDING}"
 ```
 
+Before you send traffic through it:
+
+1. Run `haproxy -c -f forwarded-client-cert.cfg` with the variables set. It must say `Configuration file is valid` with no warning that `'http-request' rules [are] ignored`. That warning means HAProxy is in TCP mode and the lines that remove the client's headers are not running: every client can then claim any certificate.
+2. **Required check.** From a client with no certificate, send a forged header through the proxy and expect `401` with `"code": "client_auth_missing"`, never a token:
+
+   ```sh
+   curl -s https://attenuo.example.com/token -H 'Content-Type: application/json' \
+     -H "Client-Cert: :$(openssl x509 -in coder.crt -outform DER | base64 -w0):" \
+     -d '{"grant_type":"urn:ietf:params:oauth:grant-type:token-exchange","subject_token":"<a token>","subject_token_type":"urn:ietf:params:oauth:token-type:jwt","actor":"coder","client_id":"coder"}'
+   ```
+
+Notes:
+
 - `verify optional` with `ca-ignore-err all crt-ignore-err all` passes on any certificate whose key the client proved, as attenuo's own listener does. attenuo then checks the pin, or the chain and name. To let only certificates from your CA through the proxy, use `verify optional ca-file <your CA>` without the two `ignore-err` options, and add `{ ssl_c_verify 0 }` to the condition; then pinned self-signed certificates do not pass. This variant was not run here.
-- HAProxy cannot send the chain as an RFC 9440 list (`ssl_c_chain_der` is one blob), so it sends no `Client-Cert-Chain`. For a certificate from an intermediate CA, put the intermediate CA's certificate in the entry's `tls_client_ca_pem_path`. With only the root there, the check fails (`chain_invalid` in the debug log). This was checked both ways.
-- What was run: tokens issued through HAProxy for both agents; another agent's id with a certificate, and a stranger's certificate, refused with the one answer; a client's own `Client-Cert` header removed by HAProxy (`client_auth_missing` without a certificate, the stranger's certificate used with one); a direct request from `127.0.0.2` to the forwarding listener refused with `403`; the header on the main listener refused with `400`; the log lines `token exchanged` with `client_cert_source="forwarded"`.
+- HAProxy cannot send the chain as an RFC 9440 list (`ssl_c_chain_der` is one blob), so it sends no `Client-Cert-Chain`. For a certificate from an intermediate CA, put the intermediate CA's certificate in the entry's `tls_client_ca_pem_path`. With only the root there, the check fails (`chain_invalid` in the debug log).
+- HAProxy's request buffer (`tune.bufsize`, 16 KiB by default) holds the whole request head, so it bounds the size of the client certificate it can forward. A certificate of a few KiB fits; raise `tune.bufsize` in `global` for larger ones.
+- **What was run.** `scripts/haproxy-forwarded-smoke.sh` (not part of CI) runs the file above as it is, with HAProxy 2.8.30 (Ubuntu 24.04) and `attenuo-server`, on 127.0.0.1, over HTTP/1.1 and over HTTP/2 to HAProxy. On 2026-11-24: `haproxy -c` valid with no warning; a pinned self-signed certificate and a certificate from an intermediate CA got tokens; a stranger's certificate with coder's id got `401 client_authentication_failed`; forged `Client-Cert` and `Client-Cert-Chain` headers from a client without a certificate got `401 client_auth_missing`, and from a client with the stranger's certificate `401 client_authentication_failed`; a forged, malformed `Client-Cert-Chain` next to a good certificate was removed (`200`); a direct request from `127.0.0.2` to the forwarding listener got `403`; the header on the main listener got `400`; the log named `client_cert_source="forwarded"`.
 
 nginx exposes the certificate as URL-encoded PEM (`$ssl_client_escaped_cert`), not as an RFC 9440 byte sequence, and cannot make one without a script module. Envoy's default header is its own `x-forwarded-client-cert`, which attenuo does not read. Neither was tested here. [ADR-0021](../decisions/0021-forwarded-client-certificates.md) has the decision.
 
@@ -281,7 +334,7 @@ attenuo is an inline, fail-closed decision point: when it is down or swamped, ev
 
 - **In-flight cap.** `max_in_flight` (default 1024) requests are handled at once on the main listener; the next gets `503` `overloaded` with `Retry-After: 1` at once instead of waiting in a queue. `/healthz` and `/readyz` are never refused, so a busy server is not restarted for being busy. A streamed MCP answer stops counting once its headers are sent. The admin listener (`[admin] listen`) is not counted, which keeps revocation reachable while the main listener sheds.
 - **Deadlines.** Headers must arrive within `header_read_timeout_seconds` (30), which also closes idle kept-alive connections; bodies within `request_body_timeout_seconds` (30, else `408`); every answer except `/mcp/{server}` and `/admin/*` within `request_timeout_seconds` (60, else `503`). The proxy keeps its own upstream deadlines (`[proxy] upstream_connect_timeout_seconds`, `upstream_response_timeout_seconds`), and its streams stay open for as long as their leases are live.
-- **Rate limits, off by default.** `mcp_requests_per_minute` per run, `authzen_search_requests_per_minute` (AuthZEN action search) per run, `token_requests_per_minute` per authenticated agent and `token_unauthenticated_requests_per_minute` per peer address. Over the limit: `429` with `Retry-After`. Start at a few times the busiest legitimate rate, watch `requests_rate_limited_total`, and keep the per-peer limit off behind a reverse proxy, where every caller shares the proxy's address.
+- **Rate limits, off by default.** `mcp_requests_per_minute` per run, `authzen_search_requests_per_minute` (AuthZEN action search) per run, `token_requests_per_minute` per authenticated agent and `token_unauthenticated_requests_per_minute` per peer address. Over the limit: `429` with `Retry-After`. Start at a few times the busiest legitimate rate, watch `requests_rate_limited_total`, and keep the per-peer limit off behind a reverse proxy, where every caller shares the proxy's address (on the [forwarding listener](#forwarded-client-certificates) it counts per certificate instead).
 - **Set `authzen_search_requests_per_minute` when agents can reach `/access/v1/search/action`.** The caller of a search chooses the arguments, so without a limit a run can try argument values against your policy as fast as the server answers. Each search writes one `search` audit record, so you can see it happen, but nothing stops it ([action search](../reference/authzen.md#action-search), SR-117). The limit counts per run (also for a PEP sending an unsigned chain), after authentication; evaluations are not counted by it. Set it, as the others, at a few times the busiest legitimate run's search rate; a run that meets it shows in `requests_rate_limited_total{limit="authzen_search"}`.
 
 Your reverse proxy or load balancer is still the place for connection limits per client address and for limits across replicas; attenuo does not read `X-Forwarded-For`.

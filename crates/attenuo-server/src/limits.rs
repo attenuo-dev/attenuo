@@ -75,6 +75,10 @@ pub(crate) struct Limits {
     pub(crate) token: Option<RateLimiter>,
     /// `POST /token` that authenticated no agent, per peer address.
     pub(crate) token_peer: Option<RateLimiter>,
+    /// The same limit on the `[server.forwarded_client_cert]` listener, per forwarded
+    /// certificate: there every peer address is the proxy's. A table of its own, so that
+    /// certificates made up through the proxy cannot fill the table of the other listeners.
+    pub(crate) token_forwarded: Option<RateLimiter>,
     /// `/mcp/{server}`, per run.
     pub(crate) mcp: Option<RateLimiter>,
     /// `POST /access/v1/search/action`, per run; a table of its own, so searches and MCP
@@ -113,6 +117,7 @@ impl Limits {
             request_timeout: Duration::from_secs(section.request_timeout_seconds),
             token: limiter(section.token_requests_per_minute),
             token_peer: limiter(section.token_unauthenticated_requests_per_minute),
+            token_forwarded: limiter(section.token_unauthenticated_requests_per_minute),
             mcp: limiter(section.mcp_requests_per_minute),
             authzen_search: limiter(section.authzen_search_requests_per_minute),
             metrics,
@@ -715,20 +720,47 @@ pub(crate) fn peer_key(peer: Option<SocketAddr>) -> String {
 /// credentials authenticate. If it authenticated an agent it is answered as usual and not
 /// counted here; if not, its answer is replaced by the same `429` it would have got up front,
 /// counted as `table_full`, so a failed authentication learns nothing past the refusal.
+///
+/// On the `[server.forwarded_client_cert]` listener every peer address is the proxy's, so one
+/// client could use up the minute of all of them. There the key is the forwarded
+/// certificate's SHA-256, in a table of its own ([`Limits::token_forwarded`]), and a request
+/// without a certificate is not counted here: attenuo cannot tell its clients apart, so the
+/// proxy must limit them by client address. Anyone can make a new certificate, so this table
+/// does not slow down a client that makes them up; it only keeps one client from locking out
+/// the others. Every other listener keys on the peer address, whatever certificate the
+/// request carries, so a new certificate never gives a peer a new minute.
 pub(crate) async fn token_peer_limit(
     State(limits): State<Arc<Limits>>,
     mut req: Request,
     next: Next,
 ) -> Response {
-    let Some(limiter) = &limits.token_peer else {
-        req.extensions_mut().insert(CallerMark::default());
-        return next.run(req).await;
-    };
-    let peer = req
+    let forwarded = req
         .extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|c| c.0);
-    let key = peer_key(peer);
+        .get::<crate::listen::ServedForwarded>()
+        .is_some();
+    let (limiter, key) = if forwarded {
+        let cert = req
+            .extensions()
+            .get::<crate::client_cert::ClientCertificate>()
+            .map(|c| format!("cert:{}", c.x5t_s256()));
+        match (&limits.token_forwarded, cert) {
+            (Some(limiter), Some(key)) => (limiter, key),
+            _ => {
+                req.extensions_mut().insert(CallerMark::default());
+                return next.run(req).await;
+            }
+        }
+    } else {
+        let Some(limiter) = &limits.token_peer else {
+            req.extensions_mut().insert(CallerMark::default());
+            return next.run(req).await;
+        };
+        let peer = req
+            .extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|c| c.0);
+        (limiter, peer_key(peer))
+    };
     let verdict = limiter.peek(&key, Instant::now());
     let on_full_table = match verdict {
         Verdict::Admit => false,

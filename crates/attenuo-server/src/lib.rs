@@ -239,7 +239,8 @@ pub mod fuzzing {
             };
             headers.append(name, value);
         }
-        crate::forwarded::parse(&headers).map(|c| c.is_some())
+        crate::forwarded::parse(&headers, &crate::client_pki::SharedStates::new())
+            .map(|c| c.is_some())
     }
 
     /// `client_pki::useful_intermediates`: the intermediates of `sent` kept for path building
@@ -338,15 +339,8 @@ pub fn router(state: Arc<AppState>, upstreams: Vec<UpstreamConfig>, config: &Con
         )
         .merge(authzen_routes);
     if config.admin.on_main_listener() {
-        let admin = admin_routes(&state);
-        // Never on the forwarding listener: there the admin paths answer as unknown ones.
-        api = api.merge(if state.forwarded.is_some() {
-            admin.layer(axum::middleware::from_fn(
-                forwarded::not_on_forwarding_listener,
-            ))
-        } else {
-            admin
-        });
+        // Never on the forwarding listener (`forwarded::only_served_routes` below).
+        api = api.merge(admin_routes(&state));
     }
     let api = api
         .with_state(state.clone())
@@ -381,10 +375,17 @@ pub fn router(state: Arc<AppState>, upstreams: Vec<UpstreamConfig>, config: &Con
             limits::shed,
         ));
     let app = outer_layers(app, &state);
-    // `[server.tls]`: outermost, so nothing runs for a request that did not come over TLS (or
-    // from a trusted peer of the forwarding listener, whose proxy ended TLS).
-    if state.main_tls.is_some() {
+    // `[server.tls]`: so nothing runs for a request that did not come over TLS (or from a
+    // trusted peer of the forwarding listener, whose proxy ended TLS).
+    let app = if state.main_tls.is_some() {
         app.layer(axum::middleware::from_fn(listen::require_tls))
+    } else {
+        app
+    };
+    // `[server.forwarded_client_cert]`: outermost, so on the forwarding listener a route that
+    // is not listed answers as an unknown path before anything else runs.
+    if state.forwarded.is_some() {
+        app.layer(axum::middleware::from_fn(forwarded::only_served_routes))
     } else {
         app
     }
@@ -472,10 +473,12 @@ fn outer_layers(app: Router, state: &Arc<AppState>) -> Router {
 /// `app` with [`forwarded::headers`] when `[server.forwarded_client_cert]` is set; `app` as it
 /// is otherwise, so a server without the section treats the headers exactly as before.
 pub(crate) fn with_forwarded_headers(app: Router, state: &AppState) -> Router {
-    if state.forwarded.is_some() {
-        app.layer(axum::middleware::from_fn(forwarded::headers))
-    } else {
-        app
+    match &state.forwarded {
+        Some(f) => app.layer(axum::middleware::from_fn_with_state(
+            f.pki.clone(),
+            forwarded::headers,
+        )),
+        None => app,
     }
 }
 
