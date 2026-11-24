@@ -90,6 +90,7 @@
   - [ADR-0016: Admin operators](decisions/0016-admin-operators.md)
   - [ADR-0017: Client authentication with private_key_jwt](decisions/0017-private-key-jwt.md)
   - [ADR-0018: Native TLS listener](decisions/0018-native-tls-listener.md)
+  - [ADR-0019: Self-signed TLS client certificates](decisions/0019-self-signed-tls-client-auth.md)
 
 # Research
 

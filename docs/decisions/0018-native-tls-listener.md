@@ -97,3 +97,7 @@ Not done here, each for a later change:
 - A metric for failed handshakes.
 
 Related: ADR-0007 and ADR-0017, which set mTLS aside for lack of native TLS; ADR-0013, the admin listener; ADR-0014, the request limits whose header-read timeout bounds the handshake.
+
+### Update 2026-11-24: client certificates
+
+The decision above stands. The first item of "Not done here" is now done for self-signed certificates: with `[server.tls] client_certificates = "optional"` the listener asks for a client certificate, and `tls_client_cert_sha256` on `[[agents]]` and `[[peps]]` pins it ([ADR-0019](0019-self-signed-tls-client-auth.md)). The default, `"off"`, asks for none, as this ADR decided. Certificate-bound access tokens are still not done.
