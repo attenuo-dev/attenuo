@@ -35,8 +35,8 @@ pub(crate) struct Cli {
 
     /// PEM file of a TLS client certificate to present to the origin of an `https://`
     /// `--server` (never to an `--admin-server` on another origin), for an agent pinned with
-    /// `tls_client_cert_sha256`. Needs `--tls-client-key`. Without the flag, `ATTENUO_TLS_CLIENT_CERT` is used (empty counts
-    /// as unset).
+    /// `tls_client_cert_sha256`. Needs `--tls-client-key`. Without the flag,
+    /// `ATTENUO_TLS_CLIENT_CERT` is used (empty counts as unset).
     #[arg(long, global = true, value_name = "PATH")]
     pub tls_client_cert: Option<std::path::PathBuf>,
 

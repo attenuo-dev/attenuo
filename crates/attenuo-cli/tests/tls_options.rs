@@ -717,3 +717,139 @@ async fn connect_uses_the_ca_and_presents_the_client_certificate() {
     }
     task.abort();
 }
+
+/// Commands that send nothing to --server or --admin-server do not check the TLS options
+/// against those URLs: with the client certificate variables set and the default http://
+/// --server they succeed, and with the CA variable set they print no warning. The commands
+/// that do send still get the error or the warning, before any request. An error about a
+/// value from an environment variable names the variable.
+#[tokio::test(flavor = "multi_thread")]
+async fn offline_commands_ignore_the_targets_and_env_errors_name_the_variable() {
+    let dir = tempfile::tempdir().unwrap();
+    let (cert, key) = write_client(dir.path(), &ClientCert::new("coder"), "coder");
+    let ca = Ca::new("offline CA").write(dir.path(), "ca.pem");
+
+    // A real delegation token for `token inspect`, from a plain server.
+    let mut cfg = Config::default();
+    cfg.issuer.private_key_pem_path = Some(dir.path().join("issuer.pem"));
+    cfg.audit.sqlite_path = ":memory:".into();
+    cfg.admin.token = Some(ADMIN.into());
+    cfg.dev.allow_root_mint = true;
+    let (router, _state) = attenuo_server::build(&cfg).unwrap();
+    let server = attenuo_proxy::testing::spawn_router(router).await.unwrap();
+    let url = server.url("").trim_end_matches('/').to_string();
+    let mut c = attenuo();
+    c.env("ATTENUO_ADMIN_TOKEN", ADMIN)
+        .args(["--server", &url, "--json", "token", "root"])
+        .args([
+            "--subject",
+            "alice",
+            "--agent",
+            "planner",
+            "--cap",
+            "github:*",
+        ]);
+    let root: Value = serde_json::from_str(&ok(&run(c).await)).unwrap();
+    let token = root["access_token"].as_str().unwrap().to_owned();
+
+    let offline: Vec<Vec<String>> = vec![
+        vec!["token".into(), "inspect".into(), token.clone()],
+        vec![
+            "key".into(),
+            "gen".into(),
+            "--dpop".into(),
+            dir.path().join("dpop.jwk").to_str().unwrap().into(),
+        ],
+        vec![
+            "admin".into(),
+            "operator".into(),
+            "new".into(),
+            "--name".into(),
+            "alice".into(),
+            "--role".into(),
+            "admin".into(),
+        ],
+    ];
+    for args in &offline {
+        // The default --server, http://127.0.0.1:8080.
+        let mut c = attenuo();
+        c.args(args)
+            .env("ATTENUO_TLS_CLIENT_CERT", &cert)
+            .env("ATTENUO_TLS_CLIENT_KEY", &key);
+        let out = run(c).await;
+        ok(&out);
+        assert!(!text(&out.stderr).contains("https://"), "{args:?}: {out:?}");
+        let _ = std::fs::remove_file(dir.path().join("dpop.jwk"));
+        let mut c = attenuo();
+        c.args(args).env("ATTENUO_TLS_CA_CERT", &ca);
+        let out = run(c).await;
+        ok(&out);
+        assert!(!text(&out.stderr).contains("warning"), "{args:?}: {out:?}");
+        let _ = std::fs::remove_file(dir.path().join("dpop.jwk"));
+    }
+
+    // A command that sends: the error with the certificate, the warning with the CA alone.
+    let mut c = attenuo();
+    c.args(["--server", &url, "health"])
+        .env("ATTENUO_TLS_CLIENT_CERT", &cert)
+        .env("ATTENUO_TLS_CLIENT_KEY", &key);
+    let err = failed(&run(c).await);
+    assert!(err.contains("need an https:// --server"), "{err}");
+    let mut c = attenuo();
+    c.args(["--server", &url, "health"])
+        .env("ATTENUO_TLS_CA_CERT", &ca);
+    let out = run(c).await;
+    ok(&out);
+    assert!(
+        text(&out.stderr).starts_with("warning: --tls-ca-cert"),
+        "{out:?}"
+    );
+    // `--server` that is not a URL: that message, not the https one.
+    let mut c = attenuo();
+    c.args(["--server", "github", "health"])
+        .env("ATTENUO_TLS_CLIENT_CERT", &cert)
+        .env("ATTENUO_TLS_CLIENT_KEY", &key);
+    let err = failed(&run(c).await);
+    assert!(
+        err.contains("--server must be the attenuo server's base URL"),
+        "{err}"
+    );
+
+    // Errors name the environment variable a path came from, and the flag otherwise.
+    let missing = dir.path().join("missing.pem");
+    let mut c = attenuo();
+    c.args(["--server", &url, "health"])
+        .env("ATTENUO_TLS_CA_CERT", &missing);
+    let err = failed(&run(c).await);
+    assert!(
+        err.starts_with("error: cannot read ATTENUO_TLS_CA_CERT "),
+        "{err}"
+    );
+    let mut c = attenuo();
+    c.args(["--server", &url, "health"])
+        .env("ATTENUO_TLS_CLIENT_CERT", &cert)
+        .env("ATTENUO_TLS_CLIENT_KEY", &missing);
+    let err = failed(&run(c).await);
+    assert!(
+        err.starts_with("error: cannot read ATTENUO_TLS_CLIENT_KEY "),
+        "{err}"
+    );
+    let mut c = attenuo();
+    c.args(["--server", &url, "health"])
+        .env("ATTENUO_TLS_CLIENT_CERT", &cert);
+    let err = failed(&run(c).await);
+    assert!(
+        err.starts_with("error: ATTENUO_TLS_CLIENT_CERT needs --tls-client-key"),
+        "{err}"
+    );
+    let mut c = attenuo();
+    c.args(["--server", &url, "--tls-client-key"])
+        .arg(&missing)
+        .arg("health")
+        .env("ATTENUO_TLS_CLIENT_CERT", &cert);
+    let err = failed(&run(c).await);
+    assert!(
+        err.starts_with("error: cannot read --tls-client-key "),
+        "{err}"
+    );
+}

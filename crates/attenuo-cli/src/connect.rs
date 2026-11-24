@@ -2057,6 +2057,9 @@ impl Front {
 /// `attenuo connect`. The exit status: 0, or [`EXIT_REVOKED`] after `lease_revoked`.
 pub(crate) async fn run(server: &str, args: ConnectArgs, tls: &crate::tls::Tls) -> Result<u8> {
     let base = check_server(server)?;
+    if let Some(warning) = tls.check_targets(&base, None)? {
+        errln!("{warning}");
+    }
     attenuo_core::names::check_server_name(&args.upstream)
         .map_err(|e| anyhow!("--upstream is not a valid upstream name: {e}"))?;
     let source = Source::from_args(&args)?;

@@ -88,6 +88,9 @@ pub(crate) struct Client {
     /// The latest `DPoP-Nonce` this server sent (RFC 9449 §8), for the next proof. Never
     /// printed or logged.
     nonce: Mutex<Option<String>>,
+    /// [`Tls::check_targets`]'s warning, printed before the first request.
+    tls_warning: Option<String>,
+    tls_warned: std::sync::atomic::AtomicBool,
 }
 
 impl Client {
@@ -112,6 +115,9 @@ impl Client {
             })?,
             None => base.clone(),
         };
+        // After the URLs are known to be URLs, so `--server github` gets that message.
+        let tls_warning =
+            tls.check_targets(&base, admin_base_given.then_some(admin_base.as_str()))?;
         Ok(Self {
             http: tls.build(Target::Server, client_builder())?,
             plain_http: tls.build(Target::Admin, client_builder())?,
@@ -120,6 +126,8 @@ impl Client {
             admin_base_given,
             admin_token,
             nonce: Mutex::new(None),
+            tls_warning,
+            tls_warned: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -211,6 +219,14 @@ impl Client {
     /// Send `req` (for the API path `path`) with [`Client::client_for`]'s client, and refuse
     /// a redirect.
     async fn execute(&self, path: &str, req: RequestBuilder) -> Result<reqwest::Response> {
+        if let Some(warning) = &self.tls_warning {
+            if !self
+                .tls_warned
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                errln!("{warning}");
+            }
+        }
         let req = req.build()?;
         let resp = self
             .client_for(req.url())

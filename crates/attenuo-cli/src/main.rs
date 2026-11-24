@@ -160,13 +160,12 @@ async fn run(cli: Cli) -> Result<Outcome> {
         cli.tls_client_key.as_deref(),
     )?;
     // An empty `ATTENUO_ADMIN_SERVER` (a compose file's `${VAR:-}`) counts as unset.
+    // Whether the TLS options fit the URLs is checked where a client for them is built
+    // (`Client::new`, `connect::run`), so a command that sends nothing is not refused.
     let admin_server = cli.admin_server.as_deref().filter(|s| !s.is_empty());
-    if let Some(warning) = tls.check_targets(&cli.server, admin_server)? {
-        errln!("{warning}");
-    }
     let client = Client::new(&cli.server, admin_server, admin_token, &tls);
     match cli.command {
-        Command::Token(TokenCmd::Inspect(args)) => inspect(client.ok(), args, json).await,
+        Command::Token(TokenCmd::Inspect(args)) => inspect(client, args, json).await,
         Command::Health(a) => health(&client?, &a, json).await,
         // Talks to no attenuo server.
         Command::StdioBridge(a) => stdio_bridge::run(a).await.map(|()| Outcome::Ok),
@@ -1122,7 +1121,7 @@ fn print_token(resp: &Value, only: Option<Field>, json: bool) -> Result<()> {
     Ok(())
 }
 
-async fn inspect(client: Option<Client>, args: cli::InspectArgs, json: bool) -> Result<Outcome> {
+async fn inspect(client: Result<Client>, args: cli::InspectArgs, json: bool) -> Result<Outcome> {
     let token = if args.jwt == "-" {
         let mut s = String::new();
         std::io::stdin().read_to_string(&mut s)?;
@@ -1134,7 +1133,7 @@ async fn inspect(client: Option<Client>, args: cli::InspectArgs, json: bool) -> 
     let now = OffsetDateTime::now_utc();
     let mut verdict: Option<Result<attenuo_token::VerifiedToken>> = None;
     if args.verify {
-        let client = client.context("--verify needs a valid --server URL to fetch the JWKS")?;
+        let client = client.context("--verify fetches the JWKS from --server")?;
         let jwks = client.get("/.well-known/jwks.json").await?;
         verdict = Some(jwt::verify_with_jwks(
             &token,

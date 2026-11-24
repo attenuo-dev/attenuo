@@ -86,58 +86,80 @@ impl Tls {
         client_key: Option<&Path>,
     ) -> Result<Self> {
         let env = |name: &str| std::env::var_os(name);
-        let ca = resolve(ca_cert, env(CA_ENV));
-        let cert = resolve(client_cert, env(CERT_ENV));
-        let key = resolve(client_key, env(KEY_ENV));
-        Self::load(ca.as_deref(), cert.as_deref(), key.as_deref())
+        let ca = resolve(ca_cert, CA_FLAG, CA_ENV, env(CA_ENV));
+        let cert = resolve(client_cert, CERT_FLAG, CERT_ENV, env(CERT_ENV));
+        let key = resolve(client_key, KEY_FLAG, KEY_ENV, env(KEY_ENV));
+        fn given<'a>(g: &'a Option<(PathBuf, &'static str)>) -> Option<Given<'a>> {
+            g.as_ref().map(|(path, name)| Given { path, name })
+        }
+        Self::load_from(given(&ca), given(&cert), given(&key))
     }
 
-    /// Read and check the three options. `None` is unset.
+    /// [`Tls::load_from`] with paths given by the flags.
+    #[cfg(test)]
     pub(crate) fn load(
         ca_cert: Option<&Path>,
         client_cert: Option<&Path>,
         client_key: Option<&Path>,
     ) -> Result<Self> {
+        fn flag<'a>(path: Option<&'a Path>, name: &'static str) -> Option<Given<'a>> {
+            path.map(|path| Given { path, name })
+        }
+        Self::load_from(
+            flag(ca_cert, CA_FLAG),
+            flag(client_cert, CERT_FLAG),
+            flag(client_key, KEY_FLAG),
+        )
+    }
+
+    /// Read and check the three options. `None` is unset. Each error names the flag or the
+    /// environment variable the path came from.
+    pub(crate) fn load_from(
+        ca_cert: Option<Given<'_>>,
+        client_cert: Option<Given<'_>>,
+        client_key: Option<Given<'_>>,
+    ) -> Result<Self> {
         // The pairing is checked before any file is read.
         let pair = match (client_cert, client_key) {
             (Some(c), Some(k)) => Some((c, k)),
             (None, None) => None,
-            (Some(_), None) => bail!(
-                "--tls-client-cert needs --tls-client-key (or ATTENUO_TLS_CLIENT_KEY): the \
-                 private key of the certificate"
+            (Some(c), None) => bail!(
+                "{} needs --tls-client-key (or {KEY_ENV}): the private key of the certificate",
+                c.name
             ),
-            (None, Some(_)) => bail!(
-                "--tls-client-key needs --tls-client-cert (or ATTENUO_TLS_CLIENT_CERT): the \
-                 certificate of the key"
+            (None, Some(k)) => bail!(
+                "{} needs --tls-client-cert (or {CERT_ENV}): the certificate of the key",
+                k.name
             ),
         };
         let mut tls = Tls::default();
-        if let Some(path) = ca_cert {
-            tls.roots = Some((path.to_path_buf(), read_ca(path)?));
+        if let Some(ca) = ca_cert {
+            tls.roots = Some((ca.path.to_path_buf(), read_ca(ca.name, ca.path)?));
             // A certificate that rustls cannot take as a trust anchor fails here, not on the
             // first request.
             tls.build(Target::Admin, ClientBuilder::new())
                 .map_err(|_| {
                     anyhow!(
-                        "--tls-ca-cert {}: a certificate in it cannot be used as a CA \
-                         certificate",
-                        path.display()
+                        "{} {}: a certificate in it cannot be used as a CA certificate",
+                        ca.name,
+                        ca.path.display()
                     )
                 })?;
         }
         if let Some((cert, key)) = pair {
             let identity = read_identity(cert, key)?;
-            tls.client = Some((cert.to_path_buf(), key.to_path_buf(), identity));
+            tls.client = Some((cert.path.to_path_buf(), key.path.to_path_buf(), identity));
             // A key that is not the certificate's, or of a type rustls cannot sign with,
             // fails here. The error from rustls is not shown.
             tls.build(Target::Server, ClientBuilder::new())
                 .map_err(|_| {
                     anyhow!(
-                        "--tls-client-key {} is not the private key of the certificate in \
-                         --tls-client-cert {}, or its key type is not supported (Ed25519, \
-                         ECDSA P-256 or P-384, RSA)",
-                        key.display(),
-                        cert.display()
+                        "{} {} is not the private key of the certificate in {} {}, or its key \
+                         type is not supported (Ed25519, ECDSA P-256 or P-384, RSA)",
+                        key.name,
+                        key.path.display(),
+                        cert.name,
+                        cert.path.display()
                     )
                 })?;
         }
@@ -212,14 +234,35 @@ impl Tls {
 
 /// The environment variables of the three options.
 const CA_ENV: &str = "ATTENUO_TLS_CA_CERT";
+const CA_FLAG: &str = "--tls-ca-cert";
+const CERT_FLAG: &str = "--tls-client-cert";
+const KEY_FLAG: &str = "--tls-client-key";
 const CERT_ENV: &str = "ATTENUO_TLS_CLIENT_CERT";
 const KEY_ENV: &str = "ATTENUO_TLS_CLIENT_KEY";
 
-/// The flag's path, else the environment variable's when it is not empty (a compose file's
-/// `${VAR:-}` gives an empty one). An empty flag value never gets here: clap refuses it.
-fn resolve(flag: Option<&Path>, env: Option<std::ffi::OsString>) -> Option<PathBuf> {
-    flag.map(Path::to_path_buf)
-        .or_else(|| env.filter(|v| !v.is_empty()).map(PathBuf::from))
+/// A path and where it came from: the flag's name, or the environment variable's, which
+/// every error about it names.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Given<'a> {
+    pub(crate) path: &'a Path,
+    pub(crate) name: &'static str,
+}
+
+/// The flag's path (named `flag`), else the environment variable `var`'s when it is not
+/// empty (a compose file's `${VAR:-}` gives an empty one). An empty flag value never gets
+/// here: clap refuses it.
+fn resolve(
+    path: Option<&Path>,
+    flag: &'static str,
+    var: &'static str,
+    env: Option<std::ffi::OsString>,
+) -> Option<(PathBuf, &'static str)> {
+    match path {
+        Some(p) => Some((p.to_path_buf(), flag)),
+        None => env
+            .filter(|v| !v.is_empty())
+            .map(|v| (PathBuf::from(v), var)),
+    }
 }
 
 /// Open `path` for reading without blocking on a FIFO or a device: on Unix with
@@ -310,19 +353,18 @@ fn is_private_key(kind: SectionKind) -> bool {
 }
 
 /// The certificates of the `--tls-ca-cert` bundle: at least one, and no private key.
-fn read_ca(path: &Path) -> Result<Vec<Certificate>> {
-    const FLAG: &str = "--tls-ca-cert";
-    let bytes = read_file(FLAG, path, MAX_CA_BYTES)?;
+fn read_ca(flag: &str, path: &Path) -> Result<Vec<Certificate>> {
+    let bytes = read_file(flag, path, MAX_CA_BYTES)?;
     if has_any_private_key(&bytes) {
         bail!(
-            "{FLAG} {} holds a private key; it must hold only the CA certificates",
+            "{flag} {} holds a private key; it must hold only the CA certificates",
             path.display()
         );
     }
-    let sections = sections(FLAG, path, &bytes)?;
+    let sections = sections(flag, path, &bytes)?;
     if sections.iter().any(|(k, _)| is_private_key(*k)) {
         bail!(
-            "{FLAG} {} holds a private key; it must hold only the CA certificates",
+            "{flag} {} holds a private key; it must hold only the CA certificates",
             path.display()
         );
     }
@@ -333,12 +375,12 @@ fn read_ca(path: &Path) -> Result<Vec<Certificate>> {
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| {
             anyhow!(
-                "{FLAG} {}: a certificate in it cannot be read",
+                "{flag} {}: a certificate in it cannot be read",
                 path.display()
             )
         })?;
     if roots.is_empty() {
-        bail!("{FLAG} {} holds no PEM certificate", path.display());
+        bail!("{flag} {} holds no PEM certificate", path.display());
     }
     Ok(roots)
 }
@@ -346,20 +388,22 @@ fn read_ca(path: &Path) -> Result<Vec<Certificate>> {
 /// The identity of `--tls-client-cert` (one or more certificates, the client's first, and no
 /// private key) and `--tls-client-key` (exactly one unencrypted private key, and nothing
 /// else). The key file is read once.
-fn read_identity(cert: &Path, key: &Path) -> Result<Identity> {
-    const CERT: &str = "--tls-client-cert";
-    const KEY: &str = "--tls-client-key";
-    let cert_bytes = read_file(CERT, cert, MAX_CLIENT_BYTES)?;
+fn read_identity(cert: Given<'_>, key: Given<'_>) -> Result<Identity> {
+    let (cert_name, cert) = (cert.name, cert.path);
+    let (key_name, key) = (key.name, key.path);
+    let cert_bytes = read_file(cert_name, cert, MAX_CLIENT_BYTES)?;
     if has_any_private_key(&cert_bytes) {
         bail!(
-            "{CERT} {} holds a private key; give the key in {KEY} and only the certificate here",
+            "{cert_name} {} holds a private key; give the key in {key_name} and only the \
+             certificate here",
             cert.display()
         );
     }
-    let cert_sections = sections(CERT, cert, &cert_bytes)?;
+    let cert_sections = sections(cert_name, cert, &cert_bytes)?;
     if cert_sections.iter().any(|(k, _)| is_private_key(*k)) {
         bail!(
-            "{CERT} {} holds a private key; give the key in {KEY} and only the certificate here",
+            "{cert_name} {} holds a private key; give the key in {key_name} and only the \
+             certificate here",
             cert.display()
         );
     }
@@ -369,16 +413,16 @@ fn read_identity(cert: &Path, key: &Path) -> Result<Identity> {
         || cert_sections.is_empty()
     {
         bail!(
-            "{CERT} {} must hold the client certificate in PEM (`BEGIN CERTIFICATE`) and \
+            "{cert_name} {} must hold the client certificate in PEM (`BEGIN CERTIFICATE`) and \
              nothing else",
             cert.display()
         );
     }
-    let key_bytes = read_file(KEY, key, MAX_CLIENT_BYTES)?;
+    let key_bytes = read_file(key_name, key, MAX_CLIENT_BYTES)?;
     let labels = begin_labels(&key_bytes);
     if labels.iter().any(|l| l.starts_with(b"ENCRYPTED")) {
         bail!(
-            "{KEY} {} is an encrypted private key; the CLI needs it unencrypted (for \
+            "{key_name} {} is an encrypted private key; the CLI needs it unencrypted (for \
              example `openssl pkey -in <key> -out <plain key>`, then chmod 600)",
             key.display()
         );
@@ -389,19 +433,19 @@ fn read_identity(cert: &Path, key: &Path) -> Result<Identity> {
         .any(|l| l.ends_with(b"PRIVATE KEY") && !supported.contains(l))
     {
         bail!(
-            "{KEY} {} holds a kind of private key the CLI cannot read; it needs PEM `BEGIN \
+            "{key_name} {} holds a kind of private key the CLI cannot read; it needs PEM `BEGIN \
              PRIVATE KEY` (PKCS#8), `BEGIN EC PRIVATE KEY` or `BEGIN RSA PRIVATE KEY`",
             key.display()
         );
     }
-    let key_sections = sections(KEY, key, &key_bytes)?;
+    let key_sections = sections(key_name, key, &key_bytes)?;
     let keys = key_sections
         .iter()
         .filter(|(k, _)| is_private_key(*k))
         .count();
     if keys != 1 || key_sections.len() != 1 {
         bail!(
-            "{KEY} {} must hold exactly one unencrypted private key in PEM (`BEGIN PRIVATE \
+            "{key_name} {} must hold exactly one unencrypted private key in PEM (`BEGIN PRIVATE \
              KEY`, `BEGIN EC PRIVATE KEY` or `BEGIN RSA PRIVATE KEY`) and nothing else",
             key.display()
         );
@@ -413,7 +457,7 @@ fn read_identity(cert: &Path, key: &Path) -> Result<Identity> {
     pem.extend_from_slice(&key_bytes);
     Identity::from_pem(&pem).map_err(|_| {
         anyhow!(
-            "{CERT} {} and {KEY} {} cannot be used together as a client certificate",
+            "{cert_name} {} and {key_name} {} cannot be used together as a client certificate",
             cert.display(),
             key.display()
         )
@@ -461,14 +505,48 @@ mod tests {
     fn the_flag_wins_and_an_empty_environment_variable_is_unset() {
         let flag = Path::new("/flag.pem");
         let env = |v: &str| Some(std::ffi::OsString::from(v));
-        assert_eq!(resolve(Some(flag), env("/env.pem")).unwrap(), flag);
+        let r = |p: Option<&Path>, e| resolve(p, CA_FLAG, CA_ENV, e);
         assert_eq!(
-            resolve(None, env("/env.pem")).unwrap(),
-            Path::new("/env.pem")
+            r(Some(flag), env("/env.pem")),
+            Some((flag.to_path_buf(), CA_FLAG))
+        );
+        assert_eq!(
+            r(None, env("/env.pem")),
+            Some((PathBuf::from("/env.pem"), CA_ENV))
         );
         // A compose file's `${VAR:-}`.
-        assert_eq!(resolve(None, env("")), None);
-        assert_eq!(resolve(None, None), None);
+        assert_eq!(r(None, env("")), None);
+        assert_eq!(r(None, None), None);
+    }
+
+    #[test]
+    fn errors_name_the_environment_variable_a_path_came_from() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, _) = client_pair();
+        let c = write(dir.path(), "c.pem", &cert);
+        let missing = dir.path().join("missing.pem");
+        fn env<'a>(path: &'a Path, name: &'static str) -> Option<Given<'a>> {
+            Some(Given { path, name })
+        }
+        let e = err(Tls::load_from(env(&missing, CA_ENV), None, None));
+        assert!(e.starts_with("cannot read ATTENUO_TLS_CA_CERT "), "{e}");
+        let e = err(Tls::load_from(None, env(&c, CERT_ENV), None));
+        assert!(
+            e.starts_with("ATTENUO_TLS_CLIENT_CERT needs --tls-client-key"),
+            "{e}"
+        );
+        let e = err(Tls::load_from(
+            None,
+            env(&c, CERT_FLAG),
+            env(&missing, KEY_ENV),
+        ));
+        assert!(e.starts_with("cannot read ATTENUO_TLS_CLIENT_KEY "), "{e}");
+        let e = err(Tls::load_from(
+            None,
+            env(&missing, CERT_ENV),
+            env(&c, KEY_FLAG),
+        ));
+        assert!(e.starts_with("cannot read ATTENUO_TLS_CLIENT_CERT "), "{e}");
     }
 
     #[test]
