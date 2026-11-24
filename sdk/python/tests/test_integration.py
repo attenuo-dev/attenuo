@@ -16,6 +16,7 @@ import json
 import os
 import shutil
 import socket
+import ssl
 import struct
 import subprocess
 import sys
@@ -39,6 +40,7 @@ from attenuo import (
     AdminClient,
     ApiError,
     ApprovalRequired,
+    AsyncAdminClient,
     AsyncClient,
     AuthzenAction,
     AuthzenEvaluation,
@@ -59,6 +61,7 @@ from attenuo import (
     StatedUsage,
     Token,
     TokenRefresher,
+    TransportError,
     Unauthorized,
     _retry,
     call_hash,
@@ -226,7 +229,10 @@ def run_stack(
     fake_args: list[str] | None = None,
     policy: Path | None = None,
     edits: Mapping[str, str] | None = None,
+    tls: tuple[Path, Path, Path] | None = None,
 ) -> Iterator[Stack]:
+    """``tls`` is the server certificate, its key and the CA that signed it: the main listener
+    then speaks TLS (``[server.tls]`` with ``client_certificates = "optional"``)."""
     built_server, built_fake = binaries()
     # Copy them: a shared CARGO_TARGET_DIR can be rebuilt under us mid-test.
     server_bin = work / "attenuo-server"
@@ -250,13 +256,24 @@ def run_stack(
         config = config.replace(
             "[issuer]\n", f'[issuer]\nprivate_key_pem_path = "{issuer_key}"\n', 1
         )
+    verify: ssl.SSLContext | bool = True
+    if tls is not None:
+        cert, key, ca = tls
+        config = config.replace(
+            "[issuer]\n",
+            f'public_url = "https://127.0.0.1:{ob_port}"\n\n[server.tls]\n'
+            f'cert_pem_path = "{cert}"\nkey_pem_path = "{key}"\n'
+            'client_certificates = "optional"\n\n[issuer]\n',
+            1,
+        )
+        verify = ssl.create_default_context(cafile=str(ca))
     (work / "config.toml").write_text(config)
 
     procs: list[subprocess.Popen[bytes]] = []
     fake_out = (work / "fake-mcp.out").open("wb")
     fake_log = (work / "fake-mcp.log").open("wb")
     server_log = (work / "server.log").open("wb")
-    url = f"http://127.0.0.1:{ob_port}"
+    url = f"{'https' if tls else 'http'}://127.0.0.1:{ob_port}"
 
     def start_server() -> subprocess.Popen[bytes]:
         return subprocess.Popen(
@@ -270,7 +287,7 @@ def run_stack(
         deadline = time.monotonic() + 20
         while time.monotonic() < deadline:
             try:
-                ready = httpx.get(f"{url}/healthz", timeout=1).is_success
+                ready = httpx.get(f"{url}/healthz", timeout=1, verify=verify).is_success
             except httpx.HTTPError:
                 ready = False
             if ready and b"listening" in (work / "fake-mcp.out").read_bytes():
@@ -2105,3 +2122,76 @@ def test_audit_prune_plan_prune_and_anchors(prune_stack: Stack) -> None:
         c = cross_check(retained, work / "shipped.jsonl", checkpoint_public_keys=jwks)
         assert c.ok, c
         assert (c.anchors.shipped, c.anchors.checked, c.anchors.matched) == (1, 1, 1)
+
+
+@pytest.fixture(scope="module")
+def tls_stack(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Stack]:
+    """The stack on a TLS listener (``[server.tls]``, ``client_certificates = "optional"``),
+    with the ``coder`` agent pinned by a client certificate in place of its secret."""
+    from .tlsutil import Ca, ClientCert
+
+    work = tmp_path_factory.mktemp("attenuo-it-tls")
+    ca = Ca("it-ca")
+    cert, key = ca.leaf(["127.0.0.1"])
+    (work / "server.crt").write_bytes(cert)
+    (work / "server.key").write_bytes(key)
+    (work / "server.key").chmod(0o600)
+    (work / "ca.pem").write_bytes(ca.pem)
+    coder = ClientCert("coder")
+    coder.write(work, "coder")
+    pin = f'tls_client_cert_sha256 = ["{coder.sha256}"]'
+    yield from run_stack(
+        work,
+        tls=(work / "server.crt", work / "server.key", work / "ca.pem"),
+        edits={f'secret_sha256 = "{CODER_SECRET_SHA256}"': pin},
+    )
+
+
+CODER_SECRET_SHA256 = hashlib.sha256(CODER_SECRET.encode()).hexdigest()
+
+
+def test_exchange_with_a_tls_client_certificate(tls_stack: Stack) -> None:
+    """The ``coder`` agent authenticates with its certificate alone: the client sends
+    ``client_id`` and no secret. Without the certificate the same exchange is refused, and a
+    client trusting another CA cannot connect at all."""
+    from .tlsutil import Ca
+
+    work = tls_stack.work
+    ca = work / "ca.pem"
+    with AdminClient(tls_stack.url, ADMIN_TOKEN, tls_ca_cert=ca) as admin:
+        root = admin.mint_root_dev("alice", "https://idp.example", "assistant", ["github:*"])
+    caps = [Capability("github", "read_file")]
+    with Client(
+        tls_stack.url,
+        tls_ca_cert=ca,
+        tls_client_cert=work / "coder.crt",
+        tls_client_key=work / "coder.key",
+    ) as ob:
+        coder = ob.exchange(root, "coder", caps)
+        assert coder.agent == "coder"
+        result = ob.call_tool(
+            coder, "github", "read_file", {"repo": "alice/public-docs", "path": "README.md"}
+        )
+        assert not result.is_error
+    with Client(tls_stack.url, tls_ca_cert=ca) as ob, pytest.raises(ApiError) as e:
+        ob.exchange(root, "coder", caps)
+    assert e.value.status == 401
+    other = work / "other-ca.pem"
+    other.write_bytes(Ca("other").pem)
+    with Client(tls_stack.url, tls_ca_cert=other) as ob, pytest.raises(TransportError):
+        ob.exchange(root, "coder", caps)
+
+
+async def test_exchange_with_a_tls_client_certificate_async(tls_stack: Stack) -> None:
+    work = tls_stack.work
+    ca = work / "ca.pem"
+    async with AsyncAdminClient(tls_stack.url, ADMIN_TOKEN, tls_ca_cert=ca) as admin:
+        root = await admin.mint_root_dev("alice", "https://idp.example", "assistant", ["github:*"])
+    async with AsyncClient(
+        tls_stack.url,
+        tls_ca_cert=ca,
+        tls_client_cert=work / "coder.crt",
+        tls_client_key=work / "coder.key",
+    ) as ob:
+        coder = await ob.exchange(root, "coder", [Capability("github", "read_file")])
+        assert coder.agent == "coder"
