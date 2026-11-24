@@ -28,6 +28,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use axum::extract::ConnectInfo;
+use axum::response::IntoResponse as _;
 use axum::Router;
 use hyper::body::Incoming;
 use hyper_util::rt::{TokioIo, TokioTimer};
@@ -66,9 +67,14 @@ pub(crate) async fn serve(
         let live = live_rx.clone();
         tokio::spawn(async move {
             // Facts about the connection that each request carries go into `PeerService`:
-            // today the peer address. What the TLS handshake learns about the peer would be
-            // taken from `stream` here, once the handshake is done.
-            let service = PeerService { app, peer };
+            // the peer address and whether the connection is TLS. What the TLS handshake
+            // learns about the peer would be taken from `stream` here, once the handshake is
+            // done.
+            let service = PeerService {
+                app,
+                peer,
+                tls: tls.is_some(),
+            };
             match tls {
                 None => serve_connection(stream, service, header_read_timeout, &mut stop).await,
                 Some(acceptor) => {
@@ -155,11 +161,19 @@ async fn accept_error(e: std::io::Error) {
     tokio::time::sleep(Duration::from_secs(1)).await;
 }
 
-/// The router as a hyper service of one connection, adding the peer address to each request.
+/// Put into each request that came over a TLS connection of this accept loop. A router built
+/// over a state with `[server.tls]` refuses requests without it ([`require_tls`]), so that it
+/// is never served as plain HTTP by a loop that does not speak TLS.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ServedOverTls;
+
+/// The router as a hyper service of one connection, adding the peer address (and, on a TLS
+/// connection, [`ServedOverTls`]) to each request.
 #[derive(Clone)]
 struct PeerService {
     app: Router,
     peer: SocketAddr,
+    tls: bool,
 }
 
 impl hyper::service::Service<hyper::Request<Incoming>> for PeerService {
@@ -170,8 +184,30 @@ impl hyper::service::Service<hyper::Request<Incoming>> for PeerService {
     fn call(&self, req: hyper::Request<Incoming>) -> Self::Future {
         let mut req = req.map(axum::body::Body::new);
         req.extensions_mut().insert(ConnectInfo(self.peer));
+        if self.tls {
+            req.extensions_mut().insert(ServedOverTls);
+        }
         self.app.clone().oneshot(req)
     }
+}
+
+/// Middleware of the main router when `[server.tls]` is set: a request that did not come over
+/// a TLS connection of [`serve`] is answered `500` with an empty body and logged as an error.
+/// This catches a router served by something other than [`crate::run`] (such as
+/// [`crate::serve_until`], which never speaks TLS) while discovery and DPoP name `https://`
+/// URLs: fail closed rather than take tokens in cleartext.
+pub(crate) async fn require_tls(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if req.extensions().get::<ServedOverTls>().is_some() {
+        return next.run(req).await;
+    }
+    tracing::error!(
+        "a request reached the main router without TLS although [server.tls] is set; serve \
+         the router with attenuo_server::run or serve, not serve_until or another server"
+    );
+    axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
 }
 
 #[cfg(test)]

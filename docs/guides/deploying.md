@@ -114,7 +114,8 @@ listen = "127.0.0.1:9102"
 [server.tls]
 # The server certificate first, then any intermediate certificates.
 cert_pem_path = "/etc/attenuo/tls/server.crt"
-# One private key: PKCS#8, SEC1 or PKCS#1, not encrypted. Mode 0600.
+# One private key: PKCS#8, SEC1 or PKCS#1, not encrypted. ECDSA P-256 is the cheapest to
+# serve. Mode 0600 or 0400, owned by the server's user.
 key_pem_path = "/etc/attenuo/tls/server.key"
 ```
 
@@ -131,15 +132,45 @@ What it does:
 What it needs:
 
 - `[server] public_url` must be set and must start with `https://`. `[server] allow_insecure_http` is refused.
-- The key file must be readable by the server's user only (`chmod 600`). On Unix the server refuses to start if the group or others can read or write it.
 - The key must belong to the first certificate in `cert_pem_path`.
-- Keep the private key out of `cert_pem_path`, unless both keys name the same file.
+- Keep the private key out of `cert_pem_path`, unless both keys name the same file. An encrypted key is refused in either file.
+- The key file must not be readable or writable by its group or by others. See [The key file's mode](#the-key-files-mode).
 
-The server reads both files once, at start. A renewed certificate needs a restart. Plan the restart before the old certificate expires.
+The server reads both files once, at start. A renewed certificate needs a restart. Plan the restart before the old certificate expires. The server does not check its own certificate's dates: an expired certificate is served until clients refuse it.
 
 Only the main listener speaks TLS. `[admin] listen`, `[admin_ui]` and `[metrics]` stay plain HTTP. Keep them on loopback or a private network, and reach them over an SSH tunnel.
 
 `[server.tls]` cannot be created from an environment variable. Turn it on in the config file. See [ADR-0018](../decisions/0018-native-tls-listener.md) for the decision and what is not done yet.
+
+Embedders: `attenuo_server::run` and `serve` speak TLS. `attenuo_server::serve_until` never does. A router built from a config with `[server.tls]` answers `500` to every request that did not come over TLS, so it is not served in cleartext by mistake.
+
+#### Health checks, the image and the CLI
+
+With `[server.tls]` the main listener answers no plain HTTP, so every check of it must change.
+
+- **Probes and health checks** must use `https://`. A checker that verifies the certificate must use a name that is in the certificate, and must trust its CA. Kubernetes `httpGet` probes with `scheme: HTTPS` do not verify the certificate, so they work with any certificate.
+- **The image's built-in `HEALTHCHECK` fails.** It runs `attenuo --server http://127.0.0.1:8080 health`, which is plain HTTP. Turn it off or replace it. With `docker run`, pass `--no-healthcheck`, or `--health-cmd` with your own check. In a compose file, set `healthcheck: { disable: true }`, or your own `test`. A replacement inside the container can only use the CLI (the image has no `curl`), and the CLI has the limit below.
+- **The `attenuo` CLI trusts only the public web PKI roots** built into it. It has no option for another CA. With a certificate from a private CA, or a self-signed one, the CLI cannot reach the TLS main listener: `health`, `token exchange`, `call`, `tools` and the JWKS fetches fail. Admin commands still work when the server has `[admin] listen`: the CLI sends every `/admin/*` request to `--admin-server` (`ATTENUO_ADMIN_SERVER`), and that listener stays plain HTTP. With a certificate from a public CA, give the CLI the `https://` name in the certificate.
+- **The Helm chart does not support `[server.tls]`.** Its startup, liveness and readiness probes use plain HTTP on the `http` port, so the pod fails its startup probe and is restarted. Use TLS at an ingress or gateway with the chart, as it documents.
+
+#### The key file's mode
+
+On Unix the server refuses a key file that its group or others may read or write (any bit of `0o077`). Give it mode `0600` or `0400`, owned by the user the server runs as. The image runs as uid `10001`.
+
+- **A file on the host**: `chown 10001 server.key && chmod 600 server.key`. A bind mount keeps that mode and owner.
+- **Docker Swarm secrets**: set `mode: 0400` and `uid: "10001"` in the service's `secrets` entry. A Compose file outside Swarm mounts the host file as it is, so set the mode on the host.
+- **Kubernetes Secrets**: set `defaultMode: 0400` on the volume (or `mode` on the item). The files then belong to root. A server that runs as a non-root user cannot read a root-owned `0400` file. With `fsGroup` set, Kubernetes may also add group read (`0440`), and the server then refuses the file. One way out: an init container, running as the server's user, copies the key from the Secret into an `emptyDir` with mode `0600`, and `key_pem_path` names the copy.
+
+The check is strict on purpose: the key lets anyone who reads it impersonate the server.
+
+#### What TLS costs
+
+- Each new connection costs the server CPU: a key exchange and a signature. RSA keys cost much more than ECDSA. Use an ECDSA P-256 key.
+- There is no session resumption, so every new connection pays the full handshake. Clients that keep connections alive pay it once.
+- There is no cap on concurrent connections or handshakes, as on the plain listener. The `[limits]` in-flight cap counts requests, not connections, so it does not bound handshakes.
+- A connection can be held for up to twice `header_read_timeout_seconds` before it sends a request: once for the handshake, once for the headers.
+
+So a flood of new connections can still use up CPU and file descriptors. A front proxy or a connection limit at the network level is still the defence against that.
 
 ## Load limits
 

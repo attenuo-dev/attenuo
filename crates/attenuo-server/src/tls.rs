@@ -82,6 +82,7 @@ fn build(
     // builder's ticketer already makes none; sending none makes that explicit.
     config.session_storage = Arc::new(NoServerSessionStorage {});
     config.send_tls13_tickets = 0;
+    config.max_tls13_tickets = 0;
     config.max_early_data_size = 0;
     Ok(Arc::new(config))
 }
@@ -121,18 +122,39 @@ fn read_certs(path: &Path, key_path: &Path) -> Result<Vec<CertificateDer<'static
     if pem.iter().all(u8::is_ascii_whitespace) {
         return Err("the file is empty; it must hold PEM certificates".into());
     }
+    let has_key = has_private_key_label(&pem);
+    // A private key here would be as exposed as the certificate, which is not secret; keep it
+    // in key_pem_path. The same file for both keys is fine: it is checked as a key file. Any
+    // `... PRIVATE KEY` section counts, an encrypted one included, which rustls does not read.
+    if has_key && path != key_path {
+        return Err("the file holds a private key; keep the key in key_pem_path only".into());
+    }
+    // The parser decodes every section, so its error can quote a character of a key block
+    // in a file that holds one: then it is not shown.
     let certs = CertificateDer::pem_slice_iter(&pem)
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("not a PEM certificate file ({e})"))?;
+        .map_err(|e| {
+            if has_key {
+                "not a valid PEM file".to_owned()
+            } else {
+                format!("not a PEM certificate file ({e})")
+            }
+        })?;
     if certs.is_empty() {
         return Err("no PEM certificate (-----BEGIN CERTIFICATE-----) in the file".into());
     }
-    // A private key here would be as exposed as the certificate, which is not secret; keep it
-    // in key_pem_path. The same file for both keys is fine: it is checked as a key file.
-    if path != key_path && PrivateKeyDer::pem_slice_iter(&pem).next().is_some() {
-        return Err("the file holds a private key; keep the key in key_pem_path only".into());
-    }
     Ok(certs)
+}
+
+/// Whether `pem` has a line that begins a `... PRIVATE KEY` section: `PRIVATE KEY`,
+/// `EC PRIVATE KEY`, `RSA PRIVATE KEY`, and also kinds the PEM parser skips, such as
+/// `ENCRYPTED PRIVATE KEY` (PKCS#8 encrypted, RFC 5958). Read from the labels alone, without
+/// decoding anything.
+fn has_private_key_label(pem: &[u8]) -> bool {
+    pem.split(|b| *b == b'\n' || *b == b'\r').any(|line| {
+        let line = line.trim_ascii();
+        line.starts_with(b"-----BEGIN ") && line.ends_with(b"PRIVATE KEY-----")
+    })
 }
 
 /// The one private key of the `key_pem_path` file.
@@ -202,8 +224,9 @@ fn check_key_mode(meta: &std::fs::Metadata) -> Result<(), String> {
     let mode = meta.permissions().mode() & 0o7777;
     if mode & 0o077 != 0 {
         return Err(format!(
-            "the private key file has mode {mode:04o}, so its group or others may read or \
-             change it; make it readable by the server's account only (chmod 600)"
+            "the private key file has mode {mode:04o}; it must not be readable or writable by \
+             its group or by others. Give it mode 0600 or 0400, owned by the server's account \
+             (chmod 600)"
         ));
     }
     Ok(())
@@ -265,6 +288,7 @@ mod tests {
         let config = server_config(&section(&cert, &key)).unwrap();
         assert_eq!(config.alpn_protocols, vec![b"http/1.1".to_vec()]);
         assert_eq!(config.send_tls13_tickets, 0);
+        assert_eq!(config.max_tls13_tickets, 0);
         assert_eq!(config.max_early_data_size, 0);
         assert!(!config.ticketer.enabled());
         assert!(!config.session_storage.can_cache());
@@ -356,9 +380,12 @@ mod tests {
         let text = write(dir.path(), "text.crt", "not pem at all\n", 0o644);
         let err = refusal(&text, &key);
         assert!(err.contains("no PEM certificate"), "{err}");
-        // A key where the certificate should be (two different paths).
-        let only_key = write(dir.path(), "only-key.crt", &key_pem, 0o644);
+        // A key where the certificate should be: refused as a key in the certificate file
+        // (two paths), or for having no certificate (one path).
+        let only_key = write(dir.path(), "only-key.crt", &key_pem, 0o600);
         let err = refusal(&only_key, &key);
+        assert!(err.contains("holds a private key"), "{err}");
+        let err = refusal(&only_key, &only_key);
         assert!(err.contains("no PEM certificate"), "{err}");
         let broken = write(
             dir.path(),
@@ -443,6 +470,95 @@ mod tests {
         assert!(err.contains("private key cannot be used"), "{err}");
     }
 
+    /// A real key PEM with one character of its body replaced by `*`, and the body's lines.
+    fn broken_key() -> (String, Vec<String>) {
+        let (_, key_pem) = cert_and_key();
+        let mut lines: Vec<String> = key_pem.lines().map(str::to_owned).collect();
+        let body: Vec<String> = lines[1..lines.len() - 1].to_vec();
+        let mid = &mut lines[1];
+        let at = mid.len() / 2;
+        mid.replace_range(at..=at, "*");
+        (lines.join("\n") + "\n", body)
+    }
+
+    /// `err` shows no part of the key body: no line, no run of 6 characters, no parser detail.
+    fn assert_no_key_text(err: &str, body: &[String]) {
+        for line in body {
+            assert!(!err.contains(line.as_str()), "{err}");
+            for i in 0..line.len().saturating_sub(6) {
+                assert!(!err.contains(&line[i..i + 6]), "{err}");
+            }
+        }
+        for detail in ["InvalidCharacter", "base64", "Base64", "*"] {
+            assert!(!err.contains(detail), "{detail}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_broken_key_block_is_never_quoted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert_pem, key_pem) = cert_and_key();
+        let (broken, body) = broken_key();
+        let cert = write(dir.path(), "server.crt", &cert_pem, 0o644);
+        let key = write(dir.path(), "server.key", &key_pem, 0o600);
+
+        // The key file itself.
+        let bad_key = write(dir.path(), "bad.key", &broken, 0o600);
+        let err = refusal(&cert, &bad_key);
+        assert!(err.contains("not a valid PEM private key file"), "{err}");
+        assert_no_key_text(&err, &body);
+
+        // A combined file used for both keys: the certificate is parsed first.
+        let combined = write(
+            dir.path(),
+            "combined.pem",
+            &format!("{cert_pem}{broken}"),
+            0o600,
+        );
+        let err = refusal(&combined, &combined);
+        assert!(err.contains("not a valid PEM file"), "{err}");
+        assert_no_key_text(&err, &body);
+
+        // A combined file as the certificate only, next to a good key file.
+        let err = refusal(&combined, &key);
+        assert!(err.contains("holds a private key"), "{err}");
+        assert_no_key_text(&err, &body);
+
+        // A broken key block before the certificate.
+        let first = write(
+            dir.path(),
+            "first.pem",
+            &format!("{broken}{cert_pem}"),
+            0o600,
+        );
+        let err = refusal(&first, &first);
+        assert_no_key_text(&err, &body);
+    }
+
+    #[test]
+    fn an_encrypted_key_in_the_certificate_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert_pem, key_pem) = cert_and_key();
+        let encrypted = "-----BEGIN ENCRYPTED PRIVATE KEY-----\nAAAA\n\
+                         -----END ENCRYPTED PRIVATE KEY-----\n";
+        let with_encrypted = write(
+            dir.path(),
+            "enc.pem",
+            &format!("{cert_pem}{encrypted}"),
+            0o600,
+        );
+        let key = write(dir.path(), "server.key", &key_pem, 0o600);
+        let err = refusal(&with_encrypted, &key);
+        assert!(err.contains("holds a private key"), "{err}");
+        // As the key file too (the same path): the key file has no key rustls reads.
+        let err = refusal(&with_encrypted, &with_encrypted);
+        assert!(
+            err.contains("key_pem_path") && err.contains("no private key"),
+            "{err}"
+        );
+        assert!(err.contains("encrypted key is not supported"), "{err}");
+    }
+
     #[test]
     fn a_key_of_another_certificate_is_refused() {
         let dir = tempfile::tempdir().unwrap();
@@ -481,6 +597,10 @@ mod tests {
             let key = write(dir.path(), &format!("k{mode:o}.key"), &key_pem, mode);
             let err = refusal(&cert, &key);
             assert!(err.contains("chmod 600"), "{mode:o}: {err}");
+            assert!(
+                err.contains("must not be readable or writable"),
+                "{mode:o}: {err}"
+            );
             assert!(err.contains(&format!("{mode:04o}")), "{mode:o}: {err}");
         }
         for mode in [0o600, 0o400] {

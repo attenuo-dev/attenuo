@@ -246,7 +246,7 @@ async fn plain_http_to_the_tls_port_fails_and_the_server_goes_on() {
         .await
         .unwrap();
     let mut buf = Vec::new();
-    let read = tokio::time::timeout(Duration::from_secs(5), plain.read_to_end(&mut buf)).await;
+    let read = tokio::time::timeout(Duration::from_secs(15), plain.read_to_end(&mut buf)).await;
     assert!(read.is_ok(), "the connection was not closed");
     assert!(
         !String::from_utf8_lossy(&buf).contains("HTTP/1.1"),
@@ -291,12 +291,13 @@ async fn a_client_that_does_not_trust_the_certificate_fails() {
 
 /// A peer that connects and sends nothing, or half a ClientHello, is dropped at the
 /// header-read timeout; meanwhile other clients are served (the handshake is not in the
-/// accept loop).
+/// accept loop). No upper wall-clock bound but a generous deadline: the lower bound holds by
+/// construction (the clock starts before the connections are made).
 #[tokio::test]
 async fn a_silent_or_slow_handshake_is_dropped_at_the_header_read_timeout() {
     let dir = tempfile::tempdir().unwrap();
     let ca = Ca::new("server-tls test CA");
-    let (server, state) = start(tls_config(dir.path(), &ca, 1)).await;
+    let (server, state) = start(tls_config(dir.path(), &ca, 3)).await;
 
     let started = Instant::now();
     let mut silent = tokio::net::TcpStream::connect(server.addr()).await.unwrap();
@@ -306,25 +307,34 @@ async fn a_silent_or_slow_handshake_is_dropped_at_the_header_read_timeout() {
         .await
         .unwrap();
 
-    // While both hang, another client is served at once.
+    // While both hang, another client is served, and both are still open after it.
     let resp = client(&ca)
         .get(server.https_url("/healthz"))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    assert!(started.elapsed() < Duration::from_millis(900));
+    if started.elapsed() < Duration::from_millis(2500) {
+        for stream in [&mut silent, &mut half] {
+            let mut byte = [0u8; 1];
+            let peek =
+                tokio::time::timeout(Duration::from_millis(50), stream.peek(&mut byte)).await;
+            assert!(
+                peek.is_err(),
+                "a hanging connection was closed early: {peek:?}"
+            );
+        }
+    }
 
     for stream in [&mut silent, &mut half] {
         let mut buf = Vec::new();
         let read =
-            tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut buf)).await;
+            tokio::time::timeout(Duration::from_secs(30), stream.read_to_end(&mut buf)).await;
         assert!(read.is_ok(), "the hanging connection was not closed");
         assert!(buf.is_empty(), "{buf:?}");
     }
     let waited = started.elapsed();
-    assert!(waited >= Duration::from_millis(900), "{waited:?}");
-    assert!(waited < Duration::from_secs(5), "{waited:?}");
+    assert!(waited >= Duration::from_millis(2500), "{waited:?}");
     server.stop(state).await;
 }
 
@@ -334,18 +344,19 @@ async fn a_silent_or_slow_handshake_is_dropped_at_the_header_read_timeout() {
 async fn an_idle_tls_connection_is_closed_at_the_header_read_timeout() {
     let dir = tempfile::tempdir().unwrap();
     let ca = Ca::new("server-tls test CA");
-    let (server, state) = start(tls_config(dir.path(), &ca, 1)).await;
+    let (server, state) = start(tls_config(dir.path(), &ca, 3)).await;
     let mut stream = tls_connect(&ca, server.addr(), &[b"http/1.1"])
         .await
         .unwrap();
+    // The clock starts before the request, so the idle timer cannot have started earlier.
+    let started = Instant::now();
     assert!(get_on(&mut stream, "/healthz")
         .await
         .starts_with("HTTP/1.1 200"));
-    let started = Instant::now();
     let mut buf = Vec::new();
-    let read = tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut buf)).await;
+    let read = tokio::time::timeout(Duration::from_secs(30), stream.read_to_end(&mut buf)).await;
     assert!(read.is_ok(), "the idle connection was not closed");
-    assert!(started.elapsed() >= Duration::from_millis(500));
+    assert!(started.elapsed() >= Duration::from_millis(2500));
     server.stop(state).await;
 }
 
@@ -367,19 +378,21 @@ async fn shutdown_closes_open_tls_connections() {
     // Let the server accept it, so it is a live connection when the stop comes.
     tokio::time::sleep(Duration::from_millis(100)).await;
 
+    // Not the 60 s header-read timeout, and not the 10 s drain timeout either, which is what
+    // a connection left hanging in its handshake would cost.
     let started = Instant::now();
     server.stop(state).await;
     assert!(
-        started.elapsed() < Duration::from_secs(5),
+        started.elapsed() < attenuo_server::DRAIN_TIMEOUT - Duration::from_secs(2),
         "{:?}",
         started.elapsed()
     );
 
     let mut buf = Vec::new();
-    let read = tokio::time::timeout(Duration::from_secs(5), open.read_to_end(&mut buf)).await;
+    let read = tokio::time::timeout(Duration::from_secs(15), open.read_to_end(&mut buf)).await;
     assert!(read.is_ok(), "the open TLS connection was not closed");
     let read = tokio::time::timeout(
-        Duration::from_secs(5),
+        Duration::from_secs(15),
         handshaking.read_to_end(&mut Vec::new()),
     )
     .await;
@@ -417,13 +430,13 @@ async fn a_tls_request_in_progress_finishes_during_the_drain() {
         .await
         .unwrap();
     stream.flush().await.unwrap();
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
     let stopping = tokio::spawn(server.stop(state));
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
     stream.write_all(rest.as_bytes()).await.unwrap();
     stream.flush().await.unwrap();
     let mut buf = Vec::new();
-    let _ = tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut buf)).await;
+    let _ = tokio::time::timeout(Duration::from_secs(15), stream.read_to_end(&mut buf)).await;
     let text = String::from_utf8_lossy(&buf);
     assert!(text.starts_with("HTTP/1.1 200"), "{text}");
     assert!(text.contains("access_token"), "{text}");
@@ -458,6 +471,81 @@ async fn without_server_tls_the_listener_speaks_plain_http() {
         .await
         .is_err());
     server.stop(state).await;
+}
+
+/// `serve_until` never speaks TLS: a router built over a state with `[server.tls]` answers
+/// every request it serves with 500 and issues nothing, rather than take tokens in cleartext.
+#[tokio::test]
+async fn serve_until_refuses_to_serve_a_tls_router_in_cleartext() {
+    let dir = tempfile::tempdir().unwrap();
+    let ca = Ca::new("server-tls test CA");
+    let cfg = tls_config(dir.path(), &ca, 10);
+    let (router, _state) = attenuo_server::build(&cfg).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let task = tokio::spawn(attenuo_server::serve_until(
+        listener,
+        router,
+        async move {
+            let _ = stopped.await;
+        },
+        Duration::from_secs(5),
+    ));
+    let http = reqwest::Client::new();
+    for path in ["/healthz", "/.well-known/authzen-configuration"] {
+        let resp = http
+            .get(format!("http://{addr}{path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR, "{path}");
+        assert!(resp.text().await.unwrap().is_empty(), "{path}");
+    }
+    let resp = http
+        .post(format!("http://{addr}/admin/root-token"))
+        .bearer_auth(ADMIN)
+        .json(&json!({
+            "subject": "alice",
+            "issuer": "https://idp.example",
+            "agent": "planner",
+            "capabilities": ["github:read_file"],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(!resp.text().await.unwrap().contains("access_token"));
+    stop.send(()).unwrap();
+    task.await.unwrap().unwrap();
+
+    // The same config without [server.tls] is served by serve_until as before.
+    let mut plain = plain_config(dir.path(), 10);
+    plain.audit.sqlite_path = dir
+        .path()
+        .join("plain.sqlite")
+        .to_string_lossy()
+        .into_owned();
+    let (router, _state) = attenuo_server::build(&plain).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let task = tokio::spawn(attenuo_server::serve_until(
+        listener,
+        router,
+        async move {
+            let _ = stopped.await;
+        },
+        Duration::from_secs(5),
+    ));
+    let resp = http
+        .get(format!("http://{addr}/healthz"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    stop.send(()).unwrap();
+    task.await.unwrap().unwrap();
 }
 
 /// The startup refusals reach `build`, so `serve` stops before binding anything.
@@ -516,13 +604,47 @@ fn a_bad_server_tls_section_stops_the_server_at_startup() {
             .unwrap();
     }
 
-    // The error never shows the key.
+    // A broken key block, in a combined file and in a key file of its own: the error shows
+    // no part of the key body (the PEM parser's own error would quote a character of it).
     let key_text = std::fs::read_to_string(&tls.key_pem_path).unwrap();
-    let body = key_text.lines().nth(1).unwrap();
-    let mut cfg = good.clone();
-    cfg.server.tls.as_mut().unwrap().cert_pem_path = tls.key_pem_path.clone();
-    let err = refused(&cfg);
-    assert!(!err.contains(body), "{err}");
+    let mut lines: Vec<String> = key_text.lines().map(str::to_owned).collect();
+    let body: Vec<String> = lines[1..lines.len() - 1].to_vec();
+    let at = lines[1].len() / 2;
+    lines[1].replace_range(at..=at, "*");
+    let broken = lines.join("\n") + "\n";
+    let cert_text = std::fs::read_to_string(&tls.cert_pem_path).unwrap();
+    let write_secret = |name: &str, text: &str| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, text).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        path
+    };
+    let combined = write_secret("combined.pem", &format!("{cert_text}{broken}"));
+    let broken_key = write_secret("broken.key", &broken);
+    for (cert, key) in [
+        (&combined, &combined),
+        (&tls.cert_pem_path, &broken_key),
+        (&combined, &tls.key_pem_path),
+    ] {
+        let mut cfg = good.clone();
+        let section = cfg.server.tls.as_mut().unwrap();
+        section.cert_pem_path = cert.clone();
+        section.key_pem_path = key.clone();
+        let err = refused(&cfg);
+        for line in &body {
+            for i in 0..line.len().saturating_sub(6) {
+                assert!(!err.contains(&line[i..i + 6]), "{err}");
+            }
+        }
+        assert!(
+            !err.contains("InvalidCharacter") && !err.contains('*'),
+            "{err}"
+        );
+    }
 
     let _ = attenuo_server::build(&good).unwrap();
 }

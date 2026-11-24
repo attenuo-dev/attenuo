@@ -299,7 +299,13 @@ pub fn router(state: Arc<AppState>, upstreams: Vec<UpstreamConfig>, config: &Con
             state.limits.clone(),
             limits::shed,
         ));
-    outer_layers(app, &state)
+    let app = outer_layers(app, &state);
+    // `[server.tls]`: outermost, so nothing runs for a request that did not come over TLS.
+    if state.main_tls.is_some() {
+        app.layer(axum::middleware::from_fn(listen::require_tls))
+    } else {
+        app
+    }
 }
 
 /// The router of the `[admin] listen` listener (S-1): the admin routes of the table above
@@ -901,6 +907,11 @@ pub async fn run(
 /// wait up to `drain` for in-flight requests before giving up on them. Connections get the
 /// default `[limits] header_read_timeout_seconds`
 /// ([`config::DEFAULT_HEADER_READ_TIMEOUT_SECONDS`]).
+///
+/// It never speaks TLS: every connection is plain HTTP, whatever the config says. [`run`] and
+/// [`serve`] serve `[server.tls]`. A router that [`router`] or [`build`] made over a state with
+/// `[server.tls]` answers every request served here with `500` (empty body, an error logged),
+/// so it is never served in cleartext while discovery names `https://` URLs.
 ///
 /// # Errors
 ///
