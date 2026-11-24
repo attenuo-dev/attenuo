@@ -730,12 +730,13 @@ pub async fn trace_route(
     let mode = if authzen
         && inbound.is_some()
         // HTTP Basic only: a client assertion is in the body, which is not read here (and
-        // would be used up by checking it).
+        // would be used up by checking it), and so is the `pep_id` a TLS client certificate
+        // needs: a PEP that authenticates with a certificate is not recognised here.
         && state
             .clients
             .snapshot()
             .peps
-            .authenticate(req.headers(), None, None, None, state.now())
+            .authenticate(req.headers(), None, None, None, None, state.now())
             .is_ok()
     {
         trace.inbound_authzen

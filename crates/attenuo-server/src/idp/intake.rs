@@ -64,6 +64,7 @@ use time::{Duration, OffsetDateTime};
 use super::JWT_BEARER_GRANT_TYPE;
 use super::{claims, CredentialKind, IntakeError, ID_JAG_TOKEN_TYPE, ID_TOKEN_TYPE};
 use crate::actor::{VerifiedActor, ACTOR_TOKEN_TYPE};
+use crate::client_cert::ClientCertificate;
 use crate::clientauth::{self, invalid_request, Authenticated, Clients, FetchedKey};
 use crate::config::{capability_set, ActorAuth, RootGrant};
 use crate::error::{
@@ -123,6 +124,7 @@ pub(crate) async fn handle(
     state: &Arc<AppState>,
     headers: &HeaderMap,
     body: Value,
+    cert: Option<&ClientCertificate>,
     mark: Option<&crate::limits::CallerMark>,
     now: OffsetDateTime,
 ) -> Result<Response, ApiError> {
@@ -156,9 +158,18 @@ pub(crate) async fn handle(
         headers,
         &req,
         assertion.as_deref().map(|a| (a, &fetched)),
+        cert,
         actor.as_ref().map(|(v, _)| v),
         now,
     )?;
+    // `client_cert` of the record's arguments, only for an agent authenticated by its TLS
+    // client certificate, so other records digest as before.
+    let client_cert = client.as_ref().and_then(Authenticated::client_cert_audit);
+    let client_x5t = client_cert
+        .as_ref()
+        .and_then(|c| c.get("x5t#S256"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     // A client assertion authenticates this one request, whatever its outcome: its `jti` is
     // recorded now (`crate::clientauth`), unlike the actor token and the IdP credential, which
     // are recorded together once the root token is issued. The rate limit and a DPoP proof
@@ -366,6 +377,9 @@ pub(crate) async fn handle(
                 args["actor_subject"] = subject.into();
                 args["actor_trust"] = trust.into();
             }
+            if let Some(c) = client_cert {
+                args["client_cert"] = c;
+            }
             // The same claims as a readable member of the record, with a digest of their full
             // values (SR-126); absent without the ceiling, so other records are unchanged.
             if let Err(e) = audit_issuance_with(
@@ -390,6 +404,7 @@ pub(crate) async fn handle(
         credential = kind.as_str(),
         agent = ?agent,
         agent_auth,
+        client_cert_x5t_s256 = client_x5t.as_deref(),
         lease = %issued.lease.0,
         // Only when `[idps.id_jag_ceiling]` was applied: which claims narrowed the root grant
         // and what they said, as the IdP signed them, capped and Debug-formatted (SR-126).
@@ -707,6 +722,7 @@ fn authenticate_client(
     headers: &HeaderMap,
     req: &IntakeRequest,
     assertion: Option<(&str, &FetchedKey)>,
+    cert: Option<&ClientCertificate>,
     now: OffsetDateTime,
 ) -> Result<Authenticated, ApiError> {
     let none = FetchedKey::none();
@@ -720,6 +736,7 @@ fn authenticate_client(
         req.client_secret.as_deref(),
         assertion,
         fetched,
+        cert,
         now,
     )
 }
@@ -730,22 +747,26 @@ type AgentAuth = (String, &'static str, Option<Authenticated>);
 
 /// Authenticate the agent of a hop-0 request under `[token] actor_auth` (see the module
 /// docs), and check that `actor` and `client_id` name it. Returns the agent id, how it
-/// authenticated (`client_secret`, `private_key_jwt`, `actor_token`,
-/// `actor_token+client_secret` or `actor_token+private_key_jwt`) and, for client credentials,
-/// the [`Authenticated`] to commit.
+/// authenticated (`client_secret`, `private_key_jwt`, `self_signed_tls_client_auth`,
+/// `actor_token`, or `actor_token+` one of the three) and, for client credentials, the
+/// [`Authenticated`] to commit.
+#[allow(clippy::too_many_arguments)]
 fn authenticate_agent(
     agents: &Clients,
     mode: ActorAuth,
     headers: &HeaderMap,
     req: &IntakeRequest,
     assertion: Option<(&str, &FetchedKey)>,
+    cert: Option<&ClientCertificate>,
     actor: Option<&VerifiedActor>,
     now: OffsetDateTime,
 ) -> Result<AgentAuth, ApiError> {
     let presented = clientauth::presented(
         headers,
+        req.client_id.as_deref(),
         req.client_secret.as_deref(),
         assertion.map(|(a, _)| a),
+        cert,
     )?;
     if presented && mode == ActorAuth::ActorToken {
         return Err(invalid_request(
@@ -767,7 +788,7 @@ fn authenticate_agent(
                 }
             }
             if presented {
-                let client = authenticate_client(agents, headers, req, assertion, now)?;
+                let client = authenticate_client(agents, headers, req, assertion, cert, now)?;
                 let id = client.id().to_owned();
                 if id != verified.agent {
                     return Err(invalid_request(
@@ -792,7 +813,7 @@ fn authenticate_agent(
             ));
         }
         None => {
-            let client = authenticate_client(agents, headers, req, assertion, now)?;
+            let client = authenticate_client(agents, headers, req, assertion, cert, now)?;
             (
                 client.id().to_owned(),
                 client.method().as_str(),
@@ -851,7 +872,7 @@ mod tests {
         h: &HeaderMap,
         r: &IntakeRequest,
     ) -> Result<String, ApiError> {
-        authenticate_client(agents, h, r, None, now()).map(|c| c.id().to_owned())
+        authenticate_client(agents, h, r, None, None, now()).map(|c| c.id().to_owned())
     }
 
     fn req(id: Option<&str>, secret: Option<&str>) -> IntakeRequest {
@@ -941,6 +962,7 @@ mod tests {
             jwks_url: None,
             jwks_ttl_seconds: None,
             ca_pem_path: None,
+            tls_client_cert_sha256: None,
         };
         let e = validate_agents(&[neither]).err().unwrap().to_string();
         assert!(e.contains("set secret_sha256, jwks"), "{e}");
@@ -961,7 +983,7 @@ mod tests {
     fn agent_auth_follows_actor_auth_modes() {
         let h = HeaderMap::new();
         let auth = |mode, r: &IntakeRequest, actor: Option<&VerifiedActor>| {
-            authenticate_agent(&agents(), mode, &h, r, None, actor, now())
+            authenticate_agent(&agents(), mode, &h, r, None, None, actor, now())
                 .map(|(a, how, _)| (a, how))
         };
         let desc = |r: Result<(String, &'static str), ApiError>| r.unwrap_err().description;
@@ -1059,6 +1081,7 @@ mod tests {
                 &h,
                 &req(None, None),
                 Some((a, &none)),
+                None,
                 actor,
                 now(),
             )

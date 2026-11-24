@@ -15,8 +15,12 @@
 //! - TLS 1.3 only;
 //! - ALPN `http/1.1` only (the listener serves HTTP/1, [`crate::listen`]);
 //! - no session resumption: no session cache, no tickets, no early data, so every connection
-//!   makes a full handshake;
-//! - no client authentication.
+//!   makes a full handshake, and every client certificate a request carries was proven on its
+//!   own connection;
+//! - no client certificate is asked for, unless `client_certificates = "optional"`: then one
+//!   is asked for and never required, and any certificate whose handshake signature verifies
+//!   is accepted ([`crate::client_cert_verifier`]). Whether it authenticates a client is
+//!   decided per request ([`crate::clientauth`]).
 //!
 //! Nothing here logs or returns the content of a file: every error is a fixed text that names
 //! the file and the kind of problem, never a parser's or rustls's detail. A renewed certificate takes a restart.
@@ -30,7 +34,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::NoServerSessionStorage;
 use rustls::sign::{CertifiedKey, SingleCertAndKey};
 
-use crate::config::ServerTlsSection;
+use crate::config::{ClientCertificates, ServerTlsSection};
 
 /// Largest `cert_pem_path` file read: 1 MiB, as for a `ca_pem_path` file
 /// ([`crate::idp::jwks::MAX_CA_FILE_BYTES`]). A chain is a few KiB.
@@ -58,7 +62,7 @@ pub(crate) fn server_config(tls: &ServerTlsSection) -> anyhow::Result<Arc<rustls
     let key = read_key(key_path).map_err(|why| {
         anyhow::anyhow!("[server.tls] key_pem_path {}: {why}", key_path.display())
     })?;
-    build(certs, key).map_err(|why| {
+    build(certs, key, tls.client_certificates).map_err(|why| {
         anyhow::anyhow!(
             "[server.tls] cert_pem_path {} and key_pem_path {}: {why}",
             cert_path.display(),
@@ -67,18 +71,26 @@ pub(crate) fn server_config(tls: &ServerTlsSection) -> anyhow::Result<Arc<rustls
     })
 }
 
-/// The rustls configuration of `certs` (leaf first) and `key`.
+/// The rustls configuration of `certs` (leaf first) and `key`, asking for client
+/// certificates as `client_certificates` says.
 fn build(
     certs: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
+    client_certificates: ClientCertificates,
 ) -> Result<Arc<rustls::ServerConfig>, String> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let certified = certified_key(certs, key, &provider)?;
-    let mut config = rustls::ServerConfig::builder_with_provider(provider)
+    let algs = provider.signature_verification_algorithms;
+    let builder = rustls::ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
-        .map_err(|e| format!("cannot set up TLS 1.3 ({e})"))?
-        .with_no_client_auth()
-        .with_cert_resolver(Arc::new(SingleCertAndKey::from(certified)));
+        .map_err(|e| format!("cannot set up TLS 1.3 ({e})"))?;
+    let builder = match client_certificates {
+        ClientCertificates::Off => builder.with_no_client_auth(),
+        ClientCertificates::Optional => builder.with_client_cert_verifier(Arc::new(
+            crate::client_cert_verifier::AnyClientCert::new(algs),
+        )),
+    };
+    let mut config = builder.with_cert_resolver(Arc::new(SingleCertAndKey::from(certified)));
     config.alpn_protocols = ALPN.iter().map(|p| p.to_vec()).collect();
     // No resumption: no session cache (TLS 1.2 style or TLS 1.3 stateful), no tickets. The
     // builder's ticketer already makes none; sending none makes that explicit.
@@ -302,6 +314,7 @@ mod tests {
         ServerTlsSection {
             cert_pem_path: cert.to_owned(),
             key_pem_path: key.to_owned(),
+            client_certificates: crate::config::ClientCertificates::Off,
         }
     }
 
@@ -336,6 +349,24 @@ mod tests {
             0o600,
         );
         server_config(&section(&both, &both)).unwrap();
+    }
+
+    /// `client_certificates = "optional"` builds, and keeps resumption off. Whether a
+    /// certificate is asked for is checked through real handshakes (tests/mtls.rs): rustls
+    /// does not expose the verifier of a built config.
+    #[test]
+    fn client_certificates_set_the_verifier() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, key) = cert_and_key();
+        let cert = write(dir.path(), "server.crt", &cert, 0o644);
+        let key = write(dir.path(), "server.key", &key, 0o600);
+        let mut optional = section(&cert, &key);
+        optional.client_certificates = ClientCertificates::Optional;
+        let optional = server_config(&optional).unwrap();
+        assert_eq!(optional.alpn_protocols, vec![b"http/1.1".to_vec()]);
+        assert_eq!(optional.send_tls13_tickets, 0);
+        assert!(!optional.session_storage.can_cache());
+        assert!(!optional.ticketer.enabled());
     }
 
     #[test]

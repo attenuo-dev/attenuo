@@ -525,8 +525,8 @@ pub struct ServerSection {
 /// `[server.tls]`: the certificate and private key of the main listener (`[server] listen`).
 ///
 /// The files are read once, at startup: a renewed certificate takes a restart. The listener
-/// speaks TLS 1.3 only, offers ALPN `http/1.1`, keeps no sessions for resumption and asks for
-/// no client certificate (`tls.rs`).
+/// speaks TLS 1.3 only, offers ALPN `http/1.1` and keeps no sessions for resumption
+/// (`tls.rs`). It asks for a client certificate only with `client_certificates = "optional"`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerTlsSection {
@@ -537,6 +537,35 @@ pub struct ServerTlsSection {
     /// root, no access for others, no group write or execute, and group read only when root
     /// owns the file.
     pub key_pem_path: PathBuf,
+    /// Whether the listener asks clients for a certificate, for RFC 8705
+    /// `self_signed_tls_client_auth` (`[[agents]]` and `[[peps]]` `tls_client_cert_sha256`).
+    /// `"off"` (the default): no certificate is asked for. `"optional"`: one is asked for and
+    /// never required, so clients without one connect as before.
+    #[serde(default)]
+    pub client_certificates: ClientCertificates,
+}
+
+/// `[server.tls] client_certificates`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientCertificates {
+    /// The listener asks for no client certificate.
+    #[default]
+    Off,
+    /// The listener asks for a client certificate and accepts a connection without one. A
+    /// certificate whose handshake signature verifies is taken to the request; whether it
+    /// authenticates anyone is decided there, against `tls_client_cert_sha256`.
+    Optional,
+}
+
+impl ServerSection {
+    /// Whether the main listener asks for client certificates: `[server.tls]` with
+    /// `client_certificates = "optional"`.
+    pub fn asks_for_client_certificates(&self) -> bool {
+        self.tls
+            .as_ref()
+            .is_some_and(|t| t.client_certificates == ClientCertificates::Optional)
+    }
 }
 
 impl ServerSection {
@@ -3022,6 +3051,14 @@ pub struct AgentConfig {
     /// agents reload; only with `jwks_url`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ca_pem_path: Option<PathBuf>,
+    /// RFC 8705 `self_signed_tls_client_auth`: the client certificates this entry accepts, as
+    /// the lowercase hex SHA-256 of each certificate's DER bytes (1 to 8 values, no
+    /// duplicates, none on another entry of the same list). The client presents the
+    /// certificate in the TLS handshake of `[server.tls]` with `client_certificates =
+    /// "optional"`, and names itself with `client_id` (`pep_id`). Refused without that
+    /// setting. Two values let a client rotate its certificate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_client_cert_sha256: Option<Vec<String>>,
 }
 
 impl AgentConfig {
@@ -3034,6 +3071,7 @@ impl AgentConfig {
             jwks_url: None,
             jwks_ttl_seconds: None,
             ca_pem_path: None,
+            tls_client_cert_sha256: None,
         }
     }
 
@@ -3046,6 +3084,24 @@ impl AgentConfig {
             jwks_url: None,
             jwks_ttl_seconds: None,
             ca_pem_path: None,
+            tls_client_cert_sha256: None,
+        }
+    }
+
+    /// An entry that authenticates with a client certificate only (RFC 8705
+    /// `self_signed_tls_client_auth`), with these SHA-256 thumbprints (lowercase hex).
+    pub fn with_tls_client_cert_sha256(
+        id: impl Into<String>,
+        thumbprints: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            secret_sha256: None,
+            jwks: None,
+            jwks_url: None,
+            jwks_ttl_seconds: None,
+            ca_pem_path: None,
+            tls_client_cert_sha256: Some(thumbprints.into_iter().map(Into::into).collect()),
         }
     }
 
@@ -3059,6 +3115,7 @@ impl AgentConfig {
             jwks_url: Some(jwks_url.into()),
             jwks_ttl_seconds: None,
             ca_pem_path: None,
+            tls_client_cert_sha256: None,
         }
     }
 }
@@ -5413,18 +5470,45 @@ mod tests {
             Some(ServerTlsSection {
                 cert_pem_path: "tls/server.crt".into(),
                 key_pem_path: "tls/server.key".into(),
+                client_certificates: ClientCertificates::Off,
             })
         );
         cfg.server.check_public_url().unwrap();
+        assert!(!cfg.server.asks_for_client_certificates());
         let unknown = Config::from_toml(
             "[server.tls]\ncert_pem_path = \"a\"\nkey_pem_path = \"b\"\n\
-             client_certificates = \"optional\"\n",
+             client_ca_pem_path = \"ca.pem\"\n",
         )
         .unwrap_err();
         assert!(
-            format!("{unknown:#}").contains("client_certificates"),
+            format!("{unknown:#}").contains("client_ca_pem_path"),
             "{unknown:#}"
         );
+        // `client_certificates`: "off" (the default) or "optional", nothing else.
+        let with = |v: &str| {
+            Config::from_toml(&format!(
+                "[server.tls]\ncert_pem_path = \"a\"\nkey_pem_path = \"b\"\n\
+                 client_certificates = {v}\n"
+            ))
+        };
+        let optional = with("\"optional\"").unwrap();
+        assert_eq!(
+            optional.server.tls.as_ref().unwrap().client_certificates,
+            ClientCertificates::Optional
+        );
+        assert!(optional.server.asks_for_client_certificates());
+        assert_eq!(
+            with("\"off\"")
+                .unwrap()
+                .server
+                .tls
+                .unwrap()
+                .client_certificates,
+            ClientCertificates::Off
+        );
+        for bad in ["\"required\"", "\"on\"", "true", "\"Optional\""] {
+            assert!(with(bad).is_err(), "{bad}");
+        }
         for missing in ["cert_pem_path = \"a\"\n", "key_pem_path = \"b\"\n", ""] {
             let toml = format!("[server.tls]\n{missing}");
             assert!(Config::from_toml(&toml).is_err(), "{toml}");
@@ -5438,6 +5522,7 @@ mod tests {
         let tls = Some(ServerTlsSection {
             cert_pem_path: "c".into(),
             key_pem_path: "k".into(),
+            client_certificates: ClientCertificates::default(),
         });
         let at = |listen: &str, url: Option<&str>, insecure: bool| ServerSection {
             listen: listen.parse().unwrap(),

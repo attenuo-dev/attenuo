@@ -118,7 +118,7 @@ Notes:
 
 - Use a separate entry and a separate secret for each agent identity. Do not share one across agents.
 - The secret goes in the agent's runtime. Treat a leak as a leak of that agent's root-grant ceiling for every user whose ID token the attacker can also get.
-- Secrets are static. To rotate one, edit the entry and run `attenuo admin agent reload` (or restart); see [Deploying](deploying.md#adding-or-rotating-an-agent-without-a-restart). To keep no shared secret on the server at all, give the agent a key pair instead (below). There is no mTLS client authentication.
+- Secrets are static. To rotate one, edit the entry and run `attenuo admin agent reload` (or restart); see [Deploying](deploying.md#adding-or-rotating-an-agent-without-a-restart). To keep no shared secret on the server at all, give the agent a key pair or a TLS client certificate instead (below).
 - If an `actor` is sent on an intake request it must equal the authenticated agent.
 
 ### A key instead of a secret
@@ -158,6 +158,71 @@ jwks_url = "https://planner.example.com/.well-known/jwks.json"
 The rules are those of the `[[idps]]` key URLs: `https://` only (plain `http://` only on loopback), no redirects, at most 256 KiB, 5 seconds, and `ca_pem_path` for a private CA ([private CAs for key URLs](#private-cas-for-key-urls)). The set must pass the rules of `jwks`, but keys for other uses (`use: "enc"`, a curve or algorithm attenuo does not accept) are skipped; a set with a private key in it is refused whole. Nothing is fetched at startup. Keys are kept for `jwks_ttl_seconds`; an assertion with a `kid` that is not in the set fetches it again at once, at most once per 30 seconds, so a new key works within 30 seconds at most. To rotate: publish the new key next to the old one, wait at least 30 seconds, switch the agent to it, then remove the old key. A removed key stops working at the latest `jwks_ttl_seconds` after the last fetch, so lower it if that must be sooner. One entry has `jwks` or `jwks_url`, never both.
 
 Whoever controls the URL controls the agent's identity at attenuo, so serve it from a place only the agent's owner can change. If attenuo cannot fetch the set, the agent is refused with the answer an unknown client gets (`client_authentication_failed`), and the server logs `client JWKS unavailable` at warn level with the cause. The full rules are in the [config reference](../reference/config.md#keys-from-a-url).
+
+### TLS client certificates
+
+An agent or a PEP can also prove who it is with a self-signed TLS client certificate (RFC 8705 `self_signed_tls_client_auth`). The server keeps only the certificate's SHA-256 thumbprint. The client keeps the private key.
+
+This works only when the client connects to attenuo's own TLS listener. A proxy that ends TLS in front of attenuo hides the certificate. Use a direct connection or a TCP (layer 4) pass-through. See [TLS in attenuo itself](deploying.md#tls-in-attenuo-itself).
+
+**1. Make a key and a certificate.** The certificate must not be a CA certificate, and its extended key usage must allow client authentication. A plain `openssl req -x509` makes a CA certificate, which attenuo refuses, so add the two `-addext` lines:
+
+```sh
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+  -keyout planner-client.key -out planner-client.crt -days 90 -subj "/CN=planner" \
+  -addext "basicConstraints=critical,CA:FALSE" \
+  -addext "extendedKeyUsage=clientAuth"
+chmod 600 planner-client.key
+```
+
+Ed25519 (`-newkey ed25519`) and RSA (`-newkey rsa:2048`) work too. The name in `-subj` is for you: attenuo does not read it.
+
+**2. Get the thumbprint.** It is the SHA-256 of the certificate in DER form, in lowercase hex:
+
+```sh
+openssl x509 -in planner-client.crt -outform DER | sha256sum | cut -d' ' -f1
+```
+
+(`openssl x509 -noout -fingerprint -sha256` prints the same value in upper case with colons. attenuo wants lower case and no colons.)
+
+**3. Configure.** Ask for client certificates on the listener, and put the thumbprint on the entry:
+
+```toml
+[server.tls]
+cert_pem_path = "/etc/attenuo/tls/server.crt"
+key_pem_path = "/etc/attenuo/tls/server.key"
+client_certificates = "optional"
+
+[[agents]]
+id = "planner"
+tls_client_cert_sha256 = ["324c5a7527fbc287fad0d167b264a16419c02bafaca3f95978bab6ceda220291"]
+```
+
+The client sends the certificate in the handshake and `client_id` in the body, with no secret:
+
+```sh
+curl --cert planner-client.crt --key planner-client.key --cacert server-ca.pem \
+  https://attenuo.example.com:8443/token \
+  -d grant_type=urn:ietf:params:oauth:grant-type:token-exchange \
+  -d subject_token="$ID_TOKEN" -d subject_token_type=urn:ietf:params:oauth:token-type:id_token \
+  -d client_id=planner
+```
+
+A PEP sends `pep_id` in the evaluation body instead. The `attenuo` CLI and the SDKs cannot send a client certificate yet.
+
+**4. Rotate.** An entry takes up to 8 thumbprints. Add the new certificate's thumbprint next to the old one and run `attenuo admin agent reload`. Move the client to the new certificate. Then remove the old thumbprint and reload again. A removed thumbprint stops working on the next request, also on a connection that is already open.
+
+Notes:
+
+- `"optional"` means the server asks every client for a certificate but never requires one. Clients without one still connect and use a secret or a key.
+- If a request carries a secret or a client assertion too, that one decides. The certificate is then ignored.
+- A certificate on the connection makes `client_id` a credential, also next to an actor token. With an actor token, send no `client_id`, or present no certificate: otherwise the certificate counts too. Under `[token] actor_auth = "actor_token"` the request is then refused with `client_auth_not_accepted`, whatever the certificate. Under `"either"` it is refused with `client_authentication_failed` when the certificate is not pinned for that id.
+- The certificate's dates are checked on every request. An expired certificate stops working without a reload, so renew it in time.
+- There is no CRL or OCSP check. To revoke a certificate, remove its thumbprint and reload.
+- Tokens issued this way are bearer tokens (or DPoP-bound, if the client sends a DPoP proof). They are not bound to the certificate.
+- Every refusal is the same `401 client_authentication_failed`. The reason is in the server's debug log.
+
+The full rules are in the [config reference](../reference/config.md#tls-client-certificates).
 
 ## `[[root_grants]]`
 

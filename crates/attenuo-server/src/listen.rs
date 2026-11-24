@@ -14,7 +14,9 @@
 //! the connection's own task (never in the accept loop, so a slow handshake does not hold up
 //! the others) and within the same header-read timeout: a peer that connects and sends
 //! nothing, or half a handshake, is dropped when it runs out. The request headers then get the
-//! timeout again, as on a plain connection. A failed handshake (a plain-HTTP request, an old
+//! timeout again, as on a plain connection. With `[server.tls] client_certificates =
+//! "optional"`, the certificate the client proved in the handshake goes into each request of
+//! the connection as a [`ClientCertificate`]; nothing else ever sets it. A failed handshake (a plain-HTTP request, an old
 //! TLS version, a client that does not trust the certificate) is logged at debug and closes
 //! the connection; the listener goes on.
 //!
@@ -34,6 +36,8 @@ use hyper::body::Incoming;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio_rustls::TlsAcceptor;
 use tower::ServiceExt as _;
+
+use crate::client_cert::ClientCertificate;
 
 /// Serve `app` on `listener` until `shutdown` resolves, then drain as `axum::serve`'s graceful
 /// shutdown does. Returns once every connection has ended. With `tls`, every connection speaks
@@ -67,13 +71,13 @@ pub(crate) async fn serve(
         let live = live_rx.clone();
         tokio::spawn(async move {
             // Facts about the connection that each request carries go into `PeerService`:
-            // the peer address and whether the connection is TLS. What the TLS handshake
-            // learns about the peer would be taken from `stream` here, once the handshake is
-            // done.
-            let service = PeerService {
+            // the peer address, whether the connection is TLS, and the client certificate the
+            // TLS handshake proved (taken from the stream below, once the handshake is done).
+            let mut service = PeerService {
                 app,
                 peer,
                 tls: tls.is_some(),
+                client_cert: None,
             };
             match tls {
                 None => serve_connection(stream, service, header_read_timeout, &mut stop).await,
@@ -99,6 +103,15 @@ pub(crate) async fn serve(
                         // to finish.
                         _ = stop.changed() => return,
                     };
+                    // The end-entity certificate, when the client sent one: its handshake
+                    // signature verified (`crate::client_cert_verifier`). Only this loop sets
+                    // it; the requests of this connection all carry it.
+                    service.client_cert = stream
+                        .get_ref()
+                        .1
+                        .peer_certificates()
+                        .and_then(<[_]>::first)
+                        .map(|der| ClientCertificate::new(der.clone().into_owned()));
                     serve_connection(stream, service, header_read_timeout, &mut stop).await;
                 }
             }
@@ -168,12 +181,14 @@ async fn accept_error(e: std::io::Error) {
 pub(crate) struct ServedOverTls;
 
 /// The router as a hyper service of one connection, adding the peer address (and, on a TLS
-/// connection, [`ServedOverTls`]) to each request.
+/// connection, [`ServedOverTls`] and the client certificate, if any) to each request.
 #[derive(Clone)]
 struct PeerService {
     app: Router,
     peer: SocketAddr,
     tls: bool,
+    /// The certificate the client proved in the TLS handshake ([`ClientCertificate`]).
+    client_cert: Option<ClientCertificate>,
 }
 
 impl hyper::service::Service<hyper::Request<Incoming>> for PeerService {
@@ -186,6 +201,10 @@ impl hyper::service::Service<hyper::Request<Incoming>> for PeerService {
         req.extensions_mut().insert(ConnectInfo(self.peer));
         if self.tls {
             req.extensions_mut().insert(ServedOverTls);
+        }
+        // Set by this loop only: a request off the wire has no extensions of its own.
+        if let Some(cert) = &self.client_cert {
+            req.extensions_mut().insert(cert.clone());
         }
         self.app.clone().oneshot(req)
     }

@@ -25,7 +25,7 @@ listen = "127.0.0.1:8080"
 # allow_insecure_http = false
 
 # TLS on this listener ([server] listen) only, off by default. The admin, console and metrics
-# listeners stay plain HTTP. TLS 1.3 only, HTTP/1.1 only, no client certificates. The files
+# listeners stay plain HTTP. TLS 1.3 only, HTTP/1.1 only. The files
 # are read at start: a renewed certificate needs a restart. With it, public_url must be set
 # and https://, and allow_insecure_http is refused. See docs/guides/deploying.md.
 # [server.tls]
@@ -36,6 +36,11 @@ listen = "127.0.0.1:8080"
 # # the file (0600 for the server's own file, 0640 when root owns it), as PostgreSQL asks of
 # # ssl_key_file.
 # key_pem_path = "/etc/attenuo/tls/server.key"
+# # "off" (default): ask for no client certificate. "optional": ask for one, never require
+# # one, so agents and PEPs with tls_client_cert_sha256 can authenticate with a self-signed
+# # certificate (RFC 8705). A proxy that ends TLS in front hides it: needs a direct
+# # connection or TCP pass-through. There is no "required".
+# client_certificates = "off"
 
 [issuer]
 issuer = "http://127.0.0.1:8080"
@@ -248,6 +253,12 @@ secret_sha256 = "a93d472e76b73bffcef69973eb463fb679b1365377e183a459d7f33c2ee97b7
 # jwks_ttl_seconds and fetched again on an unknown kid. Optional ca_pem_path for a private CA.
 # jwks_url = "https://planner.example.com/.well-known/jwks.json"
 # jwks_ttl_seconds = 300
+# Or self-signed TLS client certificates (RFC 8705 self_signed_tls_client_auth): 1 to 8
+# SHA-256 thumbprints, lowercase hex. Needs [server.tls] client_certificates = "optional".
+# The agent sends the certificate in the handshake and client_id with no secret. The
+# certificate must be within its dates, not a CA certificate, and allow clientAuth.
+# Thumbprint: openssl x509 -in planner.crt -outform DER | sha256sum | cut -d' ' -f1
+# tls_client_cert_sha256 = ["<64 lowercase hex characters>"]
 
 # Agents also authenticate on every token exchange (hop n to n+1) as the `actor` they name.
 [[agents]]
@@ -395,6 +406,7 @@ diagnostics = "peps"
 # [[peps]]
 # id = "gateway"
 # secret_sha256 = "<printf %s \"$SECRET\" | sha256sum>"
+# tls_client_cert_sha256 = ["<64 lowercase hex characters>"]   # with pep_id in the body
 
 [dev]
 # DEVELOPMENT ONLY. Mounts POST /admin/root-token, which mints root tokens for a user nobody

@@ -95,6 +95,7 @@ use time::OffsetDateTime;
 use super::extract::Body;
 use super::{audit_issuance, no_store, register_issued};
 use crate::actor::{VerifiedActor, ACTOR_TOKEN_TYPE};
+use crate::client_cert::ClientCertificate;
 use crate::clientauth;
 use crate::config::{capability_set, ActorAuth, CapSpec};
 use crate::error::{mint_refusal, ApiError, INVALID_CAPABILITY};
@@ -122,14 +123,19 @@ pub async fn exchange(
 ) -> Result<Response, ApiError> {
     // Set by `crate::limits::token_peer_limit`, which `crate::router` mounts on this route.
     let mark = extensions.get::<CallerMark>().cloned();
+    // The TLS client certificate of the connection, set by the accept loop only
+    // (`crate::listen`): never read from a header.
+    let cert = extensions.get::<ClientCertificate>().cloned();
     let value = parse_body(&headers, &body)?;
     // A request from a new address on a full per-peer table goes on only to authenticate an
-    // agent with client credentials (SR-109, `crate::limits::refuse_on_full_table`).
+    // agent with client credentials (SR-109, `crate::limits::refuse_on_full_table`): a secret,
+    // an assertion, or a client id on a connection with a client certificate.
     if mark.as_ref().is_some_and(CallerMark::on_full_table) {
         let present = |k: &str| value.get(k).is_some_and(|v| !v.is_null());
         let client = present("client_secret")
             || present("client_assertion")
-            || clientauth::basic_credentials(&headers).is_ok_and(|b| b.is_some());
+            || clientauth::basic_credentials(&headers).is_ok_and(|b| b.is_some())
+            || (present("client_id") && cert.is_some());
         crate::limits::refuse_on_full_table(mark.as_ref(), client, present("actor_token"))?;
     }
     let now = state.now();
@@ -137,7 +143,15 @@ pub async fn exchange(
         // Hop 0 from an IdP credential: the exported span (`crate::telemetry::trace_route`)
         // is `attenuo.token.root`, not `attenuo.token.exchange`.
         crate::telemetry::rename_current_span("attenuo.token.root");
-        return crate::idp::intake::handle(&state, &headers, value, mark.as_ref(), now).await;
+        return crate::idp::intake::handle(
+            &state,
+            &headers,
+            value,
+            cert.as_ref(),
+            mark.as_ref(),
+            now,
+        )
+        .await;
     }
     let mut value = value;
     // The actor token is verified here, on the async side: it may need a JWKS fetch.
@@ -157,7 +171,7 @@ pub async fn exchange(
     // Lease lookups, registration and the audit append are SQLite calls: off the async workers.
     state
         .blocking(move |s| {
-            let client_keys = (&clients.agents, &fetched);
+            let client_keys = (&clients.agents, &fetched, cert.as_ref());
             exchange_sync(s, &headers, value, actor, client_keys, mark.as_ref(), now)
         })
         .await
@@ -309,7 +323,11 @@ fn exchange_sync(
     headers: &HeaderMap,
     value: Value,
     actor: Option<(VerifiedActor, String)>,
-    (agents, fetched): (&clientauth::Clients, &clientauth::FetchedKey),
+    (agents, fetched, cert): (
+        &clientauth::Clients,
+        &clientauth::FetchedKey,
+        Option<&ClientCertificate>,
+    ),
     mark: Option<&CallerMark>,
     now: OffsetDateTime,
 ) -> Result<Response, ApiError> {
@@ -325,7 +343,13 @@ fn exchange_sync(
         assertion = clientauth::take_client_assertion(obj)?;
     }
     let mut req = parse_request(value)?;
-    let presented = clientauth::presented(headers, client_secret.as_deref(), assertion.as_deref())?;
+    let presented = clientauth::presented(
+        headers,
+        client_id.as_deref(),
+        client_secret.as_deref(),
+        assertion.as_deref(),
+        cert,
+    )?;
     if presented && state.actor_auth == ActorAuth::ActorToken {
         return Err(clientauth::invalid_request(
             "client_auth_not_accepted",
@@ -336,6 +360,9 @@ fn exchange_sync(
     // subject token has verified, so that the refusal is audited against its chain.
     let mut mismatch = None;
     let mut actor_auth = "none";
+    // `client_cert` of the record's arguments: only for a client authenticated by its TLS
+    // client certificate, so other records digest as before.
+    let mut client_cert = None;
     // The agent this request authenticated as, for `[limits] token_requests_per_minute`.
     let mut caller = actor.as_ref().map(|(verified, _)| verified.agent.clone());
     if let Some((verified, _)) = &actor {
@@ -366,9 +393,11 @@ fn exchange_sync(
             client_secret.as_deref(),
             assertion.as_deref(),
             fetched,
+            cert,
             now,
         )?;
         let method = client.method();
+        client_cert = client.client_cert_audit();
         // The rate limit and a DPoP proof that will be refused come first, so that a request
         // the client is told to send again does not use its assertion up (SR-108, SR-111).
         client.check_before_commit(state, headers, mark, now)?;
@@ -426,6 +455,7 @@ fn exchange_sync(
         parent: &parent,
         mismatch,
         actor_auth,
+        client_cert: client_cert.clone(),
         cnf,
     };
     match exchange_verified(state, &mut req, verified, actor.as_ref(), now) {
@@ -434,18 +464,18 @@ fn exchange_sync(
         Err(Failure::Refused(reason, e)) => {
             // One `deny` record against the verified parent chain, under a fixed tool name.
             // The request's own strings reach the record only digested, in the arguments.
-            let call = ToolCall::new(
-                super::AUDIT_SERVER,
-                EXCHANGE_TOOL,
-                json!({
-                    "actor": req.actor,
-                    "requested": asked,
-                    "parent_lease": parent.chain.hops.last().map(|h| &h.lease),
-                    "actor_auth": actor_auth,
-                    "dpop_bound": dpop_bound,
-                }),
-            )
-            .with_dpop_bound(dpop_bound);
+            let mut args = json!({
+                "actor": req.actor,
+                "requested": asked,
+                "parent_lease": parent.chain.hops.last().map(|h| &h.lease),
+                "actor_auth": actor_auth,
+                "dpop_bound": dpop_bound,
+            });
+            if let Some(c) = client_cert {
+                args["client_cert"] = c;
+            }
+            let call =
+                ToolCall::new(super::AUDIT_SERVER, EXCHANGE_TOOL, args).with_dpop_bound(dpop_bound);
             let id = state
                 .pipeline
                 .record_rejection(&parent.chain, &call, reason, now);
@@ -461,6 +491,9 @@ struct Verified<'a> {
     parent: &'a attenuo_token::VerifiedToken,
     mismatch: Option<ApiError>,
     actor_auth: &'static str,
+    /// The `client_cert` member of the record's arguments, for a client authenticated by its
+    /// TLS client certificate.
+    client_cert: Option<Value>,
     cnf: Option<attenuo_token::Confirmation>,
 }
 
@@ -478,6 +511,7 @@ fn exchange_verified(
         parent,
         mismatch,
         actor_auth,
+        client_cert,
         cnf,
     } = verified;
     if let Some(e) = mismatch {
@@ -611,6 +645,15 @@ fn exchange_verified(
         args["actor_subject"] = verified.subject.clone().into();
         args["actor_trust"] = verified.trust.clone().into();
     }
+    // The thumbprint for the log line: base64url only, nothing caller-written beyond it.
+    let client_x5t = client_cert
+        .as_ref()
+        .and_then(|c| c.get("x5t#S256"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    if let Some(c) = client_cert {
+        args["client_cert"] = c;
+    }
     if let Err(e) = audit_issuance(state, EXCHANGE_TOOL, &issued.chain, args, dpop_bound, now) {
         // An issuance we cannot record must not be usable.
         let _ = state.leases.revoke(&resp.lease, "audit_error", now);
@@ -625,6 +668,7 @@ fn exchange_verified(
         actor = ?req.actor,
         actor_auth,
         actor_subject = ?actor.map(|(v, _)| v.subject.as_str()),
+        client_cert_x5t_s256 = client_x5t.as_deref(),
         lease = %resp.lease.0,
         depth = issued.chain.depth(),
         dpop_bound,

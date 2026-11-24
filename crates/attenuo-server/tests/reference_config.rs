@@ -62,6 +62,7 @@ public_url = "https://attenuo.example.com"
 [server.tls]
 cert_pem_path = "server.crt"
 key_pem_path = "server.key"
+client_certificates = "optional"
 
 [issuer]
 private_key_pem_path = "issuer.pem"
@@ -154,6 +155,7 @@ jwks = "{}"
 jwks_url = "https://keys.example/planner.json"
 jwks_ttl_seconds = 300
 ca_pem_path = "/etc/attenuo/client-ca.pem"
+tls_client_cert_sha256 = ["0000000000000000000000000000000000000000000000000000000000000000"]
 
 [[peps]]
 id = "pep"
@@ -162,6 +164,7 @@ jwks = "{}"
 jwks_url = "https://keys.example/pep.json"
 jwks_ttl_seconds = 300
 ca_pem_path = "/etc/attenuo/client-ca.pem"
+tls_client_cert_sha256 = ["0000000000000000000000000000000000000000000000000000000000000000"]
 
 [[root_grants]]
 issuer = "https://idp.example"

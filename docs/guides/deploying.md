@@ -124,7 +124,7 @@ What it does:
 - It speaks TLS 1.3 only. A client that only speaks TLS 1.2 cannot connect.
 - It offers HTTP/1.1 only (ALPN `http/1.1`). There is no HTTP/2.
 - It keeps no sessions. Every connection makes a full handshake.
-- It asks for no client certificate. There is no client certificate (mTLS) authentication yet. Agents and PEPs still use a secret or `private_key_jwt`.
+- It asks for no client certificate, unless you set `client_certificates = "optional"` (below).
 - The handshake must finish within `[limits] header_read_timeout_seconds`. A peer that connects and sends nothing is dropped then. The request headers get the same timeout again after the handshake.
 - A plain-HTTP request to this port fails its handshake. The server logs it at debug and goes on.
 - The startup line `attenuo server listening` says `tls=true`.
@@ -138,9 +138,20 @@ What it needs:
 
 The server reads both files once, at start. A renewed certificate needs a restart. Plan the restart before the old certificate expires. The server does not check its own certificate's dates: an expired certificate is served until clients refuse it.
 
+#### Client certificates
+
+With `client_certificates = "optional"` in `[server.tls]`, agents and PEPs can authenticate with a self-signed TLS client certificate instead of a secret or a key (RFC 8705 `self_signed_tls_client_auth`). [Identity providers](identity-providers.md#tls-client-certificates) shows how to make one and configure it.
+
+- "Optional" means the server asks every client for a certificate and never requires one. A client without a certificate connects as before.
+- The handshake only proves that the client holds the certificate's private key. It does not check a chain, an issuer or the dates. Each request then decides, against the lists in force, whether the certificate authenticates the client its `client_id` (or `pep_id`) names. So `attenuo admin agent reload` also applies to connections that are already open.
+- The default is `"off"`: the server asks for nothing. A `tls_client_cert_sha256` on an entry refuses to start unless the listener asks for certificates.
+- **A proxy that ends TLS hides the certificate.** attenuo never reads `Client-Cert`, `X-Forwarded-Client-Cert` or any other header for it. Clients must reach attenuo's own TLS listener: directly, or through a load balancer or ingress that passes TCP through (layer 4, TLS pass-through).
+- There is no CRL or OCSP check, and tokens are not bound to the certificate.
+- A certificate on the connection makes a `client_id` (or `pep_id`) a client credential. So under `[token] actor_auth = "actor_token"`, a request that sends `client_id` over a connection with any certificate is refused with `client_auth_not_accepted`. Under `"either"`, a request that sends an actor token and `client_id` is refused with `client_authentication_failed` when the certificate is not pinned for that id. A client that uses an actor token should leave `client_id` out, or not present a certificate.
+
 Only the main listener speaks TLS. `[admin] listen`, `[admin_ui]` and `[metrics]` stay plain HTTP. Keep them on loopback or a private network, and reach them over an SSH tunnel.
 
-`[server.tls]` cannot be created from an environment variable. Turn it on in the config file. See [ADR-0018](../decisions/0018-native-tls-listener.md) for the decision and what is not done yet.
+No `[server.tls]` key can be set from an environment variable, also when the file has the section. Every TLS setting, `client_certificates` included, is in the config file. See [ADR-0018](../decisions/0018-native-tls-listener.md) for the decision and what is not done yet.
 
 Embedders: `attenuo_server::run` and `serve` speak TLS. `attenuo_server::serve_until` never does. A router built from a config with `[server.tls]` answers `500` to every request that did not come over TLS, so it is not served in cleartext by mistake.
 
@@ -175,6 +186,7 @@ The server refuses any other file and says which rule failed. The image runs as 
 - There is no session resumption, so every new connection pays the full handshake. Clients that keep connections alive pay it once.
 - There is no cap on concurrent connections or handshakes, as on the plain listener. The `[limits]` in-flight cap counts requests, not connections, so it does not bound handshakes.
 - A connection can be held for up to twice `header_read_timeout_seconds` before it sends a request: once for the handshake, once for the headers.
+- With `client_certificates = "optional"`, a client can send up to 64 KiB of certificate data in its handshake (the largest handshake message rustls takes). The server keeps it for as long as the connection is open, whether or not the certificate authenticates anyone.
 
 So a flood of new connections can still use up CPU and file descriptors. A front proxy or a connection limit at the network level is still the defence against that.
 

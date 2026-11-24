@@ -1,6 +1,7 @@
 //! A test certificate authority and an HTTPS key server whose certificate it issued, for the
-//! key URL tests with `ca_pem_path` (`key_url_ca.rs`, `client_jwks_uri.rs`), and the server
-//! certificate files and TLS clients of the `[server.tls]` tests (`server_tls.rs`).
+//! key URL tests with `ca_pem_path` (`key_url_ca.rs`, `client_jwks_uri.rs`), the server
+//! certificate files and TLS clients of the `[server.tls]` tests (`server_tls.rs`), and
+//! self-signed client certificates for the mTLS client authentication tests (`mtls.rs`).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -76,6 +77,35 @@ impl Ca {
         config
     }
 
+    /// A `rustls` client config that trusts this CA only, speaks TLS 1.3, offers `http/1.1`
+    /// and presents `client` (a certificate and a key) when the server asks for one.
+    pub fn rustls_client_with(
+        &self,
+        client: Arc<dyn rustls::client::ResolvesClientCert>,
+    ) -> rustls::ClientConfig {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(self.cert.der().clone()).unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_client_cert_resolver(client);
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        config
+    }
+
+    /// A reqwest client that trusts this CA only and presents `identity`, if any.
+    pub fn reqwest_client(&self, identity: Option<&ClientCert>) -> reqwest::Client {
+        let mut builder = reqwest::Client::builder()
+            .tls_built_in_root_certs(false)
+            .add_root_certificate(self.reqwest_root());
+        if let Some(id) = identity {
+            builder = builder.identity(id.identity());
+        }
+        builder.build().unwrap()
+    }
+
     /// Write a server certificate for `names` (with this CA's certificate after it) and its
     /// key into `dir` as PEM files, the key with mode 0600. Returns the two paths.
     pub fn write_server_files(&self, dir: &Path, names: &[&str]) -> (PathBuf, PathBuf) {
@@ -107,6 +137,129 @@ impl Ca {
             std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
         (cert_path, key_path)
+    }
+}
+
+/// A self-signed client certificate and its key, as an agent or a PEP makes one for RFC 8705
+/// `self_signed_tls_client_auth`.
+#[derive(Clone)]
+pub struct ClientCert {
+    pub der: rustls::pki_types::CertificateDer<'static>,
+    pub cert_pem: String,
+    pub key_pem: String,
+    key_der: Vec<u8>,
+}
+
+impl std::fmt::Debug for ClientCert {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("ClientCert")
+            .field(&self.sha256_hex())
+            .finish()
+    }
+}
+
+impl ClientCert {
+    /// Valid from a day ago for 30 days, `CA:FALSE`, extended key usage `clientAuth`: what the
+    /// guide's `openssl req -x509` command makes.
+    pub fn new(name: &str) -> Self {
+        let now = time::OffsetDateTime::now_utc();
+        Self::with_dates(
+            name,
+            now - time::Duration::days(1),
+            now + time::Duration::days(30),
+        )
+    }
+
+    /// Valid from `not_before` to `not_after`.
+    pub fn with_dates(
+        name: &str,
+        not_before: time::OffsetDateTime,
+        not_after: time::OffsetDateTime,
+    ) -> Self {
+        Self::made(name, |p| {
+            p.not_before = not_before;
+            p.not_after = not_after;
+        })
+    }
+
+    /// Made with `edit` applied over [`ClientCert::new`]'s parameters.
+    pub fn made(name: &str, edit: impl FnOnce(&mut rcgen::CertificateParams)) -> Self {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let now = time::OffsetDateTime::now_utc();
+        let mut params = rcgen::CertificateParams::new(vec![name.to_string()]).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, name);
+        params.not_before = now - time::Duration::days(1);
+        params.not_after = now + time::Duration::days(30);
+        params.is_ca = rcgen::IsCa::ExplicitNoCa;
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+        edit(&mut params);
+        let cert = params.self_signed(&key).unwrap();
+        Self {
+            der: cert.der().clone(),
+            cert_pem: cert.pem(),
+            key_pem: key.serialize_pem(),
+            key_der: key.serialize_der(),
+        }
+    }
+
+    /// The lowercase hex SHA-256 of the DER bytes: a `tls_client_cert_sha256` value.
+    pub fn sha256_hex(&self) -> String {
+        use sha2::Digest;
+        hex::encode(sha2::Sha256::digest(self.der.as_ref()))
+    }
+
+    /// The base64url SHA-256: the `x5t#S256` of the audit records.
+    pub fn x5t_s256(&self) -> String {
+        use base64::Engine as _;
+        use sha2::Digest;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(sha2::Sha256::digest(self.der.as_ref()))
+    }
+
+    /// For a reqwest client.
+    pub fn identity(&self) -> reqwest::Identity {
+        reqwest::Identity::from_pem(format!("{}{}", self.cert_pem, self.key_pem).as_bytes())
+            .unwrap()
+    }
+
+    /// The certificate with its own key, for a raw rustls client.
+    pub fn resolver(&self) -> Arc<dyn rustls::client::ResolvesClientCert> {
+        self.resolver_signing_with(self)
+    }
+
+    /// This certificate, but the handshake signed with `other`'s key: a client that sends a
+    /// certificate whose private key it does not hold.
+    pub fn resolver_signing_with(
+        &self,
+        other: &ClientCert,
+    ) -> Arc<dyn rustls::client::ResolvesClientCert> {
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(other.key_der.clone().into());
+        let signing = rustls::crypto::ring::sign::any_supported_type(&key).unwrap();
+        Arc::new(Fixed(Arc::new(rustls::sign::CertifiedKey::new(
+            vec![self.der.clone()],
+            signing,
+        ))))
+    }
+}
+
+/// A client certificate resolver that always presents the same certificate and key, whether
+/// or not they belong together.
+#[derive(Debug)]
+struct Fixed(Arc<rustls::sign::CertifiedKey>);
+
+impl rustls::client::ResolvesClientCert for Fixed {
+    fn resolve(
+        &self,
+        _root_hint_subjects: &[&[u8]],
+        _sigschemes: &[rustls::SignatureScheme],
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        Some(self.0.clone())
+    }
+
+    fn has_certs(&self) -> bool {
+        true
     }
 }
 

@@ -32,6 +32,7 @@ fn tls_config(dir: &std::path::Path, ca: &Ca, header_read_timeout: u64) -> Confi
     cfg.server.tls = Some(ServerTlsSection {
         cert_pem_path: cert,
         key_pem_path: key,
+        client_certificates: Default::default(),
     });
     cfg
 }
