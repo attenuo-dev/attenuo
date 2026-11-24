@@ -358,8 +358,9 @@ impl TokenSection {
         if self.dpop == DpopMode::Required {
             anyhow::bail!(
                 "[token] tls_client_certificate_bound_access_tokens = true does not go with \
-                 dpop = \"required\": a token has one binding, so an agent that authenticates \
-                 with its certificate could get no token"
+                 dpop = \"required\": \"required\" means every token is bound to a DPoP key, \
+                 and a token holds one binding only, so a certificate-bound token would break \
+                 that rule"
             );
         }
         Ok(())

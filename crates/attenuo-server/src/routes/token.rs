@@ -424,6 +424,23 @@ fn exchange_sync(
         // The rate limit and a DPoP proof that will be refused come first, so that a request
         // the client is told to send again does not use its assertion up (SR-108, SR-111).
         client.check_before_commit(state, headers, mark, now)?;
+        // So do the refusals of a certificate-bound subject token, which the client can
+        // correct (`crate::cert_binding::check_exchange_of_cert_bound`). A subject token that
+        // does not verify is refused below, in its usual place.
+        if let Ok(parent) = state.keys().verifier.verify(&req.subject_token, now) {
+            if let Some(bound) = parent
+                .claims
+                .cnf
+                .as_ref()
+                .and_then(attenuo_token::Confirmation::cert_thumbprint)
+            {
+                crate::cert_binding::check_exchange_of_cert_bound(
+                    bound,
+                    crate::dpop::header_proof(headers)?.is_some() || subject_proof.is_some(),
+                    cert.map(ClientCertificate::sha256),
+                )?;
+            }
+        }
         // Past that, an assertion authenticates this one request, whatever its outcome: its
         // `jti` is recorded now (`crate::clientauth`).
         let agent = client.commit(&state.replay, now)?;

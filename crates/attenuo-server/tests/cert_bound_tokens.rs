@@ -44,6 +44,8 @@ const CLIENT_AUD: &str = "attenuo-client";
 const EXCHANGE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
 const JWT: &str = "urn:ietf:params:oauth:token-type:jwt";
 const ID_TOKEN: &str = "urn:ietf:params:oauth:token-type:id_token";
+const JWT_BEARER: &str = "urn:ietf:params:oauth:grant-type:jwt-bearer";
+const WORKLOAD: &str = "https://workload.test";
 const SPIFFE_CODER: &str = "spiffe://example.org/ns/agents/sa/pki-coder";
 const GATEWAY_SECRET: &str = "cert-bound-gateway-secret";
 
@@ -70,30 +72,84 @@ fn uri_san(s: &str) -> rcgen::SanType {
     rcgen::SanType::URI(s.try_into().unwrap())
 }
 
-/// A fake IdP with one key.
+/// A fake IdP and workload issuer, one key each, and the key of the `private_key_jwt` agent
+/// `jwt-agent`.
 struct Idp {
     key: DpopKey,
+    workload: DpopKey,
+    agent_key: DpopKey,
     server: Spawned,
+}
+
+/// `key`'s public JWK with `kid`, as a JWK Set.
+fn jwk_set(key: &DpopKey, kid: &str) -> Value {
+    let mut jwk = key.public_jwk().clone();
+    jwk["kid"] = kid.into();
+    jwk["alg"] = "EdDSA".into();
+    json!({ "keys": [jwk] })
 }
 
 impl Idp {
     async fn start() -> Self {
         let key = DpopKey::generate().unwrap();
-        let mut jwk = key.public_jwk().clone();
-        jwk["kid"] = "idp-1".into();
-        jwk["alg"] = "EdDSA".into();
-        let set = json!({ "keys": [jwk] });
-        let app = Router::new().route(
-            "/jwks",
-            get(move || {
-                let d = set.clone();
-                async move { Json(d) }
-            }),
-        );
+        let workload = DpopKey::generate().unwrap();
+        let (a, b) = (jwk_set(&key, "idp-1"), jwk_set(&workload, "wl-1"));
+        let app = Router::new()
+            .route(
+                "/jwks",
+                get(move || {
+                    let d = a.clone();
+                    async move { Json(d) }
+                }),
+            )
+            .route(
+                "/actor-jwks",
+                get(move || {
+                    let d = b.clone();
+                    async move { Json(d) }
+                }),
+            );
         Self {
             key,
+            workload,
+            agent_key: DpopKey::generate().unwrap(),
             server: spawn_router(app).await.unwrap(),
         }
+    }
+
+    /// An ID-JAG for `sub` and the agent `client_id`, bound by `cnf` when given.
+    fn id_jag(&self, sub: &str, client_id: &str, cnf: Option<Value>) -> String {
+        let t = now().unix_timestamp();
+        let mut claims = json!({"iss": IDP, "aud": ISSUER, "sub": sub, "client_id": client_id,
+                                "iat": t, "exp": t + 300,
+                                "jti": uuid::Uuid::new_v4().to_string()});
+        if let Some(c) = cnf {
+            claims["cnf"] = c;
+        }
+        self.key.sign_jws(
+            &json!({"alg": "EdDSA", "kid": "idp-1", "typ": "oauth-id-jag+jwt"}),
+            &claims,
+        )
+    }
+
+    /// A workload-identity JWT for the agent `sub`, from the `[[actor_trust]]` issuer.
+    fn actor_token(&self, sub: &str) -> String {
+        let t = now().unix_timestamp();
+        self.workload.sign_jws(
+            &json!({"alg": "EdDSA", "kid": "wl-1", "typ": "JWT"}),
+            &json!({"iss": WORKLOAD, "aud": ISSUER, "sub": sub, "iat": t, "exp": t + 300,
+                    "jti": uuid::Uuid::new_v4().to_string()}),
+        )
+    }
+
+    /// A `private_key_jwt` client assertion for `jwt-agent`.
+    fn assertion(&self) -> String {
+        let t = now().unix_timestamp();
+        self.agent_key.sign_jws(
+            &json!({"alg": "EdDSA", "kid": "agent-1", "typ": "JWT"}),
+            &json!({"iss": "jwt-agent", "sub": "jwt-agent", "aud": ISSUER, "iat": t,
+                    "exp": t + 60, "jti": uuid::Uuid::new_v4().to_string()}),
+        )
     }
 
     fn id_token(&self, sub: &str) -> String {
@@ -136,7 +192,7 @@ impl Certs {
         }
     }
 
-    fn lists(&self) -> String {
+    fn lists(&self, agent_jwks: &Value) -> String {
         let pin = |c: &ClientCert| format!("\"{}\"", c.sha256_hex());
         let ca = self.dir.path().join("ca.pem").display().to_string();
         format!(
@@ -145,7 +201,8 @@ impl Certs {
              [[agents]]\nid = \"reviewer\"\nsecret_sha256 = \"{}\"\n\n\
              [[agents]]\nid = \"both\"\nsecret_sha256 = \"{}\"\ntls_client_cert_sha256 = [{}]\n\n\
              [[agents]]\nid = \"pki-coder\"\ntls_client_ca_pem_path = \"{ca}\"\n\
-             tls_client_auth_san_uri = \"{SPIFFE_CODER}\"\n",
+             tls_client_auth_san_uri = \"{SPIFFE_CODER}\"\n\n\
+             [[agents]]\nid = \"jwt-agent\"\njwks = '{agent_jwks}'\n",
             pin(&self.planner),
             pin(&self.coder),
             pin(&self.coder_next),
@@ -215,6 +272,8 @@ fn write_config(
              [[idps]]\nissuer = \"{IDP}\"\njwks_url = \"{}\"\nallowed_algs = [\"EdDSA\"]\n\
              client_ids = {{ planner = \"{CLIENT_AUD}\", \"pki-coder\" = \"{CLIENT_AUD}\", \
              both = \"{CLIENT_AUD}\" }}\n\n\
+             [[actor_trust]]\nissuer = \"{WORKLOAD}\"\njwks_url = \"{}\"\naudience = \"{ISSUER}\"\n\
+             subject_to_agent = \"sub\"\nallowed_algs = [\"EdDSA\"]\n\n\
              [[root_grants]]\nissuer = \"{IDP}\"\nagent = \"planner\"\ncapabilities = [\"github:*\"]\n\n\
              [[root_grants]]\nissuer = \"{IDP}\"\nagent = \"pki-coder\"\ncapabilities = [\"github:*\"]\n\n\
              [[root_grants]]\nissuer = \"{IDP}\"\nagent = \"both\"\ncapabilities = [\"github:*\"]\n\n{}",
@@ -223,7 +282,8 @@ fn write_config(
             opts.dpop,
             opts.bound,
             idp.server.url("/jwks"),
-            certs.lists(),
+            idp.server.url("/actor-jwks"),
+            certs.lists(&jwk_set(&idp.agent_key, "agent-1")),
         ),
     )
     .unwrap();
@@ -952,7 +1012,14 @@ async fn every_route_enforces_the_binding() {
     let approval_path = format!("/approvals/{approval}");
     let routes: Vec<(Method, &str, Option<Value>)> = vec![
         (Method::POST, "/mcp/github", Some(read_call())),
+        // A JSON-RPC batch: one token check for the whole request.
+        (
+            Method::POST,
+            "/mcp/github",
+            Some(json!([read_call(), {"jsonrpc": "2.0", "id": 9, "method": "tools/list"}])),
+        ),
         (Method::GET, "/mcp/github", None),
+        (Method::DELETE, "/mcp/github", None),
         (Method::POST, "/token/renew", None),
         (Method::POST, "/access/v1/evaluation", Some(evaluation())),
         (Method::POST, "/access/v1/evaluations", Some(batch)),
@@ -976,9 +1043,10 @@ async fn every_route_enforces_the_binding() {
         ] {
             let a = send(via, Auth::Bearer).await;
             assert_ne!(a.status, StatusCode::UNAUTHORIZED, "{path}: {}", a.body);
+            // `GET` and `DELETE` reach the upstream, which answers as it does (405, 400).
             assert!(
-                a.status == StatusCode::OK || (*method == Method::GET && path.starts_with("/mcp")),
-                "{path}: {} {}",
+                a.status == StatusCode::OK || (*method != Method::POST && path.starts_with("/mcp")),
+                "{method} {path}: {} {}",
                 a.status,
                 a.body
             );
@@ -1424,6 +1492,311 @@ async fn a_bound_token_stays_bound_with_the_setting_off() {
         h.x5t(a.body["access_token"].as_str().unwrap()),
         Some(c.coder.x5t_s256())
     );
+    h.stop().await;
+}
+
+// --- client credentials, ID-JAG and actor tokens -------------------------------------------
+
+/// A `private_key_jwt` assertion is used once (SR-108, SR-111). An exchange of a
+/// certificate-bound subject token that is refused for its binding (a DPoP proof of either
+/// kind, no certificate, another certificate) is refused before the assertion is recorded, so
+/// the same assertion works on the corrected request.
+#[tokio::test]
+async fn a_binding_refusal_does_not_use_up_the_client_assertion() {
+    let h = Harness::start(Opts::default()).await;
+    let c = &h.certs;
+    let parent = h.bound_to(Via::Native(Some(&c.coder)), "coder").await;
+    let assertion = h.idp.assertion();
+    let body = |extra: Value| {
+        let mut b = exchange_body(
+            &parent,
+            "jwt-agent",
+            json!({"client_id": "jwt-agent", "client_assertion": assertion,
+                   "client_assertion_type":
+                       "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"}),
+        );
+        for (k, v) in extra.as_object().unwrap() {
+            b[k] = v.clone();
+        }
+        b
+    };
+    let key = DpopKey::generate().unwrap();
+    let url = format!("{PUBLIC_URL}/token");
+    let a = h
+        .token(
+            Via::Native(Some(&c.coder)),
+            &body(json!({})),
+            &[("DPoP", key.proof("POST", &url, None, now()))],
+        )
+        .await;
+    assert_eq!(a.status, StatusCode::BAD_REQUEST, "{}", a.body);
+    assert_eq!(a.code(), WITH_DPOP);
+    let sign_off = key.sign_off(&url, &parent, key.thumbprint(), "jwt-agent", now());
+    let a = h
+        .token(
+            Via::Native(Some(&c.coder)),
+            &body(json!({"subject_token_dpop": sign_off})),
+            &[],
+        )
+        .await;
+    assert_eq!(a.status, StatusCode::BAD_REQUEST, "{}", a.body);
+    assert_eq!(a.code(), WITH_DPOP);
+    h.token(Via::Native(None), &body(json!({})), &[])
+        .await
+        .refused(REQUIRED, "assertion, no certificate");
+    h.token(Via::Native(Some(&c.planner)), &body(json!({})), &[])
+        .await
+        .refused(MISMATCH, "assertion, other certificate");
+    // Corrected: the same assertion, over the bound certificate.
+    let a = h
+        .token(Via::Native(Some(&c.coder)), &body(json!({})), &[])
+        .await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert_eq!(
+        h.x5t(a.body["access_token"].as_str().unwrap()),
+        Some(c.coder.x5t_s256())
+    );
+    // And now it is used up, as any assertion is after an exchange.
+    let fresh = h.bound_to(Via::Native(Some(&c.coder)), "coder").await;
+    let mut again = body(json!({}));
+    again["subject_token"] = fresh.into();
+    let a = h.token(Via::Native(Some(&c.coder)), &again, &[]).await;
+    assert_eq!(a.status, StatusCode::UNAUTHORIZED, "{}", a.body);
+    assert_eq!(a.code(), "client_assertion_replayed", "{}", a.body);
+    h.stop().await;
+}
+
+/// An ID-JAG at hop 0, by an agent that authenticates with its certificate: an unbound one
+/// gives a certificate-bound root token. One bound to a DPoP key (`cnf.jkt`) cannot be used:
+/// with the `DPoP` proof it needs, the request asks for a second binding
+/// (`dpop_with_certificate_binding`); without it, the ID-JAG's own rule refuses it
+/// (`credential_pop_required`).
+#[tokio::test]
+async fn a_dpop_bound_id_jag_does_not_go_with_a_certificate_binding() {
+    let h = Harness::start(Opts::default()).await;
+    let c = &h.certs;
+    let body = |jag: String| {
+        json!({"grant_type": JWT_BEARER, "assertion": jag, "client_id": "planner",
+               "authorization_details": [{"type": "attenuo_capabilities",
+                   "capabilities": [{"server": "github", "tool": "read_file"}]}]})
+    };
+    let a = h
+        .token(
+            Via::Native(Some(&c.planner)),
+            &body(h.idp.id_jag("alice", "planner", None)),
+            &[],
+        )
+        .await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert_eq!(a.body["token_type"], "Bearer");
+    assert_eq!(
+        h.x5t(a.body["access_token"].as_str().unwrap()),
+        Some(c.planner.x5t_s256())
+    );
+    let key = DpopKey::generate().unwrap();
+    let jkt = || Some(json!({"jkt": key.thumbprint()}));
+    let proof = key.proof("POST", &format!("{PUBLIC_URL}/token"), None, now());
+    for via in [Via::Native(Some(&c.planner)), Via::Fwd(Some(&c.planner))] {
+        let a = h
+            .token(
+                via,
+                &body(h.idp.id_jag("alice", "planner", jkt())),
+                &[("DPoP", proof.clone())],
+            )
+            .await;
+        assert_eq!(a.status, StatusCode::BAD_REQUEST, "{}", a.body);
+        assert_eq!(a.code(), WITH_DPOP, "{}", a.body);
+        let a = h
+            .token(via, &body(h.idp.id_jag("alice", "planner", jkt())), &[])
+            .await;
+        assert_eq!(a.status, StatusCode::BAD_REQUEST, "{}", a.body);
+        assert_eq!(a.body["error"], "invalid_grant", "{}", a.body);
+        assert_eq!(a.code(), "credential_pop_required", "{}", a.body);
+    }
+    h.stop().await;
+}
+
+/// Actor tokens (`actor_auth = "either"`, the default). An exchange of a certificate-bound
+/// subject token by an actor token alone, over a connection with the parent's certificate,
+/// gives a child bound to that certificate; without it or with another one it is refused. An
+/// actor token alone never binds an unbound parent's child; with a certificate client next to
+/// it, the child is bound.
+#[tokio::test]
+async fn actor_tokens_and_the_certificate_binding() {
+    let h = Harness::start(Opts::default()).await;
+    let c = &h.certs;
+    let actor =
+        |agent: &str| json!({"actor_token": h.idp.actor_token(agent), "actor_token_type": JWT});
+    let parent = h.bound_to(Via::Native(Some(&c.coder)), "coder").await;
+    let before = h.count("token.exchange").await;
+    h.token(
+        Via::Native(None),
+        &exchange_body(&parent, "reviewer", actor("reviewer")),
+        &[],
+    )
+    .await
+    .refused(REQUIRED, "actor token, no certificate");
+    h.token(
+        Via::Fwd(Some(&c.planner)),
+        &exchange_body(&parent, "reviewer", actor("reviewer")),
+        &[],
+    )
+    .await
+    .refused(MISMATCH, "actor token, other certificate");
+    assert_eq!(h.count("token.exchange").await, before);
+    let a = h
+        .token(
+            Via::Native(Some(&c.coder)),
+            &exchange_body(&parent, "reviewer", actor("reviewer")),
+            &[],
+        )
+        .await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert_eq!(
+        h.x5t(a.body["access_token"].as_str().unwrap()),
+        Some(c.coder.x5t_s256())
+    );
+    let r = h.last("token.exchange").await;
+    assert_eq!(r["cert_bound"], true, "{r}");
+
+    // An unbound parent: an actor token alone, over a certificate connection, binds nothing.
+    let root = h.dev_root(None).await;
+    let a = h
+        .token(
+            Via::Native(Some(&c.coder)),
+            &exchange_body(&root, "reviewer", actor("reviewer")),
+            &[],
+        )
+        .await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert_eq!(h.cnf(a.body["access_token"].as_str().unwrap()), None);
+    // With the certificate client next to the actor token, both are checked and the child is
+    // bound to the certificate.
+    let mut both = actor("coder");
+    both["client_id"] = "coder".into();
+    let a = h
+        .token(
+            Via::Native(Some(&c.coder)),
+            &exchange_body(&root, "coder", both),
+            &[],
+        )
+        .await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert_eq!(
+        h.x5t(a.body["access_token"].as_str().unwrap()),
+        Some(c.coder.x5t_s256())
+    );
+    h.stop().await;
+}
+
+// --- one connection, many tokens ------------------------------------------------------------
+
+/// Send one request on `stream` (kept alive) and read the answer by its `Content-Length`:
+/// (status, body).
+async fn request_on(
+    stream: &mut tokio::net::TcpStream,
+    path: &str,
+    headers: &[(&str, String)],
+    body: &Value,
+) -> (u16, Value) {
+    let body = body.to_string();
+    let extra: String = headers
+        .iter()
+        .map(|(k, v)| format!("{k}: {v}\r\n"))
+        .collect();
+    stream
+        .write_all(
+            format!(
+                "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{extra}\
+                 Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let n = stream.read(&mut chunk).await.unwrap();
+        assert!(n > 0, "closed before a full response");
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+            let len = head
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .map_or(0, |v| v.trim().parse::<usize>().unwrap());
+            if buf.len() >= end + 4 + len {
+                let status = head.split_whitespace().nth(1).unwrap().parse().unwrap();
+                let v = serde_json::from_slice(&buf[end + 4..end + 4 + len]).unwrap_or(Value::Null);
+                return (status, v);
+            }
+        }
+    }
+}
+
+/// Requests with different tokens on one kept-alive connection each get their own answer: a
+/// token bound to one certificate and a token bound to another, with each certificate, and
+/// with none. On the forwarding listener (a proxy sends many clients' requests on one
+/// connection) and on one TLS connection with one handshake certificate.
+#[tokio::test]
+async fn tokens_on_one_connection_each_get_their_own_answer() {
+    let h = Harness::start(Opts::default()).await;
+    let c = &h.certs;
+    let a_token = h.bound_to(Via::Fwd(Some(&c.coder)), "coder").await;
+    let b_token = h.bound_to(Via::Fwd(Some(&c.pki_coder)), "pki-coder").await;
+    let mut conn = tcp(h.forwarded, "127.0.0.1".parse().unwrap()).await;
+    let ask = |token: &str, cert: Option<&ClientCert>| {
+        let mut hd = cert.map(forwarded_headers).unwrap_or_default();
+        hd.push(("Authorization", format!("Bearer {token}")));
+        hd
+    };
+    for round in 0..2 {
+        for (token, cert, want) in [
+            (&a_token, Some(&c.coder), None),
+            (&b_token, Some(&c.coder), Some(MISMATCH)),
+            (&b_token, Some(&c.pki_coder), None),
+            (&a_token, Some(&c.pki_coder), Some(MISMATCH)),
+            (&a_token, None, Some(REQUIRED)),
+            (&b_token, Some(&c.pki_coder), None),
+        ] {
+            let (status, v) = request_on(
+                &mut conn,
+                "/access/v1/evaluation",
+                &ask(token, cert),
+                &evaluation(),
+            )
+            .await;
+            match want {
+                None => assert_eq!(status, 200, "round {round}: {v}"),
+                Some(code) => {
+                    assert_eq!(status, 401, "round {round}: {v}");
+                    assert_eq!(v["code"], code, "round {round}: {v}");
+                }
+            }
+        }
+    }
+
+    // One TLS client, one handshake certificate, kept-alive connections.
+    let client = h.ca.reqwest_client(Some(&c.coder));
+    for (token, ok) in [(&a_token, true), (&b_token, false), (&a_token, true)] {
+        let a = Answer::of(
+            client
+                .post(h.running.https_url("/access/v1/evaluation"))
+                .bearer_auth(token)
+                .json(&evaluation())
+                .send()
+                .await
+                .unwrap(),
+        )
+        .await;
+        if ok {
+            assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+        } else {
+            a.refused(MISMATCH, "other token on the same TLS client");
+        }
+    }
     h.stop().await;
 }
 

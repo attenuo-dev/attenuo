@@ -344,10 +344,11 @@ pub(crate) fn bind_exchange(
 ) -> Result<Option<Confirmation>, BindingFailure> {
     match x.parent {
         Some(Confirmation::X5tS256(bound)) => {
-            if x.header.is_some() || x.subject_proof.is_some() {
-                return Err(CertFailure::WithDpop { issuing: true }.into());
-            }
-            check_cert(bound, x.cert)?;
+            check_exchange_of_cert_bound(
+                bound,
+                x.header.is_some() || x.subject_proof.is_some(),
+                x.cert,
+            )?;
             Ok(Some(Confirmation::x5t_s256(bound.clone())))
         }
         Some(parent @ Confirmation::Jkt(_)) => Ok(dpop.bind_exchange(
@@ -361,6 +362,28 @@ pub(crate) fn bind_exchange(
         )?),
         None => bind_root(dpop, x.issuing, x.header, x.url, now),
     }
+}
+
+/// The refusals of [`bind_exchange`] for a subject token bound to the certificate `bound`:
+/// a DPoP proof of either kind (`proof`), then the request's certificate `cert`
+/// ([`check_cert`]).
+///
+/// `POST /token` also calls this before it uses up a single-use client credential (a
+/// `private_key_jwt` assertion), so that a request the client can correct and send again does
+/// not spend its assertion (SR-108, SR-111), as hop 0 refuses a `DPoP` header first.
+///
+/// # Errors
+///
+/// [`CertFailure::WithDpop`] (`issuing: true`), and the [`CertFailure`]s of [`check_cert`].
+pub(crate) fn check_exchange_of_cert_bound(
+    bound: &str,
+    proof: bool,
+    cert: Option<&[u8; 32]>,
+) -> Result<(), CertFailure> {
+    if proof {
+        return Err(CertFailure::WithDpop { issuing: true });
+    }
+    check_cert(bound, cert)
 }
 
 /// Middleware of the MCP proxy's routes: give the proxy the request's verified client
