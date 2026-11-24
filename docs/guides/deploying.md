@@ -9,7 +9,7 @@ attenuo is pre-alpha. Do not treat this guide as a statement that it is ready fo
 - **One node.** There is no clustering, no replication and no leader election. One server process owns one SQLite file, and the server enforces it: a second server on the same file refuses to start (see [One process per file](#one-process-per-file)).
 - **SQLite only.** The audit log and the lease registry live in the same SQLite file, in WAL mode. Store calls run on the blocking pool, and audit appends go through one writer thread that commits whatever is queued in one transaction (group commit). On a shared 4-core development container a file-backed server handled about 3,000 to 4,500 calls per second at one hop (memory: about 5,000 to 6,600); see [design/performance.md](../design/performance.md) for the method and the caveats.
 - **No high availability.** If the process is down, every call through the proxy fails. That is by design: attenuo fails closed. Do not start a second replica against the same file, or against a copy. Against a copy, each process keeps its own idea of which leases are revoked and how much of a run limit is spent. Against the same file, the lease registry and the counters are shared, but the state that makes a credential single use, the locks that serialise a run's budgeted decisions and a user's decisions under a per-user window, and the loaded policy set live in each process, so a credential can be redeemed once per replica and a reload reaches one replica only. Per-user windows (`context.usage.user_window`) are therefore a single-replica guarantee: against a copy each replica keeps its own windows, so a user gets the cap once per replica, and against the same file two replicas can each pass a call the window should have stopped. A window that guards money should also run at `[audit] durability = "full"`: at `"normal"` a power failure can drop the newest commits, and a lost window charge can be spent again in the same window (a call that also charges a `sum` limit already commits with a full sync). The inventory is in [multi-replica readiness](../design/multi-replica.md) (proposed).
-- **No TLS.** The server speaks plain HTTP. Terminate TLS in front of it.
+- **TLS on the main listener only, and off by default.** The server speaks plain HTTP unless you set `[server.tls]`. Most setups still end TLS in a reverse proxy in front of it. The admin, console and metrics listeners always speak plain HTTP. See [TLS in attenuo itself](#tls-in-attenuo-itself).
 - **Static admin tokens.** Each operator can have a token of its own with a role (`[[admin.operators]]`, [ADR-0016](../decisions/0016-admin-operators.md)): `viewer`, `operator` (also revokes and decides approvals) or `admin`. There is no login, no expiry and no rotation short of editing the config and restarting. Admin actions (lease revocations, policy reloads, refunds, development root mints, operator approvals) are recorded in the audit log under the operator, `urn:attenuo:admin:<name>`, or `urn:attenuo:admin` for the single `[admin] token`; the `urn:attenuo:` prefix is reserved, so no identity provider can issue such a subject.
 - **Metrics on a side listener only.** `GET /metrics` (Prometheus text) is served on its own loopback listener when you enable it, with no authentication. See [What to monitor](#what-to-monitor).
 - **Manual key rotation with no overlap.** See [Key rotation](#key-rotation).
@@ -26,7 +26,7 @@ Go through this before pointing anything real at the server.
 - [ ] Every agent that receives a token is an `[[agents]]` entry with its own secret or, to keep no shared secret on the server, its own public key (`jwks`, or `jwks_url` for keys the agent publishes itself, [`private_key_jwt`](identity-providers.md#a-key-instead-of-a-secret)): token exchanges authenticate as their `actor` (`[token] require_actor_auth`, on by default).
 - [ ] `[policy] unknown_tools` is `deny` (the default) or `sensitive`, not `allow`.
 - [ ] `/admin/*` is not reachable from the networks agents live on: `[admin] listen` gives it a port of its own. See [Network exposure](#network-exposure).
-- [ ] TLS terminates in front of attenuo, and agents reach it over HTTPS only. `[server] public_url` is the proxy's `https://` URL, and agents, the CLI and the SDKs are given that URL itself: they follow no redirect, so a URL that redirects is an error ([TLS and a reverse proxy](#tls-and-a-reverse-proxy)). A plain `http://` `public_url` on a host that is not loopback refuses to start unless `[server] allow_insecure_http = true`, which you should not need.
+- [ ] Agents reach attenuo over HTTPS only. TLS ends in a reverse proxy in front of it, or in attenuo itself with `[server.tls]` ([TLS in attenuo itself](#tls-in-attenuo-itself)). `[server] public_url` is the `https://` URL agents use, and agents, the CLI and the SDKs are given that URL itself: they follow no redirect, so a URL that redirects is an error ([TLS and a reverse proxy](#tls-and-a-reverse-proxy)). A plain `http://` `public_url` on a host that is not loopback refuses to start unless `[server] allow_insecure_http = true`, which you should not need.
 - [ ] Every `[[idps]]`, `[[actor_trust]]`, `[[agents]]` and `[[peps]]` key URL (`jwks_url`, `spiffe_bundle_url`, or the IdP `issuer` used for discovery) is the final `https://` URL. Plain `http://` is accepted only on loopback, and redirects are not followed, so a key URL that redirects fails every ID or actor token it should verify. Its certificate chains to a root built into attenuo (the web PKI) or, for a private CA, to a CA in that entry's `ca_pem_path` ([private CAs for key URLs](identity-providers.md#private-cas-for-key-urls)).
 - [ ] `[issuer] private_key_pem_path` is set, the file is mode 0600, owned by the service user, and backed up somewhere safe. Without the setting the server makes a new key at every start and every token dies on restart.
 - [ ] `[audit] sqlite_path` is a real path on durable storage. The default is `:memory:`, which loses the audit log and every lease on exit. The server logs a warning when it is in memory.
@@ -40,7 +40,7 @@ Go through this before pointing anything real at the server.
 
 ## Network exposure
 
-The default bind is `127.0.0.1:8080`. Keep it that way and put a reverse proxy in front, unless you have a reason not to.
+The default bind is `127.0.0.1:8080`. Keep it that way and put a reverse proxy in front, unless you have a reason not to. Without a proxy, set `[server.tls]` before you bind off loopback ([TLS in attenuo itself](#tls-in-attenuo-itself)).
 
 The routes fall into three groups:
 
@@ -97,6 +97,49 @@ This hides `/admin` from the public name for a server that serves it on the main
 For nginx, the equivalent pieces are `proxy_pass http://127.0.0.1:8080;`, `proxy_buffering off;`, `proxy_http_version 1.1;` and a `location /admin/ { return 404; }` block. Untested.
 
 attenuo builds the AuthZEN discovery document from `[server] public_url`, which is required whenever `listen` is not a loopback address, so a forged `Host` header cannot put another host's URLs into a document a shared cache might keep. Only on a loopback listener without `public_url` does it fall back to `Host`, and then it accepts only `localhost`, `127.0.0.1` or `[::1]` (with an optional port) and answers 400 `invalid_host` to anything else. It does not use `X-Forwarded-*` headers.
+
+### TLS in attenuo itself
+
+A reverse proxy is still the usual setup. If you have none, the main listener (`[server] listen`) can speak TLS itself:
+
+```toml
+[server]
+listen = "0.0.0.0:8443"
+public_url = "https://attenuo.example.com:8443"
+
+[admin]
+# Off loopback the admin API needs a listener of its own (see above). It stays plain HTTP.
+listen = "127.0.0.1:9102"
+
+[server.tls]
+# The server certificate first, then any intermediate certificates.
+cert_pem_path = "/etc/attenuo/tls/server.crt"
+# One private key: PKCS#8, SEC1 or PKCS#1, not encrypted. Mode 0600.
+key_pem_path = "/etc/attenuo/tls/server.key"
+```
+
+What it does:
+
+- It speaks TLS 1.3 only. A client that only speaks TLS 1.2 cannot connect.
+- It offers HTTP/1.1 only (ALPN `http/1.1`). There is no HTTP/2.
+- It keeps no sessions. Every connection makes a full handshake.
+- It asks for no client certificate. There is no client certificate (mTLS) authentication yet. Agents and PEPs still use a secret or `private_key_jwt`.
+- The handshake must finish within `[limits] header_read_timeout_seconds`. A peer that connects and sends nothing is dropped then. The request headers get the same timeout again after the handshake.
+- A plain-HTTP request to this port fails its handshake. The server logs it at debug and goes on.
+- The startup line `attenuo server listening` says `tls=true`.
+
+What it needs:
+
+- `[server] public_url` must be set and must start with `https://`. `[server] allow_insecure_http` is refused.
+- The key file must be readable by the server's user only (`chmod 600`). On Unix the server refuses to start if the group or others can read or write it.
+- The key must belong to the first certificate in `cert_pem_path`.
+- Keep the private key out of `cert_pem_path`, unless both keys name the same file.
+
+The server reads both files once, at start. A renewed certificate needs a restart. Plan the restart before the old certificate expires.
+
+Only the main listener speaks TLS. `[admin] listen`, `[admin_ui]` and `[metrics]` stay plain HTTP. Keep them on loopback or a private network, and reach them over an SSH tunnel.
+
+`[server.tls]` cannot be created from an environment variable. Turn it on in the config file. See [ADR-0018](../decisions/0018-native-tls-listener.md) for the decision and what is not done yet.
 
 ## Load limits
 
@@ -494,7 +537,7 @@ helm install attenuo deploy/helm/attenuo -n attenuo \
 
 What you give it:
 
-- `publicUrl` (required): the `https://` URL agents use. attenuo has no TLS of its own, so terminate TLS at an ingress or gateway (`ingress.enabled`, or your own). An `http://` URL is refused unless `allowInsecureHttp=true`.
+- `publicUrl` (required): the `https://` URL agents use. The chart does not turn on attenuo's own TLS (`[server.tls]`), so terminate TLS at an ingress or gateway (`ingress.enabled`, or your own). An `http://` URL is refused unless `allowInsecureHttp=true`.
 - `config` (required): your `attenuo.toml`, stored in a Secret. Leave out `[server] listen` and `public_url`, `[admin] listen`, `[policy] policies_path`, `[audit] sqlite_path` and `[issuer] private_key_pem_path`: the chart sets them through `ATTENUO__...` environment overrides, which win over the file. `existingConfigSecret` names a Secret you manage instead.
 - `policy` (required): your Cedar file, stored in a ConfigMap (`existingPolicyConfigMap` for your own).
 - `adminToken.existingSecret`: the Secret with the admin bearer. Do not put the token in `config`.

@@ -18,11 +18,22 @@ listen = "127.0.0.1:8080"
 # /.well-known/authzen-configuration. Required when `listen` is not a loopback address (the
 # server refuses to start without it). On loopback it may stay unset: discovery then uses
 # http://<Host>, and only a Host of localhost, 127.0.0.1 or [::1] is accepted (400 otherwise).
-# The server has no TLS of its own: terminate TLS at a reverse proxy and give its https:// URL
-# here. A plain http:// public_url on a host that is not loopback is refused (tokens would
+# Terminate TLS at a reverse proxy and give its https:// URL here, or turn on [server.tls]
+# below. A plain http:// public_url on a host that is not loopback is refused (tokens would
 # cross the network in cleartext) unless allow_insecure_http = true.
 # public_url = "https://attenuo.example.com"
 # allow_insecure_http = false
+
+# TLS on this listener ([server] listen) only, off by default. The admin, console and metrics
+# listeners stay plain HTTP. TLS 1.3 only, HTTP/1.1 only, no client certificates. The files
+# are read at start: a renewed certificate needs a restart. With it, public_url must be set
+# and https://, and allow_insecure_http is refused. See docs/guides/deploying.md.
+# [server.tls]
+# # The server certificate first, then any intermediate certificates.
+# cert_pem_path = "/etc/attenuo/tls/server.crt"
+# # One private key (PKCS#8, SEC1 or PKCS#1, not encrypted). On Unix the server refuses to
+# # start if its group or others can read or write it: chmod 600.
+# key_pem_path = "/etc/attenuo/tls/server.key"
 
 [issuer]
 issuer = "http://127.0.0.1:8080"
