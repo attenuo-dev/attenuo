@@ -306,7 +306,8 @@ Notes:
 - For a `spiffe://` name, the certificate must carry exactly one URI name, as an X.509-SVID does.
 - The dates of the certificate and its intermediates are checked on every request.
 - The client may send at most 4 intermediate CA certificates. If it needs cross-certificates, it sends the one its path uses first: only the first one with a given subject is used.
-- A certificate that also carries the name of another agent (or, for a PEP, another PEP) is refused. Extra names that no entry uses are fine.
+- A certificate that also carries the name of another agent (or, for a PEP, another PEP) is refused. Extra names that no entry uses are fine. So adding an entry whose name is an extra SAN in another client's certificate (for example one of SPIRE's `dns_names`) makes that certificate be refused for both entries; the debug log says `certificate_names_several_clients`.
+- A key-rollover link certificate (the new root signed by the old one) that the client sends is ignored, because it is self-issued: put the new root in the CA file.
 - There is no CRL or OCSP check. To stop a certificate before it expires, remove the CA or change the name on the entry and reload. Short-lived certificates make this matter less.
 - A CA you list can make a certificate for any name. List a CA only on the entries it should vouch for.
 

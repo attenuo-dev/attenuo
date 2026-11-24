@@ -676,8 +676,8 @@ fn extension<'a>(cert: &'a [u8], oid: &[u8]) -> Option<Option<&'a [u8]>> {
 
 /// Whether a certificate's `basicConstraints` (2.5.29.19) says `cA` TRUE, in DER: one
 /// `SEQUENCE` and nothing after it, holding the `BOOLEAN` `0xff`, then at most one `INTEGER`
-/// (`pathLenConstraint`) and nothing else. Anything else, a malformed extension included, is
-/// "not a CA", so the file is refused.
+/// (`pathLenConstraint`, not negative) and nothing else. Anything else, a malformed extension
+/// included, is "not a CA", so the file is refused.
 pub(crate) fn is_ca(cert: &[u8]) -> bool {
     let ca = || -> Option<()> {
         let value = extension(cert, &[0x55, 0x1d, 0x13])??;
@@ -690,7 +690,8 @@ pub(crate) fn is_ca(cert: &[u8]) -> bool {
             return Some(());
         }
         let (len, rest) = expect(rest, 0x02)?;
-        (!len.is_empty() && rest.is_empty()).then_some(())
+        // A path length is never negative: the first content byte has its top bit clear.
+        (len.first().is_some_and(|&b| b < 0x80) && rest.is_empty()).then_some(())
     };
     ca().is_some()
 }
@@ -1468,6 +1469,8 @@ mod tests {
             b"\x30\x03\x01\x01\xff\x00",
             b"\x30\x05\x01\x01\xff\x02\x00",
             b"\x30\x08\x01\x01\xff\x02\x01\x00\x05\x00",
+            b"\x30\x06\x01\x01\xff\x02\x01\x80",
+            b"\x30\x06\x01\x01\xff\x02\x01\xff",
             b"\x30\x04\x01\x01\xff",
             b"\x31\x03\x01\x01\xff",
             b"\x01\x01\xff",

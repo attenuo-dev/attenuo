@@ -201,7 +201,8 @@ fuzz_target!(|input: Input| {
         );
     }
 
-    // 4. The intermediates kept.
+    // 4. The intermediates kept. The expected list is built with the server's own issuer and
+    // subject read (`pki_issuer_subject`): this checks the filter's logic, not that read.
     let leaf = simple(input.leaf.0, input.leaf.1, input.leaf.2);
     let mut sent: Vec<Vec<u8>> = input
         .sent

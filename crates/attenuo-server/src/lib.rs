@@ -111,8 +111,9 @@ pub(crate) mod tls;
 
 /// Thin wrappers over crate-private code for the cargo-fuzz targets (`fuzz/`): the
 /// `[idps.id_jag_ceiling]` code for `idjag_ceiling`, and the DER reads of the TLS client
-/// certificate check (`client_pki`) for `client_pki_der`. **Not a public API**: behind the `fuzzing` feature, which only
-/// `fuzz/Cargo.toml` enables, hidden from the docs, and free to change or go with any release.
+/// certificate check (`client_pki`) for `client_pki_der`. **Not a public API**: behind the
+/// `fuzzing` feature, which only `fuzz/Cargo.toml` enables, hidden from the docs, and free to
+/// change or go with any release.
 /// Each wrapper calls the server's own function; none holds logic of its own.
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
