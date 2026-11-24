@@ -11,6 +11,35 @@ use attenuo_server::config::AgentConfig;
 
 pub mod tls;
 
+/// A free loopback port, for a listener the server binds itself (`run`, `serve`).
+///
+/// The port is released before the server binds it, so it must be one no other test can be given
+/// in between. A `127.0.0.1:0` bind takes its port from the system's ephemeral range, and
+/// the tests in this binary run in parallel and bind that way all the time: one of them
+/// could get the port just released, and the request meant for this server would reach
+/// that one. So the port comes from below the ephemeral range, and a counter keeps two
+/// calls in this process apart.
+pub fn free_port() -> std::net::SocketAddr {
+    use std::sync::atomic::{AtomicU16, Ordering};
+    const FIRST: u16 = 20_000;
+    const COUNT: u16 = 12_000;
+    static NEXT: AtomicU16 = AtomicU16::new(0);
+    // Start at a different place in each process, so two test binaries do not walk the same ports.
+    // The odd factor spreads neighbouring process ids apart.
+    let start = u16::try_from(u64::from(std::process::id()) * 7919 % u64::from(COUNT)).unwrap_or(0);
+    for _ in 0..COUNT {
+        let step = NEXT.fetch_add(1, Ordering::Relaxed) % COUNT;
+        let port = FIRST + (start + step) % COUNT;
+        if let Ok(l) = std::net::TcpListener::bind(("127.0.0.1", port)) {
+            return l.local_addr().unwrap();
+        }
+    }
+    panic!(
+        "no free loopback port between {FIRST} and {}",
+        FIRST + COUNT - 1
+    );
+}
+
 /// Lower-case hex SHA-256 of `s`, the form of a `secret_sha256` in the server config.
 pub fn sha256_hex(s: &str) -> String {
     use sha2::Digest;

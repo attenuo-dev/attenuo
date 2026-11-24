@@ -13,14 +13,6 @@ use serde_json::{json, Value};
 
 const ADMIN: &str = "admin-listener-test-token-0123456789abcdef";
 
-/// A free loopback address, for a listener `run` binds itself.
-fn free_port() -> std::net::SocketAddr {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-}
-
 fn config(dir: &std::path::Path) -> Config {
     let mut cfg = Config::default();
     cfg.audit.sqlite_path = dir.join("audit.sqlite").to_string_lossy().into_owned();
@@ -115,7 +107,7 @@ async fn answer(
 async fn admin_paths_on_the_main_listener_answer_as_unknown_paths_do() {
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = config(dir.path());
-    cfg.admin.listen = Some(free_port());
+    cfg.admin.listen = Some(common::free_port());
     let (router, _state) = attenuo_server::build(&cfg).unwrap();
     let main = spawn_router(router).await.unwrap();
     let base = main.url("");
@@ -180,7 +172,7 @@ async fn on_loopback_the_admin_api_stays_on_the_main_listener_by_default() {
 async fn the_admin_listener_serves_the_admin_api_behind_the_admin_bearer() {
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = config(dir.path());
-    cfg.admin.listen = Some(free_port());
+    cfg.admin.listen = Some(common::free_port());
     let (_router, state) = attenuo_server::build(&cfg).unwrap();
     let admin = spawn_router(attenuo_server::admin_router(state))
         .await
@@ -225,8 +217,8 @@ async fn the_admin_listener_serves_the_admin_api_behind_the_admin_bearer() {
 async fn run_serves_the_admin_listener_next_to_the_main_one_and_the_console() {
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = config(dir.path());
-    let admin_addr = free_port();
-    let console_addr = free_port();
+    let admin_addr = common::free_port();
+    let console_addr = common::free_port();
     cfg.admin.listen = Some(admin_addr);
     cfg.admin_ui.enabled = true;
     cfg.admin_ui.listen = console_addr;

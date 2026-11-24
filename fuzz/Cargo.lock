@@ -128,7 +128,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "attenuo-audit"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "attenuo-core",
  "attenuo-token",
@@ -146,7 +146,7 @@ dependencies = [
 
 [[package]]
 name = "attenuo-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "hex",
  "ryu",
@@ -188,7 +188,7 @@ dependencies = [
 
 [[package]]
 name = "attenuo-policy"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "attenuo-core",
  "cedar-policy",
@@ -204,7 +204,7 @@ dependencies = [
 
 [[package]]
 name = "attenuo-proxy"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -227,7 +227,7 @@ dependencies = [
 
 [[package]]
 name = "attenuo-server"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -273,7 +273,7 @@ dependencies = [
 
 [[package]]
 name = "attenuo-token"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "attenuo-core",
  "base64 0.23.1",

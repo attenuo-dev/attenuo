@@ -1,6 +1,8 @@
 //! The admin console listener (`[admin_ui]`): assets, headers, which admin routes it mounts,
 //! and that `serve` starts it.
 
+mod common;
+
 use std::sync::Arc;
 
 use attenuo_proxy::testing::{spawn_router, Spawned};
@@ -660,19 +662,13 @@ async fn cross_origin_requests_get_no_cors_headers() {
 /// `serve` binds `[admin_ui] listen` next to the main listener when enabled.
 #[tokio::test]
 async fn serve_starts_the_console_listener() {
-    let free_port = || {
-        std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-    };
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = Config::default();
     cfg.audit.sqlite_path = dir.path().join("a.sqlite").to_string_lossy().into_owned();
     cfg.admin.token = Some(ADMIN.into());
-    cfg.server.listen = free_port();
+    cfg.server.listen = common::free_port();
     cfg.admin_ui.enabled = true;
-    cfg.admin_ui.listen = free_port();
+    cfg.admin_ui.listen = common::free_port();
     let console = cfg.admin_ui.listen;
     let main = cfg.server.listen;
     let task = tokio::spawn(attenuo_server::serve(cfg));

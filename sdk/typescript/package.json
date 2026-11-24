@@ -1,6 +1,6 @@
 {
   "name": "@attenuo/sdk",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "TypeScript client for the attenuo authorization server: token exchange, attenuated capabilities, MCP calls through the enforcing proxy, lease renewal and the audit log.",
   "license": "Apache-2.0",
   "repository": {

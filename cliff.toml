@@ -3,7 +3,7 @@
 # Produces a Keep a Changelog style draft from Conventional Commits.
 # Usage:
 #   git cliff --unreleased            # draft the Unreleased section
-#   git cliff --tag v0.2.0            # preview the next release section
+#   git cliff --tag v0.2.1            # preview the next release section
 # The output is edited by hand into CHANGELOG.md; it is not committed verbatim.
 
 [changelog]
