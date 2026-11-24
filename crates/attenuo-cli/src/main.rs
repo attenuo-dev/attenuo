@@ -34,6 +34,7 @@ mod render;
 mod secrets;
 mod sse;
 mod stdio_bridge;
+mod tls;
 mod watch;
 
 #[cfg(test)]
@@ -151,19 +152,28 @@ async fn run(cli: Cli) -> Result<Outcome> {
         secrets::ADMIN_TOKEN_ENV,
         &mut stdin,
     )?;
+    // Read and checked before anything is sent, whatever the command: a client certificate
+    // without its key, or a file that cannot be read, is an error here.
+    let tls = tls::Tls::load(
+        cli.tls_ca_cert.as_deref(),
+        cli.tls_client_cert.as_deref(),
+        cli.tls_client_key.as_deref(),
+    )?;
     // An empty `ATTENUO_ADMIN_SERVER` (a compose file's `${VAR:-}`) counts as unset.
     let admin_server = cli.admin_server.as_deref().filter(|s| !s.is_empty());
-    let client = Client::new(&cli.server, admin_server, admin_token);
+    let client = Client::new(&cli.server, admin_server, admin_token, &tls);
     match cli.command {
         Command::Token(TokenCmd::Inspect(args)) => inspect(client.ok(), args, json).await,
         Command::Health(a) => health(&client?, &a, json).await,
         // Talks to no attenuo server.
         Command::StdioBridge(a) => stdio_bridge::run(a).await.map(|()| Outcome::Ok),
         Command::Init(a) => init_cmd::run(a).await.map(|()| Outcome::Ok),
-        Command::Connect(a) => connect::run(&cli.server, a).await.map(|code| match code {
-            0 => Outcome::Ok,
-            code => Outcome::Exit(code),
-        }),
+        Command::Connect(a) => connect::run(&cli.server, a, &tls)
+            .await
+            .map(|code| match code {
+                0 => Outcome::Ok,
+                code => Outcome::Exit(code),
+            }),
         Command::Admin(AdminCmd::Operator(OperatorCmd::New {
             name,
             role,
@@ -332,6 +342,11 @@ async fn run(cli: Cli) -> Result<Outcome> {
                 if let Some(secret) = secret {
                     body["client_id"] = client_id.into();
                     body["client_secret"] = secret.into();
+                } else if tls.has_client_cert() && body.get("actor_token").is_none() {
+                    // RFC 8705 `self_signed_tls_client_auth`: the certificate on the connection
+                    // authenticates the `client_id`. Not next to an actor token, where a
+                    // `client_id` would make the certificate count too.
+                    body["client_id"] = client_id.into();
                 }
             }
             let given = a
@@ -1278,7 +1293,14 @@ async fn approval_verify(
     let (header, claims) = jwt::decode_approval_unverified(&token)?;
     let jwks: Value = match args.jwks.as_deref() {
         Some(u) if u.starts_with("http://") || u.starts_with("https://") => {
-            let resp = client::http_client()?
+            // The `--server` client (its CA and client certificate) only for a URL on the
+            // same origin as `--server`; any other host gets the built-in roots and no
+            // certificate.
+            let http = match client.as_ref().ok().and_then(|c| c.http_for_url(u)) {
+                Some(http) => http,
+                None => client::http_client()?,
+            };
+            let resp = http
                 .get(u)
                 .send()
                 .await
@@ -2426,7 +2448,10 @@ mod tests {
 
     #[test]
     fn server_name_instead_of_url_is_explained() {
-        let err = Client::new("github", None, None).err().unwrap().to_string();
+        let err = Client::new("github", None, None, &tls::Tls::default())
+            .err()
+            .unwrap()
+            .to_string();
         assert!(err.contains("base URL"), "{err}");
     }
 }

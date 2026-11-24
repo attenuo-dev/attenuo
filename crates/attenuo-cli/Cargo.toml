@@ -32,6 +32,11 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true }
+# `--tls-ca-cert`, `--tls-client-cert`, `--tls-client-key`: reading the PEM sections (to check
+# each file before any request, without showing a parser message) and zeroing the key's bytes.
+# Both are already in the lock file through reqwest's rustls.
+rustls-pki-types = { version = "1", default-features = false, features = ["alloc"] }
+zeroize = { version = "1", default-features = false, features = ["alloc"] }
 
 # Signalling the STDIO server's process group (stdio-bridge) without `unsafe`. Already in the
 # lock file through tokio's and tempfile's dependencies.
@@ -45,3 +50,9 @@ rusqlite = { workspace = true }
 attenuo-core = { workspace = true }
 attenuo-server = { path = "../attenuo-server" }
 attenuo-proxy = { workspace = true, features = ["testing"] }
+# The TLS tests (`tests/tls_options.rs`, the unit tests of `tls.rs`) make a CA, server and
+# client certificates and serve TLS, with the server tests' helpers (`tests/common/tls.rs` of
+# attenuo-server). All three are already in the lock file.
+rcgen = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }

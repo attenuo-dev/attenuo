@@ -5,7 +5,7 @@
 use std::process::Command;
 
 /// The `attenuo` binary, with the environment variables that would supply a token, a secret,
-/// a server URL or a DPoP key removed, so a developer's shell cannot change a test's outcome.
+/// a server URL, a DPoP key or a TLS option removed, so a developer's shell cannot change a test's outcome.
 pub fn attenuo() -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_attenuo"));
     for var in [
@@ -15,6 +15,9 @@ pub fn attenuo() -> Command {
         "ATTENUO_SERVER",
         "ATTENUO_ADMIN_SERVER",
         "ATTENUO_DPOP_KEY",
+        "ATTENUO_TLS_CA_CERT",
+        "ATTENUO_TLS_CLIENT_CERT",
+        "ATTENUO_TLS_CLIENT_KEY",
     ] {
         c.env_remove(var);
     }
