@@ -223,6 +223,7 @@ dependencies = [
  "hex",
  "reqwest",
  "ring",
+ "rusqlite",
  "rustix",
  "serde_json",
  "sha2",

@@ -75,6 +75,10 @@ pub use shipped::{
 };
 pub use spans::{SpanHit, MAX_SEQS_PER_PROBE, MAX_SPANS_PER_RUN};
 pub use sqlite::{
+    compact, CompactError, CompactOptions, CompactReport, CompactState, SpaceCheck, SpacePlace,
+    TableDigest, AFTER_VACUUM_STEPS, COMPACT_BUSY_TIMEOUT,
+};
+pub use sqlite::{
     AnchorState, PlanBound, PlanGuards, PruneExpect, PruneGuard, PruneLimits, PruneOutcome,
     PrunePlan, PruneStep, SinkProgress, StoredAnchor,
 };

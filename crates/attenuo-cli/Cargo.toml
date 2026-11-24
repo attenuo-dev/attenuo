@@ -40,6 +40,8 @@ rustix = { version = "1", default-features = false, features = ["std", "process"
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# `audit compact` tests change a file's schema version directly.
+rusqlite = { workspace = true }
 attenuo-core = { workspace = true }
 attenuo-server = { path = "../attenuo-server" }
 attenuo-proxy = { workspace = true, features = ["testing"] }
