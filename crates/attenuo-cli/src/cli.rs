@@ -26,6 +26,26 @@ pub(crate) struct Cli {
     #[arg(long, global = true, env = "ATTENUO_ADMIN_SERVER", value_name = "URL")]
     pub admin_server: Option<String>,
 
+    /// PEM file of the CA certificates to trust for the server's TLS certificate, for a server
+    /// whose certificate comes from a private CA. When set, only these are trusted for
+    /// `--server`, `--admin-server` and `--jwks` URLs, not the public roots built into the
+    /// CLI. Without the flag, `ATTENUO_TLS_CA_CERT` is used (empty counts as unset).
+    #[arg(long, global = true, value_name = "PATH")]
+    pub tls_ca_cert: Option<std::path::PathBuf>,
+
+    /// PEM file of a TLS client certificate to present to the origin of an `https://`
+    /// `--server` (never to an `--admin-server` on another origin), for an agent pinned with
+    /// `tls_client_cert_sha256`. Needs `--tls-client-key`. Without the flag,
+    /// `ATTENUO_TLS_CLIENT_CERT` is used (empty counts as unset).
+    #[arg(long, global = true, value_name = "PATH")]
+    pub tls_client_cert: Option<std::path::PathBuf>,
+
+    /// PEM file of the private key of `--tls-client-cert` (unencrypted). Needs
+    /// `--tls-client-cert`. Without the flag, `ATTENUO_TLS_CLIENT_KEY` is used (empty counts
+    /// as unset).
+    #[arg(long, global = true, value_name = "PATH")]
+    pub tls_client_key: Option<std::path::PathBuf>,
+
     /// Bearer token for `/admin/*` (token root, lease, audit, policy). Without this flag,
     /// `--admin-token-stdin` or `--admin-token-file`, the `ATTENUO_ADMIN_TOKEN` environment
     /// variable is used.

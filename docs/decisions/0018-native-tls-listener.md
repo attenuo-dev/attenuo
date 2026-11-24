@@ -101,3 +101,7 @@ Related: ADR-0007 and ADR-0017, which set mTLS aside for lack of native TLS; ADR
 ### Update 2026-11-24: client certificates
 
 The decision above stands. The first item of "Not done here" is now done for self-signed certificates: with `[server.tls] client_certificates = "optional"` the listener asks for a client certificate, and `tls_client_cert_sha256` on `[[agents]]` and `[[peps]]` pins it ([ADR-0019](0019-self-signed-tls-client-auth.md)). The default, `"off"`, asks for none, as this ADR decided. The rule that an environment override cannot create the section is made stricter: no key of `[server.tls]` can be set from the environment, also when the file has the section. Certificate-bound access tokens are still not done.
+
+### Update 2026-11-24: CLI TLS options
+
+The decision above stands. The CLI limit named under "Bad" is lifted: `--tls-ca-cert` (`ATTENUO_TLS_CA_CERT`) gives the CLI the CA of a private or self-signed server certificate, and with it the CLI trusts only that file for `--server`, `--admin-server` and an `approval verify --jwks` URL, not its built-in web PKI roots. A self-signed server certificate works only if it is not a CA certificate (`CA:FALSE`) ([CLI reference](../reference/cli.md#global-options)). The image's built-in `HEALTHCHECK` and the Helm chart's probes are unchanged and still use plain HTTP; a health check override can now use the CLI with that option ([deploying](../guides/deploying.md#health-checks-the-image-and-the-cli)).

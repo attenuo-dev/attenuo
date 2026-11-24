@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 use std::sync::Mutex;
 
 use crate::render::escape_controls;
+use crate::tls::{Target, Tls};
 
 /// Present `token` with a DPoP proof by `key` for `method` and `url` (RFC 9449 §7.1:
 /// `Authorization: DPoP <token>` and a `DPoP` header whose `ath` covers the token), or as a
@@ -71,7 +72,13 @@ const ROOT_MINT_HINT: &str = "hint: POST /admin/root-token exists only when the 
      identity provider, use `attenuo token exchange --subject-token-type id-token`";
 
 pub(crate) struct Client {
+    /// Sends to the origin of `--server` only: `--tls-ca-cert` and the client certificate,
+    /// when given. [`Client::client_for`] is the only place that hands it out.
     http: reqwest::Client,
+    /// Sends to every other origin (`--admin-server`): `--tls-ca-cert`, never the client
+    /// certificate. Requests are also built with it, so a request sent from its builder
+    /// directly carries no certificate either.
+    plain_http: reqwest::Client,
     base: String,
     /// Where `/admin/*` goes: `--admin-server` when given, else `base`.
     admin_base: String,
@@ -81,15 +88,20 @@ pub(crate) struct Client {
     /// The latest `DPoP-Nonce` this server sent (RFC 9449 §8), for the next proof. Never
     /// printed or logged.
     nonce: Mutex<Option<String>>,
+    /// [`Tls::check_targets`]'s warning, printed before the first request.
+    tls_warning: Option<String>,
+    tls_warned: std::sync::atomic::AtomicBool,
 }
 
 impl Client {
     /// A client for the server at `base`, sending `/admin/*` to `admin_base` instead when
-    /// given (`--admin-server`, for a server with `[admin] listen`).
+    /// given (`--admin-server`, for a server with `[admin] listen`), with the `--tls-*`
+    /// options in `tls`.
     pub(crate) fn new(
         base: &str,
         admin_base: Option<&str>,
         admin_token: Option<String>,
+        tls: &Tls,
     ) -> Result<Self> {
         let base = base_url(base)?;
         let admin_base_given = admin_base.is_some();
@@ -103,13 +115,19 @@ impl Client {
             })?,
             None => base.clone(),
         };
+        // After the URLs are known to be URLs, so `--server github` gets that message.
+        let tls_warning =
+            tls.check_targets(&base, admin_base_given.then_some(admin_base.as_str()))?;
         Ok(Self {
-            http: http_client()?,
+            http: tls.build(Target::Server, client_builder())?,
+            plain_http: tls.build(Target::Admin, client_builder())?,
             base,
             admin_base,
             admin_base_given,
             admin_token,
             nonce: Mutex::new(None),
+            tls_warning,
+            tls_warned: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -127,22 +145,19 @@ impl Client {
     /// Keeps the response's `DPoP-Nonce`; when `dpop` is set and the server refused the proof
     /// with `use_dpop_nonce` and sent a nonce, builds and sends the request once more with it
     /// (RFC 9449 §8.2).
+    /// `path` is the API path the request is for (`/token`, `/admin/...`), without any
+    /// prefix of the base URL; it chooses the messages, not the client.
     async fn send_dpop(
         &self,
+        path: &str,
         dpop: bool,
         mut build: impl FnMut(Option<&str>) -> Result<RequestBuilder>,
     ) -> Result<Reply> {
         let mut retried = false;
+        let admin_hint = self.hints_admin_listener(path);
         loop {
-            let req = build(self.current_nonce().as_deref())?.build()?;
-            let base = self.base_for(req.url().path()).to_owned();
-            let admin_hint = self.hints_admin_listener(req.url().path());
-            let resp = self
-                .http
-                .execute(req)
-                .await
-                .with_context(|| format!("could not reach the server at {base}"))?;
-            refuse_redirect(&resp, self.flag_for(resp.url().path()))?;
+            let req = build(self.current_nonce().as_deref())?;
+            let resp = self.execute(path, req).await?;
             let status = resp.status();
             let headers = resp.headers().clone();
             let text = resp.text().await?;
@@ -180,6 +195,48 @@ impl Client {
         }
     }
 
+    /// The HTTP client for a request to `url`, chosen by the URL the request goes to, never
+    /// by the API path: the `--server` client (with the client certificate) only when `url`
+    /// has the origin (scheme, host and port) of `--server`, the client without the
+    /// certificate for every other URL. So `--admin-server` on another origin never gets the
+    /// certificate, whatever prefix either base URL has. One on the same origin as
+    /// `--server` is the same host, and does.
+    fn client_for(&self, url: &reqwest::Url) -> &reqwest::Client {
+        match (origin(url.as_str()), origin(&self.base)) {
+            (Some(a), Some(b)) if a == b => &self.http,
+            _ => &self.plain_http,
+        }
+    }
+
+    /// The client for a full URL that is not built from `--server` or `--admin-server` (an
+    /// `approval verify --jwks` URL): [`Client::client_for`]'s choice, so the certificate
+    /// goes only to the origin of `--server`, and `--tls-ca-cert` applies either way.
+    pub(crate) fn http_for_url(&self, url: &str) -> Result<reqwest::Client> {
+        let url = reqwest::Url::parse(url).with_context(|| format!("`{url}` is not a URL"))?;
+        Ok(self.client_for(&url).clone())
+    }
+
+    /// Send `req` (for the API path `path`) with [`Client::client_for`]'s client, and refuse
+    /// a redirect.
+    async fn execute(&self, path: &str, req: RequestBuilder) -> Result<reqwest::Response> {
+        if let Some(warning) = &self.tls_warning {
+            if !self
+                .tls_warned
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                errln!("{warning}");
+            }
+        }
+        let req = req.build()?;
+        let resp = self
+            .client_for(req.url())
+            .execute(req)
+            .await
+            .with_context(|| format!("could not reach the server at {}", self.base_for(path)))?;
+        refuse_redirect(&resp, self.flag_for(path))?;
+        Ok(resp)
+    }
+
     /// The flag that sets the base URL serving `path`, for [`refuse_redirect`]'s message.
     fn flag_for(&self, path: &str) -> &'static str {
         if is_admin_path(path) && self.admin_base_given {
@@ -208,10 +265,10 @@ impl Client {
         Ok(req.bearer_auth(token))
     }
 
-    async fn send_json(&self, req: RequestBuilder) -> Result<Value> {
+    async fn send_json(&self, path: &str, req: RequestBuilder) -> Result<Value> {
         let mut req = Some(req);
         let reply = self
-            .send_dpop(false, |_| Ok(req.take().expect("sent once")))
+            .send_dpop(path, false, |_| Ok(req.take().expect("sent once")))
             .await?;
         json_reply(reply)
     }
@@ -223,24 +280,19 @@ impl Client {
         path: &str,
         timeout: std::time::Duration,
     ) -> Result<(StatusCode, String)> {
-        let resp = self
-            .http
-            .get(self.url(path))
-            .timeout(timeout)
-            .send()
-            .await
-            .with_context(|| format!("could not reach the server at {}", self.base_for(path)))?;
-        refuse_redirect(&resp, self.flag_for(path))?;
+        let req = self.plain_http.get(self.url(path)).timeout(timeout);
+        let resp = self.execute(path, req).await?;
         let status = resp.status();
         Ok((status, resp.text().await?))
     }
 
     pub(crate) async fn get(&self, path: &str) -> Result<Value> {
-        self.send_json(self.http.get(self.url(path))).await
+        self.send_json(path, self.plain_http.get(self.url(path)))
+            .await
     }
 
     pub(crate) async fn admin_get(&self, path: &str) -> Result<Value> {
-        self.send_json(self.admin(self.http.get(self.url(path)))?)
+        self.send_json(path, self.admin(self.plain_http.get(self.url(path)))?)
             .await
     }
 
@@ -248,13 +300,10 @@ impl Client {
     /// (the audit export). Non-success statuses become errors; the long timeout is for a big
     /// export, not for a hung server.
     pub(crate) async fn admin_get_stream(&self, path: &str) -> Result<reqwest::Response> {
-        let resp = self
-            .admin(self.http.get(self.url(path)))?
-            .timeout(std::time::Duration::from_secs(3600))
-            .send()
-            .await
-            .with_context(|| format!("could not reach the server at {}", self.base_for(path)))?;
-        refuse_redirect(&resp, self.flag_for(path))?;
+        let req = self
+            .admin(self.plain_http.get(self.url(path)))?
+            .timeout(std::time::Duration::from_secs(3600));
+        let resp = self.execute(path, req).await?;
         let status = resp.status();
         if status.is_success() {
             return Ok(resp);
@@ -268,16 +317,20 @@ impl Client {
     }
 
     pub(crate) async fn admin_post(&self, path: &str, body: &Value) -> Result<Value> {
-        self.send_json(self.admin(self.http.post(self.url(path)).json(body))?)
-            .await
+        self.send_json(
+            path,
+            self.admin(self.plain_http.post(self.url(path)).json(body))?,
+        )
+        .await
     }
 
     /// `POST /admin/root-token`, bound to `key` when given (a DPoP proof in the header).
     pub(crate) async fn root(&self, body: &Value, key: Option<&DpopKey>) -> Result<Value> {
-        let url = self.url("/admin/root-token");
+        let path = "/admin/root-token";
+        let url = self.url(path);
         let reply = self
-            .send_dpop(key.is_some(), |nonce| {
-                let mut req = self.admin(self.http.post(&url).json(body))?;
+            .send_dpop(path, key.is_some(), |nonce| {
+                let mut req = self.admin(self.plain_http.post(&url).json(body))?;
                 if let Some(k) = key {
                     req = req.header(
                         "dpop",
@@ -311,8 +364,8 @@ impl Client {
     ) -> Result<Value> {
         let dpop = proof(None)?.is_some();
         let reply = self
-            .send_dpop(dpop, |nonce| {
-                let mut req = self.http.post(self.url("/token")).json(body);
+            .send_dpop("/token", dpop, |nonce| {
+                let mut req = self.plain_http.post(self.url("/token")).json(body);
                 if let Some(p) = proof(nonce)? {
                     req = req.header("dpop", p);
                 }
@@ -354,8 +407,8 @@ impl Client {
     ) -> Result<Value> {
         let url = self.url(path);
         let reply = self
-            .send_dpop(key.is_some(), |nonce| {
-                Ok(present(self.http.post(&url), token, key, "POST", &url, nonce).json(body))
+            .send_dpop(path, key.is_some(), |nonce| {
+                Ok(present(self.plain_http.post(&url), token, key, "POST", &url, nonce).json(body))
             })
             .await?;
         json_reply(reply)
@@ -372,16 +425,17 @@ impl Client {
         params: Value,
     ) -> Result<Value> {
         let body = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
-        let url = self.url(&format!("/mcp/{server}"));
+        let path = format!("/mcp/{server}");
+        let url = self.url(&path);
         let Reply {
             status,
             headers,
             text,
             ..
         } = self
-            .send_dpop(key.is_some(), |nonce| {
+            .send_dpop(&path, key.is_some(), |nonce| {
                 Ok(
-                    present(self.http.post(&url), token, key, "POST", &url, nonce)
+                    present(self.plain_http.post(&url), token, key, "POST", &url, nonce)
                         .header("accept", "application/json, text/event-stream")
                         .json(&body),
                 )
@@ -426,6 +480,17 @@ fn json_reply(reply: Reply) -> Result<Value> {
     } else {
         err
     })
+}
+
+/// The origin of `url` (scheme, host and port, the default port filled in), or `None` for a
+/// string that is not a URL with a host.
+fn origin(url: &str) -> Option<(String, String, Option<u16>)> {
+    let u = reqwest::Url::parse(url).ok()?;
+    Some((
+        u.scheme().to_owned(),
+        u.host_str()?.to_owned(),
+        u.port_or_known_default(),
+    ))
 }
 
 /// Whether `path` is `/admin` or under it, which `--admin-server` serves.
@@ -507,11 +572,19 @@ pub(crate) fn stable_code(body: &Value) -> Option<&str> {
 /// A followed `307` or `308` sends the body again to wherever `Location` names, client
 /// secret, client assertion and subject token included; [`refuse_redirect`] reports it
 /// instead.
+///
+/// This one trusts the built-in roots and presents no client certificate: it is for `init`,
+/// which talks to an MCP server, not to attenuo. [`Client`] and `approval verify --jwks` add
+/// the `--tls-*` options to [`client_builder`] themselves.
 pub(crate) fn http_client() -> Result<reqwest::Client> {
-    Ok(reqwest::Client::builder()
+    Ok(client_builder().build()?)
+}
+
+/// The settings of [`http_client`], before it is built.
+pub(crate) fn client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
-        .build()?)
 }
 
 /// An error for a 3xx answer, naming its status and `Location` (SR-112): the client follows
@@ -820,13 +893,19 @@ mod tests {
 
     #[test]
     fn admin_listener_hint_only_for_a_bare_404_to_an_implicit_admin_base() {
-        let one = Client::new("http://main:8080", None, None).unwrap();
+        let one = Client::new("http://main:8080", None, None, &Tls::default()).unwrap();
         assert!(one.hints_admin_listener("/admin/audit/verify"));
         assert!(one.hints_admin_listener("/admin"));
         for path in ["/token", "/mcp/admin", "/administer", "/healthz"] {
             assert!(!one.hints_admin_listener(path), "{path}");
         }
-        let split = Client::new("http://main:8080", Some("http://adm:9102"), None).unwrap();
+        let split = Client::new(
+            "http://main:8080",
+            Some("http://adm:9102"),
+            None,
+            &Tls::default(),
+        )
+        .unwrap();
         assert!(!split.hints_admin_listener("/admin/audit/verify"));
 
         let bare = with_admin_hint(api_error(StatusCode::NOT_FOUND, "")).to_string();
@@ -854,20 +933,83 @@ mod tests {
         }
     }
 
+    /// The client is chosen by the origin a request goes to, never by its path: an
+    /// `--admin-server` with a path prefix (`/pfx/admin/...`) on another origin gets the
+    /// client without the certificate, and a prefixed `--server` keeps its own.
+    #[test]
+    fn the_certificate_client_is_used_only_for_the_server_origin() {
+        let is_server = |c: &Client, path: &str| {
+            let url = reqwest::Url::parse(&c.url(path)).unwrap();
+            std::ptr::eq(c.client_for(&url), &c.http)
+        };
+        for (server, admin) in [
+            ("https://main.test", "https://adm.test"),
+            ("https://main.test/pfx", "https://adm.test/pfx"),
+            ("https://main.test", "https://main.test:9102"),
+            ("https://main.test", "http://main.test"),
+        ] {
+            let c = Client::new(server, Some(admin), None, &Tls::default()).unwrap();
+            for path in ["/admin/policies", "/admin", "/admin/root-token"] {
+                assert!(!is_server(&c, path), "{server} {admin} {path}");
+            }
+            for path in ["/token", "/healthz", "/mcp/admin", "/administer"] {
+                assert!(is_server(&c, path), "{server} {admin} {path}");
+            }
+        }
+        // Without --admin-server, `/admin/*` goes to `--server`, the same host.
+        let one = Client::new("https://main.test/pfx", None, None, &Tls::default()).unwrap();
+        assert!(is_server(&one, "/admin/audit"));
+
+        // Full URLs (`approval verify --jwks`): the server origin only.
+        let c = Client::new("https://attenuo.test", None, None, &Tls::default()).unwrap();
+        let picks_server = |u: &str| {
+            let url = reqwest::Url::parse(u).unwrap();
+            std::ptr::eq(c.client_for(&url), &c.http)
+        };
+        for same in [
+            "https://attenuo.test/.well-known/jwks.json",
+            "https://attenuo.test:443/jwks",
+            "https://ATTENUO.test/jwks",
+        ] {
+            assert!(picks_server(same), "{same}");
+        }
+        for other in [
+            "http://attenuo.test/jwks",
+            "https://attenuo.test:8443/jwks",
+            "https://attenuo.test.evil/jwks",
+            "https://other.test/jwks",
+            "https://evil@other.test/jwks",
+        ] {
+            assert!(!picks_server(other), "{other}");
+        }
+        assert!(c.http_for_url("not a url").is_err());
+    }
+
     #[test]
     fn server_must_be_a_url() {
-        assert!(Client::new("github", None, None).is_err());
-        assert!(Client::new("http://127.0.0.1:8080/", None, None).is_ok());
-        let err = Client::new("http://127.0.0.1:8080", Some("admin"), None)
-            .err()
-            .unwrap()
-            .to_string();
+        assert!(Client::new("github", None, None, &Tls::default()).is_err());
+        assert!(Client::new("http://127.0.0.1:8080/", None, None, &Tls::default()).is_ok());
+        let err = Client::new(
+            "http://127.0.0.1:8080",
+            Some("admin"),
+            None,
+            &Tls::default(),
+        )
+        .err()
+        .unwrap()
+        .to_string();
         assert!(err.starts_with("--admin-server must be"), "{err}");
     }
 
     #[test]
     fn admin_paths_go_to_the_admin_server_when_given() {
-        let split = Client::new("http://main:8080/", Some("http://adm:9102/"), None).unwrap();
+        let split = Client::new(
+            "http://main:8080/",
+            Some("http://adm:9102/"),
+            None,
+            &Tls::default(),
+        )
+        .unwrap();
         for path in [
             "/admin/audit?from=1",
             "/admin/root-token",
@@ -885,7 +1027,7 @@ mod tests {
         ] {
             assert_eq!(split.url(path), format!("http://main:8080{path}"));
         }
-        let one = Client::new("http://main:8080", None, None).unwrap();
+        let one = Client::new("http://main:8080", None, None, &Tls::default()).unwrap();
         assert_eq!(one.url("/admin/audit"), "http://main:8080/admin/audit");
         assert_eq!(one.url("/token"), "http://main:8080/token");
     }

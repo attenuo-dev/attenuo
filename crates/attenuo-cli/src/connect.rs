@@ -2055,8 +2055,11 @@ impl Front {
 }
 
 /// `attenuo connect`. The exit status: 0, or [`EXIT_REVOKED`] after `lease_revoked`.
-pub(crate) async fn run(server: &str, args: ConnectArgs) -> Result<u8> {
+pub(crate) async fn run(server: &str, args: ConnectArgs, tls: &crate::tls::Tls) -> Result<u8> {
     let base = check_server(server)?;
+    if let Some(warning) = tls.check_targets(&base, None)? {
+        errln!("{warning}");
+    }
     attenuo_core::names::check_server_name(&args.upstream)
         .map_err(|e| anyhow!("--upstream is not a valid upstream name: {e}"))?;
     let source = Source::from_args(&args)?;
@@ -2067,10 +2070,13 @@ pub(crate) async fn run(server: &str, args: ConnectArgs) -> Result<u8> {
         );
     }
     let tokens = Tokens::start(source).await?;
-    let http = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(CONNECT_TIMEOUT)
-        .build()?;
+    // Every request goes to `--server`: its CA and the client certificate, when given.
+    let http = tls.build(
+        crate::tls::Target::Server,
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(CONNECT_TIMEOUT),
+    )?;
     let (out, out_rx) = mpsc::channel(OUT_QUEUE);
     tokio::spawn(write_stdout(out_rx));
     let max_message = usize::try_from(args.max_message_bytes).unwrap_or(usize::MAX);

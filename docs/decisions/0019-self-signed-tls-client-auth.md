@@ -105,6 +105,10 @@ Not done here, each for a later change:
 
 Related: ADR-0007 and ADR-0017, which set mTLS aside; ADR-0018, the native TLS listener; ADR-0014, the SR-109 rule; ADR-0017's SR-110 update, one answer for refusals.
 
+### Update 2026-11-24: CLI client certificates
+
+The decision above stands. The `attenuo` CLI can now present a client certificate: `--tls-client-cert` and `--tls-client-key` (`ATTENUO_TLS_CLIENT_CERT`, `ATTENUO_TLS_CLIENT_KEY`) go to the origin of `--server` only, never to an `--admin-server` or another origin (except that an `https://` proxy in `HTTPS_PROXY` is offered the certificate if it asks), and `token exchange` then sends `client_id` with no secret ([identity providers](../guides/identity-providers.md#tls-client-certificates)). The Python and TypeScript SDKs still cannot, and the Helm chart and the image's health check still do not support `[server.tls]`.
+
 ### Update 2026-11-24: certificates from a CA
 
 The decision above stands. The first item of "Not done here" is now done for SAN URI (with SPIFFE IDs) and SAN DNS: `tls_client_ca_pem_path` with `tls_client_auth_san_uri` or `tls_client_auth_san_dns` (RFC 8705 `tls_client_auth`, [ADR-0020](0020-pki-tls-client-auth.md)). An entry uses pins or a CA, not both. The listener now also keeps the certificates the client sends after its own (at most 8), for the CA check; the self-signed check still ignores them.
