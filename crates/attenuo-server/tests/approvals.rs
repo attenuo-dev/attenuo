@@ -1491,7 +1491,7 @@ async fn approval_token_of_a_dpop_bound_hop_is_bound_to_its_key() {
         .verifier
         .verify_approval(approval_token, OffsetDateTime::now_utc())
         .unwrap();
-    assert_eq!(claims.cnf.unwrap().jkt, key.thumbprint());
+    assert_eq!(claims.cnf.unwrap().key_thumbprint(), Some(key.thumbprint()));
 
     // A token for the same approval but minted for another key, or for no key, is refused
     // even with the right key's proof.

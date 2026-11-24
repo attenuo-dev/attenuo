@@ -60,7 +60,11 @@
 //! **Sender constraint (SR-24).** A `DPoP` header binds the child to the proof's key; a bound
 //! subject token needs a proof by its key (in the header, with `ath`, or in the body field
 //! `subject_token_dpop` when the child is bound to another key), and its child is always
-//! bound. See [`crate::dpop`] for the rule and `[token] dpop`.
+//! bound. See [`crate::dpop`] for the rule and `[token] dpop`. A subject token bound to a TLS
+//! client certificate needs a request that shows that certificate, and its child is bound to
+//! the same one; with `[token] tls_client_certificate_bound_access_tokens`, the child of an
+//! unbound subject token is bound to the certificate the agent authenticated with. See
+//! `crate::cert_binding`.
 //!
 //! **Audited refusals.** Once the subject token has verified (signature, type, issuer,
 //! audience, expiry, chain) and so has its DPoP proof, a refusal the caller caused is recorded
@@ -315,7 +319,9 @@ fn refusal_reason(e: &attenuo_token::TokenError) -> Option<&'static str> {
     use attenuo_core::ChainError;
     use attenuo_token::TokenError;
     Some(match e {
-        TokenError::Key(_) | TokenError::BindingRequired => return None,
+        TokenError::Key(_) | TokenError::BindingRequired | TokenError::BindingMismatch => {
+            return None
+        }
         TokenError::Chain(ChainError::AttenuationViolated { .. }) => REASON_EXCHANGE_WIDENING,
         TokenError::Chain(ChainError::TooDeep { .. }) => REASON_EXCHANGE_TOO_DEEP,
         TokenError::Chain(ChainError::DuplicateAgent { .. }) => REASON_EXCHANGE_DUPLICATE_ACTOR,
@@ -375,6 +381,9 @@ fn exchange_sync(
     // `client_cert` of the record's arguments: only for a client authenticated by its TLS
     // client certificate, so other records digest as before.
     let mut client_cert = None;
+    // `[token] tls_client_certificate_bound_access_tokens`: the certificate an unbound
+    // parent's child is bound to, when the agent authenticated with one.
+    let mut issuing = None;
     // The agent this request authenticated as, for `[limits] token_requests_per_minute`.
     let mut caller = actor.as_ref().map(|(verified, _)| verified.agent.clone());
     if let Some((verified, _)) = &actor {
@@ -410,9 +419,34 @@ fn exchange_sync(
         )?;
         let method = client.method();
         client_cert = client.client_cert_audit();
+        issuing =
+            crate::cert_binding::issuing_cert(state.cert_bound_tokens, Some(&client)).cloned();
         // The rate limit and a DPoP proof that will be refused come first, so that a request
         // the client is told to send again does not use its assertion up (SR-108, SR-111).
         client.check_before_commit(state, headers, mark, now)?;
+        // So do the refusals of a certificate-bound subject token, which the client can
+        // correct (`crate::cert_binding::check_exchange_of_cert_bound`). A subject token that
+        // does not verify is refused below, in its usual place.
+        if let Ok(parent) = state.keys().verifier.verify(&req.subject_token, now) {
+            if let Some(bound) = parent
+                .claims
+                .cnf
+                .as_ref()
+                .and_then(attenuo_token::Confirmation::cert_thumbprint)
+            {
+                if let Err(refused) = crate::cert_binding::check_exchange_of_cert_bound(
+                    bound,
+                    crate::dpop::header_proof(headers)?.is_some() || subject_proof.is_some(),
+                    cert.map(ClientCertificate::sha256),
+                ) {
+                    // Counted by `[limits] token_requests_per_minute` as the refusals after
+                    // the commit are, so that this check costs the agent its budget too: over
+                    // the limit the answer is the usual 429. The assertion is not used up.
+                    state.limits.admit_agent(mark, client.id())?;
+                    return Err(refused.into());
+                }
+            }
+        }
         // Past that, an assertion authenticates this one request, whatever its outcome: its
         // `jti` is recorded now (`crate::clientauth`).
         let agent = client.commit(&state.replay, now)?;
@@ -432,7 +466,9 @@ fn exchange_sync(
         };
         caller = Some(agent);
     }
-    // Before the subject token, the lease lookups, signing and the audit append.
+    // Before the subject token, the lease lookups, signing and the audit append. A request
+    // the early certificate-binding check refused was counted there and does not get here,
+    // so each request is counted once.
     if let Some(agent) = &caller {
         state.limits.admit_agent(mark, agent)?;
     }
@@ -450,18 +486,25 @@ fn exchange_sync(
     let issuer_keys = state.keys();
     let parent = issuer_keys.verifier.verify(&req.subject_token, now)?;
     // DPoP (SR-24): bind the child to the header proof's key; a bound parent needs proof of
-    // its key and a bound child.
-    let cnf = state.dpop.bind_exchange(
-        parent.claims.cnf.as_ref(),
-        &req.subject_token,
-        &req.actor.0,
-        crate::dpop::header_proof(headers)?,
-        subject_proof.as_deref(),
-        &state.dpop.expected_url_for(headers, "/token"),
+    // its key and a bound child. A certificate-bound parent (RFC 8705 §3) needs the request to
+    // show its certificate, and its child is bound to the same one (`crate::cert_binding`).
+    let cnf = crate::cert_binding::bind_exchange(
+        &state.dpop,
+        &crate::cert_binding::ExchangeBinding {
+            parent: parent.claims.cnf.as_ref(),
+            subject_token: &req.subject_token,
+            actor: &req.actor.0,
+            header: crate::dpop::header_proof(headers)?,
+            subject_proof: subject_proof.as_deref(),
+            issuing: issuing.as_ref(),
+            cert: cert.map(ClientCertificate::sha256),
+            url: &state.dpop.expected_url_for(headers, "/token"),
+        },
         now,
     )?;
     let asked = req.requested.clone();
-    let dpop_bound = cnf.is_some();
+    let binding = crate::cert_binding::Binding::of(cnf.as_ref());
+    let dpop_bound = binding.dpop();
     let verified = Verified {
         keys: &issuer_keys,
         parent: &parent,
@@ -483,11 +526,13 @@ fn exchange_sync(
                 "actor_auth": actor_auth,
                 "dpop_bound": dpop_bound,
             });
+            binding.add_to(&mut args);
             if let Some(c) = client_cert {
                 args["client_cert"] = c;
             }
-            let call =
-                ToolCall::new(super::AUDIT_SERVER, EXCHANGE_TOOL, args).with_dpop_bound(dpop_bound);
+            let call = ToolCall::new(super::AUDIT_SERVER, EXCHANGE_TOOL, args)
+                .with_dpop_bound(dpop_bound)
+                .with_cert_bound(binding.cert());
             let id = state
                 .pipeline
                 .record_rejection(&parent.chain, &call, reason, now);
@@ -595,7 +640,8 @@ fn exchange_verified(
         }
         None => None,
     };
-    let dpop_bound = cnf.is_some();
+    let binding = crate::cert_binding::Binding::of(cnf.as_ref());
+    let dpop_bound = binding.dpop();
     // Run limits (ADR-0010): the child's `calls` and `sum` figures are clamped to what the
     // parent hop has left now, not only to its static figures. What was asked is audited.
     let asked = req.requested.clone();
@@ -653,6 +699,7 @@ fn exchange_verified(
         "actor_auth": actor_auth,
         "dpop_bound": dpop_bound,
     });
+    binding.add_to(&mut args);
     if let Some((verified, _)) = actor {
         args["actor_subject"] = verified.subject.clone().into();
         args["actor_trust"] = verified.trust.clone().into();
@@ -671,7 +718,7 @@ fn exchange_verified(
     if let Some(c) = client_cert {
         args["client_cert"] = c;
     }
-    if let Err(e) = audit_issuance(state, EXCHANGE_TOOL, &issued.chain, args, dpop_bound, now) {
+    if let Err(e) = audit_issuance(state, EXCHANGE_TOOL, &issued.chain, args, binding, now) {
         // An issuance we cannot record must not be usable.
         let _ = state.leases.revoke(&resp.lease, "audit_error", now);
         return Err(e.into());
@@ -690,6 +737,7 @@ fn exchange_verified(
         lease = %resp.lease.0,
         depth = issued.chain.depth(),
         dpop_bound,
+        cert_bound = binding.cert(),
         "token exchanged"
     );
     let mut out = Json(resp).into_response();

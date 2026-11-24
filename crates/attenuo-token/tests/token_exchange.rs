@@ -1061,7 +1061,7 @@ fn children_of_bound_tokens_must_be_bound_sr24() {
             )
             .unwrap();
         let cc = issuer.verifier().verify(&c.token, t0()).unwrap().claims;
-        assert_eq!(cc.cnf.unwrap().jkt, key.thumbprint());
+        assert_eq!(cc.cnf.unwrap().key_thumbprint(), Some(key.thumbprint()));
     }
     // An unbound parent may have a bound or an unbound child, as before.
     let open = root(&issuer);
@@ -1095,6 +1095,129 @@ fn children_of_bound_tokens_must_be_bound_sr24() {
         ),
         Err(TokenError::Malformed(_))
     ));
+}
+
+/// RFC 8705 §3: a token bound to a TLS client certificate (`cnf.x5t#S256`) has children bound
+/// to the same certificate only: not unbound, not to a key, not to another certificate. A
+/// key-bound parent never gets a certificate-bound child. The response says `Bearer`.
+#[test]
+fn children_of_certificate_bound_tokens_keep_the_certificate() {
+    use attenuo_token::{Confirmation, DpopKey};
+    let issuer = issuer();
+    let cert = "ungWv48Bz-pBQUDeXa4iI7ADYaOWF3qctBD_YfIAFa0";
+    let other = "LCa0a2j_xo_5m0U8HTBBNBNCLXBkg7-g-YpeiGJm564";
+    let with = |cnf: Option<Confirmation>| IssueOptions {
+        cnf,
+        ..IssueOptions::default()
+    };
+    let read = || caps([Capability::new("github", "read_file")]);
+    let r = issuer
+        .issue_root_with(
+            user(),
+            AgentId::new("agent:planner"),
+            caps([Capability::new("github", "read_*")]),
+            None,
+            t0(),
+            &with(Some(Confirmation::x5t_s256(cert))),
+        )
+        .unwrap();
+    let payload = decode_payload(&r.token);
+    assert_eq!(payload["cnf"], json!({"x5t#S256": cert}));
+    assert_eq!(
+        issuer.verifier().verify(&r.token, t0()).unwrap().claims.cnf,
+        Some(Confirmation::x5t_s256(cert))
+    );
+    assert_eq!(ExchangeResponse::from_issued(&r, t0()).token_type, "Bearer");
+
+    let exchange = |cnf: Option<Confirmation>| {
+        issuer.exchange_with(
+            &r.token,
+            AgentId::new("agent:coder"),
+            read(),
+            None,
+            t0(),
+            &with(cnf),
+        )
+    };
+    let child = exchange(Some(Confirmation::x5t_s256(cert))).unwrap();
+    assert_eq!(child.cnf, Some(Confirmation::x5t_s256(cert)));
+    assert_eq!(
+        ExchangeResponse::from_issued(&child, t0()).token_type,
+        "Bearer"
+    );
+    assert!(matches!(exchange(None), Err(TokenError::BindingRequired)));
+    let key = DpopKey::generate().unwrap();
+    for cnf in [
+        Confirmation::x5t_s256(other),
+        Confirmation::jkt(key.thumbprint()),
+    ] {
+        assert!(
+            matches!(
+                exchange(Some(cnf.clone())),
+                Err(TokenError::BindingMismatch)
+            ),
+            "{cnf:?}"
+        );
+    }
+    // A key-bound parent gets no certificate-bound child.
+    let keyed = issuer
+        .issue_root_with(
+            user(),
+            AgentId::new("agent:planner"),
+            caps([Capability::new("github", "read_*")]),
+            None,
+            t0(),
+            &with(Some(Confirmation::jkt(key.thumbprint()))),
+        )
+        .unwrap();
+    assert!(matches!(
+        issuer.exchange_with(
+            &keyed.token,
+            AgentId::new("agent:coder"),
+            read(),
+            None,
+            t0(),
+            &with(Some(Confirmation::x5t_s256(cert))),
+        ),
+        Err(TokenError::BindingMismatch)
+    ));
+    // A malformed certificate thumbprint is not minted.
+    assert!(matches!(
+        issuer.issue_root_with(
+            user(),
+            AgentId::new("agent:planner"),
+            read(),
+            None,
+            t0(),
+            &with(Some(Confirmation::x5t_s256("nope"))),
+        ),
+        Err(TokenError::Malformed(_))
+    ));
+}
+
+/// A `cnf` with both bindings, or with none, is refused when a token is read, even with a good
+/// signature: such a token is never minted, and a verifier must not pick one of the two.
+#[test]
+fn a_cnf_with_two_bindings_or_none_does_not_verify() {
+    let issuer = issuer();
+    let t = "ungWv48Bz-pBQUDeXa4iI7ADYaOWF3qctBD_YfIAFa0";
+    let r = root(&issuer);
+    for cnf in [
+        json!({"jkt": t, "x5t#S256": t}),
+        json!({}),
+        json!({"x5t": t}),
+    ] {
+        let mut payload = decode_payload(&r.token);
+        payload["cnf"] = cnf.clone();
+        let forged = resign_with_issuer_key(&issuer, &payload);
+        assert!(
+            matches!(
+                issuer.verifier().verify(&forged, t0()),
+                Err(TokenError::Malformed(_))
+            ),
+            "{cnf}"
+        );
+    }
 }
 
 /// Found by the `ou_sig` fuzz target: an `authenticated_at` outside RFC 3339's years 0..=9999

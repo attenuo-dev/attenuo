@@ -180,6 +180,12 @@ pub enum AuthError {
     /// is good.
     #[error("rate limited; retry in {0} s")]
     RateLimited(u64),
+    /// The token is bound to a TLS client certificate (`cnf.x5t#S256`, RFC 8705 §3) and the
+    /// request does not show that certificate, shows another one, or carries a DPoP proof. The
+    /// string is the reason code (`client_certificate_required`, `client_certificate_mismatch`,
+    /// `dpop_with_certificate_binding`).
+    #[error("certificate-bound token refused: {0}")]
+    CertificateBinding(String),
 }
 
 /// Reason code of [`AuthError::MissingToken`].
@@ -219,6 +225,7 @@ impl AuthError {
             AuthError::UseDpopNonce(_) => REASON_USE_DPOP_NONCE,
             AuthError::Unavailable(reason) | AuthError::UnavailableFor { reason, .. } => reason,
             AuthError::RateLimited(_) => REASON_RATE_LIMITED,
+            AuthError::CertificateBinding(reason) => reason,
         }
     }
 
@@ -240,8 +247,17 @@ impl AuthError {
     }
 }
 
+/// The SHA-256 of the TLS client certificate a request showed, put into the request's
+/// extensions by the server that runs the proxy: from its own TLS handshake, or from a trusted
+/// proxy's forwarded certificate. Never read from the request itself. The proxy hands it to the
+/// [`Authorizer`] in [`RequestAuth::client_cert`], for tokens bound to a certificate (RFC 8705
+/// §3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientCertThumbprint(pub [u8; 32]);
+
 /// What the proxy hands the [`Authorizer`] about a request (SR-24): the token, the DPoP proof
-/// if one was sent, and the method and target the proof must name.
+/// if one was sent, the method and target the proof must name, and the client certificate the
+/// request showed.
 #[derive(Debug, Clone, Copy)]
 pub struct RequestAuth<'a> {
     /// The token from `Authorization: Bearer <token>` or `Authorization: DPoP <token>`.
@@ -258,6 +274,12 @@ pub struct RequestAuth<'a> {
     /// for `path`: the gateway URL the agent called, from an `[[ext_authz]]` entry's
     /// `dpop_url`. Always from configuration, never from the request. `None` everywhere else.
     pub url: Option<&'a str>,
+    /// The `Authorization` header names the `DPoP` scheme, not `Bearer`.
+    pub dpop_scheme: bool,
+    /// The SHA-256 of the TLS client certificate the request showed
+    /// ([`ClientCertThumbprint`]). `None` without one, and always on the gateway route
+    /// (`/ext-authz/v1/mcp/{server}`), where the certificate is the gateway's, not the agent's.
+    pub client_cert: Option<[u8; 32]>,
 }
 
 /// An authenticated caller.
@@ -269,6 +291,8 @@ pub struct Authenticated {
     pub dpop_bound: bool,
     /// The token's `cnf.jkt` when `dpop_bound`: the key an approval for this hop is bound to.
     pub jkt: Option<String>,
+    /// The token is bound to a TLS client certificate and the request showed it.
+    pub cert_bound: bool,
 }
 
 /// Authentication and authorization, as the proxy sees it.
@@ -295,6 +319,7 @@ pub trait Authorizer: Send + Sync {
             chain: self.authenticate(req.token, now).await?,
             dpop_bound: false,
             jkt: None,
+            cert_bound: false,
         })
     }
 

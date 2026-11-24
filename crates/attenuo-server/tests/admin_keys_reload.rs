@@ -366,6 +366,7 @@ fn record(i: usize, at: time::OffsetDateTime) -> DecisionRecord {
         session_id: None,
         policy_ids: Vec::new(),
         dpop_bound: false,
+        cert_bound: false,
         decision_id: None,
         result: None,
         labels: None,

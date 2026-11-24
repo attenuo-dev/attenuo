@@ -1173,11 +1173,17 @@ async fn inspect(client: Result<Client>, args: cli::InspectArgs, json: bool) -> 
             _ => c.may_act.as_ref(),
         };
         outln!("{}", render::fmt_may_act(may_act))?;
-        if let Some(cnf) = &c.cnf {
-            outln!(
-                "bound to DPoP key jkt {} (needs a proof by that key)",
-                cnf.jkt
-            )?;
+        match &c.cnf {
+            Some(attenuo_token::Confirmation::Jkt(jkt)) => {
+                outln!("bound to DPoP key jkt {jkt} (needs a proof by that key)")?;
+            }
+            Some(attenuo_token::Confirmation::X5tS256(t)) => {
+                outln!(
+                    "bound to TLS client certificate x5t#S256 {t} (needs a connection that \
+                     shows that certificate)"
+                )?;
+            }
+            None => {}
         }
         match &verdict {
             None => outln!("signature NOT verified (decoded only; pass --verify to check it)")?,

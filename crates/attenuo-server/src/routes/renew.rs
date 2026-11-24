@@ -12,8 +12,10 @@
 //! is revoked or unknown, or when an ancestor lease has expired: a child cannot outlive a
 //! parent that stopped renewing. An expired or invalid *token* is a
 //! 401. A token bound to a key (`cnf.jkt`) needs a DPoP proof for `POST /token/renew`
-//! ([`crate::dpop`]). Every renewal is appended to the audit log (`attenuo` / `lease.renew`,
-//! reason `lease_renewed`, with `dpop_bound`).
+//! ([`crate::dpop`]); a token bound to a TLS client certificate (`cnf.x5t#S256`) needs a
+//! request that shows that certificate (`crate::cert_binding`). Every renewal is appended to
+//! the audit log (`attenuo` / `lease.renew`, reason `lease_renewed`, with `dpop_bound`, and
+//! `cert_bound` for a certificate-bound token).
 //!
 //! **Audited refusals.** Once the token has verified (signature, audience, expiry, chain) and
 //! so has its DPoP proof, a refused renewal is recorded through
@@ -44,6 +46,7 @@ use time::OffsetDateTime;
 use crate::authz::{REASON_LEASE_EXPIRED, REASON_LEASE_REVOKED, REASON_LEASE_UNKNOWN};
 
 use super::{audit_event, bearer_of, no_store};
+use crate::client_cert::ClientCertificate;
 use crate::error::ApiError;
 use crate::state::AppState;
 
@@ -59,12 +62,19 @@ use crate::state::AppState;
 pub async fn renew(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
+    extensions: axum::http::Extensions,
 ) -> Result<Response, ApiError> {
     // Lease and audit I/O is SQLite: keep it off the async workers.
-    state.blocking(move |s| renew_sync(s, &headers)).await
+    state
+        .blocking(move |s| renew_sync(s, &headers, &extensions))
+        .await
 }
 
-fn renew_sync(state: &AppState, headers: &HeaderMap) -> Result<Response, ApiError> {
+fn renew_sync(
+    state: &AppState,
+    headers: &HeaderMap,
+    extensions: &axum::http::Extensions,
+) -> Result<Response, ApiError> {
     let bearer = bearer_of(headers)?.ok_or_else(|| {
         ApiError::unauthorized(
             crate::error::REASON_MISSING_TOKEN,
@@ -77,16 +87,25 @@ fn renew_sync(state: &AppState, headers: &HeaderMap) -> Result<Response, ApiErro
         .verifier
         .verify(bearer, now)
         .map_err(|e| ApiError::bad_token(&e))?;
-    let dpop_bound = state.dpop.check_presented(
-        verified.claims.cnf.as_ref(),
-        bearer,
-        crate::dpop::header_proof(headers)?,
-        "POST",
-        &state.dpop.expected_url_for(headers, "/token/renew"),
+    // A request on a listener that shows no certificate has none here: a token bound to one
+    // is then refused.
+    let cert = extensions.get::<ClientCertificate>();
+    let binding = crate::cert_binding::check_presented(
+        &state.dpop,
+        &crate::cert_binding::Presented {
+            cnf: verified.claims.cnf.as_ref(),
+            token: bearer,
+            proof: crate::dpop::header_proof(headers)?,
+            dpop_scheme: crate::cert_binding::dpop_scheme(headers),
+            cert: cert.map(ClientCertificate::sha256),
+            method: "POST",
+            url: &state.dpop.expected_url_for(headers, "/token/renew"),
+        },
         now,
     )?;
+    let dpop_bound = binding.dpop();
     let chain = verified.chain;
-    match renew_verified(state, &chain, dpop_bound, now) {
+    match renew_verified(state, &chain, binding, now) {
         Ok(resp) => Ok(resp),
         Err(Failure::Other(e)) => Err(e),
         Err(Failure::Refused {
@@ -96,16 +115,15 @@ fn renew_sync(state: &AppState, headers: &HeaderMap) -> Result<Response, ApiErro
         }) => {
             // One `deny` record against the verified chain, under the fixed tool name of a
             // renewal. Lease ids are not secret and come from the signed token.
-            let call = ToolCall::new(
-                super::AUDIT_SERVER,
-                RENEW_TOOL,
-                json!({
-                    "lease": chain.hops.last().map(|h| &h.lease),
-                    "ancestor": ancestor,
-                    "dpop_bound": dpop_bound,
-                }),
-            )
-            .with_dpop_bound(dpop_bound);
+            let mut args = json!({
+                "lease": chain.hops.last().map(|h| &h.lease),
+                "ancestor": ancestor,
+                "dpop_bound": dpop_bound,
+            });
+            binding.add_to(&mut args);
+            let call = ToolCall::new(super::AUDIT_SERVER, RENEW_TOOL, args)
+                .with_dpop_bound(dpop_bound)
+                .with_cert_bound(binding.cert());
             let id = state.pipeline.record_rejection(&chain, &call, reason, now);
             Err(error.with_decision_id(id))
         }
@@ -165,7 +183,7 @@ fn own_lease_refused(reason: &'static str) -> Failure {
 fn renew_verified(
     state: &AppState,
     chain: &DelegationChain,
-    dpop_bound: bool,
+    binding: crate::cert_binding::Binding,
     now: OffsetDateTime,
 ) -> Result<Response, Failure> {
     let hop = chain
@@ -219,18 +237,19 @@ fn renew_verified(
             other => other.into(),
         })?;
 
-    let args = json!({
+    let mut args = json!({
         "lease": hop.lease,
         "previous_expires_at": previous.expires_at.format(&Rfc3339).unwrap_or_default(),
         "expires_at": new_expiry.format(&Rfc3339).unwrap_or_default(),
     });
+    binding.add_to(&mut args);
     if let Err(e) = audit_event(
         state,
         RecordKind::LeaseRenew,
         RENEW_TOOL,
         chain,
         args,
-        dpop_bound,
+        binding,
         now,
     ) {
         // A renewal we cannot record does not happen.

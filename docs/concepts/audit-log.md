@@ -53,6 +53,8 @@ Two top-level fields let you filter and join an export without reading anything 
 | `admin` | any other admin action (policy reload, budget refund, dev root mint) | `admin.*` |
 | `search` | an AuthZEN action search was answered (one record per request; it decides nothing) | `authzen.search` |
 
+A record of a request made with a token bound to a DPoP key carries `"dpop_bound": true`, and one made with a token bound to a TLS client certificate carries `"cert_bound": true` ([binding tokens](../guides/binding-tokens-to-keys.md#binding-tokens-to-a-tls-client-certificate)). So does the record of an issuance that bound the new token. Each member is left out when false, so other records hash as before.
+
 Checkpoints are not records, so they have no kind: they sit in their own table and appear as `checkpoint` lines in an export.
 
 `chain_id` is the lease id of the chain's first hop. Every hop issued from a root token descends from it, so it is the same for the root token's issuance, each exchange, every call made with any token of the run, and each renewal, and it does not change as hops are added (`chain_digest` does). It is not a new token claim: the lease is already in the token. Admin records have no chain and no `chain_id`.
@@ -97,7 +99,7 @@ A repeated gated call while its approval is still pending gets a new `decision` 
 | `decision`, `reason` | `allow`, `search_answered` |
 | `server`, `tool` | the searched server, `authzen.search` |
 | `arguments_digest` | the digest of `context.input`, the same one an evaluation of that request records |
-| `session_id`, `dpop_bound` | as for an evaluation |
+| `session_id`, `dpop_bound`, `cert_bound` | as for an evaluation |
 | `search` | `{"evaluated": n, "permitted": m}`: the candidates this page evaluated and how many it returned |
 
 A `search` record is not a decision. It allows nothing, charges nothing and takes no approval, and `kind=decision` does not return it. A search refused before it evaluated anything (a 400, 401, 403 or a 429 from `[limits] authzen_search_requests_per_minute`) writes no record. If the record cannot be written, the search answers 500 and returns nothing.

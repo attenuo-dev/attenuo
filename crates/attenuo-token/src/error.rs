@@ -57,6 +57,16 @@ pub enum TokenError {
     /// child to a key: a bound delegation can only produce bound children.
     #[error("the subject token is bound to a key (cnf.jkt); the new token must be bound too")]
     BindingRequired,
+    /// The parent token is bound in one way and the exchange asked to bind the child in
+    /// another: a key-bound (`cnf.jkt`) parent gets a key-bound child only, and a
+    /// certificate-bound (`cnf.x5t#S256`) parent gets a child bound to the same certificate
+    /// only.
+    #[error(
+        "the subject token's binding (cnf) allows no such binding for the new token: a \
+         key-bound token has key-bound children, a certificate-bound token has children bound \
+         to the same certificate"
+    )]
+    BindingMismatch,
     /// A key could not be generated, parsed, or used.
     #[error("key error: {0}")]
     Key(String),

@@ -176,6 +176,11 @@ pub struct DecisionRecord {
     /// records written before this field existed, which keeps their hashes unchanged.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub dpop_bound: bool,
+    /// The token was bound to a TLS client certificate (`cnf.x5t#S256`) and the request showed
+    /// that certificate (RFC 8705 §3). For an issuance record: the new token is bound to one.
+    /// Absent (false) on every other record, which keeps their hashes unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cert_bound: bool,
     /// For a [`RecordKind::ToolResult`] record: the id of the decision record of the call the
     /// result answers. Absent on every other kind, which keeps their hashes unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -543,6 +548,7 @@ impl DecisionRecord {
             session_id: call.session_id.clone(),
             policy_ids,
             dpop_bound: call.dpop_bound,
+            cert_bound: call.cert_bound,
             decision_id: None,
             result: None,
             labels: None,

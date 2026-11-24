@@ -101,6 +101,9 @@ pub struct AppState {
     pub require_actor_auth: bool,
     /// `[token] actor_auth`.
     pub actor_auth: ActorAuth,
+    /// `[token] tls_client_certificate_bound_access_tokens`: bind tokens issued to agents that
+    /// authenticated with a TLS client certificate to it (`crate::cert_binding`).
+    pub cert_bound_tokens: bool,
     /// Issuers of actor tokens (`[[actor_trust]]`).
     pub actor_trust: ActorTrustRegistry,
     /// `[authzen] allow_unsigned_chain`.
@@ -223,6 +226,9 @@ impl AppState {
         config.check_retention()?;
         config.token.check_dpop()?;
         config.token.check_client_assertion()?;
+        config
+            .token
+            .check_certificate_binding(config.server.takes_client_certificates())?;
         config.approvals.check()?;
         if let Some(n) = &config.leases.notify {
             n.validate()?;
@@ -435,6 +441,7 @@ impl AppState {
             authzen_diagnostics: config.authzen.diagnostics,
             require_actor_auth: config.token.require_actor_auth,
             actor_auth,
+            cert_bound_tokens: config.token.tls_client_certificate_bound_access_tokens,
             actor_trust,
             public_url: config.server.public_url.clone(),
             lease_interval: lease_interval(config)?,

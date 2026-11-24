@@ -193,6 +193,9 @@ pub struct StreamRecord {
     pub session: Option<String>,
     /// Whether the request that opened the stream proved possession of the token's key.
     pub dpop_bound: bool,
+    /// Whether the request that opened the stream showed the certificate its token is bound
+    /// to.
+    pub cert_bound: bool,
 }
 
 /// Why a check failed: the reason code, and whether it is a lease or token judgement (which
@@ -266,7 +269,17 @@ impl StreamGuard {
             server: server.to_owned(),
             session: session_id.map(session_tag),
             dpop_bound,
+            cert_bound: false,
         });
+        self
+    }
+
+    /// Record, with [`StreamGuard::recording`], that the request that opened the stream
+    /// showed the certificate its token is bound to.
+    pub fn with_cert_bound(mut self, cert_bound: bool) -> Self {
+        if let Some(record) = &mut self.record {
+            record.cert_bound = cert_bound;
+        }
         self
     }
 
@@ -317,7 +330,8 @@ impl StreamGuard {
                 | AuthError::DpopRequired
                 | AuthError::InvalidDpopProof(_)
                 | AuthError::UseDpopNonce(_)
-                | AuthError::RateLimited(_),
+                | AuthError::RateLimited(_)
+                | AuthError::CertificateBinding(_),
             ) => fail(
                 "unauthorized".to_owned(),
                 false,
@@ -362,7 +376,8 @@ impl StreamGuard {
             }
         }
         let mut call = ToolCall::new(record.server.as_str(), STREAM_END_TOOL, json!({}))
-            .with_dpop_bound(record.dpop_bound);
+            .with_dpop_bound(record.dpop_bound)
+            .with_cert_bound(record.cert_bound);
         if let Some(tag) = &record.session {
             call = call.with_session(tag.clone());
         }

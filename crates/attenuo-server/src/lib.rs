@@ -83,6 +83,7 @@ pub mod admin_ui;
 pub mod auto_prune;
 // Used by the benches (`result_digest`).
 pub mod authz;
+pub(crate) mod cert_binding;
 pub(crate) mod client_cert;
 pub(crate) mod client_cert_verifier;
 pub(crate) mod client_pki;
@@ -361,7 +362,10 @@ pub fn router(state: Arc<AppState>, upstreams: Vec<UpstreamConfig>, config: &Con
             .with_ext_authz(config.ext_authz.clone()),
         authorizer,
         state.clock.clone(),
-    );
+    )
+    // The proxy sees the request's client certificate as its thumbprint only, for tokens
+    // bound to a certificate (`crate::cert_binding`).
+    .layer(axum::middleware::from_fn(cert_binding::expose_to_proxy));
     // `[limits]`: the deadlines inside the in-flight cap, both inside the metrics layer so
     // that their refusals are counted by route like any answer. Main listener only.
     let app = api

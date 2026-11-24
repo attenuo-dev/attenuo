@@ -678,6 +678,7 @@ fn call_for(g: &mut Gen, c: &Capability) -> ToolCall {
         arguments,
         session_id: None,
         dpop_bound: false,
+        cert_bound: false,
     }
 }
 

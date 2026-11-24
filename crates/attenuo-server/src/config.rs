@@ -254,6 +254,14 @@ pub struct TokenSection {
     /// 60, the default `clock_skew_seconds` of `[[idps]]` and `[[actor_trust]]`; at most 600.
     #[serde(default = "default_clock_skew")]
     pub client_assertion_clock_skew_seconds: u64,
+    /// Certificate-bound access tokens (RFC 8705 §3): bind a token that `POST /token` issues to
+    /// an agent that authenticated with its TLS client certificate to that certificate
+    /// (`cnf.x5t#S256`). Default `false`. Needs `[server.tls] client_certificates =
+    /// "optional"` or `[server.forwarded_client_cert]`, and does not go with `dpop =
+    /// "required"`. Tokens already bound to a certificate need it whatever this says. See
+    /// `crate::cert_binding`.
+    #[serde(default)]
+    pub tls_client_certificate_bound_access_tokens: bool,
 }
 
 /// Default for `[token] dpop_max_age_seconds`.
@@ -290,6 +298,7 @@ impl Default for TokenSection {
             dpop_nonce: DpopNonceMode::default(),
             client_assertion_max_lifetime_seconds: DEFAULT_CLIENT_ASSERTION_MAX_LIFETIME_SECONDS,
             client_assertion_clock_skew_seconds: default_clock_skew(),
+            tls_client_certificate_bound_access_tokens: false,
         }
     }
 }
@@ -323,6 +332,36 @@ impl TokenSection {
         }
         if self.dpop_replay_capacity == 0 {
             anyhow::bail!("[token] dpop_replay_capacity must be at least 1");
+        }
+        Ok(())
+    }
+
+    /// Startup check of `tls_client_certificate_bound_access_tokens` against the rest of the
+    /// config: `takes_client_certificates` is [`ServerSection::takes_client_certificates`].
+    ///
+    /// # Errors
+    ///
+    /// When it is on and no listener takes client certificates (the setting could never bind
+    /// a token), or when it is on with `dpop = "required"` (an agent that authenticates with
+    /// its certificate could then get no token: a DPoP proof would bind it a second time).
+    pub fn check_certificate_binding(&self, takes_client_certificates: bool) -> anyhow::Result<()> {
+        if !self.tls_client_certificate_bound_access_tokens {
+            return Ok(());
+        }
+        if !takes_client_certificates {
+            anyhow::bail!(
+                "[token] tls_client_certificate_bound_access_tokens = true needs a listener that \
+                 takes client certificates: [server.tls] client_certificates = \"optional\" or \
+                 [server.forwarded_client_cert]"
+            );
+        }
+        if self.dpop == DpopMode::Required {
+            anyhow::bail!(
+                "[token] tls_client_certificate_bound_access_tokens = true does not go with \
+                 dpop = \"required\": \"required\" means every token is bound to a DPoP key, \
+                 and a token holds one binding only, so a certificate-bound token would break \
+                 that rule"
+            );
         }
         Ok(())
     }
@@ -5052,6 +5091,46 @@ mod tests {
         }
         // A jwks given as a table instead of JSON text is refused when parsing.
         assert!(Config::from_toml("[[agents]]\nid = \"a\"\njwks = { keys = [] }\n").is_err());
+    }
+
+    /// `tls_client_certificate_bound_access_tokens`: off by default; on, it needs a listener
+    /// that takes client certificates and does not go with `dpop = "required"`.
+    #[test]
+    fn certificate_binding_is_off_by_default_and_checked_at_start() {
+        let d = TokenSection::default();
+        assert!(!d.tls_client_certificate_bound_access_tokens);
+        d.check_certificate_binding(false).unwrap();
+        let cfg = Config::from_toml("[token]\n").unwrap();
+        assert!(!cfg.token.tls_client_certificate_bound_access_tokens);
+
+        let on = Config::from_toml("[token]\ntls_client_certificate_bound_access_tokens = true\n")
+            .unwrap();
+        assert!(on.token.tls_client_certificate_bound_access_tokens);
+        on.token.check_certificate_binding(true).unwrap();
+        let e = on.token.check_certificate_binding(false).unwrap_err();
+        assert!(e.to_string().contains("client certificates"), "{e}");
+
+        for dpop in ["off", "optional"] {
+            let cfg = Config::from_toml(&format!(
+                "[token]\ntls_client_certificate_bound_access_tokens = true\ndpop = \"{dpop}\"\n"
+            ))
+            .unwrap();
+            cfg.token.check_certificate_binding(true).unwrap();
+        }
+        let cfg = Config::from_toml(
+            "[token]\ntls_client_certificate_bound_access_tokens = true\ndpop = \"required\"\n",
+        )
+        .unwrap();
+        let e = cfg.token.check_certificate_binding(true).unwrap_err();
+        assert!(e.to_string().contains("dpop = \"required\""), "{e}");
+        // Off, nothing is checked.
+        let cfg = Config::from_toml("[token]\ndpop = \"required\"\n").unwrap();
+        cfg.token.check_certificate_binding(false).unwrap();
+        // Not a boolean: refused when parsing.
+        assert!(Config::from_toml(
+            "[token]\ntls_client_certificate_bound_access_tokens = \"yes\"\n"
+        )
+        .is_err());
     }
 
     /// `dpop_future_skew_seconds`: default 10, or the max age when that is smaller; set, from

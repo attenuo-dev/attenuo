@@ -2,7 +2,7 @@
 
 A delegation token is a bearer token by default: whoever holds it can use it until it expires or its lease is revoked. If an agent leaks its token (in a log line, a prompt, a crash dump, a tool result it echoes back), the leak is as good as the agent.
 
-A **bound** token is useless without a private key the agent keeps. attenuo implements this with DPoP (RFC 9449): the token carries the thumbprint of a key, and every request that presents it must carry a fresh proof signed by that key. This guide shows how to bind tokens with the CLI and the SDKs, how binding passes from one agent to the next, and what the server refuses.
+A **bound** token is useless without a private key the agent keeps. attenuo implements this with DPoP (RFC 9449): the token carries the thumbprint of a key, and every request that presents it must carry a fresh proof signed by that key. This guide shows how to bind tokens with the CLI and the SDKs, how binding passes from one agent to the next, and what the server refuses. An agent that authenticates with a TLS client certificate can have its tokens bound to that certificate instead ([below](#binding-tokens-to-a-tls-client-certificate)).
 
 Everything below was run against a local server with the [GitHub leak demo](https://github.com/attenuo-dev/attenuo/blob/main/examples/github-leak-demo/README.md) config. Binding is optional: nothing changes for clients that do not use it, unless the operator sets `[token] dpop = "required"`.
 
@@ -171,6 +171,34 @@ The Python and TypeScript clients (`Client`, `AsyncClient`, `AttenuoClient`, `Ad
 
 The server keeps no nonce state. A nonce is an HMAC of the current time bucket (`dpop_max_age_seconds` wide) under a key derived from the issuer's signing key. The current and the previous bucket's nonces are accepted, so a nonce lives for one to two windows, and replicas that share the signing key accept each other's nonces. The exchange sign-off (`subject_token_dpop`) needs no nonce, because the parent makes it ahead of time.
 
+## Binding tokens to a TLS client certificate
+
+An agent that authenticates at `/token` with a TLS client certificate ([identity providers](identity-providers.md#tls-client-certificates)) can get tokens bound to that certificate (RFC 8705 §3). The token carries `cnf.x5t#S256`, the base64url SHA-256 of the certificate. It is accepted only on a request that shows the same certificate. No DPoP key is needed. Off by default:
+
+```toml
+[token]
+tls_client_certificate_bound_access_tokens = true
+```
+
+The server needs a listener that takes client certificates: `[server.tls] client_certificates = "optional"`, or `[server.forwarded_client_cert]` behind a proxy ([ADR-0021](../decisions/0021-forwarded-client-certificates.md)). It refuses to start without one, and with `dpop = "required"`.
+
+- **Issue.** A token that `POST /token` issues to an agent that authenticated with its certificate is bound to it, at hop 0 and at an exchange of an unbound parent. The answer says `token_type: "Bearer"`: send the token as a bearer token over a connection that shows the certificate. A client that authenticated with a secret, an assertion or an actor token alone gets an unbound token, even over a connection with a certificate. The dev mint never binds to a certificate.
+- **One binding.** A token is bound to a key or to a certificate, never both. A request that would be bound to the certificate and carries a `DPoP` header is refused with 400 `dpop_with_certificate_binding`.
+- **Use.** Every route that takes a token checks the certificate: the proxy, `/token/renew`, the AuthZEN routes, `GET /approvals/{id}`, and `/token` when the token is the subject of an exchange. Call them over the same TLS listener, or through the same proxy, with the same certificate.
+- **Children.** The child of a certificate-bound token is bound to the same certificate, and the exchange must show that certificate. A sub-agent with another certificate cannot take the child. A key-bound parent keeps the DPoP rules above, and its child is key-bound.
+- **Once bound, always bound.** Turning the setting off does not unbind tokens issued while it was on.
+- **Rotation.** A token dies with its certificate. After a rotation, the tokens bound to the old certificate are refused with `client_certificate_mismatch`, even when both certificates are pinned for the agent. Get new tokens with the new certificate. With short-lived certificates (SPIFFE SVIDs), keep token lifetimes below the rotation interval.
+
+| Situation | Answer |
+| --- | --- |
+| No certificate on the request (a plain-HTTP listener, a TLS connection without one, the ext-authz gateway route) | 401 `client_certificate_required` (MCP: `-32001`, `data.reason`) |
+| Another certificate, also one from the same CA with the same name, or the next one of a rotation | 401 `client_certificate_mismatch` |
+| A `DPoP` header or `Authorization: DPoP` with a certificate-bound token | 401 `dpop_with_certificate_binding`; 400 at `/token` |
+
+A `Client-Cert` header never stands in for a certificate, except on the forwarding listener from a trusted peer. Elsewhere it is refused (400) or ignored. The ext-authz gateway route sees the gateway's connection, not the agent's, so it refuses certificate-bound tokens. An external PEP that verifies tokens itself must check the certificate itself.
+
+Audit records of requests made with a certificate-bound token, and of issuances that bound one, carry `"cert_bound": true`. The CLI and the SDKs were not changed for this, except that `attenuo token inspect` shows an `x5t#S256` binding. They were not tested with certificate-bound tokens. See [ADR-0022](../decisions/0022-certificate-bound-tokens.md).
+
 ## Limits
 
 - Proof replay protection is in memory, per process. With several server replicas, a proof could be replayed against another replica within the `iat` window. Proof `jti`s are not written to the database because every proxied call with a bound token checks one, and a write per call would slow every call; the single-use credentials of `POST /token` and approvals are written there and survive a restart.
@@ -184,6 +212,6 @@ The server keeps no nonce state. A nonce is an HMAC of the current time bucket (
 - Server nonces are off by default; freshness then rests on `iat` and the `jti` cache. With nonces on, a nonce is shared by every client of the server for its lifetime, so it limits how far ahead a proof can be made. It does not stop the cross-replica replay above.
 - Binding is checked by the server and the built-in proxy. An external enforcement point that verifies tokens itself must check proofs too, or ask the AuthZEN endpoint with the token and a proof.
 - Cedar policies cannot see whether a call was bound yet; only the audit record says so.
-- mTLS (RFC 8705) and SPIFFE X.509 binding are not implemented.
+- Certificate binding (above) gives a child the parent's certificate only. Delegation to a holder with another certificate is not implemented.
 
 See [RFC-0001 section 4.1](../spec/rfc-0001-attenuo.md#41-sender-constrained-tokens-dpop) for the specification.

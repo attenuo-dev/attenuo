@@ -248,7 +248,7 @@ const planner = await ob.exchange(idToken, "planner", ["github:*"]);
 
 The SDKs work the same way with a certificate from a CA ([below](#tls-client-certificates-from-a-ca-spiffe)): put the intermediate CA certificates after the client certificate in the `tls_client_cert` (`tlsClientCert`) file, at most 4. Both SDKs' integration tests run an exchange with such a file against the server, and check that the client certificate alone, without its intermediate, gets `401`. The TypeScript options need Node.js 20.16 or later. The SDKs have no PEP mode either, and they do not read the `ATTENUO_TLS_*` variables. The details are in the [Python](https://github.com/attenuo-dev/attenuo/blob/main/sdk/python/README.md#tls-a-private-ca-and-a-client-certificate) and [TypeScript](https://github.com/attenuo-dev/attenuo/blob/main/sdk/typescript/README.md#tls-a-private-ca-and-a-client-certificate) READMEs.
 
-**4. Rotate.** An entry takes up to 8 thumbprints. Add the new certificate's thumbprint next to the old one and run `attenuo admin agent reload`. Move the client to the new certificate. Then remove the old thumbprint and reload again. A removed thumbprint stops working on the next request, also on a connection that is already open.
+**4. Rotate.** An entry takes up to 8 thumbprints. Add the new certificate's thumbprint next to the old one and run `attenuo admin agent reload`. Move the client to the new certificate. Then remove the old thumbprint and reload again. A removed thumbprint stops working on the next request, also on a connection that is already open. A token bound to the old certificate does not work with the new one: get new tokens after the switch.
 
 Notes:
 
@@ -257,7 +257,7 @@ Notes:
 - A certificate on the connection makes `client_id` a credential, also next to an actor token. With an actor token, send no `client_id`, or present no certificate: otherwise the certificate counts too. Under `[token] actor_auth = "actor_token"` the request is then refused with `client_auth_not_accepted`, whatever the certificate. Under `"either"` it is refused with `client_authentication_failed` when the certificate is not pinned for that id.
 - The certificate's dates are checked on every request. An expired certificate stops working without a reload, so renew it in time.
 - There is no CRL or OCSP check. To revoke a certificate, remove its thumbprint and reload.
-- Tokens issued this way are bearer tokens (or DPoP-bound, if the client sends a DPoP proof). They are not bound to the certificate.
+- Tokens issued this way are bearer tokens (or DPoP-bound, if the client sends a DPoP proof). With `[token] tls_client_certificate_bound_access_tokens = true` they are bound to the certificate instead, and every later request with them must show it ([binding tokens to a TLS client certificate](binding-tokens-to-keys.md#binding-tokens-to-a-tls-client-certificate)).
 - Every refusal is the same `401 client_authentication_failed`. The reason is in the server's debug log.
 
 The full rules are in the [config reference](../reference/config.md#tls-client-certificates).
@@ -325,7 +325,7 @@ curl --cert coder.crt --key coder.key --cacert server-ca.pem \
 
 The audit record says `actor_auth` = `tls_client_auth`. The same call with a certificate for `spiffe://example.org/ns/agents/sa/reviewer` gets `401 client_authentication_failed`, and the server's debug log says `reason="san_mismatch"` with the name it found.
 
-**4. Rotate.** A new certificate from the same CA with the same name works at once, with no change. When the CA itself changes (SPIRE rotates its bundle), write the new CA certificates to the file, old and new together during the change, and run `attenuo admin agent reload`. The file may hold up to 16 CA certificates.
+**4. Rotate.** A new certificate from the same CA with the same name works at once, with no change. A token bound to the old certificate does not move to the new one, even with the same name: get new tokens with the new certificate. When the CA itself changes (SPIRE rotates its bundle), write the new CA certificates to the file, old and new together during the change, and run `attenuo admin agent reload`. The file may hold up to 16 CA certificates.
 
 Notes:
 
@@ -351,6 +351,7 @@ What is different:
 - Every other listener refuses those headers with `400` while the section is set. So a client that sends them to the main listener fails at once.
 - The audit records say `"source": "forwarded"` in `client_cert`; `actor_auth` and `agent_auth` are the same as on the native listener.
 - With HAProxy, which sends no chain, put the intermediate CA in the entry's CA file.
+- With certificate-bound tokens, the proxy must forward the certificate on every route that takes a token, not only on `/token`.
 
 The setup, the fences, and a tested HAProxy recipe are in [forwarded client certificates](deploying.md#forwarded-client-certificates).
 

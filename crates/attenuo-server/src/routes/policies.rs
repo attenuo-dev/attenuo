@@ -224,7 +224,10 @@ pub async fn evaluate_policies(
                 .map_err(|e| ApiError::bad_request("invalid_token", e.to_string()))?;
             super::authzen::attach_chain(&mut req, &v.chain)?;
             let (chain, call) = chain_and_call(&req)?;
-            let call = call.with_dpop_bound(v.claims.cnf.is_some());
+            // `dpop_bound` as before. `cert_bound` stays false: it says that the request showed
+            // the certificate, and a dry run shows none.
+            let call = call
+                .with_dpop_bound(crate::cert_binding::Binding::of(v.claims.cnf.as_ref()).dpop());
             (chain, call, CHAIN_SOURCE_TOKEN, expired)
         }
         None => {

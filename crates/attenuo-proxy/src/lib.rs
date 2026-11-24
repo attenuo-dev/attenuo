@@ -213,8 +213,9 @@ pub mod fuzzing {
 }
 
 pub use auth::{
-    ApprovalTicket, AuthDecision, AuthError, Authenticated, Authorizer, CallContext, RequestAuth,
-    META_APPROVAL_KEY, REASON_APPROVAL_REQUIRED, REASON_LABEL_ERROR,
+    ApprovalTicket, AuthDecision, AuthError, Authenticated, Authorizer, CallContext,
+    ClientCertThumbprint, RequestAuth, META_APPROVAL_KEY, REASON_APPROVAL_REQUIRED,
+    REASON_LABEL_ERROR,
 };
 pub use config::{ExtAuthzRoute, ProxyConfig, UpstreamConfig};
 pub use guard::{StreamEndCause, REASON_UPSTREAM_STREAM_END_SHAPE};

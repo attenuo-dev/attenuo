@@ -226,17 +226,21 @@ impl VerifiedTokens {
 
 #[async_trait]
 impl Authorizer for ServerAuthorizer {
-    /// Without the request there is no DPoP proof to check: a bound token is refused.
+    /// Without the request there is no DPoP proof and no client certificate to check: a bound
+    /// token is refused.
     async fn authenticate(
         &self,
         bearer: &str,
         now: OffsetDateTime,
     ) -> Result<DelegationChain, AuthError> {
         let v = self.verify(bearer, now)?;
-        if v.claims.cnf.is_some() {
-            return Err(AuthError::DpopRequired);
+        match crate::cert_binding::Binding::of(v.claims.cnf.as_ref()) {
+            crate::cert_binding::Binding::None => Ok(v.into_chain()),
+            crate::cert_binding::Binding::Dpop => Err(AuthError::DpopRequired),
+            crate::cert_binding::Binding::Cert => {
+                Err(crate::cert_binding::CertFailure::Required.into())
+            }
         }
-        Ok(v.into_chain())
     }
 
     async fn authenticate_request(
@@ -245,27 +249,47 @@ impl Authorizer for ServerAuthorizer {
         now: OffsetDateTime,
     ) -> Result<Authenticated, AuthError> {
         let v = self.verify(req.token, now)?;
-        let dpop_bound = match &self.dpop {
+        let binding = match &self.dpop {
             Some(dpop) => {
                 // An `[[ext_authz]]` entry names the gateway URL the agent's proof is for.
                 let url = req
                     .url
                     .map_or_else(|| dpop.expected_url(req.host, req.path), str::to_owned);
-                dpop.check_presented(
-                    v.claims.cnf.as_ref(),
-                    req.token,
-                    req.dpop,
-                    req.method,
-                    &url,
+                // A token bound to a certificate needs the request's certificate, which the
+                // proxy has from the server (`crate::cert_binding::expose_to_proxy`); the
+                // gateway route never passes one.
+                crate::cert_binding::check_presented(
+                    dpop,
+                    &crate::cert_binding::Presented {
+                        cnf: v.claims.cnf.as_ref(),
+                        token: req.token,
+                        proof: req.dpop,
+                        dpop_scheme: req.dpop_scheme,
+                        cert: req.client_cert.as_ref(),
+                        method: req.method,
+                        url: &url,
+                    },
                     now,
                 )?
             }
-            None if v.claims.cnf.is_some() => return Err(AuthError::DpopRequired),
-            None => false,
+            // Without the DPoP checker (unit tests only), a bound token is refused.
+            None => match crate::cert_binding::Binding::of(v.claims.cnf.as_ref()) {
+                crate::cert_binding::Binding::None => crate::cert_binding::Binding::None,
+                crate::cert_binding::Binding::Dpop => return Err(AuthError::DpopRequired),
+                crate::cert_binding::Binding::Cert => {
+                    return Err(crate::cert_binding::CertFailure::Required.into())
+                }
+            },
         };
+        let dpop_bound = binding.dpop();
         // The key an approval for this hop is bound to: only when the request proved it.
         let jkt = dpop_bound
-            .then(|| v.claims.cnf.as_ref().map(|c| c.jkt.clone()))
+            .then(|| {
+                v.claims
+                    .cnf
+                    .as_ref()
+                    .and_then(|c| c.key_thumbprint().map(str::to_owned))
+            })
             .flatten();
         // The per-run rate limit, keyed by the root lease: known from the verified token (a
         // cache hit after the first request), before any lease lookup, decision, audit append
@@ -280,6 +304,7 @@ impl Authorizer for ServerAuthorizer {
             chain: v.into_chain(),
             dpop_bound,
             jkt,
+            cert_bound: binding.cert(),
         })
     }
 

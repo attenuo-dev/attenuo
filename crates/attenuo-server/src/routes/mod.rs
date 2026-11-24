@@ -22,6 +22,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use time::OffsetDateTime;
 
+use crate::cert_binding::Binding;
 use crate::error::{ApiError, REASON_INVALID_TOKEN};
 use crate::metrics::TokenKind;
 use crate::operators::AdminIdentity;
@@ -203,6 +204,7 @@ pub(crate) fn admin_record(
         session_id: None,
         policy_ids: Vec::new(),
         dpop_bound: false,
+        cert_bound: false,
         decision_id: None,
         result: None,
         labels: None,
@@ -220,16 +222,17 @@ pub(crate) fn admin_record(
 /// reason `token_issued`, server `attenuo` and tool `token.exchange` (or `token.root` for a
 /// dev root mint). The chain is the *new* chain, so the record names the new hop's agent and
 /// lease; the arguments (actor, requested capabilities) are stored as a digest like any call.
-/// `dpop_bound` records whether the new token is bound to a key (SR-24).
+/// `binding` records whether the new token is bound to a key (`dpop_bound`, SR-24) or to a
+/// TLS client certificate (`cert_bound`, RFC 8705 §3).
 pub(crate) fn audit_issuance(
     state: &AppState,
     tool: &str,
     chain: &DelegationChain,
     arguments: Value,
-    dpop_bound: bool,
+    binding: Binding,
     now: OffsetDateTime,
 ) -> Result<uuid::Uuid, ApiError> {
-    audit_issuance_with(state, tool, chain, arguments, dpop_bound, None, now)
+    audit_issuance_with(state, tool, chain, arguments, binding, None, now)
 }
 
 /// [`audit_issuance`], with the record's `id_jag_ceiling` member for a root token minted
@@ -240,7 +243,7 @@ pub(crate) fn audit_issuance_with(
     tool: &str,
     chain: &DelegationChain,
     arguments: Value,
-    dpop_bound: bool,
+    binding: Binding,
     ceiling: Option<attenuo_core::CeilingInfo>,
     now: OffsetDateTime,
 ) -> Result<uuid::Uuid, ApiError> {
@@ -249,7 +252,7 @@ pub(crate) fn audit_issuance_with(
     } else {
         RecordKind::Exchange
     };
-    let mut record = event_record(kind, tool, chain, arguments, dpop_bound, now);
+    let mut record = event_record(kind, tool, chain, arguments, binding, now);
     record.id_jag_ceiling = ceiling;
     let id = append_audit(state, record)?;
     state.metrics.token_issued(if tool == "token.root" {
@@ -262,19 +265,19 @@ pub(crate) fn audit_issuance_with(
 
 /// Record a server-performed event (issuance, lease renewal) as an `allow` decision record
 /// (reason `token_issued`, or `lease_renewed` for a renewal), server `attenuo` and `tool` naming the event, and the record's
-/// `dpop_bound` flag.
+/// `dpop_bound` and `cert_bound` flags.
 pub(crate) fn audit_event(
     state: &AppState,
     kind: RecordKind,
     tool: &str,
     chain: &DelegationChain,
     arguments: Value,
-    dpop_bound: bool,
+    binding: Binding,
     now: OffsetDateTime,
 ) -> Result<uuid::Uuid, ApiError> {
     append_audit(
         state,
-        event_record(kind, tool, chain, arguments, dpop_bound, now),
+        event_record(kind, tool, chain, arguments, binding, now),
     )
 }
 
@@ -284,14 +287,16 @@ fn event_record(
     tool: &str,
     chain: &DelegationChain,
     arguments: Value,
-    dpop_bound: bool,
+    binding: Binding,
     now: OffsetDateTime,
 ) -> DecisionRecord {
     let reason = match kind {
         RecordKind::LeaseRenew => REASON_LEASE_RENEWED,
         _ => REASON_TOKEN_ISSUED,
     };
-    let call = ToolCall::new(AUDIT_SERVER, tool, arguments).with_dpop_bound(dpop_bound);
+    let call = ToolCall::new(AUDIT_SERVER, tool, arguments)
+        .with_dpop_bound(binding.dpop())
+        .with_cert_bound(binding.cert());
     DecisionRecord::new(now, Decision::Allow, reason, chain, &call, Vec::new()).with_kind(kind)
 }
 

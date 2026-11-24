@@ -354,12 +354,47 @@ fn check_token(token: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// The token's `exp` (Unix seconds), read without checking the signature, and whether it is
-/// bound to a DPoP key. `None` for a token that is not an attenuo JWT.
-fn token_meta(token: &str) -> (Option<i64>, bool) {
+/// How a token is bound, as its `cnf` says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenBinding {
+    /// A bearer token, or not an attenuo JWT.
+    None,
+    /// Bound to a DPoP key (`cnf.jkt`).
+    Dpop,
+    /// Bound to a TLS client certificate (`cnf.x5t#S256`).
+    Cert,
+}
+
+/// The token's `exp` (Unix seconds), read without checking the signature, and how it is
+/// bound. `None` and [`TokenBinding::None`] for a token that is not an attenuo JWT.
+fn token_meta(token: &str) -> (Option<i64>, TokenBinding) {
     match crate::jwt::decode_unverified(token) {
-        Ok(d) => (Some(d.claims.exp), d.claims.cnf.is_some()),
-        Err(_) => (None, false),
+        Ok(d) => {
+            let binding = match &d.claims.cnf {
+                Some(c) if c.key_thumbprint().is_some() => TokenBinding::Dpop,
+                Some(c) if c.cert_thumbprint().is_some() => TokenBinding::Cert,
+                _ => TokenBinding::None,
+            };
+            (Some(d.claims.exp), binding)
+        }
+        Err(_) => (None, TokenBinding::None),
+    }
+}
+
+/// What `attenuo connect` says on stderr about a new token's binding, if anything.
+fn binding_note(binding: TokenBinding) -> Option<&'static str> {
+    match binding {
+        TokenBinding::None => None,
+        TokenBinding::Dpop => Some(
+            "attenuo connect: warning: the token is bound to a DPoP key (cnf.jkt), and \
+             attenuo connect sends no DPoP proofs, so the proxy will refuse it",
+        ),
+        TokenBinding::Cert => Some(
+            "attenuo connect: note: the token is bound to a TLS client certificate \
+             (cnf.x5t#S256), so the proxy takes it only over a connection that shows that \
+             certificate: give it with --tls-client-cert and --tls-client-key and an https:// \
+             --server, or through a proxy that forwards it",
+        ),
     }
 }
 
@@ -609,13 +644,10 @@ impl Tokens {
 
     /// Wrap a new token, and say on stderr what matters about it.
     fn describe_new(source: &Source, token: String, generation: u64) -> Current {
-        let (exp, bound) = token_meta(&token);
+        let (exp, binding) = token_meta(&token);
         let fetched_ms = now_ms();
-        if bound {
-            errln!(
-                "attenuo connect: warning: the token is bound to a DPoP key (cnf.jkt), and \
-                 attenuo connect sends no DPoP proofs, so the proxy will refuse it"
-            );
+        if let Some(note) = binding_note(binding) {
+            errln!("{note}");
         }
         match exp {
             Some(exp) => errln!(
@@ -2206,6 +2238,64 @@ mod tests {
             // The error never repeats the text.
             assert!(!e.contains("open"), "{e}");
         }
+    }
+
+    /// A root token for planner, bound by `cnf` when given.
+    fn minted(cnf: Option<attenuo_token::Confirmation>) -> String {
+        let now = time::OffsetDateTime::now_utc();
+        let issuer = attenuo_token::Issuer::generate(attenuo_token::IssuerConfig {
+            issuer: "http://ob".into(),
+            audience: "attenuo".into(),
+            max_depth: 4,
+            default_ttl: time::Duration::minutes(5),
+        });
+        let user = attenuo_core::OriginatingUser {
+            subject: "alice".into(),
+            issuer: "https://idp.example".into(),
+            authenticated_at: now,
+            attributes: Default::default(),
+        };
+        issuer
+            .issue_root_with(
+                user,
+                attenuo_core::AgentId::new("planner"),
+                attenuo_core::CapabilitySet::from_iter([attenuo_core::Capability::new(
+                    "github", "*",
+                )]),
+                None,
+                now,
+                &attenuo_token::IssueOptions {
+                    cnf,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .token
+    }
+
+    #[test]
+    fn the_note_on_a_new_token_names_its_binding() {
+        let thumb = "A".repeat(43);
+        let bearer = minted(None);
+        let dpop = minted(Some(attenuo_token::Confirmation::jkt(thumb.clone())));
+        let cert = minted(Some(attenuo_token::Confirmation::x5t_s256(thumb)));
+        assert_eq!(token_meta(&bearer).1, TokenBinding::None);
+        assert_eq!(token_meta(&dpop).1, TokenBinding::Dpop);
+        assert_eq!(token_meta(&cert).1, TokenBinding::Cert);
+        assert_eq!(token_meta("not.a.jwt").1, TokenBinding::None);
+        assert!(binding_note(TokenBinding::None).is_none());
+        let d = binding_note(TokenBinding::Dpop).unwrap();
+        assert!(
+            d.contains("DPoP key") && d.contains("will refuse it"),
+            "{d}"
+        );
+        // A certificate-bound token is not called DPoP-bound, and is not said to be refused.
+        let c = binding_note(TokenBinding::Cert).unwrap();
+        assert!(
+            c.contains("x5t#S256") && c.contains("--tls-client-cert"),
+            "{c}"
+        );
+        assert!(!c.contains("DPoP") && !c.contains("refuse"), "{c}");
     }
 
     #[test]

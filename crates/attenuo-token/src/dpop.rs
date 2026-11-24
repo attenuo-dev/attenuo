@@ -69,24 +69,128 @@ pub const SIGN_OFF_CHILD_JKT: &str = "child_jkt";
 /// (SR-40).
 pub const SIGN_OFF_CHILD_ACTOR: &str = "child_actor";
 
-/// The `cnf` (confirmation) claim of a sender-constrained token (RFC 7800, RFC 9449 §6.1).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Confirmation {
+/// Member of `cnf` naming the SHA-256 thumbprint of a DPoP key (RFC 9449 §6.1).
+pub const CNF_JKT: &str = "jkt";
+
+/// Member of `cnf` naming the SHA-256 thumbprint of a TLS client certificate (RFC 8705 §3.1).
+pub const CNF_X5T_S256: &str = "x5t#S256";
+
+/// The `cnf` (confirmation) claim of a sender-constrained token (RFC 7800).
+///
+/// A token is bound in exactly one way: to a DPoP key (`{"jkt": ...}`, RFC 9449 §6.1) or to a
+/// TLS client certificate (`{"x5t#S256": ...}`, RFC 8705 §3.1). Reading a `cnf` that has both
+/// members, neither, or any other member fails, so a token whose binding this crate does not
+/// understand is never taken as one it does. A `cnf` is written with its one member only, so a
+/// key-bound token is the same bytes as before certificate binding existed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Confirmation {
     /// RFC 7638 SHA-256 thumbprint of the holder's public key, base64url without padding.
-    pub jkt: String,
+    Jkt(String),
+    /// SHA-256 of the DER bytes of the holder's TLS client certificate, base64url without
+    /// padding (RFC 8705 §3.1).
+    X5tS256(String),
 }
 
 impl Confirmation {
     /// Bind to the key with this thumbprint.
     pub fn jkt(jkt: impl Into<String>) -> Self {
-        Self { jkt: jkt.into() }
+        Confirmation::Jkt(jkt.into())
     }
 
-    /// Is `jkt` a well-formed SHA-256 thumbprint (43 base64url characters)?
+    /// Bind to the TLS client certificate with this thumbprint.
+    pub fn x5t_s256(thumbprint: impl Into<String>) -> Self {
+        Confirmation::X5tS256(thumbprint.into())
+    }
+
+    /// The key thumbprint (`jkt`) of a token bound to a DPoP key; `None` for any other binding.
+    pub fn key_thumbprint(&self) -> Option<&str> {
+        match self {
+            Confirmation::Jkt(jkt) => Some(jkt),
+            Confirmation::X5tS256(_) => None,
+        }
+    }
+
+    /// The certificate thumbprint (`x5t#S256`) of a token bound to a TLS client certificate;
+    /// `None` for any other binding.
+    pub fn cert_thumbprint(&self) -> Option<&str> {
+        match self {
+            Confirmation::X5tS256(t) => Some(t),
+            Confirmation::Jkt(_) => None,
+        }
+    }
+
+    /// The thumbprint, whichever kind it is.
+    fn value(&self) -> &str {
+        match self {
+            Confirmation::Jkt(v) | Confirmation::X5tS256(v) => v,
+        }
+    }
+
+    /// The name of the one member: [`CNF_JKT`] or [`CNF_X5T_S256`].
+    pub fn member(&self) -> &'static str {
+        match self {
+            Confirmation::Jkt(_) => CNF_JKT,
+            Confirmation::X5tS256(_) => CNF_X5T_S256,
+        }
+    }
+
+    /// Is the thumbprint a well-formed SHA-256 (43 base64url characters, no padding)?
     pub fn is_well_formed(&self) -> bool {
         URL_SAFE_NO_PAD
-            .decode(&self.jkt)
+            .decode(self.value())
             .is_ok_and(|raw| raw.len() == 32)
+    }
+}
+
+impl Serialize for Confirmation {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(1))?;
+        map.serialize_entry(self.member(), self.value())?;
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for Confirmation {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_map(ConfirmationVisitor)
+    }
+}
+
+/// Reads a `cnf` object: exactly one of [`CNF_JKT`] and [`CNF_X5T_S256`], each a string,
+/// once, and no other member. Only a JSON object is accepted (not an array, as a derived
+/// `Deserialize` would).
+struct ConfirmationVisitor;
+
+impl<'de> serde::de::Visitor<'de> for ConfirmationVisitor {
+    type Value = Confirmation;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a cnf object with one member, `jkt` or `x5t#S256`")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Confirmation, A::Error> {
+        use serde::de::Error as _;
+        let mut found: Option<Confirmation> = None;
+        while let Some(name) = map.next_key::<String>()? {
+            let make: fn(String) -> Confirmation = match name.as_str() {
+                CNF_JKT => Confirmation::Jkt,
+                CNF_X5T_S256 => Confirmation::X5tS256,
+                _ => {
+                    return Err(A::Error::custom(format!(
+                        "cnf member `{name}` is not supported; use `jkt` or `x5t#S256`"
+                    )))
+                }
+            };
+            let value: String = map.next_value()?;
+            if found.is_some() {
+                return Err(A::Error::custom(
+                    "cnf must hold one binding: `jkt` or `x5t#S256`, once",
+                ));
+            }
+            found = Some(make(value));
+        }
+        found.ok_or_else(|| A::Error::custom("cnf must hold one binding: `jkt` or `x5t#S256`"))
     }
 }
 
@@ -696,6 +800,55 @@ mod tests {
             jwk_thumbprint(&rfc).unwrap(),
             "kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k"
         );
+    }
+
+    /// `cnf` holds one binding. A key binding is written exactly as before certificate binding
+    /// existed; a `cnf` with both members, neither, or another member does not parse.
+    #[test]
+    fn cnf_holds_exactly_one_binding() {
+        let t = "ungWv48Bz-pBQUDeXa4iI7ADYaOWF3qctBD_YfIAFa0";
+        let jkt = Confirmation::jkt(t);
+        assert_eq!(
+            serde_json::to_string(&jkt).unwrap(),
+            format!(r#"{{"jkt":"{t}"}}"#)
+        );
+        let x5t = Confirmation::x5t_s256(t);
+        assert_eq!(
+            serde_json::to_string(&x5t).unwrap(),
+            format!(r#"{{"x5t#S256":"{t}"}}"#)
+        );
+        for c in [&jkt, &x5t] {
+            let back: Confirmation =
+                serde_json::from_str(&serde_json::to_string(c).unwrap()).unwrap();
+            assert_eq!(&back, c);
+            assert!(c.is_well_formed());
+        }
+        assert_eq!(jkt.key_thumbprint(), Some(t));
+        assert_eq!(jkt.cert_thumbprint(), None);
+        assert_eq!(x5t.cert_thumbprint(), Some(t));
+        assert_eq!(x5t.key_thumbprint(), None);
+        assert!(!Confirmation::x5t_s256("short").is_well_formed());
+        for bad in [
+            json!({"jkt": t, "x5t#S256": t}),
+            json!({}),
+            json!({"jkt": null}),
+            json!({"x5t#S256": null}),
+            json!({"jkt": t, "jwk": {}}),
+            json!({"x5t#S256": t, "kid": "k"}),
+            json!({"x5t": t}),
+            json!({"X5T#S256": t}),
+            json!({"x5t#S256": 7}),
+            json!([t]),
+            json!(t),
+        ] {
+            assert!(
+                serde_json::from_value::<Confirmation>(bad.clone()).is_err(),
+                "{bad}"
+            );
+        }
+        // A repeated member is refused too.
+        let twice = format!(r#"{{"x5t#S256":"{t}","x5t#S256":"{t}"}}"#);
+        assert!(serde_json::from_str::<Confirmation>(&twice).is_err());
     }
 
     #[test]
