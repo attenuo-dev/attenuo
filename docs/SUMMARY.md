@@ -92,6 +92,7 @@
   - [ADR-0018: Native TLS listener](decisions/0018-native-tls-listener.md)
   - [ADR-0019: Self-signed TLS client certificates](decisions/0019-self-signed-tls-client-auth.md)
   - [ADR-0020: TLS client certificates from a CA](decisions/0020-pki-tls-client-auth.md)
+  - [ADR-0021: TLS client certificates forwarded by a proxy](decisions/0021-forwarded-client-certificates.md)
 
 # Research
 

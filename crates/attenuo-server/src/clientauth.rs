@@ -910,6 +910,7 @@ impl Clients {
                     client = ?id,
                     list = self.kind.section(),
                     x5t_s256 = %cert.x5t_s256(),
+                    source = cert.source().as_str(),
                     "TLS client certificate refused"
                 );
                 Err(invalid_client("client_authentication_failed", CERT_REFUSED))
@@ -968,6 +969,7 @@ impl Clients {
                     client = ?c.id,
                     list = self.kind.section(),
                     x5t_s256 = %cert.x5t_s256(),
+                    source = cert.source().as_str(),
                     names = ?why.names,
                     "TLS client certificate refused"
                 );
@@ -1406,8 +1408,9 @@ pub(crate) struct ClientRules {
     /// table.
     actor_trust: Vec<Option<Vec<String>>>,
     allow_unsigned_chain: bool,
-    /// `[server.tls] client_certificates = "optional"`: the listener asks for client
-    /// certificates, so `tls_client_cert_sha256` and `tls_client_ca_pem_path` can be used.
+    /// `[server.tls] client_certificates = "optional"` (the listener asks for client
+    /// certificates) or `[server.forwarded_client_cert]` (a proxy forwards them), so
+    /// `tls_client_cert_sha256` and `tls_client_ca_pem_path` can be used.
     client_certificates: bool,
 }
 
@@ -1440,7 +1443,7 @@ impl ClientRules {
                 })
                 .collect(),
             allow_unsigned_chain: config.authzen.allow_unsigned_chain,
-            client_certificates: config.server.asks_for_client_certificates(),
+            client_certificates: config.server.takes_client_certificates(),
         }
     }
 
@@ -1454,10 +1457,10 @@ impl ClientRules {
     ///
     /// As [`crate::config::check_reserved_client_ids`] and [`Clients::from_config`], when
     /// `[authzen] allow_unsigned_chain = true` and `peps` is empty, and when an entry has
-    /// `tls_client_cert_sha256` or `tls_client_ca_pem_path` while the listener asks for no
-    /// client certificate (no
-    /// `[server.tls]`, or `client_certificates` is not `"optional"`): such a setting could
-    /// never be used. The message is the one startup fails with.
+    /// `tls_client_cert_sha256` or `tls_client_ca_pem_path` while no listener takes a client
+    /// certificate (no `[server.tls]` with `client_certificates = "optional"`, and no
+    /// `[server.forwarded_client_cert]`): such a setting could never be used. The message is
+    /// the one startup fails with.
     pub(crate) fn check(
         &self,
         agents: &[AgentConfig],
@@ -1479,8 +1482,9 @@ impl ClientRules {
                 if let Some(c) = list.iter().find(|c| c.has_certificates()) {
                     anyhow::bail!(
                         "{} `{}`: {} needs [server.tls] with client_certificates = \
-                         \"optional\"; without it the server asks for no client certificate, \
-                         so this entry's certificates could never be used",
+                         \"optional\", or [server.forwarded_client_cert]; without either the \
+                         server takes no client certificate, so this entry's certificates \
+                         could never be used",
                         list.kind.section(),
                         c.id,
                         c.certificate_key()

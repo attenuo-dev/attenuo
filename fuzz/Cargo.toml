@@ -200,3 +200,10 @@ path = "fuzz_targets/client_pki_der.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "forwarded_client_cert"
+path = "fuzz_targets/forwarded_client_cert.rs"
+test = false
+doc = false
+bench = false

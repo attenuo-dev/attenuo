@@ -20,7 +20,8 @@
 //!   review sees it, or not at all.
 //! - `[server.tls]` keys are refused, also when the file has the section: the certificate, the
 //!   key and whether clients are asked for certificates are set in the file, where a review
-//!   sees them.
+//!   sees them. So are `[server.forwarded_client_cert]` keys: turning on trust in forwarded
+//!   certificate headers is always in the reviewed file.
 //! - Anything else is an error that stops the server and names the variable, never its value:
 //!   an unknown key, a value of the wrong type, an empty value, two variables for one key, and
 //!   a variable that sets the same key as `ATTENUO_ADMIN_TOKEN` or `ATTENUO_LOG_FORMAT`.
@@ -176,6 +177,17 @@ fn resolve(schema: &Json, variable: &str) -> Result<Target, String> {
         return Err(
             "[dev] keys cannot be set from the environment: the development-only switches \
              are set in the config file, where a review sees them"
+                .into(),
+        );
+    }
+    if segments.len() >= 2
+        && segments[0].eq_ignore_ascii_case("server")
+        && segments[1].eq_ignore_ascii_case("forwarded_client_cert")
+    {
+        return Err(
+            "[server.forwarded_client_cert] keys cannot be set from the environment: whether \
+             a listener trusts forwarded certificate headers, and from which peers, is set in \
+             the config file, where a review sees it"
                 .into(),
         );
     }
@@ -775,6 +787,58 @@ mod tests {
             cfg.server.public_url.as_deref(),
             Some("https://attenuo.example")
         );
+    }
+
+    #[test]
+    fn forwarded_client_cert_keys_are_refused_even_when_the_file_has_the_section() {
+        const FWD: &str = "[server]\npublic_url = \"https://a.example\"\n\n\
+                           [server.forwarded_client_cert]\nlisten = \"127.0.0.1:8444\"\n\
+                           trusted_peers = [\"127.0.0.1\"]\n";
+        for (file, var, value) in [
+            (
+                FWD,
+                "ATTENUO__SERVER__FORWARDED_CLIENT_CERT__LISTEN",
+                "127.0.0.1:9999",
+            ),
+            (
+                FWD,
+                "attenuo__server__forwarded_client_cert__listen",
+                "0.0.0.0:8444",
+            ),
+            (
+                FWD,
+                "ATTENUO__SERVER__FORWARDED_CLIENT_CERT__TRUSTED_PEERS",
+                "0.0.0.0/0",
+            ),
+            (FWD, "ATTENUO__SERVER__FORWARDED_CLIENT_CERT", "x"),
+            (
+                "",
+                "ATTENUO__SERVER__FORWARDED_CLIENT_CERT__LISTEN",
+                "127.0.0.1:8444",
+            ),
+            (
+                "",
+                "ATTENUO__SERVER__FORWARDED_CLIENT_CERT__TRUSTED_PEERS",
+                "127.0.0.1",
+            ),
+        ] {
+            let e = refused(file, &[(var, value)]);
+            assert!(
+                e.contains(&format!(
+                    "{var}: [server.forwarded_client_cert] keys cannot be set from the environment"
+                )),
+                "{e}"
+            );
+            assert!(!e.contains(value) || value == "x", "{e}");
+        }
+        // Without the section in the file, nothing in the environment makes one.
+        let (cfg, _) = load("", &[]).unwrap();
+        assert!(cfg.server.forwarded_client_cert.is_none());
+        // The file's section, as written.
+        let (cfg, _) = load(FWD, &[]).unwrap();
+        let f = cfg.server.forwarded_client_cert.unwrap();
+        assert_eq!(f.listen, "127.0.0.1:8444".parse().unwrap());
+        assert_eq!(f.trusted_peers, ["127.0.0.1"]);
     }
 
     #[test]

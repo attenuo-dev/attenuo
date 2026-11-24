@@ -146,7 +146,7 @@ With `client_certificates = "optional"` in `[server.tls]`, agents and PEPs can a
 - The handshake only proves that the client holds the certificate's private key. It does not check a chain, an issuer or the dates. Each request then decides, against the lists in force, whether the certificate authenticates the client its `client_id` (or `pep_id`) names. So `attenuo admin agent reload` also applies to connections that are already open.
 - The default is `"off"`: the server asks for nothing. A `tls_client_cert_sha256` or `tls_client_ca_pem_path` on an entry refuses to start unless the listener asks for certificates.
 - With a CA, attenuo reads the CA file at start and at every `attenuo admin agent reload`. When SPIRE (or your CA) rotates its CA certificates, write the new bundle to the file and reload.
-- **A proxy that ends TLS hides the certificate.** attenuo never reads `Client-Cert`, `X-Forwarded-Client-Cert` or any other header for it. Clients must reach attenuo's own TLS listener: directly, or through a load balancer or ingress that passes TCP through (layer 4, TLS pass-through).
+- **A proxy that ends TLS hides the certificate.** On this listener attenuo never reads `Client-Cert`, `X-Forwarded-Client-Cert` or any other header for it. Clients must reach attenuo's own TLS listener: directly, or through a load balancer or ingress that passes TCP through (layer 4, TLS pass-through). Or let the proxy forward the certificate to a listener of its own: see [forwarded client certificates](#forwarded-client-certificates).
 - There is no CRL or OCSP check, and tokens are not bound to the certificate.
 - A certificate on the connection makes a `client_id` (or `pep_id`) a client credential. So under `[token] actor_auth = "actor_token"`, a request that sends `client_id` over a connection with any certificate is refused with `client_auth_not_accepted`. Under `"either"`, a request that sends an actor token and `client_id` is refused with `client_authentication_failed` when the certificate is not pinned for that id. A client that uses an actor token should leave `client_id` out, or not present a certificate.
 
@@ -210,6 +210,70 @@ The server refuses any other file and says which rule failed. The image runs as 
 - With `client_certificates = "optional"`, a client can send up to 64 KiB of certificate data in its handshake (the largest handshake message rustls takes). The server keeps it for as long as the connection is open, whether or not the certificate authenticates anyone.
 
 So a flood of new connections can still use up CPU and file descriptors. A front proxy or a connection limit at the network level is still the defence against that.
+
+### Forwarded client certificates
+
+When TLS ends at a reverse proxy, attenuo never sees the client's certificate. `[server.forwarded_client_cert]` lets the proxy pass it on in the RFC 9440 headers `Client-Cert` (the client's certificate) and `Client-Cert-Chain` (its intermediates), to a listener that does nothing else.
+
+**Read this first.** attenuo cannot check these headers. Whoever can send `Client-Cert` to the forwarding listener can claim any certificate, and so be any agent or PEP that authenticates with one. attenuo does not see the handshake either: it trusts the proxy to have checked that the client holds the certificate's key. Use the native listener (`[server.tls] client_certificates = "optional"`, above) when clients can reach attenuo directly or through a TCP pass-through. Use forwarding only when TLS must end at the proxy.
+
+```toml
+[server]
+listen = "127.0.0.1:8080"
+public_url = "https://attenuo.example.com"
+
+[server.forwarded_client_cert]
+# Plain HTTP. Bind it where only the proxy can reach it.
+listen = "127.0.0.1:8444"
+# The proxy's own addresses. Required. Nothing wider than /8, never 0.0.0.0/0.
+trusted_peers = ["127.0.0.1/32"]
+```
+
+The fences:
+
+- **A listener of its own.** The headers are read on `listen` only. It serves the same routes as the main listener (token, AuthZEN, approvals, discovery, health, the MCP proxy), but never `/admin/*`, the console or metrics. Point the proxy's backend at it.
+- **Listed peers only.** A connection whose TCP peer address is not in `trusted_peers` gets `403 forwarded_peer_not_trusted` for every request, before routing, and is closed. `X-Forwarded-For` and similar headers are not read for this.
+- **Refused everywhere else.** While the section is set, a request with either header on the main, admin, console or metrics listener is refused with `400 client_cert_header_not_accepted` and logged at warn. A client that tries to claim a certificate there, or a proxy pointed at the wrong port, shows up at once. Without the section the headers are ignored, as before.
+- **One source per listener.** The forwarding listener never speaks TLS; the TLS listener never reads the headers. You may set both `[server.tls]` and this section: each request has one possible source.
+- **Strict headers.** One `Client-Cert` line with one `:base64:` item, an optional `Client-Cert-Chain` line with at most 4 items, standard base64, at most 16 KiB per certificate. Anything else is `400 client_cert_header_malformed`.
+- **The same checks.** The certificate is checked exactly as one from attenuo's own handshake: `tls_client_cert_sha256` or `tls_client_ca_pem_path` on the entry, the same one answer for every refusal. Audit records say `"source": "forwarded"`.
+- **Not from the environment.** No key of the section can be set by an `ATTENUO__...` variable. `listen` and `trusted_peers` are read at start only; changing them needs a restart.
+
+**The proxy MUST** remove any `Client-Cert` and `Client-Cert-Chain` header the client sent, and set them only from its own TLS handshake, only when the client presented a certificate. A proxy that passes on the client's copy lets anyone be anyone. attenuo cannot tell.
+
+**What a reachable forwarding listener means.** Every process that can open a connection from a listed address can claim any certificate. With `127.0.0.1/32` that is every process on the host, not only the proxy. So run attenuo and the proxy where nothing else runs, or bind the listener to an address only the proxy reaches (a private interface, or the pod network of a sidecar proxy), and list only the proxy's address. A compromised proxy is a compromise of every certificate client.
+
+Other things change behind a proxy:
+
+- The per-peer limits (`[limits] token_unauthenticated_requests_per_minute`, SR-109) see the proxy's address for every client.
+- The CA check for `tls_client_ca_pem_path` runs on every request, because one proxy connection carries many clients. The native listener keeps the answer per connection.
+- `[server] public_url` must be the proxy's `https://` URL.
+
+#### HAProxy
+
+Tested here with HAProxy 2.8.30 (Ubuntu 24.04) against `attenuo-server`, for a pinned self-signed certificate and for a certificate from an intermediate CA:
+
+```text
+frontend attenuo_tls
+    # Ask for a client certificate and require none. The handshake proves that the client
+    # holds the key; attenuo decides whether the certificate authenticates anyone.
+    bind :443 ssl crt /etc/haproxy/attenuo.pem verify optional ca-file /etc/haproxy/agents-ca.pem ca-ignore-err all crt-ignore-err all
+    # MUST: drop any copy the client sent.
+    http-request del-header Client-Cert
+    http-request del-header Client-Cert-Chain
+    # Set it from this handshake only, and only when there was a certificate.
+    http-request set-header Client-Cert :%[ssl_c_der,base64]: if { ssl_c_used } { ssl_c_der -m found }
+    default_backend attenuo_forwarding
+
+backend attenuo_forwarding
+    server attenuo 127.0.0.1:8444
+```
+
+- `verify optional` with `ca-ignore-err all crt-ignore-err all` passes on any certificate whose key the client proved, as attenuo's own listener does. attenuo then checks the pin, or the chain and name. To let only certificates from your CA through the proxy, use `verify optional ca-file <your CA>` without the two `ignore-err` options, and add `{ ssl_c_verify 0 }` to the condition; then pinned self-signed certificates do not pass. This variant was not run here.
+- HAProxy cannot send the chain as an RFC 9440 list (`ssl_c_chain_der` is one blob), so it sends no `Client-Cert-Chain`. For a certificate from an intermediate CA, put the intermediate CA's certificate in the entry's `tls_client_ca_pem_path`. With only the root there, the check fails (`chain_invalid` in the debug log). This was checked both ways.
+- What was run: tokens issued through HAProxy for both agents; another agent's id with a certificate, and a stranger's certificate, refused with the one answer; a client's own `Client-Cert` header removed by HAProxy (`client_auth_missing` without a certificate, the stranger's certificate used with one); a direct request from `127.0.0.2` to the forwarding listener refused with `403`; the header on the main listener refused with `400`; the log lines `token exchanged` with `client_cert_source="forwarded"`.
+
+nginx exposes the certificate as URL-encoded PEM (`$ssl_client_escaped_cert`), not as an RFC 9440 byte sequence, and cannot make one without a script module. Envoy's default header is its own `x-forwarded-client-cert`, which attenuo does not read. Neither was tested here. [ADR-0021](../decisions/0021-forwarded-client-certificates.md) has the decision.
 
 ## Load limits
 

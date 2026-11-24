@@ -105,3 +105,7 @@ The decision above stands. The first item of "Not done here" is now done for sel
 ### Update 2026-11-24: CLI TLS options
 
 The decision above stands. The CLI limit named under "Bad" is lifted: `--tls-ca-cert` (`ATTENUO_TLS_CA_CERT`) gives the CLI the CA of a private or self-signed server certificate, and with it the CLI trusts only that file for `--server`, `--admin-server` and an `approval verify --jwks` URL, not its built-in web PKI roots. A self-signed server certificate works only if it is not a CA certificate (`CA:FALSE`) ([CLI reference](../reference/cli.md#global-options)). The image's built-in `HEALTHCHECK` and the Helm chart's probes are unchanged and still use plain HTTP; a health check override can now use the CLI with that option ([deploying](../guides/deploying.md#health-checks-the-image-and-the-cli)).
+
+### Update 2026-11-24: forwarded client certificates
+
+The decision above stands. A proxy that ends TLS in front of attenuo can now forward the client's certificate to a listener of its own, `[server.forwarded_client_cert]` ([ADR-0021](0021-forwarded-client-certificates.md)). That listener speaks plain HTTP. With `[server.tls]` set too, the main router's TLS guard accepts requests from that listener's trusted peers in place of TLS ones; every other plain-HTTP request is still refused.

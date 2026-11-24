@@ -39,9 +39,24 @@ listen = "127.0.0.1:8080"
 # # "off" (default): ask for no client certificate. "optional": ask for one, never require
 # # one, so agents and PEPs with tls_client_cert_sha256 (a self-signed certificate) or
 # # tls_client_ca_pem_path (a certificate from a CA) can authenticate with it (RFC 8705).
-# # A proxy that ends TLS in front hides it: needs a direct connection or TCP pass-through.
+# # A proxy that ends TLS in front hides it: needs a direct connection or TCP pass-through,
+# # or [server.forwarded_client_cert] below.
 # # There is no "required".
 # client_certificates = "off"
+
+# Client certificates forwarded by a reverse proxy that ends TLS (RFC 9440 Client-Cert and
+# Client-Cert-Chain headers), on a listener of its own, off by default. DANGER: anyone who can
+# send these headers to this listener can claim any certificate, so it takes connections
+# from trusted_peers only (the TCP peer address, never a header). The proxy MUST remove any
+# copy the client sent and set them only from its own handshake. While this is set, every
+# other listener refuses the headers with 400. Plain HTTP; serves the main listener's routes
+# but never /admin/*. Needs an https:// public_url. Read at start only, never from
+# environment overrides. See docs/guides/deploying.md#forwarded-client-certificates.
+# [server.forwarded_client_cert]
+# # Not the address of any other listener. Bind it where only the proxy can reach it.
+# listen = "127.0.0.1:8444"
+# # The proxy's addresses: IPs or CIDRs, required, not empty, nothing wider than /8.
+# trusted_peers = ["127.0.0.1/32"]
 
 [issuer]
 issuer = "http://127.0.0.1:8080"
@@ -255,7 +270,8 @@ secret_sha256 = "a93d472e76b73bffcef69973eb463fb679b1365377e183a459d7f33c2ee97b7
 # jwks_url = "https://planner.example.com/.well-known/jwks.json"
 # jwks_ttl_seconds = 300
 # Or self-signed TLS client certificates (RFC 8705 self_signed_tls_client_auth): 1 to 8
-# SHA-256 thumbprints, lowercase hex. Needs [server.tls] client_certificates = "optional".
+# SHA-256 thumbprints, lowercase hex. Needs [server.tls] client_certificates = "optional"
+# or [server.forwarded_client_cert].
 # The agent sends the certificate in the handshake and client_id with no secret. The
 # certificate must be within its dates, not a CA certificate, and allow clientAuth.
 # Thumbprint: openssl x509 -in planner.crt -outform DER | sha256sum | cut -d' ' -f1

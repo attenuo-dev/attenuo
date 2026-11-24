@@ -60,6 +60,11 @@
 //! answers those paths as it answers any unknown path. Without it they are on the main
 //! listener, which the server accepts off loopback only with `[admin] serve_on_main_listener =
 //! true` (S-1). `/healthz`, `/readyz` and everything else stay on the main listener.
+//!
+//! **Forwarding listener.** With `[server.forwarded_client_cert]` a listener of its own serves
+//! the main router to the reverse proxies in `trusted_peers`, which forward the client's TLS
+//! certificate in the RFC 9440 `Client-Cert` headers (the `forwarded` module). The `/admin/*` routes
+//! answer there as unknown paths. Every other listener refuses those headers with 400.
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
@@ -88,6 +93,7 @@ pub mod dpop;
 pub(crate) mod early_close;
 // Used by the integration tests.
 pub mod error;
+pub(crate) mod forwarded;
 pub(crate) mod idp;
 pub mod issuer_keys;
 pub(crate) mod limits;
@@ -110,8 +116,9 @@ pub mod telemetry;
 pub(crate) mod tls;
 
 /// Thin wrappers over crate-private code for the cargo-fuzz targets (`fuzz/`): the
-/// `[idps.id_jag_ceiling]` code for `idjag_ceiling`, and the DER reads of the TLS client
-/// certificate check (`client_pki`) for `client_pki_der`. **Not a public API**: behind the
+/// `[idps.id_jag_ceiling]` code for `idjag_ceiling`, the DER reads of the TLS client
+/// certificate check (`client_pki`) for `client_pki_der`, and the RFC 9440 header reads
+/// (`forwarded`) for `forwarded_client_cert`. **Not a public API**: behind the
 /// `fuzzing` feature, which only `fuzz/Cargo.toml` enables, hidden from the docs, and free to
 /// change or go with any release.
 /// Each wrapper calls the server's own function; none holds logic of its own.
@@ -205,6 +212,34 @@ pub mod fuzzing {
     /// `client_pki::not_after`: a certificate's `notAfter`, in Unix seconds.
     pub fn pki_not_after(cert: &[u8]) -> Option<i64> {
         crate::client_pki::not_after(cert)
+    }
+
+    /// `forwarded::parse_values`: the DER of the leaf and of the chain from the
+    /// `Client-Cert` and `Client-Cert-Chain` values (`None`: absent), or why they are refused.
+    #[allow(clippy::type_complexity)]
+    pub fn forwarded_parse_values(
+        leaf: Option<&[u8]>,
+        chain: Option<&[u8]>,
+    ) -> Result<Option<(Vec<u8>, Vec<Vec<u8>>)>, &'static str> {
+        crate::forwarded::parse_values(leaf, chain)
+    }
+
+    /// `forwarded::parse` over a header map holding these lines: whether a certificate was
+    /// taken (`Ok(true)`), the headers were absent (`Ok(false)`), or why they are refused.
+    pub fn forwarded_parse_headers(lines: &[(bool, &[u8])]) -> Result<bool, &'static str> {
+        let mut headers = axum::http::HeaderMap::new();
+        for (chain, value) in lines {
+            let Ok(value) = axum::http::HeaderValue::from_bytes(value) else {
+                continue;
+            };
+            let name = if *chain {
+                crate::forwarded::CLIENT_CERT_CHAIN
+            } else {
+                crate::forwarded::CLIENT_CERT
+            };
+            headers.append(name, value);
+        }
+        crate::forwarded::parse(&headers).map(|c| c.is_some())
     }
 
     /// `client_pki::useful_intermediates`: the intermediates of `sent` kept for path building
@@ -303,7 +338,15 @@ pub fn router(state: Arc<AppState>, upstreams: Vec<UpstreamConfig>, config: &Con
         )
         .merge(authzen_routes);
     if config.admin.on_main_listener() {
-        api = api.merge(admin_routes(&state));
+        let admin = admin_routes(&state);
+        // Never on the forwarding listener: there the admin paths answer as unknown ones.
+        api = api.merge(if state.forwarded.is_some() {
+            admin.layer(axum::middleware::from_fn(
+                forwarded::not_on_forwarding_listener,
+            ))
+        } else {
+            admin
+        });
     }
     let api = api
         .with_state(state.clone())
@@ -338,7 +381,8 @@ pub fn router(state: Arc<AppState>, upstreams: Vec<UpstreamConfig>, config: &Con
             limits::shed,
         ));
     let app = outer_layers(app, &state);
-    // `[server.tls]`: outermost, so nothing runs for a request that did not come over TLS.
+    // `[server.tls]`: outermost, so nothing runs for a request that did not come over TLS (or
+    // from a trusted peer of the forwarding listener, whose proxy ended TLS).
     if state.main_tls.is_some() {
         app.layer(axum::middleware::from_fn(listen::require_tls))
     } else {
@@ -409,17 +453,30 @@ fn admin_routes(state: &Arc<AppState>) -> Router<Arc<AppState>> {
 }
 
 /// The layers around everything the main and the admin listener serve, unknown paths included.
+/// With `[server.forwarded_client_cert]`, [`forwarded::headers`] is one of them: it reads the
+/// `Client-Cert` headers on the forwarding listener and refuses them anywhere else.
 fn outer_layers(app: Router, state: &Arc<AppState>) -> Router {
-    app.layer(axum::middleware::from_fn_with_state(
+    let app = app.layer(axum::middleware::from_fn_with_state(
         state.dpop.clone(),
         dpop::nonce_header,
-    ))
-    .layer(axum::middleware::from_fn_with_state(
-        state.metrics.clone(),
-        metrics::track_http,
-    ))
-    // Outermost, so it sees every answer, the early refusals of the layers above included.
-    .layer(axum::middleware::from_fn(early_close::mark_early_refusal))
+    ));
+    with_forwarded_headers(app, state)
+        .layer(axum::middleware::from_fn_with_state(
+            state.metrics.clone(),
+            metrics::track_http,
+        ))
+        // Outermost, so it sees every answer, the early refusals of the layers above included.
+        .layer(axum::middleware::from_fn(early_close::mark_early_refusal))
+}
+
+/// `app` with [`forwarded::headers`] when `[server.forwarded_client_cert]` is set; `app` as it
+/// is otherwise, so a server without the section treats the headers exactly as before.
+pub(crate) fn with_forwarded_headers(app: Router, state: &AppState) -> Router {
+    if state.forwarded.is_some() {
+        app.layer(axum::middleware::from_fn(forwarded::headers))
+    } else {
+        app
+    }
 }
 
 /// Start the `[audit] checkpoint_interval_seconds` timer: every `period`, sign the head if
@@ -751,7 +808,10 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
 /// stop. This is [`serve`] without the binding of `[server] listen` and the signal handling,
 /// for an embedder that runs the server in its own process and stops it itself. With
 /// `[server.tls]`, `listener` speaks TLS with the certificate and key `state` read at
-/// startup; the other listeners always speak plain HTTP.
+/// startup; the other listeners always speak plain HTTP. With
+/// `[server.forwarded_client_cert]`, `app` is served on that listener too, to its trusted
+/// peers only (the `forwarded` module); it should be the router [`build`] made over `state`, whose
+/// layers read the `Client-Cert` headers there and refuse them on `listener`.
 ///
 /// When it returns, everything it started has finished and been dropped: the listeners are
 /// closed, their connections drained (or, past the drain timeout, abandoned), the timers stopped
@@ -762,8 +822,9 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
 ///
 /// # Errors
 ///
-/// When the metrics, admin or admin UI listener cannot be bound (nothing has started then), or
-/// when serving fails with an I/O error. A failed final WAL checkpoint is logged, not returned.
+/// When the metrics, admin, admin UI or forwarding listener cannot be bound (nothing has
+/// started then), or when serving fails with an I/O error. A failed final WAL checkpoint is
+/// logged, not returned.
 pub async fn run(
     config: &Config,
     state: Arc<AppState>,
@@ -771,10 +832,13 @@ pub async fn run(
     listener: tokio::net::TcpListener,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
-    let tls = state.main_tls.clone().map(tokio_rustls::TlsAcceptor::from);
+    let main = match state.main_tls.clone() {
+        Some(tls) => listen::Transport::Tls(tokio_rustls::TlsAcceptor::from(tls)),
+        None => listen::Transport::Plain,
+    };
     tracing::info!(
         addr = %listener.local_addr()?,
-        tls = tls.is_some(),
+        tls = main.is_tls(),
         upstreams = config.upstreams.len(),
         "attenuo server listening"
     );
@@ -793,6 +857,19 @@ pub async fn run(
                 "admin API listening (/admin/*, not on the main listener)"
             );
             Some(l)
+        }
+        None => None,
+    };
+    let forwarding_listener = match &state.forwarded {
+        Some(f) => {
+            let l = tokio::net::TcpListener::bind(f.listen).await?;
+            tracing::info!(
+                addr = %l.local_addr()?,
+                trusted_peers = f.peers.len(),
+                "forwarding listener for proxied client certificates (plain HTTP, \
+                 Client-Cert headers from trusted_peers only)"
+            );
+            Some((l, f.peers.clone()))
         }
         None => None,
     };
@@ -861,25 +938,40 @@ pub async fn run(
             }),
         ));
     }
+    use listen::Transport::Plain;
     if let Some(l) = metrics_listener {
-        let app = metrics::router(state.metrics.clone());
-        let until = serve_and_release(l, app, None, stopped(), DRAIN_TIMEOUT, header_read_timeout);
+        let app = with_forwarded_headers(metrics::router(state.metrics.clone()), &state);
+        let until = serve_and_release(l, app, Plain, stopped(), DRAIN_TIMEOUT, header_read_timeout);
         tasks.push(("metrics listener", tokio::spawn(until)));
     }
     if let Some(l) = admin_listener {
         let app = admin_router(state.clone());
-        let until = serve_and_release(l, app, None, stopped(), DRAIN_TIMEOUT, header_read_timeout);
+        let until = serve_and_release(l, app, Plain, stopped(), DRAIN_TIMEOUT, header_read_timeout);
         tasks.push(("admin listener", tokio::spawn(until)));
     }
     if let Some(l) = console_listener {
         let app = admin_ui::router(state.clone(), config);
-        let until = serve_and_release(l, app, None, stopped(), DRAIN_TIMEOUT, header_read_timeout);
+        let until = serve_and_release(l, app, Plain, stopped(), DRAIN_TIMEOUT, header_read_timeout);
         tasks.push(("admin console listener", tokio::spawn(until)));
+    }
+    if let Some((l, peers)) = forwarding_listener {
+        // The main router itself: one set of routes, proxy sessions and limits for both
+        // listeners. Its admin routes answer as unknown paths here, and only this listener's
+        // requests carry `listen::ServedForwarded`.
+        let until = serve_and_release(
+            l,
+            app.clone(),
+            listen::Transport::Forwarded(peers),
+            stopped(),
+            DRAIN_TIMEOUT,
+            header_read_timeout,
+        );
+        tasks.push(("forwarding listener", tokio::spawn(until)));
     }
     let res = serve_and_release(
         listener,
         app,
-        tls,
+        main,
         async move {
             shutdown.await;
             let _ = stop_tx.send(true);
@@ -964,23 +1056,30 @@ pub async fn serve_until(
 ) -> anyhow::Result<()> {
     let header_read_timeout =
         std::time::Duration::from_secs(config::DEFAULT_HEADER_READ_TIMEOUT_SECONDS);
-    serve_until_drained(listener, app, None, shutdown, drain, header_read_timeout)
-        .await
-        .map(drop)
+    serve_until_drained(
+        listener,
+        app,
+        listen::Transport::Plain,
+        shutdown,
+        drain,
+        header_read_timeout,
+    )
+    .await
+    .map(drop)
 }
 
 /// [`serve_until`], saying whether every connection was drained (`false`: the drain timed out).
-/// Each connection gets `header_read_timeout` ([`listen`]), and speaks TLS with `tls`.
+/// Each connection gets `header_read_timeout` ([`listen`]), and speaks as `transport` says.
 async fn serve_until_drained(
     listener: tokio::net::TcpListener,
     app: Router,
-    tls: Option<tokio_rustls::TlsAcceptor>,
+    transport: listen::Transport,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     drain: std::time::Duration,
     header_read_timeout: std::time::Duration,
 ) -> anyhow::Result<bool> {
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-    let server = listen::serve(listener, app, tls, header_read_timeout, async move {
+    let server = listen::serve(listener, app, transport, header_read_timeout, async move {
         let _ = rx.await;
     });
     let mut server = tokio::spawn(server);
@@ -1026,14 +1125,23 @@ struct RouterCopy {
 async fn serve_and_release(
     listener: tokio::net::TcpListener,
     app: Router,
-    tls: Option<tokio_rustls::TlsAcceptor>,
+    transport: listen::Transport,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     drain: std::time::Duration,
     header_read_timeout: std::time::Duration,
 ) -> anyhow::Result<()> {
     let (copy, mut copies) = tokio::sync::mpsc::channel::<()>(1);
     let app = app.layer(axum::Extension(RouterCopy { _held: copy }));
-    if serve_until_drained(listener, app, tls, shutdown, drain, header_read_timeout).await? {
+    if serve_until_drained(
+        listener,
+        app,
+        transport,
+        shutdown,
+        drain,
+        header_read_timeout,
+    )
+    .await?
+    {
         // Nothing is sent: `recv` answers `None` once the last sender, so the last copy, is gone.
         if tokio::time::timeout(drain, copies.recv()).await.is_err() {
             tracing::warn!("a copy of the router outlived the drain");

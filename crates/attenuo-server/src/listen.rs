@@ -20,6 +20,13 @@
 //! TLS version, a client that does not trust the certificate) is logged at debug and closes
 //! the connection; the listener goes on.
 //!
+//! With [`Transport::Forwarded`] (`[server.forwarded_client_cert]`) the connection is plain
+//! HTTP and its TCP peer address must be in `trusted_peers`: any other peer gets `403
+//! forwarded_peer_not_trusted` for every request it sends, without routing, and the
+//! connection is closed. Requests of a trusted peer carry [`ServedForwarded`], which is what
+//! lets [`crate::forwarded::headers`] read the `Client-Cert` headers; no other loop sets it.
+//! Such a connection never speaks TLS, so it never has a handshake certificate.
+//!
 //! Shutdown is `axum::serve`'s: once `shutdown` resolves the listener is dropped, every
 //! connection is told to finish its request in progress and close, and the returned future
 //! resolves when the last connection task has ended. A connection still in its handshake is
@@ -38,14 +45,34 @@ use tokio_rustls::TlsAcceptor;
 use tower::ServiceExt as _;
 
 use crate::client_cert::ClientCertificate;
+use crate::forwarded::TrustedPeers;
+
+/// What a listener speaks, and where a request's client certificate may come from.
+#[derive(Clone)]
+pub(crate) enum Transport {
+    /// Plain HTTP; no client certificate.
+    Plain,
+    /// TLS ([`crate::tls`]); the certificate of the handshake, if any.
+    Tls(TlsAcceptor),
+    /// Plain HTTP from the peers listed only; the certificate from the `Client-Cert` headers
+    /// ([`crate::forwarded`]).
+    Forwarded(std::sync::Arc<TrustedPeers>),
+}
+
+impl Transport {
+    /// Whether connections speak TLS.
+    pub(crate) fn is_tls(&self) -> bool {
+        matches!(self, Transport::Tls(_))
+    }
+}
 
 /// Serve `app` on `listener` until `shutdown` resolves, then drain as `axum::serve`'s graceful
-/// shutdown does. Returns once every connection has ended. With `tls`, every connection speaks
-/// TLS ([`crate::tls`]); without it, plain HTTP.
+/// shutdown does. Returns once every connection has ended. Every connection speaks as
+/// `transport` says.
 pub(crate) async fn serve(
     listener: tokio::net::TcpListener,
     app: Router,
-    tls: Option<TlsAcceptor>,
+    transport: Transport,
     header_read_timeout: Duration,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) {
@@ -66,22 +93,49 @@ pub(crate) async fn serve(
             () = &mut shutdown => break,
         };
         let app = app.clone();
-        let tls = tls.clone();
+        let transport = transport.clone();
         let mut stop = stop_rx.clone();
         let live = live_rx.clone();
         tokio::spawn(async move {
             // Facts about the connection that each request carries go into `PeerService`:
-            // the peer address, whether the connection is TLS, and the client certificate the
-            // TLS handshake proved (taken from the stream below, once the handshake is done).
+            // the peer address, whether the connection is TLS or from a trusted forwarding
+            // proxy, and the client certificate the TLS handshake proved (taken from the
+            // stream below, once the handshake is done).
             let mut service = PeerService {
                 app,
                 peer,
-                tls: tls.is_some(),
+                tls: transport.is_tls(),
+                forwarded: false,
+                untrusted: false,
                 client_cert: None,
             };
-            match tls {
-                None => serve_connection(stream, service, header_read_timeout, &mut stop).await,
-                Some(acceptor) => {
+            match transport {
+                Transport::Plain => {
+                    serve_connection(stream, service, header_read_timeout, &mut stop).await
+                }
+                Transport::Forwarded(peers) => {
+                    // The TCP peer, never a header: `X-Forwarded-For` and the like play no part.
+                    if peers.contains(peer.ip()) {
+                        service.forwarded = true;
+                    } else {
+                        match crate::forwarded::UNTRUSTED.warn() {
+                            Some(suppressed) => tracing::warn!(
+                                %peer,
+                                suppressed,
+                                "a peer that is not in [server.forwarded_client_cert] \
+                                 trusted_peers connected to the forwarding listener; its \
+                                 requests are refused with 403"
+                            ),
+                            None => tracing::debug!(
+                                %peer,
+                                "untrusted peer on the forwarding listener; refused"
+                            ),
+                        }
+                        service.untrusted = true;
+                    }
+                    serve_connection(stream, service, header_read_timeout, &mut stop).await
+                }
+                Transport::Tls(acceptor) => {
                     let handshake =
                         tokio::time::timeout(header_read_timeout, acceptor.accept(stream));
                     let stream = tokio::select! {
@@ -182,13 +236,27 @@ async fn accept_error(e: std::io::Error) {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ServedOverTls;
 
+/// Put into each request that came, over a connection of this accept loop, from a peer in
+/// `[server.forwarded_client_cert] trusted_peers` to the forwarding listener. Only then are
+/// the `Client-Cert` headers read ([`crate::forwarded::headers`]). [`require_tls`] takes it in
+/// place of [`ServedOverTls`]: the proxy ended the client's TLS, by the operator's
+/// declaration. Only [`serve`] with [`Transport::Forwarded`] sets it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ServedForwarded;
+
 /// The router as a hyper service of one connection, adding the peer address (and, on a TLS
-/// connection, [`ServedOverTls`] and the client certificate, if any) to each request.
+/// connection, [`ServedOverTls`] and the client certificate, if any; on a trusted forwarding
+/// connection, [`ServedForwarded`]) to each request.
 #[derive(Clone)]
 struct PeerService {
     app: Router,
     peer: SocketAddr,
     tls: bool,
+    /// From a trusted peer of the forwarding listener.
+    forwarded: bool,
+    /// From a peer of the forwarding listener that is not trusted: every request is refused
+    /// without routing.
+    untrusted: bool,
     /// The certificate the client proved in the TLS handshake ([`ClientCertificate`]).
     client_cert: Option<ClientCertificate>,
 }
@@ -196,24 +264,37 @@ struct PeerService {
 impl hyper::service::Service<hyper::Request<Incoming>> for PeerService {
     type Response = axum::response::Response;
     type Error = Infallible;
-    type Future = tower::util::Oneshot<Router, axum::extract::Request>;
+    type Future = futures_util::future::Either<
+        std::future::Ready<Result<axum::response::Response, Infallible>>,
+        tower::util::Oneshot<Router, axum::extract::Request>,
+    >;
 
     fn call(&self, req: hyper::Request<Incoming>) -> Self::Future {
+        if self.untrusted {
+            // The body is not read; the connection closes after this answer.
+            return futures_util::future::Either::Left(std::future::ready(Ok(
+                crate::forwarded::untrusted_peer(),
+            )));
+        }
         let mut req = req.map(axum::body::Body::new);
         req.extensions_mut().insert(ConnectInfo(self.peer));
         if self.tls {
             req.extensions_mut().insert(ServedOverTls);
         }
+        if self.forwarded {
+            req.extensions_mut().insert(ServedForwarded);
+        }
         // Set by this loop only: a request off the wire has no extensions of its own.
         if let Some(cert) = &self.client_cert {
             req.extensions_mut().insert(cert.clone());
         }
-        self.app.clone().oneshot(req)
+        futures_util::future::Either::Right(self.app.clone().oneshot(req))
     }
 }
 
 /// Middleware of the main router when `[server.tls]` is set: a request that did not come over
-/// a TLS connection of [`serve`] is answered `500` with an empty body and logged as an error.
+/// a TLS connection of [`serve`] (or from a trusted peer of the forwarding listener,
+/// [`ServedForwarded`]) is answered `500` with an empty body and logged as an error.
 /// This catches a router served by something other than [`crate::run`] (such as
 /// [`crate::serve_until`], which never speaks TLS) while discovery and DPoP name `https://`
 /// URLs: fail closed rather than take tokens in cleartext.
@@ -221,7 +302,9 @@ pub(crate) async fn require_tls(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    if req.extensions().get::<ServedOverTls>().is_some() {
+    if req.extensions().get::<ServedOverTls>().is_some()
+        || req.extensions().get::<ServedForwarded>().is_some()
+    {
         return next.run(req).await;
     }
     // An error once per process, so a misconfigured embedder does not flood the log; every
@@ -262,7 +345,7 @@ mod tests {
         let task = tokio::spawn(serve(
             listener,
             app,
-            None,
+            Transport::Plain,
             header_read_timeout,
             async move {
                 let _ = rx.await;

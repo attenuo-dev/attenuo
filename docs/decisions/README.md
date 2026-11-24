@@ -60,5 +60,6 @@ Only the `status` and `date` fields and the More Information section of an accep
 | [0018](0018-native-tls-listener.md) | Native TLS on the main listener: optional `[server.tls]`, TLS 1.3 only, read at start, no client certificates yet | proposed |
 | [0019](0019-self-signed-tls-client-auth.md) | Client certificates on the ADR-0018 TLS listener: `client_certificates = "optional"`, self-signed certificates for agents and PEPs pinned by SHA-256 thumbprint, the trust decision made per request | proposed |
 | [0020](0020-pki-tls-client-auth.md) | Client certificates from a CA (`tls_client_auth`): a CA file and exactly one SAN, URI (SPIFFE ID) or DNS, per entry; no subject DN, no revocation | proposed |
+| [0021](0021-forwarded-client-certificates.md) | Client certificates forwarded by a trusted reverse proxy in the RFC 9440 headers: a listener of its own, a required peer allowlist, the headers refused on every other listener, the same checks as the native path | proposed |
 
 Add a row for each new ADR.

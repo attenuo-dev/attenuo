@@ -651,6 +651,11 @@ fn exchange_verified(
         .and_then(|c| c.get("x5t#S256"))
         .and_then(Value::as_str)
         .map(str::to_owned);
+    let client_source = client_cert
+        .as_ref()
+        .and_then(|c| c.get("source"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     if let Some(c) = client_cert {
         args["client_cert"] = c;
     }
@@ -669,6 +674,7 @@ fn exchange_verified(
         actor_auth,
         actor_subject = ?actor.map(|(v, _)| v.subject.as_str()),
         client_cert_x5t_s256 = client_x5t.as_deref(),
+        client_cert_source = client_source.as_deref(),
         lease = %resp.lease.0,
         depth = issued.chain.depth(),
         dpop_bound,
