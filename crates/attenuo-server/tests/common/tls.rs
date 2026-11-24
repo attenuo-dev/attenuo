@@ -1,5 +1,6 @@
 //! A test certificate authority and an HTTPS key server whose certificate it issued, for the
-//! key URL tests with `ca_pem_path` (`key_url_ca.rs`, `client_jwks_uri.rs`).
+//! key URL tests with `ca_pem_path` (`key_url_ca.rs`, `client_jwks_uri.rs`), and the server
+//! certificate files and TLS clients of the `[server.tls]` tests (`server_tls.rs`).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -48,6 +49,64 @@ impl Ca {
         let issuer = rcgen::Issuer::from_params(&self.params, &self.key);
         let cert = params.signed_by(&key, &issuer).unwrap();
         (cert.der().clone(), key.serialize_der())
+    }
+}
+
+impl Ca {
+    /// The CA certificate as a root for a reqwest client.
+    pub fn reqwest_root(&self) -> reqwest::Certificate {
+        reqwest::Certificate::from_pem(self.cert.pem().as_bytes()).unwrap()
+    }
+
+    /// A `rustls` client config that trusts this CA only, offers `alpn` and speaks `versions`.
+    pub fn rustls_client(
+        &self,
+        versions: &[&'static rustls::SupportedProtocolVersion],
+        alpn: &[&[u8]],
+    ) -> rustls::ClientConfig {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(self.cert.der().clone()).unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_protocol_versions(versions)
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+        config
+    }
+
+    /// Write a server certificate for `names` (with this CA's certificate after it) and its
+    /// key into `dir` as PEM files, the key with mode 0600. Returns the two paths.
+    pub fn write_server_files(&self, dir: &Path, names: &[&str]) -> (PathBuf, PathBuf) {
+        let (cert, key) = self.leaf(names);
+        let pem = |label: &str, der: &[u8]| {
+            use base64::Engine as _;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(der);
+            let lines: Vec<&str> = b64
+                .as_bytes()
+                .chunks(64)
+                .map(|c| std::str::from_utf8(c).unwrap())
+                .collect();
+            format!(
+                "-----BEGIN {label}-----\n{}\n-----END {label}-----\n",
+                lines.join("\n")
+            )
+        };
+        let cert_path = dir.join("server.crt");
+        let key_path = dir.join("server.key");
+        std::fs::write(
+            &cert_path,
+            format!("{}{}", pem("CERTIFICATE", &cert), self.cert.pem()),
+        )
+        .unwrap();
+        std::fs::write(&key_path, pem("PRIVATE KEY", &key)).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        (cert_path, key_path)
     }
 }
 

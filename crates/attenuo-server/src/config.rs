@@ -507,13 +507,36 @@ pub struct ServerSection {
     /// (with an optional port) is accepted.
     #[serde(default)]
     pub public_url: Option<String>,
-    /// Accept an `http://` `public_url` whose host is not a loopback name. Default `false`: the
-    /// server has no TLS of its own, so such a URL means tokens and admin bearers cross the
-    /// network in cleartext, and the server refuses to start (S-9). Terminate TLS at a reverse
-    /// proxy and set an `https://` `public_url` instead. Set this only when the plain-HTTP hop
-    /// is on a network you trust; a warning is still logged at startup.
+    /// Accept an `http://` `public_url` whose host is not a loopback name. Default `false`:
+    /// such a URL means tokens and admin bearers cross the network in cleartext, and the server
+    /// refuses to start (S-9). Terminate TLS at a reverse proxy, or turn on `[server.tls]`, and
+    /// set an `https://` `public_url` instead. Set this only when the plain-HTTP hop is on a
+    /// network you trust; a warning is still logged at startup. Refused together with
+    /// `[server.tls]`, where the listener speaks no plain HTTP.
     #[serde(default)]
     pub allow_insecure_http: bool,
+    /// `[server.tls]`: serve `listen` over TLS with this certificate and key. Unset by default:
+    /// the main listener speaks plain HTTP. The admin, admin console and metrics listeners
+    /// always speak plain HTTP.
+    #[serde(default)]
+    pub tls: Option<ServerTlsSection>,
+}
+
+/// `[server.tls]`: the certificate and private key of the main listener (`[server] listen`).
+///
+/// The files are read once, at startup: a renewed certificate takes a restart. The listener
+/// speaks TLS 1.3 only, offers ALPN `http/1.1`, keeps no sessions for resumption and asks for
+/// no client certificate (`tls.rs`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServerTlsSection {
+    /// PEM file with the server certificate first, then any intermediate certificates.
+    pub cert_pem_path: PathBuf,
+    /// PEM file with the one private key of the certificate (PKCS#8, SEC1 or PKCS#1, not
+    /// encrypted). On Unix, PostgreSQL's `ssl_key_file` rule: owned by the server's effective user or
+    /// root, no access for others, no group write or execute, and group read only when root
+    /// owns the file.
+    pub key_pem_path: PathBuf,
 }
 
 impl ServerSection {
@@ -533,6 +556,9 @@ impl ServerSection {
     /// loopback and `allow_insecure_http` is not set; or when it is unset and `listen` is not a
     /// loopback address.
     pub fn check_public_url(&self) -> anyhow::Result<()> {
+        if self.tls.is_some() {
+            self.check_public_url_with_tls()?;
+        }
         match self.public_url.as_deref() {
             Some(url) => {
                 let rest = url
@@ -556,9 +582,9 @@ impl ServerSection {
                     if !self.allow_insecure_http {
                         anyhow::bail!(
                             "[server] public_url = {url:?} is plain http:// on a host that is not \
-                             loopback. The server has no TLS of its own, so tokens and the admin \
-                             bearer would cross the network in cleartext. Terminate TLS at a \
-                             reverse proxy and set an https:// public_url, or set \
+                             loopback, so tokens and the admin bearer would cross the network in \
+                             cleartext. Terminate TLS at a reverse proxy or turn on [server.tls], \
+                             and set an https:// public_url, or set \
                              [server] allow_insecure_http = true if this hop is on a network you \
                              trust."
                         );
@@ -578,6 +604,35 @@ impl ServerSection {
                  https://attenuo.example.com): without it the AuthZEN discovery document would \
                  be built from the request's Host header, which any client can choose.",
                 self.listen
+            ),
+        }
+    }
+}
+
+impl ServerSection {
+    /// The [`ServerSection::check_public_url`] rules of `[server.tls]`: the listener speaks
+    /// TLS only, so `public_url` must be set and `https://`, and `allow_insecure_http` (which
+    /// only ever lets an `http://` URL through) is refused as a contradiction. A `public_url`
+    /// left unset would make discovery and DPoP build `http://<Host>` URLs for a listener
+    /// that answers no plain HTTP.
+    fn check_public_url_with_tls(&self) -> anyhow::Result<()> {
+        if self.allow_insecure_http {
+            anyhow::bail!(
+                "[server] allow_insecure_http = true cannot be combined with [server.tls]: the \
+                 listener then speaks TLS only. Remove allow_insecure_http."
+            );
+        }
+        match self.public_url.as_deref() {
+            Some(url) if url.starts_with("https://") => Ok(()),
+            Some(url) => anyhow::bail!(
+                "[server] public_url = {url:?} must start with https:// when [server.tls] is \
+                 set: the listener speaks TLS only."
+            ),
+            None => anyhow::bail!(
+                "[server.tls] is set but [server] public_url is not. Set public_url to the \
+                 https:// URL clients use (for example https://localhost:{} on this machine): \
+                 without it discovery and DPoP would name http:// URLs.",
+                self.listen.port()
             ),
         }
     }
@@ -631,6 +686,7 @@ impl Default for ServerSection {
             listen: default_listen(),
             public_url: None,
             allow_insecure_http: false,
+            tls: None,
         }
     }
 }
@@ -5303,6 +5359,7 @@ mod tests {
             listen: "0.0.0.0:8080".parse().unwrap(),
             public_url: Some(url.into()),
             allow_insecure_http: insecure,
+            tls: None,
         };
         for ok in [
             "https://attenuo.example.com",
@@ -5338,6 +5395,90 @@ mod tests {
         assert!(toml.server.allow_insecure_http);
         toml.server.check_public_url().unwrap();
         assert!(!Config::default().server.allow_insecure_http);
+    }
+
+    /// `[server.tls]` parses with its two keys, refuses unknown and missing keys, and is unset
+    /// by default.
+    #[test]
+    fn server_tls_section_parses_strictly() {
+        assert_eq!(Config::default().server.tls, None);
+        assert_eq!(Config::from_toml("[server]\n").unwrap().server.tls, None);
+        let cfg = Config::from_toml(
+            "[server]\npublic_url = \"https://localhost:8443\"\n[server.tls]\n\
+             cert_pem_path = \"tls/server.crt\"\nkey_pem_path = \"tls/server.key\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.server.tls,
+            Some(ServerTlsSection {
+                cert_pem_path: "tls/server.crt".into(),
+                key_pem_path: "tls/server.key".into(),
+            })
+        );
+        cfg.server.check_public_url().unwrap();
+        let unknown = Config::from_toml(
+            "[server.tls]\ncert_pem_path = \"a\"\nkey_pem_path = \"b\"\n\
+             client_certificates = \"optional\"\n",
+        )
+        .unwrap_err();
+        assert!(
+            format!("{unknown:#}").contains("client_certificates"),
+            "{unknown:#}"
+        );
+        for missing in ["cert_pem_path = \"a\"\n", "key_pem_path = \"b\"\n", ""] {
+            let toml = format!("[server.tls]\n{missing}");
+            assert!(Config::from_toml(&toml).is_err(), "{toml}");
+        }
+    }
+
+    /// With `[server.tls]` the public URL must be set and `https://`, and
+    /// `allow_insecure_http` is refused; without it nothing changes.
+    #[test]
+    fn server_tls_needs_an_https_public_url() {
+        let tls = Some(ServerTlsSection {
+            cert_pem_path: "c".into(),
+            key_pem_path: "k".into(),
+        });
+        let at = |listen: &str, url: Option<&str>, insecure: bool| ServerSection {
+            listen: listen.parse().unwrap(),
+            public_url: url.map(Into::into),
+            allow_insecure_http: insecure,
+            tls: tls.clone(),
+        };
+        at("0.0.0.0:8443", Some("https://attenuo.example.com"), false)
+            .check_public_url()
+            .unwrap();
+        at("127.0.0.1:8443", Some("https://localhost:8443"), false)
+            .check_public_url()
+            .unwrap();
+        for url in [
+            "http://attenuo.example.com",
+            "http://127.0.0.1:8443",
+            "http://localhost",
+        ] {
+            for listen in ["0.0.0.0:8443", "127.0.0.1:8443"] {
+                let err = at(listen, Some(url), false)
+                    .check_public_url()
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains("[server.tls]"), "{url}: {err}");
+                assert!(err.contains("https://"), "{url}: {err}");
+            }
+        }
+        let err = at("127.0.0.1:8443", None, false)
+            .check_public_url()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("public_url is not"), "{err}");
+        let err = at("0.0.0.0:8443", Some("https://attenuo.example.com"), true)
+            .check_public_url()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("allow_insecure_http"), "{err}");
+        // The https check does not replace the others.
+        assert!(at("0.0.0.0:8443", Some("https://"), false)
+            .check_public_url()
+            .is_err());
     }
 
     #[test]

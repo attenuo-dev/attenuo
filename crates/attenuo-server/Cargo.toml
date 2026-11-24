@@ -52,6 +52,10 @@ hyper-util = { workspace = true, features = ["tokio", "server", "http1"] }
 jsonwebtoken = { workspace = true }
 reqwest = { workspace = true }
 ring = { workspace = true }
+# `[server.tls]`: the main listener's TLS (`src/tls.rs`, `src/listen.rs`). The versions and the
+# `ring` provider reqwest already brings in.
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_urlencoded = { workspace = true }
@@ -73,6 +77,11 @@ opentelemetry-http = { workspace = true, optional = true }
 tracing-opentelemetry = { workspace = true, optional = true }
 uuid = { workspace = true }
 
+# The effective uid, without `unsafe`, for the `[server.tls]` key file's owner check
+# (`src/tls.rs`). Already in the lock file through tempfile and the other workspace crates.
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, features = ["process"] }
+
 [dev-dependencies]
 criterion = { workspace = true }
 # `SqliteLeaseStore::write_turns`, for the write count of the `allowed_call` bench and tests.
@@ -81,10 +90,9 @@ attenuo-proxy = { workspace = true, features = ["testing"] }
 rusqlite = { workspace = true }
 tempfile = { workspace = true }
 # A test CA, its certificates and an HTTPS key server, for `[[idps]]` / `[[actor_trust]]`
-# `ca_pem_path` (tests/key_url_ca.rs and the unit tests of `idp::jwks`).
+# `ca_pem_path` (tests/key_url_ca.rs and the unit tests of `idp::jwks`), and the server
+# certificates of the `[server.tls]` tests (tests/server_tls.rs, the unit tests of `tls`).
 rcgen = { workspace = true }
-rustls = { workspace = true }
-tokio-rustls = { workspace = true }
 # Paused time (`tokio::time::pause`) for the stream re-check test in `tests/e2e.rs`.
 tokio = { workspace = true, features = ["test-util"] }
 

@@ -59,6 +59,10 @@ const FULL: &str = r#"
 [server]
 public_url = "https://attenuo.example.com"
 
+[server.tls]
+cert_pem_path = "server.crt"
+key_pem_path = "server.key"
+
 [issuer]
 private_key_pem_path = "issuer.pem"
 previous_key_paths = ["old.pem"]

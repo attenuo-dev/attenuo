@@ -94,6 +94,16 @@ impl Running {
         format!("http://{}{}", self.addr, path)
     }
 
+    /// `https://{addr}{path}`, for a server with `[server.tls]`.
+    pub fn https_url(&self, path: &str) -> String {
+        format!("https://{}{}", self.addr, path)
+    }
+
+    /// The address of the main listener.
+    pub fn addr(&self) -> std::net::SocketAddr {
+        self.addr
+    }
+
     /// Stop as `serve` does after a signal, wait until `run` has returned, drop `state` (the
     /// caller's last reference) and wait until the state is gone, which releases the database.
     /// Nothing is retried: [`attenuo_server::AppState::released`] resolves when the state is

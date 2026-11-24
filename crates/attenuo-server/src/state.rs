@@ -144,6 +144,9 @@ pub struct AppState {
     pub trace: Option<Arc<crate::telemetry::ServerTrace>>,
     /// `[limits]`: the in-flight cap, the deadlines and the rate limits ([`crate::limits`]).
     pub(crate) limits: Arc<crate::limits::Limits>,
+    /// `[server.tls]`: the TLS configuration of the main listener, read at startup
+    /// ([`crate::tls`]); `None` for plain HTTP. [`crate::run`] serves `[server] listen` with it.
+    pub(crate) main_tls: Option<Arc<rustls::ServerConfig>>,
     /// The thread that keeps the DPoP liveness marker ahead of the clock; `None` for
     /// `:memory:`. Its drop runs before the single-writer fence below is released: it closes
     /// the marker, so no `Dpop` still held elsewhere (a router, a request) can move the
@@ -184,6 +187,13 @@ impl AppState {
             tracing::warn!("{warning}");
         }
         config.server.check_public_url()?;
+        // Read once, here: a file that cannot be used stops the server before anything starts.
+        let main_tls = config
+            .server
+            .tls
+            .as_ref()
+            .map(crate::tls::server_config)
+            .transpose()?;
         config.admin.check_listen(config.server.listen)?;
         config
             .dev
@@ -439,6 +449,7 @@ impl AppState {
                 &config.limits,
                 metrics_for_limits,
             )),
+            main_tls,
             dpop_heartbeat,
             store_fence,
             released: tokio::sync::watch::Sender::new(()),

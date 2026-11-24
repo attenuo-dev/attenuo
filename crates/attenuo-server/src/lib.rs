@@ -104,6 +104,7 @@ pub mod routes;
 pub mod sink;
 pub(crate) mod state;
 pub mod telemetry;
+pub(crate) mod tls;
 
 /// Thin wrappers over the crate-private `[idps.id_jag_ceiling]` code, for the cargo-fuzz target
 /// `idjag_ceiling` (`fuzz/`). **Not a public API**: behind the `fuzzing` feature, which only
@@ -298,7 +299,13 @@ pub fn router(state: Arc<AppState>, upstreams: Vec<UpstreamConfig>, config: &Con
             state.limits.clone(),
             limits::shed,
         ));
-    outer_layers(app, &state)
+    let app = outer_layers(app, &state);
+    // `[server.tls]`: outermost, so nothing runs for a request that did not come over TLS.
+    if state.main_tls.is_some() {
+        app.layer(axum::middleware::from_fn(listen::require_tls))
+    } else {
+        app
+    }
 }
 
 /// The router of the `[admin] listen` listener (S-1): the admin routes of the table above
@@ -704,7 +711,9 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
 /// next to it (the checkpoint timer, lease maintenance, the `[metrics]`, `[admin] listen` and
 /// `[admin_ui]` listeners) until `shutdown` resolves; then drain every listener for [`DRAIN_TIMEOUT`] and
 /// stop. This is [`serve`] without the binding of `[server] listen` and the signal handling,
-/// for an embedder that runs the server in its own process and stops it itself.
+/// for an embedder that runs the server in its own process and stops it itself. With
+/// `[server.tls]`, `listener` speaks TLS with the certificate and key `state` read at
+/// startup; the other listeners always speak plain HTTP.
 ///
 /// When it returns, everything it started has finished and been dropped: the listeners are
 /// closed, their connections drained (or, past the drain timeout, abandoned), the timers stopped
@@ -724,7 +733,13 @@ pub async fn run(
     listener: tokio::net::TcpListener,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
-    tracing::info!(addr = %listener.local_addr()?, upstreams = config.upstreams.len(), "attenuo server listening");
+    let tls = state.main_tls.clone().map(tokio_rustls::TlsAcceptor::from);
+    tracing::info!(
+        addr = %listener.local_addr()?,
+        tls = tls.is_some(),
+        upstreams = config.upstreams.len(),
+        "attenuo server listening"
+    );
     let metrics_listener = if config.metrics.enabled {
         let l = tokio::net::TcpListener::bind(config.metrics.listen).await?;
         tracing::info!(addr = %l.local_addr()?, "metrics listening (unauthenticated)");
@@ -810,22 +825,23 @@ pub async fn run(
     }
     if let Some(l) = metrics_listener {
         let app = metrics::router(state.metrics.clone());
-        let until = serve_and_release(l, app, stopped(), DRAIN_TIMEOUT, header_read_timeout);
+        let until = serve_and_release(l, app, None, stopped(), DRAIN_TIMEOUT, header_read_timeout);
         tasks.push(("metrics listener", tokio::spawn(until)));
     }
     if let Some(l) = admin_listener {
         let app = admin_router(state.clone());
-        let until = serve_and_release(l, app, stopped(), DRAIN_TIMEOUT, header_read_timeout);
+        let until = serve_and_release(l, app, None, stopped(), DRAIN_TIMEOUT, header_read_timeout);
         tasks.push(("admin listener", tokio::spawn(until)));
     }
     if let Some(l) = console_listener {
         let app = admin_ui::router(state.clone(), config);
-        let until = serve_and_release(l, app, stopped(), DRAIN_TIMEOUT, header_read_timeout);
+        let until = serve_and_release(l, app, None, stopped(), DRAIN_TIMEOUT, header_read_timeout);
         tasks.push(("admin console listener", tokio::spawn(until)));
     }
     let res = serve_and_release(
         listener,
         app,
+        tls,
         async move {
             shutdown.await;
             let _ = stop_tx.send(true);
@@ -892,6 +908,11 @@ pub async fn run(
 /// default `[limits] header_read_timeout_seconds`
 /// ([`config::DEFAULT_HEADER_READ_TIMEOUT_SECONDS`]).
 ///
+/// It never speaks TLS: every connection is plain HTTP, whatever the config says. [`run`] and
+/// [`serve`] serve `[server.tls]`. A router that [`router`] or [`build`] made over a state with
+/// `[server.tls]` answers every request served here with `500` (empty body, an error logged),
+/// so it is never served in cleartext while discovery names `https://` URLs.
+///
 /// # Errors
 ///
 /// When the server task fails with an I/O error or panics, before or during the drain. A drain
@@ -905,22 +926,23 @@ pub async fn serve_until(
 ) -> anyhow::Result<()> {
     let header_read_timeout =
         std::time::Duration::from_secs(config::DEFAULT_HEADER_READ_TIMEOUT_SECONDS);
-    serve_until_drained(listener, app, shutdown, drain, header_read_timeout)
+    serve_until_drained(listener, app, None, shutdown, drain, header_read_timeout)
         .await
         .map(drop)
 }
 
 /// [`serve_until`], saying whether every connection was drained (`false`: the drain timed out).
-/// Each connection gets `header_read_timeout` ([`listen`]).
+/// Each connection gets `header_read_timeout` ([`listen`]), and speaks TLS with `tls`.
 async fn serve_until_drained(
     listener: tokio::net::TcpListener,
     app: Router,
+    tls: Option<tokio_rustls::TlsAcceptor>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     drain: std::time::Duration,
     header_read_timeout: std::time::Duration,
 ) -> anyhow::Result<bool> {
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-    let server = listen::serve(listener, app, header_read_timeout, async move {
+    let server = listen::serve(listener, app, tls, header_read_timeout, async move {
         let _ = rx.await;
     });
     let mut server = tokio::spawn(server);
@@ -966,13 +988,14 @@ struct RouterCopy {
 async fn serve_and_release(
     listener: tokio::net::TcpListener,
     app: Router,
+    tls: Option<tokio_rustls::TlsAcceptor>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
     drain: std::time::Duration,
     header_read_timeout: std::time::Duration,
 ) -> anyhow::Result<()> {
     let (copy, mut copies) = tokio::sync::mpsc::channel::<()>(1);
     let app = app.layer(axum::Extension(RouterCopy { _held: copy }));
-    if serve_until_drained(listener, app, shutdown, drain, header_read_timeout).await? {
+    if serve_until_drained(listener, app, tls, shutdown, drain, header_read_timeout).await? {
         // Nothing is sent: `recv` answers `None` once the last sender, so the last copy, is gone.
         if tokio::time::timeout(drain, copies.recv()).await.is_err() {
             tracing::warn!("a copy of the router outlived the drain");

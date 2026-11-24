@@ -13,8 +13,8 @@ nameOverride: ""
 fullnameOverride: ""
 
 # REQUIRED. The URL agents and MCP clients use to reach attenuo, for example
-# https://attenuo.example.com. attenuo has no TLS of its own: terminate TLS at an ingress
-# or gateway and give its https:// URL here.
+# https://attenuo.example.com. The chart does not turn on attenuo's own TLS ([server.tls]):
+# terminate TLS at an ingress or gateway and give its https:// URL here.
 publicUrl: ""
 # Accept an http:// publicUrl on a host that is not loopback. Tokens and the admin bearer
 # then cross the network in cleartext. Only for a network you trust, or a test cluster.

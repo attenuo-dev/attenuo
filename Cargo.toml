@@ -65,9 +65,9 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 bytes = "1"
 proptest = "1"
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
-# Test-only (attenuo-server dev-dependencies): a CA and a server certificate made in the test,
-# and the TLS server that presents it, for the `ca_pem_path` key-fetch tests. rustls and
-# tokio-rustls are the versions reqwest already brings in, with its `ring` provider.
+# rcgen is test-only (attenuo-server dev-dependencies): a CA and server certificates made in
+# the tests. rustls and tokio-rustls serve `[server.tls]` in attenuo-server and the test TLS
+# servers; they are the versions reqwest already brings in, with its `ring` provider.
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }

@@ -1,4 +1,5 @@
-//! The server's accept loop: `axum::serve` with a header-read timeout and the peer address.
+//! The server's accept loop: `axum::serve` with a header-read timeout, the peer address and,
+//! on the main listener with `[server.tls]`, TLS.
 //!
 //! `axum::serve` gives hyper no timer, so hyper's header-read timeout never runs and a client
 //! can hold a connection (and a task) open forever by sending a request's headers one byte at
@@ -9,25 +10,38 @@
 //! [`axum::extract::ConnectInfo`], which the `POST /token` peer limit reads
 //! ([`crate::limits`]).
 //!
+//! With a [`TlsAcceptor`] ([`crate::tls`]), each connection first makes its TLS handshake, in
+//! the connection's own task (never in the accept loop, so a slow handshake does not hold up
+//! the others) and within the same header-read timeout: a peer that connects and sends
+//! nothing, or half a handshake, is dropped when it runs out. The request headers then get the
+//! timeout again, as on a plain connection. A failed handshake (a plain-HTTP request, an old
+//! TLS version, a client that does not trust the certificate) is logged at debug and closes
+//! the connection; the listener goes on.
+//!
 //! Shutdown is `axum::serve`'s: once `shutdown` resolves the listener is dropped, every
 //! connection is told to finish its request in progress and close, and the returned future
-//! resolves when the last connection task has ended.
+//! resolves when the last connection task has ended. A connection still in its handshake is
+//! dropped at once: it has no request in progress.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::time::Duration;
 
 use axum::extract::ConnectInfo;
+use axum::response::IntoResponse as _;
 use axum::Router;
 use hyper::body::Incoming;
 use hyper_util::rt::{TokioIo, TokioTimer};
+use tokio_rustls::TlsAcceptor;
 use tower::ServiceExt as _;
 
 /// Serve `app` on `listener` until `shutdown` resolves, then drain as `axum::serve`'s graceful
-/// shutdown does. Returns once every connection has ended.
+/// shutdown does. Returns once every connection has ended. With `tls`, every connection speaks
+/// TLS ([`crate::tls`]); without it, plain HTTP.
 pub(crate) async fn serve(
     listener: tokio::net::TcpListener,
     app: Router,
+    tls: Option<TlsAcceptor>,
     header_read_timeout: Duration,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) {
@@ -47,34 +61,45 @@ pub(crate) async fn serve(
             },
             () = &mut shutdown => break,
         };
-        let service = PeerService {
-            app: app.clone(),
-            peer,
-        };
+        let app = app.clone();
+        let tls = tls.clone();
         let mut stop = stop_rx.clone();
         let live = live_rx.clone();
         tokio::spawn(async move {
-            let mut builder = hyper::server::conn::http1::Builder::new();
-            builder
-                .timer(TokioTimer::new())
-                .header_read_timeout(header_read_timeout);
-            let conn = builder
-                .serve_connection(TokioIo::new(stream), service)
-                .with_upgrades();
-            tokio::pin!(conn);
-            let mut stopping = false;
-            loop {
-                tokio::select! {
-                    res = conn.as_mut() => {
-                        if let Err(e) = res {
-                            tracing::trace!(error = %e, "connection ended with an error");
-                        }
-                        break;
-                    }
-                    _ = stop.changed(), if !stopping => {
-                        stopping = true;
-                        conn.as_mut().graceful_shutdown();
-                    }
+            // Facts about the connection that each request carries go into `PeerService`:
+            // the peer address and whether the connection is TLS. What the TLS handshake
+            // learns about the peer would be taken from `stream` here, once the handshake is
+            // done.
+            let service = PeerService {
+                app,
+                peer,
+                tls: tls.is_some(),
+            };
+            match tls {
+                None => serve_connection(stream, service, header_read_timeout, &mut stop).await,
+                Some(acceptor) => {
+                    let handshake =
+                        tokio::time::timeout(header_read_timeout, acceptor.accept(stream));
+                    let stream = tokio::select! {
+                        res = handshake => match res {
+                            Ok(Ok(stream)) => stream,
+                            Ok(Err(e)) => {
+                                tracing::debug!(%peer, error = %e, "TLS handshake failed");
+                                return;
+                            }
+                            Err(_) => {
+                                tracing::debug!(
+                                    %peer,
+                                    "TLS handshake not done within the header-read timeout"
+                                );
+                                return;
+                            }
+                        },
+                        // Shutting down: a connection still in its handshake has no request
+                        // to finish.
+                        _ = stop.changed() => return,
+                    };
+                    serve_connection(stream, service, header_read_timeout, &mut stop).await;
                 }
             }
             drop(live);
@@ -84,6 +109,41 @@ pub(crate) async fn serve(
     drop(stop_tx);
     drop(live_rx);
     live_tx.closed().await;
+}
+
+/// Serve one connection with hyper's HTTP/1 server until it ends; once `stop` changes (or its
+/// sender is dropped), finish the request in progress and close.
+async fn serve_connection<S>(
+    stream: S,
+    service: PeerService,
+    header_read_timeout: Duration,
+    stop: &mut tokio::sync::watch::Receiver<()>,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let mut builder = hyper::server::conn::http1::Builder::new();
+    builder
+        .timer(TokioTimer::new())
+        .header_read_timeout(header_read_timeout);
+    let conn = builder
+        .serve_connection(TokioIo::new(stream), service)
+        .with_upgrades();
+    tokio::pin!(conn);
+    let mut stopping = false;
+    loop {
+        tokio::select! {
+            res = conn.as_mut() => {
+                if let Err(e) = res {
+                    tracing::trace!(error = %e, "connection ended with an error");
+                }
+                break;
+            }
+            _ = stop.changed(), if !stopping => {
+                stopping = true;
+                conn.as_mut().graceful_shutdown();
+            }
+        }
+    }
 }
 
 /// What `axum::serve` does with a failed accept: a per-connection error is skipped, anything
@@ -101,11 +161,19 @@ async fn accept_error(e: std::io::Error) {
     tokio::time::sleep(Duration::from_secs(1)).await;
 }
 
-/// The router as a hyper service of one connection, adding the peer address to each request.
+/// Put into each request that came over a TLS connection of this accept loop. A router built
+/// over a state with `[server.tls]` refuses requests without it ([`require_tls`]), so that it
+/// is never served as plain HTTP by a loop that does not speak TLS.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ServedOverTls;
+
+/// The router as a hyper service of one connection, adding the peer address (and, on a TLS
+/// connection, [`ServedOverTls`]) to each request.
 #[derive(Clone)]
 struct PeerService {
     app: Router,
     peer: SocketAddr,
+    tls: bool,
 }
 
 impl hyper::service::Service<hyper::Request<Incoming>> for PeerService {
@@ -116,8 +184,38 @@ impl hyper::service::Service<hyper::Request<Incoming>> for PeerService {
     fn call(&self, req: hyper::Request<Incoming>) -> Self::Future {
         let mut req = req.map(axum::body::Body::new);
         req.extensions_mut().insert(ConnectInfo(self.peer));
+        if self.tls {
+            req.extensions_mut().insert(ServedOverTls);
+        }
         self.app.clone().oneshot(req)
     }
+}
+
+/// Middleware of the main router when `[server.tls]` is set: a request that did not come over
+/// a TLS connection of [`serve`] is answered `500` with an empty body and logged as an error.
+/// This catches a router served by something other than [`crate::run`] (such as
+/// [`crate::serve_until`], which never speaks TLS) while discovery and DPoP name `https://`
+/// URLs: fail closed rather than take tokens in cleartext.
+pub(crate) async fn require_tls(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if req.extensions().get::<ServedOverTls>().is_some() {
+        return next.run(req).await;
+    }
+    // An error once per process, so a misconfigured embedder does not flood the log; every
+    // later refusal at debug.
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::debug!("a request reached the main router without TLS; refused with 500");
+    } else {
+        tracing::error!(
+            "a request reached the main router without TLS although [server.tls] is set; \
+             serve the router with attenuo_server::run or serve, not serve_until or another \
+             server. Every such request is refused with 500 (logged at debug from now on)"
+        );
+    }
+    axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
 }
 
 #[cfg(test)]
@@ -140,9 +238,15 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-        let task = tokio::spawn(serve(listener, app, header_read_timeout, async move {
-            let _ = rx.await;
-        }));
+        let task = tokio::spawn(serve(
+            listener,
+            app,
+            None,
+            header_read_timeout,
+            async move {
+                let _ = rx.await;
+            },
+        ));
         (addr, tx, task)
     }
 
