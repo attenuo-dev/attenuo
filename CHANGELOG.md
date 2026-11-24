@@ -8,6 +8,10 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-24
+
+0.2.0 was tagged but never released: its container image build failed, so there is no GitHub release and no image for it. 0.2.1 is the first release with everything listed under 0.2.0, plus the entries below. The upgrade from 0.1.0 is the one in the [0.2.0 upgrade notes](docs/release/0.2.0.md#upgrade-from-010).
+
 ### Added
 
 - Admin console: a **Reload** page ([guide](docs/guides/admin-console.md#reload)). It reloads the admin operators, the agents and PEPs (`allow_empty`, `allow_mismatch`) and the issuer keys (`allow_drop_current`, `allow_drop_audit_key`, `allow_mismatch`), each after a confirmation that says what the reload does, with every option off until you tick it. It shows what the server answered: names, counts, digests and key ids added, removed or changed, what needs a restart, warnings, and a link to the audit record. A refusal (a 4xx answer) shows the server's code and message, and nothing changes. When the server cannot be reached or answers 5xx, the console says the outcome is unknown and that the audit log shows whether the reload happened. While a reload runs its confirmation cannot be dismissed, and only one reload of a kind runs at a time. The policy reload on the Policy page now has the same confirmation and result. The buttons need the `admin` role; on a console listener without `[admin_ui] allow_write` they are not shown.
@@ -20,6 +24,8 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 - Release workflow: the image job may run for 180 minutes, not 60. The arm64 image builds under emulation and passed the old limit at v0.2.0, so the image for that tag was not built.
 
 ## [0.2.0] - 2026-11-22
+
+The tag v0.2.0 exists, but there is no GitHub release and no container image for it: the image build failed. Its changes were first released in 0.2.1.
 
 ### Highlights
 
@@ -742,6 +748,7 @@ The injection-suite figures in the docs come from synthetic, model-free cases wr
 - RFC-0001 section 7 now says what the audit log implements today (hash over `(seq, prev_hash, record)`, no automatic checkpoints, no `kind` field) next to the design target.
 - Documentation site: the `docs/` tree is built with mdBook (`book.toml`, `docs/SUMMARY.md`) and deployed to GitHub Pages by `.github/workflows/docs.yml` (mdBook 0.4.52, pinned). New concept pages in `docs/concepts/` (delegation chain, capabilities and attenuation, leases and revocation, audit log, enforcement points) and reference pages in `docs/reference/` (CLI commands, config keys, HTTP endpoints). Links from `docs/` to files outside it are now absolute GitHub URLs. Preview steps are in CONTRIBUTING.md.
 
-[Unreleased]: https://github.com/attenuo-dev/attenuo/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/attenuo-dev/attenuo/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/attenuo-dev/attenuo/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/attenuo-dev/attenuo/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/attenuo-dev/attenuo/releases/tag/v0.1.0

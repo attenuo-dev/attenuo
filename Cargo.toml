@@ -15,7 +15,7 @@ members = [
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/attenuo-dev/attenuo"
@@ -23,11 +23,11 @@ homepage = "https://github.com/attenuo-dev/attenuo"
 rust-version = "1.89"
 
 [workspace.dependencies]
-attenuo-core = { version = "0.2.0", path = "crates/attenuo-core" }
-attenuo-token = { version = "0.2.0", path = "crates/attenuo-token" }
-attenuo-policy = { version = "0.2.0", path = "crates/attenuo-policy" }
-attenuo-audit = { version = "0.2.0", path = "crates/attenuo-audit" }
-attenuo-proxy = { version = "0.2.0", path = "crates/attenuo-proxy" }
+attenuo-core = { version = "0.2.1", path = "crates/attenuo-core" }
+attenuo-token = { version = "0.2.1", path = "crates/attenuo-token" }
+attenuo-policy = { version = "0.2.1", path = "crates/attenuo-policy" }
+attenuo-audit = { version = "0.2.1", path = "crates/attenuo-audit" }
+attenuo-proxy = { version = "0.2.1", path = "crates/attenuo-proxy" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }

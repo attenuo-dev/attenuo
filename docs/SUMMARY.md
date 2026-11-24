@@ -136,6 +136,7 @@
 - [Numbers](numbers.md)
 - [FAQ](faq.md)
 - [Comparison with alternatives](comparison.md)
+- [Release 0.2.1](release/0.2.1.md)
 - [Release 0.2.0](release/0.2.0.md)
 - [Release 0.1.0](release/0.1.0.md)
 - [Changelog](project/changelog.md)

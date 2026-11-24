@@ -9,7 +9,7 @@
 #
 # The checksum protects against a damaged or incomplete download. It comes from the same
 # release as the archive, so it does not protect against a release that was replaced; the
-# container image is signed with cosign for that (docs/release/0.2.0.md).
+# container image is signed with cosign for that (docs/release/0.2.1.md).
 #
 # Environment:
 #   ATTENUO_VERSION      release tag to install, for example v0.1.0 (default: the latest release)
