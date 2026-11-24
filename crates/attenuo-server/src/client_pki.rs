@@ -44,6 +44,7 @@
 //!   already passed (or failed on its names) for the same CA file and name is answered from
 //!   it, while the answer still holds.
 
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 
@@ -67,6 +68,9 @@ const LOGGED_NAME_CHARS: usize = 256;
 /// Most answers one connection keeps ([`PerConnection`]): one per CA file and name it was
 /// checked against, the oldest dropped first.
 const CACHED_ANSWERS: usize = 8;
+/// Most certificates whose state the forwarding listener keeps ([`SharedStates`]), the oldest
+/// dropped first.
+const SHARED_STATES: usize = 256;
 /// The refusals that depend on nothing but the certificate's names, once its path was
 /// accepted: true at any later time, so kept for the connection.
 const NAME_REFUSALS: [&str; 2] = ["uri_san_count", "san_mismatch"];
@@ -397,6 +401,84 @@ impl PerConnection {
         self.cache
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+}
+
+/// The [`PerConnection`] states of the forwarding listener (`[server.forwarded_client_cert]`),
+/// where every request carries its certificate anew and one proxy connection carries many
+/// clients' requests.
+///
+/// A request gets the state kept for exactly its certificate and the intermediates kept of it
+/// (the key is a SHA-256 over their DER bytes, each with its length), or a new one. So the
+/// cache holds the answers a native connection keeps, under the same rules
+/// ([`PerConnection`]: per CA file `Arc` and name, an accepted path only within its dates and
+/// from the time it was checked, a name refusal kept, no other refusal kept), shared only by
+/// requests whose certificates are byte for byte the same. A certificate with more than
+/// [`MAX_INTERMEDIATES`](crate::client_cert::MAX_INTERMEDIATES) intermediates gets a state of
+/// its own, which caches nothing. At most [`SHARED_STATES`] states, the oldest dropped first:
+/// a flood of new certificates only makes the check run again.
+pub(crate) struct SharedStates {
+    inner: Mutex<SharedInner>,
+}
+
+#[derive(Default)]
+struct SharedInner {
+    states: HashMap<[u8; 32], Arc<PerConnection>>,
+    /// The keys of `states`, oldest first.
+    order: VecDeque<[u8; 32]>,
+}
+
+impl std::fmt::Debug for SharedStates {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedStates").finish_non_exhaustive()
+    }
+}
+
+impl SharedStates {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: Mutex::new(SharedInner::default()),
+        }
+    }
+
+    /// The state for the certificate `leaf` with the intermediates kept of it (`None` when it
+    /// came with too many).
+    pub(crate) fn state(
+        &self,
+        leaf: &[u8],
+        intermediates: Option<&[CertificateDer<'_>]>,
+    ) -> Arc<PerConnection> {
+        let Some(kept) = intermediates else {
+            return Arc::new(PerConnection::new(leaf, None));
+        };
+        let mut h = Sha256::new();
+        for der in std::iter::once(leaf).chain(kept.iter().map(|c| c.as_ref())) {
+            h.update((der.len() as u64).to_be_bytes());
+            h.update(der);
+        }
+        let key: [u8; 32] = h.finalize().into();
+        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(state) = inner.states.get(&key) {
+            return state.clone();
+        }
+        let state = Arc::new(PerConnection::new(leaf, Some(kept)));
+        if inner.states.len() >= SHARED_STATES {
+            if let Some(oldest) = inner.order.pop_front() {
+                inner.states.remove(&oldest);
+            }
+        }
+        inner.states.insert(key, state.clone());
+        inner.order.push_back(key);
+        state
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .states
             .len()
     }
 }
@@ -1172,6 +1254,156 @@ mod tests {
             assert!(verify(&pki, &cert, at(NOW)).is_err());
         }
         assert!(cert.pki_state().cached_answers() <= CACHED_ANSWERS);
+    }
+
+    /// The forwarding listener's shared states answer only while true, as a connection's
+    /// cache does, with a new certificate (as a new request makes) each time.
+    #[test]
+    fn shared_states_answer_only_while_true() {
+        let root = Authority::new("root", None);
+        let pki = root.pki(san_uri(CODER).unwrap());
+        let leaf = root.issue(|p| p.subject_alt_names = vec![uri(CODER)]);
+        let shared = SharedStates::new();
+        let req = |leaf: &CertificateDer<'static>, chain: &[CertificateDer<'static>]| {
+            ClientCertificate::forwarded(leaf.clone(), chain, &shared)
+        };
+        assert_eq!(verify(&pki, &req(&leaf, &[]), at(NOW)), Ok(()));
+        assert_eq!(req(&leaf, &[]).pki_state().cached_answers(), 1);
+        assert_eq!(verify(&pki, &req(&leaf, &[]), at(NOW + 3600)), Ok(()));
+        let r = verify(&pki, &req(&leaf, &[]), at(NOW + 3601)).unwrap_err();
+        assert_eq!(r.reason, "certificate_expired");
+        let r = verify(&pki, &req(&leaf, &[]), at(NOW - 3601)).unwrap_err();
+        assert_eq!(r.reason, "certificate_not_yet_valid");
+        assert_eq!(verify(&pki, &req(&leaf, &[]), at(NOW)), Ok(()));
+
+        // Not yet valid is not a lasting refusal.
+        let early = root.issue(|p| {
+            p.subject_alt_names = vec![uri(CODER)];
+            p.not_before = at(NOW + 10);
+        });
+        let r = verify(&pki, &req(&early, &[]), at(NOW)).unwrap_err();
+        assert_eq!(r.reason, "certificate_not_yet_valid");
+        assert_eq!(req(&early, &[]).pki_state().cached_answers(), 0);
+        assert_eq!(verify(&pki, &req(&early, &[]), at(NOW + 10)), Ok(()));
+
+        // An intermediate that expires before the client's certificate ends the answer.
+        let mid = Authority::new("mid", Some(&root));
+        let long = mid.issue(|p| {
+            p.subject_alt_names = vec![uri(CODER)];
+            p.not_after = at(NOW + 3 * 86_400);
+        });
+        let chain = [mid.cert.der().clone()];
+        assert_eq!(verify(&pki, &req(&long, &chain), at(NOW)), Ok(()));
+        assert_eq!(verify(&pki, &req(&long, &chain), at(NOW + 86_400)), Ok(()));
+        let r = verify(&pki, &req(&long, &chain), at(NOW + 86_401)).unwrap_err();
+        assert_eq!(r.reason, "certificate_expired");
+        // The same certificate without its intermediate has a state of its own: the accepted
+        // path of the chain is not its answer.
+        let alone = req(&long, &[]);
+        assert!(!std::ptr::eq(
+            alone.pki_state(),
+            req(&long, &chain).pki_state()
+        ));
+        assert_eq!(
+            verify(&pki, &alone, at(NOW)).unwrap_err().reason,
+            "chain_invalid"
+        );
+        assert_eq!(verify(&pki, &req(&long, &chain), at(NOW)), Ok(()));
+    }
+
+    /// A shared answer is for one CA file and one name, as a connection's is.
+    #[test]
+    fn shared_states_never_carry_an_answer_to_another_ca_or_name() {
+        let root = Authority::new("root", None);
+        let other = Authority::new("other", None);
+        let a = root.pki(san_uri(CODER).unwrap());
+        let leaf = root.issue(|p| p.subject_alt_names = vec![uri(CODER)]);
+        let shared = SharedStates::new();
+        let req = || ClientCertificate::forwarded(leaf.clone(), &[], &shared);
+        assert_eq!(verify(&a, &req(), at(NOW)), Ok(()));
+        let b = Pki {
+            ca_path: a.ca_path.clone(),
+            ca: a.ca.clone(),
+            name: san_uri("spiffe://example.org/ns/agents/sa/reviewer").unwrap(),
+        };
+        assert_eq!(
+            verify(&b, &req(), at(NOW)).unwrap_err().reason,
+            "san_mismatch"
+        );
+        assert_eq!(
+            verify(&b, &req(), at(NOW)).unwrap_err().reason,
+            "san_mismatch"
+        );
+        assert_eq!(verify(&a, &req(), at(NOW)), Ok(()));
+        // A reload that puts another CA in the file, and one that changes only the name.
+        let reloaded = Pki {
+            ca_path: a.ca_path.clone(),
+            ca: other.pki(san_uri(CODER).unwrap()).ca,
+            name: a.name.clone(),
+        };
+        assert_eq!(
+            verify(&reloaded, &req(), at(NOW)).unwrap_err().reason,
+            "chain_invalid"
+        );
+        let renamed = Pki {
+            ca_path: a.ca_path.clone(),
+            ca: a.ca.clone(),
+            name: san_dns("coder.agents").unwrap(),
+        };
+        assert_eq!(
+            verify(&renamed, &req(), at(NOW)).unwrap_err().reason,
+            "san_mismatch"
+        );
+        // The same file read again: a new `Arc`, checked again, accepted again.
+        let same = root.pki(san_uri(CODER).unwrap());
+        assert!(!Arc::ptr_eq(&same.ca, &a.ca));
+        assert_eq!(verify(&same, &req(), at(NOW)), Ok(()));
+        assert!(req().pki_state().cached_answers() <= CACHED_ANSWERS);
+    }
+
+    /// At most [`SHARED_STATES`] states, the oldest dropped first; a certificate with too many
+    /// intermediates is never kept; many requests at once for one certificate share one state.
+    #[test]
+    fn shared_states_are_bounded_and_shared_safely() {
+        let shared = SharedStates::new();
+        let first = shared.state(b"cert 0", Some(&[]));
+        assert!(Arc::ptr_eq(&first, &shared.state(b"cert 0", Some(&[]))));
+        for i in 1..SHARED_STATES + 10 {
+            shared.state(format!("cert {i}").as_bytes(), Some(&[]));
+        }
+        assert_eq!(shared.len(), SHARED_STATES);
+        assert!(!Arc::ptr_eq(&first, &shared.state(b"cert 0", Some(&[]))));
+        // The key holds every certificate's length: moving bytes between the leaf and an
+        // intermediate is another key.
+        let ab = shared.state(b"ab", Some(&[CertificateDer::from(&b"c"[..])]));
+        let a_bc = shared.state(b"a", Some(&[CertificateDer::from(&b"bc"[..])]));
+        assert!(!Arc::ptr_eq(&ab, &a_bc));
+        let before = shared.len();
+        let too_many = shared.state(b"cert 0", None);
+        assert!(!Arc::ptr_eq(&too_many, &shared.state(b"cert 0", None)));
+        assert_eq!(shared.len(), before);
+
+        let root = Authority::new("root", None);
+        let pki = Arc::new(root.pki(san_uri(CODER).unwrap()));
+        let leaf = root.issue(|p| p.subject_alt_names = vec![uri(CODER)]);
+        let shared = Arc::new(SharedStates::new());
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let (shared, pki, leaf) = (shared.clone(), pki.clone(), leaf.clone());
+                std::thread::spawn(move || {
+                    for _ in 0..25 {
+                        let cert = ClientCertificate::forwarded(leaf.clone(), &[], &shared);
+                        assert_eq!(verify(&pki, &cert, at(NOW)), Ok(()));
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let cert = ClientCertificate::forwarded(leaf, &[], &shared);
+        assert_eq!(cert.pki_state().cached_answers(), 1);
+        assert_eq!(shared.len(), 1);
     }
 
     /// rustls-webpki does not read the client certificate's `keyUsage`: one without

@@ -73,7 +73,8 @@ pub(crate) struct Limits {
     request_timeout: Duration,
     /// `POST /token`, per authenticated agent.
     pub(crate) token: Option<RateLimiter>,
-    /// `POST /token` that authenticated no agent, per peer address.
+    /// `POST /token` that authenticated no agent, per peer address (on the forwarding
+    /// listener, one key per proxy address, apart from that address's key elsewhere).
     pub(crate) token_peer: Option<RateLimiter>,
     /// `/mcp/{server}`, per run.
     pub(crate) mcp: Option<RateLimiter>,
@@ -630,6 +631,7 @@ impl http_body::Body for Deadlined {
 pub(crate) struct CallerMark {
     authenticated: Arc<AtomicBool>,
     on_full_table: bool,
+    certificate_only: bool,
 }
 
 impl CallerMark {
@@ -648,6 +650,15 @@ impl CallerMark {
     /// credentials and no actor token ([`refuse_on_full_table`]).
     pub(crate) fn on_full_table(&self) -> bool {
         self.on_full_table
+    }
+
+    /// The request came in on the forwarding listener with a forwarded certificate while the
+    /// listener's bucket is over its limit: it runs only so that the certificate may
+    /// authenticate an agent, and is refused `429` afterwards if it does not. The handler
+    /// refuses it at once unless the certificate and a client id are its only credentials
+    /// ([`refuse_unless_certificate_only`]).
+    pub(crate) fn certificate_only(&self) -> bool {
+        self.certificate_only
     }
 }
 
@@ -684,6 +695,26 @@ pub(crate) fn refuse_on_full_table(
     Ok(())
 }
 
+/// For the `POST /token` handler, before any work: a request marked
+/// [`CallerMark::certificate_only`] goes on only when its credentials are a client id and the
+/// forwarded certificate (`certificate_only`): no secret, no client assertion, no Basic
+/// credentials and no actor token. A secret or an assertion could be guessed, and an actor
+/// token may need a JWKS fetch; a certificate's key was proven to the proxy. The refusal
+/// returned here is replaced by [`token_peer_limit`] with the counted one.
+///
+/// # Errors
+///
+/// `429` `rate_limited`.
+pub(crate) fn refuse_unless_certificate_only(
+    mark: Option<&CallerMark>,
+    certificate_only: bool,
+) -> Result<(), ApiError> {
+    if mark.is_some_and(CallerMark::certificate_only) && !certificate_only {
+        return Err(peer_refusal(1));
+    }
+    Ok(())
+}
+
 /// The key of a peer address: the address itself for IPv4 (and IPv4-mapped IPv6), the /64 for
 /// IPv6, since one host commonly holds a whole /64. `unknown` when the request came without
 /// one (a router driven without the server's accept loop).
@@ -715,6 +746,19 @@ pub(crate) fn peer_key(peer: Option<SocketAddr>) -> String {
 /// credentials authenticate. If it authenticated an agent it is answered as usual and not
 /// counted here; if not, its answer is replaced by the same `429` it would have got up front,
 /// counted as `table_full`, so a failed authentication learns nothing past the refusal.
+///
+/// On the `[server.forwarded_client_cert]` listener every peer address is the proxy's, and
+/// attenuo cannot tell the clients behind it apart. There the requests that authenticate no
+/// agent count in one bucket per proxy address (the key `forwarded:<address>`, apart from that
+/// address's key on the other listeners), as when the proxy pointed at the main listener.
+/// Once that bucket is over its limit, a request is refused up front as usual, except one
+/// that carries a forwarded certificate: it runs with [`CallerMark::certificate_only`] set,
+/// goes on only if a client id and the certificate are its only credentials
+/// ([`refuse_unless_certificate_only`]), and is answered `429` afterwards if it authenticated
+/// no agent. So guessing secrets through the proxy is limited, a made-up certificate earns
+/// nothing, and a flood of failing requests cannot lock out the agents that authenticate by
+/// certificate. Agents that authenticate by secret behind the proxy share the bucket, as
+/// before. The proxy should still limit by client address.
 pub(crate) async fn token_peer_limit(
     State(limits): State<Arc<Limits>>,
     mut req: Request,
@@ -724,15 +768,28 @@ pub(crate) async fn token_peer_limit(
         req.extensions_mut().insert(CallerMark::default());
         return next.run(req).await;
     };
+    let forwarded = req
+        .extensions()
+        .get::<crate::listen::ServedForwarded>()
+        .is_some();
+    let has_cert = req
+        .extensions()
+        .get::<crate::client_cert::ClientCertificate>()
+        .is_some();
     let peer = req
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|c| c.0);
-    let key = peer_key(peer);
+    let key = if forwarded {
+        format!("forwarded:{}", peer_key(peer))
+    } else {
+        peer_key(peer)
+    };
     let verdict = limiter.peek(&key, Instant::now());
-    let on_full_table = match verdict {
-        Verdict::Admit => false,
-        Verdict::Full { .. } => true,
+    let (on_full_table, certificate_only) = match verdict {
+        Verdict::Admit => (false, false),
+        Verdict::Full { .. } => (true, false),
+        Verdict::Limited { .. } if forwarded && has_cert => (false, true),
         Verdict::Limited { .. } => {
             let retry = limits.refused(RateLimitedBy::TokenUnauthenticated, &verdict);
             tracing::debug!("token request refused: the peer is over its unauthenticated limit");
@@ -742,17 +799,21 @@ pub(crate) async fn token_peer_limit(
     let mark = CallerMark {
         authenticated: Arc::default(),
         on_full_table,
+        certificate_only,
     };
     req.extensions_mut().insert(mark.clone());
     let resp = next.run(req).await;
-    if on_full_table && !mark.authenticated() {
+    if (on_full_table || certificate_only) && !mark.authenticated() {
         let retry = limits.refused(RateLimitedBy::TokenUnauthenticated, &verdict);
         tracing::debug!(
-            "token request refused: the peer table is full and the request authenticated no agent"
+            on_full_table,
+            certificate_only,
+            "token request refused: the peer table is full or the forwarding listener is over \
+             its limit, and the request authenticated no agent"
         );
         return peer_refusal(retry).into_response();
     }
-    if !mark.authenticated() {
+    if !mark.authenticated() && !certificate_only {
         let now = Instant::now();
         // Not counted when the table filled up meanwhile: the request has run already, and
         // the next one from this peer is refused by the `peek` above.
@@ -772,6 +833,20 @@ mod tests {
     use super::*;
 
     const W: Duration = Duration::from_secs(60);
+
+    /// Over the forwarding listener's limit, only a request whose credentials are a client
+    /// id and the forwarded certificate goes on; without the mark nothing is refused here.
+    #[test]
+    fn over_the_forwarding_limit_only_a_certificate_alone_goes_on() {
+        let mark = CallerMark {
+            certificate_only: true,
+            ..CallerMark::default()
+        };
+        assert!(refuse_unless_certificate_only(Some(&mark), true).is_ok());
+        assert!(refuse_unless_certificate_only(Some(&mark), false).is_err());
+        assert!(refuse_unless_certificate_only(Some(&CallerMark::default()), false).is_ok());
+        assert!(refuse_unless_certificate_only(None, false).is_ok());
+    }
 
     /// A limit of N admits N in a window, refuses the N+1st (and every later one, uncounted),
     /// and admits N again once the window has ended.

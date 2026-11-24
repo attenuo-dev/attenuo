@@ -94,3 +94,7 @@ Chosen option: "a CA file per entry and exactly one SAN, URI or DNS", because it
 Not done here: subject DN, IP and e-mail names; CRL files; CAs from a SPIFFE bundle endpoint; certificate-bound tokens (`cnf.x5t#S256`); forwarded certificate headers; CLI and SDK support.
 
 Related: ADR-0018, the TLS listener; ADR-0019, self-signed certificates, whose request rules this follows.
+
+### Update 2026-11-24: forwarded certificates
+
+The decision above stands. A CA-issued certificate can now also come from a trusted proxy, with its intermediates in `Client-Cert-Chain` (at most 4, as here), through `[server.forwarded_client_cert]` ([ADR-0021](0021-forwarded-client-certificates.md)). The checks are the same. The answer cache is kept per request there, not per connection, since one proxy connection carries many clients.

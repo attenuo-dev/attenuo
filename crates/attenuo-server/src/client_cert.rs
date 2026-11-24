@@ -1,11 +1,14 @@
-//! The client certificate of a TLS connection, as every request on that connection carries it.
+//! The client certificate of a request: from attenuo's own TLS handshake, or forwarded by a
+//! trusted reverse proxy.
 //!
 //! The accept loop ([`crate::listen`]) takes the end-entity certificate the client sent in its
 //! TLS handshake (proven by [`crate::client_cert_verifier::AnyClientCert`]) and puts a
-//! [`ClientCertificate`] into the extensions of each request of the connection. Nothing else
-//! sets it: no header is ever read for it (`Client-Cert`, `X-Forwarded-Client-Cert` and the
-//! like are ignored). Client authentication ([`crate::clientauth`]) decides per request whether
-//! it authenticates anyone.
+//! [`ClientCertificate`] into the extensions of each request of the connection. On the
+//! `[server.forwarded_client_cert]` listener, and only there, [`crate::forwarded::headers`]
+//! makes one per request from the RFC 9440 `Client-Cert` and `Client-Cert-Chain` headers
+//! instead ([`CertSource::Forwarded`]). Nothing else sets it: `X-Forwarded-Client-Cert` and
+//! the like are never read. Client authentication ([`crate::clientauth`]) decides per request
+//! whether it authenticates anyone, the same way for both sources.
 
 use std::sync::{Arc, OnceLock};
 
@@ -24,28 +27,52 @@ use time::OffsetDateTime;
 /// keeps.
 pub(crate) const MAX_INTERMEDIATES: usize = 4;
 
-/// The end-entity certificate the client proved it holds the key of, with its SHA-256
-/// thumbprint, and the other certificates the client sent after it (the intermediates, for
-/// the CA check of `tls_client_auth`). Cheap to clone: one per connection, shared by its
-/// requests.
+/// Where a [`ClientCertificate`] came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CertSource {
+    /// attenuo's own TLS handshake, which proved that the client holds the key.
+    Tls,
+    /// The `Client-Cert` header from a proxy in `[server.forwarded_client_cert]
+    /// trusted_peers`. attenuo saw no proof of possession: it trusts the proxy to have
+    /// checked the handshake.
+    Forwarded,
+}
+
+impl CertSource {
+    /// `source` in the audit record and in log lines: `"tls"` or `"forwarded"`.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            CertSource::Tls => "tls",
+            CertSource::Forwarded => "forwarded",
+        }
+    }
+}
+
+/// The end-entity certificate of the client, with its SHA-256 thumbprint, the other
+/// certificates the client sent after it (the intermediates, for the CA check of
+/// `tls_client_auth`), and where it came from. Cheap to clone: one per TLS connection,
+/// shared by its requests, or one per request on the forwarding listener.
 #[derive(Clone)]
 pub(crate) struct ClientCertificate(Arc<Inner>);
 
 struct Inner {
     der: CertificateDer<'static>,
+    source: CertSource,
     sha256: [u8; 32],
     /// The certificates after the first that can help a path, in the order the client sent
     /// them ([`crate::client_pki::useful_intermediates`]); `None` when it sent more than
     /// [`MAX_INTERMEDIATES`].
     intermediates: Option<Vec<CertificateDer<'static>>>,
-    /// The CA check's names and answers for this connection.
-    pki: crate::client_pki::PerConnection,
+    /// The CA check's names and answers for this connection (for a forwarded certificate,
+    /// shared with the requests that forward the same certificate and intermediates).
+    pki: Arc<crate::client_pki::PerConnection>,
 }
 
 impl std::fmt::Debug for ClientCertificate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("ClientCertificate")
             .field(&self.x5t_s256())
+            .field(&self.0.source)
             .finish()
     }
 }
@@ -80,33 +107,79 @@ impl ClientCertificate {
     /// The certificate `der`, with no intermediates.
     #[cfg(test)]
     pub(crate) fn new(der: CertificateDer<'static>) -> Self {
-        Self::with_intermediates(der, Some(Vec::new()))
+        Self::with_intermediates(der, Some(Vec::new()), CertSource::Tls)
     }
 
     /// The certificates the client sent in its TLS handshake, its own first: `None` when it
     /// sent none.
     pub(crate) fn from_handshake(chain: &[CertificateDer<'_>]) -> Option<Self> {
         let (leaf, rest) = chain.split_first()?;
+        Some(Self::from_chain(
+            leaf.clone().into_owned(),
+            rest,
+            CertSource::Tls,
+        ))
+    }
+
+    /// The certificate `leaf` and the certificates sent after it, from `source`. The
+    /// intermediates are kept as for a handshake: those that can help a path
+    /// ([`crate::client_pki::useful_intermediates`]), none when more than
+    /// [`MAX_INTERMEDIATES`] were sent.
+    pub(crate) fn from_chain(
+        leaf: CertificateDer<'static>,
+        rest: &[CertificateDer<'_>],
+        source: CertSource,
+    ) -> Self {
         let intermediates = (rest.len() <= MAX_INTERMEDIATES)
             .then(|| crate::client_pki::useful_intermediates(leaf.as_ref(), rest));
-        Some(Self::with_intermediates(
-            leaf.clone().into_owned(),
-            intermediates,
-        ))
+        Self::with_intermediates(leaf, intermediates, source)
+    }
+
+    /// A certificate from the forwarding listener: as [`Self::from_chain`] with source
+    /// [`CertSource::Forwarded`], with the CA check's state from `shared`, so that requests
+    /// forwarding the same certificate and intermediates share its answers.
+    pub(crate) fn forwarded(
+        leaf: CertificateDer<'static>,
+        rest: &[CertificateDer<'_>],
+        shared: &crate::client_pki::SharedStates,
+    ) -> Self {
+        let intermediates = (rest.len() <= MAX_INTERMEDIATES)
+            .then(|| crate::client_pki::useful_intermediates(leaf.as_ref(), rest));
+        let pki = shared.state(leaf.as_ref(), intermediates.as_deref());
+        Self::with_state(leaf, intermediates, CertSource::Forwarded, pki)
     }
 
     fn with_intermediates(
         der: CertificateDer<'static>,
         intermediates: Option<Vec<CertificateDer<'static>>>,
+        source: CertSource,
+    ) -> Self {
+        let pki = Arc::new(crate::client_pki::PerConnection::new(
+            der.as_ref(),
+            intermediates.as_deref(),
+        ));
+        Self::with_state(der, intermediates, source, pki)
+    }
+
+    fn with_state(
+        der: CertificateDer<'static>,
+        intermediates: Option<Vec<CertificateDer<'static>>>,
+        source: CertSource,
+        pki: Arc<crate::client_pki::PerConnection>,
     ) -> Self {
         let sha256 = Sha256::digest(der.as_ref()).into();
-        let pki = crate::client_pki::PerConnection::new(der.as_ref(), intermediates.as_deref());
         Self(Arc::new(Inner {
             der,
+            source,
             sha256,
             intermediates,
             pki,
         }))
+    }
+
+    /// Where the certificate came from.
+    pub(crate) fn source(&self) -> CertSource {
+        self.0.source
     }
 
     /// The end-entity certificate's DER bytes.
@@ -136,9 +209,10 @@ impl ClientCertificate {
     }
 
     /// The member an audit record of a request authenticated by this certificate carries in its
-    /// digested arguments: `{"x5t#S256": ..., "source": "tls"}`.
+    /// digested arguments: `{"x5t#S256": ..., "source": "tls"}`, or `"forwarded"` for a
+    /// certificate from the forwarding listener.
     pub(crate) fn audit_value(&self) -> serde_json::Value {
-        serde_json::json!({ "x5t#S256": self.x5t_s256(), "source": "tls" })
+        serde_json::json!({ "x5t#S256": self.x5t_s256(), "source": self.0.source.as_str() })
     }
 
     /// Whether the certificate is usable as a client certificate at `now`, as rustls-webpki

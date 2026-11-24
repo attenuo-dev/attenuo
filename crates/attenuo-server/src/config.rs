@@ -520,6 +520,30 @@ pub struct ServerSection {
     /// always speak plain HTTP.
     #[serde(default)]
     pub tls: Option<ServerTlsSection>,
+    /// `[server.forwarded_client_cert]`: a listener of its own that takes TLS client
+    /// certificates a trusted reverse proxy forwards in the RFC 9440 `Client-Cert` and
+    /// `Client-Cert-Chain` headers. Unset by default: the headers are never read.
+    #[serde(default)]
+    pub forwarded_client_cert: Option<ForwardedClientCertSection>,
+}
+
+/// `[server.forwarded_client_cert]`: where the forwarding listener binds and which proxies may
+/// connect to it ([ADR-0021](../../docs/decisions/0021-forwarded-client-certificates.md)).
+///
+/// The listener speaks plain HTTP (the proxy ended TLS) and serves the routes of the main
+/// listener except `/admin/*`. It reads `Client-Cert` and `Client-Cert-Chain` only from
+/// connections whose TCP peer is in `trusted_peers`; every other peer gets `403`. With this
+/// section set, any other listener refuses a request with either header (`400`). Read at
+/// startup only, never from environment overrides.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForwardedClientCertSection {
+    /// Address to bind. Required. Not the address of `[server] listen`, `[admin] listen`, the
+    /// console or the metrics listener.
+    pub listen: SocketAddr,
+    /// The proxy's IP addresses or CIDRs (`127.0.0.1`, `10.0.3.0/24`, `fd00::/64`). Required,
+    /// not empty, at most 64 entries, none wider than `/8`, no unspecified address.
+    pub trusted_peers: Vec<String>,
 }
 
 /// `[server.tls]`: the certificate and private key of the main listener (`[server] listen`).
@@ -567,6 +591,12 @@ impl ServerSection {
         self.tls
             .as_ref()
             .is_some_and(|t| t.client_certificates == ClientCertificates::Optional)
+    }
+
+    /// Whether any listener takes client certificates: the main listener asks for them
+    /// ([`Self::asks_for_client_certificates`]), or `[server.forwarded_client_cert]` is set.
+    pub fn takes_client_certificates(&self) -> bool {
+        self.asks_for_client_certificates() || self.forwarded_client_cert.is_some()
     }
 }
 
@@ -718,6 +748,7 @@ impl Default for ServerSection {
             public_url: None,
             allow_insecure_http: false,
             tls: None,
+            forwarded_client_cert: None,
         }
     }
 }
@@ -5496,6 +5527,7 @@ mod tests {
             public_url: Some(url.into()),
             allow_insecure_http: insecure,
             tls: None,
+            forwarded_client_cert: None,
         };
         for ok in [
             "https://attenuo.example.com",
@@ -5608,6 +5640,7 @@ mod tests {
             public_url: url.map(Into::into),
             allow_insecure_http: insecure,
             tls: tls.clone(),
+            forwarded_client_cert: None,
         };
         at("0.0.0.0:8443", Some("https://attenuo.example.com"), false)
             .check_public_url()

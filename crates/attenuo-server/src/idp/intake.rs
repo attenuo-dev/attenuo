@@ -170,6 +170,11 @@ pub(crate) async fn handle(
         .and_then(|c| c.get("x5t#S256"))
         .and_then(Value::as_str)
         .map(str::to_owned);
+    let client_source = client_cert
+        .as_ref()
+        .and_then(|c| c.get("source"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     // A client assertion authenticates this one request, whatever its outcome: its `jti` is
     // recorded now (`crate::clientauth`), unlike the actor token and the IdP credential, which
     // are recorded together once the root token is issued. The rate limit and a DPoP proof
@@ -405,6 +410,7 @@ pub(crate) async fn handle(
         agent = ?agent,
         agent_auth,
         client_cert_x5t_s256 = client_x5t.as_deref(),
+        client_cert_source = client_source.as_deref(),
         lease = %issued.lease.0,
         // Only when `[idps.id_jag_ceiling]` was applied: which claims narrowed the root grant
         // and what they said, as the IdP signed them, capped and Debug-formatted (SR-126).

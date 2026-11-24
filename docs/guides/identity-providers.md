@@ -163,7 +163,7 @@ Whoever controls the URL controls the agent's identity at attenuo, so serve it f
 
 An agent or a PEP can also prove who it is with a self-signed TLS client certificate (RFC 8705 `self_signed_tls_client_auth`). The server keeps only the certificate's SHA-256 thumbprint. The client keeps the private key.
 
-This works only when the client connects to attenuo's own TLS listener. A proxy that ends TLS in front of attenuo hides the certificate. Use a direct connection or a TCP (layer 4) pass-through. See [TLS in attenuo itself](deploying.md#tls-in-attenuo-itself).
+This works when the client connects to attenuo's own TLS listener: directly, or through a TCP (layer 4) pass-through. See [TLS in attenuo itself](deploying.md#tls-in-attenuo-itself). A proxy that ends TLS in front of attenuo hides the certificate, unless it forwards it in the `Client-Cert` header to a listener set aside for that ([behind a TLS-terminating proxy](#behind-a-tls-terminating-proxy)).
 
 **1. Make a key and a certificate.** The certificate must not be a CA certificate, and its extended key usage must allow client authentication. A plain `openssl req -x509` makes a CA certificate, which attenuo refuses, so add the two `-addext` lines:
 
@@ -339,6 +339,20 @@ Notes:
 - A CA you list can make a certificate for any name. List a CA only on the entries it should vouch for.
 
 The full rules are in the [config reference](../reference/config.md#tls-client-certificates-from-a-ca).
+
+### Behind a TLS-terminating proxy
+
+When TLS must end at a reverse proxy, the proxy can check the client's certificate and forward it to attenuo in the RFC 9440 headers `Client-Cert` and `Client-Cert-Chain`. Set `[server.forwarded_client_cert]` with a `listen` of its own and the proxy's addresses in `trusted_peers`, and point the proxy's backend there. The entries are the same: `tls_client_cert_sha256`, or `tls_client_ca_pem_path` with a name. The client does the same as above, against the proxy's URL.
+
+What is different:
+
+- attenuo sees no handshake. It trusts the proxy to have checked that the client holds the key. The proxy must remove any `Client-Cert` and `Client-Cert-Chain` the client sent and set them only from its own handshake.
+- Anyone who can connect to the forwarding listener from a listed address can claim any certificate. Bind it where only the proxy reaches it.
+- Every other listener refuses those headers with `400` while the section is set. So a client that sends them to the main listener fails at once.
+- The audit records say `"source": "forwarded"` in `client_cert`; `actor_auth` and `agent_auth` are the same as on the native listener.
+- With HAProxy, which sends no chain, put the intermediate CA in the entry's CA file.
+
+The setup, the fences, and a tested HAProxy recipe are in [forwarded client certificates](deploying.md#forwarded-client-certificates).
 
 ## `[[root_grants]]`
 

@@ -147,6 +147,10 @@ pub struct AppState {
     /// `[server.tls]`: the TLS configuration of the main listener, read at startup
     /// ([`crate::tls`]); `None` for plain HTTP. [`crate::run`] serves `[server] listen` with it.
     pub(crate) main_tls: Option<Arc<rustls::ServerConfig>>,
+    /// `[server.forwarded_client_cert]`, checked at startup ([`crate::forwarded`]); `None`
+    /// when the section is absent. [`crate::run`] serves its listener, and every router
+    /// refuses the `Client-Cert` headers anywhere else.
+    pub(crate) forwarded: Option<crate::forwarded::Settings>,
     /// The thread that keeps the DPoP liveness marker ahead of the clock; `None` for
     /// `:memory:`. Its drop runs before the single-writer fence below is released: it closes
     /// the marker, so no `Dpop` still held elsewhere (a router, a request) can move the
@@ -195,6 +199,7 @@ impl AppState {
             .map(crate::tls::server_config)
             .transpose()?;
         config.admin.check_listen(config.server.listen)?;
+        let forwarded = crate::forwarded::Settings::from_config(config)?;
         config
             .dev
             .check(config.admin.api_listen(config.server.listen))?;
@@ -450,6 +455,7 @@ impl AppState {
                 metrics_for_limits,
             )),
             main_tls,
+            forwarded,
             dpop_heartbeat,
             store_fence,
             released: tokio::sync::watch::Sender::new(()),

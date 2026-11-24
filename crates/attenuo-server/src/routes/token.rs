@@ -130,13 +130,25 @@ pub async fn exchange(
     // A request from a new address on a full per-peer table goes on only to authenticate an
     // agent with client credentials (SR-109, `crate::limits::refuse_on_full_table`): a secret,
     // an assertion, or a client id on a connection with a client certificate.
+    let present = |k: &str| value.get(k).is_some_and(|v| !v.is_null());
+    let basic = || clientauth::basic_credentials(&headers).is_ok_and(|b| b.is_some());
     if mark.as_ref().is_some_and(CallerMark::on_full_table) {
-        let present = |k: &str| value.get(k).is_some_and(|v| !v.is_null());
         let client = present("client_secret")
             || present("client_assertion")
-            || clientauth::basic_credentials(&headers).is_ok_and(|b| b.is_some())
+            || basic()
             || (present("client_id") && cert.is_some());
         crate::limits::refuse_on_full_table(mark.as_ref(), client, present("actor_token"))?;
+    }
+    // On the forwarding listener over its limit, only a forwarded certificate with a client
+    // id, and no other credential, goes on (`crate::limits::refuse_unless_certificate_only`).
+    if mark.as_ref().is_some_and(CallerMark::certificate_only) {
+        let only = cert.is_some()
+            && present("client_id")
+            && !present("client_secret")
+            && !present("client_assertion")
+            && !present("actor_token")
+            && !basic();
+        crate::limits::refuse_unless_certificate_only(mark.as_ref(), only)?;
     }
     let now = state.now();
     if crate::idp::intake::is_intake(&value) {
@@ -651,6 +663,11 @@ fn exchange_verified(
         .and_then(|c| c.get("x5t#S256"))
         .and_then(Value::as_str)
         .map(str::to_owned);
+    let client_source = client_cert
+        .as_ref()
+        .and_then(|c| c.get("source"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     if let Some(c) = client_cert {
         args["client_cert"] = c;
     }
@@ -669,6 +686,7 @@ fn exchange_verified(
         actor_auth,
         actor_subject = ?actor.map(|(v, _)| v.subject.as_str()),
         client_cert_x5t_s256 = client_x5t.as_deref(),
+        client_cert_source = client_source.as_deref(),
         lease = %resp.lease.0,
         depth = issued.chain.depth(),
         dpop_bound,

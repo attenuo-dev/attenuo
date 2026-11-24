@@ -64,6 +64,10 @@ cert_pem_path = "server.crt"
 key_pem_path = "server.key"
 client_certificates = "optional"
 
+[server.forwarded_client_cert]
+listen = "127.0.0.1:8444"
+trusted_peers = ["127.0.0.1/32"]
+
 [issuer]
 private_key_pem_path = "issuer.pem"
 previous_key_paths = ["old.pem"]
