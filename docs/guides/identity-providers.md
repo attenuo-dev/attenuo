@@ -221,7 +221,7 @@ ATTENUO_TOKEN="$ID_TOKEN" attenuo --server https://attenuo.example.com:8443 \
 
 The CLI sends the certificate only to the origin of `--server`, never to an `--admin-server` or a `--jwks` URL on another origin, and it reads the key file once. It needs an `https://` `--server`. One exception: through an `https://` proxy (`HTTPS_PROXY=https://...`), the proxy is offered the certificate too if it asks for one, and its own certificate must chain to `--tls-ca-cert`. It sends no `client_id` when you pass an actor token (see the notes below). The CLI has no PEP mode, so it does not send `pep_id`.
 
-The Python and TypeScript SDKs take the same three files, with the same rules. The certificate goes only to the origin of the server URL, and `exchange` without a secret, a client assertion or an actor token sends `client_id` and no secret:
+The Python and TypeScript SDKs take the same three files. The certificate goes only to the origin of the server URL, and `exchange` without a secret, a client assertion or an actor token sends `client_id` and no secret. The proxy exception is different: Python reaches an `https://` proxy with httpx's default roots and never offers it the client certificate, and the TypeScript options use no proxy at all.
 
 ```python
 from attenuo import Client

@@ -112,3 +112,7 @@ The decision above stands. The `attenuo` CLI can now present a client certificat
 ### Update 2026-11-24: certificates from a CA
 
 The decision above stands. The first item of "Not done here" is now done for SAN URI (with SPIFFE IDs) and SAN DNS: `tls_client_ca_pem_path` with `tls_client_auth_san_uri` or `tls_client_auth_san_dns` (RFC 8705 `tls_client_auth`, [ADR-0020](0020-pki-tls-client-auth.md)). An entry uses pins or a CA, not both. The listener now also keeps the certificates the client sends after its own (at most 4), for the CA check; the self-signed check still ignores them.
+
+### Update 2026-11-24: SDK client certificates
+
+The decision above stands. The Python and TypeScript SDKs can now present a client certificate: `tls_client_cert` and `tls_client_key` (TypeScript: `tlsClientCert` and `tlsClientKey`) go to the origin of the server URL only, and `exchange` then sends `client_id` with no secret ([identity providers](../guides/identity-providers.md#tls-client-certificates)). They read no `ATTENUO_TLS_*` variable and have no PEP mode.
