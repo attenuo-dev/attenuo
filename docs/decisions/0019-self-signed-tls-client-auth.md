@@ -47,6 +47,8 @@ Chosen option: "self-signed certificates pinned by SHA-256, trust decided per re
 - `[token] actor_auth` treats the certificate like the other client credentials: accepted under `"secret"` and `"either"` (with an actor token too, both are checked), refused under `"actor_token"` with `client_auth_not_accepted`.
 - Audit. The method is `self_signed_tls_client_auth`, or `actor_token+self_signed_tls_client_auth`, in `agent_auth` / `actor_auth`. Records of requests authenticated this way carry `client_cert` = `{"x5t#S256": "<base64url>", "source": "tls"}` in their digested arguments. Other records are unchanged. No `SCHEMA_VERSION` change.
 - Reload. Thumbprints are part of an entry: a change shows under `changed`, and the canonical form behind each list's `sha256` gets one more member, only in the rows of entries that have thumbprints. A list without them keeps its digest.
+- Environment overrides. No `[server.tls]` key, `client_certificates` included, can be set from `ATTENUO__...` variables, also when the file has the section, as for `[dev]`: every TLS setting is in the reviewed file.
+- A batch (`POST /access/v1/evaluations`) checks the certificate once per request and `pep_id`, and its entries reuse the result, as a client assertion is checked once for the request. A refusal refuses the whole request, so it is never reused.
 - Discovery. attenuo publishes no OAuth authorization server metadata, so there is no `token_endpoint_auth_methods_supported` to extend. It never advertises `tls_client_certificate_bound_access_tokens`.
 
 ### Consequences
@@ -59,13 +61,14 @@ Chosen option: "self-signed certificates pinned by SHA-256, trust decided per re
 - Bad, because the issued tokens are bearer or DPoP-bound, not bound to the certificate (no `cnf.x5t#S256`). The certificate proves who asked for a token, not who uses it.
 - Bad, because the `attenuo` CLI and the SDKs cannot present a client certificate yet, and the Helm chart and the image's health check do not support `[server.tls]` (ADR-0018).
 - Bad, because a plain `openssl req -x509` certificate has `CA:TRUE` and is refused. The guide gives the `-addext` lines that make a usable one.
+- Bad, because with `"optional"` a client can send up to 64 KiB of certificate data, which the server keeps for the life of the connection.
 - Neutral, because with `"optional"` every client is asked for a certificate. A client that has none answers with an empty certificate message and goes on.
-- Neutral, because a certificate on the connection makes `client_id` a client credential. Under `actor_auth = "actor_token"`, a request with an actor token and a `client_id` over such a connection is refused; the client leaves `client_id` out.
+- Neutral, because a certificate on the connection makes `client_id` a client credential, also next to an actor token. Under `actor_auth = "actor_token"`, a request with an actor token and a `client_id` over such a connection is refused (`client_auth_not_accepted`). Under `"either"` both are checked, so a certificate that is not pinned for that `client_id` refuses the request (`client_authentication_failed`) even when the actor token is good. The fix for the client: leave `client_id` out, or present no certificate.
 
 ### Confirmation
 
 - `crates/attenuo-server/tests/mtls.rs`: real TLS 1.3 handshakes through `attenuo_server::run`. An agent at hop 0 and at an exchange, and a PEP on the AuthZEN endpoints (with and without a bearer), authenticate with their certificates; a rotation with two thumbprints. One answer for an unknown thumbprint, A's certificate with B's id, a certificate for an entry with a secret only, an unknown id and a PEP's certificate used as an agent. No certificate is `client_auth_missing`. A certificate sent with a handshake signed by another key fails the handshake. A wrong secret next to a pinned certificate is refused. Expired, not-yet-valid, CA and server-only certificates are refused like an unknown one. `"off"` never asks for a certificate, and pins with `"off"` or without `[server.tls]` stop `build`. Forwarded-certificate headers change nothing. Each `actor_auth` mode. A reload that removes and adds a thumbprint, on open connections. SR-109 from many loopback addresses. The audit digests with and without `client_cert`. Discovery. A plain server, unchanged.
-- Unit tests in `client_cert_verifier.rs`, `client_cert.rs`, `clientauth.rs` (the config rules, the comparisons, the list digest and changes), `tls.rs` and `config.rs`.
+- Unit tests in `client_cert_verifier.rs`, `client_cert.rs`, `clientauth.rs` (the config rules, the comparisons, the list digest and changes), `tls.rs`, `config.rs`, `config/overrides.rs` (no `[server.tls]` key from the environment) and `routes/authzen.rs` (a batch checks a certificate once per `pep_id`).
 
 ## Pros and Cons of the Options
 

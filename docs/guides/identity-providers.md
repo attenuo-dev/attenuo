@@ -216,6 +216,7 @@ Notes:
 
 - `"optional"` means the server asks every client for a certificate but never requires one. Clients without one still connect and use a secret or a key.
 - If a request carries a secret or a client assertion too, that one decides. The certificate is then ignored.
+- A certificate on the connection makes `client_id` a credential, also next to an actor token. With an actor token, send no `client_id`, or present no certificate: otherwise the certificate is checked too, and a certificate that is not pinned for that id refuses the request (`client_authentication_failed` under `[token] actor_auth = "either"`, `client_auth_not_accepted` under `"actor_token"`).
 - The certificate's dates are checked on every request. An expired certificate stops working without a reload, so renew it in time.
 - There is no CRL or OCSP check. To revoke a certificate, remove its thumbprint and reload.
 - Tokens issued this way are bearer tokens (or DPoP-bound, if the client sends a DPoP proof). They are not bound to the certificate.

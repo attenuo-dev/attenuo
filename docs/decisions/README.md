@@ -58,6 +58,6 @@ Only the `status` and `date` fields and the More Information section of an accep
 | [0016](0016-admin-operators.md) | Admin operators: named admin bearer tokens stored as SHA-256 digests, three fixed roles checked from one route table, and the operator recorded as the actor | proposed |
 | [0017](0017-private-key-jwt.md) | Client authentication with `private_key_jwt`: public keys inline in `[[agents]]` and `[[peps]]`, `aud` fixed to the issuer identifier, and every assertion used once | proposed |
 | [0018](0018-native-tls-listener.md) | Native TLS on the main listener: optional `[server.tls]`, TLS 1.3 only, read at start, no client certificates yet | proposed |
-| [0019](0019-self-signed-tls-client-auth.md) | Self-signed TLS client certificates for agents and PEPs, pinned by SHA-256 thumbprint, the trust decision made per request | proposed |
+| [0019](0019-self-signed-tls-client-auth.md) | Client certificates on the ADR-0018 TLS listener: `client_certificates = "optional"`, self-signed certificates for agents and PEPs pinned by SHA-256 thumbprint, the trust decision made per request | proposed |
 
 Add a row for each new ADR.

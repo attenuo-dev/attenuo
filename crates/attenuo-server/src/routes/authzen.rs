@@ -293,7 +293,7 @@ fn evaluate_batch(
             state,
             &clients.peps,
             &peps.fetched,
-            peps.cert.as_ref(),
+            &peps.cert,
             headers,
             &mut raw,
         )?;
@@ -301,7 +301,7 @@ fn evaluate_batch(
             state,
             &clients.peps,
             headers,
-            peps.cert.as_ref(),
+            &peps.cert,
             bearer.as_ref(),
             pep.as_deref(),
             raw,
@@ -314,7 +314,7 @@ fn evaluate_batch(
         state,
         &clients.peps,
         &peps.fetched,
-        peps.cert.as_ref(),
+        &peps.cert,
         headers,
         &mut raw,
     )?;
@@ -343,7 +343,7 @@ fn evaluate_batch(
             state,
             &clients.peps,
             headers,
-            peps.cert.as_ref(),
+            &peps.cert,
             bearer.as_ref(),
             pep.as_deref(),
             Value::Object(merged),
@@ -594,7 +594,7 @@ fn search_actions(
         state,
         &clients.peps,
         &peps.fetched,
-        peps.cert.as_ref(),
+        &peps.cert,
         headers,
         &mut raw,
     )?;
@@ -602,7 +602,7 @@ fn search_actions(
         state,
         &clients.peps,
         headers,
-        peps.cert.as_ref(),
+        &peps.cert,
         bearer.as_ref(),
         pep.as_deref(),
         raw,
@@ -831,7 +831,7 @@ fn evaluate(
         state,
         &clients.peps,
         &peps.fetched,
-        peps.cert.as_ref(),
+        &peps.cert,
         headers,
         &mut value,
     )?;
@@ -839,7 +839,7 @@ fn evaluate(
         state,
         &clients.peps,
         headers,
-        peps.cert.as_ref(),
+        &peps.cert,
         bearer.as_ref(),
         pep.as_deref(),
         value,
@@ -855,7 +855,7 @@ fn pep_assertion(
     state: &AppState,
     peps: &clientauth::Clients,
     fetched: &clientauth::FetchedKey,
-    cert: Option<&ClientCertificate>,
+    cert: &ConnCert,
     headers: &HeaderMap,
     body: &mut Value,
 ) -> Result<Option<String>, ApiError> {
@@ -873,7 +873,7 @@ fn pep_assertion(
         field("pep_secret"),
         Some(&assertion),
         fetched,
-        cert,
+        cert.get(),
         now,
     )?;
     pep.commit(&state.replay, now).map(Some)
@@ -887,7 +887,55 @@ struct PepKeys {
     clients: Arc<clientauth::ClientSets>,
     fetched: clientauth::FetchedKey,
     /// Set by the accept loop only ([`crate::listen`]), never from a header.
+    cert: ConnCert,
+}
+
+/// The TLS client certificate of an AuthZEN request's connection, and the PEP ids it has
+/// authenticated during this request. A batch's entries share one request: the first entry
+/// that authenticates a `pep_id` by the certificate makes the check (a thumbprint compare,
+/// and a webpki check and a signature verification in [`ClientCertificate::check_usable`]),
+/// and later entries with the same `pep_id` reuse its result. A refusal is not kept: it
+/// refuses the whole request (401), so no later entry is decided. One request takes one
+/// snapshot of the lists ([`PepKeys`]), so the result cannot go stale within it.
+pub(crate) struct ConnCert {
     cert: Option<ClientCertificate>,
+    authenticated: std::sync::Mutex<Vec<String>>,
+}
+
+impl ConnCert {
+    pub(crate) fn new(cert: Option<ClientCertificate>) -> Self {
+        Self {
+            cert,
+            authenticated: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    pub(crate) fn get(&self) -> Option<&ClientCertificate> {
+        self.cert.as_ref()
+    }
+
+    /// The PEP `pep_id`, authenticated by `check` the first time this request asks for it
+    /// and taken from the earlier result after that. `check` returns the id and whether it
+    /// authenticated by the certificate; only such a result is kept (the request's headers,
+    /// and so a Basic credential, are the same for every entry).
+    pub(crate) fn authenticate_once(
+        &self,
+        pep_id: &str,
+        check: impl FnOnce() -> Result<(String, bool), ApiError>,
+    ) -> Result<String, ApiError> {
+        let mut done = self
+            .authenticated
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if done.iter().any(|id| id == pep_id) {
+            return Ok(pep_id.to_owned());
+        }
+        let (id, by_cert) = check()?;
+        if by_cert && id == pep_id {
+            done.push(id.clone());
+        }
+        Ok(id)
+    }
 }
 
 impl PepKeys {
@@ -918,7 +966,7 @@ impl PepKeys {
         Self {
             clients,
             fetched,
-            cert,
+            cert: ConnCert::new(cert),
         }
     }
 }
@@ -999,11 +1047,12 @@ fn admit(
     state: &AppState,
     peps: &clientauth::Clients,
     headers: &HeaderMap,
-    cert: Option<&ClientCertificate>,
+    conn: &ConnCert,
     bearer: Option<&Bearer>,
     pep_by_assertion: Option<&str>,
     raw: Value,
 ) -> Result<Admitted, ApiError> {
+    let cert = conn.get();
     if raw.get("client_assertion").is_some() || raw.get("client_assertion_type").is_some() {
         // Only the request's top level may carry an assertion (see `pep_assertion`).
         return Err(clientauth::invalid_request(
@@ -1037,10 +1086,14 @@ fn admit(
                     peps.authenticate(headers, pep_id.as_deref(), Some(secret), None, cert, now)?
                         .commit(&state.replay, now)?,
                 ),
-                (None, None) if pep_id.is_some() && cert.is_some() => Some(
-                    peps.authenticate(headers, pep_id.as_deref(), None, None, cert, now)?
-                        .commit(&state.replay, now)?,
-                ),
+                (None, None) if pep_id.is_some() && cert.is_some() => Some(by_certificate(
+                    state,
+                    peps,
+                    headers,
+                    conn,
+                    pep_id.as_deref(),
+                    now,
+                )?),
                 (None, None) => None,
             };
             (None, pep.is_some())
@@ -1051,6 +1104,9 @@ fn admit(
             }
             let id = match pep_by_assertion {
                 Some(pep) => pep.to_owned(),
+                None if pep_secret.is_none() && pep_id.is_some() && cert.is_some() => {
+                    by_certificate(state, peps, headers, conn, pep_id.as_deref(), now)?
+                }
                 None => peps
                     .authenticate(
                         headers,
@@ -1091,12 +1147,35 @@ fn admit(
     })
 }
 
+/// A PEP that names itself with `pep_id` and sends no `pep_secret` and no assertion, over a
+/// connection with a TLS client certificate: authenticated as [`clientauth::Clients::authenticate`]
+/// decides (Basic credentials, if any, decide instead of the certificate), at most once per
+/// request and `pep_id` ([`ConnCert::authenticate_once`]).
+fn by_certificate(
+    state: &AppState,
+    peps: &clientauth::Clients,
+    headers: &HeaderMap,
+    conn: &ConnCert,
+    pep_id: Option<&str>,
+    now: time::OffsetDateTime,
+) -> Result<String, ApiError> {
+    let check = || {
+        let a = peps.authenticate(headers, pep_id, None, None, conn.get(), now)?;
+        let by_cert = a.client_cert_audit().is_some();
+        Ok((a.commit(&state.replay, now)?, by_cert))
+    };
+    match pep_id {
+        Some(id) => conn.authenticate_once(id, check),
+        None => check().map(|(id, _)| id),
+    }
+}
+
 /// Decide one evaluation: [`admit`], then the pipeline's decision.
 fn evaluate_value(
     state: &AppState,
     peps: &clientauth::Clients,
     headers: &HeaderMap,
-    cert: Option<&ClientCertificate>,
+    cert: &ConnCert,
     bearer: Option<&Bearer>,
     pep_by_assertion: Option<&str>,
     raw: Value,
@@ -1239,4 +1318,53 @@ pub(crate) fn attach_chain(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    /// A batch checks a PEP's certificate once per `pep_id`: later entries reuse the result. A
+    /// refusal, or an id that did not authenticate by the certificate, is not kept.
+    #[test]
+    fn a_certificate_is_checked_once_per_request_and_pep() {
+        let conn = ConnCert::new(None);
+        let calls = Cell::new(0);
+        let ok = |id: &str, by_cert: bool| {
+            calls.set(calls.get() + 1);
+            Ok((id.to_owned(), by_cert))
+        };
+        for _ in 0..5 {
+            assert_eq!(
+                conn.authenticate_once("gw", || ok("gw", true)).unwrap(),
+                "gw"
+            );
+        }
+        assert_eq!(calls.get(), 1);
+        // Another id makes its own check.
+        assert_eq!(
+            conn.authenticate_once("gw2", || ok("gw2", true)).unwrap(),
+            "gw2"
+        );
+        assert_eq!(
+            conn.authenticate_once("gw2", || ok("gw2", true)).unwrap(),
+            "gw2"
+        );
+        assert_eq!(calls.get(), 2);
+        // Not by the certificate (Basic decided): checked every time.
+        for _ in 0..3 {
+            conn.authenticate_once("basic", || ok("basic", false))
+                .unwrap();
+        }
+        assert_eq!(calls.get(), 5);
+        // A refusal is not kept: the next call checks again.
+        let refused = || -> Result<(String, bool), ApiError> {
+            calls.set(calls.get() + 1);
+            Err(ApiError::unauthorized("invalid_client", "no"))
+        };
+        assert!(conn.authenticate_once("bad", refused).is_err());
+        assert!(conn.authenticate_once("bad", refused).is_err());
+        assert_eq!(calls.get(), 7);
+    }
 }

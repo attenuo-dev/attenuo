@@ -660,6 +660,41 @@ async fn an_agent_authenticates_with_its_certificate() {
             true
         )
     );
+    // With an actor token and `client_id`, over a connection with a certificate that is not
+    // pinned for that id: the certificate is a presented client credential, so it is checked
+    // too, and fails. Leaving `client_id` out, or sending no certificate, uses the actor
+    // token alone.
+    let (root, lease) = h.root().await;
+    let with_token = |client_id: bool| {
+        let mut extra = json!({"actor_token": h.issuers.actor_token("coder"),
+                               "actor_token_type": JWT});
+        if client_id {
+            extra["client_id"] = "coder".into();
+        }
+        exchange_body(&root, "coder", extra)
+    };
+    let a = h.post(Some(&c.stranger), "/token", &with_token(true)).await;
+    assert_eq!(a.status, StatusCode::UNAUTHORIZED, "{}", a.body);
+    assert_eq!(a.code(), ("invalid_client", "client_authentication_failed"));
+    let a = h
+        .post(Some(&c.stranger), "/token", &with_token(false))
+        .await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert_eq!(
+        h.last_digest("token.exchange").await,
+        exchange_digest("coder", &lease, "actor_token", None, true)
+    );
+    let (root, _) = h.root().await;
+    let body = exchange_body(
+        &root,
+        "coder",
+        json!({"client_id": "coder", "actor_token": h.issuers.actor_token("coder"),
+               "actor_token_type": JWT}),
+    );
+    let a = h.post(None, "/token", &body).await;
+    // No certificate: `client_id` alone is no credential, so the actor token decides.
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+
     // An actor token for another agent than the certificate's: refused.
     let (root, _) = h.root().await;
     let a = h
@@ -724,6 +759,38 @@ async fn a_pep_authenticates_with_its_certificate() {
         .await;
     assert_eq!(a.status, StatusCode::OK, "{}", a.body);
     assert_eq!(a.body["evaluations"].as_array().unwrap().len(), 2);
+    // A larger batch (the certificate is checked once for the request, then reused): every
+    // entry is decided as a single evaluation is.
+    let single = h
+        .post(Some(&c.gateway), "/access/v1/evaluation", &body)
+        .await;
+    let mut batch = body.clone();
+    batch["evaluations"] = json!([{}, {}, {}, {}, {}, {}]);
+    let a = h
+        .post(Some(&c.gateway), "/access/v1/evaluations", &batch)
+        .await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    let entries = a.body["evaluations"].as_array().unwrap();
+    assert_eq!(entries.len(), 6);
+    for e in entries {
+        assert_eq!(e["decision"], single.body["decision"], "{e}");
+        assert_eq!(
+            e["context"]["reason"], single.body["context"]["reason"],
+            "{e}"
+        );
+    }
+    // An entry that names another PEP (one with a secret only) refuses the whole batch with
+    // the one answer, also after earlier entries passed with the certificate.
+    batch["evaluations"] = json!([{}, {}, {"pep_id": "pep-secret"}, {}]);
+    let refused = h
+        .post(Some(&c.gateway), "/access/v1/evaluations", &batch)
+        .await;
+    assert_eq!(refused.status, StatusCode::UNAUTHORIZED, "{}", refused.body);
+    assert_eq!(
+        refused.code(),
+        ("invalid_client", "client_authentication_failed")
+    );
+    assert!(refused.challenge.is_some());
 
     // Refused: no certificate, an agent's certificate, a PEP with a secret only.
     let a = h.post(None, "/access/v1/evaluation", &body).await;

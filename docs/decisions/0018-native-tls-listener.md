@@ -100,4 +100,4 @@ Related: ADR-0007 and ADR-0017, which set mTLS aside for lack of native TLS; ADR
 
 ### Update 2026-11-24: client certificates
 
-The decision above stands. The first item of "Not done here" is now done for self-signed certificates: with `[server.tls] client_certificates = "optional"` the listener asks for a client certificate, and `tls_client_cert_sha256` on `[[agents]]` and `[[peps]]` pins it ([ADR-0019](0019-self-signed-tls-client-auth.md)). The default, `"off"`, asks for none, as this ADR decided. Certificate-bound access tokens are still not done.
+The decision above stands. The first item of "Not done here" is now done for self-signed certificates: with `[server.tls] client_certificates = "optional"` the listener asks for a client certificate, and `tls_client_cert_sha256` on `[[agents]]` and `[[peps]]` pins it ([ADR-0019](0019-self-signed-tls-client-auth.md)). The default, `"off"`, asks for none, as this ADR decided. The rule that an environment override cannot create the section is made stricter: no key of `[server.tls]` can be set from the environment, also when the file has the section. Certificate-bound access tokens are still not done.

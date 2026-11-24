@@ -18,6 +18,9 @@
 //!   integer for an integer, a number for a float, the text as is for a string.
 //! - `[dev]` keys are refused: the unverified root mint is switched on in the file, where a
 //!   review sees it, or not at all.
+//! - `[server.tls]` keys are refused, also when the file has the section: the certificate, the
+//!   key and whether clients are asked for certificates are set in the file, where a review
+//!   sees them.
 //! - Anything else is an error that stops the server and names the variable, never its value:
 //!   an unknown key, a value of the wrong type, an empty value, two variables for one key, and
 //!   a variable that sets the same key as `ATTENUO_ADMIN_TOKEN` or `ATTENUO_LOG_FORMAT`.
@@ -173,6 +176,16 @@ fn resolve(schema: &Json, variable: &str) -> Result<Target, String> {
         return Err(
             "[dev] keys cannot be set from the environment: the development-only switches \
              are set in the config file, where a review sees them"
+                .into(),
+        );
+    }
+    if segments.len() >= 2
+        && segments[0].eq_ignore_ascii_case("server")
+        && segments[1].eq_ignore_ascii_case("tls")
+    {
+        return Err(
+            "[server.tls] keys cannot be set from the environment: the listener's TLS \
+             settings are set in the config file, where a review sees them"
                 .into(),
         );
     }
@@ -729,6 +742,39 @@ mod tests {
             &[("ATTENUO__DEV__ALLOW_ROOT_MINT", "false")]
         )
         .is_err());
+    }
+
+    #[test]
+    fn server_tls_keys_are_refused_even_when_the_file_has_the_section() {
+        const TLS: &str = "[server.tls]\ncert_pem_path = \"a.crt\"\nkey_pem_path = \"a.key\"\n";
+        for (file, var, value) in [
+            (TLS, "ATTENUO__SERVER__TLS__CLIENT_CERTIFICATES", "optional"),
+            (TLS, "ATTENUO__SERVER__TLS__CLIENT_CERTIFICATES", "off"),
+            (TLS, "ATTENUO__SERVER__TLS__CERT_PEM_PATH", "/tmp/b.crt"),
+            (TLS, "attenuo__server__tls__key_pem_path", "/tmp/b.key"),
+            (TLS, "ATTENUO__SERVER__TLS__NO_SUCH_KEY", "x"),
+            ("", "ATTENUO__SERVER__TLS__CERT_PEM_PATH", "/tmp/b.crt"),
+            ("", "ATTENUO__SERVER__TLS__CLIENT_CERTIFICATES", "optional"),
+        ] {
+            let e = refused(file, &[(var, value)]);
+            assert!(
+                e.contains(&format!(
+                    "{var}: [server.tls] keys cannot be set from the environment"
+                )),
+                "{e}"
+            );
+            assert!(!e.contains(value) || value == "x", "{e}");
+        }
+        // The other [server] keys still can be.
+        let (cfg, _) = load(
+            TLS,
+            &[("ATTENUO__SERVER__PUBLIC_URL", "https://attenuo.example")],
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.server.public_url.as_deref(),
+            Some("https://attenuo.example")
+        );
     }
 
     #[test]
