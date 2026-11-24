@@ -366,11 +366,13 @@ The rules are the same as the CLI's `--tls-*` options:
 - `tls_client_cert` and `tls_client_key` go together, and need an `https://` server URL; otherwise the client raises `ValueError` when it is made. The key must be unencrypted PEM (`PRIVATE KEY`, `EC PRIVATE KEY` or `RSA PRIVATE KEY`) and nothing else.
 - The certificate goes only to the origin (scheme, host and port) of the server URL. A request to any other origin uses a connection without it. The client follows no redirect, so the certificate cannot follow a `Location` either.
 - With a certificate, `exchange` without `client_secret`, `client_assertion` or `actor_token` sends `client_id` (the `client_id` you give, else the actor) and no secret, so the certificate authenticates the agent. With an actor token it sends no `client_id`, since the certificate would then count too.
-- The files are read once, when the client is made. A file that is not a regular file (a FIFO, a directory), is larger than 4 MiB (1 MiB for the certificate and key), is empty, or does not hold what its option needs is a `ValueError` that names the option and the path and never quotes the file. A CA or certificate file that holds a private key is refused. Python's `ssl` loads the certificate and key by path, so OpenSSL reads those two files a second time.
+- The files are read when the client is made. A file that is not a regular file (a FIFO, a directory), is larger than 4 MiB (1 MiB for the certificate and key), is empty, or does not hold what its option needs is a `ValueError` that names the option and the path and never quotes the file. A CA or certificate file that holds a private key is refused. Python's `ssl` loads a certificate and key by path only. On Linux the client hands it the bytes it checked, through memory files (`memfd_create`), so the files are not read again. On other systems OpenSSL reads the two client files a second time, after the checks.
 - `Client` and `AsyncClient` take all three. `AdminClient` and `AsyncAdminClient` take `tls_ca_cert` only: the admin API uses the admin token. The options cannot be used together with `transport`.
 - An `https://` proxy (`HTTPS_PROXY=https://...`) is reached with httpx's default trust and without the client certificate: the options apply to the attenuo server's connection, not the proxy's.
 
 The SDK does not read the CLI's `ATTENUO_TLS_*` environment variables; pass the paths yourself.
+
+On Python 3.13 and later the standard library's checks are stricter: a server certificate without an Authority Key Identifier is refused, and a CA-signed server certificate placed in the `tls_ca_cert` file is accepted as a trust anchor. So the same files can behave a little differently on older Python versions.
 
 ### Keeping a token alive
 

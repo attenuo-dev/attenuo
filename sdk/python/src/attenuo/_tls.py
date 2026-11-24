@@ -10,13 +10,16 @@ attenuo server's certificate, and the TLS client certificate it presents to the 
   server URL only: a request to any other origin goes through a second ``httpx`` client that
   has the CA but no certificate (:class:`HttpClient`, the one place that chooses). No client
   follows a redirect (SR-112), so the certificate is never carried to a ``Location`` either.
-- Each file is read once, when the client is made. Anything but a regular file (a FIFO, a
-  directory) is refused before it is read, and so is a file over the size limit. An error names
+- The files are read when the client is made (for the client files, see the end of this
+  text). Anything but a regular file (a FIFO, a directory) is refused before it is read, and so
+  is a file over the size limit. An error names
   the option and the path, never the file's content. A CA or certificate file that holds a
   private key is refused. ``repr`` shows paths only.
 
-The standard library loads a client certificate from paths only (``SSLContext.load_cert_chain``),
-so the two client files are read twice: once here, to check them, and once by OpenSSL.
+The standard library loads a client certificate from paths only (``SSLContext.load_cert_chain``).
+On Linux the checked bytes are handed to it through memory files (``memfd_create``), so OpenSSL
+never reads the files again. Elsewhere it is given the paths, and reads the two client files a
+second time, after the checks.
 """
 
 from __future__ import annotations
@@ -45,7 +48,8 @@ CA = "tls_ca_cert"
 CERT = "tls_client_cert"
 KEY = "tls_client_key"
 
-_BEGIN = re.compile(rb"^[ \t]*-----BEGIN ([^\r\n]*?)-----[ \t]*\r?$", re.M)
+# Any white space but a newline around the BEGIN line: OpenSSL accepts ``\f`` and ``\v`` too.
+_BEGIN = re.compile(rb"^[^\S\n]*-----BEGIN ([^\r\n]*?)-----[^\S\n]*$", re.M)
 _SUPPORTED_KEYS = (b"PRIVATE KEY", b"EC PRIVATE KEY", b"RSA PRIVATE KEY")
 
 
@@ -122,7 +126,14 @@ def _labels(data: bytearray) -> list[bytes]:
 
 
 def _has_private_key(data: bytearray) -> bool:
-    return any(label.endswith(b"PRIVATE KEY") for label in _labels(data))
+    """Any ``PRIVATE KEY-----`` counts, whatever the BEGIN line around it looks like, so no
+    spelling of the line gets a key past this check."""
+    return b"PRIVATE KEY-----" in data or any(lb.endswith(b"PRIVATE KEY") for lb in _labels(data))
+
+
+def _all_begins_read(data: bytearray) -> bool:
+    """Whether every ``-----BEGIN `` in ``data`` is a BEGIN line :func:`_labels` reads."""
+    return data.count(b"-----BEGIN ") == len(_labels(data))
 
 
 def _certificates(option: str, path: str, data: bytearray) -> list[bytes] | None:
@@ -156,7 +167,7 @@ def _ca(path: str) -> str:
     if _has_private_key(data):
         _wipe(data)
         raise ValueError(f"{CA} {path} holds a private key; it must hold only the CA certificates")
-    ders = _certificates(CA, path, data)
+    ders = _certificates(CA, path, data) if _all_begins_read(data) else None
     if ders is None:
         raise ValueError(f"{CA} {path} is not a readable PEM file")
     if not ders:
@@ -164,9 +175,10 @@ def _ca(path: str) -> str:
     return "".join(ssl.DER_cert_to_PEM_cert(d) for d in ders)
 
 
-def _check_client(cert: str, key: str) -> None:
+def _check_client(cert: str, key: str) -> tuple[str, bytearray]:
     """Check the ``tls_client_cert`` file (certificates only, the client's first) and the
-    ``tls_client_key`` file (exactly one unencrypted private key, nothing else)."""
+    ``tls_client_key`` file (exactly one unencrypted private key, nothing else). Returns the
+    certificates as PEM and the key file's bytes, which the caller wipes."""
     data = _read(CERT, cert, MAX_CLIENT_BYTES)
     if _has_private_key(data):
         _wipe(data)
@@ -176,12 +188,19 @@ def _check_client(cert: str, key: str) -> None:
         )
     ders = _certificates(CERT, cert, data)
     labels = _labels(data)
-    if ders is None or not ders or any(label != b"CERTIFICATE" for label in labels):
+    if (
+        ders is None
+        or not ders
+        or not _all_begins_read(data)
+        or any(label != b"CERTIFICATE" for label in labels)
+    ):
         raise ValueError(
             f"{CERT} {cert} must hold the client certificate in PEM (`BEGIN CERTIFICATE`) and "
             "nothing else"
         )
+    chain = "".join(ssl.DER_cert_to_PEM_cert(d) for d in ders)
     data = _read(KEY, key, MAX_CLIENT_BYTES)
+    ok = False
     try:
         labels = _labels(data)
         encrypted = b"ENCRYPTED" in data and (
@@ -199,13 +218,51 @@ def _check_client(cert: str, key: str) -> None:
                 "`BEGIN PRIVATE KEY` (PKCS#8), `BEGIN EC PRIVATE KEY` or `BEGIN RSA PRIVATE KEY`"
             )
         ends = len(re.findall(rb"-----END ", data))
-        if len(labels) != 1 or labels[0] not in _SUPPORTED_KEYS or ends != 1:
+        if (
+            len(labels) != 1
+            or labels[0] not in _SUPPORTED_KEYS
+            or ends != 1
+            or not _all_begins_read(data)
+        ):
             raise ValueError(
                 f"{KEY} {key} must hold exactly one unencrypted private key in PEM (`BEGIN "
                 "PRIVATE KEY`, `BEGIN EC PRIVATE KEY` or `BEGIN RSA PRIVATE KEY`) and nothing else"
             )
+        ok = True
+        return chain, data
     finally:
-        _wipe(data)
+        if not ok:
+            _wipe(data)
+
+
+def _before_load() -> None:
+    """Called between the checks and the load; tests use it to change the files there."""
+
+
+def _load_cert_chain(
+    ctx: ssl.SSLContext, chain: str, key: bytearray, cert: str, key_path: str
+) -> None:
+    """Load the checked certificates and key into ``ctx``. On Linux from memory files
+    (``memfd_create``) holding the bytes that were checked, so OpenSSL never reads the files
+    again; elsewhere, or when a memory file cannot be made, from the paths."""
+    fds: list[int] = []
+    try:
+        try:
+            if not hasattr(os, "memfd_create") or not os.path.isdir("/proc/self/fd"):
+                raise OSError
+            for data in (chain.encode("ascii"), key):
+                fd = os.memfd_create("attenuo-tls", os.MFD_CLOEXEC)
+                fds.append(fd)
+                view = memoryview(data)
+                while view:
+                    view = view[os.write(fd, view) :]
+            paths = [f"/proc/self/fd/{fd}" for fd in fds]
+        except OSError:
+            paths = [cert, key_path]
+        ctx.load_cert_chain(paths[0], paths[1], password=_no_password)
+    finally:
+        for fd in fds:
+            os.close(fd)
 
 
 def _context(cadata: str | None) -> ssl.SSLContext:
@@ -272,14 +329,17 @@ class TlsSettings:
         self._other = other
         self._server = other
         if self.client_cert is not None and self.client_key is not None:
-            _check_client(self.client_cert, self.client_key)
+            chain, key = _check_client(self.client_cert, self.client_key)
             server = _context(cadata)
             loaded = False
             try:
-                server.load_cert_chain(self.client_cert, self.client_key, password=_no_password)
+                _before_load()
+                _load_cert_chain(server, chain, key, self.client_cert, self.client_key)
                 loaded = True
             except (ssl.SSLError, OSError, _NoPassword, ValueError):
                 pass
+            finally:
+                _wipe(key)
             # Raised outside the handler, so no OpenSSL error is chained to it.
             if not loaded:
                 raise ValueError(

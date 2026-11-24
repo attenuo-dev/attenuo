@@ -5,9 +5,12 @@ Each test makes its certificates and starts its own HTTPS servers on ports the k
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import socket
 import sys
+import threading
 import warnings
 from pathlib import Path
 
@@ -413,3 +416,142 @@ def test_repr_shows_paths_and_no_key(tmp_path: Path, ca: Ca, client_cert: Client
         for text in (repr(tls), repr(c), repr(c._http), repr(vars(c))):
             no_key_bytes(text, client_cert)
         assert "planner.key" in repr(tls)
+
+
+# -- review follow-ups --
+
+
+@pytest.mark.skipif(not hasattr(os, "memfd_create"), reason="Linux memory files")
+def test_the_checked_bytes_are_loaded_not_the_files_again(
+    tmp_path: Path, ca: Ca, client_cert: ClientCert, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Between the checks and the load, the files are replaced by another pair (a key that
+    must be refused, then a FIFO): the client loads what it checked."""
+    from attenuo import _tls
+
+    ca_file = write(tmp_path / "ca.pem", ca.pem)
+    crt, key = client_cert.write(tmp_path, "planner")
+    other = ClientCert("other")
+
+    def swap() -> None:
+        crt.write_bytes(other.pem)
+        key.unlink()
+        os.mkfifo(key)  # a load by path would block here
+
+    monkeypatch.setattr(_tls, "_before_load", swap)
+    with tls_server(ca, tmp_path, client_ca=client_cert.pem) as server:
+        with Client(server.url, tls_ca_cert=ca_file, tls_client_cert=crt, tls_client_key=key) as c:
+            c._http.get("/healthz").raise_for_status()
+        assert server.seen[0]["peer_cert"] == client_cert.der
+
+
+@pytest.mark.parametrize("ws", ["\f", "\v"])
+def test_a_begin_line_with_other_white_space_hides_no_key(
+    tmp_path: Path, ca: Ca, client_cert: ClientCert, ws: str
+) -> None:
+    hidden_key = client_cert.key_pem.decode().replace(
+        "-----BEGIN PRIVATE KEY-----", f"-----BEGIN PRIVATE KEY-----{ws}"
+    )
+    hidden = write(tmp_path / "hidden.pem", client_cert.pem.decode() + hidden_key)
+    _, key = client_cert.write(tmp_path, "planner")
+    with pytest.raises(ValueError, match="holds a private key"):
+        Client("https://a.test", tls_ca_cert=hidden)
+    with pytest.raises(ValueError, match="holds a private key"):
+        Client("https://a.test", tls_client_cert=hidden, tls_client_key=key)
+    # Such a line in the key file is still read as the one key.
+    spaced = write(tmp_path / "spaced.key", hidden_key)
+    crt, _ = client_cert.write(tmp_path, "planner2")
+    Client("https://a.test", tls_client_cert=crt, tls_client_key=spaced).close()
+
+
+def test_a_begin_line_that_is_not_read_is_refused(tmp_path: Path, ca: Ca) -> None:
+    odd = write(
+        tmp_path / "odd.pem",
+        ca.pem + b"-----BEGIN CERTIFICATE-----junk\nAAAA\n-----END CERTIFICATE-----\n",
+    )
+    with pytest.raises(ValueError, match="is not a readable PEM file"):
+        Client("https://a.test", tls_ca_cert=odd)
+
+
+class ConnectProxy:
+    """A local HTTP CONNECT proxy that records the targets it tunnels to."""
+
+    def __init__(self) -> None:
+        self.targets: list[str] = []
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen()
+        self.thread = threading.Thread(target=self._serve, daemon=True)
+        self.thread.start()
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.sock.getsockname()[1]}"
+
+    def _serve(self) -> None:
+        while True:
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._tunnel, args=(conn,), daemon=True).start()
+
+    def _tunnel(self, conn: socket.socket) -> None:
+        head = b""
+        while b"\r\n\r\n" not in head:
+            chunk = conn.recv(4096)
+            if not chunk:
+                conn.close()
+                return
+            head += chunk
+        target = head.split(b" ")[1].decode()
+        self.targets.append(target)
+        host, port = target.rsplit(":", 1)
+        up = socket.create_connection((host, int(port)))
+        conn.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+
+        def pipe(a: socket.socket, b: socket.socket) -> None:
+            try:
+                while data := a.recv(65536):
+                    b.sendall(data)
+            except OSError:
+                pass
+            finally:
+                for s in (a, b):
+                    with contextlib.suppress(OSError):
+                        s.shutdown(socket.SHUT_RDWR)
+
+        threading.Thread(target=pipe, args=(up, conn), daemon=True).start()
+        pipe(conn, up)
+
+    def close(self) -> None:
+        self.sock.close()
+
+
+@pytest.mark.parametrize("var", ["HTTPS_PROXY", "ALL_PROXY"])
+def test_through_a_connect_proxy_only_the_server_tunnel_carries_the_certificate(
+    tmp_path: Path, ca: Ca, client_cert: ClientCert, monkeypatch: pytest.MonkeyPatch, var: str
+) -> None:
+    for name in ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    proxy = ConnectProxy()
+    monkeypatch.setenv(var, proxy.url)
+    ca_file = write(tmp_path / "ca.pem", ca.pem)
+    crt, key = client_cert.write(tmp_path, "planner")
+    try:
+        with (
+            tls_server(ca, tmp_path, client_ca=client_cert.pem) as server,
+            tls_server(ca, tmp_path, client_ca=client_cert.pem) as elsewhere,
+        ):
+            with Client(
+                server.url, tls_ca_cert=ca_file, tls_client_cert=crt, tls_client_key=key
+            ) as c:
+                c._http.get("/healthz").raise_for_status()
+                c._http.get(f"{elsewhere.url}/healthz").raise_for_status()
+            assert server.seen[0]["peer_cert"] == client_cert.der
+            assert elsewhere.seen[0]["peer_cert"] is None
+            # Both went through the proxy.
+            ports = {t.rsplit(":", 1)[1] for t in proxy.targets}
+            assert ports == {server.url.rsplit(":", 1)[1], elsewhere.url.rsplit(":", 1)[1]}
+    finally:
+        proxy.close()
