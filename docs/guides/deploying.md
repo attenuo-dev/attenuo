@@ -306,10 +306,10 @@ frontend attenuo_tls
     # Client-Cert-Chain is set: put the issuing CA itself in the agent's CA file.
     http-request set-header Client-Cert :%[ssl_c_der,base64]: if { ssl_c_used } { ssl_c_der -m found }
     # attenuo sees every client behind this proxy as one address, so limit /token per client
-    # address here: at most 300 requests a minute, then 429. Raise it for many agents behind
-    # one NAT address.
+    # address here: at most 300 requests a minute, then 429. An IPv6 client counts by its
+    # /64, as attenuo counts IPv6 peers. Raise it for many agents behind one NAT address.
     stick-table type ipv6 size 100k expire 60s store http_req_rate(60s)
-    http-request track-sc0 src if { path /token }
+    http-request track-sc0 src,ipmask(32,64) if { path /token }
     http-request deny deny_status 429 if { path /token } { sc_http_req_rate(0) gt 300 }
     default_backend attenuo_forwarding
 
@@ -333,7 +333,7 @@ Notes:
 
 - `verify optional` with `ca-ignore-err all crt-ignore-err all` passes on any certificate whose key the client proved, as attenuo's own listener does. attenuo then checks the pin, or the chain and name. To let only certificates from your CA through the proxy, use `verify optional ca-file <your CA>` without the two `ignore-err` options, and add `{ ssl_c_verify 0 }` to the condition; then pinned self-signed certificates do not pass. This variant was not run here.
 - **TLS session resumption.** HAProxy resumes TLS sessions by default (a session cache and TLS tickets), and a resumed session keeps the first handshake's client certificate without a new proof of the key, for as long as the session or ticket lives. attenuo's own listener does not resume sessions. The recipe turns resumption off, for the same behaviour: `tune.ssl.cachesize 0` in `global` and `no-tls-tickets` on the `bind` line (checked with HAProxy 2.8.30: with both, a second connection with the first one's session is a new handshake over TLS 1.2 and 1.3; without them, it is resumed and HAProxy forwards the first certificate).
-- **Per-address limit.** The recipe answers `/token` with `429` after 300 requests a minute from one client address (a stick table), since attenuo sees only the proxy's address. Raise it for many agents behind one NAT address.
+- **Per-address limit.** The recipe answers `/token` with `429` after 300 requests a minute from one client address (a stick table; an IPv6 client counts by its /64), since attenuo sees only the proxy's address. It counts every `/token` request, those of agents that authenticate too, and refused requests keep counting, so a client that keeps retrying stays refused until it slows down. Raise it for busy agents or many agents behind one address.
 - HAProxy cannot send the chain as an RFC 9440 list (`ssl_c_chain_der` is one blob), so it sends no `Client-Cert-Chain`. For a certificate from an intermediate CA, put the intermediate CA's certificate in the entry's `tls_client_ca_pem_path`. With only the root there, the check fails (`chain_invalid` in the debug log).
 - HAProxy's request buffer (`tune.bufsize`, 16 KiB by default) holds the whole request head, so it bounds the size of the client certificate it can forward. A certificate of a few KiB fits; raise `tune.bufsize` in `global` for larger ones.
 - **What was run.** `scripts/haproxy-forwarded-smoke.sh` (not part of CI) runs the file above as it is, with HAProxy 2.8.30 (Ubuntu 24.04) and `attenuo-server`, on 127.0.0.1, over HTTP/1.1 and over HTTP/2 to HAProxy. On 2026-11-24: `haproxy -c` valid with no warning; a pinned self-signed certificate and a certificate from an intermediate CA got tokens; a stranger's certificate with coder's id got `401 client_authentication_failed`; forged `Client-Cert` and `Client-Cert-Chain` headers from a client without a certificate got `401 client_auth_missing`, and from a client with the stranger's certificate `401 client_authentication_failed`; a forged, malformed `Client-Cert-Chain` next to a good certificate was removed (`200`); a direct request from `127.0.0.2` to the forwarding listener got `403`; the header on the main listener got `400`; no TLS 1.2 or 1.3 session was resumed; the 301st `/token` request of a minute from one address got HAProxy's `429`; the log named `client_cert_source="forwarded"`.
