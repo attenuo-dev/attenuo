@@ -1461,49 +1461,104 @@ async fn the_admin_api_is_not_on_the_forwarding_listener() {
 }
 
 /// `[limits] token_unauthenticated_requests_per_minute` on the forwarding listener: every
-/// peer there is the proxy, so the minute is counted per forwarded certificate, and requests
-/// without one are not counted (the proxy must limit those). Anonymous requests and another
-/// certificate's failures do not lock a certificate client out; a certificate's own failures
-/// do.
+/// peer there is the proxy, so the requests that authenticate nobody share one bucket, as
+/// when the proxy pointed at the main listener. Guessing secrets is limited, with or without a
+/// made-up certificate; over the limit only a forwarded certificate with a client id and no
+/// other credential still runs, and it gets a token only if the certificate authenticates.
 #[tokio::test]
-async fn one_client_behind_the_proxy_cannot_use_up_the_minute_of_the_others() {
+async fn the_forwarding_listener_limits_guessing_and_keeps_certificate_clients_in() {
     let h = Harness::start(Opts {
         extra: "[limits]\ntoken_unauthenticated_requests_per_minute = 3\n\n",
         ..Opts::default()
     })
     .await;
-    let anonymous = || async {
-        let mut conn = tcp(h.ports.forwarded, None).await.unwrap();
-        request_on(&mut conn, "POST", "/token", &[], None)
-            .await
-            .unwrap()
-            .0
-    };
-    for _ in 0..6 {
-        assert_ne!(anonymous().await, 429);
-    }
-    let exchange = |cert: &'static str| {
+    let c = &h.certs;
+    let exchange = |cert: Option<ClientCert>, actor: &'static str, extra: Value| {
         let h = &h;
         async move {
-            let cert = match cert {
-                "coder" => &h.certs.coder,
-                _ => &h.certs.stranger,
-            };
             let (root, _) = h.root().await;
-            let body = exchange_body(&root, "coder", json!({"client_id": "coder"}));
-            h.fwd(Some(cert), "/token", &body, &[]).await
+            let body = exchange_body(&root, actor, extra);
+            h.fwd(cert.as_ref(), "/token", &body, &[]).await
         }
     };
-    assert_eq!(exchange("coder").await.status, StatusCode::OK);
-    // The stranger's certificate fails three times, then its minute is used up.
+    let wrong = || json!({"client_id": "reviewer", "client_secret": "wrong"});
     for _ in 0..3 {
-        assert_eq!(exchange("stranger").await.status, StatusCode::UNAUTHORIZED);
+        let a = exchange(None, "reviewer", wrong()).await;
+        assert_eq!(a.status, StatusCode::UNAUTHORIZED, "{}", a.body);
     }
-    let a = exchange("stranger").await;
+    // The 4th wrong secret, and wrong secrets with a new made-up certificate each time.
+    let a = exchange(None, "reviewer", wrong()).await;
     assert_eq!(a.status, StatusCode::TOO_MANY_REQUESTS, "{}", a.body);
-    // Not anyone else's: coder's certificate and anonymous requests go on.
-    assert_eq!(exchange("coder").await.status, StatusCode::OK);
-    assert_ne!(anonymous().await, 429);
+    for i in 0..3 {
+        let made_up = ClientCert::new(&format!("made up {i}"));
+        let a = exchange(Some(made_up), "reviewer", wrong()).await;
+        assert_eq!(a.status, StatusCode::TOO_MANY_REQUESTS, "{}", a.body);
+    }
+    // A made-up certificate with a client id and nothing else runs, and is refused 429
+    // because it authenticated nobody: never a token.
+    for i in 0..3 {
+        let made_up = ClientCert::new(&format!("made up for coder {i}"));
+        let a = exchange(Some(made_up), "coder", json!({"client_id": "coder"})).await;
+        assert_eq!(a.status, StatusCode::TOO_MANY_REQUESTS, "{}", a.body);
+    }
+    // A certificate with a secret or an actor token besides is refused up front.
+    let a = exchange(
+        Some(c.both.clone()),
+        "both",
+        json!({"client_id": "both", "client_secret": "both-secret"}),
+    )
+    .await;
+    assert_eq!(a.status, StatusCode::TOO_MANY_REQUESTS, "{}", a.body);
+    // A good certificate still gets its token; the right secret shares the bucket and waits.
+    let a = exchange(
+        Some(c.coder.clone()),
+        "coder",
+        json!({"client_id": "coder"}),
+    )
+    .await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    let a = exchange(
+        None,
+        "reviewer",
+        json!({"client_id": "reviewer", "client_secret": "reviewer-secret"}),
+    )
+    .await;
+    assert_eq!(a.status, StatusCode::TOO_MANY_REQUESTS, "{}", a.body);
+    h.stop().await;
+}
+
+/// After a flood of anonymous requests through the proxy, an agent with a good forwarded
+/// certificate still gets its token.
+#[tokio::test]
+async fn an_anonymous_flood_does_not_lock_out_certificate_clients() {
+    let h = Harness::start(Opts {
+        extra: "[limits]\ntoken_unauthenticated_requests_per_minute = 3\n\n",
+        ..Opts::default()
+    })
+    .await;
+    let mut statuses = Vec::new();
+    for _ in 0..8 {
+        let mut conn = tcp(h.ports.forwarded, None).await.unwrap();
+        statuses.push(
+            request_on(&mut conn, "POST", "/token", &[], None)
+                .await
+                .unwrap()
+                .0,
+        );
+    }
+    assert!(statuses[..3].iter().all(|s| *s != 429), "{statuses:?}");
+    assert!(statuses[3..].iter().all(|s| *s == 429), "{statuses:?}");
+    for cert in [&h.certs.coder, &h.certs.pki_coder] {
+        let actor = if std::ptr::eq(cert, &h.certs.coder) {
+            "coder"
+        } else {
+            "pki-coder"
+        };
+        let (root, _) = h.root().await;
+        let body = exchange_body(&root, actor, json!({"client_id": actor}));
+        let a = h.fwd(Some(cert), "/token", &body, &[]).await;
+        assert_eq!(a.status, StatusCode::OK, "{actor}: {}", a.body);
+    }
     h.stop().await;
 }
 

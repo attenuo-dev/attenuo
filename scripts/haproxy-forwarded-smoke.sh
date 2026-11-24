@@ -12,8 +12,9 @@
 # Client-Cert-Chain headers from a client with no certificate (401 client_auth_missing) and
 # from one with the stranger's certificate (401 client_authentication_failed), and a CA-issued
 # certificate with a forged chain (200: the forged chain is dropped). Also: `haproxy -c` gives
-# no "rules ignored" warning, a direct request from 127.0.0.2 is 403, and the header sent to the
-# main listener is 400. Exits non-zero on any mismatch.
+# no "rules ignored" warning, a direct request from 127.0.0.2 is 403, the header sent to the
+# main listener is 400, HAProxy resumes no TLS session (TLS 1.2 and 1.3), and its per-address
+# limit answers /token requests over 300 a minute with 429. Exits non-zero on any mismatch.
 #
 # Not part of CI. Run with HAProxy 2.8.30 on 2026-11-24. Needs curl (with HTTP/2), openssl and
 # python3. Skips with exit status 0 when HAPROXY_BIN is unset.
@@ -183,7 +184,9 @@ root() {
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])'
 }
 # exchange NAME PROTO ACTOR WANT_STATUS WANT_CODE [curl options]
+TOKEN_REQUESTS=0
 exchange() {
+  TOKEN_REQUESTS=$((TOKEN_REQUESTS + 1))
   local name=$1 proto=$2 actor=$3 want=$4 want_code=$5; shift 5
   local parent out status code
   parent="$(root)"
@@ -221,7 +224,29 @@ echo "ok   a direct request from 127.0.0.2 to the forwarding listener: 403"
 status="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$MAIN_PORT/healthz" -H "Client-Cert: :$CODER_DER:")"
 [ "$status" = 400 ] || fail "Client-Cert on the main listener: $status, want 400"
 echo "ok   Client-Cert sent to the main listener: 400"
+for v in tls1_2 tls1_3; do
+  rm -f sess.pem
+  (sleep 1) | openssl s_client "-$v" -connect "127.0.0.1:$PROXY_PORT" -servername localhost -CAfile proxy-ca.crt \
+    -cert coder.crt -key coder.key -sess_out sess.pem > first.out 2>&1 || true
+  if [ -s sess.pem ]; then
+    (sleep 1) | openssl s_client "-$v" -connect "127.0.0.1:$PROXY_PORT" -servername localhost -CAfile proxy-ca.crt \
+      -sess_in sess.pem > second.out 2>&1 || true
+    grep -q '^Reused,' second.out && fail "HAProxy resumed a $v session"
+    grep -q '^New,' second.out || fail "the second $v connection did not complete"
+  fi
+  grep -q '^New,' first.out || fail "the first $v connection did not complete"
+  echo "ok   no $v session resumption"
+done
 grep -q 'client_cert_source="forwarded"' server.log || grep -q 'client_cert_source=forwarded' server.log \
   || fail "no log line names client_cert_source forwarded"
 echo "ok   the log names client_cert_source forwarded"
+# Last, since it uses up this address's minute: HAProxy's own limit on /token.
+args=()
+for _ in $(seq 302); do args+=(-o /dev/null "https://localhost:$PROXY_PORT/token"); done
+codes="$(curl -s --cacert proxy-ca.crt -w '%{http_code}\n' "${args[@]}")"
+# The cases above sent $TOKEN_REQUESTS of this minute's requests already.
+left=$((300 - TOKEN_REQUESTS))
+[ "$(head -n "$left" <<<"$codes" | grep -c '^429$')" = 0 ] || fail "a /token request within the limit was refused"
+[ "$(tail -n +"$((left + 1))" <<<"$codes" | grep -vc '^429$')" = 0 ] || fail "a /token request over the limit was not refused"
+echo "ok   HAProxy answers /token requests over 300 a minute from one address with 429"
 echo "all cases passed"

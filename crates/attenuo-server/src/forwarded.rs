@@ -388,7 +388,7 @@ pub(crate) type Parsed = (Vec<u8>, Vec<Vec<u8>>);
 /// - `Client-Cert` is one Byte Sequence (`:` base64 `:`) with no parameters; spaces before
 ///   and after it are allowed.
 /// - `Client-Cert-Chain` is a List of such items, separated by `,` with optional spaces or
-///   tabs around it (only spaces before the first and after the last), at most
+///   tabs around it and after the last (only spaces before the first), at most
 ///   [`MAX_INTERMEDIATES`] of them, none empty, no trailing comma.
 ///   It needs a `Client-Cert`.
 /// - The base64 is the standard alphabet with padding, canonical (no stray bits), and not
@@ -425,16 +425,15 @@ pub(crate) fn parse_values(
         if chain.len() > MAX_CHAIN_VALUE_BYTES {
             return Err("too_large");
         }
-        let members: Vec<&[u8]> = trim(chain, b" ").split(|&b| b == b',').collect();
+        // RFC 8941 §4.2: SP only before the list. §4.2.1: OWS (SP or HTAB) after each member,
+        // the last one too, and after each comma.
+        let members: Vec<&[u8]> = trim_start(chain, b" ").split(|&b| b == b',').collect();
         if members.len() > MAX_INTERMEDIATES {
             return Err("too_many_intermediates");
         }
-        let last = members.len() - 1;
         for (i, m) in members.into_iter().enumerate() {
-            // RFC 8941 §4.2.1: only SP before the first member and after the last (cut
-            // above); SP or HTAB on either side of a comma.
             let m = if i > 0 { trim_start(m, b" \t") } else { m };
-            let m = if i < last { trim_end(m, b" \t") } else { m };
+            let m = trim_end(m, b" \t");
             let der = byte_sequence(m)?;
             total += der.len();
             certs.push(der);
@@ -692,11 +691,20 @@ pub(crate) const SERVED_ROUTES: &[(&str, &str)] = &[
 /// Routes of the main router that the forwarding listener never serves, each with why.
 // Read by the route test only: [`only_served_routes`] serves nothing it does not list.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) const NOT_SERVED_ROUTES: &[(&str, &str)] = &[(
-    "/ext-authz/v1/mcp/{server}",
-    "a gateway calls it directly, with the agent's request headers copied into its check; \
-     on this listener a copied Client-Cert would be read as one the proxy checked",
-)];
+pub(crate) const NOT_SERVED_ROUTES: &[(&str, &str)] = &[
+    (
+        "/ext-authz/v1/mcp/{server}",
+        "a gateway calls it directly, with the agent's request headers copied into its check; \
+         on this listener a copied Client-Cert would be read as one the proxy checked",
+    ),
+    ("/", "the console listener's own router, not the main one"),
+    ("/favicon.svg", "the console listener's own router"),
+    ("/metrics", "the metrics listener's own router"),
+    (
+        "/mcp",
+        "the fake MCP server of the proxy crate's testing module",
+    ),
+];
 
 /// Path prefixes the forwarding listener never serves: the admin API (operators use the main
 /// or the `[admin] listen` listener).
@@ -878,6 +886,16 @@ mod tests {
             ),
             Ok(Some((leaf.clone(), vec![a.clone(), b.clone()])))
         );
+        // OWS after the last member, a tab too (RFC 8941 §4.2.1).
+        for chain in [
+            format!("{}\t", b64(&a)),
+            format!("{}, {} \t ", b64(&a), b64(&b)),
+        ] {
+            assert!(
+                values(Some(&b64(&leaf)), Some(&chain)).unwrap().is_some(),
+                "{chain:?}"
+            );
+        }
         let four = vec![b64(&a); MAX_INTERMEDIATES].join(", ");
         assert_eq!(
             values(Some(&b64(&leaf)), Some(&four))
@@ -935,7 +953,7 @@ mod tests {
                 "empty_item",
             ),
             (Some(leaf.as_str()), Some(&format!("{a};x")), "parameters"),
-            // Only SP before the first member and after the last (RFC 8941 §4.2.1).
+            // Only SP before the first member (RFC 8941 §4.2).
             (
                 Some(leaf.as_str()),
                 Some(&format!("\t{a}")),
@@ -945,16 +963,6 @@ mod tests {
                 Some(leaf.as_str()),
                 Some(&format!(" \t{a}, {a}")),
                 "not_a_byte_sequence",
-            ),
-            (
-                Some(leaf.as_str()),
-                Some(&format!("{a}\t")),
-                "trailing_data",
-            ),
-            (
-                Some(leaf.as_str()),
-                Some(&format!("{a}, {a}\t")),
-                "trailing_data",
             ),
             (Some(&format!("{leaf}\t")), None, "trailing_data"),
             (
@@ -1085,27 +1093,62 @@ mod tests {
         assert!(!std::ptr::eq(a.pki_state(), e.pki_state()));
     }
 
-    /// Every route the main router mounts (in `lib.rs` and the MCP proxy's router) is either
-    /// served on the forwarding listener or explicitly not, so a new route forces a decision;
-    /// and every listed route exists.
+    /// Every router path in the server and proxy crates (`.route(`, `.route_service(`,
+    /// `.nest(` in any source file, test modules aside) is a string literal, or a constant
+    /// listed here, and is either served on the forwarding listener or explicitly not; so a
+    /// new route forces a decision. Every listed route exists. The listener is default-deny
+    /// whatever this finds ([`only_served_routes`]).
     #[test]
     fn every_route_is_decided_for_the_forwarding_listener() {
-        let sources = [
-            include_str!("lib.rs"),
-            include_str!("../../attenuo-proxy/src/proxy.rs"),
-        ];
+        const CONSTANTS: &[(&str, &str)] = &[("UI_PREFIX", crate::admin_ui::UI_PREFIX)];
+        fn rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir).unwrap() {
+                let path = e.unwrap().path();
+                if path.is_dir() {
+                    rs_files(&path, out);
+                } else if path.extension().is_some_and(|x| x == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        rs_files(&root.join("src"), &mut files);
+        rs_files(&root.join("../attenuo-proxy/src"), &mut files);
+        assert!(files.len() > 20, "{files:?}");
         let mut found = Vec::new();
-        for src in sources {
-            // Not the test modules.
-            let src = src.split("\n#[cfg(test)]\nmod ").next().unwrap();
-            let mut rest = src;
-            while let Some(at) = rest.find(".route(") {
-                rest = &rest[at + ".route(".len()..];
-                let t = rest.trim_start();
-                let Some(after) = t.strip_prefix('"') else {
-                    panic!("a route whose path is not a string literal: {:?}", &t[..40]);
-                };
-                found.push(after[..after.find('"').unwrap()].to_owned());
+        for file in &files {
+            let text = std::fs::read_to_string(file).unwrap();
+            // Not the test modules, not comments.
+            let text = text.split("\n#[cfg(test)]\nmod ").next().unwrap();
+            let code: String = text
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            for call in [".route(", ".route_service(", ".nest("] {
+                let mut rest = code.as_str();
+                while let Some(at) = rest.find(call) {
+                    rest = &rest[at + call.len()..];
+                    let t = rest.trim_start();
+                    let path = if let Some(after) = t.strip_prefix('"') {
+                        after[..after.find('"').unwrap()].to_owned()
+                    } else {
+                        let ident: String = t
+                            .chars()
+                            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                            .collect();
+                        match CONSTANTS.iter().find(|(n, _)| *n == ident) {
+                            Some((_, v)) => (*v).to_owned(),
+                            None => panic!(
+                                "{}: {call} with a path that is not a string literal: {:?}",
+                                file.display(),
+                                &t[..t.len().min(40)]
+                            ),
+                        }
+                    };
+                    found.push(path);
+                }
             }
         }
         assert!(found.len() > 20, "{found:?}");

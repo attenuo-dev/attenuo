@@ -311,7 +311,7 @@ With [`[server.forwarded_client_cert]`](config.md#serverforwardedclientcert) set
 - On that listener, `Client-Cert` (one RFC 8941 byte sequence) and the optional `Client-Cert-Chain` (a list of at most 4 byte sequences) are read and then removed from the request. Anything not well formed, an empty `Client-Cert` too, is 400 `invalid_request` / `client_cert_header_malformed`, with one fixed `detail` that never repeats the header. A good certificate then goes through exactly the checks above, with the same answers.
 - On every other listener (main, admin, console, metrics), a request with either header is 400 `invalid_request` / `client_cert_header_not_accepted`. Without the section, the headers are ignored as before.
 - The 400 and 403 refusals are logged at warn level with the peer address, at most once per 10 seconds each; the rest at debug.
-- `[limits] token_unauthenticated_requests_per_minute` counts per forwarded certificate there, not per peer address (every peer is the proxy), and does not count requests without a certificate.
+- `[limits] token_unauthenticated_requests_per_minute` counts there in one bucket per proxy address. Over its limit, `/token` is `429` up front, except a request whose only credentials are a forwarded certificate and `client_id` (no secret, assertion, Basic credentials or actor token): it runs, and is `429` afterwards if the certificate authenticated nobody.
 
 ## Public
 

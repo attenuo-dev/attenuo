@@ -14,9 +14,9 @@
 //! 3. Values built from bytes within the caps, with spaces around the leaf and spaces or tabs
 //!    around the commas, read back exactly those bytes; one more chain item is refused.
 //! 4. Two `Client-Cert` lines, or two `Client-Cert-Chain` lines, are always refused.
-//! 5. Around a whole chain only spaces are allowed (RFC 8941 §4.2.1): the same chain with
-//!    spaces before and after reads back the same; with a tab before its first member or
-//!    after its last it is refused.
+//! 5. Before a chain only spaces are allowed (RFC 8941 §4.2), after it spaces or tabs
+//!    (§4.2.1): the same chain with spaces before and spaces or a tab after reads back the
+//!    same; with a tab before its first member it is refused.
 #![no_main]
 
 use arbitrary::Arbitrary;
@@ -108,10 +108,12 @@ fuzz_target!(|input: Input| {
                 let spaced = format!("{}{chain_value}{}", pad(input.pad.0, false), pad(input.pad.1, false));
                 let got = forwarded_parse_values(Some(leaf_value.as_bytes()), Some(spaced.as_bytes()));
                 assert_eq!(got, Ok(Some((input.leaf.clone(), want))));
-                for tabbed in [format!("\t{chain_value}"), format!("{chain_value}\t")] {
-                    let got = forwarded_parse_values(Some(leaf_value.as_bytes()), Some(tabbed.as_bytes()));
-                    assert!(got.is_err(), "{got:?}");
-                }
+                let after = format!("{chain_value}\t ");
+                let got = forwarded_parse_values(Some(leaf_value.as_bytes()), Some(after.as_bytes()));
+                assert!(matches!(got, Ok(Some(_))), "{got:?}");
+                let tabbed = format!("\t{chain_value}");
+                let got = forwarded_parse_values(Some(leaf_value.as_bytes()), Some(tabbed.as_bytes()));
+                assert!(got.is_err(), "{got:?}");
             }
         } else {
             assert_eq!(got, Err("too_large"));
