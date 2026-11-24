@@ -1181,6 +1181,13 @@ export class AdminClient {
   private readonly nonce = new NonceCache();
 
   constructor(serverUrl: string, adminToken: string, opts: HttpOptions = {}) {
+    const given = opts as { tlsClientCert?: unknown; tlsClientKey?: unknown };
+    if (given.tlsClientCert !== undefined || given.tlsClientKey !== undefined) {
+      // From plain JavaScript: refused, not ignored. The admin API uses the admin token.
+      throw new TypeError(
+        "AdminClient takes no tlsClientCert or tlsClientKey: the admin API authenticates with the admin token",
+      );
+    }
     this.http = new Http(serverUrl, opts, { authorization: `Bearer ${adminToken}` });
     this.serverUrl = this.http.base;
   }

@@ -29,6 +29,7 @@ import type * as FsModule from "node:fs";
 import type * as HttpsModule from "node:https";
 import type * as CryptoModule from "node:crypto";
 import type * as TlsModule from "node:tls";
+import type * as NetModule from "node:net";
 import type { IncomingMessage } from "node:http";
 import type { FetchLike } from "./http.js";
 
@@ -57,7 +58,8 @@ const CA = "tlsCaCert";
 const CERT = "tlsClientCert";
 const KEY = "tlsClientKey";
 
-const BEGIN = /^[ \t]*-----BEGIN ([^\r\n]*?)-----[ \t]*\r?$/gm;
+// Any white space but a newline around the BEGIN line: OpenSSL accepts `\f` and `\v` there too.
+const BEGIN = /^[^\S\n]*-----BEGIN ([^\r\n]*?)-----[^\S\n]*$/gm;
 const SUPPORTED_KEYS = ["PRIVATE KEY", "EC PRIVATE KEY", "RSA PRIVATE KEY"];
 
 interface Node {
@@ -65,6 +67,7 @@ interface Node {
   https: typeof HttpsModule;
   crypto: typeof CryptoModule;
   tls: typeof TlsModule;
+  net: typeof NetModule;
 }
 
 /** The Node modules these options need, or an error where there are none. */
@@ -82,6 +85,7 @@ function node(): Node {
     https: load<typeof HttpsModule>("node:https"),
     crypto: load<typeof CryptoModule>("node:crypto"),
     tls: load<typeof TlsModule>("node:tls"),
+    net: load<typeof NetModule>("node:net"),
   };
 }
 
@@ -151,7 +155,16 @@ function labels(text: string): string[] {
   return [...text.matchAll(BEGIN)].map((m) => m[1]!.trim());
 }
 
-const hasPrivateKey = (text: string) => labels(text).some((l) => l.endsWith("PRIVATE KEY"));
+/**
+ * Whether `text` holds a private key of any kind. Any `PRIVATE KEY-----` counts, whatever the
+ * BEGIN line around it looks like, so no spelling of the line gets one past this check.
+ */
+const hasPrivateKey = (text: string) =>
+  text.includes("PRIVATE KEY-----") || labels(text).some((l) => l.endsWith("PRIVATE KEY"));
+
+/** Whether every `-----BEGIN ` in `text` is a BEGIN line `labels` reads. */
+const allBeginsRead = (text: string) =>
+  (text.match(/-----BEGIN /g) ?? []).length === labels(text).length;
 
 /** The DER of each `CERTIFICATE` block; undefined when a block cannot be read. */
 function certificates(n: Node, text: string): Buffer[] | undefined {
@@ -186,7 +199,7 @@ function readCa(n: Node, path: string): string[] {
   if (hasPrivateKey(text)) {
     throw new TypeError(`${CA} ${path} holds a private key; it must hold only the CA certificates`);
   }
-  const ders = certificates(n, text);
+  const ders = allBeginsRead(text) ? certificates(n, text) : undefined;
   if (ders === undefined) throw new TypeError(`${CA} ${path} is not a readable PEM file`);
   if (ders.length === 0) throw new TypeError(`${CA} ${path} holds no PEM certificate`);
   return ders.map(pem);
@@ -201,7 +214,12 @@ function readClient(n: Node, cert: string, key: string): { cert: string; key: Bu
     );
   }
   const ders = certificates(n, text);
-  if (ders === undefined || ders.length === 0 || labels(text).some((l) => l !== "CERTIFICATE")) {
+  if (
+    ders === undefined ||
+    ders.length === 0 ||
+    !allBeginsRead(text) ||
+    labels(text).some((l) => l !== "CERTIFICATE")
+  ) {
     throw new TypeError(
       `${CERT} ${cert} must hold the client certificate in PEM (\`BEGIN CERTIFICATE\`) and nothing else`,
     );
@@ -220,6 +238,7 @@ function readClient(n: Node, cert: string, key: string): { cert: string; key: Bu
     error = `${KEY} ${key} holds a kind of private key that cannot be read; it needs PEM \`BEGIN PRIVATE KEY\` (PKCS#8), \`BEGIN EC PRIVATE KEY\` or \`BEGIN RSA PRIVATE KEY\``;
   } else if (
     found.length !== 1 ||
+    !allBeginsRead(head) ||
     !SUPPORTED_KEYS.includes(found[0]!) ||
     (head.match(/-----END /g) ?? []).length !== 1
   ) {
@@ -229,8 +248,25 @@ function readClient(n: Node, cert: string, key: string): { cert: string; key: Bu
     keyBytes.fill(0);
     throw new TypeError(error);
   }
+  // OpenSSL takes a key of another type than the certificate's (an RSA key with an EC
+  // certificate) and then sends no certificate at all, so the pair is checked here.
+  let matches = false;
+  try {
+    matches = new n.crypto.X509Certificate(ders[0]!).checkPrivateKey(
+      n.crypto.createPrivateKey(keyBytes),
+    );
+  } catch {
+    // Not rethrown: Node's message is not shown.
+  }
+  if (!matches) {
+    keyBytes.fill(0);
+    throw new TypeError(mismatch(key, cert));
+  }
   return { cert: ders.map(pem).join(""), key: keyBytes };
 }
+
+const mismatch = (key: string, cert: string) =>
+  `${KEY} ${key} is not the private key of the certificate in ${CERT} ${cert}, or they cannot be used as a client certificate`;
 
 /** The origin of `url`: scheme, host and port, the default port filled in. */
 export function origin(url: string | URL): string {
@@ -301,11 +337,7 @@ class TlsSettings {
         // OpenSSL holds its own copy now.
         client.key.fill(0);
       }
-      if (made === undefined) {
-        throw new TypeError(
-          `${KEY} ${this.clientKey} is not the private key of the certificate in ${CERT} ${this.clientCert}, or they cannot be used as a client certificate`,
-        );
-      }
+      if (made === undefined) throw new TypeError(mismatch(this.clientKey, this.clientCert));
       server = made;
     }
     const agent = (secureContext: TlsModule.SecureContext) =>
@@ -346,21 +378,52 @@ async function bodyBytes(body: RequestInit["body"]): Promise<Uint8Array | string
   throw new TypeError("tlsFetch: unsupported request body type");
 }
 
-const NULL_BODY = new Set([101, 103, 204, 205, 304]);
+const NULL_BODY = new Set([204, 205, 304]);
 
-/** `res` (from `node:https`) as a web `Response` whose body read failures are `TypeError`s. */
+/**
+ * Request headers `fetch` never lets a caller set; `node:https` would send them as given (a
+ * `Host` would even change the name the server's certificate is checked against).
+ */
+const FORBIDDEN = new Set([
+  "accept-encoding",
+  "connection",
+  "content-length",
+  "expect",
+  "host",
+  "keep-alive",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+]);
+
+const failed = (cause: unknown) => new TypeError("fetch failed", { cause });
+
+/**
+ * `res` (from `node:https`) as a web `Response` whose body read failures are `TypeError`s.
+ * Throws what `new Response` throws (a status outside 200-599, a reason phrase it refuses).
+ */
 function toResponse(res: IncomingMessage, method: string, abortReason: () => unknown): Response {
   const headers = new Headers();
   const raw = res.rawHeaders;
   for (let i = 0; i + 1 < raw.length; i += 2) headers.append(raw[i]!, raw[i + 1]!);
   const status = res.statusCode ?? 0;
+  const init = { status, statusText: res.statusMessage ?? "", headers };
+  const encoding = (headers.get("content-encoding") ?? "identity").trim().toLowerCase();
+  if (encoding !== "identity") {
+    // Asked for `identity` only: a body in another encoding is not handed on undecoded.
+    throw new Error("the server answered with a content-encoding that was not asked for");
+  }
   if (NULL_BODY.has(status) || method === "HEAD") {
+    const response = new Response(null, init);
     res.resume();
-    return new Response(null, { status, statusText: res.statusMessage ?? "", headers });
+    return response;
   }
   let settled = false;
   const body = new ReadableStream<Uint8Array>({
     start(ctl) {
+      // No listener here may throw: it runs on an event emitter, where a throw would end the
+      // process. Every one checks `settled` before it touches the controller.
       const fail = (e: unknown) => {
         if (settled) return;
         settled = true;
@@ -368,6 +431,7 @@ function toResponse(res: IncomingMessage, method: string, abortReason: () => unk
         ctl.error(reason !== undefined ? reason : new TypeError("terminated", { cause: e }));
       };
       res.on("data", (chunk: Buffer) => {
+        if (settled) return;
         ctl.enqueue(new Uint8Array(chunk));
         if ((ctl.desiredSize ?? 1) <= 0) res.pause();
       });
@@ -389,50 +453,126 @@ function toResponse(res: IncomingMessage, method: string, abortReason: () => unk
       res.destroy();
     },
   });
-  return new Response(body, { status, statusText: res.statusMessage ?? "", headers });
+  return new Response(body, init);
+}
+
+/** The URL of `input`; refuses what global `fetch` refuses, and a `Request`. */
+function requestUrl(input: unknown): URL {
+  if (typeof input !== "string" && !(input instanceof URL)) {
+    throw new TypeError("tlsFetch takes the URL as a string or a URL, not a Request");
+  }
+  let url: URL;
+  try {
+    url = new URL(input);
+  } catch (e) {
+    throw new TypeError("tlsFetch: not a valid URL", { cause: e });
+  }
+  if (url.username !== "" || url.password !== "") {
+    throw new TypeError("tlsFetch: a URL with credentials (user:password@) is refused");
+  }
+  return url;
+}
+
+/** `p`, or the abort reason as soon as `signal` aborts. */
+function abortable<T>(p: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (signal === undefined) return p;
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    if (signal.aborted) return onAbort();
+    signal.addEventListener("abort", onAbort, { once: true });
+    p.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
+  });
 }
 
 /** A `fetch` over `node:https` with the agents of `tls`. Redirects are not followed. */
 function httpsFetch(n: Node, tls: TlsSettings): FetchLike {
   return async (input, init = {}) => {
-    const url = new URL(input);
+    const url = requestUrl(input);
     if (url.protocol !== "https:") {
       // No TLS on this request: global `fetch`, as without the options. Never follows a
       // redirect from here.
-      return fetch(input, { ...init, redirect: "manual" });
+      return fetch(url, { ...init, redirect: "manual" });
     }
     const signal = init.signal ?? undefined;
     signal?.throwIfAborted();
     const method = (init.method ?? "GET").toUpperCase();
+    if (method === "CONNECT" || method === "TRACE" || method === "TRACK") {
+      throw new TypeError(`tlsFetch: the method ${method} is refused`);
+    }
     const headers: Record<string, string> = {};
     new Headers(init.headers).forEach((v, k) => {
-      headers[k] = v;
+      if (!FORBIDDEN.has(k) && !k.startsWith("proxy-")) headers[k] = v;
     });
-    const data = await bodyBytes(init.body);
-    if (data !== undefined && headers["content-length"] === undefined) {
+    // The body is handed on as the server sent it, so only `identity` is asked for.
+    headers["accept-encoding"] = "identity";
+    const data = await abortable(bodyBytes(init.body), signal);
+    signal?.throwIfAborted();
+    if (data !== undefined) {
       headers["content-length"] = String(
         typeof data === "string" ? Buffer.byteLength(data) : data.byteLength,
       );
     }
     return await new Promise<Response>((resolve, reject) => {
       let aborted = false;
-      const req = n.https.request(url, { method, headers, agent: tls.agentFor(url) });
+      let done = false;
+      const settle = (f: () => void) => {
+        if (done) return;
+        done = true;
+        f();
+      };
+      // The name the server's certificate is checked against is the URL's host, always.
+      const host = url.hostname.replace(/^\[|\]$/g, "");
+      const options: HttpsModule.RequestOptions = {
+        method,
+        headers,
+        agent: tls.agentFor(url),
+      };
+      if (n.net.isIP(host) === 0) options.servername = host;
+      let req: ReturnType<typeof n.https.request>;
+      try {
+        req = n.https.request(url, options);
+      } catch (e) {
+        // For example a header value Node refuses.
+        reject(failed(e));
+        return;
+      }
       const onAbort = () => {
         aborted = true;
         req.destroy();
-        reject(signal?.reason);
+        settle(() => reject(signal?.reason));
       };
       signal?.addEventListener("abort", onAbort, { once: true });
       req.on("response", (res) => {
-        resolve(toResponse(res, method, () => (aborted ? signal?.reason : undefined)));
         // An abort while the body is read destroys the request, and so the body, too.
         res.on("close", () => signal?.removeEventListener("abort", onAbort));
+        let response: Response;
+        try {
+          response = toResponse(res, method, () => (aborted ? signal?.reason : undefined));
+        } catch (e) {
+          res.destroy();
+          settle(() => reject(failed(e)));
+          return;
+        }
+        settle(() => resolve(response));
+      });
+      req.on("upgrade", (_res, socket) => {
+        // A 101: no `fetch` answer can carry it.
+        socket.destroy();
+        settle(() => reject(failed(new Error("the server switched protocols"))));
       });
       req.on("error", (e) => {
         signal?.removeEventListener("abort", onAbort);
         // As global `fetch` does: a network failure is a `TypeError` with the cause.
-        reject(aborted ? signal?.reason : new TypeError("fetch failed", { cause: e }));
+        settle(() => reject(aborted ? signal?.reason : failed(e)));
       });
+      req.on("close", () => {
+        // Anything else that ends the request without an answer.
+        settle(() => reject(failed(new Error("the connection closed without an answer"))));
+      });
+      if (signal?.aborted) {
+        onAbort();
+        return;
+      }
       req.end(data);
     });
   };

@@ -399,3 +399,122 @@ describe("refusals when the client is made", () => {
     }
   });
 });
+
+describe("answers and requests tlsFetch must not mishandle", () => {
+  const raws = [
+    ["a status of 600", "HTTP/1.1 600 Weird\r\ncontent-length: 0\r\n\r\n"],
+    ["a reason phrase with a control byte", "HTTP/1.1 200 O\x01K\r\ncontent-length: 0\r\n\r\n"],
+    [
+      "a 101 Switching Protocols",
+      "HTTP/1.1 101 Switching Protocols\r\nupgrade: x\r\nconnection: upgrade\r\n\r\n",
+    ],
+    [
+      "a body in an encoding that was not asked for",
+      "HTTP/1.1 200 OK\r\ncontent-encoding: gzip\r\ncontent-length: 4\r\n\r\nxxxx",
+    ],
+  ] as const;
+
+  for (const [what, raw] of raws) {
+    it(`rejects ${what} (tlsFetch and AttenuoClient), and the process lives on`, async () => {
+      const s = await server(ca);
+      s.raw = raw;
+      const f = tlsFetch(s.url, { tlsCaCert: caFile });
+      const e = await f(`${s.url}/x`).catch((x: unknown) => x);
+      expect(e).toBeInstanceOf(TypeError);
+      expect((e as Error).message).toBe("fetch failed");
+      const c = new AttenuoClient(s.url, withCert());
+      await expect(c.jwks()).rejects.toBeInstanceOf(TransportError);
+    });
+  }
+
+  it("stops reading the request body when aborted", async () => {
+    const s = await server(ca);
+    const f = tlsFetch(s.url, { tlsCaCert: caFile });
+    const ctl = new AbortController();
+    const body = new ReadableStream<Uint8Array>({ pull: () => new Promise(() => {}) });
+    const p = f(`${s.url}/x`, {
+      method: "POST",
+      body,
+      signal: ctl.signal,
+      duplex: "half",
+    } as RequestInit);
+    ctl.abort(new Error("stop"));
+    await expect(p).rejects.toThrow("stop");
+    // Aborted before the call: nothing is sent.
+    await expect(f(`${s.url}/x`, { signal: AbortSignal.abort() })).rejects.toThrow();
+    expect(s.seen).toEqual([]);
+  });
+
+  it("refuses credentials in the URL and a Request", async () => {
+    const s = await server(ca);
+    const f = tlsFetch(s.url, { tlsCaCert: caFile });
+    const withUser = s.url.replace("https://", "https://user:pw@");
+    await expect(f(`${withUser}/x`)).rejects.toThrow(/credentials/);
+    const req = new Request(`${s.url}/x`) as unknown as string;
+    await expect(f(req)).rejects.toThrow(/not a Request/);
+    expect(s.seen).toEqual([]);
+  });
+
+  it("asks for identity only and drops headers fetch forbids", async () => {
+    const s = await server(ca);
+    const f = tlsFetch(s.url, { tlsCaCert: caFile });
+    const headers = { "accept-encoding": "gzip, br", host: "evil.test", "x-ok": "1" };
+    await (await f(`${s.url}/x`, { headers })).text();
+    const h = s.seen[0]!.headers;
+    expect(h["accept-encoding"]).toBe("identity");
+    expect(h.host).toBe(new URL(s.url).host);
+    expect(h["x-ok"]).toBe("1");
+  });
+
+  it("refuses a CA or certificate file whose BEGIN line ends in other white space", () => {
+    for (const ws of ["\f", "\v"]) {
+      const body = client.keyPem.replace(
+        "-----BEGIN PRIVATE KEY-----",
+        `-----BEGIN PRIVATE KEY-----${ws}`,
+      );
+      const hidden = write("hidden.pem", client.pem + body);
+      expect(() => new AttenuoClient("https://a.test", { tlsCaCert: hidden })).toThrow(
+        /holds a private key/,
+      );
+      expect(
+        () =>
+          new AttenuoClient("https://a.test", {
+            tlsClientCert: hidden,
+            tlsClientKey: client.keyPath,
+          }),
+      ).toThrow(/holds a private key/);
+    }
+    // A BEGIN line the parser does not read is refused, not skipped.
+    const odd = write(
+      "odd-begin.pem",
+      ca.pem + "-----BEGIN CERTIFICATE-----junk\nAAAA\n-----END CERTIFICATE-----\n",
+    );
+    expect(() => new AttenuoClient("https://a.test", { tlsCaCert: odd })).toThrow(
+      /is not a readable PEM file/,
+    );
+  });
+
+  it("refuses a key of another type than the certificate", () => {
+    for (const alg of [
+      ["genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048"],
+      ["genpkey", "-algorithm", "ED25519"],
+    ]) {
+      const out = join(dir, `${alg[2]}.key`);
+      execFileSync("openssl", [...alg, "-out", out]);
+      const e = thrown(
+        () =>
+          new AttenuoClient("https://a.test", {
+            tlsClientCert: client.certPath,
+            tlsClientKey: out,
+          }),
+      );
+      expect(e.message).toMatch(/is not the private key of the certificate/);
+      expect(e.cause).toBeUndefined();
+    }
+  });
+
+  it("refuses tlsClientCert on the admin client", () => {
+    const opts = { tlsClientCert: client.certPath, tlsClientKey: client.keyPath } as object;
+    expect(() => new AdminClient("https://a.test", "t", opts)).toThrow(/takes no tlsClientCert/);
+  });
+});

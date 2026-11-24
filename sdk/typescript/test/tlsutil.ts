@@ -162,6 +162,7 @@ export interface Seen {
   /** The DER of the client certificate the handshake carried, or undefined. */
   peerCert: Buffer | undefined;
   body: string;
+  headers: Record<string, string | string[] | undefined>;
 }
 
 /**
@@ -176,6 +177,8 @@ export class TlsServer {
   };
   /** Answer nothing (for a client timeout). */
   hang = false;
+  /** Write these bytes as the whole answer instead. */
+  raw: string | undefined;
   private constructor(private readonly server: Server) {}
 
   static async start(cert: string, key: string): Promise<TlsServer> {
@@ -190,7 +193,13 @@ export class TlsServer {
           path: req.url ?? "",
           peerCert: peer && "raw" in peer && peer.raw ? peer.raw : undefined,
           body: Buffer.concat(chunks).toString("utf8"),
+          headers: req.headers,
         });
+        if (s.raw !== undefined) {
+          // Bytes no well-behaved server sends (a status of 600, a 101), written as they are.
+          req.socket.end(s.raw);
+          return;
+        }
         if (s.hang) return;
         res.writeHead(s.answer.status, {
           "content-type": "application/json",
