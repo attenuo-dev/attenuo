@@ -374,7 +374,13 @@ def exchange_body(
     actor_token: str | None = None,
     may_act: Iterable[str] | None = None,
     client_assertion: str | None = None,
+    client_cert: bool = False,
 ) -> dict[str, Any]:
+    """The ``POST /token`` body. ``client_cert`` is whether the client presents a TLS client
+    certificate: then, with no secret, client assertion or actor token, ``client_id`` (the
+    actor by default) is sent alone and the certificate authenticates it (RFC 8705
+    ``self_signed_tls_client_auth``). Next to an actor token no ``client_id`` is sent, since
+    with a certificate on the connection it would make the certificate count too."""
     if actor_token is not None and not actor_token.strip():
         raise ValueError("actor_token is empty")
     if client_assertion is not None and not client_assertion.strip():
@@ -382,8 +388,12 @@ def exchange_body(
     if client_assertion is not None and client_secret:
         # RFC 6749 §2.3: one client authentication method per request.
         raise ValueError("use client_secret or client_assertion, not both")
-    if client_id is not None and not client_secret and client_assertion is None:
-        raise ValueError("client_id goes with client_secret or client_assertion")
+    by_cert = client_cert and not client_secret and client_assertion is None and actor_token is None
+    if client_id is not None and not client_secret and client_assertion is None and not by_cert:
+        raise ValueError(
+            "client_id goes with client_secret, client_assertion or a TLS client certificate "
+            "(without an actor_token)"
+        )
     if client_secret and client_id is None:
         # A hop n+1 exchange authenticates as its actor.
         client_id = actor
@@ -393,7 +403,10 @@ def exchange_body(
         # the server also requires them, as the actor's, on a hop n+1 exchange. Hop 0 is an
         # IdP credential, which is not an attenuo delegation token.
         authenticated = (
-            client_secret is not None or actor_token is not None or client_assertion is not None
+            client_secret is not None
+            or actor_token is not None
+            or client_assertion is not None
+            or by_cert
         )
         intake = authenticated and not is_delegation_token(subject_token)
         subject_token_type = TYPE_ID_TOKEN if intake else TYPE_JWT
@@ -420,6 +433,9 @@ def exchange_body(
             body["client_id"] = client_id
         body["client_assertion_type"] = CLIENT_ASSERTION_TYPE
         body["client_assertion"] = client_assertion.strip()
+    if by_cert:
+        # RFC 8705 §2.2: the certificate on the connection authenticates this client id.
+        body["client_id"] = client_id if client_id is not None else actor
     if actor_token is not None:
         # RFC 8693 §2.1: a workload-identity JWT (e.g. a SPIFFE JWT-SVID) for the actor.
         body["actor_token"] = actor_token.strip()

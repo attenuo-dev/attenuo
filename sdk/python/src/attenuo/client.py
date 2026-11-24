@@ -17,11 +17,12 @@ from typing import Any
 
 import httpx
 
-from . import _retry
+from . import _retry, _tls
 from . import _wire as w
 from ._http import AsyncHttpClient, HttpClient
 from ._retry import DEFAULT_MAX_RETRY_DELAY, RetryPolicy
 from ._sse import DEFAULT_MAX_EVENT_BYTES, CallStream, Deadline, StreamEvent, check_deadline
+from ._tls import PathArg
 from .capability import CapabilityLike
 from .dpop import DpopKey, NonceCache, exchange_proofs, presented
 from .errors import ApprovalNotGranted, ApprovalRequired, AttenuoError
@@ -59,6 +60,16 @@ class Client:
     not an :class:`~attenuo.Unauthorized`, not a transport error. A streamed call is retried only
     before its stream starts, and not past its ``deadline``. When the retries run out, the last
     refusal is raised. ``max_retries`` is at most 10 and ``max_retry_delay`` at most 300.
+
+    ``tls_ca_cert`` (a PEM file path) is the CA to trust for an ``https://`` server URL: only
+    its certificates are trusted, in place of httpx's default roots, and hostname checks stay
+    on. ``tls_client_cert`` and ``tls_client_key`` (PEM file paths, both or neither) are a TLS
+    client certificate (RFC 8705 ``self_signed_tls_client_auth``), presented to the origin of
+    the server URL only; they need an ``https://`` URL. With one, :meth:`exchange` without a
+    secret, client assertion or actor token sends ``client_id`` and no secret, and the
+    certificate authenticates the agent. The files are read when the client is made; a
+    problem is a ``ValueError`` naming the option and the path. They cannot be combined with
+    ``transport``.
     """
 
     def __init__(
@@ -72,14 +83,21 @@ class Client:
         dpop_key: DpopKey | dict[str, Any] | None = None,
         max_retries: int = 0,
         max_retry_delay: float = DEFAULT_MAX_RETRY_DELAY,
+        tls_ca_cert: PathArg | None = None,
+        tls_client_cert: PathArg | None = None,
+        tls_client_key: PathArg | None = None,
     ) -> None:
         self.server_url = w.normalize_base(server_url)
         self.token = token
         self._retry = RetryPolicy(max_retries, max_retry_delay)
         self.dpop_key = DpopKey.of(dpop_key)
         self._nonce = NonceCache()
+        tls = _tls.settings(
+            self.server_url, tls_ca_cert, tls_client_cert, tls_client_key, transport
+        )
+        self._client_cert = tls is not None and tls.has_client_cert
         self._http = HttpClient(
-            base_url=self.server_url, timeout=timeout, transport=transport, headers=headers
+            base_url=self.server_url, timeout=timeout, transport=transport, headers=headers, tls=tls
         )
         self._ids = itertools.count(1)
 
@@ -163,6 +181,7 @@ class Client:
             actor_token=actor_token,
             may_act=may_act,
             client_assertion=client_assertion,
+            client_cert=self._client_cert,
         )
         resp = self._post(
             "/token",
@@ -617,14 +636,21 @@ class AsyncClient:
         dpop_key: DpopKey | dict[str, Any] | None = None,
         max_retries: int = 0,
         max_retry_delay: float = DEFAULT_MAX_RETRY_DELAY,
+        tls_ca_cert: PathArg | None = None,
+        tls_client_cert: PathArg | None = None,
+        tls_client_key: PathArg | None = None,
     ) -> None:
         self.server_url = w.normalize_base(server_url)
         self.token = token
         self._retry = RetryPolicy(max_retries, max_retry_delay)
         self.dpop_key = DpopKey.of(dpop_key)
         self._nonce = NonceCache()
+        tls = _tls.settings(
+            self.server_url, tls_ca_cert, tls_client_cert, tls_client_key, transport
+        )
+        self._client_cert = tls is not None and tls.has_client_cert
         self._http = AsyncHttpClient(
-            base_url=self.server_url, timeout=timeout, transport=transport, headers=headers
+            base_url=self.server_url, timeout=timeout, transport=transport, headers=headers, tls=tls
         )
         self._ids = itertools.count(1)
 
@@ -669,6 +695,7 @@ class AsyncClient:
             actor_token=actor_token,
             may_act=may_act,
             client_assertion=client_assertion,
+            client_cert=self._client_cert,
         )
         resp = await self._post(
             "/token",
