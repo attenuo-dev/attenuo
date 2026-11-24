@@ -221,15 +221,20 @@ dependencies = [
  "base64 0.23.1",
  "clap",
  "hex",
+ "rcgen",
  "reqwest",
  "ring",
  "rusqlite",
  "rustix",
+ "rustls",
+ "rustls-pki-types",
  "serde_json",
  "sha2",
  "tempfile",
  "time",
  "tokio",
+ "tokio-rustls",
+ "zeroize",
 ]
 
 [[package]]

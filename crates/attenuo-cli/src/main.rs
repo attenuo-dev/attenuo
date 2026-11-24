@@ -34,6 +34,7 @@ mod render;
 mod secrets;
 mod sse;
 mod stdio_bridge;
+mod tls;
 mod watch;
 
 #[cfg(test)]
@@ -151,19 +152,30 @@ async fn run(cli: Cli) -> Result<Outcome> {
         secrets::ADMIN_TOKEN_ENV,
         &mut stdin,
     )?;
+    // Read and checked before anything is sent, whatever the command: a client certificate
+    // without its key, or a file that cannot be read, is an error here.
+    let tls = tls::Tls::from_flags(
+        cli.tls_ca_cert.as_deref(),
+        cli.tls_client_cert.as_deref(),
+        cli.tls_client_key.as_deref(),
+    )?;
     // An empty `ATTENUO_ADMIN_SERVER` (a compose file's `${VAR:-}`) counts as unset.
+    // Whether the TLS options fit the URLs is checked where a client for them is built
+    // (`Client::new`, `connect::run`), so a command that sends nothing is not refused.
     let admin_server = cli.admin_server.as_deref().filter(|s| !s.is_empty());
-    let client = Client::new(&cli.server, admin_server, admin_token);
+    let client = Client::new(&cli.server, admin_server, admin_token, &tls);
     match cli.command {
-        Command::Token(TokenCmd::Inspect(args)) => inspect(client.ok(), args, json).await,
+        Command::Token(TokenCmd::Inspect(args)) => inspect(client, args, json).await,
         Command::Health(a) => health(&client?, &a, json).await,
         // Talks to no attenuo server.
         Command::StdioBridge(a) => stdio_bridge::run(a).await.map(|()| Outcome::Ok),
         Command::Init(a) => init_cmd::run(a).await.map(|()| Outcome::Ok),
-        Command::Connect(a) => connect::run(&cli.server, a).await.map(|code| match code {
-            0 => Outcome::Ok,
-            code => Outcome::Exit(code),
-        }),
+        Command::Connect(a) => connect::run(&cli.server, a, &tls)
+            .await
+            .map(|code| match code {
+                0 => Outcome::Ok,
+                code => Outcome::Exit(code),
+            }),
         Command::Admin(AdminCmd::Operator(OperatorCmd::New {
             name,
             role,
@@ -332,6 +344,11 @@ async fn run(cli: Cli) -> Result<Outcome> {
                 if let Some(secret) = secret {
                     body["client_id"] = client_id.into();
                     body["client_secret"] = secret.into();
+                } else if tls.has_client_cert() && body.get("actor_token").is_none() {
+                    // RFC 8705 `self_signed_tls_client_auth`: the certificate on the connection
+                    // authenticates the `client_id`. Not next to an actor token, where a
+                    // `client_id` would make the certificate count too.
+                    body["client_id"] = client_id.into();
                 }
             }
             let given = a
@@ -541,7 +558,9 @@ async fn run(cli: Cli) -> Result<Outcome> {
         Command::Approval(ApprovalCmd::Decline { id }) => {
             approval_decide(&client?, &id, "decline", json).await
         }
-        Command::Approval(ApprovalCmd::Verify(args)) => approval_verify(client, args, json).await,
+        Command::Approval(ApprovalCmd::Verify(args)) => {
+            approval_verify(client, &tls, args, json).await
+        }
         Command::Budget(BudgetCmd::Refund {
             decision_id,
             reason,
@@ -1102,7 +1121,7 @@ fn print_token(resp: &Value, only: Option<Field>, json: bool) -> Result<()> {
     Ok(())
 }
 
-async fn inspect(client: Option<Client>, args: cli::InspectArgs, json: bool) -> Result<Outcome> {
+async fn inspect(client: Result<Client>, args: cli::InspectArgs, json: bool) -> Result<Outcome> {
     let token = if args.jwt == "-" {
         let mut s = String::new();
         std::io::stdin().read_to_string(&mut s)?;
@@ -1114,7 +1133,7 @@ async fn inspect(client: Option<Client>, args: cli::InspectArgs, json: bool) -> 
     let now = OffsetDateTime::now_utc();
     let mut verdict: Option<Result<attenuo_token::VerifiedToken>> = None;
     if args.verify {
-        let client = client.context("--verify needs a valid --server URL to fetch the JWKS")?;
+        let client = client.context("--verify fetches the JWKS from --server")?;
         let jwks = client.get("/.well-known/jwks.json").await?;
         verdict = Some(jwt::verify_with_jwks(
             &token,
@@ -1265,6 +1284,7 @@ async fn approval_decide(client: &Client, id: &str, decision: &str, json: bool) 
 /// `approval verify`: check an approval token offline against the issuer's JWKS.
 async fn approval_verify(
     client: Result<Client>,
+    tls: &tls::Tls,
     args: cli::ApprovalVerifyArgs,
     json: bool,
 ) -> Result<Outcome> {
@@ -1278,7 +1298,13 @@ async fn approval_verify(
     let (header, claims) = jwt::decode_approval_unverified(&token)?;
     let jwks: Value = match args.jwks.as_deref() {
         Some(u) if u.starts_with("http://") || u.starts_with("https://") => {
-            let resp = client::http_client()?
+            // `--tls-ca-cert` applies, and the client certificate only for a URL on the
+            // origin of `--server`. Without a valid `--server`, no certificate at all.
+            let http = match client.as_ref() {
+                Ok(c) => c.http_for_url(u)?,
+                Err(_) => tls.build(tls::Target::Admin, client::client_builder())?,
+            };
+            let resp = http
                 .get(u)
                 .send()
                 .await
@@ -2426,7 +2452,10 @@ mod tests {
 
     #[test]
     fn server_name_instead_of_url_is_explained() {
-        let err = Client::new("github", None, None).err().unwrap().to_string();
+        let err = Client::new("github", None, None, &tls::Tls::default())
+            .err()
+            .unwrap()
+            .to_string();
         assert!(err.contains("base URL"), "{err}");
     }
 }

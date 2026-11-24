@@ -160,8 +160,28 @@ Embedders: `attenuo_server::run` and `serve` speak TLS. `attenuo_server::serve_u
 With `[server.tls]` the main listener answers no plain HTTP, so every check of it must change.
 
 - **Probes and health checks** must use `https://`. A checker that verifies the certificate must use a name that is in the certificate, and must trust its CA. Kubernetes `httpGet` probes with `scheme: HTTPS` do not verify the certificate, so they work with any certificate.
-- **The image's built-in `HEALTHCHECK` fails.** It runs `attenuo --server http://127.0.0.1:8080 health`, which is plain HTTP. Turn it off or replace it. With `docker run`, pass `--no-healthcheck`, or `--health-cmd` with your own check. In a compose file, set `healthcheck: { disable: true }`, or your own `test`. A replacement inside the container can only use the CLI (the image has no `curl`), and the CLI has the limit below.
-- **The `attenuo` CLI trusts only the public web PKI roots** built into it. It has no option for another CA. With a certificate from a private CA, or a self-signed one, the CLI cannot reach the TLS main listener: `health`, `token exchange`, `call`, `tools` and the JWKS fetches fail. Admin commands still work when the server has `[admin] listen`: the CLI sends every `/admin/*` request to `--admin-server` (`ATTENUO_ADMIN_SERVER`), and that listener stays plain HTTP. With a certificate from a public CA, give the CLI the `https://` name in the certificate.
+- **The image's built-in `HEALTHCHECK` fails.** It runs `attenuo --server http://127.0.0.1:8080 health`, which is plain HTTP. Turn it off or replace it. With `docker run`, pass `--no-healthcheck`, or `--health-cmd` with your own check. In a compose file, set `healthcheck: { disable: true }`, or your own `test`. A replacement inside the container can only use the CLI (the image has no `curl`). See the next point for the command.
+- **The `attenuo` CLI needs the CA for a private certificate.** By default it trusts the public web PKI roots built into it, so with a certificate from a public CA, give it the `https://` name in the certificate and nothing else. With a certificate from a private CA, give it that CA's certificate with `--tls-ca-cert` or `ATTENUO_TLS_CA_CERT`. It then trusts only that file for `--server`, `--admin-server` and a `--jwks` URL, not the public roots. For a JWKS on a host with a public certificate, save it to a file and pass `approval verify --jwks <file>`. The name in `--server` must still be one of the certificate's names. For a check inside the container, put `127.0.0.1` in the certificate's names, or map the certificate's name to `127.0.0.1` with `--add-host` (compose: `extra_hosts`).
+
+  A self-signed server certificate also works as its own `--tls-ca-cert`, but only if it is not a CA certificate. A plain `openssl req -x509` makes a CA certificate (`CA:TRUE`), and the CLI refuses it as a server certificate (`CaUsedAsEndEntity`). Add the `basicConstraints` line, and the names the CLI will use:
+
+  ```sh
+  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+    -keyout server.key -out server.crt -days 90 -subj "/CN=attenuo" \
+    -addext "basicConstraints=critical,CA:FALSE" \
+    -addext "subjectAltName=DNS:attenuo.example.com,IP:127.0.0.1"
+  chmod 600 server.key
+  attenuo --server https://127.0.0.1:8443 --tls-ca-cert server.crt health
+  ```
+
+  A health check override for the `[server.tls]` example above (port 8443), with the CA mounted next to the server's own files and the same timeout as the image's own check:
+
+  ```sh
+  docker run --health-cmd \
+    'attenuo --server https://127.0.0.1:8443 --tls-ca-cert /etc/attenuo/tls/ca.pem health --timeout 3' ...
+  ```
+
+  In a compose file: `healthcheck: { test: ["CMD", "attenuo", "--server", "https://127.0.0.1:8443", "--tls-ca-cert", "/etc/attenuo/tls/ca.pem", "health", "--timeout", "3"] }`. The CA file holds no secret: it is the public certificate of the CA. Admin commands also work when the server has `[admin] listen`: the CLI sends every `/admin/*` request to `--admin-server` (`ATTENUO_ADMIN_SERVER`), and that listener stays plain HTTP. An agent pinned by a client certificate passes it with `--tls-client-cert` and `--tls-client-key` ([TLS client certificates](identity-providers.md#tls-client-certificates)). If the CLI goes through an `https://` proxy (`HTTPS_PROXY=https://...`), the proxy's own certificate must also chain to `--tls-ca-cert`.
 - **The Helm chart does not support `[server.tls]`.** Its startup, liveness and readiness probes use plain HTTP on the `http` port, so the pod fails its startup probe and is restarted. Use TLS at an ingress or gateway with the chart, as it documents.
 
 #### The key file's mode

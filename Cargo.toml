@@ -54,6 +54,10 @@ jsonwebtoken = "9"
 cedar-policy = "4"
 rusqlite = { version = "0.42", features = ["bundled", "hooks"] }
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+# The attenuo CLI's `--tls-*` options: reading PEM sections and zeroing its buffers for the
+# client key. Both are already in the lock file through reqwest's rustls.
+rustls-pki-types = { version = "1", default-features = false, features = ["alloc"] }
+zeroize = { version = "1", default-features = false, features = ["alloc"] }
 glob-match = "0.2"
 rand = "0.8"
 ring = "0.17"

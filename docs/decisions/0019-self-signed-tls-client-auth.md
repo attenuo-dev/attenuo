@@ -104,3 +104,7 @@ Not done here, each for a later change:
 - `x5c` in JWK Sets, CRL and OCSP.
 
 Related: ADR-0007 and ADR-0017, which set mTLS aside; ADR-0018, the native TLS listener; ADR-0014, the SR-109 rule; ADR-0017's SR-110 update, one answer for refusals.
+
+### Update 2026-11-24: CLI client certificates
+
+The decision above stands. The `attenuo` CLI can now present a client certificate: `--tls-client-cert` and `--tls-client-key` (`ATTENUO_TLS_CLIENT_CERT`, `ATTENUO_TLS_CLIENT_KEY`) go to the origin of `--server` only, never to an `--admin-server` or another origin (except that an `https://` proxy in `HTTPS_PROXY` is offered the certificate if it asks), and `token exchange` then sends `client_id` with no secret ([identity providers](../guides/identity-providers.md#tls-client-certificates)). The Python and TypeScript SDKs still cannot, and the Helm chart and the image's health check still do not support `[server.tls]`.

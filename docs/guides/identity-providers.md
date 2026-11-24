@@ -208,7 +208,18 @@ curl --cert planner-client.crt --key planner-client.key --cacert server-ca.pem \
   -d client_id=planner
 ```
 
-A PEP sends `pep_id` in the evaluation body instead. The `attenuo` CLI and the SDKs cannot send a client certificate yet.
+A PEP sends `pep_id` in the evaluation body instead.
+
+The `attenuo` CLI presents the certificate with `--tls-client-cert` and `--tls-client-key` (or `ATTENUO_TLS_CLIENT_CERT` and `ATTENUO_TLS_CLIENT_KEY`). `token exchange` then sends `client_id` and no secret. Give the server's CA with `--tls-ca-cert` too when its certificate comes from a private CA. The same hop-0 exchange as the `curl` above:
+
+```sh
+ATTENUO_TOKEN="$ID_TOKEN" attenuo --server https://attenuo.example.com:8443 \
+  --tls-ca-cert server-ca.pem \
+  --tls-client-cert planner-client.crt --tls-client-key planner-client.key \
+  token exchange --subject-token-type id-token --actor planner --cap 'github:*'
+```
+
+The CLI sends the certificate only to the origin of `--server`, never to an `--admin-server` or a `--jwks` URL on another origin, and it reads the key file once. It needs an `https://` `--server`. One exception: through an `https://` proxy (`HTTPS_PROXY=https://...`), the proxy is offered the certificate too if it asks for one, and its own certificate must chain to `--tls-ca-cert`. It sends no `client_id` when you pass an actor token (see the notes below). The CLI has no PEP mode, so it does not send `pep_id`. The Python and TypeScript SDKs cannot send a client certificate yet.
 
 **4. Rotate.** An entry takes up to 8 thumbprints. Add the new certificate's thumbprint next to the old one and run `attenuo admin agent reload`. Move the client to the new certificate. Then remove the old thumbprint and reload again. A removed thumbprint stops working on the next request, also on a connection that is already open.
 
