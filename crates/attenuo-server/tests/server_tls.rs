@@ -473,6 +473,124 @@ async fn without_server_tls_the_listener_speaks_plain_http() {
     server.stop(state).await;
 }
 
+/// With `[server.tls]` the other listeners (`[admin] listen`, `[admin_ui]`, `[metrics]`) serve
+/// plain HTTP exactly as before: they have routers of their own, without the layer that
+/// refuses requests not made over TLS, and they do not speak TLS.
+#[tokio::test]
+async fn the_side_listeners_stay_plain_http_with_server_tls() {
+    let dir = tempfile::tempdir().unwrap();
+    let ca = Ca::new("server-tls test CA");
+    let mut cfg = tls_config(dir.path(), &ca, 10);
+    let admin = common::free_port();
+    let console = common::free_port();
+    let metrics = common::free_port();
+    cfg.admin.listen = Some(admin);
+    cfg.admin_ui.enabled = true;
+    cfg.admin_ui.listen = console;
+    cfg.metrics.enabled = true;
+    cfg.metrics.listen = metrics;
+    let (server, state) = start(cfg).await;
+    // `run` binds the side listeners itself, after `start` returns.
+    for addr in [admin, console, metrics] {
+        let end = Instant::now() + Duration::from_secs(20);
+        while tokio::net::TcpStream::connect(addr).await.is_err() {
+            assert!(Instant::now() < end, "{addr} never listened");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    let http = reqwest::Client::new();
+
+    // The admin API, on its own listener: plain HTTP, behind the bearer, as before.
+    let resp = http
+        .get(format!("http://{admin}/admin/whoami"))
+        .bearer_auth(ADMIN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let me: Value = resp.json().await.unwrap();
+    assert_eq!(me["role"], "admin", "{me}");
+    let resp = http
+        .get(format!("http://{admin}/admin/whoami"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    // And not on the main listener, over TLS: an unknown path there.
+    let resp = client(&ca)
+        .get(server.https_url("/admin/whoami"))
+        .bearer_auth(ADMIN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // The console: its page and its admin routes, plain HTTP.
+    let resp = http
+        .get(format!("http://{console}/admin/ui/"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = http
+        .get(format!("http://{console}/admin/whoami"))
+        .bearer_auth(ADMIN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Metrics, plain HTTP; they count the TLS request above too.
+    let resp = http
+        .get(format!("http://{metrics}/metrics"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(resp.text().await.unwrap().contains("attenuo_"));
+
+    // None of them speaks TLS.
+    for addr in [admin, console, metrics] {
+        assert!(
+            tls_connect(&ca, addr, &[b"http/1.1"]).await.is_err(),
+            "{addr}"
+        );
+    }
+    server.stop(state).await;
+}
+
+/// Without `[admin] listen` the admin API is on the main listener and works over TLS.
+#[tokio::test]
+async fn admin_routes_on_the_main_listener_work_over_tls() {
+    let dir = tempfile::tempdir().unwrap();
+    let ca = Ca::new("server-tls test CA");
+    let cfg = tls_config(dir.path(), &ca, 10);
+    assert!(cfg.admin.listen.is_none());
+    let (server, state) = start(cfg).await;
+    let https = client(&ca);
+    let resp = https
+        .get(server.https_url("/admin/whoami"))
+        .bearer_auth(ADMIN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = https
+        .get(server.https_url("/admin/audit/verify"))
+        .bearer_auth(ADMIN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = https
+        .get(server.https_url("/admin/whoami"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    server.stop(state).await;
+}
+
 /// `serve_until` never speaks TLS: a router built over a state with `[server.tls]` answers
 /// every request it serves with 500 and issues nothing, rather than take tokens in cleartext.
 #[tokio::test]
@@ -493,9 +611,13 @@ async fn serve_until_refuses_to_serve_a_tls_router_in_cleartext() {
         Duration::from_secs(5),
     ));
     let http = reqwest::Client::new();
+    // The TLS marker is a value the accept loop puts into the request, never a header: no
+    // header a client sends gets a request through.
     for path in ["/healthz", "/.well-known/authzen-configuration"] {
         let resp = http
             .get(format!("http://{addr}{path}"))
+            .header("ServedOverTls", "1")
+            .header("X-Forwarded-Proto", "https")
             .send()
             .await
             .unwrap();
@@ -596,7 +718,7 @@ fn a_bad_server_tls_section_stops_the_server_at_startup() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tls.key_pem_path, std::fs::Permissions::from_mode(0o640))
+        std::fs::set_permissions(&tls.key_pem_path, std::fs::Permissions::from_mode(0o604))
             .unwrap();
         let err = refused(&good);
         assert!(err.contains("chmod 600"), "{err}");

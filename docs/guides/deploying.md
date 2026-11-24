@@ -115,7 +115,7 @@ listen = "127.0.0.1:9102"
 # The server certificate first, then any intermediate certificates.
 cert_pem_path = "/etc/attenuo/tls/server.crt"
 # One private key: PKCS#8, SEC1 or PKCS#1, not encrypted. ECDSA P-256 is the cheapest to
-# serve. Mode 0600 or 0400, owned by the server's user.
+# serve. Mode 0600 owned by the server's user, or 0640 owned by root with the server's group.
 key_pem_path = "/etc/attenuo/tls/server.key"
 ```
 
@@ -134,7 +134,7 @@ What it needs:
 - `[server] public_url` must be set and must start with `https://`. `[server] allow_insecure_http` is refused.
 - The key must belong to the first certificate in `cert_pem_path`.
 - Keep the private key out of `cert_pem_path`, unless both keys name the same file. An encrypted key is refused in either file.
-- The key file must not be readable or writable by its group or by others. See [The key file's mode](#the-key-files-mode).
+- The key file must give others no access, and its group at most read, and that only when root owns it. See [The key file's mode](#the-key-files-mode).
 
 The server reads both files once, at start. A renewed certificate needs a restart. Plan the restart before the old certificate expires. The server does not check its own certificate's dates: an expired certificate is served until clients refuse it.
 
@@ -155,13 +155,18 @@ With `[server.tls]` the main listener answers no plain HTTP, so every check of i
 
 #### The key file's mode
 
-On Unix the server refuses a key file that its group or others may read or write (any bit of `0o077`). Give it mode `0600` or `0400`, owned by the user the server runs as. The image runs as uid `10001`.
+On Unix the server checks the key file's owner and mode. It follows PostgreSQL's rule for `ssl_key_file`:
 
-- **A file on the host**: `chown 10001 server.key && chmod 600 server.key`. A bind mount keeps that mode and owner.
+- Others may never have any access.
+- The group may never write or execute.
+- If root owns the file, the group may read it: mode `0640` or `0440` at most.
+- If anyone else owns it, the group gets nothing: mode `0600` or `0400` at most.
+
+The server refuses any other file and says which rule failed. The image runs as uid `10001`.
+
+- **A file on the host**: `chown 10001 server.key && chmod 600 server.key`. Or let root own it with the server's group: `chown root:attenuo server.key && chmod 640 server.key`. A bind mount keeps that mode and owner.
 - **Docker Swarm secrets**: set `mode: 0400` and `uid: "10001"` in the service's `secrets` entry. A Compose file outside Swarm mounts the host file as it is, so set the mode on the host.
-- **Kubernetes Secrets**: set `defaultMode: 0400` on the volume (or `mode` on the item). The files then belong to root. A server that runs as a non-root user cannot read a root-owned `0400` file. With `fsGroup` set, Kubernetes may also add group read (`0440`), and the server then refuses the file. One way out: an init container, running as the server's user, copies the key from the Secret into an `emptyDir` with mode `0600`, and `key_pem_path` names the copy.
-
-The check is strict on purpose: the key lets anyone who reads it impersonate the server.
+- **Kubernetes Secrets**: set `defaultMode: 0440` on the volume (or `mode` on the item) and `fsGroup` to the server's group in the pod's `securityContext` (the image's group is `10001`). Kubernetes normally makes the Secret's files owned by root with the `fsGroup` group, so the server reads the key through its group, and the rule above accepts it. This was not tested here. Do not use `defaultMode: 0400` without `fsGroup` for a non-root server: the root-owned file is then unreadable.
 
 #### What TLS costs
 

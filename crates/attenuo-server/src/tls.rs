@@ -3,9 +3,9 @@
 //! [`server_config`] reads the certificate chain and the private key once, at startup, and
 //! refuses anything it cannot use as it is (fail closed): a file that cannot be read, is not
 //! a regular file, is empty or too large; a certificate file with no certificate, or with a
-//! private key in it; a key file with no private key or more than one; a key file that its
-//! group or others may read or write (Unix); a key that does not belong to the first
-//! certificate.
+//! private key in it; a key file with no private key or more than one; a key file whose
+//! owner and mode break PostgreSQL's `ssl_key_file` rule ([`key_mode_ok`], Unix); a key that
+//! does not belong to the first certificate.
 //!
 //! The configuration it builds:
 //!
@@ -216,17 +216,47 @@ fn read_file(path: &Path, max: u64, secret: bool) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-/// On Unix, refuse a key file that its group or others may read or write (any bit of `0o077`).
-/// The mode is the open file's, so it is the file that is read.
+/// On Unix, the rule of [`key_mode_ok`] for the open file: its owner and mode are the open
+/// file's, so they are those of the file that is read.
 #[cfg(unix)]
 fn check_key_mode(meta: &std::fs::Metadata) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-    let mode = meta.permissions().mode() & 0o7777;
-    if mode & 0o077 != 0 {
+    use std::os::unix::fs::MetadataExt;
+    key_mode_ok(meta.uid(), meta.mode())
+}
+
+/// The key file rule, PostgreSQL's for `ssl_key_file`: no bit for others, ever, and no group
+/// write or execute. A file owned by root may also be readable by its group (mode at most
+/// `0640`), which is how a Kubernetes Secret volume with `fsGroup` or a distribution's
+/// `ssl-cert` group gives a non-root server the key. A file owned by anyone else has no group
+/// bits at all (mode at most `0600`). `mode` may carry the file type bits; only the
+/// permission bits are read.
+pub(crate) fn key_mode_ok(uid: u32, mode: u32) -> Result<(), String> {
+    let perm = mode & 0o7777;
+    if perm & 0o007 != 0 {
         return Err(format!(
-            "the private key file has mode {mode:04o}; it must not be readable or writable by \
-             its group or by others. Give it mode 0600 or 0400, owned by the server's account \
-             (chmod 600)"
+            "the private key file has mode {perm:04o}, which gives others access; no bit for \
+             others is allowed. Use mode 0600 or 0400 owned by the server's account (chmod 600), \
+             or 0640 or 0440 owned by root with the server's group"
+        ));
+    }
+    if perm & 0o030 != 0 {
+        return Err(format!(
+            "the private key file has mode {perm:04o}, which lets its group write or execute it; \
+             at most group read is allowed, and only when root owns the file. Use mode 0600 or \
+             0400 owned by the server's account (chmod 600), or 0640 or 0440 owned by root"
+        ));
+    }
+    if perm & 0o040 != 0 && uid != 0 {
+        return Err(format!(
+            "the private key file has mode {perm:04o} and is not owned by root, so its group may \
+             read it; group read is allowed only when root owns the file. Use mode 0600 or 0400 \
+             (chmod 600), or make root the owner (0640 or 0440, group of the server's account)"
+        ));
+    }
+    if perm & 0o7000 != 0 {
+        return Err(format!(
+            "the private key file has mode {perm:04o}, with a setuid, setgid or sticky bit; \
+             use mode 0600 (chmod 600)"
         ));
     }
     Ok(())
@@ -587,25 +617,80 @@ mod tests {
         );
     }
 
+    /// [`key_mode_ok`], for every case, whoever runs the tests.
+    #[test]
+    fn the_key_mode_rule_follows_postgresql() {
+        const ROOT: u32 = 0;
+        const USER: u32 = 10001;
+        // Accepted: owner only, for anyone; group read too, for root only.
+        for (uid, mode) in [
+            (USER, 0o600),
+            (USER, 0o400),
+            (USER, 0o200),
+            (ROOT, 0o600),
+            (ROOT, 0o400),
+            (ROOT, 0o640),
+            (ROOT, 0o440),
+            // The file type bits are ignored.
+            (USER, 0o100_600),
+            (ROOT, 0o100_440),
+        ] {
+            assert!(key_mode_ok(uid, mode).is_ok(), "{uid} {mode:o}");
+        }
+        let refused = |uid: u32, mode: u32, why: &str| {
+            let err = key_mode_ok(uid, mode).unwrap_err();
+            assert!(err.contains(why), "{uid} {mode:o}: {err}");
+            assert!(err.contains("chmod 600"), "{uid} {mode:o}: {err}");
+            assert!(err.contains(&format!("{:04o}", mode & 0o7777)), "{err}");
+        };
+        // Others: never, whoever owns it.
+        for uid in [ROOT, USER] {
+            for mode in [0o604, 0o602, 0o601, 0o644, 0o666, 0o444, 0o640 | 0o004] {
+                refused(uid, mode, "gives others access");
+            }
+            // Group write or execute: never.
+            for mode in [0o620, 0o610, 0o660, 0o670, 0o460] {
+                refused(uid, mode, "group write or execute");
+            }
+            for mode in [0o4600, 0o2600, 0o1600] {
+                refused(uid, mode, "setuid");
+            }
+        }
+        // Group read: only for root.
+        for mode in [0o640, 0o440] {
+            refused(USER, mode, "not owned by root");
+        }
+    }
+
+    /// The rule on real files: the owner is whoever runs the test, so the root-owned group
+    /// read case is checked on disk only when that is root (`the_key_mode_rule_follows_postgresql`
+    /// checks the decision itself for both owners).
     #[cfg(unix)]
     #[test]
     fn a_key_file_open_to_group_or_others_is_refused() {
+        use std::os::unix::fs::MetadataExt;
         let dir = tempfile::tempdir().unwrap();
         let (cert_pem, key_pem) = cert_and_key();
         let cert = write(dir.path(), "server.crt", &cert_pem, 0o644);
-        for mode in [0o640, 0o604, 0o620, 0o602, 0o660, 0o644, 0o666] {
+        let owner = std::fs::metadata(&cert).unwrap().uid();
+        for mode in [0o644, 0o604, 0o666, 0o620, 0o660, 0o602] {
             let key = write(dir.path(), &format!("k{mode:o}.key"), &key_pem, mode);
             let err = refusal(&cert, &key);
             assert!(err.contains("chmod 600"), "{mode:o}: {err}");
-            assert!(
-                err.contains("must not be readable or writable"),
-                "{mode:o}: {err}"
-            );
             assert!(err.contains(&format!("{mode:04o}")), "{mode:o}: {err}");
         }
         for mode in [0o600, 0o400] {
             let key = write(dir.path(), &format!("k{mode:o}.key"), &key_pem, mode);
             server_config(&section(&cert, &key)).unwrap();
+        }
+        for mode in [0o640, 0o440] {
+            let key = write(dir.path(), &format!("g{mode:o}.key"), &key_pem, mode);
+            if owner == 0 {
+                server_config(&section(&cert, &key)).unwrap();
+            } else {
+                let err = refusal(&cert, &key);
+                assert!(err.contains("not owned by root"), "{mode:o}: {err}");
+            }
         }
         // The certificate file's mode does not matter.
         let key = write(dir.path(), "ok.key", &key_pem, 0o600);

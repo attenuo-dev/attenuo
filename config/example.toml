@@ -31,8 +31,9 @@ listen = "127.0.0.1:8080"
 # [server.tls]
 # # The server certificate first, then any intermediate certificates.
 # cert_pem_path = "/etc/attenuo/tls/server.crt"
-# # One private key (PKCS#8, SEC1 or PKCS#1, not encrypted). On Unix the server refuses to
-# # start if its group or others can read or write it: chmod 600.
+# # One private key (PKCS#8, SEC1 or PKCS#1, not encrypted). On Unix: no access for others,
+# # no group write, and group read only when root owns the file (0600 for the server's own
+# # file, 0640 when root owns it), as PostgreSQL asks of ssl_key_file.
 # key_pem_path = "/etc/attenuo/tls/server.key"
 
 [issuer]
