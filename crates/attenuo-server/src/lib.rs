@@ -80,6 +80,7 @@ pub mod auto_prune;
 pub mod authz;
 pub(crate) mod client_cert;
 pub(crate) mod client_cert_verifier;
+pub(crate) mod client_pki;
 pub(crate) mod clientauth;
 pub mod config;
 // Used by the fuzz targets.

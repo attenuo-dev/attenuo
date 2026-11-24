@@ -71,6 +71,9 @@ criterion = { version = "0.8", default-features = false, features = ["cargo_benc
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+# Path building for RFC 8705 `tls_client_auth` in attenuo-server (`src/client_pki.rs`): the
+# version rustls already brings in, with the same `ring` algorithms.
+rustls-webpki = { version = "0.103", default-features = false, features = ["ring", "std"] }
 clap = { version = "4", features = ["derive"] }
 toml = "1"
 serde_urlencoded = "0.7"

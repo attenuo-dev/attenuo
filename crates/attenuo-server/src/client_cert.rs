@@ -15,14 +15,26 @@ use rustls::pki_types::{CertificateDer, UnixTime};
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 
+/// Most intermediate certificates kept from a client's handshake, after its own certificate.
+/// A chain with more is kept without them and refused by the CA check
+/// ([`crate::client_pki`]); a client certificate from a CA rarely needs more than one or
+/// two. The whole certificate message is at most 64 KiB (rustls' limit for a handshake
+/// message), so this also bounds what a connection keeps.
+pub(crate) const MAX_INTERMEDIATES: usize = 8;
+
 /// The end-entity certificate the client proved it holds the key of, with its SHA-256
-/// thumbprint. Cheap to clone: one per connection, shared by its requests.
+/// thumbprint, and the other certificates the client sent after it (the intermediates, for
+/// the CA check of `tls_client_auth`). Cheap to clone: one per connection, shared by its
+/// requests.
 #[derive(Clone)]
 pub(crate) struct ClientCertificate(Arc<Inner>);
 
 struct Inner {
     der: CertificateDer<'static>,
     sha256: [u8; 32],
+    /// The certificates after the first, in the order the client sent them; `None` when it
+    /// sent more than [`MAX_INTERMEDIATES`].
+    intermediates: Option<Vec<CertificateDer<'static>>>,
 }
 
 impl std::fmt::Debug for ClientCertificate {
@@ -60,10 +72,45 @@ impl NotUsable {
 }
 
 impl ClientCertificate {
-    /// The certificate `der`, as the TLS handshake gave it.
+    /// The certificate `der`, with no intermediates.
+    #[cfg(test)]
     pub(crate) fn new(der: CertificateDer<'static>) -> Self {
+        Self::with_intermediates(der, Some(Vec::new()))
+    }
+
+    /// The certificates the client sent in its TLS handshake, its own first: `None` when it
+    /// sent none.
+    pub(crate) fn from_handshake(chain: &[CertificateDer<'_>]) -> Option<Self> {
+        let (leaf, rest) = chain.split_first()?;
+        let intermediates = (rest.len() <= MAX_INTERMEDIATES)
+            .then(|| rest.iter().map(|c| c.clone().into_owned()).collect());
+        Some(Self::with_intermediates(
+            leaf.clone().into_owned(),
+            intermediates,
+        ))
+    }
+
+    fn with_intermediates(
+        der: CertificateDer<'static>,
+        intermediates: Option<Vec<CertificateDer<'static>>>,
+    ) -> Self {
         let sha256 = Sha256::digest(der.as_ref()).into();
-        Self(Arc::new(Inner { der, sha256 }))
+        Self(Arc::new(Inner {
+            der,
+            sha256,
+            intermediates,
+        }))
+    }
+
+    /// The end-entity certificate's DER bytes.
+    pub(crate) fn der(&self) -> &CertificateDer<'static> {
+        &self.0.der
+    }
+
+    /// The certificates the client sent after its own, for path building; `None` when it
+    /// sent more than [`MAX_INTERMEDIATES`].
+    pub(crate) fn intermediates(&self) -> Option<&[CertificateDer<'static>]> {
+        self.0.intermediates.as_deref()
     }
 
     /// The SHA-256 of the certificate's DER bytes.
@@ -113,7 +160,7 @@ impl ClientCertificate {
 }
 
 /// The `ring` provider, the listener's, made once.
-fn provider() -> Arc<rustls::crypto::CryptoProvider> {
+pub(crate) fn provider() -> Arc<rustls::crypto::CryptoProvider> {
     static PROVIDER: OnceLock<Arc<rustls::crypto::CryptoProvider>> = OnceLock::new();
     PROVIDER
         .get_or_init(|| Arc::new(rustls::crypto::ring::default_provider()))
@@ -156,6 +203,32 @@ mod tests {
             abc.audit_value(),
             serde_json::json!({"x5t#S256": "ungWv48Bz-pBQUDeXa4iI7ADYaOWF3qctBD_YfIAFa0", "source": "tls"})
         );
+    }
+
+    /// The handshake's chain: the first certificate is the client's, the rest are kept as
+    /// intermediates, up to [`MAX_INTERMEDIATES`].
+    #[test]
+    fn the_handshake_chain_is_kept_up_to_a_limit() {
+        assert!(ClientCertificate::from_handshake(&[]).is_none());
+        let der = |b: &[u8]| CertificateDer::from(b.to_vec());
+        let leaf = ClientCertificate::from_handshake(&[der(b"leaf")]).unwrap();
+        assert_eq!(leaf.der().as_ref(), b"leaf");
+        assert_eq!(leaf.intermediates(), Some(&[][..]));
+        let chain: Vec<_> = std::iter::once(der(b"leaf"))
+            .chain((0..MAX_INTERMEDIATES).map(|i| der(&[u8::try_from(i).unwrap()])))
+            .collect();
+        let full = ClientCertificate::from_handshake(&chain).unwrap();
+        assert_eq!(full.intermediates().unwrap(), &chain[1..]);
+        assert_eq!(full.sha256(), leaf.sha256());
+        let mut long = chain.clone();
+        long.push(der(b"one too many"));
+        let long = ClientCertificate::from_handshake(&long).unwrap();
+        assert_eq!(long.der().as_ref(), b"leaf");
+        assert!(long.intermediates().is_none());
+        assert!(ClientCertificate::new(der(b"x"))
+            .intermediates()
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

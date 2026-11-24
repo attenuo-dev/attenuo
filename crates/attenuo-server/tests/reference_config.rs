@@ -156,6 +156,9 @@ jwks_url = "https://keys.example/planner.json"
 jwks_ttl_seconds = 300
 ca_pem_path = "/etc/attenuo/client-ca.pem"
 tls_client_cert_sha256 = ["0000000000000000000000000000000000000000000000000000000000000000"]
+tls_client_ca_pem_path = "/etc/attenuo/agents-ca.pem"
+tls_client_auth_san_uri = "spiffe://example.org/ns/agents/sa/planner"
+tls_client_auth_san_dns = "planner.agents.internal"
 
 [[peps]]
 id = "pep"
@@ -165,6 +168,9 @@ jwks_url = "https://keys.example/pep.json"
 jwks_ttl_seconds = 300
 ca_pem_path = "/etc/attenuo/client-ca.pem"
 tls_client_cert_sha256 = ["0000000000000000000000000000000000000000000000000000000000000000"]
+tls_client_ca_pem_path = "/etc/attenuo/agents-ca.pem"
+tls_client_auth_san_uri = "spiffe://example.org/ns/agents/sa/planner"
+tls_client_auth_san_dns = "planner.agents.internal"
 
 [[root_grants]]
 issuer = "https://idp.example"

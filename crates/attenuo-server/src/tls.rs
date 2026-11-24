@@ -156,7 +156,7 @@ fn read_certs(path: &Path, key_path: &Path) -> Result<Vec<CertificateDer<'static
 /// Whether the bytes `PRIVATE KEY` appear anywhere in `pem`: a key section of any kind
 /// (`PRIVATE KEY`, `EC PRIVATE KEY`, `RSA PRIVATE KEY`, `ENCRYPTED PRIVATE KEY`, ...), well
 /// formed or not, on a line of its own or run together with others. Nothing is decoded.
-fn mentions_private_key(pem: &[u8]) -> bool {
+pub(crate) fn mentions_private_key(pem: &[u8]) -> bool {
     const NEEDLE: &[u8] = b"PRIVATE KEY";
     pem.windows(NEEDLE.len()).any(|w| w == NEEDLE)
 }
@@ -195,7 +195,7 @@ fn read_key(path: &Path) -> Result<PrivateKeyDer<'static>, String> {
 /// The bytes of a regular file of at most `max` bytes, checked before reading and again while
 /// reading, as `ca_pem_path` files are read. For a `secret` file on Unix, the open file must
 /// not be readable or writable by its group or by others.
-fn read_file(path: &Path, max: u64, secret: bool) -> Result<Vec<u8>, String> {
+pub(crate) fn read_file(path: &Path, max: u64, secret: bool) -> Result<Vec<u8>, String> {
     use std::io::Read;
     let unreadable = |e: std::io::Error| format!("cannot read the file ({e})");
     let too_big = || format!("the file is larger than {} KiB", max / 1024);

@@ -104,3 +104,7 @@ Not done here, each for a later change:
 - `x5c` in JWK Sets, CRL and OCSP.
 
 Related: ADR-0007 and ADR-0017, which set mTLS aside; ADR-0018, the native TLS listener; ADR-0014, the SR-109 rule; ADR-0017's SR-110 update, one answer for refusals.
+
+### Update 2026-11-24: certificates from a CA
+
+The decision above stands. The first item of "Not done here" is now done for SAN URI (with SPIFFE IDs) and SAN DNS: `tls_client_ca_pem_path` with `tls_client_auth_san_uri` or `tls_client_auth_san_dns` (RFC 8705 `tls_client_auth`, [ADR-0020](0020-pki-tls-client-auth.md)). An entry uses pins or a CA, not both. The listener now also keeps the certificates the client sends after its own (at most 8), for the CA check; the self-signed check still ignores them.

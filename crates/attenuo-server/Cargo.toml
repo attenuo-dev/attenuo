@@ -56,6 +56,9 @@ ring = { workspace = true }
 # `ring` provider reqwest already brings in.
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
+# RFC 8705 `tls_client_auth`: a client certificate's path to its entry's CAs and its names
+# (`src/client_pki.rs`). The version rustls already uses; imported as `webpki`.
+rustls-webpki = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_urlencoded = { workspace = true }

@@ -20,7 +20,8 @@
 //! - no chain, no trust anchor, no issuer: any certificate, self-signed or not, passes;
 //! - no dates, no key usage, no extended key usage, no names;
 //! - no revocation (no CRL, no OCSP);
-//! - the intermediates the client sent are ignored.
+//! - the intermediates the client sent are not checked here; the accept loop keeps them with
+//!   the certificate, for the CA check of `tls_client_auth` ([`crate::client_pki`]).
 //!
 //! It never requires a certificate ([`ClientCertVerifier::client_auth_mandatory`] is
 //! `false`): a client without one connects as before. It asks for one
@@ -37,7 +38,8 @@
 //! ([`crate::client_cert::ClientCertificate`], set by the accept loop only, never from a
 //! header), and each request decides, against its own snapshot of the lists, whether the
 //! certificate authenticates a client ([`crate::clientauth`]: its SHA-256 thumbprint must be
-//! one the named entry lists, and its dates must hold). A certificate removed by a reload
+//! one the named entry lists, or it must chain to the entry's CAs and carry its name, and its
+//! dates must hold). A certificate removed by a reload
 //! stops working on the next request of a connection that is already open. With session
 //! resumption off ([`crate::tls`]), every certificate a request carries was proven in this
 //! process, on that connection.
