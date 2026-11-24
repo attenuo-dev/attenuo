@@ -203,10 +203,18 @@ pub(crate) async fn require_tls(
     if req.extensions().get::<ServedOverTls>().is_some() {
         return next.run(req).await;
     }
-    tracing::error!(
-        "a request reached the main router without TLS although [server.tls] is set; serve \
-         the router with attenuo_server::run or serve, not serve_until or another server"
-    );
+    // An error once per process, so a misconfigured embedder does not flood the log; every
+    // later refusal at debug.
+    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::debug!("a request reached the main router without TLS; refused with 500");
+    } else {
+        tracing::error!(
+            "a request reached the main router without TLS although [server.tls] is set; \
+             serve the router with attenuo_server::run or serve, not serve_until or another \
+             server. Every such request is refused with 500 (logged at debug from now on)"
+        );
+    }
     axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
 }
 

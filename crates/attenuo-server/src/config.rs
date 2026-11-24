@@ -533,8 +533,9 @@ pub struct ServerTlsSection {
     /// PEM file with the server certificate first, then any intermediate certificates.
     pub cert_pem_path: PathBuf,
     /// PEM file with the one private key of the certificate (PKCS#8, SEC1 or PKCS#1, not
-    /// encrypted). On Unix, PostgreSQL's `ssl_key_file` rule: no access for others, no group write
-    /// or execute, and group read only when root owns the file.
+    /// encrypted). On Unix, PostgreSQL's `ssl_key_file` rule: owned by the server's effective user or
+    /// root, no access for others, no group write or execute, and group read only when root
+    /// owns the file.
     pub key_pem_path: PathBuf,
 }
 

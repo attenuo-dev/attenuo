@@ -4,8 +4,9 @@
 //! refuses anything it cannot use as it is (fail closed): a file that cannot be read, is not
 //! a regular file, is empty or too large; a certificate file with no certificate, or with a
 //! private key in it; a key file with no private key or more than one; a key file whose
-//! owner and mode break PostgreSQL's `ssl_key_file` rule ([`key_mode_ok`], Unix); a key that
-//! does not belong to the first certificate.
+//! owner and mode break PostgreSQL's `ssl_key_file` rule ([`key_mode_ok`], Unix: owned by
+//! the server's effective user or root, no access for others); a key that does not belong to
+//! the first certificate.
 //!
 //! The configuration it builds:
 //!
@@ -17,7 +18,8 @@
 //!   makes a full handshake;
 //! - no client authentication.
 //!
-//! Nothing here logs or returns the content of a file. A renewed certificate takes a restart.
+//! Nothing here logs or returns the content of a file: every error is a fixed text that names
+//! the file and the kind of problem, never a parser's or rustls's detail. A renewed certificate takes a restart.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -95,11 +97,10 @@ fn certified_key(
     key: PrivateKeyDer<'static>,
     provider: &CryptoProvider,
 ) -> Result<CertifiedKey, String> {
-    let signing_key = provider.key_provider.load_private_key(key).map_err(|e| {
-        format!(
-            "the private key cannot be used ({e}); use an RSA, ECDSA P-256 or P-384, or \
-             Ed25519 key"
-        )
+    // No error detail from rustls or the file: fixed texts only.
+    let signing_key = provider.key_provider.load_private_key(key).map_err(|_| {
+        "the private key cannot be used; use an RSA, ECDSA P-256 or P-384, or Ed25519 key"
+            .to_owned()
     })?;
     let certified = CertifiedKey::new(certs, signing_key);
     match certified.keys_match() {
@@ -112,7 +113,7 @@ fn certified_key(
         Err(rustls::Error::InconsistentKeys(_)) => {
             Err("cannot check that the private key belongs to the first certificate".into())
         }
-        Err(e) => Err(format!("the first certificate cannot be read ({e})")),
+        Err(_) => Err("the first certificate cannot be read as an X.509 certificate".into()),
     }
 }
 
@@ -122,39 +123,30 @@ fn read_certs(path: &Path, key_path: &Path) -> Result<Vec<CertificateDer<'static
     if pem.iter().all(u8::is_ascii_whitespace) {
         return Err("the file is empty; it must hold PEM certificates".into());
     }
-    let has_key = has_private_key_label(&pem);
+    let has_key = mentions_private_key(&pem);
     // A private key here would be as exposed as the certificate, which is not secret; keep it
     // in key_pem_path. The same file for both keys is fine: it is checked as a key file. Any
-    // `... PRIVATE KEY` section counts, an encrypted one included, which rustls does not read.
+    // mention of `PRIVATE KEY` counts, an encrypted or malformed key included.
     if has_key && path != key_path {
         return Err("the file holds a private key; keep the key in key_pem_path only".into());
     }
-    // The parser decodes every section, so its error can quote a character of a key block
-    // in a file that holds one: then it is not shown.
+    // The parser's error is never shown: some of its variants print a whole line of the file,
+    // which may be part of a private key.
     let certs = CertificateDer::pem_slice_iter(&pem)
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| {
-            if has_key {
-                "not a valid PEM file".to_owned()
-            } else {
-                format!("not a PEM certificate file ({e})")
-            }
-        })?;
+        .map_err(|_| "not a valid PEM certificate file".to_owned())?;
     if certs.is_empty() {
         return Err("no PEM certificate (-----BEGIN CERTIFICATE-----) in the file".into());
     }
     Ok(certs)
 }
 
-/// Whether `pem` has a line that begins a `... PRIVATE KEY` section: `PRIVATE KEY`,
-/// `EC PRIVATE KEY`, `RSA PRIVATE KEY`, and also kinds the PEM parser skips, such as
-/// `ENCRYPTED PRIVATE KEY` (PKCS#8 encrypted, RFC 5958). Read from the labels alone, without
-/// decoding anything.
-fn has_private_key_label(pem: &[u8]) -> bool {
-    pem.split(|b| *b == b'\n' || *b == b'\r').any(|line| {
-        let line = line.trim_ascii();
-        line.starts_with(b"-----BEGIN ") && line.ends_with(b"PRIVATE KEY-----")
-    })
+/// Whether the bytes `PRIVATE KEY` appear anywhere in `pem`: a key section of any kind
+/// (`PRIVATE KEY`, `EC PRIVATE KEY`, `RSA PRIVATE KEY`, `ENCRYPTED PRIVATE KEY`, ...), well
+/// formed or not, on a line of its own or run together with others. Nothing is decoded.
+fn mentions_private_key(pem: &[u8]) -> bool {
+    const NEEDLE: &[u8] = b"PRIVATE KEY";
+    pem.windows(NEEDLE.len()).any(|w| w == NEEDLE)
 }
 
 /// The one private key of the `key_pem_path` file.
@@ -216,22 +208,31 @@ fn read_file(path: &Path, max: u64, secret: bool) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-/// On Unix, the rule of [`key_mode_ok`] for the open file: its owner and mode are the open
-/// file's, so they are those of the file that is read.
+/// On Unix, the rule of [`key_mode_ok`] for the open file and this process: the owner and
+/// mode are the open file's, so they are those of the file that is read.
 #[cfg(unix)]
 fn check_key_mode(meta: &std::fs::Metadata) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt;
-    key_mode_ok(meta.uid(), meta.mode())
+    key_mode_ok(meta.uid(), meta.mode(), rustix::process::geteuid().as_raw())
 }
 
-/// The key file rule, PostgreSQL's for `ssl_key_file`: no bit for others, ever, and no group
-/// write or execute. A file owned by root may also be readable by its group (mode at most
-/// `0640`), which is how a Kubernetes Secret volume with `fsGroup` or a distribution's
-/// `ssl-cert` group gives a non-root server the key. A file owned by anyone else has no group
-/// bits at all (mode at most `0600`). `mode` may carry the file type bits; only the
-/// permission bits are read.
-pub(crate) fn key_mode_ok(uid: u32, mode: u32) -> Result<(), String> {
+/// The key file rule, PostgreSQL's for `ssl_key_file`: the file is owned by the server's
+/// effective user (`euid`) or by root; others get no bit, ever, and the group never write or
+/// execute. A file owned by root may also be readable by its group (mode at most `0640`),
+/// which is how a Kubernetes Secret volume with `fsGroup` or a distribution's `ssl-cert`
+/// group gives a non-root server the key. A file owned by the server's user has no group bits
+/// at all (mode at most `0600`). `mode` may carry the file type bits; only the permission
+/// bits are read.
+pub(crate) fn key_mode_ok(file_uid: u32, mode: u32, euid: u32) -> Result<(), String> {
     let perm = mode & 0o7777;
+    if file_uid != euid && file_uid != 0 {
+        return Err(format!(
+            "the private key file is owned by uid {file_uid}, which is neither the server's \
+             account (uid {euid}) nor root; another account could change or swap it. Make the \
+             server's account (chown {euid}, chmod 600) or root (chown 0, chmod 640, group of \
+             the server's account) its owner"
+        ));
+    }
     if perm & 0o007 != 0 {
         return Err(format!(
             "the private key file has mode {perm:04o}, which gives others access; no bit for \
@@ -246,7 +247,7 @@ pub(crate) fn key_mode_ok(uid: u32, mode: u32) -> Result<(), String> {
              0400 owned by the server's account (chmod 600), or 0640 or 0440 owned by root"
         ));
     }
-    if perm & 0o040 != 0 && uid != 0 {
+    if perm & 0o040 != 0 && file_uid != 0 {
         return Err(format!(
             "the private key file has mode {perm:04o} and is not owned by root, so its group may \
              read it; group read is allowed only when root owns the file. Use mode 0600 or 0400 \
@@ -424,7 +425,7 @@ mod tests {
             0o644,
         );
         let err = refusal(&broken, &key);
-        assert!(err.contains("not a PEM certificate file"), "{err}");
+        assert!(err.contains("not a valid PEM certificate file"), "{err}");
         // A block that is base64 but not a certificate.
         let garbage = write(
             dir.path(),
@@ -511,16 +512,108 @@ mod tests {
         (lines.join("\n") + "\n", body)
     }
 
-    /// `err` shows no part of the key body: no line, no run of 6 characters, no parser detail.
-    fn assert_no_key_text(err: &str, body: &[String]) {
-        for line in body {
-            assert!(!err.contains(line.as_str()), "{err}");
-            for i in 0..line.len().saturating_sub(6) {
-                assert!(!err.contains(&line[i..i + 6]), "{err}");
+    /// `err` shows no part of the key body: no line, no run of 6 characters, no list of byte
+    /// values (the form the PEM parser prints a line in), no parser detail, and it is short
+    /// once the file paths are taken out.
+    fn assert_no_key_text(err: &str, body: &[String], paths: &[&Path]) {
+        let mut text = err.to_owned();
+        for p in paths {
+            text = text.replace(&p.display().to_string(), "<path>");
+        }
+        assert!(text.len() < 300, "{} bytes: {text}", text.len());
+        let joined: String = body.concat();
+        for i in 0..joined.len().saturating_sub(6) {
+            assert!(!text.contains(&joined[i..i + 6]), "{text}");
+        }
+        assert!(numbers_in_a_row(&text) <= 3, "{text}");
+        for detail in [
+            "InvalidCharacter",
+            "base64",
+            "Base64",
+            "*",
+            "missing section",
+            "illegal section",
+        ] {
+            assert!(!text.contains(detail), "{detail}: {text}");
+        }
+    }
+
+    /// The longest run of comma-separated numbers in `text` (`45, 45, 66` is 3).
+    fn numbers_in_a_row(text: &str) -> usize {
+        let mut best = 0;
+        let mut run = 0;
+        for part in text.split(',') {
+            if !part.trim().is_empty() && part.trim().bytes().all(|b| b.is_ascii_digit()) {
+                run += 1;
+                best = best.max(run);
+            } else {
+                run = usize::from(
+                    part.trim_end()
+                        .rsplit(|c: char| !c.is_ascii_digit())
+                        .next()
+                        .is_some_and(|d| !d.is_empty()),
+                );
+                best = best.max(run);
             }
         }
-        for detail in ["InvalidCharacter", "base64", "Base64", "*"] {
-            assert!(!err.contains(detail), "{detail}: {err}");
+        best
+    }
+
+    #[test]
+    fn numbers_in_a_row_counts_byte_lists() {
+        assert_eq!(numbers_in_a_row("no numbers"), 0);
+        assert_eq!(numbers_in_a_row("line: [45, 45, 45, 66, 69]"), 4);
+        assert_eq!(numbers_in_a_row("mode 0640, uid 0"), 1);
+    }
+
+    /// A real key and a certificate, run together on one line with every newline removed, in
+    /// either order, as a file loses its line breaks when pasted through some tools.
+    #[test]
+    fn a_flattened_file_never_quotes_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert_pem, key_pem) = cert_and_key();
+        let body: Vec<String> = key_pem
+            .lines()
+            .filter(|l| !l.starts_with("-----"))
+            .map(str::to_owned)
+            .collect();
+        let flat = |t: &str| t.replace(['\n', '\r'], "");
+        let good_key = write(dir.path(), "good.key", &key_pem, 0o600);
+        let good_cert = write(dir.path(), "good.crt", &cert_pem, 0o644);
+        let cases = [
+            ("key-first", flat(&format!("{key_pem}{cert_pem}"))),
+            ("cert-first", flat(&format!("{cert_pem}{key_pem}"))),
+            ("key-only", flat(&key_pem)),
+            // A BEGIN line with text after it.
+            (
+                "trailing",
+                key_pem.replacen(
+                    "-----BEGIN PRIVATE KEY-----",
+                    "-----BEGIN PRIVATE KEY----- x",
+                    1,
+                ) + &cert_pem,
+            ),
+            // CRLF line ends, and a CR-only file.
+            ("crlf", format!("{key_pem}{cert_pem}").replace('\n', "\r\n")),
+            ("cr", format!("{key_pem}{cert_pem}").replace('\n', "\r")),
+        ];
+        for (name, text) in cases {
+            let file = write(dir.path(), &format!("{name}.pem"), &text, 0o600);
+            for (cert, key) in [(&file, &file), (&file, &good_key), (&good_cert, &file)] {
+                if let Err(e) = server_config(&section(cert, key)) {
+                    let err = format!("{e:#}");
+                    assert_no_key_text(&err, &body, &[cert, key]);
+                } else {
+                    // Only a well-formed file with other line ends may be accepted, and never
+                    // as a certificate file next to another key file.
+                    assert!(
+                        matches!(name, "crlf" | "cr") && !(cert == &file && key == &good_key),
+                        "{name} accepted as {} and {}",
+                        cert.display(),
+                        key.display()
+                    );
+                }
+            }
         }
     }
 
@@ -536,7 +629,7 @@ mod tests {
         let bad_key = write(dir.path(), "bad.key", &broken, 0o600);
         let err = refusal(&cert, &bad_key);
         assert!(err.contains("not a valid PEM private key file"), "{err}");
-        assert_no_key_text(&err, &body);
+        assert_no_key_text(&err, &body, &[&cert, &bad_key]);
 
         // A combined file used for both keys: the certificate is parsed first.
         let combined = write(
@@ -546,13 +639,13 @@ mod tests {
             0o600,
         );
         let err = refusal(&combined, &combined);
-        assert!(err.contains("not a valid PEM file"), "{err}");
-        assert_no_key_text(&err, &body);
+        assert!(err.contains("not a valid PEM certificate file"), "{err}");
+        assert_no_key_text(&err, &body, &[&combined]);
 
         // A combined file as the certificate only, next to a good key file.
         let err = refusal(&combined, &key);
         assert!(err.contains("holds a private key"), "{err}");
-        assert_no_key_text(&err, &body);
+        assert_no_key_text(&err, &body, &[&combined, &key]);
 
         // A broken key block before the certificate.
         let first = write(
@@ -562,7 +655,7 @@ mod tests {
             0o600,
         );
         let err = refusal(&first, &first);
-        assert_no_key_text(&err, &body);
+        assert_no_key_text(&err, &body, &[&first]);
     }
 
     #[test]
@@ -617,49 +710,66 @@ mod tests {
         );
     }
 
-    /// [`key_mode_ok`], for every case, whoever runs the tests.
+    /// [`key_mode_ok`], for every case, whoever runs the tests: a server that runs as a
+    /// user, and one that runs as root.
     #[test]
     fn the_key_mode_rule_follows_postgresql() {
         const ROOT: u32 = 0;
         const USER: u32 = 10001;
-        // Accepted: owner only, for anyone; group read too, for root only.
-        for (uid, mode) in [
-            (USER, 0o600),
-            (USER, 0o400),
-            (USER, 0o200),
-            (ROOT, 0o600),
-            (ROOT, 0o400),
-            (ROOT, 0o640),
-            (ROOT, 0o440),
-            // The file type bits are ignored.
-            (USER, 0o100_600),
-            (ROOT, 0o100_440),
-        ] {
-            assert!(key_mode_ok(uid, mode).is_ok(), "{uid} {mode:o}");
+        const OTHER: u32 = 12345;
+        for euid in [USER, ROOT] {
+            // Accepted: owned by the server's user with no group or other bits, or by root
+            // with group read at most.
+            for (uid, mode) in [
+                (euid, 0o600),
+                (euid, 0o400),
+                (euid, 0o200),
+                (ROOT, 0o600),
+                (ROOT, 0o400),
+                (ROOT, 0o640),
+                (ROOT, 0o440),
+                // The file type bits are ignored.
+                (euid, 0o100_600),
+                (ROOT, 0o100_440),
+            ] {
+                assert!(
+                    key_mode_ok(uid, mode, euid).is_ok(),
+                    "{euid} {uid} {mode:o}"
+                );
+            }
+            let refused = |uid: u32, mode: u32, why: &str| {
+                let err = key_mode_ok(uid, mode, euid).unwrap_err();
+                assert!(err.contains(why), "{euid} {uid} {mode:o}: {err}");
+                assert!(err.contains("chmod 6"), "{euid} {uid} {mode:o}: {err}");
+            };
+            // Another owner: never, whatever the mode.
+            for mode in [0o600, 0o400, 0o640] {
+                refused(OTHER, mode, "neither the server's account");
+            }
+            // Others: never, whoever owns it.
+            for uid in [ROOT, euid] {
+                for mode in [0o604, 0o602, 0o601, 0o644, 0o666, 0o444] {
+                    refused(uid, mode, "gives others access");
+                }
+                // Group write or execute: never.
+                for mode in [0o620, 0o610, 0o660, 0o670, 0o460] {
+                    refused(uid, mode, "group write or execute");
+                }
+                for mode in [0o4600, 0o2600, 0o1600] {
+                    refused(uid, mode, "setuid");
+                }
+            }
         }
-        let refused = |uid: u32, mode: u32, why: &str| {
-            let err = key_mode_ok(uid, mode).unwrap_err();
-            assert!(err.contains(why), "{uid} {mode:o}: {err}");
-            assert!(err.contains("chmod 600"), "{uid} {mode:o}: {err}");
-            assert!(err.contains(&format!("{:04o}", mode & 0o7777)), "{err}");
-        };
-        // Others: never, whoever owns it.
-        for uid in [ROOT, USER] {
-            for mode in [0o604, 0o602, 0o601, 0o644, 0o666, 0o444, 0o640 | 0o004] {
-                refused(uid, mode, "gives others access");
-            }
-            // Group write or execute: never.
-            for mode in [0o620, 0o610, 0o660, 0o670, 0o460] {
-                refused(uid, mode, "group write or execute");
-            }
-            for mode in [0o4600, 0o2600, 0o1600] {
-                refused(uid, mode, "setuid");
-            }
-        }
-        // Group read: only for root.
+        // Group read: only when root owns the file, also for a server that is not root.
         for mode in [0o640, 0o440] {
-            refused(USER, mode, "not owned by root");
+            let err = key_mode_ok(USER, mode, USER).unwrap_err();
+            assert!(err.contains("not owned by root"), "{mode:o}: {err}");
         }
+        let err = key_mode_ok(OTHER, 0o600, USER).unwrap_err();
+        assert!(
+            err.contains("uid 12345") && err.contains("uid 10001"),
+            "{err}"
+        );
     }
 
     /// The rule on real files: the owner is whoever runs the test, so the root-owned group
@@ -691,6 +801,14 @@ mod tests {
                 let err = refusal(&cert, &key);
                 assert!(err.contains("not owned by root"), "{mode:o}: {err}");
             }
+        }
+        // Owned by another account: refused. Only root can give a file away, so this runs
+        // on disk only as root.
+        if owner == 0 {
+            let key = write(dir.path(), "theirs.key", &key_pem, 0o600);
+            std::os::unix::fs::chown(&key, Some(12345), None).unwrap();
+            let err = refusal(&cert, &key);
+            assert!(err.contains("neither the server's account"), "{err}");
         }
         // The certificate file's mode does not matter.
         let key = write(dir.path(), "ok.key", &key_pem, 0o600);

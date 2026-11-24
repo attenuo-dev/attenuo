@@ -252,6 +252,7 @@ dependencies = [
  "opentelemetry_sdk",
  "reqwest",
  "ring",
+ "rustix",
  "rustls",
  "serde",
  "serde_json",

@@ -289,10 +289,54 @@ async fn a_client_that_does_not_trust_the_certificate_fails() {
     server.stop(state).await;
 }
 
-/// A peer that connects and sends nothing, or half a ClientHello, is dropped at the
-/// header-read timeout; meanwhile other clients are served (the handshake is not in the
-/// accept loop). No upper wall-clock bound but a generous deadline: the lower bound holds by
-/// construction (the clock starts before the connections are made).
+/// Two peers that hang in their handshake (one sends nothing, one half a ClientHello) do not
+/// hold up a third: the handshake is not in the accept loop. The header-read timeout is long
+/// (20 s), the well-behaved client must be served within half of it while both hanging
+/// sockets are still open, and the test ends there, without waiting for the timeout.
+#[tokio::test]
+async fn a_hanging_handshake_does_not_hold_up_other_clients() {
+    const TIMEOUT: Duration = Duration::from_secs(20);
+    let dir = tempfile::tempdir().unwrap();
+    let ca = Ca::new("server-tls test CA");
+    let (server, state) = start(tls_config(dir.path(), &ca, TIMEOUT.as_secs())).await;
+
+    let mut silent = tokio::net::TcpStream::connect(server.addr()).await.unwrap();
+    let mut half = tokio::net::TcpStream::connect(server.addr()).await.unwrap();
+    // A TLS record header announcing a 512-byte handshake message, and then only a few bytes.
+    half.write_all(&[0x16, 0x03, 0x01, 0x02, 0x00, 0x01, 0x00])
+        .await
+        .unwrap();
+    // Give the accept loop the time to take both (it takes connections in order).
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let started = Instant::now();
+    let resp = reqwest::Client::builder()
+        .tls_built_in_root_certs(false)
+        .add_root_certificate(ca.reqwest_root())
+        .timeout(TIMEOUT / 2)
+        .build()
+        .unwrap()
+        .get(server.https_url("/healthz"))
+        .send()
+        .await
+        .expect("the client was not served while two handshakes hang");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let served = started.elapsed();
+    assert!(served < TIMEOUT / 2, "{served:?}");
+
+    // Both hanging sockets are still open: no data, no end of stream, no reset.
+    for stream in [&mut silent, &mut half] {
+        let mut byte = [0u8; 1];
+        let peek = tokio::time::timeout(Duration::from_millis(200), stream.peek(&mut byte)).await;
+        assert!(peek.is_err(), "a hanging connection was not open: {peek:?}");
+    }
+    // Shutdown drops them at once.
+    server.stop(state).await;
+}
+
+/// A peer that connects and sends nothing, or half a ClientHello, is dropped by the server
+/// at the header-read timeout (3 s). The lower bound holds by construction: the clock starts
+/// before the connections are made. The upper bound is only a generous deadline.
 #[tokio::test]
 async fn a_silent_or_slow_handshake_is_dropped_at_the_header_read_timeout() {
     let dir = tempfile::tempdir().unwrap();
@@ -302,30 +346,9 @@ async fn a_silent_or_slow_handshake_is_dropped_at_the_header_read_timeout() {
     let started = Instant::now();
     let mut silent = tokio::net::TcpStream::connect(server.addr()).await.unwrap();
     let mut half = tokio::net::TcpStream::connect(server.addr()).await.unwrap();
-    // A TLS record header announcing a 512-byte handshake message, and then only a few bytes.
     half.write_all(&[0x16, 0x03, 0x01, 0x02, 0x00, 0x01, 0x00])
         .await
         .unwrap();
-
-    // While both hang, another client is served, and both are still open after it.
-    let resp = client(&ca)
-        .get(server.https_url("/healthz"))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    if started.elapsed() < Duration::from_millis(2500) {
-        for stream in [&mut silent, &mut half] {
-            let mut byte = [0u8; 1];
-            let peek =
-                tokio::time::timeout(Duration::from_millis(50), stream.peek(&mut byte)).await;
-            assert!(
-                peek.is_err(),
-                "a hanging connection was closed early: {peek:?}"
-            );
-        }
-    }
-
     for stream in [&mut silent, &mut half] {
         let mut buf = Vec::new();
         let read =
@@ -747,19 +770,49 @@ fn a_bad_server_tls_section_stops_the_server_at_startup() {
     };
     let combined = write_secret("combined.pem", &format!("{cert_text}{broken}"));
     let broken_key = write_secret("broken.key", &broken);
+    // The same key and certificate with every line break removed, in both orders: the PEM
+    // parser's errors print such a line in full, as a list of byte values.
+    let flat = |t: &str| t.replace(['\n', '\r'], "");
+    let flat_key_first = write_secret(
+        "flat-key-first.pem",
+        &flat(&format!("{key_text}{cert_text}")),
+    );
+    let flat_cert_first = write_secret(
+        "flat-cert-first.pem",
+        &flat(&format!("{cert_text}{key_text}")),
+    );
+    let flat_key = write_secret("flat.key", &flat(&key_text));
+    let joined: String = body.concat();
     for (cert, key) in [
         (&combined, &combined),
         (&tls.cert_pem_path, &broken_key),
         (&combined, &tls.key_pem_path),
+        (&flat_key_first, &tls.key_pem_path),
+        (&flat_key_first, &flat_key_first),
+        (&flat_cert_first, &tls.key_pem_path),
+        (&flat_cert_first, &flat_cert_first),
+        (&tls.cert_pem_path, &flat_key),
     ] {
         let mut cfg = good.clone();
         let section = cfg.server.tls.as_mut().unwrap();
         section.cert_pem_path = cert.clone();
         section.key_pem_path = key.clone();
-        let err = refused(&cfg);
-        for line in &body {
-            for i in 0..line.len().saturating_sub(6) {
-                assert!(!err.contains(&line[i..i + 6]), "{err}");
+        let err = refused(&cfg)
+            .replace(&cert.display().to_string(), "<path>")
+            .replace(&key.display().to_string(), "<path>");
+        assert!(err.len() < 300, "{} bytes: {err}", err.len());
+        for i in 0..joined.len().saturating_sub(6) {
+            assert!(!err.contains(&joined[i..i + 6]), "{err}");
+        }
+        // No list of byte values: at most a few comma-separated numbers in a row.
+        let mut run = 0;
+        for part in err.split(',') {
+            let digits = part.trim().trim_matches(|c| c == '[' || c == ']');
+            if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+                run += 1;
+                assert!(run <= 3, "{err}");
+            } else {
+                run = 0;
             }
         }
         assert!(

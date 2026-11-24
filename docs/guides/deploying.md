@@ -134,7 +134,7 @@ What it needs:
 - `[server] public_url` must be set and must start with `https://`. `[server] allow_insecure_http` is refused.
 - The key must belong to the first certificate in `cert_pem_path`.
 - Keep the private key out of `cert_pem_path`, unless both keys name the same file. An encrypted key is refused in either file.
-- The key file must give others no access, and its group at most read, and that only when root owns it. See [The key file's mode](#the-key-files-mode).
+- The key file must be owned by the server's user or by root. It must give others no access, and its group at most read, and that only when root owns it. See [The key file's mode](#the-key-files-mode).
 
 The server reads both files once, at start. A renewed certificate needs a restart. Plan the restart before the old certificate expires. The server does not check its own certificate's dates: an expired certificate is served until clients refuse it.
 
@@ -155,12 +155,13 @@ With `[server.tls]` the main listener answers no plain HTTP, so every check of i
 
 #### The key file's mode
 
-On Unix the server checks the key file's owner and mode. It follows PostgreSQL's rule for `ssl_key_file`:
+On Unix the server checks the key file's owner and mode, as read from the open file. It follows PostgreSQL's rule for `ssl_key_file`:
 
+- The file must be owned by the user the server runs as (its effective uid) or by root. Any other owner is refused.
 - Others may never have any access.
 - The group may never write or execute.
 - If root owns the file, the group may read it: mode `0640` or `0440` at most.
-- If anyone else owns it, the group gets nothing: mode `0600` or `0400` at most.
+- If the server's user owns it, the group gets nothing: mode `0600` or `0400` at most.
 
 The server refuses any other file and says which rule failed. The image runs as uid `10001`.
 
