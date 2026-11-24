@@ -147,7 +147,7 @@ With `client_certificates = "optional"` in `[server.tls]`, agents and PEPs can a
 - The default is `"off"`: the server asks for nothing. A `tls_client_cert_sha256` on an entry refuses to start unless the listener asks for certificates.
 - **A proxy that ends TLS hides the certificate.** attenuo never reads `Client-Cert`, `X-Forwarded-Client-Cert` or any other header for it. Clients must reach attenuo's own TLS listener: directly, or through a load balancer or ingress that passes TCP through (layer 4, TLS pass-through).
 - There is no CRL or OCSP check, and tokens are not bound to the certificate.
-- A certificate on the connection makes a `client_id` (or `pep_id`) a client credential. So a request that sends an actor token and `client_id` over a connection whose certificate is not pinned for that id is refused: under `[token] actor_auth = "either"` with `client_authentication_failed`, under `"actor_token"` with `client_auth_not_accepted`. A client that uses an actor token should leave `client_id` out, or not present a certificate.
+- A certificate on the connection makes a `client_id` (or `pep_id`) a client credential. So under `[token] actor_auth = "actor_token"`, a request that sends `client_id` over a connection with any certificate is refused with `client_auth_not_accepted`. Under `"either"`, a request that sends an actor token and `client_id` is refused with `client_authentication_failed` when the certificate is not pinned for that id. A client that uses an actor token should leave `client_id` out, or not present a certificate.
 
 Only the main listener speaks TLS. `[admin] listen`, `[admin_ui]` and `[metrics]` stay plain HTTP. Keep them on loopback or a private network, and reach them over an SSH tunnel.
 
