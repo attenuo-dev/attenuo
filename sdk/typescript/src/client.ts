@@ -55,6 +55,17 @@ export interface ClientOptions extends HttpOptions {
   maxRetries?: number;
   /** The longest `Retry-After` a retry waits out, in milliseconds (default 10000, at most 300000). */
   maxRetryDelayMs?: number;
+  /**
+   * A PEM file with a TLS client certificate to present to the server (RFC 8705
+   * `self_signed_tls_client_auth`), for an agent whose entry pins it with
+   * `tls_client_cert_sha256` (Node.js 20.16 or later). Needs `tlsClientKey` and an `https://`
+   * server URL. It is presented to the origin of the server URL only, never to another origin
+   * (a `jwksUrl` elsewhere). With it, `exchange` without a `clientSecret`, `clientAssertion` or
+   * `actorToken` sends `client_id` (the `clientId`, else the actor) and no secret.
+   */
+  tlsClientCert?: string;
+  /** The private key of `tlsClientCert`: an unencrypted PEM file with that one key. */
+  tlsClientKey?: string;
 }
 
 export interface InspectOptions {
@@ -153,7 +164,10 @@ export class AttenuoClient {
 
   constructor(serverUrl: string, opts: ClientOptions = {}) {
     this.retry = new RetryPolicy(opts.maxRetries, opts.maxRetryDelayMs);
-    this.http = new Http(serverUrl, opts);
+    const clientCert: { tlsClientCert?: string; tlsClientKey?: string } = {};
+    if (opts.tlsClientCert !== undefined) clientCert.tlsClientCert = opts.tlsClientCert;
+    if (opts.tlsClientKey !== undefined) clientCert.tlsClientKey = opts.tlsClientKey;
+    this.http = new Http(serverUrl, opts, {}, clientCert);
     this.serverUrl = this.http.base;
     this.token = opts.token;
     this.dpopKeyLike = opts.dpopKey;
@@ -256,7 +270,7 @@ export class AttenuoClient {
     if (opts.subjectDpopKey !== undefined && opts.subjectTokenDpop !== undefined) {
       throw new AttenuoError("pass subjectDpopKey or subjectTokenDpop, not both");
     }
-    const body = w.exchangeBody(subjectToken, actor, capabilities, opts);
+    const body = w.exchangeBody(subjectToken, actor, capabilities, opts, this.http.hasClientCert);
     const subjectKey = await DpopKey.of(opts.subjectDpopKey);
     const headers = async (nonce?: string): Promise<Record<string, string>> => {
       const { header, signOff } = await exchangeProofs(

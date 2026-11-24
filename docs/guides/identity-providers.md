@@ -219,7 +219,34 @@ ATTENUO_TOKEN="$ID_TOKEN" attenuo --server https://attenuo.example.com:8443 \
   token exchange --subject-token-type id-token --actor planner --cap 'github:*'
 ```
 
-The CLI sends the certificate only to the origin of `--server`, never to an `--admin-server` or a `--jwks` URL on another origin, and it reads the key file once. It needs an `https://` `--server`. One exception: through an `https://` proxy (`HTTPS_PROXY=https://...`), the proxy is offered the certificate too if it asks for one, and its own certificate must chain to `--tls-ca-cert`. It sends no `client_id` when you pass an actor token (see the notes below). The CLI has no PEP mode, so it does not send `pep_id`. The Python and TypeScript SDKs cannot send a client certificate yet.
+The CLI sends the certificate only to the origin of `--server`, never to an `--admin-server` or a `--jwks` URL on another origin, and it reads the key file once. It needs an `https://` `--server`. One exception: through an `https://` proxy (`HTTPS_PROXY=https://...`), the proxy is offered the certificate too if it asks for one, and its own certificate must chain to `--tls-ca-cert`. It sends no `client_id` when you pass an actor token (see the notes below). The CLI has no PEP mode, so it does not send `pep_id`.
+
+The Python and TypeScript SDKs take the same three files. The certificate goes only to the origin of the server URL, and `exchange` without a secret, a client assertion or an actor token sends `client_id` and no secret. The proxy exception is different: Python reaches an `https://` proxy with httpx's default roots and never offers it the client certificate, and the TypeScript options use no proxy at all.
+
+```python
+from attenuo import Client
+
+with Client(
+    "https://attenuo.example.com:8443",
+    tls_ca_cert="server-ca.pem",
+    tls_client_cert="planner-client.crt",
+    tls_client_key="planner-client.key",
+) as ob:
+    planner = ob.exchange(id_token, "planner", ["github:*"])
+```
+
+```ts
+import { AttenuoClient } from "@attenuo/sdk";
+
+const ob = new AttenuoClient("https://attenuo.example.com:8443", {
+  tlsCaCert: "server-ca.pem",
+  tlsClientCert: "planner-client.crt",
+  tlsClientKey: "planner-client.key",
+});
+const planner = await ob.exchange(idToken, "planner", ["github:*"]);
+```
+
+The SDKs work the same way with a certificate from a CA ([below](#tls-client-certificates-from-a-ca-spiffe)): put the intermediate CA certificates after the client certificate in the `tls_client_cert` (`tlsClientCert`) file, at most 4. Both SDKs' integration tests run an exchange with such a file against the server, and check that the client certificate alone, without its intermediate, gets `401`. The TypeScript options need Node.js 20.16 or later. The SDKs have no PEP mode either, and they do not read the `ATTENUO_TLS_*` variables. The details are in the [Python](https://github.com/attenuo-dev/attenuo/blob/main/sdk/python/README.md#tls-a-private-ca-and-a-client-certificate) and [TypeScript](https://github.com/attenuo-dev/attenuo/blob/main/sdk/typescript/README.md#tls-a-private-ca-and-a-client-certificate) READMEs.
 
 **4. Rotate.** An entry takes up to 8 thumbprints. Add the new certificate's thumbprint next to the old one and run `attenuo admin agent reload`. Move the client to the new certificate. Then remove the old thumbprint and reload again. A removed thumbprint stops working on the next request, also on a connection that is already open.
 

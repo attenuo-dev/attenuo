@@ -469,11 +469,19 @@ export interface ExchangeOptions {
   subjectTokenDpop?: string;
 }
 
+/**
+ * The `POST /token` body. `clientCert` is whether the client presents a TLS client certificate:
+ * then, with no secret, client assertion or actor token, `client_id` (the actor by default) is
+ * sent alone and the certificate authenticates it (RFC 8705 `self_signed_tls_client_auth`). Next
+ * to an actor token no `client_id` is sent, since with a certificate on the connection it would
+ * make the certificate count too.
+ */
 export function exchangeBody(
   subjectToken: Token | string,
   actor: string,
   capabilities: CapabilityLike | readonly CapabilityLike[],
   opts: ExchangeOptions,
+  clientCert = false,
 ): Json {
   if (opts.clientAssertion !== undefined && opts.clientAssertion.trim() === "") {
     throw new TypeError("clientAssertion is empty");
@@ -482,8 +490,20 @@ export function exchangeBody(
     // RFC 6749 §2.3: one client authentication method per request.
     throw new TypeError("use clientSecret or clientAssertion, not both");
   }
-  if (opts.clientId !== undefined && !opts.clientSecret && opts.clientAssertion === undefined) {
-    throw new TypeError("clientId goes with clientSecret or clientAssertion");
+  const byCert =
+    clientCert &&
+    !opts.clientSecret &&
+    opts.clientAssertion === undefined &&
+    opts.actorToken === undefined;
+  if (
+    opts.clientId !== undefined &&
+    !opts.clientSecret &&
+    opts.clientAssertion === undefined &&
+    !byCert
+  ) {
+    throw new TypeError(
+      "clientId goes with clientSecret, clientAssertion or a TLS client certificate (without an actorToken)",
+    );
   }
   if (opts.actorToken !== undefined && opts.actorToken.trim() === "") {
     throw new TypeError("actorToken is empty");
@@ -497,7 +517,8 @@ export function exchangeBody(
   const authenticated =
     Boolean(opts.clientSecret) ||
     opts.actorToken !== undefined ||
-    opts.clientAssertion !== undefined;
+    opts.clientAssertion !== undefined ||
+    byCert;
   const intake = authenticated && !isDelegationToken(subjectToken);
   const body: Json = {
     grant_type: TOKEN_EXCHANGE_GRANT,
@@ -518,6 +539,10 @@ export function exchangeBody(
     if (opts.clientId !== undefined) body.client_id = opts.clientId;
     body.client_assertion_type = CLIENT_ASSERTION_TYPE;
     body.client_assertion = opts.clientAssertion.trim();
+  }
+  if (byCert) {
+    // RFC 8705 §2.2: the certificate on the connection authenticates this client id.
+    body.client_id = opts.clientId ?? actor;
   }
   if (opts.actorToken !== undefined) {
     body.actor_token = opts.actorToken.trim();

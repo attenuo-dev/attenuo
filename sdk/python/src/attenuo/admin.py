@@ -16,8 +16,10 @@ from typing import Any, Literal
 
 import httpx
 
+from . import _tls
 from . import _wire as w
 from ._http import AsyncHttpClient, HttpClient
+from ._tls import PathArg
 from .capability import CapabilityLike, capabilities_to_json
 from .dpop import DpopKey, NonceCache
 from .errors import AttenuoError, budget_limit_from_json
@@ -1290,7 +1292,11 @@ def _approval_path(approval_id: str) -> str:
 
 
 class AdminClient:
-    """Operator client. ``mint_root_dev`` needs ``[dev] allow_root_mint = true`` on the server."""
+    """Operator client. ``mint_root_dev`` needs ``[dev] allow_root_mint = true`` on the server.
+
+    ``tls_ca_cert`` (a PEM file path) is the CA to trust for an ``https://`` server URL, in
+    place of the default roots, as for :class:`~attenuo.Client`. The admin client presents no
+    TLS client certificate: the admin API authenticates with the admin token."""
 
     def __init__(
         self,
@@ -1299,6 +1305,7 @@ class AdminClient:
         timeout: float | httpx.Timeout | None = 30.0,
         *,
         transport: httpx.BaseTransport | None = None,
+        tls_ca_cert: PathArg | None = None,
     ) -> None:
         self.server_url = w.normalize_base(server_url)
         self._http = HttpClient(
@@ -1306,6 +1313,7 @@ class AdminClient:
             timeout=timeout,
             transport=transport,
             headers={"authorization": f"Bearer {admin_token}"},
+            tls=_tls.settings(self.server_url, tls_ca_cert, transport=transport),
         )
         self._nonce = NonceCache()
 
@@ -1752,6 +1760,7 @@ class AsyncAdminClient:
         timeout: float | httpx.Timeout | None = 30.0,
         *,
         transport: httpx.AsyncBaseTransport | None = None,
+        tls_ca_cert: PathArg | None = None,
     ) -> None:
         self.server_url = w.normalize_base(server_url)
         self._http = AsyncHttpClient(
@@ -1759,6 +1768,7 @@ class AsyncAdminClient:
             timeout=timeout,
             transport=transport,
             headers={"authorization": f"Bearer {admin_token}"},
+            tls=_tls.settings(self.server_url, tls_ca_cert, transport=transport),
         )
         self._nonce = NonceCache()
 
