@@ -1,4 +1,5 @@
 import { ApiError, TransportError, TransportTimeoutError } from "./errors.js";
+import { optionalTlsFetch, type TlsOptions } from "./tls.js";
 import { normalizeBase } from "./wire.js";
 
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
@@ -10,6 +11,12 @@ export interface HttpOptions {
   headers?: Record<string, string>;
   /** Per-request timeout in milliseconds (default 30000, `0` disables). */
   timeoutMs?: number;
+  /**
+   * A PEM file with the CA certificates to trust for an `https://` server URL, in place of the
+   * built-in roots (Node.js 20.16 or later). Hostname checks stay on. Cannot be used with
+   * `fetch`. With an `http://` server URL it has no effect (no warning is printed).
+   */
+  tlsCaCert?: string;
 }
 
 export const DEFAULT_TIMEOUT_MS = 30_000;
@@ -106,10 +113,31 @@ export class Http {
   private readonly headers: Record<string, string>;
   /** Per-request timeout in milliseconds; `0` disables it. */
   readonly timeoutMs: number;
+  /** Whether a TLS client certificate is presented to the server's origin. */
+  readonly hasClientCert: boolean;
 
-  constructor(serverUrl: string, opts: HttpOptions = {}, headers: Record<string, string> = {}) {
+  /**
+   * `clientCert` is the `tlsClientCert` and `tlsClientKey` of an `AttenuoClient`; the admin
+   * client passes none. With any TLS option, requests go through `tlsFetch`.
+   */
+  constructor(
+    serverUrl: string,
+    opts: HttpOptions = {},
+    headers: Record<string, string> = {},
+    clientCert: Pick<TlsOptions, "tlsClientCert" | "tlsClientKey"> = {},
+  ) {
     this.base = normalizeBase(serverUrl);
-    this.doFetch = opts.fetch ?? ((input, init) => fetch(input, init));
+    const tls: TlsOptions = {};
+    if (opts.tlsCaCert !== undefined) tls.tlsCaCert = opts.tlsCaCert;
+    if (clientCert.tlsClientCert !== undefined) tls.tlsClientCert = clientCert.tlsClientCert;
+    if (clientCert.tlsClientKey !== undefined) tls.tlsClientKey = clientCert.tlsClientKey;
+    const tlsFetch = optionalTlsFetch(this.base, tls);
+    if (tlsFetch !== undefined && opts.fetch !== undefined) {
+      // A fetch brings its own TLS setup; the options would silently not apply.
+      throw new TypeError("pass either fetch or the tls* options, not both");
+    }
+    this.hasClientCert = tls.tlsClientCert !== undefined;
+    this.doFetch = opts.fetch ?? tlsFetch ?? ((input, init) => fetch(input, init));
     this.headers = { ...opts.headers, ...headers };
     this.timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   }

@@ -183,6 +183,7 @@ export {
 } from "./errors.js";
 export type { RunUsage, UntrustedArg, UserWindow, WindowUsage } from "./errors.js";
 export type { FetchLike, HttpOptions } from "./http.js";
+export { tlsFetch, type TlsOptions } from "./tls.js";
 export { TokenRefresher } from "./refresh.js";
 export { DEFAULT_MAX_EVENT_BYTES, SseParser } from "./sse.js";
 export type { SseEvent, StreamEvent } from "./sse.js";

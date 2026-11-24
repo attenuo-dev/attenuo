@@ -44,6 +44,8 @@ import {
   RpcError,
   type Token,
   TokenRefresher,
+  tlsFetch,
+  TransportError,
   UnauthorizedError,
   VerificationError,
   ExportError,
@@ -53,6 +55,7 @@ import {
   withLimits,
 } from "../src/index.js";
 import { retryHooks } from "../src/retry.js";
+import { Ca, ClientCert, tempDir } from "./tlsutil.js";
 
 // [[agents]] secrets in the demo config: an exchange authenticates as its actor.
 const CODER_SECRET = "demo-coder-secret";
@@ -97,7 +100,12 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 async function startStack(
   tokenSection = "",
   fakeArgs: string[] = [],
-  opts: { policyExtra?: string; edits?: Record<string, string> } = {},
+  opts: {
+    policyExtra?: string;
+    edits?: Record<string, string>;
+    /** Serve the main listener over TLS (`[server.tls]`, client certificates optional). */
+    tls?: { cert: string; key: string; ca: string };
+  } = {},
 ): Promise<{ url: string; work: string; procs: ChildProcess[] }> {
   const work = mkdtempSync(join(tmpdir(), "attenuo-it-"));
   const procs: ChildProcess[] = [];
@@ -125,6 +133,14 @@ async function startStack(
     if (!config.includes(from)) throw new Error(`not in the demo config: ${from}`);
     config = config.replace(from, to);
   }
+  if (opts.tls) {
+    config = config.replace(
+      "[issuer]\n",
+      `public_url = "https://127.0.0.1:${obPort}"\n\n[server.tls]\n` +
+        `cert_pem_path = "${opts.tls.cert}"\nkey_pem_path = "${opts.tls.key}"\n` +
+        `client_certificates = "optional"\n\n[issuer]\n`,
+    );
+  }
   writeFileSync(join(work, "config.toml"), config.replaceAll("{work}", work));
 
   const fakeOut = join(work, "fake-mcp.out");
@@ -146,13 +162,14 @@ async function startStack(
       env: { ...process.env, RUST_LOG: "warn" },
     }),
   );
-  const url = `http://127.0.0.1:${obPort}`;
+  const url = `${opts.tls ? "https" : "http"}://127.0.0.1:${obPort}`;
+  const probe = opts.tls ? tlsFetch(url, { tlsCaCert: opts.tls.ca }) : fetch;
 
   const deadline = Date.now() + 20_000;
   for (;;) {
     let ready = false;
     try {
-      ready = (await fetch(`${url}/healthz`, { signal: AbortSignal.timeout(1000) })).ok;
+      ready = (await probe(`${url}/healthz`, { signal: AbortSignal.timeout(1000) })).ok;
     } catch {
       /* not up yet */
     }
@@ -1749,5 +1766,63 @@ describe.skipIf(!enabled)("audit retention against the real server", () => {
     );
     expect(c.ok).toBe(true);
     expect([c.anchors.shipped, c.anchors.checked, c.anchors.matched]).toEqual([1, 1, 1]);
+  });
+});
+
+describe.skipIf(!enabled)("a TLS client certificate against the real server", () => {
+  let stack: { url: string; work: string; procs: ChildProcess[] } | undefined;
+  let tls: { dir: string; remove: () => void } | undefined;
+  let ca = "";
+  let coder: ClientCert;
+
+  beforeAll(async () => {
+    tls = tempDir();
+    const authority = new Ca(tls.dir, "it-ca");
+    const leaf = authority.leaf(["IP:127.0.0.1"], "server");
+    coder = new ClientCert(tls.dir, "coder");
+    ca = authority.certPath;
+    const coderSecretSha256 = createHash("sha256").update(CODER_SECRET).digest("hex");
+    stack = await startStack("", [], {
+      tls: { cert: leaf.certPath, key: leaf.keyPath, ca },
+      // The coder agent is pinned by its certificate, with no secret.
+      edits: {
+        [`secret_sha256 = "${coderSecretSha256}"`]: `tls_client_cert_sha256 = ["${coder.sha256}"]`,
+      },
+    });
+  }, 60_000);
+
+  afterAll(async () => {
+    if (stack) await stopStack(stack.procs, stack.work);
+    tls?.remove();
+  });
+
+  it("exchanges with the certificate alone, and is refused without it", async () => {
+    const url = stack!.url;
+    const admin = new AdminClient(url, ADMIN_TOKEN, { tlsCaCert: ca });
+    const root = await admin.mintRootDev("alice", "https://idp.example", "assistant", {
+      capabilities: ["github:*"],
+    });
+    const caps = [capability("github", "read_file")];
+    const ob = new AttenuoClient(url, {
+      tlsCaCert: ca,
+      tlsClientCert: coder.certPath,
+      tlsClientKey: coder.keyPath,
+    });
+    const token = await ob.exchange(root, "coder", caps);
+    expect(token.agent).toBe("coder");
+    const result = await ob.callTool(token, "github", "read_file", {
+      repo: "alice/public-docs",
+      path: "README.md",
+    });
+    expect(result.isError).toBe(false);
+
+    const noCert = new AttenuoClient(url, { tlsCaCert: ca });
+    const e = await noCert.exchange(root, "coder", caps).catch((x: unknown) => x);
+    expect(e).toBeInstanceOf(ApiError);
+    expect((e as ApiError).status).toBe(401);
+    // The server's certificate is checked: a client trusting another CA cannot connect.
+    const stranger = new Ca(tls!.dir, "stranger");
+    const refused = new AttenuoClient(url, { tlsCaCert: stranger.certPath });
+    await expect(refused.exchange(root, "coder", caps)).rejects.toBeInstanceOf(TransportError);
   });
 });
