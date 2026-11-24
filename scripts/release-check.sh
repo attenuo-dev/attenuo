@@ -21,7 +21,7 @@
 # `cargo publish --dry-run --workspace`, which verifies every publishable crate against the
 # others through a temporary local registry, so the crates need not be on crates.io yet. The
 # SDK integration tests (ATTENUO_INTEGRATION=1) are not run here; see the SDK READMEs.
-# What to do after it passes: docs/release/0.2.0.md (the one-time registry setup is in
+# What to do after it passes: docs/release/0.2.1.md (the one-time registry setup is in
 # docs/release/0.1.0.md).
 set -euo pipefail
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

@@ -130,7 +130,7 @@ Check that it is up:
 
 ```sh
 curl -s http://127.0.0.1:8080/healthz
-# {"status":"ok","version":"0.2.0"}
+# {"status":"ok","version":"0.2.1"}
 ```
 
 ## 5. Point a client at the proxy

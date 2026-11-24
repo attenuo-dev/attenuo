@@ -2,7 +2,7 @@
 
 Python client for the [attenuo](https://github.com/attenuo-dev/attenuo/blob/main/README.md) authorization server: exchange delegation tokens, attenuate capabilities, call MCP tools through the enforcing proxy, handle denials, renew leases, and read the audit log.
 
-**Status: pre-alpha**, like the server. Version 0.2.0, released together with attenuo 0.2.0: the SDK carries the server's version number, follows that release's wire format and will change with it. Once it is on PyPI, `pip install attenuo` installs it; until the maintainer publishes it, install from a checkout.
+**Status: pre-alpha**, like the server. Version 0.2.1, released together with attenuo 0.2.1: the SDK carries the server's version number, follows that release's wire format and will change with it. Once it is on PyPI, `pip install attenuo` installs it; until the maintainer publishes it, install from a checkout.
 
 ```sh
 pip install -e sdk/python            # runtime dependency: httpx

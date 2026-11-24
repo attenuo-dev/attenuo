@@ -8,6 +8,10 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-24
+
+0.2.0 was tagged but never released: its container image build failed, so there is no GitHub release and no image for it. 0.2.1 is the first release with everything listed under 0.2.0, plus the entries below. The upgrade from 0.1.0 is the one in the [0.2.0 upgrade notes](docs/release/0.2.0.md#upgrade-from-010).
+
 ### Added
 
 - `attenuo audit compact --db <file>`: shrink the SQLite file after a prune, offline, with the server stopped ([deploying](docs/guides/deploying.md#bounding-the-audit-log), [CLI](docs/reference/cli.md#audit-compact---db-path)). It runs `VACUUM` and empties the WAL. It refuses (exit 2; the database and its WAL are not changed) when the server's lock file or SQLite's exclusive lock is held, when the file is not in WAL mode or is on a network filesystem, when `PRAGMA integrity_check` is not `ok`, when the schema version is not this build's, when the hash chain does not verify, or when free space is short. After `VACUUM` it checks that every row of every table, the chain head, the entry count, the prune marker, the newest anchor and the schema version are unchanged, and exits 3 if not, or if a step after `VACUUM` fails (restore the backup). `--dry-run` runs the checks only. It writes no audit entry. The deploying guide's untested `sqlite3 ... VACUUM` advice is replaced.
@@ -18,9 +22,11 @@ Entries are written by hand. `git cliff --unreleased` (see `cliff.toml`) produce
 ### Fixed
 
 - Docker image build: each target architecture now has its own cargo registry and target caches. The multi-arch release build runs amd64 and arm64 at once, and with shared caches the two could unpack the same crate at the same time (the build failed with "File exists"). The target directory was shared too.
-- Release workflow: the image job may run for 180 minutes, not 60. The arm64 image builds under emulation and passed the old limit at v0.2.0, so the image for that tag was not built.
+- Release workflow: the image job may run for 180 minutes, not 60. The arm64 image builds under emulation and went over the old 60 minute limit at v0.2.0, so the image for that tag was not built.
 
 ## [0.2.0] - 2026-11-22
+
+The tag v0.2.0 exists, but there is no GitHub release and no container image for it: the image build failed. Its changes were first released in 0.2.1.
 
 ### Highlights
 
@@ -743,6 +749,7 @@ The injection-suite figures in the docs come from synthetic, model-free cases wr
 - RFC-0001 section 7 now says what the audit log implements today (hash over `(seq, prev_hash, record)`, no automatic checkpoints, no `kind` field) next to the design target.
 - Documentation site: the `docs/` tree is built with mdBook (`book.toml`, `docs/SUMMARY.md`) and deployed to GitHub Pages by `.github/workflows/docs.yml` (mdBook 0.4.52, pinned). New concept pages in `docs/concepts/` (delegation chain, capabilities and attenuation, leases and revocation, audit log, enforcement points) and reference pages in `docs/reference/` (CLI commands, config keys, HTTP endpoints). Links from `docs/` to files outside it are now absolute GitHub URLs. Preview steps are in CONTRIBUTING.md.
 
-[Unreleased]: https://github.com/attenuo-dev/attenuo/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/attenuo-dev/attenuo/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/attenuo-dev/attenuo/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/attenuo-dev/attenuo/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/attenuo-dev/attenuo/releases/tag/v0.1.0
