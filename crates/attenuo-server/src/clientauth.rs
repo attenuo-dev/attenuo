@@ -4,7 +4,7 @@
 //! exchange) and for PEPs at the AuthZEN endpoints (an unsigned body chain with
 //! `[authzen] allow_unsigned_chain`, or diagnostics).
 //!
-//! A client authenticates in exactly one of two ways per request (RFC 6749 §2.3):
+//! A client authenticates in exactly one of three ways per request (RFC 6749 §2.3):
 //!
 //! - **Client secret.** HTTP Basic (RFC 6749 §2.3.1: id and secret form-encoded, then base64)
 //!   or two body fields, never both. Secrets are stored as the lowercase hex SHA-256 of the
@@ -16,9 +16,20 @@
 //!   assertion's `jti` is recorded in the replay store ([`crate::replay::ReplayCache`]) when
 //!   [`Authenticated::commit`] runs, so an assertion authenticates one request, across restarts
 //!   when the store is a database file.
+//! - **`self_signed_tls_client_auth`** (RFC 8705 §2.2). The client presents a certificate in
+//!   the TLS handshake of `[server.tls]` (with `client_certificates = "optional"`) and names
+//!   itself with the id field (`client_id`, `pep_id`), with no secret, no HTTP Basic and no
+//!   assertion. The TLS layer proved that the client holds the certificate's key
+//!   ([`crate::client_cert_verifier`]); here the certificate's SHA-256 thumbprint must be one
+//!   the entry lists in `tls_client_cert_sha256` (compared in constant time, against decoys
+//!   for unknown ids and entries without thumbprints), and the certificate must be usable at
+//!   the request's time ([`ClientCertificate::check_usable`]: its dates, not a CA, `clientAuth`
+//!   when it names extended key usages). A certificate comes only from the connection, never
+//!   from a header. With a secret or an assertion in the request, that credential decides and
+//!   the certificate is ignored.
 //!
-//! An entry may hold a secret, keys, or both; it can only be authenticated by what it holds.
-//! Sending a secret and an assertion together is `multiple_client_auth`.
+//! An entry may hold a secret, keys and certificates, in any mix; it can only be authenticated
+//! by what it holds. Sending a secret and an assertion together is `multiple_client_auth`.
 //!
 //! # Keys from a URL (`jwks_url`)
 //!
@@ -56,6 +67,7 @@ use time::OffsetDateTime;
 
 pub(crate) use attenuo_token::client_assertion::CLIENT_ASSERTION_TYPE;
 
+use crate::client_cert::ClientCertificate;
 use crate::config::{ActorAuth, AgentConfig, CLIENT_ASSERTION_ALGS};
 use crate::error::ApiError;
 use crate::idp::jwks::{FailurePolicy, JwksCache, JwksError};
@@ -110,14 +122,17 @@ pub(crate) enum ClientMethod {
     Secret,
     /// A `private_key_jwt` client assertion.
     PrivateKeyJwt,
+    /// A self-signed TLS client certificate pinned by its thumbprint (RFC 8705 §2.2).
+    SelfSignedTls,
 }
 
 impl ClientMethod {
-    /// `client_secret` or `private_key_jwt`.
+    /// `client_secret`, `private_key_jwt` or `self_signed_tls_client_auth`.
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             ClientMethod::Secret => "client_secret",
             ClientMethod::PrivateKeyJwt => "private_key_jwt",
+            ClientMethod::SelfSignedTls => "self_signed_tls_client_auth",
         }
     }
 
@@ -126,6 +141,7 @@ impl ClientMethod {
         match self {
             ClientMethod::Secret => "actor_token+client_secret",
             ClientMethod::PrivateKeyJwt => "actor_token+private_key_jwt",
+            ClientMethod::SelfSignedTls => "actor_token+self_signed_tls_client_auth",
         }
     }
 }
@@ -199,14 +215,20 @@ pub(crate) fn take_client_assertion(
     }
 }
 
-/// Did the request present client credentials of either kind: a secret (HTTP Basic or the
-/// body field) or an assertion?
+/// Did the request present client credentials of any kind: a secret (HTTP Basic or the body
+/// field), an assertion, or a client id (`body_id`) on a connection with a client certificate
+/// (`cert`, from the TLS handshake)?
 pub(crate) fn presented(
     headers: &HeaderMap,
+    body_id: Option<&str>,
     body_secret: Option<&str>,
     assertion: Option<&str>,
+    cert: Option<&ClientCertificate>,
 ) -> Result<bool, ApiError> {
-    Ok(body_secret.is_some() || assertion.is_some() || basic_credentials(headers)?.is_some())
+    Ok(body_secret.is_some()
+        || assertion.is_some()
+        || basic_credentials(headers)?.is_some()
+        || (body_id.is_some() && cert.is_some()))
 }
 
 /// A public key of a client, bound at startup to the one algorithm it verifies.
@@ -241,6 +263,8 @@ pub struct Client {
     /// The SHA-256 (lowercase hex) of the entry's `ca_pem_path` file as it was read, for the
     /// list digest and the changes of a reload.
     ca_pem_sha256: Option<String>,
+    /// The entry's `tls_client_cert_sha256`, decoded; empty when it has none.
+    cert_sha256: Vec<[u8; 32]>,
 }
 
 impl std::fmt::Debug for Client {
@@ -250,6 +274,7 @@ impl std::fmt::Debug for Client {
             .field("secret", &self.secret_sha256.is_some())
             .field("keys", &self.keys.len())
             .field("jwks_url", &self.remote.is_some())
+            .field("certificates", &self.cert_sha256.len())
             .finish()
     }
 }
@@ -263,6 +288,11 @@ impl Client {
     /// Whether the entry has keys for `private_key_jwt`, inline or at a `jwks_url`.
     pub fn has_keys(&self) -> bool {
         !self.keys.is_empty() || self.remote.is_some()
+    }
+
+    /// Whether the entry accepts client certificates (`tls_client_cert_sha256`).
+    pub fn has_certificates(&self) -> bool {
+        !self.cert_sha256.is_empty()
     }
 }
 
@@ -384,6 +414,16 @@ pub struct Clients {
 
 /// Most keys one entry's `jwks` may hold.
 pub(crate) const MAX_CLIENT_KEYS: usize = 8;
+/// Most thumbprints one entry's `tls_client_cert_sha256` may hold, as for keys.
+pub(crate) const MAX_CLIENT_CERTS: usize = 8;
+/// What a presented certificate's thumbprint is compared with in the slots an entry does not
+/// fill, and for an unknown id: every check makes [`MAX_CLIENT_CERTS`] comparisons, so timing
+/// does not tell which ids exist or how many certificates an entry lists. Never a real
+/// thumbprint: its match counts for nothing.
+const DECOY_CERT_SHA256: [u8; 32] = [0; 32];
+/// The `detail` of every refused client certificate (SR-110).
+const CERT_REFUSED: &str = "unknown client, or the TLS client certificate is not one the client's \
+                            entry accepts";
 /// Smallest RSA modulus accepted in a client's `jwks`, in bytes (2048 bits).
 const MIN_RSA_MODULUS_BYTES: usize = 256;
 /// Longest `jti` accepted in a client assertion, in bytes.
@@ -419,8 +459,9 @@ impl Clients {
     }
 
     /// Validate a list at startup: ids non-empty and unique; at least one of
-    /// `secret_sha256` (64 hex characters) and keys, either `jwks` (see
-    /// [`parse_client_jwks`]) or `jwks_url` (see [`remote_keys`]), not both.
+    /// `secret_sha256` (64 hex characters), keys, either `jwks` (see
+    /// [`parse_client_jwks`]) or `jwks_url` (see [`remote_keys`]), not both, and
+    /// `tls_client_cert_sha256` (see [`client_cert_pins`]); no thumbprint on two entries.
     pub(crate) fn from_config(
         kind: ClientKind,
         entries: &[AgentConfig],
@@ -460,11 +501,30 @@ impl Clients {
                 Some((cache, ca)) => (Some(Arc::new(cache)), ca),
                 None => (None, None),
             };
-            if secret_sha256.is_none() && keys.is_empty() && remote.is_none() {
+            let cert_sha256 = client_cert_pins(section, a)?;
+            if secret_sha256.is_none()
+                && keys.is_empty()
+                && remote.is_none()
+                && cert_sha256.is_empty()
+            {
                 anyhow::bail!(
-                    "{section} `{}`: set secret_sha256, jwks or jwks_url (private_key_jwt), or a \
-                     secret and keys",
+                    "{section} `{}`: set secret_sha256, jwks or jwks_url (private_key_jwt), or \
+                     tls_client_cert_sha256 (a TLS client certificate); several may be set \
+                     together",
                     a.id
+                );
+            }
+            // One certificate, one client: the certificate alone would otherwise not say
+            // which entry it stands for.
+            if let Some(other) = list
+                .iter()
+                .find(|b| b.cert_sha256.iter().any(|p| cert_sha256.contains(p)))
+            {
+                anyhow::bail!(
+                    "{section} `{}`: a tls_client_cert_sha256 value is also listed by `{}`; one \
+                     certificate may authenticate only one client",
+                    a.id,
+                    other.id
                 );
             }
             list.push(Client {
@@ -473,6 +533,7 @@ impl Clients {
                 keys,
                 remote,
                 ca_pem_sha256,
+                cert_sha256,
             });
         }
         let decoys = parse_client_jwks(DECOY_JWKS)
@@ -596,6 +657,7 @@ impl Clients {
         body_id: Option<&str>,
         body_secret: Option<&str>,
         assertion: Option<&str>,
+        cert: Option<&ClientCertificate>,
         now: OffsetDateTime,
     ) -> Result<Authenticated, ApiError> {
         self.authenticate_with(
@@ -604,13 +666,17 @@ impl Clients {
             body_secret,
             assertion,
             &FetchedKey::none(),
+            cert,
             now,
         )
     }
 
     /// [`authenticate`](Self::authenticate) with the key [`fetch_key`](Self::fetch_key)
     /// fetched for `assertion`. Without it, an assertion of an entry with `jwks_url` is
-    /// refused.
+    /// refused. `cert` is the client certificate of the request's TLS connection, as the
+    /// accept loop attached it ([`ClientCertificate`]); it authenticates only a request that
+    /// carries no other credential and names the client in the id field.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn authenticate_with(
         &self,
         headers: &HeaderMap,
@@ -618,11 +684,19 @@ impl Clients {
         body_secret: Option<&str>,
         assertion: Option<&str>,
         fetched: &FetchedKey,
+        cert: Option<&ClientCertificate>,
         now: OffsetDateTime,
     ) -> Result<Authenticated, ApiError> {
         let kind = self.kind;
         let (id_field, secret_field) = kind.fields();
         let basic = basic_credentials(headers)?;
+        if cert.is_some() && (assertion.is_some() || basic.is_some() || body_secret.is_some()) {
+            tracing::debug!(
+                list = kind.section(),
+                "the request carries a client credential: its TLS client certificate is not used \
+                 to authenticate it"
+            );
+        }
         if let Some(assertion) = assertion {
             if basic.is_some() || body_secret.is_some() {
                 return Err(invalid_request(
@@ -641,6 +715,7 @@ impl Clients {
                 id: v.client,
                 method: ClientMethod::PrivateKeyJwt,
                 replay: Some((v.replay_key, v.replay_until)),
+                client_cert: None,
             });
         }
         let (id, secret) = match (basic, body_secret) {
@@ -669,13 +744,16 @@ impl Clients {
                 }
             },
             (None, None) => {
+                if let (Some(id), Some(cert)) = (body_id, cert) {
+                    return self.authenticate_certificate(id, cert, now);
+                }
                 return Err(invalid_client(
                     "client_auth_missing",
                     format!(
                         "client authentication is required (HTTP Basic, {id_field} and \
                          {secret_field}, or client_assertion)"
                     ),
-                ))
+                ));
             }
         };
         if self.is_empty() {
@@ -697,11 +775,71 @@ impl Clients {
                 id: a.id.clone(),
                 method: ClientMethod::Secret,
                 replay: None,
+                client_cert: None,
             }),
             _ => Err(invalid_client(
                 "client_authentication_failed",
                 "unknown client or wrong secret",
             )),
+        }
+    }
+
+    /// Authenticate client `id` by the TLS client certificate `cert` (RFC 8705 §2.2): its
+    /// thumbprint is one of the entry's `tls_client_cert_sha256`, and it is usable at `now`
+    /// ([`ClientCertificate::check_usable`]). The certificate's own check runs first, whatever
+    /// `id` names, and the thumbprint is compared with [`MAX_CLIENT_CERTS`] values in constant
+    /// time (the entry's, then [`DECOY_CERT_SHA256`]), so the work does not depend on the id.
+    /// Every refusal is the same answer, `client_authentication_failed` with the same
+    /// `detail`; the reason (`unknown_client`, `no_certificate_settings`,
+    /// `thumbprint_mismatch`, `certificate_expired`, `certificate_not_yet_valid`,
+    /// `certificate_not_usable`) goes to the debug log only (SR-110).
+    fn authenticate_certificate(
+        &self,
+        id: &str,
+        cert: &ClientCertificate,
+        now: OffsetDateTime,
+    ) -> Result<Authenticated, ApiError> {
+        if self.is_empty() {
+            return Err(invalid_client(
+                self.kind.none_configured(),
+                format!("no {} are configured", self.kind.section()),
+            ));
+        }
+        let usable = cert.check_usable(now);
+        let known = self.find(id);
+        let pins = known.map_or(&[][..], |c| c.cert_sha256.as_slice());
+        let mut matched = false;
+        for i in 0..MAX_CLIENT_CERTS {
+            let (pin, real) = match pins.get(i) {
+                Some(p) => (p, true),
+                None => (&DECOY_CERT_SHA256, false),
+            };
+            matched |= constant_time_eq(pin, cert.sha256()) & real;
+        }
+        let refused = match (known, usable) {
+            (None, _) => Some("unknown_client"),
+            (Some(c), _) if !c.has_certificates() => Some("no_certificate_settings"),
+            (Some(_), _) if !matched => Some("thumbprint_mismatch"),
+            (Some(_), Err(why)) => Some(why.reason()),
+            (Some(_), Ok(())) => None,
+        };
+        match (refused, known) {
+            (None, Some(c)) => Ok(Authenticated {
+                id: c.id.clone(),
+                method: ClientMethod::SelfSignedTls,
+                replay: None,
+                client_cert: Some(cert.clone()),
+            }),
+            (why, _) => {
+                tracing::debug!(
+                    reason = why.unwrap_or("unknown_client"),
+                    client = ?id,
+                    list = self.kind.section(),
+                    x5t_s256 = %cert.x5t_s256(),
+                    "TLS client certificate refused"
+                );
+                Err(invalid_client("client_authentication_failed", CERT_REFUSED))
+            }
         }
     }
 
@@ -833,6 +971,46 @@ impl Clients {
     }
 }
 
+/// The entry's `tls_client_cert_sha256`, decoded: 1 to [`MAX_CLIENT_CERTS`] values, each
+/// exactly 64 lowercase hex characters (the SHA-256 of a certificate's DER bytes, as
+/// `secret_sha256` writes a digest), none listed twice. Empty when the entry has none. A
+/// refusal names the entry and the problem, never a value.
+fn client_cert_pins(section: &str, a: &AgentConfig) -> anyhow::Result<Vec<[u8; 32]>> {
+    let Some(values) = &a.tls_client_cert_sha256 else {
+        return Ok(Vec::new());
+    };
+    let fail = |msg: String| anyhow::anyhow!("{section} `{}`: tls_client_cert_sha256 {msg}", a.id);
+    if values.is_empty() || values.len() > MAX_CLIENT_CERTS {
+        return Err(fail(format!(
+            "must list 1 to {MAX_CLIENT_CERTS} certificate thumbprints, not {}",
+            values.len()
+        )));
+    }
+    let mut out: Vec<[u8; 32]> = Vec::with_capacity(values.len());
+    for (i, v) in values.iter().enumerate() {
+        let lower_hex = v.len() == 64 && v.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        let decoded = lower_hex
+            .then(|| hex::decode(v).ok())
+            .flatten()
+            .and_then(|d| <[u8; 32]>::try_from(d).ok());
+        let Some(pin) = decoded else {
+            return Err(fail(format!(
+                "value {}: must be 64 lowercase hex characters, the SHA-256 of the certificate's \
+                 DER bytes (openssl x509 -in cert.pem -outform DER | openssl dgst -sha256)",
+                i + 1
+            )));
+        };
+        if out.contains(&pin) {
+            return Err(fail(format!(
+                "value {}: lists the same thumbprint twice",
+                i + 1
+            )));
+        }
+        out.push(pin);
+    }
+    Ok(out)
+}
+
 /// The key cache of an entry with `jwks_url`, checked as the `[[idps]]` key URLs are: the
 /// URL is `https://` (plain `http://` only to a loopback host), `jwks_ttl_seconds` is
 /// positive, and `ca_pem_path` names a readable PEM file of CA certificates. `jwks_url` and
@@ -928,8 +1106,9 @@ pub struct ClientChanges {
     pub added: Vec<String>,
     /// Ids in the old list and not in the new one: their credentials stop working.
     pub removed: Vec<String>,
-    /// Ids in both whose `secret_sha256`, `jwks`, `jwks_url`, `jwks_ttl_seconds` or
-    /// `ca_pem_path` differs, or whose `ca_pem_path` file holds other bytes.
+    /// Ids in both whose `secret_sha256`, `jwks`, `jwks_url`, `jwks_ttl_seconds`,
+    /// `ca_pem_path` or `tls_client_cert_sha256` (as a set) differs, or whose `ca_pem_path`
+    /// file holds other bytes.
     pub changed: Vec<String>,
 }
 
@@ -957,7 +1136,9 @@ impl ClientSets {
 /// The changes from `old` to `new` (each the entries and the list built from them), each list
 /// sorted. A digest is compared without regard to case and a `jwks` as JSON, so rewriting the
 /// same value differently is not a change. The settings of a `jwks_url` are compared as
-/// [`remote_row`] gives them, so a new content of the `ca_pem_path` file is a change.
+/// [`remote_row`] gives them, so a new content of the `ca_pem_path` file is a change. The
+/// thumbprints of `tls_client_cert_sha256` are compared as a set ([`cert_row`]), so a new order
+/// is not a change.
 fn entry_changes(
     (old, old_built): (&[AgentConfig], &Clients),
     (new, new_built): (&[AgentConfig], &Clients),
@@ -975,7 +1156,8 @@ fn entry_changes(
             Some(o)
                 if digest(o) != digest(n)
                     || keys(o) != keys(n)
-                    || remote_row(o, old_built) != remote_row(n, new_built) =>
+                    || remote_row(o, old_built) != remote_row(n, new_built)
+                    || cert_row(o) != cert_row(n) =>
             {
                 out.changed.push(n.id.clone());
             }
@@ -1011,6 +1193,9 @@ pub(crate) struct ClientRules {
     /// table.
     actor_trust: Vec<Option<Vec<String>>>,
     allow_unsigned_chain: bool,
+    /// `[server.tls] client_certificates = "optional"`: the listener asks for client
+    /// certificates, so `tls_client_cert_sha256` can be used.
+    client_certificates: bool,
 }
 
 /// An id as it is written into a warning or a refusal: escaped, so that one with a newline or
@@ -1042,6 +1227,7 @@ impl ClientRules {
                 })
                 .collect(),
             allow_unsigned_chain: config.authzen.allow_unsigned_chain,
+            client_certificates: config.server.asks_for_client_certificates(),
         }
     }
 
@@ -1053,9 +1239,11 @@ impl ClientRules {
     ///
     /// # Errors
     ///
-    /// As [`crate::config::check_reserved_client_ids`] and [`Clients::from_config`], and when
-    /// `[authzen] allow_unsigned_chain = true` and `peps` is empty. The message is the one
-    /// startup fails with.
+    /// As [`crate::config::check_reserved_client_ids`] and [`Clients::from_config`], when
+    /// `[authzen] allow_unsigned_chain = true` and `peps` is empty, and when an entry has
+    /// `tls_client_cert_sha256` while the listener asks for no client certificate (no
+    /// `[server.tls]`, or `client_certificates` is not `"optional"`): such a setting could
+    /// never be used. The message is the one startup fails with.
     pub(crate) fn check(
         &self,
         agents: &[AgentConfig],
@@ -1064,6 +1252,19 @@ impl ClientRules {
         crate::config::check_reserved_client_ids(agents, peps)?;
         let agent_list = Clients::agents(agents, self.policy.clone())?;
         let pep_list = Clients::peps(peps, self.policy.clone())?;
+        if !self.client_certificates {
+            for list in [&agent_list, &pep_list] {
+                if let Some(c) = list.iter().find(|c| c.has_certificates()) {
+                    anyhow::bail!(
+                        "{} `{}`: tls_client_cert_sha256 needs [server.tls] with \
+                         client_certificates = \"optional\"; without it the server asks for no \
+                         client certificate, so this entry's certificates could never be used",
+                        list.kind.section(),
+                        c.id
+                    );
+                }
+            }
+        }
         let mut warnings = Vec::new();
         for (issuer, client_ids) in &self.idps {
             for agent in agent_list.iter().filter(|a| !client_ids.contains(&a.id)) {
@@ -1080,6 +1281,16 @@ impl ClientRules {
             warnings.push(
                 "[[agents]] entries have keys (jwks or jwks_url) but [token] actor_auth = \
                  \"actor_token\": client assertions, like client secrets, are refused"
+                    .into(),
+            );
+        }
+        if self.actor_auth == ActorAuth::ActorToken
+            && agent_list.iter().any(Client::has_certificates)
+        {
+            warnings.push(
+                "[[agents]] entries have tls_client_cert_sha256 but [token] actor_auth = \
+                 \"actor_token\": TLS client certificates, like client secrets, are refused at \
+                 POST /token"
                     .into(),
             );
         }
@@ -1157,8 +1368,10 @@ impl ClientRules {
 /// (base64url) of the entry's `jwks` keys. An entry with `jwks_url` has four more members,
 /// [`remote_row`]: `[id, secret_sha256, [], jwks_url, jwks_ttl_seconds, ca_pem_path,
 /// ca_pem_sha256]`; an entry without one keeps three, so a list without `jwks_url` has the
-/// digest it had before the setting existed. The keys at a URL are not in it: they change
-/// without a reload. `built` is the list as built from `entries`, which holds the digest of
+/// digest it had before the setting existed. An entry with `tls_client_cert_sha256` has one
+/// more member after those, [`cert_row`]: `{"tls_client_cert_sha256": [sorted thumbprints]}`;
+/// an entry without it has none, so a list without certificates keeps its digest too. The keys
+/// at a URL are not in it: they change without a reload. `built` is the list as built from `entries`, which holds the digest of
 /// each `ca_pem_path` file as it was read. Recorded in the reload's audit record, so that a
 /// config file can be shown to hold the lists that were put in force; no secret or key
 /// material goes into it beyond digests and thumbprints.
@@ -1184,6 +1397,7 @@ pub(crate) fn list_sha256(entries: &[AgentConfig], built: &Clients) -> String {
                 Value::from(thumbprints),
             ];
             row.extend(remote_row(a, built).into_iter().flatten());
+            row.extend(cert_row(a));
             Value::Array(row)
         })
         .collect();
@@ -1210,6 +1424,15 @@ fn remote_row(a: &AgentConfig, built: &Clients) -> Option<[Value; 4]> {
             .ca_pem_sha256(&a.id)
             .map_or(Value::Null, |d| Value::from(d.to_owned())),
     ])
+}
+
+/// The certificate settings of an entry, `None` without `tls_client_cert_sha256`: the object
+/// `{"tls_client_cert_sha256": [...]}` with the thumbprints sorted, as written (the list check
+/// accepts lowercase hex only).
+fn cert_row(a: &AgentConfig) -> Option<Value> {
+    let mut pins = a.tls_client_cert_sha256.clone()?;
+    pins.sort();
+    Some(serde_json::json!({ "tls_client_cert_sha256": pins }))
 }
 
 /// The RFC 7638 SHA-256 thumbprint (base64url) of a public JWK: the required members of its
@@ -1320,6 +1543,9 @@ pub(crate) struct Authenticated {
     id: String,
     method: ClientMethod,
     replay: Option<(String, i64)>,
+    /// The TLS client certificate that authenticated the client, for
+    /// [`ClientMethod::SelfSignedTls`] only.
+    client_cert: Option<ClientCertificate>,
 }
 
 impl Authenticated {
@@ -1331,6 +1557,15 @@ impl Authenticated {
     /// How the client authenticated.
     pub(crate) fn method(&self) -> ClientMethod {
         self.method
+    }
+
+    /// For a client authenticated by its TLS client certificate, the `client_cert` member of
+    /// the audit record's arguments ([`ClientCertificate::audit_value`]); `None` otherwise, so
+    /// the records of other requests digest as before.
+    pub(crate) fn client_cert_audit(&self) -> Option<Value> {
+        self.client_cert
+            .as_ref()
+            .map(ClientCertificate::audit_value)
     }
 
     /// For an agent at `POST /token`, the refusals that come before any work and leave the
@@ -1776,7 +2011,7 @@ mod tests {
         id: Option<&str>,
         secret: Option<&str>,
     ) -> Result<String, ApiError> {
-        c.authenticate(h, id, secret, None, now())
+        c.authenticate(h, id, secret, None, None, now())
             .map(|a| a.id().to_owned())
     }
 
@@ -2131,6 +2366,7 @@ mod tests {
             jwks_url: None,
             jwks_ttl_seconds: None,
             ca_pem_path: None,
+            tls_client_cert_sha256: None,
         };
         let e = Clients::agents(&[neither], policy())
             .unwrap_err()
@@ -2142,6 +2378,391 @@ mod tests {
         let bad = AgentConfig::with_jwks("coder", jwks(&[ed_key().private_jwk()]));
         let e = Clients::peps(&[bad], policy()).unwrap_err().to_string();
         assert!(e.starts_with("[[peps]] `coder`: jwks:"), "{e}");
+    }
+
+    // --- TLS client certificates (RFC 8705 self_signed_tls_client_auth) -----------------
+
+    /// A self-signed client certificate valid around [`now`], and its lowercase hex SHA-256.
+    fn client_cert() -> (ClientCertificate, String) {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["client".to_string()]).unwrap();
+        params.not_before = now() - time::Duration::days(1);
+        params.not_after = now() + time::Duration::days(1);
+        let der = params.self_signed(&key).unwrap().der().clone();
+        let hex = hex::encode(Sha256::digest(der.as_ref()));
+        (ClientCertificate::new(der), hex)
+    }
+
+    fn pinned(id: &str, pins: &[&str]) -> AgentConfig {
+        AgentConfig::with_tls_client_cert_sha256(id, pins.iter().copied())
+    }
+
+    #[test]
+    fn tls_client_cert_sha256_is_checked() {
+        let refused = |a: AgentConfig| Clients::agents(&[a], policy()).unwrap_err().to_string();
+        let good = "ab".repeat(32);
+        let other = "cd".repeat(32);
+        // 1 to 8 values; a certificate alone is a credential.
+        let c = Clients::agents(&[pinned("coder", &[&good])], policy()).unwrap();
+        let entry = c.iter().next().unwrap();
+        assert!(entry.has_certificates() && !entry.has_secret() && !entry.has_keys());
+        let eight: Vec<String> = (0..8).map(|i| format!("{i:064x}")).collect();
+        let eight_refs: Vec<&str> = eight.iter().map(String::as_str).collect();
+        Clients::agents(&[pinned("coder", &eight_refs)], policy()).unwrap();
+        let nine: Vec<String> = (0..9).map(|i| format!("{i:064x}")).collect();
+        let nine_refs: Vec<&str> = nine.iter().map(String::as_str).collect();
+        let e = refused(pinned("coder", &nine_refs));
+        assert!(e.contains("1 to 8") && e.contains("not 9"), "{e}");
+        let e = refused(pinned("coder", &[]));
+        assert!(e.contains("1 to 8") && e.contains("not 0"), "{e}");
+        // Exactly 64 lowercase hex characters; the message never quotes the value.
+        for bad in [
+            good.to_ascii_uppercase(),
+            good[..63].to_string(),
+            format!("{good}0"),
+            format!("{}zz", &good[..62]),
+            format!("sha256:{good}"),
+            URL_SAFE_NO_PAD.encode([0xabu8; 32]),
+            String::new(),
+        ] {
+            let e = refused(pinned("coder", &[&other, &bad]));
+            assert!(
+                e.starts_with(
+                    "[[agents]] `coder`: tls_client_cert_sha256 value 2: must be 64 lowercase hex"
+                ),
+                "{bad}: {e}"
+            );
+            assert!(bad.is_empty() || !e.contains(&bad), "{e}");
+        }
+        let e = refused(pinned("coder", &[&good, &other, &good]));
+        assert!(
+            e.contains("value 3: lists the same thumbprint twice"),
+            "{e}"
+        );
+        // The same certificate on two entries of one list: one certificate, one client.
+        let e = Clients::peps(
+            &[pinned("a", &[&good]), pinned("b", &[&other, &good])],
+            policy(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            e.starts_with("[[peps]] `b`: a tls_client_cert_sha256 value is also listed by `a`"),
+            "{e}"
+        );
+        // With a secret and keys too.
+        let mixed = AgentConfig {
+            tls_client_cert_sha256: Some(vec![good.clone()]),
+            ..AgentConfig::with_jwks("coder", jwks(&[public(&ed_key(), None)]))
+        };
+        let mixed = AgentConfig {
+            secret_sha256: Some(sha("s")),
+            ..mixed
+        };
+        let c = Clients::agents(&[mixed], policy()).unwrap();
+        let e = c.iter().next().unwrap();
+        assert!(e.has_certificates() && e.has_secret() && e.has_keys());
+        // The TOML key parses into the field, and unknown spellings are refused.
+        let cfg = crate::config::Config::from_toml(&format!(
+            "[[agents]]\nid = \"coder\"\ntls_client_cert_sha256 = [\"{good}\"]\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            cfg.agents[0].tls_client_cert_sha256,
+            Some(vec![good.clone()])
+        );
+        assert!(crate::config::Config::from_toml(&format!(
+            "[[agents]]\nid = \"coder\"\ntls_client_cert_sha256 = \"{good}\"\n"
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn a_pinned_certificate_authenticates_its_client() {
+        let (cert, hex) = client_cert();
+        let (other_cert, other_hex) = client_cert();
+        let c = Clients::agents(
+            &[
+                pinned("coder", &[&"00".repeat(32), &hex]),
+                AgentConfig::with_secret_sha256("planner", sha("p")),
+                pinned("reviewer", &[&other_hex]),
+            ],
+            policy(),
+        )
+        .unwrap();
+        let h = HeaderMap::new();
+        let auth = c
+            .authenticate(&h, Some("coder"), None, None, Some(&cert), now())
+            .unwrap();
+        assert_eq!(auth.id(), "coder");
+        assert_eq!(auth.method(), ClientMethod::SelfSignedTls);
+        assert_eq!(
+            auth.client_cert_audit(),
+            Some(json!({"x5t#S256": cert.x5t_s256(), "source": "tls"}))
+        );
+        assert!(auth.replay.is_none());
+        assert_eq!(
+            auth.commit(
+                &ReplayCache::new(Arc::new(MemoryLeaseStore::new()), 10),
+                now()
+            )
+            .unwrap(),
+            "coder"
+        );
+
+        // Every refusal is the same answer: status, error, sub-code, detail and headers.
+        let refusals = [
+            // Unknown id.
+            c.authenticate(&h, Some("nobody"), None, None, Some(&cert), now()),
+            // An entry without certificates.
+            c.authenticate(&h, Some("planner"), None, None, Some(&cert), now()),
+            // The certificate of another entry.
+            c.authenticate(&h, Some("reviewer"), None, None, Some(&cert), now()),
+            c.authenticate(&h, Some("coder"), None, None, Some(&other_cert), now()),
+            // Expired and not yet valid, though pinned.
+            c.authenticate(
+                &h,
+                Some("coder"),
+                None,
+                None,
+                Some(&cert),
+                now() + time::Duration::days(2),
+            ),
+            c.authenticate(
+                &h,
+                Some("coder"),
+                None,
+                None,
+                Some(&cert),
+                now() - time::Duration::days(2),
+            ),
+        ];
+        let answers: Vec<_> = refusals
+            .into_iter()
+            .map(|r| {
+                let e = r.unwrap_err();
+                let resp = axum::response::IntoResponse::into_response(e.clone());
+                (
+                    e.status,
+                    e.code.clone(),
+                    e.description,
+                    e.detail.clone(),
+                    resp.headers().clone(),
+                )
+            })
+            .collect();
+        assert_eq!(answers[0].0, StatusCode::UNAUTHORIZED);
+        assert_eq!(answers[0].1, "invalid_client");
+        assert_eq!(answers[0].2, Some("client_authentication_failed"));
+        assert_eq!(answers[0].3, CERT_REFUSED);
+        for a in &answers {
+            assert_eq!(a, &answers[0]);
+        }
+        // Without a client id the certificate authenticates nobody: no credential at all.
+        assert_eq!(
+            code(c.authenticate(&h, None, None, None, Some(&cert), now())),
+            "client_auth_missing"
+        );
+        // A list with no entries.
+        let none = Clients::agents(&[], policy()).unwrap();
+        assert_eq!(
+            code(none.authenticate(&h, Some("coder"), None, None, Some(&cert), now())),
+            "no_agents_configured"
+        );
+        // Rotation: either of two pinned certificates.
+        let both = Clients::peps(&[pinned("gw", &[&hex, &other_hex])], policy()).unwrap();
+        for crt in [&cert, &other_cert] {
+            assert_eq!(
+                both.authenticate(&h, Some("gw"), None, None, Some(crt), now())
+                    .unwrap()
+                    .id(),
+                "gw"
+            );
+        }
+    }
+
+    /// A body credential decides; the certificate is then ignored, even when it is pinned.
+    #[test]
+    fn a_body_credential_wins_over_the_certificate() {
+        let (cert, hex) = client_cert();
+        let mut entry = pinned("coder", &[&hex]);
+        entry.secret_sha256 = Some(sha("s3cret"));
+        let c = Clients::agents(&[entry, pinned("solo", &[&"11".repeat(32)])], policy()).unwrap();
+        let h = HeaderMap::new();
+        let auth = c
+            .authenticate(&h, Some("coder"), Some("s3cret"), None, Some(&cert), now())
+            .unwrap();
+        assert_eq!(auth.method(), ClientMethod::Secret);
+        assert_eq!(auth.client_cert_audit(), None);
+        // A wrong secret is refused though the certificate would have authenticated.
+        assert_eq!(
+            code(c.authenticate(&h, Some("coder"), Some("nope"), None, Some(&cert), now())),
+            "client_authentication_failed"
+        );
+        let b = basic("coder", "nope");
+        assert_eq!(
+            code(c.authenticate(&b, None, None, None, Some(&cert), now())),
+            "client_authentication_failed"
+        );
+        let b = basic("coder", "s3cret");
+        assert_eq!(
+            c.authenticate(&b, Some("coder"), None, None, Some(&cert), now())
+                .unwrap()
+                .method(),
+            ClientMethod::Secret
+        );
+        // An entry with certificates only and a secret in the request: the secret path refuses.
+        assert_eq!(
+            code(c.authenticate(&h, Some("solo"), Some("x"), None, Some(&cert), now())),
+            "client_authentication_failed"
+        );
+    }
+
+    #[test]
+    fn a_client_id_with_a_certificate_counts_as_presented() {
+        let (cert, _) = client_cert();
+        let h = HeaderMap::new();
+        assert!(presented(&h, Some("coder"), None, None, Some(&cert)).unwrap());
+        assert!(!presented(&h, Some("coder"), None, None, None).unwrap());
+        assert!(!presented(&h, None, None, None, Some(&cert)).unwrap());
+        assert!(presented(&h, None, Some("s"), None, None).unwrap());
+        assert!(presented(&h, None, None, Some("a.b.c"), None).unwrap());
+        assert!(presented(&basic("a", "b"), None, None, None, None).unwrap());
+        assert!(!presented(&h, None, None, None, None).unwrap());
+    }
+
+    #[test]
+    fn client_method_strings() {
+        assert_eq!(ClientMethod::Secret.as_str(), "client_secret");
+        assert_eq!(ClientMethod::PrivateKeyJwt.as_str(), "private_key_jwt");
+        assert_eq!(
+            ClientMethod::SelfSignedTls.as_str(),
+            "self_signed_tls_client_auth"
+        );
+        assert_eq!(
+            ClientMethod::SelfSignedTls.with_actor_token(),
+            "actor_token+self_signed_tls_client_auth"
+        );
+        assert_eq!(
+            ClientMethod::Secret.with_actor_token(),
+            "actor_token+client_secret"
+        );
+    }
+
+    /// The digest of a list without certificates is the one the code gave before they
+    /// existed (a fixed value); an entry with certificates gets one more member; the order of
+    /// the thumbprints is no change, a new set is.
+    #[test]
+    fn the_list_digest_and_the_changes_cover_certificates() {
+        let built = |list: &[AgentConfig]| Clients::agents(list, policy()).unwrap();
+        let sha256 = |list: &[AgentConfig]| list_sha256(list, &built(list));
+        let changed = |old: &[AgentConfig], new: &[AgentConfig]| {
+            entry_changes((old, &built(old)), (new, &built(new))).changed
+        };
+        let s = AgentConfig::with_secret_sha256("planner", sha("p"));
+        assert_eq!(
+            sha256(std::slice::from_ref(&s)),
+            "2344eebf03579c4299b82a1cbadce9f3e3c2dbc0fa2758e713d38b3353821746"
+        );
+        let (a, b) = ("aa".repeat(32), "bb".repeat(32));
+        let ab = pinned("coder", &[&a, &b]);
+        let ba = pinned("coder", &[&b, &a]);
+        let only_a = pinned("coder", &[&a]);
+        let digest = |rows: Value| hex::encode(Sha256::digest(rows.to_string().as_bytes()));
+        assert_eq!(
+            sha256(&[s.clone(), ab.clone()]),
+            digest(json!([
+                ["coder", null, [], {"tls_client_cert_sha256": [a, b]}],
+                ["planner", sha("p"), []]
+            ]))
+        );
+        assert_eq!(
+            sha256(std::slice::from_ref(&ab)),
+            sha256(std::slice::from_ref(&ba))
+        );
+        assert!(changed(std::slice::from_ref(&ab), std::slice::from_ref(&ba)).is_empty());
+        assert_eq!(
+            changed(std::slice::from_ref(&ab), std::slice::from_ref(&only_a)),
+            ["coder"]
+        );
+        assert_ne!(
+            sha256(std::slice::from_ref(&ab)),
+            sha256(std::slice::from_ref(&only_a))
+        );
+        // Adding certificates to an entry that had a secret is a change.
+        let mut with = s.clone();
+        with.tls_client_cert_sha256 = Some(vec![a.clone()]);
+        assert_eq!(
+            changed(std::slice::from_ref(&s), std::slice::from_ref(&with)),
+            ["planner"]
+        );
+        assert_ne!(sha256(std::slice::from_ref(&s)), sha256(&[with]));
+        // With jwks_url as well: the certificate member comes after its four.
+        let url = AgentConfig {
+            tls_client_cert_sha256: Some(vec![a.clone()]),
+            ..AgentConfig::with_jwks_url("coder", "https://keys.example/a")
+        };
+        assert_eq!(
+            sha256(&[url]),
+            digest(json!([[
+                "coder",
+                null,
+                [],
+                "https://keys.example/a",
+                300,
+                null,
+                null,
+                {"tls_client_cert_sha256": [a]}
+            ]]))
+        );
+    }
+
+    /// `tls_client_cert_sha256` is refused at startup and at reload unless the listener asks
+    /// for client certificates; with actor_auth = "actor_token" it is a warning.
+    #[test]
+    fn certificates_need_a_listener_that_asks_for_them() {
+        let pin = "ab".repeat(32);
+        let mut config = crate::config::Config::default();
+        let off = ClientRules::from_config(&config);
+        let agent = [pinned("coder", &[&pin])];
+        let secret = [AgentConfig::with_secret_sha256("gw", sha("g"))];
+        for (agents, peps, section) in [
+            (&agent[..], &secret[..], "[[agents]] `coder`"),
+            (&secret[..], &[pinned("gw2", &[&pin])][..], "[[peps]] `gw2`"),
+        ] {
+            let e = off.check(agents, peps).err().unwrap().to_string();
+            assert!(
+                e.starts_with(&format!(
+                    "{section}: tls_client_cert_sha256 needs [server.tls]"
+                )),
+                "{e}"
+            );
+        }
+        config.server.public_url = Some("https://localhost:8443".into());
+        config.server.tls = Some(crate::config::ServerTlsSection {
+            cert_pem_path: "c".into(),
+            key_pem_path: "k".into(),
+            client_certificates: crate::config::ClientCertificates::Off,
+        });
+        let tls_off = ClientRules::from_config(&config);
+        assert!(tls_off.check(&agent, &secret).is_err());
+        config.server.tls.as_mut().unwrap().client_certificates =
+            crate::config::ClientCertificates::Optional;
+        let on = ClientRules::from_config(&config);
+        let (sets, warnings) = on.check(&agent, &secret).unwrap();
+        assert!(sets.agents.iter().next().unwrap().has_certificates());
+        assert!(warnings.is_empty(), "{warnings:?}");
+        // The same thumbprint on an agent and a PEP is allowed: different lists.
+        on.check(&agent, &[pinned("gw", &[&pin])]).unwrap();
+        config.token.actor_auth = ActorAuth::ActorToken;
+        let (_, warnings) = ClientRules::from_config(&config)
+            .check(&agent, &secret)
+            .unwrap();
+        assert!(
+            warnings.iter().any(|w| w.contains("tls_client_cert_sha256")
+                && w.contains("actor_auth = \"actor_token\"")),
+            "{warnings:?}"
+        );
     }
 
     // --- assertions ---------------------------------------------------------------------
@@ -2196,6 +2817,7 @@ mod tests {
                     jwks_url: None,
                     jwks_ttl_seconds: None,
                     ca_pem_path: None,
+                    tls_client_cert_sha256: None,
                 },
             ],
             policy(),
@@ -2273,13 +2895,15 @@ mod tests {
         assert!(verify(&c, &new.sign(&patched("coder", &[], &["iat"])), None).is_ok());
         let h = HeaderMap::new();
         let a = both.sign(&claims("both"));
-        let auth = c.authenticate(&h, None, None, Some(&a), now()).unwrap();
+        let auth = c
+            .authenticate(&h, None, None, Some(&a), None, now())
+            .unwrap();
         assert_eq!(
             (auth.id(), auth.method()),
             ("both", ClientMethod::PrivateKeyJwt)
         );
         let auth = c
-            .authenticate(&h, Some("both"), Some("b0th"), None, now())
+            .authenticate(&h, Some("both"), Some("b0th"), None, None, now())
             .unwrap();
         assert_eq!((auth.id(), auth.method()), ("both", ClientMethod::Secret));
     }
@@ -2364,7 +2988,10 @@ mod tests {
         let h = HeaderMap::new();
         let answers: Vec<ApiError> = [&ghost, &secretive, &other_kid, &no_kid, &swapped]
             .into_iter()
-            .map(|a| c.authenticate(&h, None, None, Some(a), now()).unwrap_err())
+            .map(|a| {
+                c.authenticate(&h, None, None, Some(a), None, now())
+                    .unwrap_err()
+            })
             .collect();
         assert!(answers.iter().all(|e| *e == answers[0]), "{answers:?}");
         // Audience: the token endpoint URL, another server, an extra value, an empty array.
@@ -2562,7 +3189,9 @@ mod tests {
             )
             .unwrap();
             assert_eq!(header["alg"], s.key.alg());
-            let auth = c.authenticate(&h, None, None, Some(&a), now()).unwrap();
+            let auth = c
+                .authenticate(&h, None, None, Some(&a), None, now())
+                .unwrap();
             assert_eq!(
                 (auth.id(), auth.method()),
                 ("coder", ClientMethod::PrivateKeyJwt)
@@ -2576,7 +3205,7 @@ mod tests {
         .sign(&claims("coder"));
         assert_eq!(unverified(&c, &crossed), Unverified::KeyAlgMismatch);
         assert_eq!(
-            code(c.authenticate(&h, None, None, Some(&crossed), now())),
+            code(c.authenticate(&h, None, None, Some(&crossed), None, now())),
             "client_authentication_failed"
         );
     }
@@ -2588,16 +3217,16 @@ mod tests {
         let a = new.sign(&claims("coder"));
         let h = HeaderMap::new();
         assert_eq!(
-            code(c.authenticate(&h, None, Some("x"), Some(&a), now())),
+            code(c.authenticate(&h, None, Some("x"), Some(&a), None, now())),
             "multiple_client_auth"
         );
         assert_eq!(
-            code(c.authenticate(&basic("coder", "x"), None, None, Some(&a), now())),
+            code(c.authenticate(&basic("coder", "x"), None, None, Some(&a), None, now())),
             "multiple_client_auth"
         );
         let b = both.sign(&claims("both"));
         assert_eq!(
-            code(c.authenticate(&h, Some("both"), Some("b0th"), Some(&b), now())),
+            code(c.authenticate(&h, Some("both"), Some("b0th"), Some(&b), None, now())),
             "multiple_client_auth"
         );
         // A key-only entry has no secret, whatever is sent; an empty secret neither.
@@ -2614,12 +3243,12 @@ mod tests {
         // A secret-only entry cannot be authenticated by an assertion.
         let fake = new.sign(&claims("secretive"));
         assert_eq!(
-            code(c.authenticate(&h, None, None, Some(&fake), now())),
+            code(c.authenticate(&h, None, None, Some(&fake), None, now())),
             "client_authentication_failed"
         );
         let none = Clients::agents(&[], policy()).unwrap();
         assert_eq!(
-            code(none.authenticate(&h, None, None, Some(&a), now())),
+            code(none.authenticate(&h, None, None, Some(&a), None, now())),
             "no_agents_configured"
         );
     }
@@ -2630,7 +3259,10 @@ mod tests {
         let h = HeaderMap::new();
         let a = new.sign(&claims("coder"));
         let replay = ReplayCache::new(Arc::new(MemoryLeaseStore::new()), 10);
-        let auth = |a: &str| c.authenticate(&h, None, None, Some(a), now()).unwrap();
+        let auth = |a: &str| {
+            c.authenticate(&h, None, None, Some(a), None, now())
+                .unwrap()
+        };
         assert_eq!(auth(&a).commit(&replay, now()).unwrap(), "coder");
         // The whole refusal, as it was when the replay was recognised by its sub-code.
         let e = auth(&a).commit(&replay, now()).unwrap_err();
@@ -2657,7 +3289,7 @@ mod tests {
         )
         .unwrap();
         let before = replay.len();
-        s.authenticate(&h, Some("secretive"), Some("s3cret"), None, now())
+        s.authenticate(&h, Some("secretive"), Some("s3cret"), None, None, now())
             .unwrap()
             .commit(&replay, now())
             .unwrap();
@@ -2741,7 +3373,7 @@ mod tests {
         let (c2, _, new, _, _) = setup();
         let a = new.sign(&patched("coder", &[("aud", "https://other".into())], &[]));
         let e = c2
-            .authenticate(&HeaderMap::new(), None, None, Some(&a), now())
+            .authenticate(&HeaderMap::new(), None, None, Some(&a), None, now())
             .unwrap_err();
         assert!(
             !e.detail.contains(&a) && !e.detail.contains("other"),

@@ -78,6 +78,8 @@ pub mod admin_ui;
 pub mod auto_prune;
 // Used by the benches (`result_digest`).
 pub mod authz;
+pub(crate) mod client_cert;
+pub(crate) mod client_cert_verifier;
 pub(crate) mod clientauth;
 pub mod config;
 // Used by the fuzz targets.

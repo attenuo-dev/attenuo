@@ -779,6 +779,7 @@ async fn startup_refuses_unusable_client_keys() {
                 jwks_url: None,
                 jwks_ttl_seconds: None,
                 ca_pem_path: None,
+                tls_client_cert_sha256: None,
             },
             "set secret_sha256, jwks",
         ),
