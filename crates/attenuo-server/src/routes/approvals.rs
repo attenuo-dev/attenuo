@@ -405,12 +405,13 @@ pub async fn user_get(
             },
             now,
         )?;
-        if binding.cert() {
-            crate::cert_binding::check_revocation(&state.clients, cert, now)?;
-        }
         if attenuo_core::chain_id_of(&verified.chain).as_deref() != Some(a.chain_id.0.as_str()) {
             // Not this run's: do not confirm the approval exists.
             return Err(unknown_approval(&id));
+        }
+        // After the run check, so that another run's token learns nothing of the approval.
+        if binding.cert() {
+            crate::cert_binding::check_revocation(&state.clients, &verified.chain, cert, now)?;
         }
         // A token whose lease (or an ancestor's) was revoked or has expired speaks for no
         // agent any more, though its signature still verifies (SR-60): answer it as one of

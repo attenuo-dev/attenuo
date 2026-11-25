@@ -104,7 +104,7 @@ fn renew_sync(
         now,
     )?;
     if binding.cert() {
-        crate::cert_binding::check_revocation(&state.clients, cert, now)?;
+        crate::cert_binding::check_revocation(&state.clients, &verified.chain, cert, now)?;
     }
     let dpop_bound = binding.dpop();
     let chain = verified.chain;

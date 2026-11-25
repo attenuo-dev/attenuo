@@ -382,7 +382,7 @@ tls_client_auth_san_uri = "spiffe://example.org/ns/agents/sa/coder"
 tls_client_crl_paths = ["/etc/attenuo/agents-ca.crl"]
 ```
 
-If an intermediate CA issues the certificates, list its CRL too, and put the intermediate's certificate in `tls_client_crl_issuer_pem_path`, so attenuo knows its key. The root's CRL then covers the intermediate itself.
+If an intermediate CA issues the certificates, list its CRL too, and put the intermediate's certificate in `tls_client_crl_issuer_pem_path`, so attenuo knows its key. The root's CRL then covers the intermediate itself. If the intermediate is in `tls_client_ca_pem_path` as well (for clients that send no chain), the path ends there, and attenuo checks the intermediate in the root's CRL only when the root is in `tls_client_ca_pem_path` or `tls_client_crl_issuer_pem_path` too. So keep the root in the CA file next to the intermediate. Each certificate of `tls_client_crl_issuer_pem_path` must be valid now and issued by a CA allowed to sign certificates. Once the root's CRL revokes the intermediate, remove the intermediate's CRL from `tls_client_crl_paths` in the same reload: a revoked CA signs no CRL attenuo uses, and the reload is refused while it is listed.
 
 **3. Reload after each new CRL.** Copy the new file into place in one step (write it next to the old one, then `mv`), and run `attenuo admin agent reload`. The reload reads every CRL again. It is refused, and the CRLs in force stay, when a file is broken, signed by another key, or older than the one in force (`client_crl_older`).
 
@@ -391,9 +391,9 @@ If an intermediate CA issues the certificates, list its CRL too, and put the int
 Notes:
 
 - A revoked certificate gets `401 client_certificate_revoked`, logged at info level with its `x5t#S256`. Refusals are not audited.
-- A CA with no CRL in the entry is not checked, unless `tls_client_crl_missing = "refuse"`.
-- The CA certificates in `tls_client_ca_pem_path` cannot be revoked by a CRL. Remove a compromised one from the file and reload.
-- A restart accepts any valid CRL, also an older one than before the restart. Keep only the newest file in place.
+- A CA with no CRL in the entry is not checked, unless `tls_client_crl_missing = "refuse"`. Under the default, the start and each reload log a warning naming each such CA by subject.
+- A CA certificate in `tls_client_ca_pem_path` that is not self-signed, and whose issuer is in that file or in `tls_client_crl_issuer_pem_path`, is checked in its issuer's CRL like any intermediate, and a warning names it when that CRL lists it. A self-signed root, or a CA whose issuer neither file holds, cannot be revoked by a CRL: remove a compromised one from the file and reload.
+- The rule that a reload never goes back to an older CRL compares with the CRLs in force only. A restart accepts any valid CRL, also an older one than before the restart. So does a reload after one that dropped that CA's CRL. Keep only the newest file in place.
 - Pinned certificates (`tls_client_cert_sha256`) are not affected by CRLs.
 - A token bound to a revoked certificate stops working too; see [binding tokens](binding-tokens-to-keys.md#binding-tokens-to-a-tls-client-certificate).
 
@@ -409,7 +409,7 @@ What is different:
 - Anyone who can connect to the forwarding listener from a listed address can claim any certificate. Bind it where only the proxy reaches it.
 - Every other listener refuses those headers with `400` while the section is set. So a client that sends them to the main listener fails at once.
 - The audit records say `"source": "forwarded"` in `client_cert`; `actor_auth` and `agent_auth` are the same as on the native listener.
-- With HAProxy, which sends no chain, put the intermediate CA in the entry's CA file.
+- With HAProxy, which sends no chain, put the intermediate CA in the entry's CA file. With CRLs, keep the root in that file too: the intermediate is then checked in the root's CRL, as when the client sends it.
 - With certificate-bound tokens, the proxy must forward the certificate on every route that takes a token, not only on `/token`.
 
 The setup, the fences, and a tested HAProxy recipe are in [forwarded client certificates](deploying.md#forwarded-client-certificates).

@@ -23,9 +23,10 @@
 //! - a certificate that is the bound one but fails the check of its `[[agents]]` entry with
 //!   `tls_client_crl_paths` ([`check_revocation`], ADR-0023): `client_certificate_revoked`,
 //!   or `client_certificate_revocation_unknown` for any other failure of that check (a stale
-//!   or missing CRL, an expired certificate, a path that no longer builds). On the MCP proxy
-//!   route the server does not hand such a certificate to the proxy
-//!   ([`expose_to_proxy`]), so the answer there is `client_certificate_required`.
+//!   or missing CRL, an expired certificate, a path that no longer builds). The same codes on
+//!   every route, the MCP proxy's included (JSON-RPC `-32001`). The check runs only for a
+//!   token bound to a certificate, once its thumbprint matched; the entries checked are
+//!   those of the token's agents, never found by the certificate's names.
 //!
 //! **Exchange.** A child of a certificate-bound token is bound to the same certificate, and
 //! the exchange request must show that certificate. No `DPoP` header and no
@@ -292,24 +293,23 @@ pub(crate) fn check_cert(bound: &str, cert: Option<&[u8; 32]>) -> Result<(), Cer
 }
 
 /// The revocation check of a certificate-bound token, after its thumbprint matched the
-/// request's certificate `cert`: the certificate passes the check of the `[[agents]]` entry
-/// with `tls_client_crl_paths` whose name it carries
+/// request's certificate `cert`: the certificate passes the check of each `[[agents]]` entry
+/// with `tls_client_auth` and `tls_client_crl_paths` that is an agent of the token's `chain`
 /// ([`crate::clientauth::Clients::bound_certificate_refusal`], against the agents in force
-/// now). A certificate that carries no such entry's name (a pinned one, one from an entry
-/// without CRLs, one whose entry a reload removed) is not checked: the thumbprint decides, as
-/// before. Not audited, as the other binding refusals are not; logged at info level.
+/// now). A token none of whose agents has such an entry (a pinned certificate's, one from an
+/// entry without CRLs, one whose entry a reload removed) is not checked: the thumbprint
+/// decides, as before. Run only for a token bound to a certificate, so other requests cost
+/// nothing more. Not audited, as the other binding refusals are not.
 pub(crate) fn check_revocation(
     clients: &crate::clientauth::SharedClients,
+    chain: &attenuo_core::DelegationChain,
     cert: Option<&ClientCertificate>,
     now: OffsetDateTime,
 ) -> Result<(), CertFailure> {
-    let Some(cert) = cert else {
-        return Ok(());
-    };
     match clients
         .snapshot()
         .agents
-        .bound_certificate_refusal(cert, now)
+        .bound_certificate_refusal(chain, cert, now)
     {
         None => Ok(()),
         Some(crate::client_crl::REVOKED_LOG_REASON) => Err(CertFailure::Revoked),
@@ -449,25 +449,38 @@ pub(crate) fn check_exchange_of_cert_bound(
 /// accept loop or the forwarding listener's header check set, and from nothing else. Any
 /// thumbprint already in the extensions is dropped first (none can be: a request off the wire
 /// has no extensions).
+///
+/// The request is then served with the certificate itself in [`REQUEST_CERTIFICATE`], for
+/// the revocation check of a certificate-bound token, which the server's authorizer runs only
+/// once the token's thumbprint matched ([`request_certificate`]). Nothing is checked here.
 pub(crate) async fn expose_to_proxy(
-    axum::extract::State(state): axum::extract::State<std::sync::Arc<crate::state::AppState>>,
     mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     req.extensions_mut()
         .remove::<attenuo_proxy::ClientCertThumbprint>();
-    // A certificate that fails its entry's CRL check is not handed to the proxy, so a token
-    // bound to it is refused there (`client_certificate_required`); a bearer or DPoP token
-    // does not need it.
-    let thumbprint = req
-        .extensions()
-        .get::<ClientCertificate>()
-        .filter(|c| check_revocation(&state.clients, Some(c), state.now()).is_ok())
-        .map(|c| attenuo_proxy::ClientCertThumbprint(*c.sha256()));
-    if let Some(t) = thumbprint {
-        req.extensions_mut().insert(t);
+    let cert = req.extensions().get::<ClientCertificate>().cloned();
+    match cert {
+        Some(cert) => {
+            req.extensions_mut()
+                .insert(attenuo_proxy::ClientCertThumbprint(*cert.sha256()));
+            REQUEST_CERTIFICATE.scope(cert, next.run(req)).await
+        }
+        None => next.run(req).await,
     }
-    next.run(req).await
+}
+
+tokio::task_local! {
+    /// The verified client certificate of the MCP proxy request being served
+    /// ([`expose_to_proxy`]), for the server's authorizer, which the proxy hands only the
+    /// thumbprint.
+    static REQUEST_CERTIFICATE: ClientCertificate;
+}
+
+/// The verified client certificate of the MCP proxy request being served, as
+/// [`expose_to_proxy`] set it; `None` outside such a request, or for a request without one.
+pub(crate) fn request_certificate() -> Option<ClientCertificate> {
+    REQUEST_CERTIFICATE.try_with(Clone::clone).ok()
 }
 
 #[cfg(test)]

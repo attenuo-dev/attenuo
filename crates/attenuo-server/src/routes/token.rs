@@ -439,7 +439,9 @@ fn exchange_sync(
                     crate::dpop::header_proof(headers)?.is_some() || subject_proof.is_some(),
                     cert.map(ClientCertificate::sha256),
                 )
-                .and_then(|()| crate::cert_binding::check_revocation(&state.clients, cert, now));
+                .and_then(|()| {
+                    crate::cert_binding::check_revocation(&state.clients, &parent.chain, cert, now)
+                });
                 if let Err(refused) = checked {
                     // Counted by `[limits] token_requests_per_minute` as the refusals after
                     // the commit are, so that this check costs the agent its budget too: over
@@ -507,7 +509,7 @@ fn exchange_sync(
     // The bound certificate passes its entry's CRL check (`crate::cert_binding`), whoever
     // authenticated the request.
     if crate::cert_binding::Binding::of(parent.claims.cnf.as_ref()).cert() {
-        crate::cert_binding::check_revocation(&state.clients, cert, now)?;
+        crate::cert_binding::check_revocation(&state.clients, &parent.chain, cert, now)?;
     }
     let asked = req.requested.clone();
     let binding = crate::cert_binding::Binding::of(cnf.as_ref());

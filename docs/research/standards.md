@@ -158,7 +158,8 @@ RFC 5280 §5 defines the X.509 CRL, and §6.3 how a relying party uses one. atte
 | 5.2.6: `freshestCRL` | ignored (no delta CRLs) | not supported |
 | 4.2.1.13: `cRLDistributionPoints` in certificates | ignored; nothing is fetched | not supported, by design |
 | 6.3.3 (a): fresh CRLs | operator's job: files, reload; stale CRLs refuse by default | supported, offline |
-| 6.3: trust anchor revocation | trust anchors are not checked | not applicable |
+| 6.3: trust anchor revocation | a self-signed trust anchor is not checked; a CA of the CA file that is not self-issued, and whose issuer the entry's files hold, is checked in that issuer's CRL like an intermediate | supported for anchors with a known issuer |
+| 4.1.2.2: serial numbers | compared as unsigned numbers, leading zero bytes stripped on both sides | supported |
 
 - **Gives us:** revocation for certificates that live longer than SPIRE's, from a format every CA produces.
 - **Gap:** no OCSP (RFC 6960) and no fetch. The CRL is as fresh as the operator's copy job.

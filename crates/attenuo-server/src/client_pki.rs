@@ -240,7 +240,7 @@ pub(crate) fn read_ca_file(path: &Path) -> Result<CaFile, String> {
 }
 
 /// [`read_ca_file`] of the bytes of the file.
-fn ca_file(pem: &[u8]) -> Result<CaFile, String> {
+pub(crate) fn ca_file(pem: &[u8]) -> Result<CaFile, String> {
     if pem.iter().all(u8::is_ascii_whitespace) {
         return Err("the file is empty; it must hold PEM CA certificates".into());
     }
@@ -588,6 +588,11 @@ pub(crate) fn verify(
     now: OffsetDateTime,
 ) -> Result<(), Refused> {
     let secs = now.unix_timestamp();
+    tracing::trace!(
+        x5t_s256 = %cert.x5t_s256(),
+        ca_path = %pki.ca_path.display(),
+        "client certificate checked against an entry's CA file"
+    );
     let state = cert.pki_state();
     if let Some(answer) = state.cached(pki, secs) {
         return answer;
@@ -597,10 +602,10 @@ pub(crate) fn verify(
     outcome
 }
 
-/// [`verify`] without the cache.
 /// The check rustls-webpki runs on each path it builds.
 type PathCheck<'c> = dyn Fn(&webpki::VerifiedPath<'_>) -> Result<(), webpki::Error> + 'c;
 
+/// [`verify`] without the cache.
 fn verify_now(pki: &Pki, cert: &ClientCertificate, now: OffsetDateTime) -> Result<(), Refused> {
     let Some(intermediates) = cert.intermediates() else {
         return Err(Refused::because("too_many_intermediates"));
@@ -657,7 +662,9 @@ fn verify_now(pki: &Pki, cert: &ClientCertificate, now: OffsetDateTime) -> Resul
 
 /// The CRL status of a verified path: each certificate below the trust anchor (the client's,
 /// then each intermediate) is looked up in the CRL of the CA that issued it in this path, by
-/// that CA's name and key ([`CrlSet::status`]). The worst status of the path.
+/// that CA's name and key ([`CrlSet::status`]); then the trust anchor itself, when it is not
+/// self-issued and the entry's files hold its issuer, as an intermediate is
+/// ([`CrlSet::anchor_status`], precomputed at load). The worst status of the path.
 fn path_status(crls: &CrlSet, path: &webpki::VerifiedPath<'_>, now: i64) -> Status {
     let mids: Vec<&webpki::Cert<'_>> = path.intermediate_certificates().collect();
     let anchor = path.anchor();
@@ -682,7 +689,11 @@ fn path_status(crls: &CrlSet, path: &webpki::VerifiedPath<'_>, now: i64) -> Stat
         };
         worst = worst.worst(status);
     }
-    worst
+    worst.worst(crls.anchor_status(
+        anchor.subject.as_ref(),
+        anchor.subject_public_key_info.as_ref(),
+        now,
+    ))
 }
 
 /// The name check of [`verify`], once the path is accepted.
@@ -782,9 +793,10 @@ pub(crate) fn expect(input: &[u8], want: u8) -> Option<(&[u8], &[u8])> {
 
 pub(crate) const SEQUENCE: u8 = 0x30;
 
-/// The parts of a certificate's `tbsCertificate` used here: the contents of the issuer and
-/// subject names and of the validity.
+/// The parts of a certificate's `tbsCertificate` used here: the serial number contents, the
+/// contents of the issuer and subject names and of the validity.
 pub(crate) struct Tbs<'a> {
+    pub(crate) serial: &'a [u8],
     pub(crate) issuer: &'a [u8],
     pub(crate) validity: &'a [u8],
     pub(crate) subject: &'a [u8],
@@ -796,12 +808,13 @@ pub(crate) fn tbs(cert: &[u8]) -> Option<Tbs<'_>> {
     if tbs.first() == Some(&0xa0) {
         tbs = element(tbs)?.2; // version [0] EXPLICIT
     }
-    let (_, tbs) = expect(tbs, 0x02)?; // serialNumber
+    let (serial, tbs) = expect(tbs, 0x02)?; // serialNumber
     let (_, tbs) = expect(tbs, SEQUENCE)?; // signature
     let (issuer, tbs) = expect(tbs, SEQUENCE)?;
     let (validity, tbs) = expect(tbs, SEQUENCE)?;
     let (subject, _) = expect(tbs, SEQUENCE)?;
     Some(Tbs {
+        serial,
         issuer,
         validity,
         subject,
@@ -810,10 +823,15 @@ pub(crate) fn tbs(cert: &[u8]) -> Option<Tbs<'_>> {
 
 /// A certificate's `notAfter`, in Unix seconds.
 pub(crate) fn not_after(cert: &[u8]) -> Option<i64> {
+    validity(cert).map(|(_, t)| t)
+}
+
+/// A certificate's `notBefore` and `notAfter`, in Unix seconds.
+pub(crate) fn validity(cert: &[u8]) -> Option<(i64, i64)> {
     let validity = tbs(cert)?.validity;
-    let (_, rest) = time_of(validity)?;
-    let (t, rest) = time_of(rest)?;
-    rest.is_empty().then_some(t)
+    let (from, rest) = time_of(validity)?;
+    let (to, rest) = time_of(rest)?;
+    rest.is_empty().then_some((from, to))
 }
 
 /// One DER `Time` (RFC 5280 §4.1.2.5): `UTCTime` `YYMMDDHHMMSSZ` (years 1950 to 2049) or
@@ -2077,5 +2095,248 @@ mod tests {
             let _ = verify(&p, &cert, at(CRL_NOW));
         }
         assert!(cert.pki_state().cached_answers() <= CACHED_ANSWERS);
+    }
+
+    fn crl_pki_with(
+        ca: &Arc<CaFile>,
+        crls: &[PathBuf],
+        issuers: Option<&Path>,
+        strict: bool,
+    ) -> Pki {
+        let s = crate::client_crl::Settings {
+            paths: crls,
+            issuers,
+            stale: None,
+            missing: strict.then_some(crate::config::ClientCrlRule::Refuse),
+        };
+        let set =
+            crate::client_crl::load(&s, ca, &mut crate::client_crl::Loading::new(at(CRL_NOW)))
+                .unwrap();
+        Pki {
+            ca_path: "ca.pem".into(),
+            ca: ca.clone(),
+            name: san_uri(A).unwrap(),
+            crls: Some(Arc::new(set)),
+        }
+    }
+
+    /// The review's case: an intermediate the root's CRL revokes is also in the CA file, so
+    /// rustls-webpki ends the path at it (anchors first). It is checked as an intermediate is.
+    #[test]
+    fn review_revoked_intermediate_also_in_ca_file() {
+        let dir = Dir::new();
+        let root = Ca::new("root", None);
+        let mid = Ca::numbered("mid", &root, 99);
+        let ca = Arc::new(dir.ca_file("ca.pem", &[&root, &mid]));
+        let crls = [dir.write("root.crl", root.crl(&[99], CRL_NOW - 60, CRL_NOW + 3600, 1))];
+        let pki = crl_pki(&ca, A, &crls, false);
+        let leaf = mid.leaf(1, A);
+        assert_eq!(
+            crl_check(&pki, &[leaf.clone(), mid.cert.der().clone()], CRL_NOW),
+            Err("certificate_revoked")
+        );
+        // With no intermediate sent too, and with the CA file in the other order.
+        assert_eq!(
+            crl_check(&pki, std::slice::from_ref(&leaf), CRL_NOW),
+            Err("certificate_revoked")
+        );
+        let ca = Arc::new(dir.ca_file("ca2.pem", &[&mid, &root]));
+        let pki = crl_pki(&ca, A, &crls, false);
+        assert_eq!(
+            crl_check(&pki, std::slice::from_ref(&leaf), CRL_NOW),
+            Err("certificate_revoked")
+        );
+        // The root's other certificates, and an intermediate it does not revoke.
+        let fine = Ca::numbered("fine", &root, 100);
+        let ca = Arc::new(dir.ca_file("ca3.pem", &[&root, &mid, &fine]));
+        let pki = crl_pki(&ca, A, &crls, false);
+        assert_eq!(crl_check(&pki, &[root.leaf(5, A)], CRL_NOW), Ok(()));
+        assert_eq!(crl_check(&pki, &[fine.leaf(5, A)], CRL_NOW), Ok(()));
+    }
+
+    /// `tls_client_crl_missing = "refuse"` with an intermediate in the CA file: the root that
+    /// issued it needs its CRL, as for an intermediate sent by the client.
+    #[test]
+    fn an_anchor_below_another_needs_that_ones_crl_under_refuse() {
+        let dir = Dir::new();
+        let root = Ca::new("root", None);
+        let mid = Ca::numbered("mid", &root, 99);
+        let ca = Arc::new(dir.ca_file("ca.pem", &[&root, &mid]));
+        let mid_crl = dir.write("mid.crl", mid.crl(&[], CRL_NOW - 60, CRL_NOW + 3600, 1));
+        let root_crl = dir.write("root.crl", root.crl(&[], CRL_NOW - 60, CRL_NOW + 3600, 1));
+        let leaf = mid.leaf(1, A);
+        let only_mid = crl_pki(&ca, A, std::slice::from_ref(&mid_crl), true);
+        assert_eq!(
+            crl_check(&only_mid, std::slice::from_ref(&leaf), CRL_NOW),
+            Err("crl_missing")
+        );
+        // Allowed by default.
+        let allow = crl_pki(&ca, A, std::slice::from_ref(&mid_crl), false);
+        assert_eq!(
+            crl_check(&allow, std::slice::from_ref(&leaf), CRL_NOW),
+            Ok(())
+        );
+        let both = crl_pki(&ca, A, &[root_crl.clone(), mid_crl.clone()], true);
+        assert_eq!(
+            crl_check(&both, std::slice::from_ref(&leaf), CRL_NOW),
+            Ok(())
+        );
+        // The root's CRL goes stale: the anchor's check is stale too.
+        assert_eq!(
+            crl_check(&both, std::slice::from_ref(&leaf), CRL_NOW + 3600),
+            Err("crl_stale")
+        );
+        // An anchor whose issuer neither file holds is a root here: not checked above.
+        let ca = Arc::new(dir.ca_file("mid-only.pem", &[&mid]));
+        let pki = crl_pki(&ca, A, std::slice::from_ref(&mid_crl), true);
+        assert_eq!(
+            crl_check(&pki, std::slice::from_ref(&leaf), CRL_NOW),
+            Ok(())
+        );
+    }
+
+    /// A self-signed root is never looked up in a CRL, its own included: a CRL that lists the
+    /// root's serial number does not refuse it.
+    #[test]
+    fn a_self_signed_root_is_unaffected() {
+        let dir = Dir::new();
+        let root = Ca::root_numbered("root", 77);
+        let ca = Arc::new(dir.ca_file("ca.pem", &[&root]));
+        let crls = [dir.write("root.crl", root.crl(&[77], CRL_NOW - 60, CRL_NOW + 3600, 1))];
+        for strict in [false, true] {
+            let pki = crl_pki(&ca, A, &crls, strict);
+            assert_eq!(crl_check(&pki, &[root.leaf(5, A)], CRL_NOW), Ok(()));
+            assert_eq!(
+                crl_check(&pki, &[root.leaf(77, A)], CRL_NOW),
+                Err("certificate_revoked")
+            );
+        }
+    }
+
+    /// An anchor issued by a certificate of `tls_client_crl_issuer_pem_path`: checked in that
+    /// certificate's CRL, and that certificate in the root's.
+    #[test]
+    fn an_anchor_issued_by_an_issuer_file_certificate() {
+        let dir = Dir::new();
+        let root = Ca::new("root", None);
+        let mid = Ca::numbered("mid", &root, 10);
+        let low = Ca::numbered("low", &mid, 20);
+        let ca = Arc::new(dir.ca_file("ca.pem", &[&root, &low]));
+        let issuers = dir.write("issuers.pem", mid.cert.pem());
+        let leaf = low.leaf(1, A);
+        let crl = |name: &str, ca: &Ca, serials: &[u64]| {
+            dir.write(name, ca.crl(serials, CRL_NOW - 60, CRL_NOW + 3600, 1))
+        };
+        let good = crl_pki_with(
+            &ca,
+            &[
+                crl("r0.crl", &root, &[]),
+                crl("m0.crl", &mid, &[]),
+                crl("l0.crl", &low, &[]),
+            ],
+            Some(&issuers),
+            true,
+        );
+        assert_eq!(
+            crl_check(&good, std::slice::from_ref(&leaf), CRL_NOW),
+            Ok(())
+        );
+        // The intermediate's CRL revokes the anchor.
+        let pki = crl_pki_with(
+            &ca,
+            &[crl("r1.crl", &root, &[]), crl("m1.crl", &mid, &[20])],
+            Some(&issuers),
+            false,
+        );
+        assert_eq!(
+            crl_check(&pki, std::slice::from_ref(&leaf), CRL_NOW),
+            Err("certificate_revoked")
+        );
+        // The root's CRL revokes the intermediate above the anchor.
+        let pki = crl_pki_with(&ca, &[crl("r2.crl", &root, &[10])], Some(&issuers), false);
+        assert_eq!(
+            crl_check(&pki, std::slice::from_ref(&leaf), CRL_NOW),
+            Err("certificate_revoked")
+        );
+        // Without the intermediate's CRL under "refuse": unknown.
+        let pki = crl_pki_with(
+            &ca,
+            &[crl("r3.crl", &root, &[]), crl("l3.crl", &low, &[])],
+            Some(&issuers),
+            true,
+        );
+        assert_eq!(
+            crl_check(&pki, std::slice::from_ref(&leaf), CRL_NOW),
+            Err("crl_missing")
+        );
+    }
+
+    /// Two CAs with one name and different keys in the CA file: each certificate is looked up
+    /// in the CRL of the key that signed it, never in the other's.
+    #[test]
+    fn same_name_different_keys_at_request_time() {
+        let dir = Dir::new();
+        let root = Ca::new("root", None);
+        let twin = root.impostor("root");
+        let ca = Arc::new(dir.ca_file("ca.pem", &[&root, &twin]));
+        let crls = [dir.write("root.crl", root.crl(&[7], CRL_NOW - 60, CRL_NOW + 3600, 1))];
+        let pki = crl_pki(&ca, A, &crls, false);
+        assert_eq!(
+            crl_check(&pki, &[root.leaf(7, A)], CRL_NOW),
+            Err("certificate_revoked")
+        );
+        assert_eq!(crl_check(&pki, &[twin.leaf(7, A)], CRL_NOW), Ok(()));
+        let strict = crl_pki(&ca, A, &crls, true);
+        assert_eq!(
+            crl_check(&strict, &[twin.leaf(8, A)], CRL_NOW),
+            Err("crl_missing")
+        );
+        assert_eq!(crl_check(&strict, &[root.leaf(8, A)], CRL_NOW), Ok(()));
+    }
+
+    /// A cross-signed intermediate (one name and key, a certificate from each of two roots),
+    /// where only the first root has a CRL, which revokes its certificate of the intermediate.
+    /// Revocation is of a certificate: the path through the other root's certificate is not
+    /// revoked, so it is accepted while that root's missing CRL is allowed, and refused as
+    /// unknown under "refuse". The same with the intermediate in the CA file (no chain sent):
+    /// the worst over its issuers' CRLs, so revoked.
+    #[test]
+    fn a_cross_signed_intermediate_with_one_crl() {
+        let dir = Dir::new();
+        let one = Ca::new("one", None);
+        let two = Ca::new("two", None);
+        let mid = Ca::numbered("mid", &one, 50);
+        let mid_by_two = mid.cross(&two, 51);
+        let ca = Arc::new(dir.ca_file("ca.pem", &[&one, &two]));
+        let crls = [dir.write("one.crl", one.crl(&[50], CRL_NOW - 60, CRL_NOW + 3600, 1))];
+        let leaf = mid.leaf(1, A);
+        let allow = crl_pki(&ca, A, &crls, false);
+        let strict = crl_pki(&ca, A, &crls, true);
+        let via_one = [leaf.clone(), mid.cert.der().clone()];
+        let via_two = [leaf.clone(), mid_by_two.cert.der().clone()];
+        assert_eq!(
+            crl_check(&allow, &via_one, CRL_NOW),
+            Err("certificate_revoked")
+        );
+        assert_eq!(crl_check(&allow, &via_two, CRL_NOW), Ok(()));
+        assert_eq!(
+            crl_check(&strict, &via_one, CRL_NOW),
+            Err("certificate_revoked")
+        );
+        assert_eq!(crl_check(&strict, &via_two, CRL_NOW), Err("crl_missing"));
+        // Both certificates of the intermediate in the CA file.
+        let ca = Arc::new(dir.ca_file("ca2.pem", &[&one, &two, &mid, &mid_by_two]));
+        let pki = crl_pki(&ca, A, &crls, false);
+        assert_eq!(
+            crl_check(&pki, std::slice::from_ref(&leaf), CRL_NOW),
+            Err("certificate_revoked")
+        );
+        // Only the second root's certificate of it in the CA file: not revoked.
+        let ca = Arc::new(dir.ca_file("ca3.pem", &[&one, &two, &mid_by_two]));
+        let pki = crl_pki(&ca, A, &crls, false);
+        assert_eq!(
+            crl_check(&pki, std::slice::from_ref(&leaf), CRL_NOW),
+            Ok(())
+        );
     }
 }

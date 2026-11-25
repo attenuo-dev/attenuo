@@ -445,6 +445,35 @@ pub struct Clients {
     pki_names: HashMap<PkiNameKey, usize>,
     /// Whether an entry has `tls_client_crl_paths`.
     has_crls: bool,
+    /// The log of [`Clients::bound_certificate_refusal`].
+    refusal_log: Arc<LogLimit>,
+}
+
+/// How often, at most, [`Clients::bound_certificate_refusal`] logs a refusal, in seconds.
+pub(crate) const BOUND_REFUSAL_LOG_SECS: i64 = 10;
+
+/// At most one log line per [`BOUND_REFUSAL_LOG_SECS`]: the second of the last line, and how
+/// many were left out since.
+#[derive(Debug, Default)]
+struct LogLimit(std::sync::Mutex<(Option<i64>, u64)>);
+
+impl LogLimit {
+    /// Whether a line may be logged at `now` (Unix seconds): with the number left out before
+    /// it, or `None` when this one is left out.
+    fn admit(&self, now: i64) -> Option<u64> {
+        let mut last = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        match last.0 {
+            Some(at) if now >= at && now - at < BOUND_REFUSAL_LOG_SECS => {
+                last.1 += 1;
+                None
+            }
+            _ => {
+                let left_out = last.1;
+                *last = (Some(now), 0);
+                Some(left_out)
+            }
+        }
+    }
 }
 
 /// A key of [`Clients::pki_names`]: (`true` for a DNS name, the name).
@@ -648,6 +677,7 @@ impl Clients {
             decoys,
             pki_names,
             has_crls,
+            refusal_log: Arc::default(),
         })
     }
 
@@ -671,51 +701,68 @@ impl Clients {
     }
 
     /// The CRLs of each entry that has `tls_client_crl_paths`.
-    pub(crate) fn crl_sets(&self) -> impl Iterator<Item = &crate::client_crl::CrlSet> {
+    pub(crate) fn crl_sets(&self) -> impl Iterator<Item = &crate::client_crl::CrlSet> + Clone {
         self.list
             .iter()
             .filter_map(|c| c.pki.as_ref().and_then(|p| p.crls.as_deref()))
     }
 
-    /// The revocation check of a certificate-bound token ([`crate::cert_binding`]), whose
-    /// certificate `cert` the request showed: for each entry of this list that has
-    /// `tls_client_crl_paths` and whose `tls_client_auth_san_uri` or `tls_client_auth_san_dns`
-    /// the certificate carries, the whole check of that entry runs again
+    /// The revocation check of a token bound to a certificate (`cnf.x5t#S256`) whose
+    /// thumbprint matched the request's certificate `cert` ([`crate::cert_binding`]): for each
+    /// agent of the token's `chain`, last hop first, whose entry in this list has
+    /// `tls_client_auth` with `tls_client_crl_paths`, the whole check of that entry runs again
     /// ([`crate::client_pki::verify`]: path, dates, CRLs, name; from the connection's cache
-    /// while it holds). The reason of the first refusal, if any. A certificate that carries
-    /// no such entry's name is not checked here: a pinned certificate, one from an entry
-    /// without CRLs, or one whose entry is gone. One lookup per name of the certificate.
+    /// while it holds). The reason of the first refusal, if any.
+    ///
+    /// Entries are found by the token's agents, never by the certificate's names. An agent
+    /// authenticated with `tls_client_auth` shows its own certificate, so on a bound token every
+    /// such agent of the chain was authenticated with the bound certificate: each of their
+    /// entries must still accept it. An agent whose entry is gone, has no CRLs or another
+    /// method is not checked. `cert` is `None` only when the caller could not hand the
+    /// certificate over: refused (`certificate_not_shown`) when an agent needs the check.
+    ///
+    /// A refusal is logged at info level, at most once per [`BOUND_REFUSAL_LOG_SECS`] for the
+    /// list, with the number of refusals left out of the log since.
     pub(crate) fn bound_certificate_refusal(
         &self,
-        cert: &ClientCertificate,
+        chain: &attenuo_core::DelegationChain,
+        cert: Option<&ClientCertificate>,
         now: OffsetDateTime,
     ) -> Option<&'static str> {
         if !self.has_crls {
             return None;
         }
-        let names = crate::client_pki::names(cert);
-        let keys = names
-            .uris
-            .iter()
-            .map(|n| (false, n))
-            .chain(names.dns.iter().map(|n| (true, n)));
-        for (dns, name) in keys {
-            let Some(&i) = self.pki_names.get(&(dns, name.clone())) else {
+        let mut seen: Vec<&str> = Vec::with_capacity(chain.hops.len());
+        for hop in chain.hops.iter().rev() {
+            let id = hop.agent.0.as_str();
+            if seen.contains(&id) {
+                continue;
+            }
+            seen.push(id);
+            let Some(client) = self.find(id) else {
                 continue;
             };
-            let Some(pki) = self.list[i].pki.as_ref().filter(|p| p.crls.is_some()) else {
+            let Some(pki) = client.pki.as_ref().filter(|p| p.crls.is_some()) else {
                 continue;
             };
-            if let Err(why) = crate::client_pki::verify(pki, cert, now) {
+            let reason = match cert {
+                None => "certificate_not_shown",
+                Some(cert) => match crate::client_pki::verify(pki, cert, now) {
+                    Ok(()) => continue,
+                    Err(why) => why.reason,
+                },
+            };
+            if let Some(suppressed) = self.refusal_log.admit(now.unix_timestamp()) {
                 tracing::info!(
-                    reason = why.reason,
-                    client = ?self.list[i].id,
-                    x5t_s256 = %cert.x5t_s256(),
-                    source = cert.source().as_str(),
+                    reason,
+                    client = ?client.id,
+                    x5t_s256 = %cert.map(ClientCertificate::x5t_s256).unwrap_or_default(),
+                    source = cert.map_or("none", |c| c.source().as_str()),
+                    suppressed,
                     "certificate-bound token refused: its certificate fails its entry's check"
                 );
-                return Some(why.reason);
             }
+            return Some(reason);
         }
         None
     }
@@ -1466,7 +1513,7 @@ pub struct ClientChanges {
 
 impl ClientSets {
     /// The CRLs of every entry of both lists.
-    pub(crate) fn crl_sets(&self) -> impl Iterator<Item = &crate::client_crl::CrlSet> {
+    pub(crate) fn crl_sets(&self) -> impl Iterator<Item = &crate::client_crl::CrlSet> + Clone {
         self.agents.crl_sets().chain(self.peps.crl_sets())
     }
 
@@ -3053,6 +3100,18 @@ mod tests {
         assert!(presented(&h, None, None, Some("a.b.c"), None).unwrap());
         assert!(presented(&basic("a", "b"), None, None, None, None).unwrap());
         assert!(!presented(&h, None, None, None, None).unwrap());
+    }
+
+    #[test]
+    fn the_bound_refusal_log_is_limited() {
+        let limit = LogLimit::default();
+        assert_eq!(limit.admit(100), Some(0));
+        assert_eq!(limit.admit(100), None);
+        assert_eq!(limit.admit(109), None);
+        assert_eq!(limit.admit(110), Some(2));
+        assert_eq!(limit.admit(111), None);
+        // A clock set back logs again.
+        assert_eq!(limit.admit(50), Some(1));
     }
 
     #[test]

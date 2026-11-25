@@ -128,6 +128,8 @@ pub(crate) mod tls;
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub mod fuzzing {
+    use std::sync::Arc;
+
     use attenuo_core::CapabilitySet;
     use serde_json::{Map, Value};
 
@@ -281,6 +283,123 @@ pub mod fuzzing {
         crate::client_crl::may_sign_crls(cert)
     }
 
+    /// `client_crl::verify_signature` of the signed object `der` (certificate or CRL) with
+    /// the key whose `subjectPublicKeyInfo` contents are `spki`; false when `der` does not
+    /// split into its signed parts.
+    pub fn crl_verify_signature(spki: &[u8], der: &[u8]) -> bool {
+        crate::client_crl::signed_data(der)
+            .is_some_and(|s| crate::client_crl::verify_signature(spki, &s))
+    }
+
+    /// An entry's CA file, issuer file and CRL files, as their bytes, for [`crl_check`].
+    #[derive(Debug, Clone, Copy)]
+    pub struct CrlEntry<'a> {
+        /// `tls_client_ca_pem_path`'s bytes.
+        pub ca_pem: &'a [u8],
+        /// `tls_client_crl_issuer_pem_path`'s bytes, when set.
+        pub issuer_pem: Option<&'a [u8]>,
+        /// The bytes of each file of `tls_client_crl_paths`.
+        pub crls: &'a [Vec<u8>],
+        /// `tls_client_crl_stale = "refuse"`.
+        pub stale_refuse: bool,
+        /// `tls_client_crl_missing = "refuse"`.
+        pub missing_refuse: bool,
+        /// The server clock, in Unix seconds.
+        pub now: i64,
+    }
+
+    /// What [`crl_check`] answers: the reason (`not_refused`, `crl_missing`, `crl_stale`,
+    /// `certificate_revoked`) of each query, of each trust anchor of the CA file in order, and
+    /// the outcome of the whole check of the client certificate chain.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct CrlAnswers {
+        /// `CrlSet::status` of each query.
+        pub statuses: Vec<&'static str>,
+        /// `CrlSet::anchor_status` of each trust anchor.
+        pub anchors: Vec<&'static str>,
+        /// `client_pki::verify` of the chain (`path_status` on each path rustls-webpki
+        /// builds), or why it was refused.
+        pub verify: Result<(), &'static str>,
+    }
+
+    /// `client_crl::load` of `entry` (`signers`, the signature, date and issuer-file checks,
+    /// the trust anchors' issuers), then `CrlSet::status` of each (issuer name contents,
+    /// `subjectPublicKeyInfo` contents, serial number) of `queries`, `CrlSet::anchor_status`
+    /// of each anchor, and `client_pki::verify` of `chain` (leaf first) for an entry whose
+    /// `tls_client_auth_san_uri` is `name`. `Err` when the files are refused, as at a start.
+    pub fn crl_check(
+        entry: &CrlEntry<'_>,
+        queries: &[(&[u8], &[u8], &[u8])],
+        chain: &[Vec<u8>],
+        name: &str,
+    ) -> Result<CrlAnswers, String> {
+        use crate::client_crl::{Loading, Settings};
+        use crate::config::ClientCrlRule;
+        use std::path::{Path, PathBuf};
+        let now =
+            time::OffsetDateTime::from_unix_timestamp(entry.now).map_err(|e| e.to_string())?;
+        let rule = |refuse| {
+            if refuse {
+                ClientCrlRule::Refuse
+            } else {
+                ClientCrlRule::Allow
+            }
+        };
+        let ca = crate::client_pki::ca_file(entry.ca_pem)?;
+        let mut loading = Loading::new(now);
+        let issuers = Path::new("fuzz-issuers.pem");
+        if let Some(pem) = entry.issuer_pem {
+            loading.add_issuer_file(issuers, crate::client_pki::ca_file(pem)?);
+        }
+        let paths: Vec<PathBuf> = (0..entry.crls.len())
+            .map(|i| PathBuf::from(format!("fuzz-{i}.crl")))
+            .collect();
+        for (path, bytes) in paths.iter().zip(entry.crls) {
+            loading.add(path, bytes)?;
+        }
+        let settings = Settings {
+            paths: &paths,
+            issuers: entry.issuer_pem.map(|_| issuers),
+            stale: Some(rule(entry.stale_refuse)),
+            missing: Some(rule(entry.missing_refuse)),
+        };
+        let set = crate::client_crl::load(&settings, &ca, &mut loading)?;
+        let statuses = queries
+            .iter()
+            .map(|(issuer, spki, serial)| set.status(issuer, spki, serial, entry.now).reason())
+            .collect();
+        let anchors = ca
+            .anchors()
+            .map(|(a, _)| {
+                set.anchor_status(
+                    a.subject.as_ref(),
+                    a.subject_public_key_info.as_ref(),
+                    entry.now,
+                )
+                .reason()
+            })
+            .collect();
+        let pki = crate::client_pki::Pki {
+            ca_path: "fuzz-ca.pem".into(),
+            ca: Arc::new(ca),
+            name: crate::client_pki::san_uri(name)?,
+            crls: Some(Arc::new(set)),
+        };
+        let ders: Vec<rustls::pki_types::CertificateDer<'_>> = chain
+            .iter()
+            .map(|c| rustls::pki_types::CertificateDer::from(c.as_slice()))
+            .collect();
+        let verify = match crate::client_cert::ClientCertificate::from_handshake(&ders) {
+            None => Err("no_certificate"),
+            Some(cert) => crate::client_pki::verify(&pki, &cert, now).map_err(|r| r.reason),
+        };
+        Ok(CrlAnswers {
+            statuses,
+            anchors,
+            verify,
+        })
+    }
+
     /// `client_pki::useful_intermediates`: the intermediates of `sent` kept for path building
     /// for the client certificate `leaf`.
     pub fn pki_useful_intermediates(leaf: &[u8], sent: &[Vec<u8>]) -> Vec<Vec<u8>> {
@@ -389,7 +508,8 @@ pub fn router(state: Arc<AppState>, upstreams: Vec<UpstreamConfig>, config: &Con
         ServerAuthorizer::new(state.keys.clone(), state.pipeline.clone())
             .with_dpop(state.dpop.clone())
             .with_trace(state.trace.clone())
-            .with_limits(state.limits.clone()),
+            .with_limits(state.limits.clone())
+            .with_clients(state.clone()),
     );
     let proxy = attenuo_proxy::router_with_clock(
         // Validated in `AppState::from_config`.
@@ -402,10 +522,7 @@ pub fn router(state: Arc<AppState>, upstreams: Vec<UpstreamConfig>, config: &Con
     )
     // The proxy sees the request's client certificate as its thumbprint only, for tokens
     // bound to a certificate (`crate::cert_binding`).
-    .layer(axum::middleware::from_fn_with_state(
-        state.clone(),
-        cert_binding::expose_to_proxy,
-    ));
+    .layer(axum::middleware::from_fn(cert_binding::expose_to_proxy));
     // `[limits]`: the deadlines inside the in-flight cap, both inside the metrics layer so
     // that their refusals are counted by route like any answer. Main listener only.
     let app = api
