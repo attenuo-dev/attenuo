@@ -31,7 +31,8 @@
 //!   issued by a CA: it must chain, through the intermediates the client sent, to a CA of the
 //!   entry's `tls_client_ca_pem_path`, be usable for client authentication at the request's
 //!   time, and carry the entry's `tls_client_auth_san_uri` or `tls_client_auth_san_dns`
-//!   ([`crate::client_pki`]). No revocation check.
+//!   ([`crate::client_pki`]). With `tls_client_crl_paths`, no certificate in its path may be
+//!   listed by the entry's CRL files ([`crate::client_crl`]); no OCSP, and nothing is fetched.
 //!
 //! An entry may hold a secret, keys and certificate settings, in any mix, except that it
 //! checks certificates one way: `tls_client_cert_sha256` or `tls_client_ca_pem_path`, not
@@ -442,6 +443,8 @@ pub struct Clients {
     /// index of its entry in `list`: a certificate that carries the name of another entry is
     /// refused ([`Clients::authenticate_pki`]).
     pki_names: HashMap<PkiNameKey, usize>,
+    /// Whether an entry has `tls_client_crl_paths`.
+    has_crls: bool,
 }
 
 /// A key of [`Clients::pki_names`]: (`true` for a DNS name, the name).
@@ -463,6 +466,24 @@ pub(crate) const MAX_CLIENT_CERTS: usize = 8;
 /// does not tell which ids exist or how many certificates an entry lists. Never a real
 /// thumbprint: its match counts for nothing.
 const DECOY_CERT_SHA256: [u8; 32] = [0; 32];
+/// The answer to a certificate refused by the CRL check (`reason` from
+/// [`crate::client_crl::Status::reason`]).
+fn crl_refusal(reason: &str) -> ApiError {
+    if reason == crate::client_crl::REVOKED_LOG_REASON {
+        invalid_client(
+            "client_certificate_revoked",
+            "the TLS client certificate, or a CA certificate in its path, is revoked by a CRL \
+             of its issuer",
+        )
+    } else {
+        invalid_client(
+            "client_certificate_revocation_unknown",
+            "the revocation status of the TLS client certificate is unknown: the CRL of a CA \
+             in its path is stale (its nextUpdate has passed) or missing",
+        )
+    }
+}
+
 /// The `detail` of every refused client certificate (SR-110).
 const CERT_REFUSED: &str = "unknown client, or the TLS client certificate is not one the client's \
                             entry accepts";
@@ -488,7 +509,13 @@ impl Clients {
     ///
     /// As [`Clients::from_config`].
     pub fn agents(entries: &[AgentConfig], policy: AssertionPolicy) -> anyhow::Result<Self> {
-        Self::from_config(ClientKind::Agent, entries, policy, &mut Vec::new())
+        Self::from_config(
+            ClientKind::Agent,
+            entries,
+            policy,
+            &mut Vec::new(),
+            &mut crate::client_crl::Loading::new(OffsetDateTime::now_utc()),
+        )
     }
 
     /// Validate the `[[peps]]` entries.
@@ -497,7 +524,13 @@ impl Clients {
     ///
     /// As [`Clients::from_config`].
     pub fn peps(entries: &[AgentConfig], policy: AssertionPolicy) -> anyhow::Result<Self> {
-        Self::from_config(ClientKind::Pep, entries, policy, &mut Vec::new())
+        Self::from_config(
+            ClientKind::Pep,
+            entries,
+            policy,
+            &mut Vec::new(),
+            &mut crate::client_crl::Loading::new(OffsetDateTime::now_utc()),
+        )
     }
 
     /// Validate a list at startup: ids non-empty and unique; at least one of
@@ -507,12 +540,14 @@ impl Clients {
     /// `tls_client_ca_pem_path` with one name (see [`client_pki_settings`]), not both; no
     /// thumbprint and no name on two entries. A CA file is read once per path: `ca_files`
     /// holds the files already read, by path, and is shared by the agents and PEPs of one
-    /// start or reload, so both lists see the same bytes.
+    /// start or reload, so both lists see the same bytes. CRL files likewise, in `crls`, which
+    /// also holds the time the CRLs are checked at ([`crate::client_crl`]).
     pub(crate) fn from_config(
         kind: ClientKind,
         entries: &[AgentConfig],
         policy: AssertionPolicy,
         ca_files: &mut crate::client_pki::CaFiles,
+        crls: &mut crate::client_crl::Loading,
     ) -> anyhow::Result<Self> {
         let section = kind.section();
         let mut list: Vec<Client> = Vec::with_capacity(entries.len());
@@ -550,7 +585,7 @@ impl Clients {
                 None => (None, None),
             };
             let cert_sha256 = client_cert_pins(section, a)?;
-            let pki = client_pki_settings(section, a, ca_files)?.map(Arc::new);
+            let pki = client_pki_settings(section, a, ca_files, crls)?.map(Arc::new);
             if secret_sha256.is_none()
                 && keys.is_empty()
                 && remote.is_none()
@@ -603,12 +638,16 @@ impl Clients {
         }
         let decoys = parse_client_jwks(DECOY_JWKS)
             .map_err(|e| anyhow::anyhow!("the decoy client keys do not parse: {e}"))?;
+        let has_crls = list
+            .iter()
+            .any(|c| c.pki.as_ref().is_some_and(|p| p.crls.is_some()));
         Ok(Self {
             kind,
             list,
             policy,
             decoys,
             pki_names,
+            has_crls,
         })
     }
 
@@ -629,6 +668,56 @@ impl Clients {
 
     fn find(&self, id: &str) -> Option<&Client> {
         self.list.iter().find(|c| c.id == id)
+    }
+
+    /// The CRLs of each entry that has `tls_client_crl_paths`.
+    pub(crate) fn crl_sets(&self) -> impl Iterator<Item = &crate::client_crl::CrlSet> {
+        self.list
+            .iter()
+            .filter_map(|c| c.pki.as_ref().and_then(|p| p.crls.as_deref()))
+    }
+
+    /// The revocation check of a certificate-bound token ([`crate::cert_binding`]), whose
+    /// certificate `cert` the request showed: for each entry of this list that has
+    /// `tls_client_crl_paths` and whose `tls_client_auth_san_uri` or `tls_client_auth_san_dns`
+    /// the certificate carries, the whole check of that entry runs again
+    /// ([`crate::client_pki::verify`]: path, dates, CRLs, name; from the connection's cache
+    /// while it holds). The reason of the first refusal, if any. A certificate that carries
+    /// no such entry's name is not checked here: a pinned certificate, one from an entry
+    /// without CRLs, or one whose entry is gone. One lookup per name of the certificate.
+    pub(crate) fn bound_certificate_refusal(
+        &self,
+        cert: &ClientCertificate,
+        now: OffsetDateTime,
+    ) -> Option<&'static str> {
+        if !self.has_crls {
+            return None;
+        }
+        let names = crate::client_pki::names(cert);
+        let keys = names
+            .uris
+            .iter()
+            .map(|n| (false, n))
+            .chain(names.dns.iter().map(|n| (true, n)));
+        for (dns, name) in keys {
+            let Some(&i) = self.pki_names.get(&(dns, name.clone())) else {
+                continue;
+            };
+            let Some(pki) = self.list[i].pki.as_ref().filter(|p| p.crls.is_some()) else {
+                continue;
+            };
+            if let Err(why) = crate::client_pki::verify(pki, cert, now) {
+                tracing::info!(
+                    reason = why.reason,
+                    client = ?self.list[i].id,
+                    x5t_s256 = %cert.x5t_s256(),
+                    source = cert.source().as_str(),
+                    "certificate-bound token refused: its certificate fails its entry's check"
+                );
+                return Some(why.reason);
+            }
+        }
+        None
     }
 
     /// The SHA-256 of the `ca_pem_path` file of entry `id`, as it was read when the list was
@@ -963,6 +1052,20 @@ impl Clients {
                 replay: None,
                 client_cert: Some(cert.clone()),
             }),
+            // Told apart only for a certificate whose path and name are this entry's
+            // (`crate::client_pki::verify`): the caller holds the key of this client's
+            // certificate, so the answer tells it nothing about other clients.
+            Err(why) if crate::client_crl::revocation_reason(why.reason) => {
+                tracing::info!(
+                    reason = why.reason,
+                    client = ?c.id,
+                    list = self.kind.section(),
+                    x5t_s256 = %cert.x5t_s256(),
+                    source = cert.source().as_str(),
+                    "TLS client certificate refused by its CRLs"
+                );
+                Err(crl_refusal(why.reason))
+            }
             Err(why) => {
                 tracing::debug!(
                     reason = why.reason,
@@ -1157,8 +1260,27 @@ fn client_pki_settings(
     section: &str,
     a: &AgentConfig,
     ca_files: &mut crate::client_pki::CaFiles,
+    crls: &mut crate::client_crl::Loading,
 ) -> anyhow::Result<Option<Pki>> {
     let fail = |msg: String| anyhow::anyhow!("{section} `{}`: {msg}", a.id);
+    let crl_keys = a.tls_client_crl_paths.is_some()
+        || a.tls_client_crl_issuer_pem_path.is_some()
+        || a.tls_client_crl_stale.is_some()
+        || a.tls_client_crl_missing.is_some();
+    if crl_keys && a.tls_client_crl_paths.is_none() {
+        return Err(fail(
+            "tls_client_crl_issuer_pem_path, tls_client_crl_stale and tls_client_crl_missing \
+             need tls_client_crl_paths"
+                .into(),
+        ));
+    }
+    if crl_keys && a.tls_client_ca_pem_path.is_none() {
+        return Err(fail(
+            "tls_client_crl_paths needs tls_client_ca_pem_path: CRLs apply to certificates \
+             from a CA, never to pinned ones (tls_client_cert_sha256)"
+                .into(),
+        ));
+    }
     let name = match (&a.tls_client_auth_san_uri, &a.tls_client_auth_san_dns) {
         (None, None) => None,
         (Some(_), Some(_)) => {
@@ -1216,10 +1338,27 @@ fn client_pki_settings(
             ca
         }
     };
+    let crls = match &a.tls_client_crl_paths {
+        None => None,
+        Some(paths) => Some(Arc::new(
+            crate::client_crl::load(
+                &crate::client_crl::Settings {
+                    paths,
+                    issuers: a.tls_client_crl_issuer_pem_path.as_deref(),
+                    stale: a.tls_client_crl_stale,
+                    missing: a.tls_client_crl_missing,
+                },
+                &ca,
+                crls,
+            )
+            .map_err(fail)?,
+        )),
+    };
     Ok(Some(Pki {
         ca_path: path.clone(),
         ca,
         name,
+        crls,
     }))
 }
 
@@ -1326,6 +1465,11 @@ pub struct ClientChanges {
 }
 
 impl ClientSets {
+    /// The CRLs of every entry of both lists.
+    pub(crate) fn crl_sets(&self) -> impl Iterator<Item = &crate::client_crl::CrlSet> {
+        self.agents.crl_sets().chain(self.peps.crl_sets())
+    }
+
     /// The [`list_sha256`] of `[[agents]]` and of `[[peps]]`.
     pub fn sha256(&self) -> (&str, &str) {
         (&self.agents_sha256, &self.peps_sha256)
@@ -1465,18 +1609,29 @@ impl ClientRules {
         &self,
         agents: &[AgentConfig],
         peps: &[AgentConfig],
+        now: OffsetDateTime,
     ) -> anyhow::Result<(ClientSets, Vec<String>)> {
         crate::config::check_reserved_client_ids(agents, peps)?;
-        // One read of each CA file for both lists.
+        // One read of each CA file and each CRL file for both lists.
         let mut ca_files = Vec::new();
+        let mut crls = crate::client_crl::Loading::new(now);
         let agent_list = Clients::from_config(
             ClientKind::Agent,
             agents,
             self.policy.clone(),
             &mut ca_files,
+            &mut crls,
         )?;
-        let pep_list =
-            Clients::from_config(ClientKind::Pep, peps, self.policy.clone(), &mut ca_files)?;
+        let pep_list = Clients::from_config(
+            ClientKind::Pep,
+            peps,
+            self.policy.clone(),
+            &mut ca_files,
+            &mut crls,
+        )?;
+        drop(crls);
+        crate::client_crl::check_consistent(agent_list.crl_sets().chain(pep_list.crl_sets()))
+            .map_err(|e| anyhow::anyhow!("[[agents]] and [[peps]]: {e}"))?;
         if !self.client_certificates {
             for list in [&agent_list, &pep_list] {
                 if let Some(c) = list.iter().find(|c| c.has_certificates()) {
@@ -1685,6 +1840,10 @@ fn pki_row(a: &AgentConfig, built: &Clients) -> Option<Value> {
         pki.name.key().into(),
         Value::from(pki.name.value().to_owned()),
     );
+    // Only for an entry with CRLs, so lists without them keep their digest.
+    if let Some(crls) = &pki.crls {
+        row.insert("tls_client_crls".into(), crls.row());
+    }
     Some(Value::Object(row))
 }
 
@@ -2628,6 +2787,10 @@ mod tests {
             tls_client_ca_pem_path: None,
             tls_client_auth_san_uri: None,
             tls_client_auth_san_dns: None,
+            tls_client_crl_paths: None,
+            tls_client_crl_issuer_pem_path: None,
+            tls_client_crl_stale: None,
+            tls_client_crl_missing: None,
         };
         let e = Clients::agents(&[neither], policy())
             .unwrap_err()
@@ -2991,7 +3154,11 @@ mod tests {
             (&agent[..], &secret[..], "[[agents]] `coder`"),
             (&secret[..], &[pinned("gw2", &[&pin])][..], "[[peps]] `gw2`"),
         ] {
-            let e = off.check(agents, peps).err().unwrap().to_string();
+            let e = off
+                .check(agents, peps, OffsetDateTime::now_utc())
+                .err()
+                .unwrap()
+                .to_string();
             assert!(
                 e.starts_with(&format!(
                     "{section}: tls_client_cert_sha256 needs [server.tls]"
@@ -3006,18 +3173,23 @@ mod tests {
             client_certificates: crate::config::ClientCertificates::Off,
         });
         let tls_off = ClientRules::from_config(&config);
-        assert!(tls_off.check(&agent, &secret).is_err());
+        assert!(tls_off
+            .check(&agent, &secret, OffsetDateTime::now_utc())
+            .is_err());
         config.server.tls.as_mut().unwrap().client_certificates =
             crate::config::ClientCertificates::Optional;
         let on = ClientRules::from_config(&config);
-        let (sets, warnings) = on.check(&agent, &secret).unwrap();
+        let (sets, warnings) = on
+            .check(&agent, &secret, OffsetDateTime::now_utc())
+            .unwrap();
         assert!(sets.agents.iter().next().unwrap().has_certificates());
         assert!(warnings.is_empty(), "{warnings:?}");
         // The same thumbprint on an agent and a PEP is allowed: different lists.
-        on.check(&agent, &[pinned("gw", &[&pin])]).unwrap();
+        on.check(&agent, &[pinned("gw", &[&pin])], OffsetDateTime::now_utc())
+            .unwrap();
         config.token.actor_auth = ActorAuth::ActorToken;
         let (_, warnings) = ClientRules::from_config(&config)
-            .check(&agent, &secret)
+            .check(&agent, &secret, OffsetDateTime::now_utc())
             .unwrap();
         assert!(
             warnings.iter().any(|w| w.contains("tls_client_cert_sha256")
@@ -3579,7 +3751,7 @@ mod tests {
             "gw", &ca, "gw.peps",
         )];
         let e = ClientRules::from_config(&config)
-            .check(&agent, &[])
+            .check(&agent, &[], OffsetDateTime::now_utc())
             .err()
             .unwrap()
             .to_string();
@@ -3591,7 +3763,7 @@ mod tests {
             "{e}"
         );
         let e = ClientRules::from_config(&config)
-            .check(&[], &pep)
+            .check(&[], &pep, OffsetDateTime::now_utc())
             .err()
             .unwrap()
             .to_string();
@@ -3606,12 +3778,12 @@ mod tests {
             client_certificates: crate::config::ClientCertificates::Off,
         });
         assert!(ClientRules::from_config(&config)
-            .check(&agent, &pep)
+            .check(&agent, &pep, OffsetDateTime::now_utc())
             .is_err());
         config.server.tls.as_mut().unwrap().client_certificates =
             crate::config::ClientCertificates::Optional;
         let (sets, warnings) = ClientRules::from_config(&config)
-            .check(&agent, &pep)
+            .check(&agent, &pep, OffsetDateTime::now_utc())
             .unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
         // The agents and the PEPs of one start or reload read a shared CA file once: both
@@ -3620,7 +3792,7 @@ mod tests {
         assert!(Arc::ptr_eq(&ca_of(&sets.agents), &ca_of(&sets.peps)));
         config.token.actor_auth = ActorAuth::ActorToken;
         let (_, warnings) = ClientRules::from_config(&config)
-            .check(&agent, &pep)
+            .check(&agent, &pep, OffsetDateTime::now_utc())
             .unwrap();
         assert!(
             warnings
@@ -3686,6 +3858,10 @@ mod tests {
                     tls_client_ca_pem_path: None,
                     tls_client_auth_san_uri: None,
                     tls_client_auth_san_dns: None,
+                    tls_client_crl_paths: None,
+                    tls_client_crl_issuer_pem_path: None,
+                    tls_client_crl_stale: None,
+                    tls_client_crl_missing: None,
                 },
             ],
             policy(),

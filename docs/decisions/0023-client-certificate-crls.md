@@ -1,0 +1,92 @@
+---
+status: proposed
+date: 2026-11-25
+decision-makers: []
+consulted: []
+informed: []
+---
+
+# ADR-0023. CRL files for client certificates from a CA: read from disk, signed by a CA the entry trusts, stale CRLs refuse by default, checked again for certificate-bound tokens
+
+## Context and Problem Statement
+
+ADR-0020 lets an agent or PEP authenticate with a certificate a CA issued. It has no revocation check. A revoked certificate works until it expires, or until the operator removes the CA or changes the name on the entry. Short-lived certificates, such as SPIRE's, keep that window small. Many CAs issue certificates for months and publish CRLs (RFC 5280 §5).
+
+Should attenuo read CRLs, from where, and what should it do when a CRL is old, missing or broken?
+
+## Decision Drivers
+
+- Fail closed. A CRL that cannot be trusted, or that has run out, refuses.
+- No new network path. The server already fetches keys for IdPs; a CRL fetch would be one more outbound connection that an attacker can slow or block.
+- No change for anyone who does not ask for it. Entries without CRL settings, and their list digests, stay as they are.
+- A reload never puts an older CRL in force, and a cache never keeps a revoked certificate working.
+- Bounded cost: lookups per request without parsing or signature checks; bounded file sizes and counts.
+- Pinned certificates (ADR-0019) are a thumbprint list. Revoking one is removing the thumbprint.
+
+## Considered Options
+
+- CRL files on each entry, read at start and on reload.
+- CRLs fetched from the certificates' distribution points.
+- OCSP.
+
+## Decision Outcome
+
+Chosen option: "CRL files on each entry", because it adds no network path, it fits the existing agents reload, and it can fail closed at start.
+
+The rules:
+
+- **Settings.** On an `[[agents]]` or `[[peps]]` entry with `tls_client_ca_pem_path`: `tls_client_crl_paths` (1 to 16 files), `tls_client_crl_issuer_pem_path` (optional intermediate CA certificates that may sign CRLs), `tls_client_crl_stale` (`"refuse"` by default, or `"allow"`) and `tls_client_crl_missing` (`"allow"` by default, or `"refuse"`). Any of them on an entry without a CA file, or the last three without `tls_client_crl_paths`, refuse to start.
+- **The file.** One CRL, PEM or DER, at most 4 MiB. rustls-webpki parses it. It must be a version 2 CRL with `nextUpdate`. Delta CRLs, indirect CRLs and CRLs partitioned by reason are refused by the parser. Any `issuingDistributionPoint` extension is refused here: a CRL scoped to some of a CA's certificates would look complete.
+- **The signer.** A CA certificate of the entry's CA file, or a certificate of the issuer file that is signed by one of those (or by another certificate of that file). The CRL's issuer name must equal the signer's subject byte for byte. The signature must verify with the signer's key, using the algorithms of the TLS listener's provider. A signer with `keyUsage` needs `cRLSign`. Any other CRL refuses to start.
+- **Dates.** `nextUpdate` after `thisUpdate`; `thisUpdate` at most 300 seconds ahead of the clock. Under `"refuse"`, a stale CRL refuses to start and refuses a reload.
+- **One CRL per CA.** One per CA (name and key) in an entry. Across entries, one content per CA, so no entry checks against an older list than another.
+- **The check.** rustls-webpki builds the path. A callback runs on each path it builds. Every certificate below the trust anchor is looked up in the CRL of the CA that issued it in that path, by serial number. A listed certificate refuses the path, and path building tries another one. The trust anchors themselves are not checked.
+- **Stale.** A CRL is stale from `nextUpdate` on, by the server's clock. Under `"refuse"`, a path that needs it is refused from that second, with no reload. Under `"allow"`, it is still used. A certificate a stale CRL lists is always refused.
+- **Missing.** Under `"allow"`, a certificate whose issuer has no CRL in the entry is not checked. Under `"refuse"`, it is refused.
+- **Answers.** A listed certificate: `401 invalid_client`, `client_certificate_revoked`. A stale or missing CRL: `client_certificate_revocation_unknown`. These are given only when the certificate's path and name match the entry the client named. Otherwise the answer is the usual `client_authentication_failed` (SR-110). Logged at info level, not audited, like the other client authentication refusals.
+- **Reload.** Every file is read again into new values. A reload is refused (`422 client_crl_older`) when a CA's new CRL has an earlier `thisUpdate`, a smaller `cRLNumber`, or no `cRLNumber` where the one in force has one. The same content is accepted. This compares with the CRLs in force only. A CA that the reload no longer lists is not compared. A restart accepts any valid CRL.
+- **Caches.** The per-connection cache and the shared cache of the forwarding listener key an answer by the identity of the entry's CRL set, which is new on every start and reload. An accepted answer is kept at most until one second before the earliest `nextUpdate` of the entry's CRLs (under `"refuse"`). A CRL refusal is never cached.
+- **Certificate-bound tokens.** When the request shows the bound certificate, and that certificate carries the name of an `[[agents]]` entry with CRLs, the full check of that entry runs again, with the lists in force. A listed certificate gives `401 invalid_token` / `client_certificate_revoked`. Any other failure gives `client_certificate_revocation_unknown`. This runs at `POST /token/renew`, the AuthZEN routes, `GET /approvals/{id}`, and an exchange of the token. On the MCP route the server does not hand the certificate to the proxy, so the answer is `client_certificate_required`. A token bound to a pinned certificate, to one of an entry without CRLs, or to one whose entry was removed, keeps the thumbprint check only.
+- **Limits.** At most 32 distinct files, 16 MiB and 250,000 listed certificates per start or reload; 100,000 per CRL. A lookup is two hash map lookups and one B-tree lookup per certificate in the path.
+
+### Consequences
+
+- Good, because a revoked certificate stops at the next request after a reload, also on an open connection.
+- Good, because a stale CRL stops working at `nextUpdate` without a reload, by default.
+- Good, because a forged or wrong CRL stops the server at start, or leaves the lists in force at reload.
+- Bad, because the operator must fetch CRLs and reload. A job that copies a CRL into place and runs `attenuo admin agent reload` is needed. If it stops, every certificate of that CA stops at `nextUpdate` under the default.
+- Bad, because a restart accepts an older CRL than the one in force before. The server keeps no state about CRLs across restarts.
+- Bad, because a trust anchor cannot be revoked by a CRL. Remove it from the CA file.
+- Neutral, because a certificate-bound token now also stops when its certificate stops passing its entry's check for another reason, such as expiry. That is stricter than before, for entries with CRLs only.
+
+### Confirmation
+
+- `crates/attenuo-server/tests/client_crl.rs`: a revoked leaf over TLS and from the proxy; a revoked intermediate; another CA's CRL revokes nothing; the startup refusals; staleness at `nextUpdate` with a manual clock, under both values; `tls_client_crl_missing`; a reload that revokes on an open connection; reloads with a bad, wrong-key or older CRL keep the CRLs in force; certificate-bound tokens; pinned certificates unaffected.
+- Unit tests in `client_crl.rs` and `client_pki.rs` (cache invalidation, limits, the file format).
+- The fuzz target `client_crl_der` (the file reads, the field reads and the `keyUsage` read).
+
+## Pros and Cons of the Options
+
+### CRL files on each entry, read at start and on reload
+
+- Good, because no outbound connection is added.
+- Good, because the existing reload gives atomic changes, an audit record and a refusal that keeps the lists in force.
+- Bad, because fetching the CRL is the operator's job.
+
+### CRLs fetched from the certificates' distribution points
+
+- Good, because no job is needed.
+- Bad, because the URL comes from the certificate, which the client chose. The server would connect where a client says, before the client is authenticated.
+- Bad, because a fetch that fails or hangs leaves a choice between failing open and refusing every client of that CA.
+
+### OCSP
+
+- Good, because answers are fresh.
+- Bad, because it is a network call per certificate, or a cache with the same freshness questions as a CRL.
+- Bad, because the same problems as distribution points apply to the responder URL.
+
+## More Information
+
+- RFC 5280 §5 (CRL profile) and §6.3 (CRL processing). The parts not supported here are listed in [standards](../research/standards.md#rfc-5280-certificate-revocation-lists-added-2026-11-25).
+- ADR-0020 (certificates from a CA), ADR-0021 (forwarded certificates), ADR-0022 (certificate-bound tokens).
+- Revisit if a deployment needs a CRL fetched by the server, or OCSP stapling from the client.

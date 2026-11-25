@@ -1,0 +1,1459 @@
+//! Certificate revocation lists (CRL files, RFC 5280 §5) for RFC 8705 `tls_client_auth`
+//! ([ADR-0023](../../docs/decisions/0023-client-certificate-crls.md)).
+//!
+//! An `[[agents]]` or `[[peps]]` entry with `tls_client_ca_pem_path` may list CRL files in
+//! `tls_client_crl_paths`. They are read at start and by an agents reload, never fetched.
+//!
+//! # At load
+//!
+//! Each file holds one CRL, PEM (`X509 CRL`) or DER, of at most [`MAX_CRL_FILE_BYTES`]. It
+//! must:
+//!
+//! - parse as a version 2 CRL with `nextUpdate` (rustls-webpki's parser, which refuses delta
+//!   CRLs, indirect CRLs and CRLs partitioned by reason), have no
+//!   `issuingDistributionPoint` extension at all (a CRL scoped to some certificates of its
+//!   CA would look complete here, so scoped and partitioned CRLs are refused), and list at
+//!   most [`MAX_CRL_ENTRIES`] certificates;
+//! - be signed by an acceptable issuer: a CA certificate of the entry's
+//!   `tls_client_ca_pem_path` (a trust anchor), or an intermediate CA certificate of the
+//!   entry's `tls_client_crl_issuer_pem_path` that is itself signed by such an anchor or by
+//!   another certificate of that file. The CRL's issuer name must equal the signer's subject,
+//!   byte for byte, and the signature must verify with the signer's key (the algorithms of
+//!   the listener's `ring` provider). A signer with a `keyUsage` extension must have
+//!   `cRLSign`. A CRL signed by any other key is refused;
+//! - have `nextUpdate` after `thisUpdate`, and `thisUpdate` at most
+//!   [`MAX_FUTURE_THIS_UPDATE_SECS`] ahead of the server clock;
+//! - with `tls_client_crl_stale = "refuse"` (the default), not be stale: `nextUpdate` must
+//!   be after the server clock;
+//! - be the only CRL of its CA (issuer name and key) in the entry, and across all entries
+//!   the same file content for one CA ([`check_consistent`]).
+//!
+//! # At authentication
+//!
+//! [`crate::client_pki::verify`] checks each path rustls-webpki builds: every certificate
+//! below the trust anchor is looked up, by the name and key of the CA that issued it in that
+//! path, then by serial number ([`CrlSet::status`]). Two hash map lookups and one B-tree
+//! lookup per certificate in the path: no signature check, no scan, no parsing.
+//!
+//! # Reload
+//!
+//! An agents reload reads every file again into new values, so caches keyed by them never
+//! answer from an old CRL. A reload is refused when a CRL of a CA in force would be replaced
+//! by an older one ([`check_not_older`]).
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use rustls::pki_types::pem::{PemObject, SectionKind};
+use sha2::{Digest, Sha256};
+use time::OffsetDateTime;
+
+use crate::client_pki::{element, expect, time_of, CaFile, SEQUENCE};
+use crate::config::ClientCrlRule;
+
+/// Largest CRL file, in bytes.
+pub(crate) const MAX_CRL_FILE_BYTES: u64 = 4 * 1024 * 1024;
+/// Most certificates one CRL may list.
+pub(crate) const MAX_CRL_ENTRIES: usize = 100_000;
+/// Most files one entry's `tls_client_crl_paths` may list.
+pub(crate) const MAX_CRLS_PER_ENTRY: usize = 16;
+/// Most distinct CRL files one start or reload reads, over all entries.
+pub(crate) const MAX_CRL_FILES: usize = 32;
+/// Most bytes of CRL files one start or reload reads, over all entries.
+pub(crate) const MAX_TOTAL_CRL_BYTES: u64 = 16 * 1024 * 1024;
+/// Most listed certificates over the CRL files of one start or reload.
+pub(crate) const MAX_TOTAL_CRL_ENTRIES: usize = 250_000;
+/// How far ahead of the server clock a CRL's `thisUpdate` may be, for clock skew.
+pub(crate) const MAX_FUTURE_THIS_UPDATE_SECS: i64 = 300;
+
+/// `id-ce-cRLNumber` (2.5.29.20).
+const CRL_NUMBER: [u8; 3] = [0x55, 0x1d, 0x14];
+/// `id-ce-issuingDistributionPoint` (2.5.29.28).
+const ISSUING_DISTRIBUTION_POINT: [u8; 3] = [0x55, 0x1d, 0x1c];
+/// `id-ce-keyUsage` (2.5.29.15).
+const KEY_USAGE: [u8; 3] = [0x55, 0x1d, 0x0f];
+
+/// One CRL, read and checked on its own (its signature is checked per entry, against the
+/// entry's acceptable issuers).
+pub(crate) struct CrlFile {
+    /// The path it was first read from, for messages.
+    path: PathBuf,
+    /// The lowercase hex SHA-256 of the file's bytes.
+    sha256: String,
+    /// The contents of the CRL's issuer name.
+    issuer: Vec<u8>,
+    this_update: i64,
+    next_update: i64,
+    /// `cRLNumber`, without leading zero bytes; `None` when the CRL has none.
+    number: Option<Vec<u8>>,
+    /// How many certificates it lists.
+    entries: usize,
+    /// The listed serial numbers, for lookups (a B-tree in rustls-webpki).
+    list: webpki::CertRevocationList<'static>,
+}
+
+#[cfg(feature = "fuzzing")]
+impl CrlFile {
+    /// For `crate::fuzzing`: the issuer name contents, `thisUpdate`, `nextUpdate`, the
+    /// `cRLNumber` and the number of listed certificates.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn summary(self) -> (Vec<u8>, i64, i64, Option<Vec<u8>>, usize) {
+        (
+            self.issuer,
+            self.this_update,
+            self.next_update,
+            self.number,
+            self.entries,
+        )
+    }
+}
+
+impl std::fmt::Debug for CrlFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CrlFile")
+            .field("path", &self.path)
+            .field("entries", &self.entries)
+            .field("this_update", &self.this_update)
+            .field("next_update", &self.next_update)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CrlFile {
+    fn number_text(&self) -> String {
+        self.number
+            .as_deref()
+            .map_or_else(|| "none".to_owned(), hex::encode)
+    }
+}
+
+/// The CRL status of one certificate in a path, worst last.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Status {
+    /// Not listed, or no CRL for its issuer and `tls_client_crl_missing = "allow"`.
+    Good,
+    /// No CRL for its issuer, and `tls_client_crl_missing = "refuse"`.
+    Missing,
+    /// The CRL of its issuer is stale, and `tls_client_crl_stale = "refuse"`.
+    Stale,
+    /// Listed by the CRL of its issuer.
+    Revoked,
+}
+
+impl Status {
+    /// The worse of two.
+    pub(crate) fn worst(self, other: Self) -> Self {
+        self.max(other)
+    }
+
+    /// The refusal reason, for the debug log and the answer.
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            Status::Good => "not_refused",
+            Status::Missing => MISSING_LOG_REASON,
+            Status::Stale => STALE_LOG_REASON,
+            Status::Revoked => REVOKED_LOG_REASON,
+        }
+    }
+}
+
+/// [`Status::Revoked`]'s reason.
+pub(crate) const REVOKED_LOG_REASON: &str = "certificate_revoked";
+/// [`Status::Stale`]'s reason.
+pub(crate) const STALE_LOG_REASON: &str = "crl_stale";
+/// [`Status::Missing`]'s reason.
+pub(crate) const MISSING_LOG_REASON: &str = "crl_missing";
+
+/// CRLs by the contents of their CA's subject name, then by the CA's key.
+type ByIssuer = HashMap<Vec<u8>, Vec<(Vec<u8>, Arc<CrlFile>)>>;
+
+/// The CRLs of one entry, as put in force by a start or a reload: one per CA, by the CA's
+/// name and key.
+pub(crate) struct CrlSet {
+    /// By the contents of the CA's subject name: each CA key with that name and its CRL.
+    by_issuer: ByIssuer,
+    /// `tls_client_crl_paths` as written, each with the SHA-256 of the file read.
+    files: Vec<(PathBuf, String)>,
+    /// `tls_client_crl_issuer_pem_path` as written, with the SHA-256 of the file read.
+    issuers: Option<(PathBuf, String)>,
+    pub(crate) stale: ClientCrlRule,
+    pub(crate) missing: ClientCrlRule,
+    /// The earliest `nextUpdate` of the set's CRLs.
+    earliest_next_update: i64,
+}
+
+impl std::fmt::Debug for CrlSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CrlSet")
+            .field("files", &self.files.len())
+            .field("stale", &self.stale)
+            .field("missing", &self.missing)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CrlSet {
+    /// The status of the certificate with DER serial number contents `serial`, issued by the
+    /// CA with subject name contents `issuer` and `subjectPublicKeyInfo` contents `spki`, at
+    /// `now` (Unix seconds). A listed certificate is [`Status::Revoked`] even when the CRL is
+    /// stale: a revocation is never taken back.
+    pub(crate) fn status(&self, issuer: &[u8], spki: &[u8], serial: &[u8], now: i64) -> Status {
+        let crl = self
+            .by_issuer
+            .get(issuer)
+            .and_then(|keys| keys.iter().find(|(k, _)| k.as_slice() == spki))
+            .map(|(_, crl)| crl);
+        let Some(crl) = crl else {
+            return match self.missing {
+                ClientCrlRule::Allow => Status::Good,
+                ClientCrlRule::Refuse => Status::Missing,
+            };
+        };
+        // The owned list never fails a lookup; a failure would be refused.
+        if !matches!(crl.list.find_serial(serial), Ok(None)) {
+            return Status::Revoked;
+        }
+        if now >= crl.next_update && self.stale == ClientCrlRule::Refuse {
+            return Status::Stale;
+        }
+        Status::Good
+    }
+
+    /// The last second an accepted path may be answered from a cache: one second before the
+    /// earliest `nextUpdate`, when stale CRLs refuse. `None` when they do not.
+    pub(crate) fn cache_until(&self) -> Option<i64> {
+        (self.stale == ClientCrlRule::Refuse).then(|| self.earliest_next_update.saturating_sub(1))
+    }
+
+    /// Each CRL of the set with its CA's name and key.
+    fn crls(&self) -> impl Iterator<Item = (&[u8], &[u8], &Arc<CrlFile>)> {
+        self.by_issuer.iter().flat_map(|(name, keys)| {
+            keys.iter()
+                .map(move |(spki, crl)| (name.as_slice(), spki.as_slice(), crl))
+        })
+    }
+
+    /// The entry's member of the list digest and of a reload's changes:
+    /// `tls_client_crl_paths` as written, the SHA-256 of each file read (in the same order),
+    /// `tls_client_crl_issuer_pem_path` and its SHA-256 when set, and the two rules in force.
+    pub(crate) fn row(&self) -> serde_json::Value {
+        let mut row = serde_json::Map::new();
+        row.insert(
+            "tls_client_crl_paths".into(),
+            self.files
+                .iter()
+                .map(|(p, _)| serde_json::Value::from(p.display().to_string()))
+                .collect(),
+        );
+        row.insert(
+            "tls_client_crl_sha256".into(),
+            self.files
+                .iter()
+                .map(|(_, d)| serde_json::Value::from(d.clone()))
+                .collect(),
+        );
+        if let Some((p, d)) = &self.issuers {
+            row.insert(
+                "tls_client_crl_issuer_pem_path".into(),
+                p.display().to_string().into(),
+            );
+            row.insert("tls_client_crl_issuer_pem_sha256".into(), d.clone().into());
+        }
+        row.insert("tls_client_crl_stale".into(), rule_name(self.stale).into());
+        row.insert(
+            "tls_client_crl_missing".into(),
+            rule_name(self.missing).into(),
+        );
+        serde_json::Value::Object(row)
+    }
+}
+
+fn rule_name(r: ClientCrlRule) -> &'static str {
+    match r {
+        ClientCrlRule::Allow => "allow",
+        ClientCrlRule::Refuse => "refuse",
+    }
+}
+
+/// The CRL files read so far by one start or reload, by path, so each is read once, and the
+/// totals that bound them. Also the intermediate CA files of `tls_client_crl_issuer_pem_path`.
+pub(crate) struct Loading {
+    /// The server clock, in Unix seconds.
+    now: i64,
+    /// Each file read: the CRL and its DER bytes (kept only while loading, for the signature
+    /// check of each entry that names it).
+    files: Vec<(PathBuf, Arc<CrlFile>, Vec<u8>)>,
+    issuer_files: Vec<(PathBuf, Arc<CaFile>)>,
+    total_bytes: u64,
+    total_entries: usize,
+}
+
+impl Loading {
+    /// A start or reload at `now`.
+    pub(crate) fn new(now: OffsetDateTime) -> Self {
+        Self {
+            now: now.unix_timestamp(),
+            files: Vec::new(),
+            issuer_files: Vec::new(),
+            total_bytes: 0,
+            total_entries: 0,
+        }
+    }
+
+    fn crl(&mut self, path: &Path) -> Result<(Arc<CrlFile>, usize), String> {
+        if let Some(i) = self.files.iter().position(|(p, _, _)| p == path) {
+            return Ok((self.files[i].1.clone(), i));
+        }
+        if self.files.len() >= MAX_CRL_FILES {
+            return Err(format!(
+                "more than {MAX_CRL_FILES} different CRL files over all entries"
+            ));
+        }
+        let bytes = crate::tls::read_file(path, MAX_CRL_FILE_BYTES, false)?;
+        self.total_bytes += bytes.len() as u64;
+        if self.total_bytes > MAX_TOTAL_CRL_BYTES {
+            return Err(format!(
+                "the CRL files of all entries hold more than {} MiB together",
+                MAX_TOTAL_CRL_BYTES / (1024 * 1024)
+            ));
+        }
+        let (crl, der) = parse(path, &bytes)?;
+        self.total_entries += crl.entries;
+        if self.total_entries > MAX_TOTAL_CRL_ENTRIES {
+            return Err(format!(
+                "the CRL files of all entries list more than {MAX_TOTAL_CRL_ENTRIES} \
+                 certificates together"
+            ));
+        }
+        let crl = Arc::new(crl);
+        self.files.push((path.to_owned(), crl.clone(), der));
+        Ok((crl, self.files.len() - 1))
+    }
+
+    fn issuer_file(&mut self, path: &Path) -> Result<Arc<CaFile>, String> {
+        if let Some((_, f)) = self.issuer_files.iter().find(|(p, _)| p == path) {
+            return Ok(f.clone());
+        }
+        let f = Arc::new(crate::client_pki::read_ca_file(path)?);
+        self.issuer_files.push((path.to_owned(), f.clone()));
+        Ok(f)
+    }
+}
+
+/// The settings of one entry, as written.
+pub(crate) struct Settings<'a> {
+    pub(crate) paths: &'a [PathBuf],
+    pub(crate) issuers: Option<&'a Path>,
+    pub(crate) stale: Option<ClientCrlRule>,
+    pub(crate) missing: Option<ClientCrlRule>,
+}
+
+/// A key that may sign CRLs for an entry: its certificate's subject name contents, its
+/// `subjectPublicKeyInfo` contents, and the certificate.
+struct Signer<'a> {
+    subject: Vec<u8>,
+    spki: Vec<u8>,
+    der: &'a [u8],
+}
+
+/// The CRLs of an entry whose CA file is `ca`, as the module docs say. A message names the
+/// key and the file, never a part of a file.
+pub(crate) fn load(s: &Settings<'_>, ca: &CaFile, loading: &mut Loading) -> Result<CrlSet, String> {
+    if s.paths.is_empty() || s.paths.len() > MAX_CRLS_PER_ENTRY {
+        return Err(format!(
+            "tls_client_crl_paths must list 1 to {MAX_CRLS_PER_ENTRY} files"
+        ));
+    }
+    for (i, p) in s.paths.iter().enumerate() {
+        if s.paths[..i].contains(p) {
+            return Err(format!(
+                "tls_client_crl_paths lists {:?} twice",
+                p.display().to_string()
+            ));
+        }
+    }
+    let stale = s.stale.unwrap_or(ClientCrlRule::Refuse);
+    let missing = s.missing.unwrap_or(ClientCrlRule::Allow);
+    let issuer_file = match s.issuers {
+        None => None,
+        Some(p) => Some((
+            p,
+            loading
+                .issuer_file(p)
+                .map_err(|e| format!("tls_client_crl_issuer_pem_path {:?}: {e}", shown(p)))?,
+        )),
+    };
+    let signers = signers(ca, issuer_file.as_ref().map(|(_, f)| &**f)).map_err(|e| {
+        format!(
+            "tls_client_crl_issuer_pem_path {:?}: {e}",
+            issuer_file
+                .as_ref()
+                .map(|(p, _)| shown(p))
+                .unwrap_or_default()
+        )
+    })?;
+    let mut by_issuer = ByIssuer::new();
+    let mut files = Vec::with_capacity(s.paths.len());
+    let mut earliest = i64::MAX;
+    for path in s.paths {
+        let fail = |e: String| format!("tls_client_crl_paths {:?}: {e}", shown(path));
+        let (crl, i) = loading.crl(path).map_err(fail)?;
+        let signer = signed_by(&crl, &loading.files[i].2, &signers).map_err(fail)?;
+        check_dates(&crl, stale, loading.now).map_err(fail)?;
+        let keys = by_issuer.entry(crl.issuer.clone()).or_default();
+        if keys.iter().any(|(k, _)| *k == signer.spki) {
+            return Err(fail(
+                "a CRL of the same CA (issuer name and key) is listed before it; list one CRL \
+                 per CA"
+                    .into(),
+            ));
+        }
+        keys.push((signer.spki.clone(), crl.clone()));
+        earliest = earliest.min(crl.next_update);
+        files.push((path.clone(), crl.sha256.clone()));
+    }
+    Ok(CrlSet {
+        by_issuer,
+        files,
+        issuers: issuer_file.map(|(p, f)| (p.to_owned(), f.sha256().to_owned())),
+        stale,
+        missing,
+        earliest_next_update: earliest,
+    })
+}
+
+fn shown(p: &Path) -> String {
+    p.display().to_string()
+}
+
+/// The keys that may sign the entry's CRLs: each CA of its CA file, then each certificate of
+/// its issuer file that is signed by one of those or by another certificate of the issuer
+/// file already accepted (so a chain of intermediates works in any order).
+fn signers<'a>(ca: &'a CaFile, issuers: Option<&'a CaFile>) -> Result<Vec<Signer<'a>>, String> {
+    let mut out: Vec<Signer<'a>> = ca
+        .anchors()
+        .map(|(a, der)| Signer {
+            subject: a.subject.as_ref().to_vec(),
+            spki: a.subject_public_key_info.as_ref().to_vec(),
+            der,
+        })
+        .collect();
+    let Some(issuers) = issuers else {
+        return Ok(out);
+    };
+    let mut pending: Vec<(usize, Signer<'a>)> = issuers
+        .anchors()
+        .enumerate()
+        .map(|(i, (a, der))| {
+            (
+                i + 1,
+                Signer {
+                    subject: a.subject.as_ref().to_vec(),
+                    spki: a.subject_public_key_info.as_ref().to_vec(),
+                    der,
+                },
+            )
+        })
+        .collect();
+    while !pending.is_empty() {
+        let before = pending.len();
+        let mut rest = Vec::new();
+        for (n, cert) in pending {
+            let (Some(t), Some(signed)) = (crate::client_pki::tbs(cert.der), signed_data(cert.der))
+            else {
+                return Err(format!("certificate {n} of the file cannot be read"));
+            };
+            if out
+                .iter()
+                .any(|s| s.subject == t.issuer && verify_signature(&s.spki, &signed))
+            {
+                out.push(cert);
+            } else {
+                rest.push((n, cert));
+            }
+        }
+        if rest.len() == before {
+            let n = rest[0].0;
+            return Err(format!(
+                "certificate {n} of the file is not issued by a CA of tls_client_ca_pem_path, \
+                 nor by another certificate of this file"
+            ));
+        }
+        pending = rest;
+    }
+    Ok(out)
+}
+
+/// The signer of `crl` (whose DER is `der`) among `signers`: its subject is the CRL's issuer
+/// name, its key verifies the signature, and its key usage, if any, allows `cRLSign`.
+fn signed_by<'s>(
+    crl: &CrlFile,
+    der: &[u8],
+    signers: &'s [Signer<'_>],
+) -> Result<&'s Signer<'s>, String> {
+    let signed = signed_data(der).ok_or_else(|| "cannot be read as an X.509 CRL".to_owned())?;
+    let mut named = signers
+        .iter()
+        .filter(|s| s.subject == crl.issuer)
+        .peekable();
+    if named.peek().is_none() {
+        return Err(
+            "its issuer is not a CA certificate of tls_client_ca_pem_path or \
+             tls_client_crl_issuer_pem_path"
+                .into(),
+        );
+    }
+    let signer = named
+        .find(|s| verify_signature(&s.spki, &signed))
+        .ok_or_else(|| {
+            "its signature does not verify with the key of the CA it names as its issuer: it \
+             was signed by another key"
+                .to_owned()
+        })?;
+    if !may_sign_crls(signer.der) {
+        return Err(
+            "the CA certificate that signed it has a keyUsage extension without cRLSign".into(),
+        );
+    }
+    Ok(signer)
+}
+
+fn check_dates(crl: &CrlFile, stale: ClientCrlRule, now: i64) -> Result<(), String> {
+    if crl.next_update <= crl.this_update {
+        return Err("its nextUpdate is not after its thisUpdate".into());
+    }
+    if crl.this_update > now.saturating_add(MAX_FUTURE_THIS_UPDATE_SECS) {
+        return Err(format!(
+            "its thisUpdate ({}) is more than {MAX_FUTURE_THIS_UPDATE_SECS} seconds ahead of \
+             the server clock",
+            date(crl.this_update)
+        ));
+    }
+    if stale == ClientCrlRule::Refuse && now >= crl.next_update {
+        return Err(format!(
+            "it is stale: its nextUpdate ({}) has passed. Get a new CRL from the CA, or set \
+             tls_client_crl_stale = \"allow\" to use it anyway",
+            date(crl.next_update)
+        ));
+    }
+    Ok(())
+}
+
+/// A Unix time as RFC 3339, for messages.
+pub(crate) fn date(secs: i64) -> String {
+    OffsetDateTime::from_unix_timestamp(secs)
+        .ok()
+        .and_then(|t| {
+            t.format(&time::format_description::well_known::Rfc3339)
+                .ok()
+        })
+        .unwrap_or_else(|| secs.to_string())
+}
+
+/// Whether a certificate's `keyUsage`, if it has one, allows `cRLSign` (bit 6). A malformed
+/// extension does not.
+pub(crate) fn may_sign_crls(cert: &[u8]) -> bool {
+    let Some(ku) = crate::client_pki::extension(cert, &KEY_USAGE) else {
+        return false;
+    };
+    let Some(value) = ku else {
+        return true;
+    };
+    let Some((bits, rest)) = expect(value, 0x03) else {
+        return false;
+    };
+    let Some((&unused, bytes)) = bits.split_first() else {
+        return false;
+    };
+    rest.is_empty() && unused < 8 && bytes.first().is_some_and(|b| b & 0x02 != 0)
+}
+
+/// The parts of a signed X.509 object (certificate or CRL): the to-be-signed element as
+/// encoded, the contents of the signature algorithm identifier, and the signature bytes.
+pub(crate) struct Signed<'a> {
+    pub(crate) tbs: &'a [u8],
+    pub(crate) alg: &'a [u8],
+    pub(crate) signature: &'a [u8],
+}
+
+/// `SEQUENCE { tbs, AlgorithmIdentifier, BIT STRING }` and nothing after it.
+pub(crate) fn signed_data(der: &[u8]) -> Option<Signed<'_>> {
+    let (outer, rest) = expect(der, SEQUENCE)?;
+    if !rest.is_empty() {
+        return None;
+    }
+    let (tag, _, after) = element(outer)?;
+    if tag != SEQUENCE {
+        return None;
+    }
+    let tbs = &outer[..outer.len() - after.len()];
+    let (alg, after) = expect(after, SEQUENCE)?;
+    let (bits, after) = expect(after, 0x03)?;
+    let (&unused, signature) = bits.split_first()?;
+    (after.is_empty() && unused == 0).then_some(Signed {
+        tbs,
+        alg,
+        signature,
+    })
+}
+
+/// Whether `signed` verifies with the key whose `subjectPublicKeyInfo` contents are `spki`,
+/// with an algorithm of the listener's provider that matches both the signature algorithm and
+/// the key's algorithm, as rustls-webpki chooses one.
+pub(crate) fn verify_signature(spki: &[u8], signed: &Signed<'_>) -> bool {
+    let Some((key_alg, rest)) = expect(spki, SEQUENCE) else {
+        return false;
+    };
+    let Some((bits, rest)) = expect(rest, 0x03) else {
+        return false;
+    };
+    let Some((0, key)) = bits.split_first().map(|(u, k)| (*u, k)) else {
+        return false;
+    };
+    if !rest.is_empty() {
+        return false;
+    }
+    crate::client_cert::provider()
+        .signature_verification_algorithms
+        .all
+        .iter()
+        .filter(|a| {
+            a.signature_alg_id().as_ref() == signed.alg && a.public_key_alg_id().as_ref() == key_alg
+        })
+        .any(|a| {
+            a.verify_signature(key, signed.tbs, signed.signature)
+                .is_ok()
+        })
+}
+
+/// What [`facts`] reads from a CRL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Facts<'a> {
+    pub(crate) issuer: &'a [u8],
+    pub(crate) this_update: i64,
+    pub(crate) next_update: i64,
+    /// The `cRLNumber` contents, as encoded.
+    pub(crate) number: Option<&'a [u8]>,
+    /// Whether it has an `issuingDistributionPoint` extension.
+    pub(crate) distribution_point: bool,
+}
+
+/// The fields of a CRL's `tbsCertList` used here (RFC 5280 §5.1): the issuer name contents,
+/// `thisUpdate`, `nextUpdate` (required here), `cRLNumber` and whether an
+/// `issuingDistributionPoint` is present. `None` on anything unexpected. Only on bytes
+/// rustls-webpki has already parsed as a CRL; it decides nothing alone.
+pub(crate) fn facts(der: &[u8]) -> Option<Facts<'_>> {
+    let signed = signed_data(der)?;
+    let (tbs, _) = expect(signed.tbs, SEQUENCE)?;
+    let (_, tbs) = expect(tbs, 0x02)?; // version
+    let (_, tbs) = expect(tbs, SEQUENCE)?; // signature
+    let (issuer, tbs) = expect(tbs, SEQUENCE)?;
+    let (this_update, tbs) = time_of(tbs)?;
+    let (next_update, mut tbs) = time_of(tbs)?;
+    if tbs.first() == Some(&SEQUENCE) {
+        tbs = element(tbs)?.2; // revokedCertificates
+    }
+    let mut out = Facts {
+        issuer,
+        this_update,
+        next_update,
+        number: None,
+        distribution_point: false,
+    };
+    if tbs.is_empty() {
+        return Some(out);
+    }
+    let (exts, rest) = expect(tbs, 0xa0)?; // crlExtensions [0] EXPLICIT
+    if !rest.is_empty() {
+        return None;
+    }
+    let (mut exts, rest) = expect(exts, SEQUENCE)?;
+    if !rest.is_empty() {
+        return None;
+    }
+    while !exts.is_empty() {
+        let (ext, rest) = expect(exts, SEQUENCE)?;
+        exts = rest;
+        let (id, mut ext) = expect(ext, 0x06)?;
+        if ext.first() == Some(&0x01) {
+            ext = expect(ext, 0x01)?.1; // critical
+        }
+        let (value, _) = expect(ext, 0x04)?;
+        if id == CRL_NUMBER {
+            let (n, rest) = expect(value, 0x02)?;
+            if !rest.is_empty() || n.first().is_none_or(|b| b & 0x80 != 0) {
+                return None;
+            }
+            out.number = Some(n);
+        } else if id == ISSUING_DISTRIBUTION_POINT {
+            out.distribution_point = true;
+        }
+    }
+    Some(out)
+}
+
+/// The DER of a CRL file: one PEM `X509 CRL` block and nothing else, or DER.
+fn file_der(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let start = bytes.iter().position(|b| !b.is_ascii_whitespace());
+    match start.map(|i| bytes[i]) {
+        None => Err("the file is empty; it must hold one CRL, PEM or DER".into()),
+        Some(SEQUENCE) => Ok(bytes.to_vec()),
+        Some(b'-') => {
+            if crate::tls::mentions_private_key(bytes) {
+                return Err("the file holds a private key; it must hold one CRL only".into());
+            }
+            // The parser's error is never shown: some of its variants quote a line.
+            let sections = <(SectionKind, Vec<u8>)>::pem_slice_iter(bytes)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| "not a valid PEM file".to_owned())?;
+            let begins = bytes.windows(11).filter(|w| w == b"-----BEGIN ").count();
+            match sections.as_slice() {
+                [(SectionKind::Crl, der)] if begins == 1 => Ok(der.clone()),
+                _ => Err(
+                    "the file must hold exactly one PEM block, -----BEGIN X509 CRL-----, and \
+                     nothing else"
+                        .into(),
+                ),
+            }
+        }
+        Some(_) => Err("the file is neither a PEM CRL (-----BEGIN X509 CRL-----) nor DER".into()),
+    }
+}
+
+/// Read one CRL file's bytes, as the module docs say, up to its signature (checked per
+/// entry). Returns the CRL and its DER.
+pub(crate) fn parse(path: &Path, bytes: &[u8]) -> Result<(CrlFile, Vec<u8>), String> {
+    let der = file_der(bytes)?;
+    let borrowed = webpki::BorrowedCertRevocationList::from_der(&der).map_err(parse_error)?;
+    // Counted before anything is kept for them.
+    let mut entries = 0usize;
+    for entry in &borrowed {
+        entry.map_err(|_| "a listed certificate of the CRL cannot be read".to_owned())?;
+        entries += 1;
+        if entries > MAX_CRL_ENTRIES {
+            return Err(format!(
+                "the CRL lists more than {MAX_CRL_ENTRIES} certificates"
+            ));
+        }
+    }
+    let f = facts(&der).ok_or_else(|| "cannot read the CRL's dates or extensions".to_owned())?;
+    if f.distribution_point {
+        return Err(
+            "the CRL has an issuingDistributionPoint extension: CRLs scoped to some of a CA's \
+             certificates, or partitioned, are not supported; use the CA's full CRL"
+                .into(),
+        );
+    }
+    let list = webpki::CertRevocationList::from(borrowed.to_owned().map_err(parse_error)?);
+    if list.issuer() != f.issuer {
+        return Err("cannot read the CRL's issuer".into());
+    }
+    let number = f.number.map(|n| {
+        let skip = n.iter().take_while(|b| **b == 0).count();
+        n[skip..].to_vec()
+    });
+    let crl = CrlFile {
+        path: path.to_owned(),
+        sha256: hex::encode(Sha256::digest(bytes)),
+        issuer: f.issuer.to_vec(),
+        this_update: f.this_update,
+        next_update: f.next_update,
+        number,
+        entries,
+        list,
+    };
+    Ok((crl, der))
+}
+
+/// A fixed message for a CRL rustls-webpki refused.
+fn parse_error(e: webpki::Error) -> String {
+    use webpki::Error as E;
+    match e {
+        E::UnsupportedDeltaCrl => "the CRL is a delta CRL; delta CRLs are not supported".into(),
+        E::UnsupportedIndirectCrl => {
+            "the CRL is an indirect CRL; indirect CRLs are not supported".into()
+        }
+        E::UnsupportedRevocationReasonsPartitioning | E::UnsupportedCrlIssuingDistributionPoint => {
+            "the CRL is partitioned or scoped (issuingDistributionPoint); not supported".into()
+        }
+        E::UnsupportedCrlVersion => "the CRL is not a version 2 CRL".into(),
+        E::UnsupportedCriticalExtension => {
+            "the CRL, or one of its entries, has a critical extension that is not supported".into()
+        }
+        _ => "cannot be read as an X.509 CRL (version 2, with nextUpdate)".into(),
+    }
+}
+
+/// CRLs by the name and key of their CA.
+type ByCa<'a> = HashMap<(&'a [u8], &'a [u8]), Vec<&'a Arc<CrlFile>>>;
+
+/// Every CRL in `sets`, by the name and key of its CA.
+fn by_ca<'a>(sets: impl Iterator<Item = &'a CrlSet>) -> ByCa<'a> {
+    let mut out = ByCa::new();
+    for set in sets {
+        for (name, spki, crl) in set.crls() {
+            out.entry((name, spki)).or_default().push(crl);
+        }
+    }
+    out
+}
+
+/// Across all entries of a start or reload, one CA has one CRL content: two entries that list
+/// different CRLs of the same CA (issuer name and key) are refused, since one of them would
+/// check against an older list.
+pub(crate) fn check_consistent<'a>(sets: impl Iterator<Item = &'a CrlSet>) -> Result<(), String> {
+    for crls in by_ca(sets).values() {
+        if let Some(other) = crls.iter().find(|c| c.sha256 != crls[0].sha256) {
+            return Err(format!(
+                "the CRL files {:?} and {:?} are both CRLs of one CA, with different contents; \
+                 list the same file for that CA in every entry",
+                shown(&crls[0].path),
+                shown(&other.path)
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A reload must not put an older CRL of a CA in force: for every CA (issuer name and key)
+/// with a CRL in force (`old`) and in the reload (`new`), the new one's `thisUpdate` must not
+/// be earlier, and when the CRL in force has a `cRLNumber` the new one must have one that is
+/// not smaller. The same content is always accepted. A CA whose CRL the reload no longer lists
+/// is not checked: the operator removed it from the config.
+pub(crate) fn check_not_older<'a>(
+    old: impl Iterator<Item = &'a CrlSet>,
+    new: impl Iterator<Item = &'a CrlSet>,
+) -> Result<(), String> {
+    let old = by_ca(old);
+    for (ca, crls) in by_ca(new) {
+        let (Some(was), Some(now)) = (old.get(&ca).and_then(|v| v.first()), crls.first()) else {
+            continue;
+        };
+        if was.sha256 == now.sha256 {
+            continue;
+        }
+        let older_number = match (&was.number, &now.number) {
+            (Some(w), Some(n)) => (n.len(), n.as_slice()) < (w.len(), w.as_slice()),
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
+        if now.this_update < was.this_update || older_number {
+            return Err(format!(
+                "the CRL file {:?} is older than the CRL of the same CA in force (thisUpdate \
+                 {} and cRLNumber {}, against {} and {} in force): a reload never puts an older \
+                 CRL in force",
+                shown(&now.path),
+                date(now.this_update),
+                now.number_text(),
+                date(was.this_update),
+                was.number_text()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Log, at info level, each CRL in force in `sets`: its path, digest, number, dates and
+/// size.
+pub(crate) fn log_in_force<'a>(sets: impl Iterator<Item = &'a CrlSet>) {
+    for crls in by_ca(sets).values() {
+        let c = crls[0];
+        tracing::info!(
+            path = %c.path.display(),
+            sha256 = %c.sha256,
+            crl_number = %c.number_text(),
+            this_update = %date(c.this_update),
+            next_update = %date(c.next_update),
+            entries = c.entries,
+            "client certificate CRL in force"
+        );
+    }
+}
+
+/// Whether a refusal reason of [`crate::client_pki::verify`] is one of the CRL check.
+pub(crate) fn revocation_reason(reason: &str) -> bool {
+    [REVOKED_LOG_REASON, STALE_LOG_REASON, MISSING_LOG_REASON].contains(&reason)
+}
+
+/// The test CA and files of the unit tests below, for the CRL tests of `client_pki`.
+#[cfg(test)]
+pub(crate) use tests::{Ca as TestCa, Dir as TestDir, NOW as TEST_NOW};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rustls::pki_types::CertificateDer;
+
+    pub(crate) const NOW: i64 = 1_800_000_000;
+
+    pub(crate) fn at(secs: i64) -> OffsetDateTime {
+        OffsetDateTime::from_unix_timestamp(secs).unwrap()
+    }
+
+    /// A CA (a root, or an intermediate another one issued) for CRL tests, valid around
+    /// [`NOW`], with `keyCertSign` and `cRLSign`.
+    pub(crate) struct Ca {
+        pub(crate) params: rcgen::CertificateParams,
+        pub(crate) key: rcgen::KeyPair,
+        pub(crate) cert: rcgen::Certificate,
+    }
+
+    impl Ca {
+        pub(crate) fn new(name: &str, issuer: Option<&Ca>) -> Self {
+            Self::with_usages(
+                name,
+                issuer,
+                vec![
+                    rcgen::KeyUsagePurpose::KeyCertSign,
+                    rcgen::KeyUsagePurpose::CrlSign,
+                ],
+            )
+        }
+
+        pub(crate) fn with_usages(
+            name: &str,
+            issuer: Option<&Ca>,
+            usages: Vec<rcgen::KeyUsagePurpose>,
+        ) -> Self {
+            Self::with_serial(name, issuer, usages, None)
+        }
+
+        /// An intermediate with serial number `serial`, so that a CRL can list it.
+        pub(crate) fn numbered(name: &str, issuer: &Ca, serial: u64) -> Self {
+            Self::with_serial(
+                name,
+                Some(issuer),
+                vec![
+                    rcgen::KeyUsagePurpose::KeyCertSign,
+                    rcgen::KeyUsagePurpose::CrlSign,
+                ],
+                Some(serial),
+            )
+        }
+
+        fn with_serial(
+            name: &str,
+            issuer: Option<&Ca>,
+            usages: Vec<rcgen::KeyUsagePurpose>,
+            serial: Option<u64>,
+        ) -> Self {
+            let key = rcgen::KeyPair::generate().unwrap();
+            let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+            params.serial_number = serial.map(rcgen::SerialNumber::from);
+            params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            params
+                .distinguished_name
+                .push(rcgen::DnType::CommonName, name);
+            params.key_usages = usages;
+            params.not_before = at(NOW - 86_400);
+            params.not_after = at(NOW + 86_400);
+            let cert = match issuer {
+                None => params.self_signed(&key).unwrap(),
+                Some(i) => params
+                    .signed_by(&key, &rcgen::Issuer::from_params(&i.params, &i.key))
+                    .unwrap(),
+            };
+            Self { params, key, cert }
+        }
+
+        /// A client certificate with serial number `serial`, for `name` (a URI name).
+        pub(crate) fn leaf(&self, serial: u64, name: &str) -> CertificateDer<'static> {
+            let key = rcgen::KeyPair::generate().unwrap();
+            let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+            params.serial_number = Some(rcgen::SerialNumber::from(serial));
+            params.not_before = at(NOW - 3600);
+            params.not_after = at(NOW + 3600);
+            params.is_ca = rcgen::IsCa::ExplicitNoCa;
+            params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+            params.subject_alt_names = vec![rcgen::SanType::URI(name.try_into().unwrap())];
+            params
+                .signed_by(&key, &rcgen::Issuer::from_params(&self.params, &self.key))
+                .unwrap()
+                .der()
+                .clone()
+        }
+
+        /// A CRL of this CA listing `serials`, valid from `this` to `next`, with number `n`.
+        pub(crate) fn crl(&self, serials: &[u64], this: i64, next: i64, n: u64) -> Vec<u8> {
+            self.crl_with(serials, this, next, n, |_| {})
+        }
+
+        pub(crate) fn crl_with(
+            &self,
+            serials: &[u64],
+            this: i64,
+            next: i64,
+            n: u64,
+            edit: impl FnOnce(&mut rcgen::CertificateRevocationListParams),
+        ) -> Vec<u8> {
+            let mut params = rcgen::CertificateRevocationListParams {
+                this_update: at(this),
+                next_update: at(next),
+                crl_number: rcgen::SerialNumber::from(n),
+                issuing_distribution_point: None,
+                revoked_certs: serials
+                    .iter()
+                    .map(|s| rcgen::RevokedCertParams {
+                        serial_number: rcgen::SerialNumber::from(*s),
+                        revocation_time: at(this),
+                        reason_code: Some(rcgen::RevocationReason::KeyCompromise),
+                        invalidity_date: None,
+                    })
+                    .collect(),
+                key_identifier_method: rcgen::KeyIdMethod::Sha256,
+            };
+            edit(&mut params);
+            params
+                .signed_by(&rcgen::Issuer::from_params(&self.params, &self.key))
+                .unwrap()
+                .der()
+                .to_vec()
+        }
+
+        /// The same name with another key: what an attacker who does not hold the CA's key
+        /// can make.
+        pub(crate) fn impostor(&self, name: &str) -> Self {
+            Self::new(name, None)
+        }
+    }
+
+    pub(crate) fn pem(label: &str, der: &[u8]) -> String {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(der);
+        format!("-----BEGIN {label}-----\n{b64}\n-----END {label}-----\n")
+    }
+
+    /// A temporary directory with files written into it.
+    pub(crate) struct Dir(pub(crate) tempfile::TempDir);
+
+    impl Dir {
+        pub(crate) fn new() -> Self {
+            Self(tempfile::tempdir().unwrap())
+        }
+
+        pub(crate) fn write(&self, name: &str, bytes: impl AsRef<[u8]>) -> PathBuf {
+            let p = self.0.path().join(name);
+            std::fs::write(&p, bytes).unwrap();
+            p
+        }
+
+        pub(crate) fn ca_file(&self, name: &str, cas: &[&Ca]) -> CaFile {
+            let text: String = cas.iter().map(|c| c.cert.pem()).collect();
+            crate::client_pki::read_ca_file(&self.write(name, text)).unwrap()
+        }
+    }
+
+    pub(crate) fn settings(paths: &[PathBuf]) -> Settings<'_> {
+        Settings {
+            paths,
+            issuers: None,
+            stale: None,
+            missing: None,
+        }
+    }
+
+    fn load_at(s: &Settings<'_>, ca: &CaFile, now: i64) -> Result<CrlSet, String> {
+        load(s, ca, &mut Loading::new(at(now)))
+    }
+
+    fn spki(c: &Ca) -> Vec<u8> {
+        let der = c.cert.der();
+        let ee = webpki::EndEntityCert::try_from(der).unwrap();
+        let spki = ee.subject_public_key_info();
+        expect(spki.as_ref(), SEQUENCE).unwrap().0.to_vec()
+    }
+
+    fn subject(c: &Ca) -> Vec<u8> {
+        crate::client_pki::tbs(c.cert.der())
+            .unwrap()
+            .subject
+            .to_vec()
+    }
+
+    fn serial(der: &[u8]) -> Vec<u8> {
+        let der = CertificateDer::from(der);
+        let ee = webpki::EndEntityCert::try_from(&der).unwrap();
+        ee.serial().to_vec()
+    }
+
+    #[test]
+    fn a_crl_is_read_in_pem_or_der() {
+        let root = Ca::new("root", None);
+        let der = root.crl(&[5, 7], NOW - 60, NOW + 3600, 42);
+        let dir = Dir::new();
+        for bytes in [der.clone(), pem("X509 CRL", &der).into_bytes()] {
+            let (crl, back) = parse(&dir.write("c", &bytes), &bytes).unwrap();
+            assert_eq!(back, der);
+            assert_eq!(crl.entries, 2);
+            assert_eq!(crl.this_update, NOW - 60);
+            assert_eq!(crl.next_update, NOW + 3600);
+            assert_eq!(crl.number.as_deref(), Some(&[42u8][..]));
+            assert_eq!(crl.issuer, subject(&root));
+            assert_eq!(crl.sha256, hex::encode(Sha256::digest(&bytes)));
+        }
+    }
+
+    #[test]
+    fn files_that_are_not_one_crl_are_refused() {
+        let root = Ca::new("root", None);
+        let der = root.crl(&[], NOW - 60, NOW + 3600, 1);
+        let one = pem("X509 CRL", &der);
+        let key = rcgen::KeyPair::generate().unwrap().serialize_pem();
+        let scoped = root.crl_with(&[], NOW - 60, NOW + 3600, 1, |p| {
+            p.issuing_distribution_point = Some(rcgen::CrlIssuingDistributionPoint {
+                distribution_point: rcgen::CrlDistributionPoint {
+                    uris: vec!["http://crl.example/root.crl".into()],
+                },
+                scope: Some(rcgen::CrlScope::UserCertsOnly),
+            });
+        });
+        let full_dp = root.crl_with(&[], NOW - 60, NOW + 3600, 1, |p| {
+            p.issuing_distribution_point = Some(rcgen::CrlIssuingDistributionPoint {
+                distribution_point: rcgen::CrlDistributionPoint {
+                    uris: vec!["http://crl.example/root.crl".into()],
+                },
+                scope: None,
+            });
+        });
+        let mut bad_sig = der.clone();
+        let last = bad_sig.len() - 1;
+        bad_sig[last] ^= 1;
+        let cases: Vec<(Vec<u8>, &str)> = vec![
+            (Vec::new(), "the file is empty"),
+            (b" \n".to_vec(), "the file is empty"),
+            (b"hello".to_vec(), "neither a PEM CRL"),
+            (format!("{one}{one}").into_bytes(), "exactly one PEM block"),
+            (root.cert.pem().into_bytes(), "exactly one PEM block"),
+            (format!("{one}{key}").into_bytes(), "holds a private key"),
+            (
+                format!("{one}{}", pem("CERTIFICATE", root.cert.der())).into_bytes(),
+                "exactly one PEM block",
+            ),
+            (
+                pem("X509 CRL", b"\x30\x00").into_bytes(),
+                "cannot be read as an X.509 CRL",
+            ),
+            (root.cert.der().to_vec(), "cannot be read as an X.509 CRL"),
+            (
+                der[..der.len() - 3].to_vec(),
+                "cannot be read as an X.509 CRL",
+            ),
+            (scoped, "issuingDistributionPoint"),
+            (full_dp, "issuingDistributionPoint"),
+        ];
+        for (bytes, want) in cases {
+            let e = parse(Path::new("x"), &bytes).err().unwrap();
+            assert!(e.contains(want), "{want}: {e}");
+            assert!(!e.contains("MII"), "{e}");
+        }
+        // A broken signature parses: the signature is checked against the entry's CAs.
+        assert!(parse(Path::new("x"), &bad_sig).is_ok());
+    }
+
+    #[test]
+    fn the_number_of_entries_is_bounded() {
+        let root = Ca::new("root", None);
+        let serials: Vec<u64> = (1..=MAX_CRL_ENTRIES as u64 + 1).collect();
+        let big = root.crl(&serials, NOW - 60, NOW + 3600, 1);
+        let e = parse(Path::new("x"), &big).err().unwrap();
+        assert!(e.contains("more than 100000 certificates"), "{e}");
+        let ok = root.crl(&serials[..MAX_CRL_ENTRIES], NOW - 60, NOW + 3600, 1);
+        assert_eq!(
+            parse(Path::new("x"), &ok).unwrap().0.entries,
+            MAX_CRL_ENTRIES
+        );
+    }
+
+    #[test]
+    fn a_crl_must_be_signed_by_a_ca_of_the_entry() {
+        let dir = Dir::new();
+        let root = Ca::new("root", None);
+        let other = Ca::new("other", None);
+        let ca = dir.ca_file("ca.pem", &[&root]);
+        let good = [dir.write("good.crl", root.crl(&[1], NOW - 60, NOW + 3600, 1))];
+        let set = load_at(&settings(&good), &ca, NOW).unwrap();
+        assert_eq!(set.files.len(), 1);
+        assert_eq!(set.stale, ClientCrlRule::Refuse);
+        assert_eq!(set.missing, ClientCrlRule::Allow);
+
+        // Another CA's CRL: its issuer is not in the file.
+        let p = [dir.write("other.crl", other.crl(&[1], NOW - 60, NOW + 3600, 1))];
+        let e = load_at(&settings(&p), &ca, NOW).err().unwrap();
+        assert!(e.contains("its issuer is not a CA certificate"), "{e}");
+        // The CA's name with another key.
+        let fake = root.impostor("root");
+        let p = [dir.write("fake.crl", fake.crl(&[1], NOW - 60, NOW + 3600, 1))];
+        let e = load_at(&settings(&p), &ca, NOW).err().unwrap();
+        assert!(e.contains("signed by another key"), "{e}");
+        assert!(e.contains("fake.crl"), "{e}");
+        // A broken signature.
+        let mut der = root.crl(&[1], NOW - 60, NOW + 3600, 1);
+        let last = der.len() - 1;
+        der[last] ^= 1;
+        let p = [dir.write("broken.crl", der)];
+        let e = load_at(&settings(&p), &ca, NOW).err().unwrap();
+        assert!(e.contains("signed by another key"), "{e}");
+        // A CA whose key usage leaves cRLSign out. rcgen refuses to sign with it, so the
+        // CRL is signed with the same name and key through parameters without key usages.
+        let mut no_crl = Ca::with_usages("nocrl", None, vec![rcgen::KeyUsagePurpose::KeyCertSign]);
+        let ca2 = dir.ca_file("ca2.pem", &[&no_crl]);
+        no_crl.params.key_usages.clear();
+        let p = [dir.write("nocrl.crl", no_crl.crl(&[1], NOW - 60, NOW + 3600, 1))];
+        let e = load_at(&settings(&p), &ca2, NOW).err().unwrap();
+        assert!(e.contains("without cRLSign"), "{e}");
+        // An intermediate's CRL needs the intermediate in tls_client_crl_issuer_pem_path.
+        let mid = Ca::new("mid", Some(&root));
+        let p = [dir.write("mid.crl", mid.crl(&[1], NOW - 60, NOW + 3600, 1))];
+        let e = load_at(&settings(&p), &ca, NOW).err().unwrap();
+        assert!(e.contains("its issuer is not a CA certificate"), "{e}");
+        let issuers = dir.write("issuers.pem", mid.cert.pem());
+        let s = Settings {
+            issuers: Some(&issuers),
+            ..settings(&p)
+        };
+        let set = load_at(&s, &ca, NOW).unwrap();
+        assert!(set.row()["tls_client_crl_issuer_pem_sha256"].is_string());
+        // An intermediate under another CA is not one of the entry's.
+        let stray = Ca::new("mid", Some(&other));
+        let issuers = dir.write("stray.pem", stray.cert.pem());
+        let s = Settings {
+            issuers: Some(&issuers),
+            ..settings(&p)
+        };
+        let e = load_at(&s, &ca, NOW).err().unwrap();
+        assert!(
+            e.contains("not issued by a CA of tls_client_ca_pem_path"),
+            "{e}"
+        );
+        // Two levels, listed bottom first: each is accepted once the one above it is.
+        let low = Ca::new("low", Some(&mid));
+        let issuers = dir.write("two.pem", format!("{}{}", low.cert.pem(), mid.cert.pem()));
+        let p = [dir.write("low.crl", low.crl(&[1], NOW - 60, NOW + 3600, 1))];
+        let s = Settings {
+            issuers: Some(&issuers),
+            ..settings(&p)
+        };
+        assert!(load_at(&s, &ca, NOW).is_ok());
+    }
+
+    #[test]
+    fn the_dates_are_checked() {
+        let dir = Dir::new();
+        let root = Ca::new("root", None);
+        let ca = dir.ca_file("ca.pem", &[&root]);
+        let p = [dir.write("c.crl", root.crl(&[], NOW - 3600, NOW - 1, 1))];
+        let e = load_at(&settings(&p), &ca, NOW).err().unwrap();
+        assert!(e.contains("it is stale"), "{e}");
+        let allow = Settings {
+            stale: Some(ClientCrlRule::Allow),
+            ..settings(&p)
+        };
+        assert!(load_at(&allow, &ca, NOW).is_ok());
+        // Exactly at nextUpdate is stale.
+        assert!(load_at(&settings(&p), &ca, NOW - 1).is_err());
+        assert!(load_at(&settings(&p), &ca, NOW - 2).is_ok());
+        // thisUpdate ahead of the clock by more than the skew.
+        let p = [dir.write("f.crl", root.crl(&[], NOW + 301, NOW + 3600, 1))];
+        let e = load_at(&settings(&p), &ca, NOW).err().unwrap();
+        assert!(e.contains("ahead of the server clock"), "{e}");
+        let p = [dir.write("g.crl", root.crl(&[], NOW + 300, NOW + 3600, 1))];
+        assert!(load_at(&settings(&p), &ca, NOW).is_ok());
+    }
+
+    #[test]
+    fn the_lists_and_totals_are_bounded() {
+        let dir = Dir::new();
+        let root = Ca::new("root", None);
+        let ca = dir.ca_file("ca.pem", &[&root]);
+        let one = dir.write("c.crl", root.crl(&[], NOW - 60, NOW + 3600, 1));
+        let e = load_at(&settings(&[]), &ca, NOW).err().unwrap();
+        assert!(e.contains("1 to 16 files"), "{e}");
+        let e = load_at(&settings(&[one.clone(), one.clone()]), &ca, NOW)
+            .err()
+            .unwrap();
+        assert!(e.contains("twice"), "{e}");
+        let many: Vec<PathBuf> = (0..=MAX_CRLS_PER_ENTRY)
+            .map(|i| dir.write(&format!("m{i}.crl"), b"x"))
+            .collect();
+        assert!(load_at(&settings(&many), &ca, NOW)
+            .err()
+            .unwrap()
+            .contains("1 to 16"));
+        // Two CRLs of one CA in one entry.
+        let two = dir.write("d.crl", root.crl(&[], NOW - 60, NOW + 3600, 2));
+        let e = load_at(&settings(&[one.clone(), two]), &ca, NOW)
+            .err()
+            .unwrap();
+        assert!(e.contains("one CRL per CA"), "{e}");
+        // Distinct files over a whole load.
+        let mut loading = Loading::new(at(NOW));
+        for i in 0..MAX_CRL_FILES {
+            let cai = Ca::new(&format!("ca{i}"), None);
+            let ca = dir.ca_file(&format!("ca{i}.pem"), &[&cai]);
+            let p = [dir.write(&format!("n{i}.crl"), cai.crl(&[], NOW - 60, NOW + 3600, 1))];
+            load(&settings(&p), &ca, &mut loading).unwrap();
+        }
+        // A file already read does not count again; a new one is refused.
+        let p = [dir.write("last.crl", root.crl(&[], NOW - 60, NOW + 3600, 1))];
+        let e = load(&settings(&p), &ca, &mut loading).err().unwrap();
+        assert!(e.contains("more than 32 different CRL files"), "{e}");
+        // Bytes over a whole load: a file of the largest size is fine, five are not.
+        let mut loading = Loading::new(at(NOW));
+        let big = vec![b' '; usize::try_from(MAX_CRL_FILE_BYTES).unwrap()];
+        for i in 0..4 {
+            let p = [dir.write(&format!("big{i}.crl"), &big)];
+            let e = load(&settings(&p), &ca, &mut loading).err().unwrap();
+            assert!(e.contains("the file is empty"), "{e}");
+        }
+        let p = [dir.write("big4.crl", &big)];
+        let e = load(&settings(&p), &ca, &mut loading).err().unwrap();
+        assert!(e.contains("more than 16 MiB together"), "{e}");
+        let mut too_big = big.clone();
+        too_big.push(b' ');
+        let p = [dir.write("huge.crl", too_big)];
+        let e = load_at(&settings(&p), &ca, NOW).err().unwrap();
+        assert!(e.contains("larger than"), "{e}");
+    }
+
+    #[test]
+    fn status_is_by_issuer_name_key_and_serial() {
+        let dir = Dir::new();
+        let root = Ca::new("root", None);
+        let ca = dir.ca_file("ca.pem", &[&root]);
+        let leaf = root.leaf(7, "urn:a");
+        let p = [dir.write("c.crl", root.crl(&[7], NOW - 60, NOW + 3600, 1))];
+        let set = load_at(&settings(&p), &ca, NOW).unwrap();
+        let (name, key) = (subject(&root), spki(&root));
+        assert_eq!(
+            set.status(&name, &key, &serial(&leaf), NOW),
+            Status::Revoked
+        );
+        let other_leaf = root.leaf(8, "urn:a");
+        assert_eq!(
+            set.status(&name, &key, &serial(&other_leaf), NOW),
+            Status::Good
+        );
+        // Revoked stays revoked once the CRL is stale; a good one is then unknown.
+        assert_eq!(
+            set.status(&name, &key, &serial(&leaf), NOW + 3600),
+            Status::Revoked
+        );
+        assert_eq!(
+            set.status(&name, &key, &serial(&other_leaf), NOW + 3600),
+            Status::Stale
+        );
+        assert_eq!(
+            set.status(&name, &key, &serial(&other_leaf), NOW + 3599),
+            Status::Good
+        );
+        assert_eq!(set.cache_until(), Some(NOW + 3599));
+        // Another key with the same name has no CRL here: as for a CA without one.
+        let fake = root.impostor("root");
+        assert_eq!(
+            set.status(&name, &spki(&fake), &serial(&leaf), NOW),
+            Status::Good
+        );
+        let strict = load_at(
+            &Settings {
+                missing: Some(ClientCrlRule::Refuse),
+                stale: Some(ClientCrlRule::Allow),
+                ..settings(&p)
+            },
+            &ca,
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(
+            strict.status(&name, &spki(&fake), &serial(&leaf), NOW),
+            Status::Missing
+        );
+        assert_eq!(
+            strict.status(&name, &key, &serial(&other_leaf), NOW + 7200),
+            Status::Good
+        );
+        assert_eq!(strict.cache_until(), None);
+        assert!(Status::Revoked.worst(Status::Good) == Status::Revoked);
+        assert!(Status::Missing.worst(Status::Stale) == Status::Stale);
+    }
+
+    #[test]
+    fn a_reload_never_puts_an_older_crl_in_force() {
+        let dir = Dir::new();
+        let root = Ca::new("root", None);
+        let ca = dir.ca_file("ca.pem", &[&root]);
+        let set = |name: &str, der: Vec<u8>| {
+            let p = [dir.write(name, der)];
+            load_at(&settings(&p), &ca, NOW).unwrap()
+        };
+        let old = set("old.crl", root.crl(&[1], NOW - 600, NOW + 3600, 5));
+        let check = |new: &CrlSet| check_not_older([&old].into_iter(), [new].into_iter());
+        assert!(check(&set("same.crl", root.crl(&[1], NOW - 600, NOW + 3600, 5))).is_ok());
+        assert!(check(&set(
+            "newer.crl",
+            root.crl(&[1, 2], NOW - 60, NOW + 3600, 6)
+        ))
+        .is_ok());
+        let e = check(&set("earlier.crl", root.crl(&[], NOW - 900, NOW + 3600, 6)))
+            .err()
+            .unwrap();
+        assert!(e.contains("earlier.crl") && e.contains("older"), "{e}");
+        let e = check(&set("smaller.crl", root.crl(&[], NOW - 60, NOW + 3600, 4)))
+            .err()
+            .unwrap();
+        assert!(e.contains("cRLNumber 04"), "{e}");
+        // Numbers compare as numbers: 256 is more than 5.
+        assert!(check(&set("big.crl", root.crl(&[], NOW - 60, NOW + 3600, 256))).is_ok());
+        // Another CA's CRL, or none at all, is not a rollback.
+        let other = Ca::new("other", None);
+        let ca2 = dir.ca_file("ca2.pem", &[&other]);
+        let p = [dir.write("o.crl", other.crl(&[], NOW - 9000, NOW + 3600, 1))];
+        let o = load_at(&settings(&p), &ca2, NOW).unwrap();
+        assert!(check(&o).is_ok());
+        assert!(check_not_older([&old].into_iter(), std::iter::empty()).is_ok());
+    }
+
+    #[test]
+    fn one_ca_has_one_crl_over_all_entries() {
+        let dir = Dir::new();
+        let root = Ca::new("root", None);
+        let ca = dir.ca_file("ca.pem", &[&root]);
+        let a = [dir.write("a.crl", root.crl(&[1], NOW - 600, NOW + 3600, 5))];
+        let b = [dir.write("b.crl", root.crl(&[1], NOW - 60, NOW + 3600, 6))];
+        let mut loading = Loading::new(at(NOW));
+        let x = load(&settings(&a), &ca, &mut loading).unwrap();
+        let y = load(&settings(&a), &ca, &mut loading).unwrap();
+        let z = load(&settings(&b), &ca, &mut loading).unwrap();
+        assert!(check_consistent([&x, &y].into_iter()).is_ok());
+        let e = check_consistent([&x, &y, &z].into_iter()).err().unwrap();
+        assert!(e.contains("a.crl") && e.contains("b.crl"), "{e}");
+        // Read once: both entries hold the same CRL.
+        assert!(Arc::ptr_eq(
+            x.crls().next().unwrap().2,
+            y.crls().next().unwrap().2
+        ));
+    }
+
+    #[test]
+    fn the_der_reads() {
+        assert!(facts(b"").is_none());
+        assert!(signed_data(b"\x30\x00").is_none());
+        assert!(signed_data(b"\x30\x06\x30\x00\x30\x00\x03\x00").is_none());
+        let s = signed_data(b"\x30\x07\x30\x00\x30\x00\x03\x01\x00").unwrap();
+        assert_eq!(
+            (s.tbs, s.alg, s.signature),
+            (&b"\x30\x00"[..], &b""[..], &b""[..])
+        );
+        // Unused bits in the signature, or bytes after it, are refused.
+        assert!(signed_data(b"\x30\x07\x30\x00\x30\x00\x03\x01\x01").is_none());
+        assert!(signed_data(b"\x30\x07\x30\x00\x30\x00\x03\x01\x00\x00").is_none());
+        assert!(!verify_signature(b"", &s));
+        let root = Ca::new("root", None);
+        assert!(may_sign_crls(root.cert.der()));
+        let no = Ca::with_usages("n", None, vec![rcgen::KeyUsagePurpose::KeyCertSign]);
+        assert!(!may_sign_crls(no.cert.der()));
+        let none = Ca::with_usages("n", None, vec![]);
+        assert!(may_sign_crls(none.cert.der()));
+        assert_eq!(date(0), "1970-01-01T00:00:00Z");
+    }
+}

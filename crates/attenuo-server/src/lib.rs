@@ -86,6 +86,7 @@ pub mod authz;
 pub(crate) mod cert_binding;
 pub(crate) mod client_cert;
 pub(crate) mod client_cert_verifier;
+pub(crate) mod client_crl;
 pub(crate) mod client_pki;
 pub(crate) mod clientauth;
 pub mod config;
@@ -118,8 +119,9 @@ pub(crate) mod tls;
 
 /// Thin wrappers over crate-private code for the cargo-fuzz targets (`fuzz/`): the
 /// `[idps.id_jag_ceiling]` code for `idjag_ceiling`, the DER reads of the TLS client
-/// certificate check (`client_pki`) for `client_pki_der`, and the RFC 9440 header reads
-/// (`forwarded`) for `forwarded_client_cert`. **Not a public API**: behind the
+/// certificate check (`client_pki`) for `client_pki_der`, the CRL file reads (`client_crl`)
+/// for `client_crl_der`, and the RFC 9440 header reads (`forwarded`) for
+/// `forwarded_client_cert`. **Not a public API**: behind the
 /// `fuzzing` feature, which only `fuzz/Cargo.toml` enables, hidden from the docs, and free to
 /// change or go with any release.
 /// Each wrapper calls the server's own function; none holds logic of its own.
@@ -244,6 +246,41 @@ pub mod fuzzing {
             .map(|c| c.is_some())
     }
 
+    /// What `client_crl::parse` reads from a CRL file's bytes (PEM or DER), up to its
+    /// signature: (issuer name contents, `thisUpdate`, `nextUpdate`, `cRLNumber` without
+    /// leading zero bytes, the number of listed certificates), or why it is refused.
+    #[allow(clippy::type_complexity)]
+    pub fn crl_parse(bytes: &[u8]) -> Result<(Vec<u8>, i64, i64, Option<Vec<u8>>, usize), String> {
+        crate::client_crl::parse(std::path::Path::new("fuzz.crl"), bytes).map(|(c, _)| c.summary())
+    }
+
+    /// `client_crl::facts`: (issuer name contents, `thisUpdate`, `nextUpdate`, `cRLNumber`
+    /// contents, whether there is an `issuingDistributionPoint`).
+    #[allow(clippy::type_complexity)]
+    pub fn crl_facts(der: &[u8]) -> Option<(&[u8], i64, i64, Option<&[u8]>, bool)> {
+        crate::client_crl::facts(der).map(|f| {
+            (
+                f.issuer,
+                f.this_update,
+                f.next_update,
+                f.number,
+                f.distribution_point,
+            )
+        })
+    }
+
+    /// `client_crl::signed_data`: the to-be-signed element, the signature algorithm contents
+    /// and the signature of a signed X.509 object.
+    pub fn crl_signed_data(der: &[u8]) -> Option<(&[u8], &[u8], &[u8])> {
+        crate::client_crl::signed_data(der).map(|s| (s.tbs, s.alg, s.signature))
+    }
+
+    /// `client_crl::may_sign_crls`: whether a certificate's `keyUsage`, if any, allows
+    /// `cRLSign`.
+    pub fn crl_may_sign(cert: &[u8]) -> bool {
+        crate::client_crl::may_sign_crls(cert)
+    }
+
     /// `client_pki::useful_intermediates`: the intermediates of `sent` kept for path building
     /// for the client certificate `leaf`.
     pub fn pki_useful_intermediates(leaf: &[u8], sent: &[Vec<u8>]) -> Vec<Vec<u8>> {
@@ -365,7 +402,10 @@ pub fn router(state: Arc<AppState>, upstreams: Vec<UpstreamConfig>, config: &Con
     )
     // The proxy sees the request's client certificate as its thumbprint only, for tokens
     // bound to a certificate (`crate::cert_binding`).
-    .layer(axum::middleware::from_fn(cert_binding::expose_to_proxy));
+    .layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        cert_binding::expose_to_proxy,
+    ));
     // `[limits]`: the deadlines inside the in-flight cap, both inside the metrics layer so
     // that their refusals are counted by route like any answer. Main listener only.
     let app = api

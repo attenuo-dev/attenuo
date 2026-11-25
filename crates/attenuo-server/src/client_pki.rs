@@ -15,7 +15,12 @@
 //!    be a CA, every issuer must be one, path lengths), the extended key usage (`clientAuth`
 //!    when the certificate lists any), unknown critical extensions, and the name constraints
 //!    of the CAs (URI name constraints are not supported by rustls-webpki and refuse the
-//!    certificate). No revocation check: no CRL, no OCSP.
+//!    certificate). With `tls_client_crl_paths`, each path rustls-webpki finds is also
+//!    checked against the entry's CRLs ([`crate::client_crl`]): a path in which the client's
+//!    certificate or an intermediate is listed by the CRL of its issuer (or, by the settings,
+//!    whose issuer's CRL is stale or missing) is refused, and the next path is tried. The
+//!    lookups are by issuer name and key, then serial number, in maps: no signature check and
+//!    no scan per request. No OCSP, nothing fetched.
 //! 2. The name. A URI is compared exactly, byte for byte. A `spiffe://` value also needs the
 //!    certificate to carry exactly one URI name, as an X.509-SVID does. A DNS name is
 //!    compared without regard to ASCII case; a wildcard name in the certificate
@@ -54,6 +59,7 @@ use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 
 use crate::client_cert::ClientCertificate;
+use crate::client_crl::{CrlSet, Status};
 
 /// Most CA certificates one `tls_client_ca_pem_path` file may hold. A trust domain has one
 /// or a few; more room is for a rotation.
@@ -78,6 +84,9 @@ const NAME_REFUSALS: [&str; 2] = ["uri_san_count", "san_mismatch"];
 /// The CA certificates of one `tls_client_ca_pem_path` file, as trust anchors.
 pub(crate) struct CaFile {
     anchors: Vec<TrustAnchor<'static>>,
+    /// The certificates the anchors were made from, in the same order: the CRL check reads
+    /// their key usage ([`crate::client_crl`]).
+    certs: Vec<CertificateDer<'static>>,
     /// The lowercase hex SHA-256 of the file's bytes as they were read, for the list digest
     /// and the changes of a reload.
     sha256: String,
@@ -100,6 +109,13 @@ impl CaFile {
     /// How many CA certificates the file holds.
     pub(crate) fn len(&self) -> usize {
         self.anchors.len()
+    }
+
+    /// Each CA certificate as a trust anchor, with the certificate it was made from.
+    pub(crate) fn anchors(&self) -> impl Iterator<Item = (&TrustAnchor<'static>, &[u8])> {
+        self.anchors
+            .iter()
+            .zip(self.certs.iter().map(|c| c.as_ref()))
     }
 }
 
@@ -138,6 +154,8 @@ pub(crate) struct Pki {
     pub(crate) ca_path: PathBuf,
     pub(crate) ca: Arc<CaFile>,
     pub(crate) name: SanName,
+    /// The entry's CRLs (`tls_client_crl_paths`), read when the list was built.
+    pub(crate) crls: Option<Arc<CrlSet>>,
 }
 
 impl std::fmt::Debug for Pki {
@@ -146,6 +164,7 @@ impl std::fmt::Debug for Pki {
             .field("ca_path", &self.ca_path)
             .field("ca_certificates", &self.ca.len())
             .field("name", &self.name.key())
+            .field("crls", &self.crls)
             .finish()
     }
 }
@@ -257,6 +276,7 @@ fn ca_file(pem: &[u8]) -> Result<CaFile, String> {
         ));
     }
     let mut anchors = Vec::with_capacity(sections.len());
+    let mut certs = Vec::with_capacity(sections.len());
     for (i, (_, der)) in sections.into_iter().enumerate() {
         let n = i + 1;
         let der = CertificateDer::from(der);
@@ -274,9 +294,11 @@ fn ca_file(pem: &[u8]) -> Result<CaFile, String> {
         let anchor = webpki::anchor_from_trusted_cert(&der)
             .map_err(|_| format!("certificate {n} of the file cannot be used as a trust anchor"))?;
         anchors.push(anchor.to_owned());
+        certs.push(der);
     }
     Ok(CaFile {
         anchors,
+        certs,
         sha256: hex::encode(Sha256::digest(pem)),
     })
 }
@@ -306,13 +328,19 @@ impl Refused {
 /// The cache holds, per CA file and name, the last answer that is still known to hold:
 ///
 /// - The key is the identity of the CA file in force (the `Arc` the entry holds; a reload
-///   reads the file again into a new one, so its old answers never match again) and the
+///   reads the file again into a new one, so its old answers never match again), the identity
+///   of the entry's CRLs in force (the same way: every start and reload reads the CRL files
+///   into a new [`CrlSet`], so an answer from before a CRL change never matches again) and the
 ///   configured name. Two entries with different names never share an answer. The cache holds
-///   the old file only weakly, so its address is not reused while an answer names it.
+///   the old file and CRLs only weakly, so their addresses are not reused while an answer
+///   names them.
 /// - An accepted path is kept with the time it was checked and the earliest `notAfter` of the
 ///   client's certificate and the intermediates kept: it is used only from that time (a clock
-///   set back checks again) up to that `notAfter`. An expired certificate is checked again,
-///   and refused.
+///   set back checks again) up to that `notAfter`, and, with CRLs whose staleness refuses
+///   (`tls_client_crl_stale = "refuse"`), up to one second before the earliest `nextUpdate`
+///   of the entry's CRLs ([`CrlSet::cache_until`]). An expired certificate is checked again,
+///   and refused; so is one whose CRL went stale, with no reload.
+/// - A revocation refusal is never kept: it is checked again on the next request.
 /// - A refusal of the name ([`NAME_REFUSALS`]) holds at any time, since it came after an
 ///   accepted path. Every other refusal (dates, path, usage) is checked again on the next
 ///   request: a certificate that is not yet valid may become valid.
@@ -333,8 +361,27 @@ impl std::fmt::Debug for PerConnection {
 
 struct Cached {
     ca: Weak<CaFile>,
+    crls: Option<Weak<CrlSet>>,
     name: SanName,
     answer: Answer,
+}
+
+impl Cached {
+    /// Whether this answer is for `pki`: the same CA file, the same CRLs (or none for both)
+    /// and the same name.
+    fn is_for(&self, pki: &Pki) -> bool {
+        let same_crls = match (&self.crls, &pki.crls) {
+            (None, None) => true,
+            (Some(a), Some(b)) => std::ptr::eq(a.as_ptr(), Arc::as_ptr(b)),
+            _ => false,
+        };
+        std::ptr::eq(self.ca.as_ptr(), Arc::as_ptr(&pki.ca)) && same_crls && self.name == pki.name
+    }
+
+    /// Whether what this answer names is still held by someone.
+    fn alive(&self) -> bool {
+        self.ca.strong_count() > 0 && self.crls.as_ref().is_none_or(|c| c.strong_count() > 0)
+    }
 }
 
 enum Answer {
@@ -363,9 +410,7 @@ impl PerConnection {
 
     fn cached(&self, pki: &Pki, now: i64) -> Option<Result<(), Refused>> {
         let cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
-        let hit = cache
-            .iter()
-            .find(|c| std::ptr::eq(c.ca.as_ptr(), Arc::as_ptr(&pki.ca)) && c.name == pki.name)?;
+        let hit = cache.iter().find(|c| c.is_for(pki))?;
         match &hit.answer {
             Answer::Accepted { from, until } => (*from <= now && now <= *until).then_some(Ok(())),
             Answer::Refused(r) => Some(Err(r.clone())),
@@ -374,23 +419,30 @@ impl PerConnection {
 
     fn remember(&self, pki: &Pki, now: i64, outcome: &Result<(), Refused>) {
         let answer = match outcome {
-            Ok(()) => match self.not_after {
-                Some(until) if now <= until => Answer::Accepted { from: now, until },
-                _ => return,
-            },
+            Ok(()) => {
+                let crl_until = pki.crls.as_ref().and_then(|c| c.cache_until());
+                match (self.not_after, crl_until) {
+                    (Some(until), crl) => {
+                        let until = crl.map_or(until, |c| until.min(c));
+                        if now > until {
+                            return;
+                        }
+                        Answer::Accepted { from: now, until }
+                    }
+                    (None, _) => return,
+                }
+            }
             Err(r) if NAME_REFUSALS.contains(&r.reason) => Answer::Refused(r.clone()),
             Err(_) => return,
         };
         let mut cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
-        cache.retain(|c| {
-            !(std::ptr::eq(c.ca.as_ptr(), Arc::as_ptr(&pki.ca)) && c.name == pki.name)
-                && c.ca.strong_count() > 0
-        });
+        cache.retain(|c| !c.is_for(pki) && c.alive());
         if cache.len() >= CACHED_ANSWERS {
             cache.remove(0);
         }
         cache.push(Cached {
             ca: Arc::downgrade(&pki.ca),
+            crls: pki.crls.as_ref().map(Arc::downgrade),
             name: pki.name.clone(),
             answer,
         });
@@ -546,6 +598,9 @@ pub(crate) fn verify(
 }
 
 /// [`verify`] without the cache.
+/// The check rustls-webpki runs on each path it builds.
+type PathCheck<'c> = dyn Fn(&webpki::VerifiedPath<'_>) -> Result<(), webpki::Error> + 'c;
+
 fn verify_now(pki: &Pki, cert: &ClientCertificate, now: OffsetDateTime) -> Result<(), Refused> {
     let Some(intermediates) = cert.intermediates() else {
         return Err(Refused::because("too_many_intermediates"));
@@ -554,7 +609,28 @@ fn verify_now(pki: &Pki, cert: &ClientCertificate, now: OffsetDateTime) -> Resul
         .map_err(|_| Refused::because("certificate_not_usable"))?;
     let secs = u64::try_from(now.unix_timestamp()).unwrap_or(0);
     let at = UnixTime::since_unix_epoch(std::time::Duration::from_secs(secs));
-    ee.verify_for_usage(
+    // The CRL check runs on each path rustls-webpki has verified up to a CA of the file: a
+    // refusal makes it try the next path, so a certificate is refused for revocation only when
+    // no path avoids it. The worst refusal seen is kept for the answer.
+    let revocation: std::cell::Cell<Option<Status>> = std::cell::Cell::new(None);
+    let crl_check = |path: &webpki::VerifiedPath<'_>| -> Result<(), webpki::Error> {
+        let Some(crls) = &pki.crls else {
+            return Ok(());
+        };
+        match path_status(crls, path, now.unix_timestamp()) {
+            Status::Good => Ok(()),
+            bad => {
+                revocation.set(Some(revocation.get().map_or(bad, |seen| seen.worst(bad))));
+                Err(if bad == Status::Revoked {
+                    webpki::Error::CertRevoked
+                } else {
+                    webpki::Error::UnknownRevocationStatus
+                })
+            }
+        }
+    };
+    let callback: Option<&PathCheck<'_>> = pki.crls.as_ref().map(|_| &crl_check as _);
+    let path = ee.verify_for_usage(
         crate::client_cert::provider()
             .signature_verification_algorithms
             .all,
@@ -563,9 +639,58 @@ fn verify_now(pki: &Pki, cert: &ClientCertificate, now: OffsetDateTime) -> Resul
         at,
         webpki::KeyUsage::client_auth(),
         None,
-        None,
-    )
-    .map_err(|e| Refused::because(path_error(&e)))?;
+        callback,
+    );
+    if let Err(e) = path {
+        return Err(match revocation.get() {
+            // A revocation refusal is told apart only for a certificate that carries the
+            // entry's name: one that names another client gets that client's answer.
+            Some(status) => match check_name(pki, cert, &ee) {
+                Ok(()) => Refused::because(status.reason()),
+                Err(r) => r,
+            },
+            None => Refused::because(path_error(&e)),
+        });
+    }
+    check_name(pki, cert, &ee)
+}
+
+/// The CRL status of a verified path: each certificate below the trust anchor (the client's,
+/// then each intermediate) is looked up in the CRL of the CA that issued it in this path, by
+/// that CA's name and key ([`CrlSet::status`]). The worst status of the path.
+fn path_status(crls: &CrlSet, path: &webpki::VerifiedPath<'_>, now: i64) -> Status {
+    let mids: Vec<&webpki::Cert<'_>> = path.intermediate_certificates().collect();
+    let anchor = path.anchor();
+    let mut worst = Status::Good;
+    let serials =
+        std::iter::once(path.end_entity().serial()).chain(mids.iter().map(|c| c.serial()));
+    for (i, serial) in serials.enumerate() {
+        let status = match mids.get(i) {
+            Some(issuer) => {
+                let spki = issuer.subject_public_key_info();
+                let Some((spki, _)) = expect(spki.as_ref(), SEQUENCE) else {
+                    return Status::Missing.worst(worst);
+                };
+                crls.status(issuer.subject(), spki, serial, now)
+            }
+            None => crls.status(
+                anchor.subject.as_ref(),
+                anchor.subject_public_key_info.as_ref(),
+                serial,
+                now,
+            ),
+        };
+        worst = worst.worst(status);
+    }
+    worst
+}
+
+/// The name check of [`verify`], once the path is accepted.
+fn check_name(
+    pki: &Pki,
+    cert: &ClientCertificate,
+    ee: &webpki::EndEntityCert<'_>,
+) -> Result<(), Refused> {
     match &pki.name {
         SanName::Uri { value, spiffe } => {
             let names: Vec<&str> = ee.valid_uri_names().collect();
@@ -625,7 +750,7 @@ fn path_error(e: &webpki::Error) -> &'static str {
 
 /// One DER element of `input`: (tag, contents, the rest). Low tag numbers and definite
 /// lengths of up to four bytes only.
-fn element(input: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+pub(crate) fn element(input: &[u8]) -> Option<(u8, &[u8], &[u8])> {
     let (&tag, rest) = input.split_first()?;
     if tag & 0x1f == 0x1f {
         return None;
@@ -650,12 +775,12 @@ fn element(input: &[u8]) -> Option<(u8, &[u8], &[u8])> {
 }
 
 /// [`element`] with tag `want`: (contents, the rest).
-fn expect(input: &[u8], want: u8) -> Option<(&[u8], &[u8])> {
+pub(crate) fn expect(input: &[u8], want: u8) -> Option<(&[u8], &[u8])> {
     let (tag, contents, rest) = element(input)?;
     (tag == want).then_some((contents, rest))
 }
 
-const SEQUENCE: u8 = 0x30;
+pub(crate) const SEQUENCE: u8 = 0x30;
 
 /// The parts of a certificate's `tbsCertificate` used here: the contents of the issuer and
 /// subject names and of the validity.
@@ -693,7 +818,7 @@ pub(crate) fn not_after(cert: &[u8]) -> Option<i64> {
 
 /// One DER `Time` (RFC 5280 §4.1.2.5): `UTCTime` `YYMMDDHHMMSSZ` (years 1950 to 2049) or
 /// `GeneralizedTime` `YYYYMMDDHHMMSSZ`, in Unix seconds, and the rest of the input.
-fn time_of(input: &[u8]) -> Option<(i64, &[u8])> {
+pub(crate) fn time_of(input: &[u8]) -> Option<(i64, &[u8])> {
     let (tag, value, rest) = element(input)?;
     let digits = |b: &[u8]| -> Option<u16> {
         b.iter().try_fold(0u16, |acc, &d| {
@@ -729,7 +854,7 @@ fn time_of(input: &[u8]) -> Option<(i64, &[u8])> {
 
 /// The `extnValue` contents of the extension `oid` of a certificate: `Some(None)` when the
 /// certificate has no such extension.
-fn extension<'a>(cert: &'a [u8], oid: &[u8]) -> Option<Option<&'a [u8]>> {
+pub(crate) fn extension<'a>(cert: &'a [u8], oid: &[u8]) -> Option<Option<&'a [u8]>> {
     let (cert, _) = expect(cert, SEQUENCE)?;
     let (mut tbs, _) = expect(cert, SEQUENCE)?;
     while !tbs.is_empty() {
@@ -857,6 +982,7 @@ mod tests {
                 ca_path: "ca.pem".into(),
                 ca: Arc::new(ca_file(self.cert.pem().as_bytes()).unwrap()),
                 name,
+                crls: None,
             }
         }
     }
@@ -1205,6 +1331,7 @@ mod tests {
             ca_path: a.ca_path.clone(),
             ca: a.ca.clone(),
             name: san_uri("spiffe://example.org/ns/agents/sa/reviewer").unwrap(),
+            crls: None,
         };
         assert_eq!(
             verify(&b, &cert, at(NOW)).unwrap_err().reason,
@@ -1222,6 +1349,7 @@ mod tests {
             ca_path: a.ca_path.clone(),
             ca: other.pki(san_uri(CODER).unwrap()).ca,
             name: a.name.clone(),
+            crls: None,
         };
         assert_eq!(
             verify(&reloaded, &cert, at(NOW)).unwrap_err().reason,
@@ -1232,6 +1360,7 @@ mod tests {
             ca_path: a.ca_path.clone(),
             ca: a.ca.clone(),
             name: san_dns("coder.agents").unwrap(),
+            crls: None,
         };
         assert_eq!(
             verify(&renamed, &cert, at(NOW)).unwrap_err().reason,
@@ -1250,6 +1379,7 @@ mod tests {
                 ca_path: a.ca_path.clone(),
                 ca: a.ca.clone(),
                 name,
+                crls: None,
             };
             assert!(verify(&pki, &cert, at(NOW)).is_err());
         }
@@ -1325,6 +1455,7 @@ mod tests {
             ca_path: a.ca_path.clone(),
             ca: a.ca.clone(),
             name: san_uri("spiffe://example.org/ns/agents/sa/reviewer").unwrap(),
+            crls: None,
         };
         assert_eq!(
             verify(&b, &req(), at(NOW)).unwrap_err().reason,
@@ -1340,6 +1471,7 @@ mod tests {
             ca_path: a.ca_path.clone(),
             ca: other.pki(san_uri(CODER).unwrap()).ca,
             name: a.name.clone(),
+            crls: None,
         };
         assert_eq!(
             verify(&reloaded, &req(), at(NOW)).unwrap_err().reason,
@@ -1349,6 +1481,7 @@ mod tests {
             ca_path: a.ca_path.clone(),
             ca: a.ca.clone(),
             name: san_dns("coder.agents").unwrap(),
+            crls: None,
         };
         assert_eq!(
             verify(&renamed, &req(), at(NOW)).unwrap_err().reason,
@@ -1715,5 +1848,234 @@ mod tests {
             element(b"\x04\x82\x00\x01\xaa"),
             Some((4, &b"\xaa"[..], &b""[..]))
         );
+    }
+
+    // --- CRLs (`tls_client_crl_paths`) ---------------------------------------------------
+
+    use crate::client_crl::{TestCa as Ca, TestDir as Dir, TEST_NOW as CRL_NOW};
+
+    fn crl_pki(ca: &Arc<CaFile>, name: &str, crls: &[PathBuf], strict: bool) -> Pki {
+        let s = crate::client_crl::Settings {
+            paths: crls,
+            issuers: None,
+            stale: None,
+            missing: strict.then_some(crate::config::ClientCrlRule::Refuse),
+        };
+        let set =
+            crate::client_crl::load(&s, ca, &mut crate::client_crl::Loading::new(at(CRL_NOW)))
+                .unwrap();
+        Pki {
+            ca_path: "ca.pem".into(),
+            ca: ca.clone(),
+            name: san_uri(name).unwrap(),
+            crls: Some(Arc::new(set)),
+        }
+    }
+
+    fn crl_check(pki: &Pki, chain: &[CertificateDer<'static>], t: i64) -> Result<(), &'static str> {
+        let cert = ClientCertificate::from_handshake(chain).unwrap();
+        verify(pki, &cert, at(t)).map_err(|r| r.reason)
+    }
+
+    const A: &str = "spiffe://example.org/a";
+
+    #[test]
+    fn a_revoked_certificate_is_refused_and_others_from_its_ca_are_not() {
+        let dir = Dir::new();
+        let root = Ca::new("root", None);
+        let other = Ca::new("other", None);
+        let ca = Arc::new(dir.ca_file("ca.pem", &[&root, &other]));
+        let revoked = root.leaf(7, A);
+        let fine = root.leaf(8, A);
+        // The other CA's CRL lists serial 8 too: it is not the issuer of `fine`.
+        let crls = [
+            dir.write("root.crl", root.crl(&[7], CRL_NOW - 60, CRL_NOW + 3600, 1)),
+            dir.write(
+                "other.crl",
+                other.crl(&[8], CRL_NOW - 60, CRL_NOW + 3600, 1),
+            ),
+        ];
+        let pki = crl_pki(&ca, A, &crls, false);
+        assert_eq!(
+            crl_check(&pki, std::slice::from_ref(&revoked), CRL_NOW),
+            Err("certificate_revoked")
+        );
+        assert_eq!(
+            crl_check(&pki, std::slice::from_ref(&fine), CRL_NOW),
+            Ok(())
+        );
+        let from_other = other.leaf(7, A);
+        assert_eq!(crl_check(&pki, &[from_other], CRL_NOW), Ok(()));
+        // A revoked certificate with another name gets the answer of a wrong name.
+        let renamed = Pki {
+            name: san_uri("spiffe://example.org/b").unwrap(),
+            ..crl_pki(&ca, A, &crls, false)
+        };
+        assert_eq!(
+            crl_check(&renamed, std::slice::from_ref(&revoked), CRL_NOW),
+            Err("san_mismatch")
+        );
+        // Without CRLs the same certificate passes: nothing else changed.
+        let none = Pki {
+            crls: None,
+            ..crl_pki(&ca, A, &crls, false)
+        };
+        assert_eq!(crl_check(&none, &[revoked], CRL_NOW), Ok(()));
+        // Expired is still expired, not revoked.
+        assert_eq!(
+            crl_check(&pki, &[root.leaf(7, A)], CRL_NOW + 7200),
+            Err("certificate_expired")
+        );
+    }
+
+    #[test]
+    fn a_revoked_intermediate_refuses_its_certificates() {
+        let dir = Dir::new();
+        let root = Ca::new("root", None);
+        let mid = Ca::numbered("mid", &root, 99);
+        let good_mid = Ca::numbered("good-mid", &root, 100);
+        let ca = Arc::new(dir.ca_file("ca.pem", &[&root]));
+        let crls = [dir.write("root.crl", root.crl(&[99], CRL_NOW - 60, CRL_NOW + 3600, 1))];
+        let pki = crl_pki(&ca, A, &crls, false);
+        let leaf = mid.leaf(1, A);
+        assert_eq!(
+            crl_check(&pki, &[leaf, mid.cert.der().clone()], CRL_NOW),
+            Err("certificate_revoked")
+        );
+        let leaf = good_mid.leaf(1, A);
+        assert_eq!(
+            crl_check(&pki, &[leaf.clone(), good_mid.cert.der().clone()], CRL_NOW),
+            Ok(())
+        );
+        // `tls_client_crl_missing = "refuse"`: the intermediate has no CRL of its own.
+        let strict = crl_pki(&ca, A, &crls, true);
+        assert_eq!(
+            crl_check(
+                &strict,
+                &[leaf.clone(), good_mid.cert.der().clone()],
+                CRL_NOW
+            ),
+            Err("crl_missing")
+        );
+        // With the intermediate's CRL (its key from tls_client_crl_issuer_pem_path).
+        let issuers = dir.write("issuers.pem", good_mid.cert.pem());
+        let both = [
+            crls[0].clone(),
+            dir.write(
+                "mid.crl",
+                good_mid.crl(&[2], CRL_NOW - 60, CRL_NOW + 3600, 1),
+            ),
+        ];
+        let s = crate::client_crl::Settings {
+            paths: &both,
+            issuers: Some(&issuers),
+            stale: None,
+            missing: Some(crate::config::ClientCrlRule::Refuse),
+        };
+        let set =
+            crate::client_crl::load(&s, &ca, &mut crate::client_crl::Loading::new(at(CRL_NOW)))
+                .unwrap();
+        let strict = Pki {
+            crls: Some(Arc::new(set)),
+            ..crl_pki(&ca, A, &crls, true)
+        };
+        let chain = |l| vec![l, good_mid.cert.der().clone()];
+        assert_eq!(crl_check(&strict, &chain(leaf), CRL_NOW), Ok(()));
+        assert_eq!(
+            crl_check(&strict, &chain(good_mid.leaf(2, A)), CRL_NOW),
+            Err("certificate_revoked")
+        );
+    }
+
+    /// A stale CRL refuses once the clock passes its `nextUpdate`, with no reload: the cached
+    /// answer ends a second before.
+    #[test]
+    fn a_crl_that_goes_stale_refuses_without_a_reload() {
+        let dir = Dir::new();
+        let root = Ca::new("root", None);
+        let ca = Arc::new(dir.ca_file("ca.pem", &[&root]));
+        let crls = [dir.write("root.crl", root.crl(&[], CRL_NOW - 60, CRL_NOW + 100, 1))];
+        let pki = crl_pki(&ca, A, &crls, false);
+        let cert = ClientCertificate::from_handshake(&[root.leaf(1, A)]).unwrap();
+        assert_eq!(verify(&pki, &cert, at(CRL_NOW)), Ok(()));
+        assert_eq!(cert.pki_state().cached_answers(), 1);
+        assert_eq!(verify(&pki, &cert, at(CRL_NOW + 99)), Ok(()));
+        assert_eq!(
+            verify(&pki, &cert, at(CRL_NOW + 100)).unwrap_err().reason,
+            "crl_stale"
+        );
+        // `tls_client_crl_stale = "allow"`: still accepted, and cached to the certificate's
+        // own end.
+        let s = crate::client_crl::Settings {
+            paths: &crls,
+            issuers: None,
+            stale: Some(crate::config::ClientCrlRule::Allow),
+            missing: None,
+        };
+        let set =
+            crate::client_crl::load(&s, &ca, &mut crate::client_crl::Loading::new(at(CRL_NOW)))
+                .unwrap();
+        let allow = Pki {
+            crls: Some(Arc::new(set)),
+            ..crl_pki(&ca, A, &crls, false)
+        };
+        assert_eq!(verify(&allow, &cert, at(CRL_NOW + 200)), Ok(()));
+        assert_eq!(verify(&allow, &cert, at(CRL_NOW + 3600)), Ok(()));
+    }
+
+    /// An answer cached under one set of CRLs is never used under another, on a connection or
+    /// in the forwarding listener's shared states: a reload that adds a revocation refuses the
+    /// certificate on the next request.
+    #[test]
+    fn a_new_crl_is_never_answered_from_the_cache() {
+        let dir = Dir::new();
+        let root = Ca::new("root", None);
+        let ca = Arc::new(dir.ca_file("ca.pem", &[&root]));
+        let before = [dir.write("1.crl", root.crl(&[], CRL_NOW - 60, CRL_NOW + 3600, 1))];
+        let after = [dir.write("2.crl", root.crl(&[5], CRL_NOW - 30, CRL_NOW + 3600, 2))];
+        let leaf = root.leaf(5, A);
+        let old = crl_pki(&ca, A, &before, false);
+        let new = crl_pki(&ca, A, &after, false);
+        let cert = ClientCertificate::from_handshake(std::slice::from_ref(&leaf)).unwrap();
+        assert_eq!(verify(&old, &cert, at(CRL_NOW)), Ok(()));
+        assert_eq!(verify(&old, &cert, at(CRL_NOW)), Ok(()));
+        assert_eq!(
+            verify(&new, &cert, at(CRL_NOW)).unwrap_err().reason,
+            "certificate_revoked"
+        );
+        // The refusal is not cached, and the old answer is not reused.
+        assert_eq!(
+            verify(&new, &cert, at(CRL_NOW)).unwrap_err().reason,
+            "certificate_revoked"
+        );
+        // The same file read again is a new set: checked again.
+        let again = crl_pki(&ca, A, &before, false);
+        assert!(!Arc::ptr_eq(
+            again.crls.as_ref().unwrap(),
+            old.crls.as_ref().unwrap()
+        ));
+        assert_eq!(verify(&again, &cert, at(CRL_NOW)), Ok(()));
+        // Forwarded certificates: the same rules through the shared states.
+        let shared = SharedStates::new();
+        let req = || ClientCertificate::forwarded(leaf.clone(), &[], &shared);
+        assert_eq!(verify(&old, &req(), at(CRL_NOW)), Ok(()));
+        assert_eq!(req().pki_state().cached_answers(), 1);
+        assert_eq!(
+            verify(&new, &req(), at(CRL_NOW)).unwrap_err().reason,
+            "certificate_revoked"
+        );
+        assert_eq!(verify(&old, &req(), at(CRL_NOW)), Ok(()));
+        // A set no one holds any more is dropped from the cache.
+        drop(old);
+        drop(again);
+        for i in 0..CACHED_ANSWERS {
+            let n = format!("spiffe://example.org/n{i}");
+            let p = Pki {
+                name: san_uri(&n).unwrap(),
+                ..crl_pki(&ca, A, &before, false)
+            };
+            let _ = verify(&p, &cert, at(CRL_NOW));
+        }
+        assert!(cert.pki_state().cached_answers() <= CACHED_ANSWERS);
     }
 }

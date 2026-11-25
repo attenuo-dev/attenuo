@@ -94,6 +94,7 @@
   - [ADR-0020: TLS client certificates from a CA](decisions/0020-pki-tls-client-auth.md)
   - [ADR-0021: TLS client certificates forwarded by a proxy](decisions/0021-forwarded-client-certificates.md)
   - [ADR-0022: Certificate-bound access tokens](decisions/0022-certificate-bound-tokens.md)
+  - [ADR-0023: CRL files for client certificates](decisions/0023-client-certificate-crls.md)
 
 # Research
 
