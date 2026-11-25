@@ -918,6 +918,67 @@ async fn a_reload_finishes_when_the_client_goes_away() {
     s.stop().await;
 }
 
+/// Reloads that wait behind a running one hold no thread and are dropped when their clients
+/// give up: once the running one ends, none of them runs. Only the started reload is counted
+/// and audited.
+#[tokio::test]
+async fn reloads_whose_clients_gave_up_while_waiting_never_run() {
+    let s = Server::start(ClientCertificates::Off, 10).await;
+    let new = s.renew(|p| {
+        p.not_before = now() - DAY;
+        p.not_after = now() + time::Duration::days(30);
+    });
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let state = s.state.clone();
+    let holder = std::thread::spawn(move || {
+        state
+            .audit
+            .with_connection(|_| {
+                held_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+            .unwrap();
+    });
+    held_rx.recv().unwrap();
+    let give_up = |ms: u64| {
+        s.ca.reqwest_client(None)
+            .post(s.running.https_url("/admin/tls/reload"))
+            .bearer_auth(ADMIN)
+            .timeout(Duration::from_millis(ms))
+            .send()
+    };
+    // The first one starts and waits on the audit log, holding the reload lock.
+    assert!(give_up(500).await.is_err());
+    // These wait on the lock, and their clients give up.
+    let waiting: Vec<_> = (0..8).map(|_| give_up(300)).collect();
+    for r in futures_util::future::join_all(waiting).await {
+        assert!(r.is_err(), "{r:?}");
+    }
+    // Time for the server to see the closed connections.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+    let end = std::time::Instant::now() + Duration::from_secs(20);
+    while s.served_leaf().await != new {
+        assert!(
+            std::time::Instant::now() < end,
+            "the started reload never finished"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // Time for any reload still queued to run, if one were.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(s.metric(&reloads("ok")), 1);
+    assert_eq!(s.metric(&reloads("failed")), 0);
+    let records = s.reload_records().await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0]["decision"], "allow");
+    s.stop().await;
+}
+
 /// A client session store that counts the tickets it is given.
 #[derive(Debug)]
 struct CountingStore {

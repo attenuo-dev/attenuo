@@ -59,22 +59,26 @@ pub async fn reload_tls(
              no certificate to reload",
         ));
     };
-    // The whole reload, from reading the files to the swap and its audit record, is one task
-    // on the blocking pool. Once started, it runs to its end even when this handler is dropped
-    // (the client went away, the request deadline): a certificate is never put in force
-    // without its audit record, and the lock is never released half way.
-    state.blocking(move |state| reload(state, &tls, &who)).await
+    // One reload at a time. A request that waits here holds no thread, and is dropped with
+    // its connection when the client goes away.
+    let guard = Arc::clone(&tls.reloading).lock_owned().await;
+    // From here the whole reload, from reading the files to the swap and its audit record, is
+    // one task on the blocking pool that owns the lock. Once started, it runs to its end even
+    // when this handler is dropped (the client went away, the request deadline): a
+    // certificate is never put in force without its audit record, and the lock is never
+    // released half way.
+    state
+        .blocking(move |state| {
+            let _reloading = guard;
+            reload(state, &tls, &who)
+        })
+        .await
 }
 
-/// The reload itself, on the blocking pool, under `tls.reloading`. The audit record is
+/// The reload itself, on the blocking pool, with `tls.reloading` held. The audit record is
 /// appended before the swap: when it cannot be appended, nothing is swapped (fail closed) and
 /// the answer is the audit error.
 fn reload(state: &AppState, tls: &ServerTls, who: &AdminIdentity) -> Result<Json<Value>, ApiError> {
-    // One reload at a time, from reading the files to the swap.
-    let _reloading = tls
-        .reloading
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     // Taken under the lock, so a reload that waited checks the dates at the time it reads.
     let now = state.now();
     let section = tls.section();

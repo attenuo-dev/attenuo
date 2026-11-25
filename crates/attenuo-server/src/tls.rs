@@ -190,9 +190,10 @@ pub(crate) struct ServerTls {
     current: RwLock<Arc<Material>>,
     /// Held by `POST /admin/tls/reload` from reading the files to the swap and its audit
     /// record, so two reloads cannot cross (the one that read the older files swapping last).
-    /// A blocking lock, taken on the blocking pool: the whole reload runs there, so a handler
-    /// that is dropped cannot release it early.
-    pub(crate) reloading: std::sync::Mutex<()>,
+    /// Waited on in async code, so a waiting reload holds no thread and is dropped with its
+    /// request; the owned guard then moves into the blocking task that runs the reload, so a
+    /// reload that has started keeps it to its end.
+    pub(crate) reloading: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl ServerTls {
@@ -228,7 +229,7 @@ impl ServerTls {
         Ok(Self {
             section: tls.clone(),
             current: RwLock::new(Arc::new(material)),
-            reloading: std::sync::Mutex::new(()),
+            reloading: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -476,28 +477,37 @@ pub(crate) fn mentions_private_key(pem: &[u8]) -> bool {
 }
 
 /// How many PEM sections of `pem` begin as a private key of any kind: each `BEGIN` whose
-/// label, up to the next `-----` or line end and within 64 bytes, holds `PRIVATE KEY` (`PRIVATE KEY`, `EC PRIVATE
-/// KEY`, `ENCRYPTED PRIVATE KEY`, `OPENSSH PRIVATE KEY`, ...). Nothing is decoded.
+/// label, up to the next `-----` or line end, holds `PRIVATE KEY` (`PRIVATE KEY`,
+/// `EC PRIVATE KEY`, `ENCRYPTED PRIVATE KEY`, `OPENSSH PRIVATE KEY`, ...). Nothing is decoded.
+/// Linear: each label is scanned once, from its `BEGIN` to its end.
 pub(crate) fn private_key_sections(pem: &[u8]) -> usize {
     const BEGIN: &[u8] = b"BEGIN";
     const NEEDLE: &[u8] = b"PRIVATE KEY";
-    (0..pem.len().saturating_sub(BEGIN.len() - 1))
-        .filter(|&i| pem[i..].starts_with(BEGIN))
-        .filter(|&i| {
-            // A label is short; looking at most 64 bytes ahead keeps this linear.
-            let label = &pem[i + BEGIN.len()..];
-            let label = &label[..label.len().min(64)];
-            let end = label
-                .windows(5)
-                .position(|w| w == b"-----")
-                .unwrap_or(label.len());
-            let end = label[..end]
-                .iter()
-                .position(|&b| b == b'\n' || b == b'\r')
-                .unwrap_or(end);
-            label[..end].windows(NEEDLE.len()).any(|w| w == NEEDLE)
-        })
-        .count()
+    let mut count = 0;
+    let mut i = 0;
+    while i + BEGIN.len() <= pem.len() {
+        if !pem[i..].starts_with(BEGIN) {
+            i += 1;
+            continue;
+        }
+        let start = i + BEGIN.len();
+        // The label ends at the next `-----`, line end, or the next `BEGIN` (counted on its
+        // own), whichever comes first.
+        let mut end = start;
+        while end < pem.len()
+            && !pem[end..].starts_with(b"-----")
+            && !pem[end..].starts_with(BEGIN)
+            && pem[end] != b'\n'
+            && pem[end] != b'\r'
+        {
+            end += 1;
+        }
+        if pem[start..end].windows(NEEDLE.len()).any(|w| w == NEEDLE) {
+            count += 1;
+        }
+        i = end.max(start);
+    }
+    count
 }
 
 /// The one private key of the `key_pem_path` file.
@@ -921,6 +931,22 @@ mod tests {
         assert_eq!(private_key_sections(cert_pem.as_bytes()), 0);
         assert_eq!(private_key_sections(b"BEGIN"), 0);
         assert_eq!(private_key_sections(b""), 0);
+        // A long label still counts: the label runs to its `-----`, however long.
+        let long = format!(
+            "-----BEGIN {} PRIVATE KEY-----\nAAAA\n-----END {0} PRIVATE KEY-----\n",
+            "X".repeat(70)
+        );
+        assert_eq!(private_key_sections(long.as_bytes()), 1);
+        let two = write(dir.path(), "two.key", &format!("{key_pem}{long}"), 0o600);
+        let err = refusal(&cert, &two);
+        assert!(err.contains("more than one private key"), "{err}");
+        // Two on one line, and a `BEGIN` inside a label, count each section once.
+        assert_eq!(
+            private_key_sections(b"-----BEGIN PRIVATE KEY----------BEGIN EC PRIVATE KEY-----"),
+            2
+        );
+        assert_eq!(private_key_sections(b"BEGINBEGIN PRIVATE KEY"), 1);
+        assert_eq!(private_key_sections(b"-----END PRIVATE KEY-----"), 0);
         // Broken base64 inside a key block: the parser's message (which may quote the file)
         // is not passed on.
         let secret_marker = "SECRETSECRET*";

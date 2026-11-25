@@ -735,7 +735,7 @@ It answers SHA-256 digests and dates, never a key, a file's content or a path:
 
 - `certificate_sha256` and `previous_certificate_sha256` are the SHA-256 (lowercase hex) of the first certificate's DER, after and before. `changed` is false when they are the same. The new files are put in force either way.
 - `chain_length` counts the certificates of `cert_pem_path`, the first one included.
-- The `admin.tls.reload` audit record keeps the digest of its arguments: `{cert_pem_path, key_pem_path}` and the members of the answer (without `audit_id`). The record is appended before the new certificate is put in force. When it cannot be appended, nothing changes and the answer is a 500. Once the server has started the reload, it runs to the end even if the client goes away. A 422 refusal is recorded as a `deny` whose `reason` is the refusal's code, with the two paths and `previous_certificate_sha256`. The 409 is not audited.
+- The `admin.tls.reload` audit record keeps the digest of its arguments: `{cert_pem_path, key_pem_path}` and the members of the answer (without `audit_id`). The record is appended before the new certificate is put in force. When it cannot be appended, nothing changes and the answer is a 500. A reload waits for the one before it to end; if its client goes away while it waits, it never runs. Once a reload has started, it runs to the end even if the client goes away. A 422 refusal is recorded as a `deny` whose `reason` is the refusal's code, with the two paths and `previous_certificate_sha256`. The 409 is not audited.
 
 What follows the reload:
 
