@@ -685,10 +685,15 @@ pub(crate) fn tbs(cert: &[u8]) -> Option<Tbs<'_>> {
 
 /// A certificate's `notAfter`, in Unix seconds.
 pub(crate) fn not_after(cert: &[u8]) -> Option<i64> {
+    validity(cert).map(|(_, not_after)| not_after)
+}
+
+/// A certificate's `notBefore` and `notAfter`, in Unix seconds.
+pub(crate) fn validity(cert: &[u8]) -> Option<(i64, i64)> {
     let validity = tbs(cert)?.validity;
-    let (_, rest) = time_of(validity)?;
-    let (t, rest) = time_of(rest)?;
-    rest.is_empty().then_some(t)
+    let (not_before, rest) = time_of(validity)?;
+    let (not_after, rest) = time_of(rest)?;
+    rest.is_empty().then_some((not_before, not_after))
 }
 
 /// One DER `Time` (RFC 5280 §4.1.2.5): `UTCTime` `YYMMDDHHMMSSZ` (years 1950 to 2049) or

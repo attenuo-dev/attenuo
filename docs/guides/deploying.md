@@ -126,7 +126,7 @@ What it does:
 - It keeps no sessions. Every connection makes a full handshake.
 - It asks for no client certificate, unless you set `client_certificates = "optional"` (below).
 - The handshake must finish within `[limits] header_read_timeout_seconds`. A peer that connects and sends nothing is dropped then. The request headers get the same timeout again after the handshake.
-- A plain-HTTP request to this port fails its handshake. The server logs it at debug and goes on.
+- A plain-HTTP request to this port fails its handshake, and the server goes on. Each failed handshake is counted in `tls_handshake_failures_total{reason}`. The server logs one at debug at most every 10 seconds, with the number it did not log.
 - The startup line `attenuo server listening` says `tls=true`.
 
 What it needs:
@@ -136,7 +136,17 @@ What it needs:
 - Keep the private key out of `cert_pem_path`, unless both keys name the same file. An encrypted key is refused in either file.
 - The key file must be owned by the server's user or by root. It must give others no access, and its group at most read, and that only when root owns it. See [The key file's mode](#the-key-files-mode).
 
-The server reads both files once, at start. A renewed certificate needs a restart. Plan the restart before the old certificate expires. The server does not check its own certificate's dates: an expired certificate is served until clients refuse it.
+The server reads both files at start. At start it does not check the certificate's dates: an expired certificate is served until clients refuse it. Watch `tls_certificate_not_after_timestamp_seconds` ([what to monitor](#what-to-monitor)).
+
+#### Renewing the certificate
+
+A renewed certificate needs no restart:
+
+1. Write the new certificate chain and key over the files `cert_pem_path` and `key_pem_path` name. Write each one to a temporary file in the same directory, then rename it into place, so a reload never reads half a file. Keep the key file's owner and mode.
+2. Run `attenuo admin tls reload` (`POST /admin/tls/reload`, role `admin`). It prints the SHA-256 of the certificate before and after, and the new dates.
+3. If it is refused, the old certificate is still in force. The error says what is wrong (`tls_key_mismatch`, `tls_certificate_expired`, ...). Fix the files and run it again.
+
+New connections get the new certificate. Open connections keep the old one until they close. A reload reads the same paths: to use other paths, change the config and restart. A reload makes the startup checks, and also refuses a certificate that has expired or is not valid yet. It changes no other TLS setting, and it does not touch client certificates or tokens bound to them. With several replicas, run it against each one. A renewal tool can run step 2 from its hook (certbot `--deploy-hook`, for example). See [TLS certificate reload](../reference/http-api.md#tls-certificate-reload).
 
 #### Client certificates
 
@@ -795,6 +805,7 @@ listen = "127.0.0.1:9100"
 | `audit_db_size_bytes`, `audit_db_free_bytes`, `audit_pruned_entries_total` | The database file's size and the part of it on SQLite's free list, as a trend, and the entries prunes of the log (`[audit.retention]`) have deleted. |
 | `audit_auto_prune_runs_total`, `audit_auto_prune_last_run_timestamp_seconds`, `audit_prune_last_timestamp_seconds` | With `prune = "auto"`: alert on any `outcome="failed"`, and on a last run or a last prune older than you expect (see [Pruning on a timer](#pruning-on-a-timer)). |
 | `approval_notify_dropped_total`, `approval_notify_outbox_rows` | `[approvals.notify]` notices given up, and notices stored but not yet delivered. The outbox count staying up means the receiver is down; the notices survive a restart. |
+| `tls_certificate_not_after_timestamp_seconds`, `tls_certificate_reloads_total{result}`, `tls_handshake_failures_total{reason}` | With `[server.tls]`: when the certificate in force expires (alert well before), reloads that were refused (`result="failed"`), and failed handshakes. A rise in `reason="peer_alert"` after a renewal means clients do not trust the new certificate. |
 | `lease_notify_dropped_total`, `lease_notify_outbox_rows` | The same for `[leases.notify]` revocation notices. A dropped one costs only time: the PEP still learns of the revocation when it next asks. |
 
 Alert on any increase of `audit_append_errors_total`, on a rising share of `reason="lease_expired"`, on `audit_sink_dropped_total` and on `readyz` returning 503. Example Prometheus rules for the newer series; tune the thresholds to your traffic:
@@ -885,9 +896,4 @@ Rules that follow from this:
   To go back, restore the backup from step 2. Whatever happened after the upgrade, decisions and revocations included, is not in it (see "Know what a restore does" under [Backup](#sqlite-file-placement-and-backup)).
 - **A file from before schema versions** (any build before this was added) is adopted as version 1 at the first start: tables and indexes that came later are created, the two `approvals` columns that came later are added, and no row changes, so the audit chain, its head and the signed checkpoints stay as they were. A log written before records had `kind` and `chain_id`, or hashed before RFC 8785 canonical JSON, is refused as before: move it aside and start a new file.
 - **Version 2** rebuilds the `approvals` table so that an approval's position, which `GET /admin/approvals` pages by, is never given twice. Every approval keeps its values and its place in the order; the step copies the table once, which is quick for any number of approvals a server keeps. A build that reads only version 1 refuses the file afterwards, as above.
-- **Version 3** adds the `used_credentials` table, which records the single-use credentials the server has accepted (ID tokens, ID-JAGs, actor tokens, exchanges, approval ID tokens) so that they stay used across a restart. It starts empty and no other table changes. The upgrade restart is the last one that forgets a credential: one redeemed by the old binary and not yet expired can be redeemed once more after it. A build that reads only version 2 refuses the file afterwards.
-- **Version 4** adds a nullable `issuer` column to `lease_subjects`: the server now records the originating user's IdP issuer with the subject of each lease it issues, which the admin lease tree needs to find the run's per-user windows. Existing rows keep their subject and get no issuer; the lease tree of a run issued before the upgrade answers `user_windows: null`. A build that reads only version 3 refuses the file afterwards.
-- **Version 5** adds the `audit_anchors` table of audit retention ([ADR-0015](../decisions/0015-audit-retention.md)): one row per prune of the log, holding the signed anchor (the last seq pruned and its hash, the prune record's seq and hash, the previous prune's boundary, the archive digest, the time, `kid` and signature) and the deletion state (`deleting` until the pruned rows are gone, then `done`). It starts empty and no other table or row changes, so a log that is never pruned verifies exactly as before. A build that reads only version 4 refuses the file afterwards.
-- Several servers on one file are already ruled out by the lock, so a migration never races a running server.
-
-**Run limits need every server on 0.1.0 or later.** A `limits` block in a capability is an open field that older servers accept and ignore, so a token whose budget says "at most 2 payments" is unlimited when an older binary checks it (any build from `main` before run limits landed on 2026-10-24). Nothing fails and nothing is logged: the decision record of the old server simply has no `budget` member. Until every replica, and every external PEP that reads `limits`, runs 0.1.0 or later, do not rely on a limit for safety; use a Cedar `forbid` for the same call, or an approval, and add the limit on top. Check the mixed-version window with `attenuo audit tail --json`: a `decision` record for a limited capability without `budget` came from an old server. (The injection-suite runner probes for this before its limits arms and refuses to run them against an old server.)
+- **Version 3** adds the `used_credentials` table, which records the single-use credentials the server has 

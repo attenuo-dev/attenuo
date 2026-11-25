@@ -1,12 +1,14 @@
 //! `[server.tls]`: the TLS configuration of the main listener.
 //!
-//! [`server_config`] reads the certificate chain and the private key once, at startup, and
-//! refuses anything it cannot use as it is (fail closed): a file that cannot be read, is not
-//! a regular file, is empty or too large; a certificate file with no certificate, or with a
-//! private key in it; a key file with no private key or more than one; a key file whose
-//! owner and mode break PostgreSQL's `ssl_key_file` rule ([`key_mode_ok`], Unix: owned by
-//! the server's effective user or root, no access for others); a key that does not belong to
-//! the first certificate.
+//! [`ServerTls::load`] reads the certificate chain and the private key at startup, and
+//! [`ServerTls::read_new`] reads them again for `POST /admin/tls/reload`. Both refuse anything
+//! they cannot use as it is (fail closed): a file that cannot be read, is not a regular file,
+//! is empty or too large; a certificate file with no certificate, or with a private key in it;
+//! a key file with no private key or more than one; a key file whose owner and mode break
+//! PostgreSQL's `ssl_key_file` rule ([`key_mode_ok`], Unix: owned by the server's effective
+//! user or root, no access for others); a key that does not belong to the first certificate.
+//! A reload also refuses a first certificate whose dates cannot be read, that has expired or
+//! that is not valid yet; startup does not check the dates.
 //!
 //! The configuration it builds:
 //!
@@ -22,19 +24,30 @@
 //!   is accepted ([`crate::client_cert_verifier`]). Whether it authenticates a client is
 //!   decided per request ([`crate::clientauth`]).
 //!
+//! **Reload.** The paths and `client_certificates` are the ones read at startup; a reload
+//! reads only the files' content again. Every setting above comes from this code ([`build`]),
+//! never from the files, so a reload cannot change it. The new configuration is put in force
+//! in one step ([`ServerTls::swap`]). The accept loop takes one snapshot of it for each new
+//! connection, before the handshake: a handshake uses the old configuration or the new one,
+//! whole, never a mix. A connection that is already open keeps the configuration it was made
+//! with. No lock is held across an `await`: the snapshot is an `Arc` clone under a read lock.
+//!
 //! Nothing here logs or returns the content of a file: every error is a fixed text that names
-//! the file and the kind of problem, never a parser's or rustls's detail. A renewed certificate takes a restart.
+//! the file and the kind of problem, never a parser's or rustls's detail.
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
 
 use rustls::crypto::CryptoProvider;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::NoServerSessionStorage;
 use rustls::sign::{CertifiedKey, SingleCertAndKey};
+use sha2::Digest;
+use time::OffsetDateTime;
 
 use crate::config::{ClientCertificates, ServerTlsSection};
+use crate::metrics::HandshakeFailure;
 
 /// Largest `cert_pem_path` file read: 1 MiB, as for a `ca_pem_path` file
 /// ([`crate::idp::jwks::MAX_CA_FILE_BYTES`]). A chain is a few KiB.
@@ -47,27 +60,230 @@ pub(crate) const MAX_KEY_FILE_BYTES: u64 = crate::issuer_keys::MAX_KEY_FILE_BYTE
 /// The ALPN protocols the listener offers: HTTP/1.1 only.
 pub(crate) const ALPN: &[&[u8]] = &[b"http/1.1"];
 
-/// The TLS configuration of `[server.tls]`.
+/// What kind of problem stopped the files from being used. Each is one error code of
+/// `POST /admin/tls/reload` ([`crate::routes::tls_reload`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Problem {
+    /// A file cannot be read: missing, no permission, not a regular file, too large, or a key
+    /// file whose owner or mode breaks the rule of [`key_mode_ok`].
+    Unreadable,
+    /// A file can be read but cannot be used: empty, not PEM, no certificate, a private key in
+    /// the certificate file, no key or more than one, a key rustls cannot use, a first
+    /// certificate that cannot be parsed or whose dates cannot be read.
+    Invalid,
+    /// The private key does not belong to the first certificate.
+    KeyMismatch,
+    /// The first certificate's `notAfter` is in the past (reload only).
+    Expired,
+    /// The first certificate's `notBefore` is in the future (reload only).
+    NotYetValid,
+}
+
+/// Which setting of `[server.tls]` a [`LoadError`] is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Setting {
+    /// `cert_pem_path`.
+    Cert,
+    /// `key_pem_path`.
+    Key,
+    /// Both: the key and the certificate do not go together.
+    Both,
+}
+
+/// Why the files of `[server.tls]` cannot be used. `why` is a fixed text (with at most an I/O
+/// error's own words, a mode or a uid): never a file's content, never a path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LoadError {
+    pub(crate) problem: Problem,
+    pub(crate) setting: Setting,
+    pub(crate) why: String,
+}
+
+impl LoadError {
+    fn new(problem: Problem, setting: Setting, why: impl Into<String>) -> Self {
+        Self {
+            problem,
+            setting,
+            why: why.into(),
+        }
+    }
+
+    /// The message of a startup refusal: the setting, its path and the problem.
+    fn startup_message(&self, tls: &ServerTlsSection) -> String {
+        let (cert, key) = (tls.cert_pem_path.display(), tls.key_pem_path.display());
+        match self.setting {
+            Setting::Cert => format!("[server.tls] cert_pem_path {cert}: {}", self.why),
+            Setting::Key => format!("[server.tls] key_pem_path {key}: {}", self.why),
+            Setting::Both => format!(
+                "[server.tls] cert_pem_path {cert} and key_pem_path {key}: {}",
+                self.why
+            ),
+        }
+    }
+
+    /// The message of a reload refusal: the setting and the problem, without the path (the
+    /// operator knows it from the config; the answer does not repeat it).
+    pub(crate) fn reload_message(&self) -> String {
+        let setting = match self.setting {
+            Setting::Cert => "cert_pem_path",
+            Setting::Key => "key_pem_path",
+            Setting::Both => "cert_pem_path and key_pem_path",
+        };
+        format!("[server.tls] {setting}: {}", self.why)
+    }
+}
+
+/// One certificate chain and key in force on the main listener, with the rustls configuration
+/// built from them.
+#[derive(Debug)]
+pub(crate) struct Material {
+    /// The configuration every new connection's handshake uses.
+    pub(crate) config: Arc<rustls::ServerConfig>,
+    /// The SHA-256 of the first certificate's DER bytes.
+    pub(crate) leaf_sha256: [u8; 32],
+    /// The first certificate's `notBefore` and `notAfter`, in Unix seconds; `None` when they
+    /// cannot be read (accepted at startup only).
+    pub(crate) validity: Option<(i64, i64)>,
+    /// How many certificates the chain file holds, the first one included.
+    pub(crate) chain_len: usize,
+}
+
+impl Material {
+    /// The SHA-256 of the first certificate, lower-case hex.
+    pub(crate) fn leaf_sha256_hex(&self) -> String {
+        hex::encode(self.leaf_sha256)
+    }
+
+    /// The first certificate's `notAfter`, in Unix seconds, for the metrics gauge: 0 when it
+    /// cannot be read or is before 1970.
+    pub(crate) fn not_after_unix(&self) -> u64 {
+        self.validity
+            .map_or(0, |(_, after)| u64::try_from(after).unwrap_or(0))
+    }
+}
+
+/// `[server.tls]` in force: the settings read at startup, and the certificate chain and key in
+/// force now, which `POST /admin/tls/reload` swaps.
+#[derive(Debug)]
+pub(crate) struct ServerTls {
+    /// The paths and `client_certificates`, as read at startup; never changed.
+    section: ServerTlsSection,
+    /// The material in force.
+    current: RwLock<Arc<Material>>,
+    /// Held by `POST /admin/tls/reload` from reading the files to the swap, so two reloads
+    /// cannot cross (the one that read the older files swapping last).
+    pub(crate) reloading: tokio::sync::Mutex<()>,
+}
+
+impl ServerTls {
+    /// Read the files of `tls` at startup, with the checks of the module documentation (the
+    /// dates are not checked).
+    ///
+    /// # Errors
+    ///
+    /// A message that names the setting and the path, never a file's content, when a file
+    /// cannot be used or rustls refuses the certificate or the key.
+    pub(crate) fn load(tls: &ServerTlsSection) -> anyhow::Result<Self> {
+        let material = load(tls).map_err(|e| anyhow::anyhow!(e.startup_message(tls)))?;
+        Ok(Self {
+            section: tls.clone(),
+            current: RwLock::new(Arc::new(material)),
+            reloading: tokio::sync::Mutex::new(()),
+        })
+    }
+
+    /// The settings read at startup.
+    pub(crate) fn section(&self) -> &ServerTlsSection {
+        &self.section
+    }
+
+    /// The material in force now. It stays usable, unchanged, after a later swap.
+    pub(crate) fn current(&self) -> Arc<Material> {
+        Arc::clone(&self.current.read().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// Read the files again, from the paths read at startup, with the startup checks and also
+    /// the first certificate's dates at `now`. Reads files: call it off the async workers.
+    ///
+    /// # Errors
+    ///
+    /// The first problem found, as at startup, or an expired, not yet valid or undated first
+    /// certificate.
+    pub(crate) fn read_new(&self, now: OffsetDateTime) -> Result<Material, LoadError> {
+        let material = load(&self.section)?;
+        let Some((not_before, not_after)) = material.validity else {
+            return Err(LoadError::new(
+                Problem::Invalid,
+                Setting::Cert,
+                "the validity dates of the first certificate cannot be read",
+            ));
+        };
+        let now = now.unix_timestamp();
+        if now > not_after {
+            return Err(LoadError::new(
+                Problem::Expired,
+                Setting::Cert,
+                format!(
+                    "the first certificate expired at {} (notAfter)",
+                    rfc3339(not_after)
+                ),
+            ));
+        }
+        if now < not_before {
+            return Err(LoadError::new(
+                Problem::NotYetValid,
+                Setting::Cert,
+                format!(
+                    "the first certificate is not valid before {} (notBefore)",
+                    rfc3339(not_before)
+                ),
+            ));
+        }
+        Ok(material)
+    }
+
+    /// Put `new` in force for every connection accepted from now on, and return the material it
+    /// replaces.
+    pub(crate) fn swap(&self, new: Material) -> Arc<Material> {
+        let mut current = self.current.write().unwrap_or_else(PoisonError::into_inner);
+        std::mem::replace(&mut *current, Arc::new(new))
+    }
+}
+
+/// `t` (Unix seconds) as RFC 3339, or the number when it is out of range.
+pub(crate) fn rfc3339(t: i64) -> String {
+    OffsetDateTime::from_unix_timestamp(t)
+        .ok()
+        .and_then(|d| {
+            d.format(&time::format_description::well_known::Rfc3339)
+                .ok()
+        })
+        .unwrap_or_else(|| t.to_string())
+}
+
+/// The TLS configuration of `[server.tls]`, as startup builds it.
 ///
 /// # Errors
 ///
-/// A message that names the key and the path, never a file's content, when a file cannot be
-/// used (see the module documentation) or rustls refuses the certificate or the key.
+/// See [`ServerTls::load`].
+#[cfg(test)]
 pub(crate) fn server_config(tls: &ServerTlsSection) -> anyhow::Result<Arc<rustls::ServerConfig>> {
-    let cert_path = &tls.cert_pem_path;
-    let key_path = &tls.key_pem_path;
-    let certs = read_certs(cert_path, key_path).map_err(|why| {
-        anyhow::anyhow!("[server.tls] cert_pem_path {}: {why}", cert_path.display())
-    })?;
-    let key = read_key(key_path).map_err(|why| {
-        anyhow::anyhow!("[server.tls] key_pem_path {}: {why}", key_path.display())
-    })?;
-    build(certs, key, tls.client_certificates).map_err(|why| {
-        anyhow::anyhow!(
-            "[server.tls] cert_pem_path {} and key_pem_path {}: {why}",
-            cert_path.display(),
-            key_path.display()
-        )
+    Ok(ServerTls::load(tls)?.current().config.clone())
+}
+
+/// Read and check the files of `tls`, and build the configuration: the startup checks.
+fn load(tls: &ServerTlsSection) -> Result<Material, LoadError> {
+    let certs = read_certs(&tls.cert_pem_path, &tls.key_pem_path)?;
+    let key = read_key(&tls.key_pem_path)?;
+    let leaf_sha256: [u8; 32] = sha2::Sha256::digest(certs[0].as_ref()).into();
+    let validity = crate::client_pki::validity(certs[0].as_ref());
+    let chain_len = certs.len();
+    let config = build(certs, key, tls.client_certificates)?;
+    Ok(Material {
+        config,
+        leaf_sha256,
+        validity,
+        chain_len,
     })
 }
 
@@ -77,13 +293,19 @@ fn build(
     certs: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
     client_certificates: ClientCertificates,
-) -> Result<Arc<rustls::ServerConfig>, String> {
+) -> Result<Arc<rustls::ServerConfig>, LoadError> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let certified = certified_key(certs, key, &provider)?;
     let algs = provider.signature_verification_algorithms;
     let builder = rustls::ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
-        .map_err(|e| format!("cannot set up TLS 1.3 ({e})"))?;
+        .map_err(|e| {
+            LoadError::new(
+                Problem::Invalid,
+                Setting::Both,
+                format!("cannot set up TLS 1.3 ({e})"),
+            )
+        })?;
     let builder = match client_certificates {
         ClientCertificates::Off => builder.with_no_client_auth(),
         ClientCertificates::Optional => builder.with_client_cert_verifier(Arc::new(
@@ -108,47 +330,62 @@ fn certified_key(
     certs: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
     provider: &CryptoProvider,
-) -> Result<CertifiedKey, String> {
+) -> Result<CertifiedKey, LoadError> {
+    let refused = |problem, why: &str| LoadError::new(problem, Setting::Both, why);
     // No error detail from rustls or the file: fixed texts only.
     let signing_key = provider.key_provider.load_private_key(key).map_err(|_| {
-        "the private key cannot be used; use an RSA, ECDSA P-256 or P-384, or Ed25519 key"
-            .to_owned()
+        refused(
+            Problem::Invalid,
+            "the private key cannot be used; use an RSA, ECDSA P-256 or P-384, or Ed25519 key",
+        )
     })?;
     let certified = CertifiedKey::new(certs, signing_key);
     match certified.keys_match() {
         Ok(()) => Ok(certified),
-        Err(rustls::Error::InconsistentKeys(rustls::InconsistentKeys::KeyMismatch)) => Err(
-            "the private key does not belong to the first certificate of the file (the \
-             server's own certificate must come first, then the intermediates)"
-                .into(),
-        ),
-        Err(rustls::Error::InconsistentKeys(_)) => {
-            Err("cannot check that the private key belongs to the first certificate".into())
+        Err(rustls::Error::InconsistentKeys(rustls::InconsistentKeys::KeyMismatch)) => {
+            Err(refused(
+                Problem::KeyMismatch,
+                "the private key does not belong to the first certificate of the file (the \
+                 server's own certificate must come first, then the intermediates)",
+            ))
         }
-        Err(_) => Err("the first certificate cannot be read as an X.509 certificate".into()),
+        Err(rustls::Error::InconsistentKeys(_)) => Err(refused(
+            Problem::Invalid,
+            "cannot check that the private key belongs to the first certificate",
+        )),
+        Err(_) => Err(refused(
+            Problem::Invalid,
+            "the first certificate cannot be read as an X.509 certificate",
+        )),
     }
 }
 
 /// The certificates of the `cert_pem_path` file, in file order.
-fn read_certs(path: &Path, key_path: &Path) -> Result<Vec<CertificateDer<'static>>, String> {
-    let pem = read_file(path, MAX_CERT_FILE_BYTES, false)?;
+fn read_certs(path: &Path, key_path: &Path) -> Result<Vec<CertificateDer<'static>>, LoadError> {
+    let invalid = |why: &str| LoadError::new(Problem::Invalid, Setting::Cert, why);
+    let pem = read_file(path, MAX_CERT_FILE_BYTES, false)
+        .map_err(|why| LoadError::new(Problem::Unreadable, Setting::Cert, why))?;
     if pem.iter().all(u8::is_ascii_whitespace) {
-        return Err("the file is empty; it must hold PEM certificates".into());
+        return Err(invalid("the file is empty; it must hold PEM certificates"));
     }
     let has_key = mentions_private_key(&pem);
     // A private key here would be as exposed as the certificate, which is not secret; keep it
     // in key_pem_path. The same file for both keys is fine: it is checked as a key file. Any
     // mention of `PRIVATE KEY` counts, an encrypted or malformed key included.
     if has_key && path != key_path {
-        return Err("the file holds a private key; keep the key in key_pem_path only".into());
+        return Err(invalid(
+            "the file holds a private key; keep the key in key_pem_path only",
+        ));
     }
     // The parser's error is never shown: some of its variants print a whole line of the file,
     // which may be part of a private key.
     let certs = CertificateDer::pem_slice_iter(&pem)
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| "not a valid PEM certificate file".to_owned())?;
+        .map_err(|_| invalid("not a valid PEM certificate file"))?;
     if certs.is_empty() {
-        return Err("no PEM certificate (-----BEGIN CERTIFICATE-----) in the file".into());
+        return Err(invalid(
+            "no PEM certificate (-----BEGIN CERTIFICATE-----) in the file",
+        ));
     }
     Ok(certs)
 }
@@ -162,33 +399,60 @@ pub(crate) fn mentions_private_key(pem: &[u8]) -> bool {
 }
 
 /// The one private key of the `key_pem_path` file.
-fn read_key(path: &Path) -> Result<PrivateKeyDer<'static>, String> {
-    let pem = read_file(path, MAX_KEY_FILE_BYTES, true)?;
+fn read_key(path: &Path) -> Result<PrivateKeyDer<'static>, LoadError> {
+    let invalid = |why: &str| LoadError::new(Problem::Invalid, Setting::Key, why);
+    let pem = read_file(path, MAX_KEY_FILE_BYTES, true)
+        .map_err(|why| LoadError::new(Problem::Unreadable, Setting::Key, why))?;
     if pem.iter().all(u8::is_ascii_whitespace) {
-        return Err("the file is empty; it must hold a PEM private key".into());
+        return Err(invalid("the file is empty; it must hold a PEM private key"));
     }
     // The parser's own error is not shown: it can quote part of the file.
     let mut keys = PrivateKeyDer::pem_slice_iter(&pem);
     let key = match keys.next() {
         Some(Ok(key)) => key,
-        Some(Err(_)) => return Err("not a valid PEM private key file".into()),
+        Some(Err(_)) => return Err(invalid("not a valid PEM private key file")),
         None => {
-            return Err(
+            return Err(invalid(
                 "no private key (-----BEGIN PRIVATE KEY-----, -----BEGIN EC PRIVATE \
                  KEY----- or -----BEGIN RSA PRIVATE KEY-----) in the file; an encrypted key \
-                 is not supported"
-                    .into(),
-            )
+                 is not supported",
+            ))
         }
     };
     match keys.next() {
         None => Ok(key),
-        Some(Ok(_)) => Err(
+        Some(Ok(_)) => Err(invalid(
             "the file holds more than one private key; keep only the key of \
-             the certificate"
-                .into(),
-        ),
-        Some(Err(_)) => Err("not a valid PEM private key file".into()),
+             the certificate",
+        )),
+        Some(Err(_)) => Err(invalid("not a valid PEM private key file")),
+    }
+}
+
+/// Why a TLS handshake of the main listener failed, from the error the handshake returned
+/// (a timeout is counted by the accept loop itself). Reads only the kind of the rustls error,
+/// never a text, so the label set stays fixed whatever the peer sends.
+pub(crate) fn handshake_failure(e: &std::io::Error) -> HandshakeFailure {
+    use rustls::Error as E;
+    let Some(err) = e.get_ref().and_then(|i| i.downcast_ref::<E>()) else {
+        return HandshakeFailure::Other;
+    };
+    match err {
+        E::InvalidCertificate(_) | E::NoCertificatesPresented | E::InvalidCertRevocationList(_) => {
+            HandshakeFailure::BadClientCertificate
+        }
+        E::AlertReceived(_) => HandshakeFailure::PeerAlert,
+        E::InappropriateMessage { .. }
+        | E::InappropriateHandshakeMessage { .. }
+        | E::InvalidMessage(_)
+        | E::PeerIncompatible(_)
+        | E::PeerMisbehaved(_)
+        | E::PeerSentOversizedRecord
+        | E::NoApplicationProtocol
+        | E::DecryptError
+        | E::InvalidEncryptedClientHello(_)
+        | E::UnsupportedNameType => HandshakeFailure::Protocol,
+        _ => HandshakeFailure::Other,
     }
 }
 
@@ -756,6 +1020,223 @@ mod tests {
             err.contains("does not belong to the first certificate"),
             "{err}"
         );
+    }
+
+    /// A key pair and a certificate for `localhost` valid from `not_before` to `not_after`
+    /// (Unix seconds), as PEM.
+    fn dated_cert_and_key(not_before: i64, not_after: i64) -> (String, String) {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        params.not_before = OffsetDateTime::from_unix_timestamp(not_before).unwrap();
+        params.not_after = OffsetDateTime::from_unix_timestamp(not_after).unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        (cert.pem(), key.serialize_pem())
+    }
+
+    const DAY: i64 = 86_400;
+
+    fn now() -> OffsetDateTime {
+        OffsetDateTime::now_utc()
+    }
+
+    /// A reload reads the same paths again: a new certificate written over the old files is
+    /// put in force by a swap, and the swap returns the old material, still usable.
+    #[test]
+    fn a_reload_reads_the_same_paths_and_swaps_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = now().unix_timestamp();
+        let (cert_pem, key_pem) = dated_cert_and_key(t - DAY, t + DAY);
+        let cert = write(dir.path(), "server.crt", &cert_pem, 0o644);
+        let key = write(dir.path(), "server.key", &key_pem, 0o600);
+        let mut tls_section = section(&cert, &key);
+        tls_section.client_certificates = ClientCertificates::Optional;
+        let tls = ServerTls::load(&tls_section).unwrap();
+        let first = tls.current();
+        assert_eq!(first.chain_len, 1);
+        assert_eq!(first.validity, Some((t - DAY, t + DAY)));
+        assert_eq!(
+            u64::try_from(t + DAY).unwrap(),
+            first.not_after_unix(),
+            "the gauge value"
+        );
+
+        let (cert2, key2) = dated_cert_and_key(t - DAY, t + 2 * DAY);
+        write(dir.path(), "server.crt", &cert2, 0o644);
+        write(dir.path(), "server.key", &key2, 0o600);
+        let new = tls.read_new(now()).unwrap();
+        assert_ne!(new.leaf_sha256, first.leaf_sha256);
+        let old = tls.swap(new);
+        assert_eq!(old.leaf_sha256, first.leaf_sha256);
+        let second = tls.current();
+        assert_ne!(second.leaf_sha256, first.leaf_sha256);
+        assert_eq!(second.validity, Some((t - DAY, t + 2 * DAY)));
+        // The settings did not change: they come from the code and the startup section.
+        for config in [&first.config, &second.config] {
+            assert_eq!(config.alpn_protocols, vec![b"http/1.1".to_vec()]);
+            assert_eq!(config.send_tls13_tickets, 0);
+            assert_eq!(config.max_tls13_tickets, 0);
+            assert_eq!(config.max_early_data_size, 0);
+            assert!(!config.ticketer.enabled());
+            assert!(!config.session_storage.can_cache());
+        }
+        assert_eq!(tls.section(), &tls_section);
+    }
+
+    /// A reload refuses what startup refuses, with the same problem, and names the setting
+    /// but never the path.
+    #[test]
+    fn a_reload_refuses_what_startup_refuses_without_naming_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = now().unix_timestamp();
+        let (cert_pem, key_pem) = dated_cert_and_key(t - DAY, t + DAY);
+        let cert = write(dir.path(), "server.crt", &cert_pem, 0o644);
+        let key = write(dir.path(), "server.key", &key_pem, 0o600);
+        let tls = ServerTls::load(&section(&cert, &key)).unwrap();
+        let (_, other_key) = dated_cert_and_key(t - DAY, t + DAY);
+        let refused = |problem: Problem, setting: Setting| {
+            let e = tls.read_new(now()).unwrap_err();
+            assert_eq!((e.problem, e.setting), (problem, setting), "{e:?}");
+            let msg = e.reload_message();
+            assert!(!msg.contains(&dir.path().display().to_string()), "{msg}");
+            assert!(msg.starts_with("[server.tls] "), "{msg}");
+            msg
+        };
+        // A key of another certificate.
+        write(dir.path(), "server.key", &other_key, 0o600);
+        let msg = refused(Problem::KeyMismatch, Setting::Both);
+        assert!(msg.contains("does not belong"), "{msg}");
+        write(dir.path(), "server.key", &key_pem, 0o600);
+        // An empty certificate file: an empty chain.
+        write(dir.path(), "server.crt", "", 0o644);
+        refused(Problem::Invalid, Setting::Cert);
+        // Not PEM.
+        write(dir.path(), "server.crt", "not pem\n", 0o644);
+        refused(Problem::Invalid, Setting::Cert);
+        write(dir.path(), "server.crt", &cert_pem, 0o644);
+        // A key file open to others.
+        #[cfg(unix)]
+        {
+            write(dir.path(), "server.key", &key_pem, 0o644);
+            let msg = refused(Problem::Unreadable, Setting::Key);
+            assert!(msg.contains("0644"), "{msg}");
+            write(dir.path(), "server.key", &key_pem, 0o600);
+        }
+        // Gone.
+        std::fs::remove_file(&key).unwrap();
+        refused(Problem::Unreadable, Setting::Key);
+        write(dir.path(), "server.key", &key_pem, 0o600);
+        // A private key in the certificate file.
+        write(
+            dir.path(),
+            "server.crt",
+            &format!("{cert_pem}{key_pem}"),
+            0o644,
+        );
+        let msg = refused(Problem::Invalid, Setting::Cert);
+        assert!(!msg.contains("BEGIN PRIVATE KEY"), "{msg}");
+        write(dir.path(), "server.crt", &cert_pem, 0o644);
+        // A broken key block is never quoted.
+        let (broken, body) = broken_key();
+        write(dir.path(), "server.key", &broken, 0o600);
+        let msg = refused(Problem::Invalid, Setting::Key);
+        assert_no_key_text(&msg, &body, &[]);
+        write(dir.path(), "server.key", &key_pem, 0o600);
+        // Every refusal left the material in force alone, and good files read again.
+        tls.read_new(now()).unwrap();
+    }
+
+    /// A reload refuses an expired or not yet valid first certificate, which startup accepts.
+    #[test]
+    fn a_reload_checks_the_dates_startup_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = now().unix_timestamp();
+        for (from, to, problem, word) in [
+            (t - 2 * DAY, t - DAY, Problem::Expired, "expired"),
+            (
+                t + DAY,
+                t + 2 * DAY,
+                Problem::NotYetValid,
+                "not valid before",
+            ),
+        ] {
+            let (cert_pem, key_pem) = dated_cert_and_key(from, to);
+            let cert = write(dir.path(), "server.crt", &cert_pem, 0o644);
+            let key = write(dir.path(), "server.key", &key_pem, 0o600);
+            // Startup takes it (and the gauge shows its notAfter).
+            let tls = ServerTls::load(&section(&cert, &key)).unwrap();
+            assert_eq!(tls.current().validity, Some((from, to)));
+            let e = tls.read_new(now()).unwrap_err();
+            assert_eq!(e.problem, problem);
+            assert_eq!(e.setting, Setting::Cert);
+            assert!(e.why.contains(word), "{}", e.why);
+            // The edges are valid: notBefore and notAfter themselves.
+            for at in [from, to] {
+                tls.read_new(OffsetDateTime::from_unix_timestamp(at).unwrap())
+                    .unwrap();
+            }
+            let past = OffsetDateTime::from_unix_timestamp(to + 1).unwrap();
+            assert_eq!(tls.read_new(past).unwrap_err().problem, Problem::Expired);
+            let early = OffsetDateTime::from_unix_timestamp(from - 1).unwrap();
+            assert_eq!(
+                tls.read_new(early).unwrap_err().problem,
+                Problem::NotYetValid
+            );
+        }
+    }
+
+    /// The reason of a failed handshake comes from the kind of the rustls error only.
+    #[test]
+    fn handshake_failures_are_classified_by_kind() {
+        let io = |e: rustls::Error| std::io::Error::new(std::io::ErrorKind::InvalidData, e);
+        let cases = [
+            (
+                io(rustls::Error::InvalidCertificate(
+                    rustls::CertificateError::BadSignature,
+                )),
+                HandshakeFailure::BadClientCertificate,
+            ),
+            (
+                io(rustls::Error::NoCertificatesPresented),
+                HandshakeFailure::BadClientCertificate,
+            ),
+            (
+                io(rustls::Error::AlertReceived(
+                    rustls::AlertDescription::UnknownCA,
+                )),
+                HandshakeFailure::PeerAlert,
+            ),
+            (
+                io(rustls::Error::PeerIncompatible(
+                    rustls::PeerIncompatible::SupportedVersionsExtensionRequired,
+                )),
+                HandshakeFailure::Protocol,
+            ),
+            (
+                io(rustls::Error::InvalidMessage(
+                    rustls::InvalidMessage::InvalidContentType,
+                )),
+                HandshakeFailure::Protocol,
+            ),
+            (
+                io(rustls::Error::NoApplicationProtocol),
+                HandshakeFailure::Protocol,
+            ),
+            (
+                io(rustls::Error::General("attacker text".into())),
+                HandshakeFailure::Other,
+            ),
+            (
+                std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "tls handshake eof"),
+                HandshakeFailure::Other,
+            ),
+            (
+                std::io::Error::from(std::io::ErrorKind::ConnectionReset),
+                HandshakeFailure::Other,
+            ),
+        ];
+        for (e, want) in cases {
+            assert_eq!(handshake_failure(&e), want, "{e}");
+        }
     }
 
     /// [`key_mode_ok`], for every case, whoever runs the tests: a server that runs as a

@@ -558,6 +558,7 @@ pub const ROUTE_ROLES: &[(&str, &str, AdminRole)] = &[
     ("POST", "/admin/operators/reload", AdminRole::Admin),
     ("POST", "/admin/agents/reload", AdminRole::Admin),
     ("POST", "/admin/keys/reload", AdminRole::Admin),
+    ("POST", "/admin/tls/reload", AdminRole::Admin),
     ("POST", "/admin/root-token", AdminRole::Admin),
     ("GET", "/admin/audit/prune/plan", AdminRole::Admin),
     ("POST", "/admin/audit/prune", AdminRole::Admin),

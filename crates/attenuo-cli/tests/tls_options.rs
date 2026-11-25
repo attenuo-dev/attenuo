@@ -76,6 +76,7 @@ fn write_client(dir: &Path, cert: &ClientCert, name: &str) -> (PathBuf, PathBuf)
 /// certificate; `reviewer` has a secret.
 struct TlsServer {
     dir: tempfile::TempDir,
+    server_ca: Ca,
     url: String,
     ca_path: PathBuf,
     coder: (PathBuf, PathBuf),
@@ -129,6 +130,7 @@ impl TlsServer {
         });
         Self {
             dir,
+            server_ca: ca,
             url,
             ca_path,
             coder,
@@ -852,4 +854,56 @@ async fn offline_commands_ignore_the_targets_and_env_errors_name_the_variable() 
         err.starts_with("error: cannot read --tls-client-key "),
         "{err}"
     );
+}
+
+/// `attenuo admin tls reload`: a renewed certificate written over the files is put in force
+/// and its SHA-256 printed; `--json` prints the answer; a key of another certificate is
+/// refused, exit 1 with the code, and the certificate in force keeps serving.
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_tls_reload_puts_a_new_certificate_in_force() {
+    use sha2::Digest as _;
+    let s = TlsServer::start().await;
+    let reload = |json: bool| {
+        let mut args = vec!["--tls-ca-cert", s.ca()];
+        if json {
+            args.push("--json");
+        }
+        args.extend(["admin", "tls", "reload"]);
+        let mut c = s.cli(&args);
+        c.env("ATTENUO_ADMIN_TOKEN", ADMIN);
+        c
+    };
+    let leaf_sha256 = |dir: &Path| {
+        let pem = std::fs::read(dir.join("server.crt")).unwrap();
+        let first = rustls::pki_types::pem::PemObject::pem_slice_iter(&pem)
+            .next()
+            .unwrap();
+        let der: rustls::pki_types::CertificateDer<'static> = first.unwrap();
+        hex::encode(sha2::Sha256::digest(der.as_ref()))
+    };
+    let before = leaf_sha256(s.dir.path());
+    s.server_ca.write_server_files(s.dir.path(), &["127.0.0.1"]);
+    let after = leaf_sha256(s.dir.path());
+    let stdout = ok(&run(reload(false)).await);
+    assert!(
+        stdout.starts_with(&format!("certificate (sha256): {before} -> {after}\n")),
+        "{stdout}"
+    );
+    assert!(stdout.contains("valid from "), "{stdout}");
+    assert!(!stdout.contains("PRIVATE"), "{stdout}");
+    // The same files again: unchanged.
+    let v: Value = serde_json::from_str(&ok(&run(reload(true)).await)).unwrap();
+    assert_eq!(v["changed"], false, "{v}");
+    assert_eq!(v["certificate_sha256"], after.as_str(), "{v}");
+
+    // A key of another certificate: refused, and the server still answers with `after`.
+    let other = s.dir.path().join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    let (_, other_key) = s.server_ca.write_server_files(&other, &["127.0.0.1"]);
+    std::fs::copy(&other_key, s.dir.path().join("server.key")).unwrap();
+    let err = failed(&run(reload(false)).await);
+    assert!(err.contains("tls_key_mismatch"), "{err}");
+    assert!(!err.contains(s.dir.path().to_str().unwrap()), "{err}");
+    ok(&run(s.cli(&["--tls-ca-cert", s.ca(), "health"])).await);
+    s.stop().await;
 }

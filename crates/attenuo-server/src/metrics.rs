@@ -125,6 +125,49 @@ pub enum TimeoutKind {
     Handler = 1,
 }
 
+/// Why a TLS handshake of the main listener failed (the `reason` label of
+/// `tls_handshake_failures_total`). A fixed set: the reason is read from the kind of the
+/// error, never from anything the peer sent (see `tls::handshake_failure`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandshakeFailure {
+    /// The client sent a certificate that cannot be parsed, or whose handshake signature
+    /// does not verify.
+    BadClientCertificate = 0,
+    /// The peer does not speak TLS 1.3 with `http/1.1` as this listener does: another TLS
+    /// version, no common cipher suite, group or ALPN protocol, a message out of order, or
+    /// bytes that are not TLS (a plain-HTTP request).
+    Protocol = 1,
+    /// The peer ended the handshake with a TLS alert, for example because it does not trust
+    /// the server's certificate.
+    PeerAlert = 2,
+    /// The handshake was not done within `[limits] header_read_timeout_seconds`.
+    Timeout = 3,
+    /// Anything else: the connection closed or broke during the handshake.
+    Other = 4,
+}
+
+impl HandshakeFailure {
+    /// Every reason, in index order.
+    pub const ALL: [HandshakeFailure; 5] = [
+        HandshakeFailure::BadClientCertificate,
+        HandshakeFailure::Protocol,
+        HandshakeFailure::PeerAlert,
+        HandshakeFailure::Timeout,
+        HandshakeFailure::Other,
+    ];
+
+    /// The label value.
+    pub fn label(self) -> &'static str {
+        match self {
+            HandshakeFailure::BadClientCertificate => "bad_client_certificate",
+            HandshakeFailure::Protocol => "protocol",
+            HandshakeFailure::PeerAlert => "peer_alert",
+            HandshakeFailure::Timeout => "timeout",
+            HandshakeFailure::Other => "other",
+        }
+    }
+}
+
 /// Who returned a run-limit charge (the `source` label of `budget_refunds_total`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefundSource {
@@ -264,6 +307,12 @@ pub struct Metrics {
     requests_shed: AtomicU64,
     rate_limited: [[AtomicU64; 2]; 4],
     request_timeouts: [AtomicU64; 2],
+    /// `[server.tls]`: failed handshakes of the main listener, by [`HandshakeFailure`]; the
+    /// first certificate's `notAfter` (Unix seconds, 0 without `[server.tls]`); and
+    /// `POST /admin/tls/reload` calls that reached the files, by result (ok, failed).
+    tls_handshake_failures: [AtomicU64; HandshakeFailure::ALL.len()],
+    tls_certificate_not_after_unix: AtomicU64,
+    tls_reloads: [AtomicU64; 2],
 }
 
 /// The reasons of `proxy_list_entries_hidden_total`, the list screen's hide reasons.
@@ -325,6 +374,9 @@ impl Default for Metrics {
             requests_shed: AtomicU64::default(),
             rate_limited: Default::default(),
             request_timeouts: Default::default(),
+            tls_handshake_failures: Default::default(),
+            tls_certificate_not_after_unix: AtomicU64::default(),
+            tls_reloads: Default::default(),
         }
     }
 }
@@ -492,6 +544,22 @@ impl Metrics {
     /// Count one request past a `[limits]` deadline.
     pub fn request_timed_out(&self, kind: TimeoutKind) {
         self.request_timeouts[kind as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count one failed TLS handshake of the main listener.
+    pub fn tls_handshake_failed(&self, reason: HandshakeFailure) {
+        self.tls_handshake_failures[reason as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Set the `notAfter` (Unix seconds) of the server certificate in force.
+    pub fn tls_certificate_not_after(&self, unix: u64) {
+        self.tls_certificate_not_after_unix
+            .store(unix, Ordering::Relaxed);
+    }
+
+    /// Count one TLS certificate reload that read the files: `ok` when it put them in force.
+    pub fn tls_reload(&self, ok: bool) {
+        self.tls_reloads[usize::from(!ok)].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record how long one authorization decision took.
@@ -994,6 +1062,7 @@ impl Metrics {
                 c.load(Ordering::Relaxed)
             );
         }
+        self.render_tls(&mut out);
         self.authorize.render(
             &mut out,
             "authorize_duration_seconds",
@@ -1030,6 +1099,46 @@ impl Metrics {
         self.render_stream_ends(&mut out);
         self.render_list_screen(&mut out);
         out
+    }
+
+    fn render_tls(&self, out: &mut String) {
+        header_lines(
+            out,
+            "tls_handshake_failures_total",
+            "Failed TLS handshakes of the main listener ([server.tls]), by reason \
+             (bad_client_certificate, protocol, peer_alert, timeout, other). Always 0 without \
+             [server.tls].",
+            "counter",
+        );
+        for reason in HandshakeFailure::ALL {
+            let _ = writeln!(
+                out,
+                "{PREFIX}_tls_handshake_failures_total{{reason=\"{}\"}} {}",
+                reason.label(),
+                self.tls_handshake_failures[reason as usize].load(Ordering::Relaxed)
+            );
+        }
+        simple_gauge(
+            out,
+            "tls_certificate_not_after_timestamp_seconds",
+            "Unix time the main listener's certificate in force expires (notAfter of the first \
+             certificate of [server.tls] cert_pem_path); 0 without [server.tls].",
+            &self.tls_certificate_not_after_unix,
+        );
+        header_lines(
+            out,
+            "tls_certificate_reloads_total",
+            "POST /admin/tls/reload calls that read the files, by result: ok (the new \
+             certificate is in force) or failed (refused; the old one stays in force).",
+            "counter",
+        );
+        for (result, c) in ["ok", "failed"].iter().zip(&self.tls_reloads) {
+            let _ = writeln!(
+                out,
+                "{PREFIX}_tls_certificate_reloads_total{{result=\"{result}\"}} {}",
+                c.load(Ordering::Relaxed)
+            );
+        }
     }
 
     fn render_limits_approvals_labels(&self, out: &mut String) {
@@ -1749,6 +1858,45 @@ mod tests {
     }
 
     /// `audit_append_shed_total` reads zero until the store reports, then its counts.
+    /// The TLS series are written at zero from the start, with a fixed label set.
+    #[test]
+    fn renders_tls_series_with_fixed_labels() {
+        let m = Metrics::new();
+        let text = m.render();
+        check_text_format(&text).unwrap();
+        for reason in HandshakeFailure::ALL {
+            assert!(
+                text.contains(&format!(
+                    "attenuo_tls_handshake_failures_total{{reason=\"{}\"}} 0\n",
+                    reason.label()
+                )),
+                "{text}"
+            );
+        }
+        assert!(text.contains("attenuo_tls_certificate_not_after_timestamp_seconds 0\n"));
+        assert!(text.contains("attenuo_tls_certificate_reloads_total{result=\"ok\"} 0\n"));
+        assert!(text.contains("attenuo_tls_certificate_reloads_total{result=\"failed\"} 0\n"));
+        m.tls_handshake_failed(HandshakeFailure::Timeout);
+        m.tls_handshake_failed(HandshakeFailure::Timeout);
+        m.tls_handshake_failed(HandshakeFailure::PeerAlert);
+        m.tls_certificate_not_after(1_900_000_000);
+        m.tls_reload(true);
+        m.tls_reload(false);
+        m.tls_reload(false);
+        let text = m.render();
+        check_text_format(&text).unwrap();
+        for line in [
+            "attenuo_tls_handshake_failures_total{reason=\"timeout\"} 2",
+            "attenuo_tls_handshake_failures_total{reason=\"peer_alert\"} 1",
+            "attenuo_tls_handshake_failures_total{reason=\"protocol\"} 0",
+            "attenuo_tls_certificate_not_after_timestamp_seconds 1900000000",
+            "attenuo_tls_certificate_reloads_total{result=\"ok\"} 1",
+            "attenuo_tls_certificate_reloads_total{result=\"failed\"} 2",
+        ] {
+            assert!(text.contains(&format!("{line}\n")), "{line}: {text}");
+        }
+    }
+
     #[test]
     fn renders_audit_append_shedding() {
         let m = Metrics::new();

@@ -147,9 +147,10 @@ pub struct AppState {
     pub trace: Option<Arc<crate::telemetry::ServerTrace>>,
     /// `[limits]`: the in-flight cap, the deadlines and the rate limits ([`crate::limits`]).
     pub(crate) limits: Arc<crate::limits::Limits>,
-    /// `[server.tls]`: the TLS configuration of the main listener, read at startup
-    /// ([`crate::tls`]); `None` for plain HTTP. [`crate::run`] serves `[server] listen` with it.
-    pub(crate) main_tls: Option<Arc<rustls::ServerConfig>>,
+    /// `[server.tls]`: the TLS configuration of the main listener, read at startup and swapped
+    /// by `POST /admin/tls/reload` ([`crate::tls`]); `None` for plain HTTP. [`crate::run`]
+    /// serves `[server] listen` with it.
+    pub(crate) main_tls: Option<Arc<crate::tls::ServerTls>>,
     /// `[server.forwarded_client_cert]`, checked at startup ([`crate::forwarded`]); `None`
     /// when the section is absent. [`crate::run`] serves its listener, and every router
     /// refuses the `Client-Cert` headers anywhere else.
@@ -199,8 +200,9 @@ impl AppState {
             .server
             .tls
             .as_ref()
-            .map(crate::tls::server_config)
-            .transpose()?;
+            .map(crate::tls::ServerTls::load)
+            .transpose()?
+            .map(Arc::new);
         config.admin.check_listen(config.server.listen)?;
         let forwarded = crate::forwarded::Settings::from_config(config)?;
         config
@@ -270,6 +272,9 @@ impl AppState {
         let policy = Arc::new(crate::authz::SharedPolicy::new(engine));
 
         let metrics = Metrics::new();
+        if let Some(tls) = &main_tls {
+            metrics.tls_certificate_not_after(tls.current().not_after_unix());
+        }
         let metrics_for_limits = metrics.clone();
         let checkpoint_sink = match &config.audit.sink {
             Some(cfg) => {

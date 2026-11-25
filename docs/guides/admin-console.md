@@ -120,7 +120,7 @@ After a reload the panel shows what the server answered: the operators added, re
 
 ## Writes and `allow_write`
 
-By default the console listener is read-only: `POST /admin/leases/{id}/revoke`, `POST /admin/policies/reload`, `POST /admin/operators/reload`, `POST /admin/agents/reload`, `POST /admin/keys/reload`, `POST /admin/approvals/{id}` and `POST /admin/budgets/refund` are not mounted there (404), and `POST /admin/leases/revoke` answers only its `?preview=true` dry run. The console learns this at login (the console listener's `GET /admin/whoami` says `"console": {"allow_write": false, ...}`): the reloads are not offered (the Reload page and the Policy page say why), while **Revoke…**, **Grant** and **Decline** are still shown and pressing them explains that writes are disabled on this listener. Use the CLI against the main listener instead, or set:
+By default the console listener is read-only: `POST /admin/leases/{id}/revoke`, `POST /admin/policies/reload`, `POST /admin/operators/reload`, `POST /admin/agents/reload`, `POST /admin/keys/reload`, `POST /admin/tls/reload`, `POST /admin/approvals/{id}` and `POST /admin/budgets/refund` are not mounted there (404), and `POST /admin/leases/revoke` answers only its `?preview=true` dry run. The console learns this at login (the console listener's `GET /admin/whoami` says `"console": {"allow_write": false, ...}`): the reloads are not offered (the Reload page and the Policy page say why), while **Revoke…**, **Grant** and **Decline** are still shown and pressing them explains that writes are disabled on this listener. Use the CLI against the main listener instead, or set:
 
 ```toml
 [admin_ui]
