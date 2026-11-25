@@ -475,6 +475,33 @@ async fn every_refusal_keeps_the_old_certificate() {
                 });
             }),
         ),
+        (
+            "more than ten certificates",
+            "tls_file_invalid",
+            Box::new(|s: &Server| {
+                let leaf = good_cert
+                    .split_inclusive("-----END CERTIFICATE-----\n")
+                    .next();
+                let text = format!("{good_cert}{}", leaf.unwrap().repeat(9));
+                std::fs::write(s.cert_path(), text).unwrap()
+            }),
+        ),
+        (
+            "a CA certificate first",
+            "tls_file_invalid",
+            Box::new(|s: &Server| {
+                s.renew(|p| p.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained));
+            }),
+        ),
+        (
+            "a second, encrypted key",
+            "tls_file_invalid",
+            Box::new(|s: &Server| {
+                let encrypted = "-----BEGIN ENCRYPTED PRIVATE KEY-----\nAAAA\n\
+                                 -----END ENCRYPTED PRIVATE KEY-----\n";
+                std::fs::write(s.key_path(), format!("{good_key}{encrypted}")).unwrap()
+            }),
+        ),
     ];
     #[cfg(unix)]
     let cases = {
@@ -790,5 +817,194 @@ async fn handshake_failures_are_counted_by_reason() {
         .collect();
     assert_eq!(series.len(), 5, "{series:?}");
     assert!(!text.contains("127.0.0.1"), "an address in the metrics");
+    s.stop().await;
+}
+
+/// When the audit record of a reload cannot be appended, nothing is swapped: the old
+/// certificate keeps serving, the answer is a 500 and the reload counts as `failed`. Once the
+/// log takes appends again, the same files reload.
+#[tokio::test]
+async fn a_reload_that_cannot_be_audited_changes_nothing() {
+    let s = Server::start(ClientCertificates::Off, 10).await;
+    let old = s.served_leaf().await;
+    let not_after = s.metric(NOT_AFTER);
+    let new = s.renew(|p| {
+        p.not_before = now() - DAY;
+        p.not_after = now() + time::Duration::days(30);
+    });
+    // Every insert into the log fails, as on a full disk.
+    s.state
+        .audit
+        .with_connection(|c| {
+            c.execute_batch(
+                "CREATE TRIGGER full_disk BEFORE INSERT ON audit \
+                 BEGIN SELECT RAISE(FAIL, 'database or disk is full'); END;",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let (status, v) = s.reload().await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{v}");
+    assert_eq!(s.served_leaf().await, old);
+    assert_eq!(s.metric(NOT_AFTER), not_after);
+    assert_eq!(s.metric(&reloads("failed")), 1);
+    assert_eq!(s.metric(&reloads("ok")), 0);
+
+    s.state
+        .audit
+        .with_connection(|c| {
+            c.execute_batch("DROP TRIGGER full_disk")?;
+            Ok(())
+        })
+        .unwrap();
+    let (status, v) = s.reload().await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(s.served_leaf().await, new);
+    let records = s.reload_records().await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0]["decision"], "allow");
+    s.stop().await;
+}
+
+/// A reload whose client goes away before the answer still ends as one unit: the audit
+/// record and the swap both happen, after the client left. The audit log is held busy so
+/// that the reload is stopped between its checks and its record while the client gives up.
+#[tokio::test]
+async fn a_reload_finishes_when_the_client_goes_away() {
+    let s = Server::start(ClientCertificates::Off, 10).await;
+    let old = s.served_leaf().await;
+    let new = s.renew(|p| {
+        p.not_before = now() - DAY;
+        p.not_after = now() + time::Duration::days(30);
+    });
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let state = s.state.clone();
+    let holder = std::thread::spawn(move || {
+        state
+            .audit
+            .with_connection(|_| {
+                held_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(())
+            })
+            .unwrap();
+    });
+    held_rx.recv().unwrap();
+    let gone =
+        s.ca.reqwest_client(None)
+            .post(s.running.https_url("/admin/tls/reload"))
+            .bearer_auth(ADMIN)
+            .timeout(Duration::from_millis(500))
+            .send()
+            .await;
+    assert!(gone.is_err(), "{gone:?}");
+    // The client is gone; the reload waits on the log, so nothing is in force yet.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(s.served_leaf().await, old);
+    assert_eq!(s.metric(&reloads("ok")), 0);
+
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+    let end = std::time::Instant::now() + Duration::from_secs(20);
+    while s.served_leaf().await != new {
+        assert!(std::time::Instant::now() < end, "the reload never finished");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(s.metric(&reloads("ok")), 1);
+    let records = s.reload_records().await;
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0]["decision"], "allow");
+    s.stop().await;
+}
+
+/// A client session store that counts the tickets it is given.
+#[derive(Debug)]
+struct CountingStore {
+    inner: rustls::client::ClientSessionMemoryCache,
+    tickets: std::sync::atomic::AtomicUsize,
+}
+
+impl rustls::client::ClientSessionStore for CountingStore {
+    fn set_kx_hint(&self, name: rustls::pki_types::ServerName<'static>, g: rustls::NamedGroup) {
+        self.inner.set_kx_hint(name, g);
+    }
+    fn kx_hint(&self, name: &rustls::pki_types::ServerName<'_>) -> Option<rustls::NamedGroup> {
+        self.inner.kx_hint(name)
+    }
+    fn set_tls12_session(
+        &self,
+        name: rustls::pki_types::ServerName<'static>,
+        value: rustls::client::Tls12ClientSessionValue,
+    ) {
+        self.inner.set_tls12_session(name, value);
+    }
+    fn tls12_session(
+        &self,
+        name: &rustls::pki_types::ServerName<'_>,
+    ) -> Option<rustls::client::Tls12ClientSessionValue> {
+        self.inner.tls12_session(name)
+    }
+    fn remove_tls12_session(&self, name: &rustls::pki_types::ServerName<'static>) {
+        self.inner.remove_tls12_session(name);
+    }
+    fn insert_tls13_ticket(
+        &self,
+        name: rustls::pki_types::ServerName<'static>,
+        value: rustls::client::Tls13ClientSessionValue,
+    ) {
+        self.tickets.fetch_add(1, Ordering::SeqCst);
+        self.inner.insert_tls13_ticket(name, value);
+    }
+    fn take_tls13_ticket(
+        &self,
+        name: &rustls::pki_types::ServerName<'static>,
+    ) -> Option<rustls::client::Tls13ClientSessionValue> {
+        self.inner.take_tls13_ticket(name)
+    }
+}
+
+/// After a reload, as before it, the server sends no session ticket, and a client that keeps
+/// sessions makes a full handshake on every connection.
+#[tokio::test]
+async fn a_reloaded_configuration_resumes_no_session() {
+    let s = Server::start(ClientCertificates::Optional, 10).await;
+    let new = s.renew(|p| {
+        p.not_before = now() - DAY;
+        p.not_after = now() + time::Duration::days(30);
+    });
+    let (status, v) = s.reload().await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+
+    let store = Arc::new(CountingStore {
+        inner: rustls::client::ClientSessionMemoryCache::new(16),
+        tickets: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let mut config =
+        s.ca.rustls_client(&[&rustls::version::TLS13], &[b"http/1.1"]);
+    config.resumption = rustls::client::Resumption::store(store.clone());
+    let config = Arc::new(config);
+    for _ in 0..3 {
+        let connector = tokio_rustls::TlsConnector::from(config.clone());
+        let tcp = tokio::net::TcpStream::connect(s.running.addr())
+            .await
+            .unwrap();
+        let name = rustls::pki_types::ServerName::try_from("127.0.0.1").unwrap();
+        let mut stream = connector.connect(name, tcp).await.unwrap();
+        // A request and its answer, so that any ticket sent after the handshake is read.
+        assert!(get_on(&mut stream, "/healthz")
+            .await
+            .starts_with("HTTP/1.1 200"));
+        assert_eq!(leaf_of(&stream), new);
+        assert_eq!(
+            stream.get_ref().1.handshake_kind(),
+            Some(rustls::HandshakeKind::Full)
+        );
+    }
+    assert_eq!(
+        store.tickets.load(Ordering::SeqCst),
+        0,
+        "a session ticket was sent"
+    );
     s.stop().await;
 }

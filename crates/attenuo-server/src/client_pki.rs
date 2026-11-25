@@ -619,9 +619,13 @@ fn path_error(e: &webpki::Error) -> &'static str {
 
 // --- a few DER reads that rustls-webpki does not expose -------------------------------------
 //
-// Only on bytes rustls-webpki has already parsed as a certificate. Every read is bounds
-// checked and returns `None` on anything unexpected; nothing here decides trust alone: it
-// only refuses more (a CA file entry that is not a CA, a second URI name).
+// Here, on bytes rustls-webpki has already parsed as a certificate. `crate::tls` also runs
+// `validity` and `is_ca` on the raw DER of a `[server.tls] cert_pem_path` file, before any
+// parser has seen it: the bytes are the operator's, not a peer's, but they may be anything.
+// Every read is bounds checked and returns `None` on anything unexpected (a test runs them on
+// every truncation and on corrupted dates); nothing here decides trust alone: it only refuses
+// more (a CA file entry that is not a CA, a second URI name, a server certificate whose dates
+// cannot be read or that is a CA).
 
 /// One DER element of `input`: (tag, contents, the rest). Low tag numbers and definite
 /// lengths of up to four bytes only.
@@ -1720,5 +1724,54 @@ mod tests {
             element(b"\x04\x82\x00\x01\xaa"),
             Some((4, &b"\xaa"[..], &b""[..]))
         );
+    }
+
+    /// `validity` and `is_ca` also read raw DER from a `[server.tls]` file (`crate::tls`):
+    /// on a certificate cut short at any byte, any byte changed, or dates that are not valid
+    /// times, they answer `None` / "not a CA" or a value, and never panic.
+    #[test]
+    fn date_and_ca_reads_hold_on_malformed_der() {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        params.not_before = at(NOW);
+        params.not_after = at(NOW + 86_400);
+        let der = params.self_signed(&key).unwrap().der().to_vec();
+        assert_eq!(validity(&der), Some((NOW, NOW + 86_400)));
+        assert!(!is_ca(&der));
+
+        for n in 0..der.len() {
+            assert_eq!(validity(&der[..n]), None, "cut at {n}");
+            assert!(!is_ca(&der[..n]), "cut at {n}");
+        }
+        for i in 0..der.len() {
+            for flip in [0x01u8, 0x80, 0xff] {
+                let mut bad = der.clone();
+                bad[i] ^= flip;
+                let _ = validity(&bad);
+                let _ = is_ca(&bad);
+            }
+        }
+
+        // The two UTCTime values of the validity: `0x17 0x0d` then 13 bytes.
+        let times: Vec<usize> = (0..der.len() - 15)
+            .filter(|&i| der[i] == 0x17 && der[i + 1] == 13)
+            .collect();
+        assert_eq!(times.len(), 2, "{times:?}");
+        let with = |at: usize, edit: &dyn Fn(&mut [u8])| {
+            let mut bad = der.clone();
+            edit(&mut bad[at..at + 15]);
+            validity(&bad)
+        };
+        for &t in &times {
+            // A letter for a digit, month 13, day 32, hour 24, no `Z`, the GeneralizedTime tag
+            // on a UTCTime's length, an unknown tag.
+            assert_eq!(with(t, &|b| b[2] = b'A'), None);
+            assert_eq!(with(t, &|b| b[4..6].copy_from_slice(b"13")), None);
+            assert_eq!(with(t, &|b| b[6..8].copy_from_slice(b"32")), None);
+            assert_eq!(with(t, &|b| b[8..10].copy_from_slice(b"24")), None);
+            assert_eq!(with(t, &|b| b[14] = b'X'), None);
+            assert_eq!(with(t, &|b| b[0] = 0x18), None);
+            assert_eq!(with(t, &|b| b[0] = 0x13), None);
+        }
     }
 }

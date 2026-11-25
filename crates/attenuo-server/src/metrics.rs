@@ -1857,7 +1857,6 @@ mod tests {
         assert!(!text.contains("attenuo_audit_checkpoint_last_timestamp_seconds 0\n"));
     }
 
-    /// `audit_append_shed_total` reads zero until the store reports, then its counts.
     /// The TLS series are written at zero from the start, with a fixed label set.
     #[test]
     fn renders_tls_series_with_fixed_labels() {
@@ -1897,6 +1896,7 @@ mod tests {
         }
     }
 
+    /// `audit_append_shed_total` reads zero until the store reports, then its counts.
     #[test]
     fn renders_audit_append_shedding() {
         let m = Metrics::new();

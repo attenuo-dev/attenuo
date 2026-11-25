@@ -146,7 +146,7 @@ A renewed certificate needs no restart:
 2. Run `attenuo admin tls reload` (`POST /admin/tls/reload`, role `admin`). It prints the SHA-256 of the certificate before and after, and the new dates.
 3. If it is refused, the old certificate is still in force. The error says what is wrong (`tls_key_mismatch`, `tls_certificate_expired`, ...). Fix the files and run it again.
 
-New connections get the new certificate. Open connections keep the old one until they close. A reload reads the same paths: to use other paths, change the config and restart. A reload makes the startup checks, and also refuses a certificate that has expired or is not valid yet. It changes no other TLS setting, and it does not touch client certificates or tokens bound to them. With several replicas, run it against each one. A renewal tool can run step 2 from its hook (certbot `--deploy-hook`, for example). See [TLS certificate reload](../reference/http-api.md#tls-certificate-reload).
+New connections get the new certificate. Open connections keep the old one until they close. A reload reads the same paths: to use other paths, change the config and restart. A reload makes the startup checks, and also refuses a certificate that has expired, is not valid yet or is a CA, and a chain of more than 10 certificates or 64 KiB. Startup logs a warning for those last two and starts. It changes no other TLS setting, and it does not touch client certificates or tokens bound to them. With several replicas, run it against each one. A renewal tool can run step 2 from its hook (certbot `--deploy-hook`, for example). See [TLS certificate reload](../reference/http-api.md#tls-certificate-reload).
 
 #### Client certificates
 

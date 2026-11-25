@@ -13,15 +13,16 @@ use super::{audit_admin, REASON_ADMIN_ACTION};
 use crate::error::ApiError;
 use crate::operators::AdminIdentity;
 use crate::state::AppState;
-use crate::tls::{LoadError, Problem};
+use crate::tls::{LoadError, Problem, ServerTls};
 
 /// The audit record's tool.
 const TOOL: &str = "admin.tls.reload";
 
 /// `POST /admin/tls/reload`: read `[server.tls] cert_pem_path` and `key_pem_path` again (the
 /// paths read at startup; a reload never re-reads the config file), check them as startup
-/// does and also check the first certificate's dates, then put the new certificate chain and
-/// key in force for every connection accepted from then on. Connections that are already open
+/// does and also check the chain's size, that the first certificate is not a CA, and its
+/// dates, append the audit record, then put the new certificate chain and key in force for
+/// every connection accepted from then on. Connections that are already open
 /// keep the certificate they were made with. TLS 1.3 only, ALPN `http/1.1`, no session
 /// resumption and `client_certificates` stay as they were: they come from the code and the
 /// startup settings, never from the files.
@@ -38,11 +39,14 @@ const TOOL: &str = "admin.tls.reload";
 /// `reload_unavailable` without `[server.tls]`; 422 `tls_file_unreadable` (a file cannot be
 /// read, is not a regular file, is too large, or the key file's owner or mode is refused), 422
 /// `tls_file_invalid` (empty, no certificate or key, not PEM, a key in the certificate file,
-/// more than one key, a key or certificate that cannot be used, undated), 422
+/// more than one key, a key or certificate that cannot be used, undated, a CA first
+/// certificate, more than 10 certificates or more than 64 KiB of DER), 422
 /// `tls_key_mismatch` (the key does not belong to the first certificate), 422
 /// `tls_certificate_expired` and 422 `tls_certificate_not_yet_valid`. The message names the
 /// setting and the problem, never the path or the content. The 422s are audited as a `deny`
-/// and counted as `failed` in `tls_certificate_reloads_total`; the 409 is neither.
+/// and counted as `failed` in `tls_certificate_reloads_total`; the 409 is neither. When the
+/// audit record of a reload that passed every check cannot be appended, nothing is swapped:
+/// 500, counted as `failed`.
 pub async fn reload_tls(
     State(state): State<Arc<AppState>>,
     Extension(who): Extension<AdminIdentity>,
@@ -55,42 +59,53 @@ pub async fn reload_tls(
              no certificate to reload",
         ));
     };
+    // The whole reload, from reading the files to the swap and its audit record, is one task
+    // on the blocking pool. Once started, it runs to its end even when this handler is dropped
+    // (the client went away, the request deadline): a certificate is never put in force
+    // without its audit record, and the lock is never released half way.
+    state.blocking(move |state| reload(state, &tls, &who)).await
+}
+
+/// The reload itself, on the blocking pool, under `tls.reloading`. The audit record is
+/// appended before the swap: when it cannot be appended, nothing is swapped (fail closed) and
+/// the answer is the audit error.
+fn reload(state: &AppState, tls: &ServerTls, who: &AdminIdentity) -> Result<Json<Value>, ApiError> {
     // One reload at a time, from reading the files to the swap.
-    let _reloading = tls.reloading.lock().await;
+    let _reloading = tls
+        .reloading
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Taken under the lock, so a reload that waited checks the dates at the time it reads.
     let now = state.now();
-    let section = tls.section().clone();
-    let paths = json!({
+    let section = tls.section();
+    let mut args = json!({
         "cert_pem_path": section.cert_pem_path,
         "key_pem_path": section.key_pem_path,
     });
-    let reader = Arc::clone(&tls);
-    let read = state.blocking(move |_| reader.read_new(now)).await;
-    let new = match read {
+    // Only a reload swaps, and reloads hold the lock: this stays the material in force until
+    // the swap below.
+    let previous_certificate_sha256 = tls.current().leaf_sha256_hex();
+    let new = match tls.read_new(now) {
         Ok(new) => new,
         Err(e) => {
             state.metrics.tls_reload(false);
             let refusal = refusal(&e);
             let code = refusal.stable_code().to_string();
             tracing::warn!(code, detail = %e.reload_message(), "TLS certificate reload refused");
-            let mut args = paths;
-            args["previous_certificate_sha256"] = json!(tls.current().leaf_sha256_hex());
-            let _ = state
-                .blocking(move |state| {
-                    audit_admin(
-                        state,
-                        &who,
-                        TOOL,
-                        Decision::Deny,
-                        &code,
-                        Vec::new(),
-                        args,
-                        now,
-                    )
-                })
-                .await
-                .inspect_err(
-                    |e| tracing::error!(error = ?e.detail, "failed TLS reload was not audited"),
-                );
+            args["previous_certificate_sha256"] = json!(previous_certificate_sha256);
+            let _ = audit_admin(
+                state,
+                who,
+                TOOL,
+                Decision::Deny,
+                &code,
+                Vec::new(),
+                args,
+                now,
+            )
+            .inspect_err(
+                |e| tracing::error!(error = ?e.detail, "failed TLS reload was not audited"),
+            );
             return Err(refusal);
         }
     };
@@ -99,49 +114,48 @@ pub async fn reload_tls(
         .validity
         .map(|(b, a)| (crate::tls::rfc3339(b), crate::tls::rfc3339(a)))
         .unwrap_or_default();
-    let chain_length = new.chain_len;
-    let not_after_unix = new.not_after_unix();
-    let old = tls.swap(new);
-    state.metrics.tls_certificate_not_after(not_after_unix);
-    state.metrics.tls_reload(true);
-    let previous_certificate_sha256 = old.leaf_sha256_hex();
     let changed = certificate_sha256 != previous_certificate_sha256;
-    tracing::info!(
-        changed,
-        certificate_sha256,
-        previous_certificate_sha256,
-        not_after,
-        chain_length,
-        "TLS certificate reloaded; new connections use it"
-    );
     let summary = json!({
         "changed": changed,
         "certificate_sha256": certificate_sha256,
         "previous_certificate_sha256": previous_certificate_sha256,
         "not_before": not_before,
         "not_after": not_after,
-        "chain_length": chain_length,
+        "chain_length": new.chain_len,
     });
-    let mut args = paths;
     for (k, v) in summary.as_object().into_iter().flatten() {
         args[k] = v.clone();
     }
-    let audit_id = state
-        .blocking(move |state| {
-            audit_admin(
-                state,
-                &who,
-                TOOL,
-                Decision::Allow,
-                REASON_ADMIN_ACTION,
-                Vec::new(),
-                args,
-                now,
-            )
-        })
-        .await
-        .inspect_err(|e| tracing::error!(error = ?e.detail, "TLS reload was not audited"))
-        .ok();
+    // Audit first: no record, no swap.
+    let audit_id = audit_admin(
+        state,
+        who,
+        TOOL,
+        Decision::Allow,
+        REASON_ADMIN_ACTION,
+        Vec::new(),
+        args,
+        now,
+    )
+    .inspect_err(|e| {
+        state.metrics.tls_reload(false);
+        tracing::error!(
+            error = ?e.detail,
+            "TLS certificate reload not audited; the certificate in force is unchanged"
+        );
+    })?;
+    let not_after_unix = new.not_after_unix();
+    tls.swap(new);
+    state.metrics.tls_certificate_not_after(not_after_unix);
+    state.metrics.tls_reload(true);
+    tracing::info!(
+        changed,
+        certificate_sha256,
+        previous_certificate_sha256,
+        not_after,
+        chain_length = summary["chain_length"].as_u64(),
+        "TLS certificate reloaded; new connections use it"
+    );
     let mut body = summary;
     body["audit_id"] = json!(audit_id);
     Ok(Json(body))

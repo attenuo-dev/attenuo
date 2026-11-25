@@ -217,7 +217,7 @@ The table is generated from `attenuo_core::error_codes::ERROR_CODES`, the one pl
 | `tenant_mismatch` | 400 `invalid_grant` |  |  | The ID-JAG's `tenant` is not the `[[idps]] tenant` of its issuer. |
 | `tls_certificate_expired` | 422 |  |  | A TLS certificate reload: the first certificate of `[server.tls] cert_pem_path` has expired (its `notAfter` is in the past). The certificate in force is unchanged. |
 | `tls_certificate_not_yet_valid` | 422 |  |  | A TLS certificate reload: the first certificate of `[server.tls] cert_pem_path` is not valid yet (its `notBefore` is in the future). The certificate in force is unchanged. |
-| `tls_file_invalid` | 422 |  |  | A TLS certificate reload: a `[server.tls]` file can be read but not used (empty, not PEM, no certificate, a private key in the certificate file, no key or more than one, a key or certificate rustls cannot use, or dates that cannot be read). The message names the setting, never the path or the content. The certificate in force is unchanged. |
+| `tls_file_invalid` | 422 |  |  | A TLS certificate reload: a `[server.tls]` file can be read but not used (empty, not PEM, no certificate, a private key in the certificate file, no key or more than one private key of any kind, a key or certificate rustls cannot use, dates that cannot be read, a first certificate that is a CA, or a chain of more than 10 certificates or 64 KiB of DER). The message names the setting, never the path or the content. The certificate in force is unchanged. |
 | `tls_file_unreadable` | 422 |  |  | A TLS certificate reload: a `[server.tls]` file cannot be read (missing, no permission, not a regular file, too large), or the key file's owner or mode is refused as at startup. The message names the setting, never the path. The certificate in force is unchanged. |
 | `tls_key_mismatch` | 422 |  |  | A TLS certificate reload: the private key of `[server.tls] key_pem_path` does not belong to the first certificate of `cert_pem_path`. The certificate in force is unchanged. |
 | `token_expired` | 401 `unauthorized`, 400 `invalid_grant` | `-32001` (401), `-32001` (200) |  | The token verified but has expired (a bearer, or at `POST /token` the subject token or a hop of its chain). |
@@ -711,7 +711,13 @@ Refusals (on every one, the keys in force are unchanged):
 
 `POST /admin/tls/reload` (role `admin`, no body) puts a renewed server certificate in force without a restart. It reads `[server.tls] cert_pem_path` and `key_pem_path` again. The paths are the ones read at startup: the config file is not read again, so a reload cannot change a path or any other setting. Reloads run one at a time.
 
-It makes every check startup makes ([config](config.md#servertls)), and one more: the first certificate must be valid now (not expired, not before its `notBefore`). Startup does not check the dates. Only the first certificate's dates are checked, not the intermediates'.
+It makes every check startup makes ([config](config.md#servertls)), and these more:
+
+- The first certificate must be valid now (not expired, not before its `notBefore`). Only the first certificate's dates are checked, not the intermediates'.
+- The first certificate must not be a CA (`basicConstraints` with `cA` true).
+- The chain must hold at most 10 certificates and at most 64 KiB of DER in all. Every handshake sends the whole chain.
+
+Startup checks none of these. It logs a warning for a CA first certificate or a chain over the limits, and starts.
 
 It answers SHA-256 digests and dates, never a key, a file's content or a path:
 
@@ -729,7 +735,7 @@ It answers SHA-256 digests and dates, never a key, a file's content or a path:
 
 - `certificate_sha256` and `previous_certificate_sha256` are the SHA-256 (lowercase hex) of the first certificate's DER, after and before. `changed` is false when they are the same. The new files are put in force either way.
 - `chain_length` counts the certificates of `cert_pem_path`, the first one included.
-- The `admin.tls.reload` audit record has `{cert_pem_path, key_pem_path}` and the members of the answer (without `audit_id`) as its arguments, kept as their digest. A 422 refusal is recorded as a `deny` whose `reason` is the refusal's code, with the two paths and `previous_certificate_sha256`. The 409 is not audited.
+- The `admin.tls.reload` audit record keeps the digest of its arguments: `{cert_pem_path, key_pem_path}` and the members of the answer (without `audit_id`). The record is appended before the new certificate is put in force. When it cannot be appended, nothing changes and the answer is a 500. Once the server has started the reload, it runs to the end even if the client goes away. A 422 refusal is recorded as a `deny` whose `reason` is the refusal's code, with the two paths and `previous_certificate_sha256`. The 409 is not audited.
 
 What follows the reload:
 
@@ -742,13 +748,13 @@ What follows the reload:
 Refusals (on every one, the certificate in force keeps serving). `detail` names the setting and the problem, never the path or the file's content:
 
 - 422 `tls_file_unreadable`: a file cannot be read (missing, no permission), is not a regular file, is too large (1 MiB for the certificate file, 64 KiB for the key file), or the key file's owner or mode breaks the startup rule.
-- 422 `tls_file_invalid`: a file can be read but not used: empty, not PEM, no certificate (an empty chain), a private key in the certificate file, no key or more than one, an encrypted key, a key rustls cannot use, a first certificate that cannot be parsed, or dates that cannot be read.
+- 422 `tls_file_invalid`: a file can be read but not used: empty, not PEM, no certificate (an empty chain), a private key in the certificate file, no key or more than one private key (any `PRIVATE KEY` section counts, an encrypted one too), an encrypted key, a key rustls cannot use, a first certificate that cannot be parsed, dates that cannot be read, a CA first certificate, or a chain of more than 10 certificates or 64 KiB of DER.
 - 422 `tls_key_mismatch`: the key does not belong to the first certificate. A reload that runs while the files are being written can see a new certificate with the old key. Write each file to a temporary name and rename it into place, then reload.
 - 422 `tls_certificate_expired`: the first certificate's `notAfter` is in the past.
 - 422 `tls_certificate_not_yet_valid`: the first certificate's `notBefore` is in the future.
 - 409 `reload_unavailable`: there is no `[server.tls]`.
 
-Each 422 is counted in `tls_certificate_reloads_total{result="failed"}` and logged at warn.
+Each 422 is counted in `tls_certificate_reloads_total{result="failed"}` and logged at warn. So is a 500 when the audit record cannot be appended.
 
 ### Budget refund
 

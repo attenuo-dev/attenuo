@@ -4,11 +4,15 @@
 //! [`ServerTls::read_new`] reads them again for `POST /admin/tls/reload`. Both refuse anything
 //! they cannot use as it is (fail closed): a file that cannot be read, is not a regular file,
 //! is empty or too large; a certificate file with no certificate, or with a private key in it;
-//! a key file with no private key or more than one; a key file whose owner and mode break
+//! a key file with no private key or more than one private-key section (of any kind, an
+//! encrypted or unknown one included); a key file whose owner and mode break
 //! PostgreSQL's `ssl_key_file` rule ([`key_mode_ok`], Unix: owned by the server's effective
 //! user or root, no access for others); a key that does not belong to the first certificate.
-//! A reload also refuses a first certificate whose dates cannot be read, that has expired or
-//! that is not valid yet; startup does not check the dates.
+//! A reload also refuses a first certificate whose dates cannot be read, that has expired, that
+//! is not valid yet or that is a CA, and a chain of more than [`MAX_RELOAD_CHAIN_CERTS`]
+//! certificates or [`MAX_RELOAD_CHAIN_DER_BYTES`] bytes of DER. Startup does not check the
+//! dates, and only logs a warning for a CA first certificate or a chain over those limits, so
+//! a server that starts today keeps starting.
 //!
 //! The configuration it builds:
 //!
@@ -57,6 +61,15 @@ pub(crate) const MAX_CERT_FILE_BYTES: u64 = crate::idp::jwks::MAX_CA_FILE_BYTES;
 /// ([`crate::issuer_keys::MAX_KEY_FILE_BYTES`]). An RSA 4096 key in PEM is about 3 KiB.
 pub(crate) const MAX_KEY_FILE_BYTES: u64 = crate::issuer_keys::MAX_KEY_FILE_BYTES;
 
+/// The most certificates a reload accepts in `cert_pem_path`, the first one included. The
+/// chain is sent in every handshake; a server certificate and its intermediates are two to
+/// four. Startup only warns above it.
+pub(crate) const MAX_RELOAD_CHAIN_CERTS: usize = 10;
+
+/// The most DER bytes, all certificates together, a reload accepts in `cert_pem_path`.
+/// Startup only warns above it.
+pub(crate) const MAX_RELOAD_CHAIN_DER_BYTES: usize = 64 * 1024;
+
 /// The ALPN protocols the listener offers: HTTP/1.1 only.
 pub(crate) const ALPN: &[&[u8]] = &[b"http/1.1"];
 
@@ -69,7 +82,8 @@ pub(crate) enum Problem {
     Unreadable,
     /// A file can be read but cannot be used: empty, not PEM, no certificate, a private key in
     /// the certificate file, no key or more than one, a key rustls cannot use, a first
-    /// certificate that cannot be parsed or whose dates cannot be read.
+    /// certificate that cannot be parsed or whose dates cannot be read; on a reload also a
+    /// first certificate that is a CA, or a chain over the limits.
     Invalid,
     /// The private key does not belong to the first certificate.
     KeyMismatch,
@@ -146,6 +160,10 @@ pub(crate) struct Material {
     pub(crate) validity: Option<(i64, i64)>,
     /// How many certificates the chain file holds, the first one included.
     pub(crate) chain_len: usize,
+    /// The DER bytes of all those certificates together.
+    pub(crate) chain_der_bytes: usize,
+    /// Whether the first certificate's `basicConstraints` says it is a CA.
+    pub(crate) leaf_is_ca: bool,
 }
 
 impl Material {
@@ -170,9 +188,11 @@ pub(crate) struct ServerTls {
     section: ServerTlsSection,
     /// The material in force.
     current: RwLock<Arc<Material>>,
-    /// Held by `POST /admin/tls/reload` from reading the files to the swap, so two reloads
-    /// cannot cross (the one that read the older files swapping last).
-    pub(crate) reloading: tokio::sync::Mutex<()>,
+    /// Held by `POST /admin/tls/reload` from reading the files to the swap and its audit
+    /// record, so two reloads cannot cross (the one that read the older files swapping last).
+    /// A blocking lock, taken on the blocking pool: the whole reload runs there, so a handler
+    /// that is dropped cannot release it early.
+    pub(crate) reloading: std::sync::Mutex<()>,
 }
 
 impl ServerTls {
@@ -185,10 +205,30 @@ impl ServerTls {
     /// cannot be used or rustls refuses the certificate or the key.
     pub(crate) fn load(tls: &ServerTlsSection) -> anyhow::Result<Self> {
         let material = load(tls).map_err(|e| anyhow::anyhow!(e.startup_message(tls)))?;
+        // Refused on a reload, accepted at startup so that a server that starts today keeps
+        // starting: one warning each.
+        if material.chain_len > MAX_RELOAD_CHAIN_CERTS
+            || material.chain_der_bytes > MAX_RELOAD_CHAIN_DER_BYTES
+        {
+            tracing::warn!(
+                certificates = material.chain_len,
+                der_bytes = material.chain_der_bytes,
+                max_certificates = MAX_RELOAD_CHAIN_CERTS,
+                max_der_bytes = MAX_RELOAD_CHAIN_DER_BYTES,
+                "[server.tls] cert_pem_path: the chain is longer than a reload accepts; every \
+                 handshake sends all of it"
+            );
+        }
+        if material.leaf_is_ca {
+            tracing::warn!(
+                "[server.tls] cert_pem_path: the first certificate is a CA certificate \
+                 (basicConstraints cA); a reload refuses one"
+            );
+        }
         Ok(Self {
             section: tls.clone(),
             current: RwLock::new(Arc::new(material)),
-            reloading: tokio::sync::Mutex::new(()),
+            reloading: std::sync::Mutex::new(()),
         })
     }
 
@@ -203,14 +243,47 @@ impl ServerTls {
     }
 
     /// Read the files again, from the paths read at startup, with the startup checks and also
-    /// the first certificate's dates at `now`. Reads files: call it off the async workers.
+    /// the chain's size, whether the first certificate is a CA, and its dates at `now`. Reads
+    /// files: call it off the async workers.
     ///
     /// # Errors
     ///
-    /// The first problem found, as at startup, or an expired, not yet valid or undated first
+    /// The first problem found, as at startup; a chain over [`MAX_RELOAD_CHAIN_CERTS`] or
+    /// [`MAX_RELOAD_CHAIN_DER_BYTES`]; a CA, expired, not yet valid or undated first
     /// certificate.
     pub(crate) fn read_new(&self, now: OffsetDateTime) -> Result<Material, LoadError> {
         let material = load(&self.section)?;
+        if material.chain_len > MAX_RELOAD_CHAIN_CERTS {
+            return Err(LoadError::new(
+                Problem::Invalid,
+                Setting::Cert,
+                format!(
+                    "the file holds {} certificates; a reload accepts at most \
+                     {MAX_RELOAD_CHAIN_CERTS} (the server's certificate and its intermediates)",
+                    material.chain_len
+                ),
+            ));
+        }
+        if material.chain_der_bytes > MAX_RELOAD_CHAIN_DER_BYTES {
+            return Err(LoadError::new(
+                Problem::Invalid,
+                Setting::Cert,
+                format!(
+                    "the certificates are {} bytes of DER together; a reload accepts at most {} \
+                     KiB",
+                    material.chain_der_bytes,
+                    MAX_RELOAD_CHAIN_DER_BYTES / 1024
+                ),
+            ));
+        }
+        if material.leaf_is_ca {
+            return Err(LoadError::new(
+                Problem::Invalid,
+                Setting::Cert,
+                "the first certificate is a CA certificate (basicConstraints cA); the server's \
+                 own certificate must come first",
+            ));
+        }
         let Some((not_before, not_after)) = material.validity else {
             return Err(LoadError::new(
                 Problem::Invalid,
@@ -277,13 +350,17 @@ fn load(tls: &ServerTlsSection) -> Result<Material, LoadError> {
     let key = read_key(&tls.key_pem_path)?;
     let leaf_sha256: [u8; 32] = sha2::Sha256::digest(certs[0].as_ref()).into();
     let validity = crate::client_pki::validity(certs[0].as_ref());
+    let leaf_is_ca = crate::client_pki::is_ca(certs[0].as_ref());
     let chain_len = certs.len();
+    let chain_der_bytes = certs.iter().map(|c| c.as_ref().len()).sum();
     let config = build(certs, key, tls.client_certificates)?;
     Ok(Material {
         config,
         leaf_sha256,
         validity,
         chain_len,
+        chain_der_bytes,
+        leaf_is_ca,
     })
 }
 
@@ -398,6 +475,31 @@ pub(crate) fn mentions_private_key(pem: &[u8]) -> bool {
     pem.windows(NEEDLE.len()).any(|w| w == NEEDLE)
 }
 
+/// How many PEM sections of `pem` begin as a private key of any kind: each `BEGIN` whose
+/// label, up to the next `-----` or line end and within 64 bytes, holds `PRIVATE KEY` (`PRIVATE KEY`, `EC PRIVATE
+/// KEY`, `ENCRYPTED PRIVATE KEY`, `OPENSSH PRIVATE KEY`, ...). Nothing is decoded.
+pub(crate) fn private_key_sections(pem: &[u8]) -> usize {
+    const BEGIN: &[u8] = b"BEGIN";
+    const NEEDLE: &[u8] = b"PRIVATE KEY";
+    (0..pem.len().saturating_sub(BEGIN.len() - 1))
+        .filter(|&i| pem[i..].starts_with(BEGIN))
+        .filter(|&i| {
+            // A label is short; looking at most 64 bytes ahead keeps this linear.
+            let label = &pem[i + BEGIN.len()..];
+            let label = &label[..label.len().min(64)];
+            let end = label
+                .windows(5)
+                .position(|w| w == b"-----")
+                .unwrap_or(label.len());
+            let end = label[..end]
+                .iter()
+                .position(|&b| b == b'\n' || b == b'\r')
+                .unwrap_or(end);
+            label[..end].windows(NEEDLE.len()).any(|w| w == NEEDLE)
+        })
+        .count()
+}
+
 /// The one private key of the `key_pem_path` file.
 fn read_key(path: &Path) -> Result<PrivateKeyDer<'static>, LoadError> {
     let invalid = |why: &str| LoadError::new(Problem::Invalid, Setting::Key, why);
@@ -405,6 +507,13 @@ fn read_key(path: &Path) -> Result<PrivateKeyDer<'static>, LoadError> {
         .map_err(|why| LoadError::new(Problem::Unreadable, Setting::Key, why))?;
     if pem.iter().all(u8::is_ascii_whitespace) {
         return Err(invalid("the file is empty; it must hold a PEM private key"));
+    }
+    // Every private-key section counts, one the parser skips (encrypted, unknown kind)
+    // included: a second key next to the one used is refused, whatever its kind.
+    if private_key_sections(&pem) > 1 {
+        return Err(invalid(
+            "the file holds more than one private key; keep only the key of the certificate",
+        ));
     }
     // The parser's own error is not shown: it can quote part of the file.
     let mut keys = PrivateKeyDer::pem_slice_iter(&pem);
@@ -790,6 +899,28 @@ mod tests {
         );
         let err = refusal(&cert, &encrypted);
         assert!(err.contains("no private key"), "{err}");
+        // A usable key next to a section the parser skips (encrypted, OpenSSH, an unknown
+        // kind), before or after it, on lines of their own or run together: more than one key.
+        for other in [
+            "-----BEGIN ENCRYPTED PRIVATE KEY-----\nAAAA\n-----END ENCRYPTED PRIVATE KEY-----\n",
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY-----\n",
+            "-----BEGIN FOO PRIVATE KEY-----\nAAAA\n-----END FOO PRIVATE KEY-----\n",
+        ] {
+            for text in [
+                format!("{key_pem}{other}"),
+                format!("{other}{key_pem}"),
+                format!("{}{}", key_pem.trim_end(), other),
+            ] {
+                let two = write(dir.path(), "two.key", &text, 0o600);
+                let err = refusal(&cert, &two);
+                assert!(err.contains("more than one private key"), "{other}: {err}");
+                assert!(!err.contains("AAAA"), "{err}");
+            }
+        }
+        assert_eq!(private_key_sections(key_pem.as_bytes()), 1);
+        assert_eq!(private_key_sections(cert_pem.as_bytes()), 0);
+        assert_eq!(private_key_sections(b"BEGIN"), 0);
+        assert_eq!(private_key_sections(b""), 0);
         // Broken base64 inside a key block: the parser's message (which may quote the file)
         // is not passed on.
         let secret_marker = "SECRETSECRET*";
@@ -1182,6 +1313,72 @@ mod tests {
                 Problem::NotYetValid
             );
         }
+    }
+
+    /// A reload refuses a chain of more than ten certificates or 64 KiB of DER, and a first
+    /// certificate that is a CA; startup accepts them (and logs a warning).
+    #[test]
+    fn a_reload_refuses_a_long_chain_or_a_ca_certificate_that_startup_takes() {
+        let dir = tempfile::tempdir().unwrap();
+        let t = now().unix_timestamp();
+        let (cert_pem, key_pem) = dated_cert_and_key(t - DAY, t + DAY);
+        let key = write(dir.path(), "server.key", &key_pem, 0o600);
+        let refused = |cert_text: &str, key_text: &str, word: &str| {
+            let cert = write(dir.path(), "server.crt", cert_text, 0o644);
+            write(dir.path(), "server.key", key_text, 0o600);
+            let tls = ServerTls::load(&section(&cert, &key)).unwrap();
+            let e = tls.read_new(now()).unwrap_err();
+            assert_eq!(
+                (e.problem, e.setting),
+                (Problem::Invalid, Setting::Cert),
+                "{e:?}"
+            );
+            assert!(e.why.contains(word), "{}", e.why);
+            tls.current()
+        };
+
+        // Ten certificates are taken; eleven are refused.
+        let ten = cert_pem.repeat(MAX_RELOAD_CHAIN_CERTS);
+        let cert = write(dir.path(), "server.crt", &ten, 0o644);
+        let tls = ServerTls::load(&section(&cert, &key)).unwrap();
+        assert_eq!(tls.read_new(now()).unwrap().chain_len, 10);
+        let eleven = cert_pem.repeat(MAX_RELOAD_CHAIN_CERTS + 1);
+        let m = refused(&eleven, &key_pem, "11 certificates");
+        assert_eq!(m.chain_len, 11);
+
+        // Five certificates, more than 64 KiB of DER together: four large ones after the
+        // server's. (One certificate of more than 64 KiB cannot be parsed at all.)
+        let names: Vec<String> = (0..800)
+            .map(|i| format!("host-{i:05}.example.org"))
+            .collect();
+        let big = rcgen::CertificateParams::new(names)
+            .unwrap()
+            .self_signed(&rcgen::KeyPair::generate().unwrap())
+            .unwrap();
+        assert!(4 * big.der().len() > MAX_RELOAD_CHAIN_DER_BYTES);
+        let long = format!("{cert_pem}{}", big.pem().repeat(4));
+        let m = refused(&long, &key_pem, "64 KiB");
+        assert_eq!(m.chain_len, 5);
+        assert!(m.chain_der_bytes > MAX_RELOAD_CHAIN_DER_BYTES);
+
+        // A CA certificate first.
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        params.not_before = OffsetDateTime::from_unix_timestamp(t - DAY).unwrap();
+        params.not_after = OffsetDateTime::from_unix_timestamp(t + DAY).unwrap();
+        let ca = params.self_signed(&ca_key).unwrap();
+        let m = refused(&ca.pem(), &ca_key.serialize_pem(), "CA certificate");
+        assert!(m.leaf_is_ca);
+        // An end-entity certificate is not a CA.
+        write(dir.path(), "server.crt", &cert_pem, 0o644);
+        write(dir.path(), "server.key", &key_pem, 0o600);
+        assert!(
+            !ServerTls::load(&section(&cert, &key))
+                .unwrap()
+                .current()
+                .leaf_is_ca
+        );
     }
 
     /// The reason of a failed handshake comes from the kind of the rustls error only.
