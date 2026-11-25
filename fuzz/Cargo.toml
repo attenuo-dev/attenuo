@@ -209,6 +209,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "client_crl_check"
+path = "fuzz_targets/client_crl_check.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "forwarded_client_cert"
 path = "fuzz_targets/forwarded_client_cert.rs"
 test = false
