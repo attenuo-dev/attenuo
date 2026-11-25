@@ -317,7 +317,7 @@ jobs:
       - run: bash examples/github-leak-demo/run-docker.sh
 
   # scripts/install.sh: its test against a fake release (every target, every refusal), then
-  # a real install of the published release 0.1.0 on this runner, and the binaries run.
+  # a real install of the published release 0.2.1 on this runner, and the binaries run.
   install-script:
     name: install script (${{ matrix.os }})
     needs: changes
@@ -334,7 +334,7 @@ jobs:
       - name: Install the published release and run it
         run: |
           set -euo pipefail
-          ATTENUO_VERSION=v0.1.0 ATTENUO_INSTALL_DIR="$RUNNER_TEMP/bin" sh scripts/install.sh
+          ATTENUO_VERSION=v0.2.1 ATTENUO_INSTALL_DIR="$RUNNER_TEMP/bin" sh scripts/install.sh
           "$RUNNER_TEMP/bin/attenuo" --version
           "$RUNNER_TEMP/bin/attenuo-server" --version
 
@@ -359,11 +359,9 @@ jobs:
           kubectl version --client
       - name: Create the cluster
         run: kind create cluster --wait 180s
-      # The newest published image. The chart's appVersion names the release being prepared,
-      # whose image exists only once its tag is pushed; move this to it after the release.
+      # No ATTENUO_IMAGE_TAG: the smoke test installs the chart's default image, at its
+      # appVersion. That image is published, so the chart and the image are checked together.
       - run: bash scripts/helm-smoke.sh
-        env:
-          ATTENUO_IMAGE_TAG: "0.1.0"
 
   # The admin console in headless Chromium: every page in both themes, with zero console
   # errors and CSP violations allowed (scripts/console-smoke.sh, tests/console/).

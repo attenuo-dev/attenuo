@@ -16,7 +16,7 @@
 
 services:
   attenuo:
-    image: ${ATTENUO_IMAGE:-ghcr.io/attenuo-dev/attenuo:0.1.0}
+    image: ${ATTENUO_IMAGE:-ghcr.io/attenuo-dev/attenuo:0.2.1}
     command: ["--config", "/etc/attenuo/config.toml"]
     environment:
       ATTENUO_ADMIN_TOKEN: ${ATTENUO_ADMIN_TOKEN:?set ATTENUO_ADMIN_TOKEN, e.g. $(openssl rand -hex 32)}
