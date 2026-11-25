@@ -755,7 +755,7 @@ What the chart decides, and why:
 
 `metrics.enabled=true` opens the metrics listener on port 9100 in the pod and adds a ClusterIP Service of its own (`attenuo-metrics`) for a scraper inside the cluster. It is never added to the main Service, which may be a LoadBalancer. Metrics have no authentication, so restrict the port with a NetworkPolicy.
 
-Tested by `scripts/helm-smoke.sh` (the CI job `helm chart`): template checks for the defaults, every optional part and every value the chart refuses, then an install into a kind cluster with the published 0.1.0 image, where a token is minted and exchanged, one call is allowed and one denied through the proxy, the pod is deleted and the new pod still verifies the old token and the audit chain, and a changed config rolls the pod. The cluster test runs the published image, not a server built from the same commit. Not tested: a cloud provider's cluster, an ingress controller, and upgrades between chart versions.
+Tested by `scripts/helm-smoke.sh` (the CI job `helm chart`): template checks for the defaults, every optional part and every value the chart refuses, then an install into a kind cluster with the published image (the chart's `appVersion`), where a token is minted and exchanged, one call is allowed and one denied through the proxy, the pod is deleted and the new pod still verifies the old token and the audit chain, and a changed config rolls the pod. The cluster test runs the published image, not a server built from the same commit. Not tested: a cloud provider's cluster, an ingress controller, and upgrades between chart versions.
 
 ## Health and readiness
 

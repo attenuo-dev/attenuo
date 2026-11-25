@@ -1,5 +1,7 @@
-# Release workflow. First run: tag v0.1.0 (2026-11-19). The builds and the image succeeded;
-# the draft-release job failed on the SBOM file name, fixed since and not yet re-run.
+# Release workflow. First full run: tag v0.2.1 (tagged 2026-11-24). It built the four binary
+# archives with their checksums, pushed and signed the multi-arch (amd64, arm64) image, and
+# created the draft release. Earlier runs did not get this far: at v0.1.0 the draft-release
+# job failed on the SBOM file name, and at v0.2.0 the image job failed, so nothing was released.
 #
 # Trigger: pushing a tag `vX.Y.Z[-suffix]` (see "Releases" in CONTRIBUTING.md).
 #

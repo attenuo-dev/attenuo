@@ -31,7 +31,7 @@ cd attenuo
 examples/github-leak-demo/run-docker.sh
 ```
 
-It pulls `ghcr.io/attenuo-dev/attenuo:0.1.0` and the stock Python image, which runs a small fake GitHub server ([details](examples/github-leak-demo/README.md#run-it-without-rust)).
+It pulls `ghcr.io/attenuo-dev/attenuo:0.2.1` and the stock Python image, which runs a small fake GitHub server ([details](examples/github-leak-demo/README.md#run-it-without-rust)).
 
 With the Rust toolchain, the first run compiles the workspace: about a minute and a half on a 4-core machine, nearly all of it compiling (plus crate downloads if your cargo cache is empty). After that the script takes about a second ([measured](docs/design/bench/2026-10-24-vm-demo-cold-timing.md)). It starts attenuo and the fake server on free ports, plays nine steps with the `attenuo` CLI, and exits non-zero if any step comes out differently. In short:
 
@@ -54,7 +54,7 @@ Prebuilt binaries for Linux (x86_64, aarch64) and macOS (Intel, Apple silicon):
 curl -fsSL https://raw.githubusercontent.com/attenuo-dev/attenuo/main/scripts/install.sh | sh
 ```
 
-The script downloads the latest release's archive for your machine, checks its SHA-256 against the release's `SHA256SUMS`, and puts `attenuo` (the CLI) and `attenuo-server` in `~/.local/bin`. It does not use `sudo`. Set `ATTENUO_VERSION=v0.1.0` to pin a release and `ATTENUO_INSTALL_DIR` to choose the directory; [read the script](scripts/install.sh) first if you prefer. There is also a container image, `ghcr.io/attenuo-dev/attenuo`, and you can [build from source](CONTRIBUTING.md).
+The script downloads the latest release's archive for your machine, checks its SHA-256 against the release's `SHA256SUMS`, and puts `attenuo` (the CLI) and `attenuo-server` in `~/.local/bin`. It does not use `sudo`. Set `ATTENUO_VERSION=v0.2.1` to pin a release and `ATTENUO_INSTALL_DIR` to choose the directory; [read the script](scripts/install.sh) first if you prefer. There is also a container image, `ghcr.io/attenuo-dev/attenuo`, and you can [build from source](CONTRIBUTING.md).
 
 ## Try it
 
@@ -121,7 +121,7 @@ All measured on a shared 4-core development container, so read them as indicativ
 
 ## Status
 
-attenuo is pre-alpha and has not been used in production. Release 0.1.0, the first, was tagged on 2026-11-19 ([release notes](docs/release/0.1.0.md)). The full account is in [docs/status.md](docs/status.md).
+attenuo is pre-alpha and has not been used in production. Release 0.2.1 was tagged on 2026-11-24 and published on 2026-11-25 ([release notes](docs/release/0.2.1.md)). The full account is in [docs/status.md](docs/status.md).
 
 - **Tests and fuzzing.** Unit, property and integration tests in Rust and in both SDKs, the SDKs against a real server, and 22 fuzz targets with no open crash.
 - **Proof.** A Lean model of the covering rule proves that delegation never widens authority in the model. The Rust code is not verified against it; a differential test finds the two in agreement on 31,500 generated cases.

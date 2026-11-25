@@ -13,7 +13,7 @@
 # Needs docker with the compose plugin (v2.20 or later) and a free port on 127.0.0.1.
 #
 # Environment:
-#   ATTENUO_IMAGE        the server image (default ghcr.io/attenuo-dev/attenuo:0.1.0)
+#   ATTENUO_IMAGE        the server image (default ghcr.io/attenuo-dev/attenuo:0.2.1)
 #   ATTENUO_HOST_PORT    the host port for the agent-facing listener (default 8080)
 #   KEEP=1               leave the containers running afterwards; the script prints how to use
 #                        and stop them
