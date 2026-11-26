@@ -2555,8 +2555,8 @@ async fn a_used_assertion_is_a_replay_before_the_early_exchange_refusal() {
         )
         .await;
     assert_eq!(a.status, StatusCode::OK, "{}", a.body);
-    // An unused assertion's early refusal is counted: over the limit now, and the assertion
-    // is still unused.
+    // An unused assertion's early refusal is counted: over the limit now. (That such a refusal
+    // leaves the assertion unused is shown by `a_binding_refusal_does_not_use_up_the_client_assertion`.)
     let unused = h.idp.assertion();
     let other = h
         .bound_to(Via::Native(Some(&c.pki_coder)), "pki-coder")
