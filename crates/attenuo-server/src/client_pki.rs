@@ -559,6 +559,19 @@ pub(crate) fn names(cert: &ClientCertificate) -> &CertNames {
     })
 }
 
+/// Whether `cert` carries the name an entry with these settings requires: a URI name equal
+/// to `tls_client_auth_san_uri`, or a DNS name equal to `tls_client_auth_san_dns` without
+/// regard to case. The name test of [`verify`] without its count of URI names: a certificate
+/// it is false for is refused by [`verify`] as `san_mismatch`. Reads the certificate's names
+/// only (once per connection), no path or signature.
+pub(crate) fn carries_name(pki: &Pki, cert: &ClientCertificate) -> bool {
+    let names = names(cert);
+    match &pki.name {
+        SanName::Uri { value, .. } => names.uris.iter().any(|n| n == value),
+        SanName::Dns(value) => names.dns.iter().any(|n| n == value),
+    }
+}
+
 /// The intermediates of `sent` worth giving to path building for the client certificate
 /// `leaf`, in the order sent: each one readable, not a copy of `leaf`, not self-issued
 /// (subject = issuer), and the first one sent with its subject. See the module docs for why.
@@ -1023,7 +1036,16 @@ mod tests {
         let mut all = vec![leaf];
         all.extend_from_slice(chain);
         let cert = ClientCertificate::from_handshake(&all).unwrap();
-        verify(pki, &cert, at(NOW)).map_err(|r| r.reason)
+        let answer = verify(pki, &cert, at(NOW)).map_err(|r| r.reason);
+        // The name test of the bound-token check agrees with the check's: an accepted
+        // certificate carries the entry's name, and one refused for its names does not
+        // (`uri_san_count` aside, which may carry it among several).
+        match answer {
+            Ok(()) => assert!(carries_name(pki, &cert)),
+            Err("san_mismatch") => assert!(!carries_name(pki, &cert)),
+            Err(_) => {}
+        }
+        answer
     }
 
     #[test]

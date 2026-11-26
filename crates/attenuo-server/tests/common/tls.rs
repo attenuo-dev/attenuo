@@ -77,6 +77,23 @@ impl Ca {
         }
     }
 
+    /// A new certificate for this CA, with its name and key, that `issuer` signs, with `edit`
+    /// applied to its parameters (its dates, for a copy that has expired).
+    pub fn reissued(
+        &self,
+        issuer: &Ca,
+        edit: impl FnOnce(&mut rcgen::CertificateParams),
+    ) -> rcgen::Certificate {
+        let mut params = self.params.clone();
+        edit(&mut params);
+        params
+            .signed_by(
+                &self.key,
+                &rcgen::Issuer::from_params(&issuer.params, &issuer.key),
+            )
+            .unwrap()
+    }
+
     /// A client certificate this CA issues: valid from a day ago for 30 days, `CA:FALSE`,
     /// extended key usage `clientAuth`, no names, then `edit`. It is sent with the
     /// intermediates up to the root, as a client sends its chain.

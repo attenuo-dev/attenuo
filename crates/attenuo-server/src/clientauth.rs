@@ -710,16 +710,22 @@ impl Clients {
     /// The revocation check of a token bound to a certificate (`cnf.x5t#S256`) whose
     /// thumbprint matched the request's certificate `cert` ([`crate::cert_binding`]): for each
     /// agent of the token's `chain`, last hop first, whose entry in this list has
-    /// `tls_client_auth` with `tls_client_crl_paths`, the whole check of that entry runs again
+    /// `tls_client_auth` with `tls_client_crl_paths` and whose name the certificate carries
+    /// ([`crate::client_pki::carries_name`]), the whole check of that entry runs again
     /// ([`crate::client_pki::verify`]: path, dates, CRLs, name; from the connection's cache
     /// while it holds). The reason of the first refusal, if any.
     ///
-    /// Entries are found by the token's agents, never by the certificate's names. An agent
-    /// authenticated with `tls_client_auth` shows its own certificate, so on a bound token every
-    /// such agent of the chain was authenticated with the bound certificate: each of their
-    /// entries must still accept it. An agent whose entry is gone, has no CRLs or another
-    /// method is not checked. `cert` is `None` only when the caller could not hand the
-    /// certificate over: refused (`certificate_not_shown`) when an agent needs the check.
+    /// Entries are found by the token's agents, then kept only when the certificate is that
+    /// agent's: it carries the entry's `tls_client_auth_san_uri` or `tls_client_auth_san_dns`.
+    /// An entry may also accept a secret or a key, and a hop that authenticated so may have
+    /// used another agent's certificate on its connection (the actor of an exchange shows the
+    /// subject's certificate): that entry does not decide on a certificate that is not its own.
+    /// The name test reads the certificate only, and a revocation never changes its names, so
+    /// a certificate checked once by an entry is checked by it on every request. When no
+    /// agent's entry carries the certificate's name (the entry was removed, has no CRLs, or
+    /// its name rule changed), nothing is checked here: the thumbprint decides, as without
+    /// CRLs. `cert` is `None` only when the caller could not hand the certificate over:
+    /// refused (`certificate_not_shown`) when an agent's entry has CRLs.
     ///
     /// A refusal is logged at info level, at most once per [`BOUND_REFUSAL_LOG_SECS`] for the
     /// list, with the number of refusals left out of the log since.
@@ -747,6 +753,8 @@ impl Clients {
             };
             let reason = match cert {
                 None => "certificate_not_shown",
+                // Not this agent's certificate.
+                Some(cert) if !crate::client_pki::carries_name(pki, cert) => continue,
                 Some(cert) => match crate::client_pki::verify(pki, cert, now) {
                     Ok(()) => continue,
                     Err(why) => why.reason,

@@ -159,6 +159,25 @@ impl Pki {
         )
     }
 
+    /// `lists` with `auditor` a mixed entry: its secret, and also `tls_client_auth` with the
+    /// root CA, its own SPIFFE ID and the CRLs of `rules`.
+    fn mixed_auditor(&self, lists: &str, rules: Rules) -> String {
+        let secret = format!(
+            "id = \"auditor\"\nsecret_sha256 = \"{}\"\n",
+            sha256_hex("auditor-secret")
+        );
+        assert!(lists.contains(&secret));
+        lists.replace(
+            &secret,
+            &format!(
+                "{secret}tls_client_ca_pem_path = \"{}\"\ntls_client_auth_san_uri = \"{}\"\n{}",
+                self.path("ca.pem").display(),
+                spiffe("auditor"),
+                self.crl_keys(rules)
+            ),
+        )
+    }
+
     /// `lists` without the root's CRL in `tls_client_crl_paths`.
     fn without_root_crl(&self, lists: &str) -> String {
         lists.replace(&format!("\"{}\", ", self.path("root.crl").display()), "")
@@ -725,8 +744,9 @@ async fn revoked_certificates_are_refused_over_tls_and_forwarded() {
 }
 
 /// The root's CRL revokes the intermediate CA: every certificate below it is refused, over
-/// both paths, and the root's other certificates are accepted. The intermediate's own CRL
-/// may not be listed then: a revoked CA signs no CRL used here, and the server does not start.
+/// both paths, and the root's other certificates are accepted. The intermediate's own CRL is
+/// still listed: the server starts, and that CRL is ignored (a revoked CA signs no CRL used
+/// here).
 #[tokio::test]
 async fn a_revoked_intermediate_refuses_every_certificate_below_it() {
     let pki = Pki::new(OffsetDateTime::now_utc());
@@ -740,16 +760,7 @@ async fn a_revoked_intermediate_refuses_every_certificate_below_it() {
             1,
         ),
     );
-    let msg = Setup::new().await.refusal(&pki.lists(Rules::default()));
-    assert!(
-        msg.contains("mid.crl") && msg.contains("is revoked by a CRL"),
-        "{msg}"
-    );
-    let h = Harness::start(&pki.lists(Rules {
-        mid_crl: false,
-        ..Rules::default()
-    }))
-    .await;
+    let h = Harness::start(&pki.lists(Rules::default())).await;
     let mid_ok = pki.leaf(&pki.mid, MID_OK, "coder");
     let coder_ok = pki.leaf(&pki.root, ROOT_OK, "coder");
     for fwd in [false, true] {
@@ -760,6 +771,79 @@ async fn a_revoked_intermediate_refuses_every_certificate_below_it() {
             .await
             .ok("the root's own certificate");
     }
+    h.stop().await;
+}
+
+/// `coder` (a certificate of the root) and `outsider` (one of the other CA) are accepted,
+/// over both paths.
+async fn others_work(h: &Harness, coder: &ClientCert, outsider: &ClientCert) {
+    for fwd in [false, true] {
+        h.exchange(via(fwd, coder), "coder")
+            .await
+            .ok("the root's own certificate");
+        h.exchange(via(fwd, outsider), "outsider")
+            .await
+            .ok("the other CA's certificate");
+    }
+}
+
+/// A reload whose root CRL revokes the intermediate while the intermediate's CRL is still
+/// listed goes on: the intermediate's CRL is ignored, its certificates are refused, and the
+/// root's and the other CA's keep working. The same when the intermediate's certificate in
+/// `tls_client_crl_issuer_pem_path` has expired (the client still sends a valid one with the
+/// same name and key): its certificates are refused as unknown, under the default
+/// `tls_client_crl_missing = "allow"`, until the current certificate is listed again.
+#[tokio::test]
+async fn a_reload_with_a_revoked_or_expired_crl_signer_goes_on() {
+    let now = OffsetDateTime::now_utc();
+    let pki = Pki::new(now);
+    let lists = pki.lists(Rules::default());
+    let h = Harness::start(&lists).await;
+    let mid_ok = pki.leaf(&pki.mid, MID_OK, "coder");
+    let coder_ok = pki.leaf(&pki.root, ROOT_OK, "coder");
+    let outsider_ok = pki.leaf(&pki.other, ROOT_REVOKED, "outsider");
+    h.exchange(via(false, &mid_ok), "coder")
+        .await
+        .ok("below the intermediate, before");
+    let (this, next) = (now, now + Duration::hours(1));
+
+    pki.write(
+        "root.crl",
+        pki.root.crl(&[ROOT_REVOKED, MID_SERIAL], this, next, 2),
+    );
+    h.reload(&lists)
+        .await
+        .ok("a reload that revokes the intermediate");
+    for fwd in [false, true] {
+        h.exchange(via(fwd, &mid_ok), "coder")
+            .await
+            .refused(REVOKED, "below the revoked intermediate");
+    }
+    others_work(&h, &coder_ok, &outsider_ok).await;
+
+    // The intermediate no longer revoked, but its certificate in the issuer file expired.
+    pki.write("root.crl", pki.root.crl(&[ROOT_REVOKED], this, next, 3));
+    let expired = pki.mid.reissued(&pki.root, |p| {
+        p.not_before = now - Duration::days(30);
+        p.not_after = now - Duration::days(1);
+    });
+    pki.write("mid.pem", expired.pem());
+    h.reload(&lists).await.ok("a reload with an expired signer");
+    for fwd in [false, true] {
+        h.exchange(via(fwd, &mid_ok), "coder").await.refused(
+            UNKNOWN,
+            "below an intermediate whose listed certificate expired",
+        );
+    }
+    others_work(&h, &coder_ok, &outsider_ok).await;
+
+    pki.write("mid.pem", pki.mid.cert.pem());
+    h.reload(&lists)
+        .await
+        .ok("the current certificate listed again");
+    h.exchange(via(true, &mid_ok), "coder")
+        .await
+        .ok("below the intermediate, after");
     h.stop().await;
 }
 
@@ -1194,8 +1278,8 @@ async fn get_approval(h: &Harness, token: &str, id: &str, via: Via<'_>) -> Answe
 /// `client_certificate_revoked`; once the CRL is stale, `client_certificate_revocation_unknown`.
 /// An approval of another run still answers `not_found` to the revoked token: the run is
 /// checked first. A token bound to a pinned certificate is unaffected, though the certificate
-/// carries `coder`'s name and a serial number a CRL lists: the entries checked are the
-/// token's agents', never found by the certificate's names.
+/// carries `coder`'s name and a serial number a CRL lists: the entries checked are those of
+/// the token's agents, never found by the certificate's names.
 #[tokio::test]
 async fn bound_tokens_follow_the_crls_and_pinned_certificates_are_unaffected() {
     let now = OffsetDateTime::now_utc();
@@ -1282,6 +1366,68 @@ async fn bound_tokens_follow_the_crls_and_pinned_certificates_are_unaffected() {
     h.clock
         .advance(std::time::Duration::try_from(left + Duration::seconds(1)).unwrap());
     check_routes(&h, Some(UNKNOWN), &reviewer_token, fwd).await;
+    h.stop().await;
+}
+
+/// `parent`'s child for `auditor`, which authenticates with its secret over a connection that
+/// shows `cert` (the certificate `parent` is bound to, so the child is bound to it too).
+async fn child_for_auditor(h: &Harness, parent: &str, cert: &ClientCert) -> String {
+    let mut body = exchange_body(parent, "auditor");
+    body["client_secret"] = json!("auditor-secret");
+    let a = h
+        .send(
+            Via::Native(Some(cert)),
+            Method::POST,
+            "/token",
+            None,
+            Some(&body),
+        )
+        .await;
+    a.ok("an exchange to auditor with its secret");
+    a.body["access_token"].as_str().unwrap().to_owned()
+}
+
+/// `auditor` accepts its secret and also has `tls_client_auth` with CRLs for its own name.
+/// The actor of an exchange of a token bound to `coder`'s certificate shows that certificate
+/// and authenticates with the secret: the child, bound to coder's certificate, is accepted on
+/// every route, since auditor's entry is not checked against a certificate that does not carry
+/// its name. Once a reload revokes coder's certificate, parent and child are refused on every
+/// route: coder's entry still checks it. A token bound to a pinned certificate whose later hop
+/// is auditor is unaffected.
+#[tokio::test]
+async fn a_hop_that_used_its_secret_is_not_checked_against_another_agents_certificate() {
+    let now = OffsetDateTime::now_utc();
+    let pki = Pki::new(now);
+    let lists = pki.mixed_auditor(&pki.lists(Rules::default()), Rules::default());
+    let h = Harness::start(&lists).await;
+    let coder = pki.leaf(&pki.root, ROOT_OK, "coder");
+    let a = h.exchange(Via::Native(Some(&coder)), "coder").await;
+    a.ok("a token bound to coder's certificate");
+    let parent = a.body["access_token"].as_str().unwrap().to_owned();
+    let child = child_for_auditor(&h, &parent, &coder).await;
+    let a = h.exchange(Via::Native(Some(&pki.pinned)), "pinned").await;
+    a.ok("a token bound to the pinned certificate");
+    let pinned_parent = a.body["access_token"].as_str().unwrap().to_owned();
+    let pinned_child = child_for_auditor(&h, &pinned_parent, &pki.pinned).await;
+    for via in [Via::Native(Some(&coder)), Via::Fwd(Some(&coder))] {
+        check_routes(&h, None, &parent, via).await;
+        check_routes(&h, None, &child, via).await;
+    }
+
+    pki.write(
+        "root.crl",
+        pki.root
+            .crl(&[ROOT_REVOKED, ROOT_OK], now, now + Duration::hours(1), 2),
+    );
+    h.reload(&lists).await.ok("reload");
+    for via in [Via::Native(Some(&coder)), Via::Fwd(Some(&coder))] {
+        check_routes(&h, Some(REVOKED), &parent, via).await;
+        check_routes(&h, Some(REVOKED), &child, via).await;
+    }
+    for via in [Via::Native(Some(&pki.pinned)), Via::Fwd(Some(&pki.pinned))] {
+        check_routes(&h, None, &pinned_parent, via).await;
+        check_routes(&h, None, &pinned_child, via).await;
+    }
     h.stop().await;
 }
 

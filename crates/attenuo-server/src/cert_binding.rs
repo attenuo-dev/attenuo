@@ -26,7 +26,8 @@
 //!   or missing CRL, an expired certificate, a path that no longer builds). The same codes on
 //!   every route, the MCP proxy's included (JSON-RPC `-32001`). The check runs only for a
 //!   token bound to a certificate, once its thumbprint matched; the entries checked are
-//!   those of the token's agents, never found by the certificate's names.
+//!   those of the token's agents whose name the certificate carries (a hop that
+//!   authenticated with a secret over another agent's connection is not its owner).
 //!
 //! **Exchange.** A child of a certificate-bound token is bound to the same certificate, and
 //! the exchange request must show that certificate. No `DPoP` header and no
@@ -295,11 +296,12 @@ pub(crate) fn check_cert(bound: &str, cert: Option<&[u8; 32]>) -> Result<(), Cer
 /// The revocation check of a certificate-bound token, after its thumbprint matched the
 /// request's certificate `cert`: the certificate passes the check of each `[[agents]]` entry
 /// with `tls_client_auth` and `tls_client_crl_paths` that is an agent of the token's `chain`
+/// and whose name the certificate carries
 /// ([`crate::clientauth::Clients::bound_certificate_refusal`], against the agents in force
 /// now). A token none of whose agents has such an entry (a pinned certificate's, one from an
-/// entry without CRLs, one whose entry a reload removed) is not checked: the thumbprint
-/// decides, as before. Run only for a token bound to a certificate, so other requests cost
-/// nothing more. Not audited, as the other binding refusals are not.
+/// entry without CRLs, one whose entry a reload removed or whose name rule changed) is not
+/// checked: the thumbprint decides, as before. Run only for a token bound to a certificate,
+/// so other requests cost nothing more. Not audited, as the other binding refusals are not.
 pub(crate) fn check_revocation(
     clients: &crate::clientauth::SharedClients,
     chain: &attenuo_core::DelegationChain,

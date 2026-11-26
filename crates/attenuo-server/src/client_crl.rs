@@ -16,13 +16,15 @@
 //!   most [`MAX_CRL_ENTRIES`] certificates;
 //! - be signed by an acceptable issuer: a CA certificate of the entry's
 //!   `tls_client_ca_pem_path` (a trust anchor), or a CA certificate of the entry's
-//!   `tls_client_crl_issuer_pem_path`. Each certificate of that file must be valid at load and
-//!   signed by a trust anchor or by another accepted certificate of the file whose `keyUsage`,
-//!   if any, allows `keyCertSign`. The CRL's issuer name must equal the signer's subject, byte
-//!   for byte, and the signature must verify with the signer's key (the algorithms of the
-//!   listener's `ring` provider; checked once per file and key over a load). A signer with a
-//!   `keyUsage` extension must have `cRLSign`. A CRL signed by any other key is refused, and
-//!   so is one signed by a certificate of the issuer file that a CRL of the entry revokes;
+//!   `tls_client_crl_issuer_pem_path`. Each certificate of that file must have started
+//!   (`notBefore`) at load and be signed by a trust anchor or by another accepted
+//!   certificate of the file whose `keyUsage`, if any, allows `keyCertSign`. The CRL's issuer
+//!   name must equal the signer's subject, byte for byte, and the signature must verify with
+//!   the signer's key (the algorithms of the listener's `ring` provider; checked once per file
+//!   and key over a load). A signer with a `keyUsage` extension must have `cRLSign`. A CRL
+//!   signed by any other key is refused. A CRL whose signer (name and key) a CRL of the entry
+//!   revokes, or has no certificate in the files valid now, is loaded but ignored: every
+//!   certificate that CA issues is [`Status::Ignored`], and the start or reload goes on;
 //! - have `nextUpdate` after `thisUpdate`, and `thisUpdate` at most
 //!   [`MAX_FUTURE_THIS_UPDATE_SECS`] ahead of the server clock;
 //! - with `tls_client_crl_stale = "refuse"` (the default), not be stale: `nextUpdate` must
@@ -31,7 +33,8 @@
 //!   the same file content for one CA ([`check_consistent`]).
 //!
 //! Also at load, for each trust anchor that is not self-issued, the certificates of the two
-//! files that issued it (by name, and by a signature checked here) and those above them, so
+//! files that issued it (by name, and by a signature checked here, once per pair of files in a
+//! load) and those above them, so
 //! that the anchor can be checked as an intermediate is ([`CrlSet::anchor_status`]); and the
 //! names behind the warnings of [`log_in_force`].
 //!
@@ -146,6 +149,10 @@ pub(crate) enum Status {
     Missing,
     /// The CRL of its issuer is stale, and `tls_client_crl_stale = "refuse"`.
     Stale,
+    /// Its issuer signed a CRL that was ignored at load: a CRL of the entry revokes the
+    /// issuer (or a CA above it), or none of the issuer's certificates in the files is valid
+    /// now. Whatever `tls_client_crl_missing` says.
+    Ignored,
     /// Listed by the CRL of its issuer.
     Revoked,
 }
@@ -162,6 +169,7 @@ impl Status {
             Status::Good => "not_refused",
             Status::Missing => MISSING_LOG_REASON,
             Status::Stale => STALE_LOG_REASON,
+            Status::Ignored => IGNORED_LOG_REASON,
             Status::Revoked => REVOKED_LOG_REASON,
         }
     }
@@ -173,6 +181,8 @@ pub(crate) const REVOKED_LOG_REASON: &str = "certificate_revoked";
 pub(crate) const STALE_LOG_REASON: &str = "crl_stale";
 /// [`Status::Missing`]'s reason.
 pub(crate) const MISSING_LOG_REASON: &str = "crl_missing";
+/// [`Status::Ignored`]'s reason.
+pub(crate) const IGNORED_LOG_REASON: &str = "crl_ignored";
 
 /// CRLs by the contents of their CA's subject name, then by the CA's key.
 type ByIssuer = HashMap<Vec<u8>, Vec<(Vec<u8>, Arc<CrlFile>)>>;
@@ -201,6 +211,22 @@ pub(crate) struct CrlSet {
     /// certificates of the entry that may issue certificates and have no CRL in the set, for
     /// the warning of [`log_in_force`].
     uncovered: Vec<String>,
+    /// The CAs (subject name contents, `subjectPublicKeyInfo` contents) whose CRL was
+    /// ignored at load: every certificate they issue is [`Status::Ignored`].
+    ignored: Vec<(Vec<u8>, Vec<u8>)>,
+    /// The CRLs ignored at load, for the warning of [`log_in_force`]: the signer's subject
+    /// name as text, and why.
+    ignored_crls: Vec<(String, Ignored)>,
+}
+
+/// Why a CRL was ignored at load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum Ignored {
+    /// A CRL of the entry revokes the CA that signed it, or a CA above it.
+    Revoked,
+    /// No certificate of the files with the signer's name and key is valid now (through
+    /// certificates valid now, up to a trust anchor).
+    Expired,
 }
 
 /// One check above a trust anchor: the certificate with serial number `serial` (without its
@@ -217,9 +243,10 @@ pub(crate) struct Step {
 type ByAnchor = HashMap<Vec<u8>, Vec<(Vec<u8>, Vec<Step>)>>;
 
 /// A serial number (the contents of a DER `INTEGER`) without its leading zero bytes, so that
-/// `00 01` and `01` are one serial number. Serial numbers are compared as unsigned big-endian
-/// numbers: two different numbers never compare equal. (A negative serial, which RFC 5280
-/// forbids, is read as its bytes.)
+/// `00 01` and `01` are one serial number: non-negative serial numbers compare as numbers.
+/// Only those are meaningful: RFC 5280 §4.1.2.2 forbids a negative one. A negative encoding
+/// compares as its bytes would unsigned (`FF`, which is -1, equals `00 FF`, which is 255), so
+/// the comparison can only list more certificates as revoked, never fewer.
 pub(crate) fn serial_key(serial: &[u8]) -> &[u8] {
     let skip = serial.iter().take_while(|b| **b == 0).count();
     &serial[skip..]
@@ -241,6 +268,13 @@ impl CrlSet {
     /// `now` (Unix seconds). A listed certificate is [`Status::Revoked`] even when the CRL is
     /// stale: a revocation is never taken back.
     pub(crate) fn status(&self, issuer: &[u8], spki: &[u8], serial: &[u8], now: i64) -> Status {
+        if self
+            .ignored
+            .iter()
+            .any(|(n, k)| n.as_slice() == issuer && k.as_slice() == spki)
+        {
+            return Status::Ignored;
+        }
         let crl = self
             .by_issuer
             .get(issuer)
@@ -354,6 +388,12 @@ pub(crate) struct Loading {
     signatures: HashMap<(usize, Vec<u8>), bool>,
     /// How many CRL signatures were checked, for the tests.
     signature_checks: usize,
+    /// The issuers found by [`nodes`] for each CA certificate, by the SHA-256 of the CA file
+    /// and of the issuer file: entries that share both check their signatures once.
+    graphs: HashMap<(String, Option<String>), Vec<Vec<usize>>>,
+    /// How many times [`nodes`] checked the signatures between CA certificates, for the
+    /// tests.
+    graph_builds: usize,
 }
 
 impl Loading {
@@ -367,6 +407,8 @@ impl Loading {
             total_entries: 0,
             signatures: HashMap::new(),
             signature_checks: 0,
+            graphs: HashMap::new(),
+            graph_builds: 0,
         }
     }
 
@@ -458,8 +500,12 @@ struct Node<'a> {
 }
 
 /// The CA certificates of an entry, CA file first, and who issued each: every signature
-/// between them checked once, here.
-fn nodes<'a>(ca: &'a CaFile, issuers: Option<&'a CaFile>) -> Result<Vec<Node<'a>>, String> {
+/// between them checked once per load and pair of files ([`Loading`] keeps the answer).
+fn nodes<'a>(
+    ca: &'a CaFile,
+    issuers: Option<&'a CaFile>,
+    loading: &mut Loading,
+) -> Result<Vec<Node<'a>>, String> {
     let files = std::iter::once((true, ca)).chain(issuers.map(|f| (false, f)));
     let mut out = Vec::new();
     let mut signed = Vec::new();
@@ -494,33 +540,48 @@ fn nodes<'a>(ca: &'a CaFile, issuers: Option<&'a CaFile>) -> Result<Vec<Node<'a>
             signed.push(s);
         }
     }
-    for i in 0..out.len() {
-        if out[i].anchor && out[i].subject == out[i].issuer {
-            continue;
+    let key = (
+        ca.sha256().to_owned(),
+        issuers.map(|f| f.sha256().to_owned()),
+    );
+    let edges = match loading.graphs.get(&key) {
+        Some(edges) => edges.clone(),
+        None => {
+            loading.graph_builds += 1;
+            let edges: Vec<Vec<usize>> = (0..out.len())
+                .map(|i| {
+                    if out[i].anchor && out[i].subject == out[i].issuer {
+                        return Vec::new();
+                    }
+                    (0..out.len())
+                        .filter(|&j| {
+                            j != i
+                                && out[j].subject == out[i].issuer
+                                && verify_signature(out[j].spki, &signed[i])
+                        })
+                        .collect()
+                })
+                .collect();
+            loading.graphs.insert(key, edges.clone());
+            edges
         }
-        let found: Vec<usize> = (0..out.len())
-            .filter(|&j| {
-                j != i
-                    && out[j].subject == out[i].issuer
-                    && verify_signature(out[j].spki, &signed[i])
-            })
-            .collect();
-        out[i].issuers = found;
+    };
+    for (node, found) in out.iter_mut().zip(edges) {
+        node.issuers = found;
     }
     Ok(out)
 }
 
-/// Each certificate of the issuer file must be, at `now`, within its validity, and issued by
-/// a trust anchor or by another accepted certificate of that file whose `keyUsage`, if any,
-/// allows `keyCertSign` (so a chain of intermediates works in any order).
-fn accept_issuer_file(nodes: &[Node<'_>], now: i64) -> Result<(), String> {
-    let valid = |n: &Node<'_>| n.not_before <= now && now < n.not_after;
+/// The certificates of `nodes` reached from the trust anchors through issuers whose
+/// `keyUsage`, if any, allows `keyCertSign`, taking only certificates `usable` says yes to (a
+/// chain of intermediates works in any order). Trust anchors are always reached.
+fn reached(nodes: &[Node<'_>], usable: impl Fn(&Node<'_>) -> bool) -> Vec<bool> {
     let mut ok: Vec<bool> = nodes.iter().map(|n| n.anchor).collect();
     loop {
         let mut changed = false;
         for i in 0..nodes.len() {
             if !ok[i]
-                && valid(&nodes[i])
+                && usable(&nodes[i])
                 && nodes[i]
                     .issuers
                     .iter()
@@ -531,19 +592,28 @@ fn accept_issuer_file(nodes: &[Node<'_>], now: i64) -> Result<(), String> {
             }
         }
         if !changed {
-            break;
+            return ok;
         }
     }
+}
+
+/// Each certificate of the issuer file must be valid already at `now` (`notBefore`), and
+/// issued by a trust anchor or by another accepted certificate of that file whose `keyUsage`,
+/// if any, allows `keyCertSign`. One that has expired is accepted here: the CRL it signed is
+/// ignored instead (see [`load`]), so that a reload carrying other revocations is not held
+/// back.
+fn accept_issuer_file(nodes: &[Node<'_>], now: i64) -> Result<(), String> {
+    let started = |n: &Node<'_>| n.not_before <= now;
+    let ok = reached(nodes, started);
     let Some(i) = ok.iter().position(|ok| !ok) else {
         return Ok(());
     };
     let node = &nodes[i];
     let n = node.n;
-    Err(if !valid(node) {
+    Err(if !started(node) {
         format!(
-            "certificate {n} of the file is not valid now (notBefore {}, notAfter {})",
-            date(node.not_before),
-            date(node.not_after)
+            "certificate {n} of the file is not valid yet (notBefore {})",
+            date(node.not_before)
         )
     } else if node.issuers.is_empty() {
         format!(
@@ -626,7 +696,7 @@ pub(crate) fn load(s: &Settings<'_>, ca: &CaFile, loading: &mut Loading) -> Resu
                 .unwrap_or_default()
         )
     };
-    let nodes = nodes(ca, issuer_file.as_ref().map(|(_, f)| &**f))?;
+    let nodes = nodes(ca, issuer_file.as_ref().map(|(_, f)| &**f), loading)?;
     accept_issuer_file(&nodes, loading.now).map_err(issuers_fail)?;
     let mut by_issuer = ByIssuer::new();
     let mut files = Vec::with_capacity(s.paths.len());
@@ -649,7 +719,7 @@ pub(crate) fn load(s: &Settings<'_>, ca: &CaFile, loading: &mut Loading) -> Resu
         keys.push((spki.to_vec(), crl.clone()));
         earliest = earliest.min(crl.next_update);
         files.push((path.clone(), crl.sha256.clone()));
-        signers.push((path, signer));
+        signers.push(signer);
     }
     let mut set = CrlSet {
         by_issuer,
@@ -663,6 +733,8 @@ pub(crate) fn load(s: &Settings<'_>, ca: &CaFile, loading: &mut Loading) -> Resu
         anchors: ByAnchor::new(),
         revoked_anchors: Vec::new(),
         uncovered: Vec::new(),
+        ignored: Vec::new(),
+        ignored_crls: Vec::new(),
     };
     let now = loading.now;
     // Listed: whatever the rules and the dates say.
@@ -671,21 +743,31 @@ pub(crate) fn load(s: &Settings<'_>, ca: &CaFile, loading: &mut Loading) -> Resu
             .iter()
             .any(|s| set.status(&s.issuer, &s.spki, &s.serial, now) == Status::Revoked)
     };
-    // A CRL signed by a certificate of the issuer file that a CRL of the entry revokes, or
-    // whose issuers above it one revokes, is refused.
-    for (path, signer) in signers {
-        let node = &nodes[signer];
-        if !node.anchor && revoked(&set, &steps(&nodes, signer)) {
-            return Err(format!(
-                "tls_client_crl_paths {:?}: the certificate that signed it (certificate {} of \
-                 tls_client_crl_issuer_pem_path), or a CA certificate above it, is revoked by a \
-                 CRL of this entry. A revoked CA signs no CRL used here: remove its CRL from \
-                 tls_client_crl_paths in the same change",
-                shown(path),
-                node.n
-            ));
-        }
+    // A CRL is ignored when the CA that signed it (by name and key) is revoked by a CRL of
+    // the entry, through any certificate of the files with that name and key or a CA above
+    // one, or when no certificate with that name and key is valid now through certificates
+    // valid now up to a trust anchor (trust anchors are not dated here). Every certificate
+    // that CA issues is then refused as unknown ([`Status::Ignored`]), never accepted: with
+    // cross-signing, its certificates might still chain another way. Revocations are counted
+    // from every CRL listed, ignored ones too: they can only add refusals.
+    let current = reached(&nodes, |n| n.not_before <= now && now < n.not_after);
+    let mut ignored = Vec::new();
+    for signer in signers {
+        let (name, spki) = (nodes[signer].subject, nodes[signer].spki);
+        let same: Vec<usize> = (0..nodes.len())
+            .filter(|&i| nodes[i].subject == name && nodes[i].spki == spki)
+            .collect();
+        let why = if same.iter().any(|&i| revoked(&set, &steps(&nodes, i))) {
+            Ignored::Revoked
+        } else if !same.iter().any(|&i| current[i]) {
+            Ignored::Expired
+        } else {
+            continue;
+        };
+        ignored.push((name.to_vec(), spki.to_vec()));
+        set.ignored_crls.push((name_text(name), why));
     }
+    set.ignored = ignored;
     // Trust anchors that are not self-issued and whose issuer the files hold: checked as an
     // intermediate is, at the end of each path ([`CrlSet::anchor_status`]).
     let mut anchors = ByAnchor::new();
@@ -1216,11 +1298,34 @@ pub(crate) fn check_not_older<'a>(
 /// entry lists as revoked (client certificates whose path ends at it are refused), and, for
 /// entries with `tls_client_crl_missing = "allow"`, each CA certificate that may issue
 /// certificates and has no CRL in its entry (certificates it issues are accepted with no
-/// revocation check). By subject name, never by path.
+/// revocation check); and each CA whose CRL was ignored (certificates it issues are refused).
+/// By subject name, never by path.
 pub(crate) fn log_in_force<'a>(sets: impl Iterator<Item = &'a CrlSet> + Clone) {
     let mut revoked = HashSet::new();
     let mut uncovered = HashSet::new();
+    let mut ignored = HashSet::new();
     for set in sets.clone() {
+        for (name, why) in &set.ignored_crls {
+            if !ignored.insert((name.as_str(), *why)) {
+                continue;
+            }
+            match why {
+                Ignored::Revoked => tracing::warn!(
+                    subject = %name,
+                    "a CRL of tls_client_crl_paths is ignored: a CRL of its entry revokes the CA \
+                     that signed it, or a CA above it. Every certificate that CA issued is \
+                     refused as client_certificate_revocation_unknown; remove its CRL from \
+                     tls_client_crl_paths"
+                ),
+                Ignored::Expired => tracing::warn!(
+                    subject = %name,
+                    "a CRL of tls_client_crl_paths is ignored: no certificate of the CA that \
+                     signed it in tls_client_crl_issuer_pem_path is valid now. Every \
+                     certificate that CA issued is refused as \
+                     client_certificate_revocation_unknown; list its current certificate"
+                ),
+            }
+        }
         for name in &set.revoked_anchors {
             if revoked.insert(name.as_str()) {
                 tracing::warn!(
@@ -1257,7 +1362,13 @@ pub(crate) fn log_in_force<'a>(sets: impl Iterator<Item = &'a CrlSet> + Clone) {
 
 /// Whether a refusal reason of [`crate::client_pki::verify`] is one of the CRL check.
 pub(crate) fn revocation_reason(reason: &str) -> bool {
-    [REVOKED_LOG_REASON, STALE_LOG_REASON, MISSING_LOG_REASON].contains(&reason)
+    [
+        REVOKED_LOG_REASON,
+        STALE_LOG_REASON,
+        MISSING_LOG_REASON,
+        IGNORED_LOG_REASON,
+    ]
+    .contains(&reason)
 }
 
 /// The test CA and files of the unit tests below, for the CRL tests of `client_pki`.
@@ -2196,8 +2307,39 @@ FUf681lvm/SY8PiGiAc8cEZOOFLjLQAUEEQipJ03GNO6fs9AsQyxwBnH6oGLA5kO
         assert_eq!(loading.signature_checks, 2);
     }
 
-    /// A certificate of `tls_client_crl_issuer_pem_path` must be valid now, issued by a CA
-    /// allowed to sign certificates, and not revoked by a CRL of the entry when it signs one.
+    /// The signatures between the CA certificates of an entry are checked once per load for
+    /// each pair of CA file and issuer file, however many entries share the pair.
+    #[test]
+    fn the_issuer_graph_is_built_once_per_pair_of_files() {
+        let dir = Dir::new();
+        let root = Ca::new("root", None);
+        let mid = Ca::numbered("mid", &root, 42);
+        let ca = dir.ca_file("ca.pem", &[&root, &mid]);
+        let issuers = dir.write("issuers.pem", mid.cert.pem());
+        let p = [dir.write("root.crl", root.crl(&[], NOW - 60, NOW + 3600, 1))];
+        let with_issuers = Settings {
+            issuers: Some(&issuers),
+            ..settings(&p)
+        };
+        let mut loading = Loading::new(at(NOW));
+        for _ in 0..3 {
+            load(&settings(&p), &ca, &mut loading).unwrap();
+            load(&with_issuers, &ca, &mut loading).unwrap();
+        }
+        assert_eq!(loading.graph_builds, 2);
+        // The same file content at another path is the same pair.
+        let again = dir.ca_file("again.pem", &[&root, &mid]);
+        load(&settings(&p), &again, &mut loading).unwrap();
+        assert_eq!(loading.graph_builds, 2);
+        // A new load checks again.
+        let mut loading = Loading::new(at(NOW));
+        load(&settings(&p), &ca, &mut loading).unwrap();
+        assert_eq!(loading.graph_builds, 1);
+    }
+
+    /// A certificate of `tls_client_crl_issuer_pem_path` must have started and be issued by a
+    /// CA allowed to sign certificates. One that has expired, or that a CRL of the entry
+    /// revokes, has the CRL it signs ignored: what it issued is refused as unknown.
     #[test]
     fn issuer_file_certificates_are_checked() {
         let dir = Dir::new();
@@ -2215,33 +2357,64 @@ FUf681lvm/SY8PiGiAc8cEZOOFLjLQAUEEQipJ03GNO6fs9AsQyxwBnH6oGLA5kO
                 t,
             )
         };
-        // Valid from NOW - 1 day to NOW + 1 day.
-        for t in [NOW - 86_401, NOW + 86_400] {
-            let p = [dir.write("mid.crl", mid.crl(&[], t - 60, t + 3600, 1))];
-            let e = with(&p, t).err().unwrap();
-            assert!(
-                e.contains("certificate 1 of the file is not valid now"),
-                "{e}"
-            );
-            assert!(e.contains("tls_client_crl_issuer_pem_path"), "{e}");
-        }
+        // Valid from NOW - 1 day to NOW + 1 day. Not valid yet: refused.
+        let t = NOW - 86_401;
+        let p = [dir.write("mid.crl", mid.crl(&[], t - 60, t + 3600, 1))];
+        let e = with(&p, t).err().unwrap();
+        assert!(
+            e.contains("certificate 1 of the file is not valid yet"),
+            "{e}"
+        );
+        assert!(e.contains("tls_client_crl_issuer_pem_path"), "{e}");
+        // Expired: loaded, its CRL ignored, and what it issued refused as unknown although
+        // tls_client_crl_missing is "allow"; the root's certificates are unaffected.
+        let t = NOW + 86_400;
+        let p = [
+            dir.write("mid.crl", mid.crl(&[], t - 60, t + 3600, 1)),
+            dir.write("root.crl", root.crl(&[], t - 60, t + 3600, 1)),
+        ];
+        let set = with(&p, t).unwrap();
+        assert_eq!(
+            set.status(&subject(&mid), &spki(&mid), &[5], t),
+            Status::Ignored
+        );
+        assert_eq!(
+            set.status(&subject(&root), &spki(&root), &[5], t),
+            Status::Good
+        );
+        assert_eq!(set.ignored_crls, [("CN=mid".to_owned(), Ignored::Expired)]);
         let mid_crl = dir.write("mid.crl", mid.crl(&[], NOW - 60, NOW + 3600, 1));
-        assert!(with(std::slice::from_ref(&mid_crl), NOW).is_ok());
-        // The root's CRL revokes the intermediate: its CRL is refused, not used.
+        let set = with(std::slice::from_ref(&mid_crl), NOW).unwrap();
+        assert_eq!(
+            set.status(&subject(&mid), &spki(&mid), &[5], NOW),
+            Status::Good
+        );
+        assert!(set.ignored_crls.is_empty());
+        // The root's CRL revokes the intermediate: loaded, the intermediate's CRL ignored,
+        // and every certificate it issued refused as unknown, under either missing rule.
         let root_crl = dir.write("root.crl", root.crl(&[42], NOW - 60, NOW + 3600, 1));
-        let e = with(&[root_crl.clone(), mid_crl.clone()], NOW)
-            .err()
-            .unwrap();
-        assert!(
-            e.contains("mid.crl") && e.contains("is revoked by a CRL"),
-            "{e}"
+        let set = with(&[root_crl.clone(), mid_crl.clone()], NOW).unwrap();
+        assert_eq!(
+            set.status(&subject(&mid), &spki(&mid), &[5], NOW),
+            Status::Ignored
         );
-        assert!(
-            e.contains("certificate 1 of tls_client_crl_issuer_pem_path"),
-            "{e}"
+        assert_eq!(
+            set.status(&subject(&root), &spki(&root), &[42], NOW),
+            Status::Revoked
         );
-        // Without the intermediate's own CRL, nothing it signed is used: accepted.
-        assert!(with(std::slice::from_ref(&root_crl), NOW).is_ok());
+        assert_eq!(
+            set.status(&subject(&root), &spki(&root), &[43], NOW),
+            Status::Good
+        );
+        assert_eq!(set.ignored_crls, [("CN=mid".to_owned(), Ignored::Revoked)]);
+        // Without the intermediate's own CRL, nothing is ignored: its certificates follow
+        // tls_client_crl_missing, and the path through it is revoked at the intermediate.
+        let set = with(std::slice::from_ref(&root_crl), NOW).unwrap();
+        assert!(set.ignored_crls.is_empty());
+        assert_eq!(
+            set.status(&subject(&mid), &spki(&mid), &[5], NOW),
+            Status::Good
+        );
         // An intermediate issued by a CA whose keyUsage leaves keyCertSign out. rcgen
         // refuses to sign with it, so it signs through parameters without key usages.
         let mut no_certs = Ca::with_usages("nocerts", None, vec![rcgen::KeyUsagePurpose::CrlSign]);
