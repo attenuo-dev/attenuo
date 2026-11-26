@@ -62,5 +62,6 @@ Only the `status` and `date` fields and the More Information section of an accep
 | [0020](0020-pki-tls-client-auth.md) | Client certificates from a CA (`tls_client_auth`): a CA file and exactly one SAN, URI (SPIFFE ID) or DNS, per entry; no subject DN, no revocation | proposed |
 | [0021](0021-forwarded-client-certificates.md) | Client certificates forwarded by a trusted reverse proxy in the RFC 9440 headers: a listener of its own, a required peer allowlist, the headers refused on every other listener, the same checks as the native path | proposed |
 | [0022](0022-certificate-bound-tokens.md) | Certificate-bound access tokens (RFC 8705 §3): off by default, one binding per token, bound to the certificate that authenticated at `/token`, checked on every route that takes a token, the same certificate for every child; no cross-holder delegation | proposed |
+| [0025](0025-id-jag-certificate-binding.md) | ID-JAG bound to a TLS client certificate (`cnf.x5t#S256`): accepted at hop 0 only from an agent that authenticated with that certificate and only when the root token is bound to it; a `cnf` read strictly, one binding only | proposed |
 
 Add a row for each new ADR.

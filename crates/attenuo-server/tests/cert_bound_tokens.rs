@@ -1915,3 +1915,466 @@ async fn startup_refuses_settings_that_cannot_work() {
         assert!(msg.contains(needle), "{msg}");
     }
 }
+
+// --- ID-JAG bound to a certificate (ADR-0025) ----------------------------------------------
+
+const CERT_REQUIRED: &str = "credential_cert_required";
+const CERT_MISMATCH: &str = "credential_cert_mismatch";
+const CNF_UNSUPPORTED: &str = "credential_cnf_unsupported";
+
+/// A `jwt-bearer` body for `jag`, with the agent's credentials in `auth`.
+fn jag_body(jag: &str, auth: Value) -> Value {
+    let mut body = json!({"grant_type": JWT_BEARER, "assertion": jag,
+        "authorization_details": [{"type": "attenuo_capabilities",
+            "capabilities": [{"server": "github", "tool": "read_file"}]}]});
+    for (k, v) in auth.as_object().unwrap() {
+        body[k] = v.clone();
+    }
+    body
+}
+
+/// `cnf` binding an ID-JAG to `cert`.
+fn x5t_cnf(cert: &ClientCert) -> Option<Value> {
+    Some(json!({ "x5t#S256": cert.x5t_s256() }))
+}
+
+/// Refused with 400 `invalid_grant` and `code`.
+fn refused_grant(a: &Answer, code: &str, what: &str) {
+    assert_eq!(a.status, StatusCode::BAD_REQUEST, "{what}: {}", a.body);
+    assert_eq!(a.body["error"], "invalid_grant", "{what}: {}", a.body);
+    assert_eq!(a.code(), code, "{what}: {}", a.body);
+}
+
+/// An ID-JAG with `cnf.x5t#S256` is accepted at hop 0 from an agent that authenticated with
+/// that certificate: pinned or CA-issued, from the handshake or from the trusted proxy. The
+/// root token is bound to the same certificate, the record says so (`cert_bound`, and
+/// `id_jag_cnf`, in the digest too), and a child keeps the binding.
+#[tokio::test]
+async fn a_certificate_bound_id_jag_is_accepted_with_its_certificate() {
+    let h = Harness::start(Opts::default()).await;
+    let c = &h.certs;
+    for (via, cert, agent, how, source) in [
+        (
+            Via::Native(Some(&c.planner)),
+            &c.planner,
+            "planner",
+            "self_signed_tls_client_auth",
+            "tls",
+        ),
+        (
+            Via::Fwd(Some(&c.planner)),
+            &c.planner,
+            "planner",
+            "self_signed_tls_client_auth",
+            "forwarded",
+        ),
+        (
+            Via::Native(Some(&c.pki_coder)),
+            &c.pki_coder,
+            "pki-coder",
+            "tls_client_auth",
+            "tls",
+        ),
+        (
+            Via::Fwd(Some(&c.pki_coder)),
+            &c.pki_coder,
+            "pki-coder",
+            "tls_client_auth",
+            "forwarded",
+        ),
+    ] {
+        let jag = h.idp.id_jag("alice", agent, x5t_cnf(cert));
+        let a = h
+            .token(via, &jag_body(&jag, json!({"client_id": agent})), &[])
+            .await;
+        assert_eq!(a.status, StatusCode::OK, "{agent} {source}: {}", a.body);
+        assert_eq!(a.body["token_type"], "Bearer", "{}", a.body);
+        let root = a.body["access_token"].as_str().unwrap();
+        assert_eq!(h.x5t(root), Some(cert.x5t_s256()), "{agent} {source}");
+        let r = h.last("token.root").await;
+        assert_eq!(r["cert_bound"], true, "{r}");
+        let requested = h
+            .state
+            .keys()
+            .verifier
+            .verify(root, now())
+            .unwrap()
+            .chain
+            .hops[0]
+            .capabilities
+            .clone();
+        let args = json!({"agent": agent, "requested": requested, "credential": "id-jag",
+                          "idp": IDP, "agent_auth": how, "dpop_bound": false,
+                          "cert_bound": true, "id_jag_cnf": "x5t#S256",
+                          "client_cert": {"x5t#S256": cert.x5t_s256(), "source": source}});
+        assert_eq!(
+            r["arguments_digest"],
+            attenuo_core::ToolCall::new("attenuo", "token.root", args).arguments_digest(),
+            "{agent} {source}"
+        );
+        // The same ID-JAG again: used once.
+        let a = h
+            .token(via, &jag_body(&jag, json!({"client_id": agent})), &[])
+            .await;
+        refused_grant(&a, "replayed", "the ID-JAG replayed");
+    }
+    // An unbound ID-JAG's record has no `id_jag_cnf`.
+    let a = h
+        .token(
+            Via::Native(Some(&c.planner)),
+            &jag_body(
+                &h.idp.id_jag("alice", "planner", None),
+                json!({"client_id": "planner"}),
+            ),
+            &[],
+        )
+        .await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert!(h.last("token.root").await.get("id_jag_cnf").is_none());
+
+    // A child keeps the certificate: an exchange over a connection that shows it, for an
+    // actor that authenticates by its secret; refused without the certificate.
+    let jag = h.idp.id_jag("alice", "planner", x5t_cnf(&c.planner));
+    let a = h
+        .token(
+            Via::Native(Some(&c.planner)),
+            &jag_body(&jag, json!({"client_id": "planner"})),
+            &[],
+        )
+        .await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    let root = a.body["access_token"].as_str().unwrap().to_owned();
+    // The root token carries `github:read_file` only.
+    let child_body = || {
+        let mut b = exchange_body(
+            &root,
+            "reviewer",
+            json!({"client_id": "reviewer", "client_secret": "reviewer-secret"}),
+        );
+        b["authorization_details"][0]["capabilities"] =
+            json!([{"server": "github", "tool": "read_file"}]);
+        b
+    };
+    h.token(Via::Native(None), &child_body(), &[])
+        .await
+        .refused(REQUIRED, "child without the certificate");
+    let a = h
+        .token(Via::Fwd(Some(&c.planner)), &child_body(), &[])
+        .await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    let child = a.body["access_token"].as_str().unwrap().to_owned();
+    assert_eq!(h.x5t(&child), Some(c.planner.x5t_s256()));
+    for (via, refusal) in [
+        (Via::Native(Some(&c.planner)), None),
+        (Via::Native(None), Some(REQUIRED)),
+        (Via::Native(Some(&c.coder)), Some(MISMATCH)),
+    ] {
+        let a = h
+            .send(
+                via,
+                Method::POST,
+                "/mcp/github",
+                Some((&child, Auth::Bearer)),
+                Some(&read_call()),
+                &[],
+            )
+            .await;
+        match refusal {
+            None => assert_eq!(a.status, StatusCode::OK, "{}", a.body),
+            Some(code) => a.refused(code, "the child on MCP"),
+        }
+    }
+    h.stop().await;
+}
+
+/// Refusals of an ID-JAG bound to a certificate, each with nothing issued and nothing used up:
+/// no certificate; a certificate on the connection that did not authenticate the agent;
+/// another certificate (a pinned one, and a second one from the same CA with the same SAN); a
+/// `DPoP` proof alongside; both `cnf` members; an `x5t#S256` of the wrong length or encoding;
+/// an actor token alone. After them the same ID-JAG, and the same DPoP proof, still work.
+#[tokio::test]
+async fn a_certificate_bound_id_jag_is_refused_without_its_certificate() {
+    let h = Harness::start(Opts::default()).await;
+    let c = &h.certs;
+    let roots = h.count("token.root").await;
+    let both = || json!({"client_id": "both", "client_secret": "both-secret"});
+    let jag = h.idp.id_jag("alice", "both", x5t_cnf(&c.both));
+
+    // No certificate: the agent authenticates by its secret.
+    for via in [Via::Native(None), Via::Fwd(None)] {
+        refused_grant(
+            &h.token(via, &jag_body(&jag, both()), &[]).await,
+            CERT_REQUIRED,
+            "secret, no certificate",
+        );
+    }
+    // The bound certificate is on the connection, but the secret authenticated the agent.
+    for via in [Via::Native(Some(&c.both)), Via::Fwd(Some(&c.both))] {
+        refused_grant(
+            &h.token(via, &jag_body(&jag, both()), &[]).await,
+            CERT_REQUIRED,
+            "secret, bound certificate on the connection",
+        );
+    }
+    // Another certificate: planner's ID-JAG bound to coder's, and pki-coder's ID-JAG presented
+    // with the second certificate of the same CA and the same SAN, which authenticates as
+    // pki-coder too.
+    let to_coder = h.idp.id_jag("alice", "planner", x5t_cnf(&c.coder));
+    let pki = h.idp.id_jag("alice", "pki-coder", x5t_cnf(&c.pki_coder));
+    for via in [Via::Native(Some(&c.planner)), Via::Fwd(Some(&c.planner))] {
+        refused_grant(
+            &h.token(
+                via,
+                &jag_body(&to_coder, json!({"client_id": "planner"})),
+                &[],
+            )
+            .await,
+            CERT_MISMATCH,
+            "another pinned certificate",
+        );
+    }
+    for via in [
+        Via::Native(Some(&c.pki_coder_2)),
+        Via::Fwd(Some(&c.pki_coder_2)),
+    ] {
+        refused_grant(
+            &h.token(via, &jag_body(&pki, json!({"client_id": "pki-coder"})), &[])
+                .await,
+            CERT_MISMATCH,
+            "same CA, same SAN",
+        );
+    }
+    // An actor token alone authenticates the agent without its certificate.
+    let planner_jag = h.idp.id_jag("alice", "planner", x5t_cnf(&c.planner));
+    let actor = json!({"actor_token": h.idp.actor_token("planner"), "actor_token_type": JWT});
+    refused_grant(
+        &h.token(
+            Via::Native(Some(&c.planner)),
+            &jag_body(&planner_jag, actor),
+            &[],
+        )
+        .await,
+        CERT_REQUIRED,
+        "actor token alone",
+    );
+    // A DPoP proof alongside: one binding only, whatever the certificate.
+    let key = DpopKey::generate().unwrap();
+    let proof = key.proof("POST", &format!("{PUBLIC_URL}/token"), None, now());
+    for via in [Via::Native(Some(&c.planner)), Via::Fwd(Some(&c.planner))] {
+        let a = h
+            .token(
+                via,
+                &jag_body(&planner_jag, json!({"client_id": "planner"})),
+                &[("DPoP", proof.clone())],
+            )
+            .await;
+        assert_eq!(a.status, StatusCode::BAD_REQUEST, "{}", a.body);
+        assert_eq!(a.body["error"], "invalid_request", "{}", a.body);
+        assert_eq!(a.code(), WITH_DPOP, "{}", a.body);
+    }
+    // Both members, a member this server does not know, an `x5t#S256` of the wrong length or
+    // encoding.
+    let x5t = c.planner.x5t_s256();
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(&x5t)
+        .unwrap();
+    let std_b64 = base64::engine::general_purpose::STANDARD.encode(&raw);
+    for cnf in [
+        json!({"jkt": key.thumbprint(), "x5t#S256": x5t}),
+        json!({"x5t#S256": x5t, "x5t": "abc"}),
+        json!({ "x5t#S256": &x5t[..42] }),
+        json!({ "x5t#S256": format!("{x5t}A") }),
+        json!({ "x5t#S256": format!("{x5t}=") }),
+        json!({ "x5t#S256": std_b64 }),
+        json!({ "x5t#S256": c.planner.sha256_hex() }),
+        json!({ "x5t#S256": [x5t] }),
+    ] {
+        let jag = h.idp.id_jag("alice", "planner", Some(cnf.clone()));
+        refused_grant(
+            &h.token(
+                Via::Native(Some(&c.planner)),
+                &jag_body(&jag, json!({"client_id": "planner"})),
+                &[],
+            )
+            .await,
+            CNF_UNSUPPORTED,
+            &cnf.to_string(),
+        );
+    }
+    assert_eq!(h.count("token.root").await, roots, "nothing was issued");
+
+    // None of these used anything up: the same ID-JAGs with their certificates work now, and
+    // the DPoP proof binds an unbound ID-JAG's root token.
+    for (via, jag, auth) in [
+        (
+            Via::Native(Some(&c.planner)),
+            &planner_jag,
+            json!({"client_id": "planner"}),
+        ),
+        (
+            Via::Fwd(Some(&c.pki_coder)),
+            &pki,
+            json!({"client_id": "pki-coder"}),
+        ),
+    ] {
+        let a = h.token(via, &jag_body(jag, auth), &[]).await;
+        assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    }
+    let a = h
+        .token(
+            Via::Native(None),
+            &jag_body(&h.idp.id_jag("alice", "both", None), both()),
+            &[("DPoP", proof)],
+        )
+        .await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert_eq!(
+        h.cnf(a.body["access_token"].as_str().unwrap())
+            .unwrap()
+            .key_thumbprint(),
+        Some(key.thumbprint())
+    );
+    h.stop().await;
+}
+
+/// A refused ID-JAG bound to a certificate does not use up a `private_key_jwt` assertion: an
+/// agent with keys and no certificate is refused before the assertion is recorded, and the
+/// same assertion works on the next request.
+#[tokio::test]
+async fn a_certificate_bound_id_jag_refusal_does_not_use_up_the_client_assertion() {
+    let h = Harness::start(Opts {
+        extra: "[[root_grants]]\nissuer = \"https://idp.test\"\nagent = \"jwt-agent\"\n\
+                capabilities = [\"github:*\"]\n\n",
+        ..Opts::default()
+    })
+    .await;
+    let c = &h.certs;
+    let assertion = h.idp.assertion();
+    let auth = || {
+        json!({"client_id": "jwt-agent", "client_assertion": assertion,
+               "client_assertion_type":
+                   "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"})
+    };
+    let bound = h.idp.id_jag("alice", "jwt-agent", x5t_cnf(&c.planner));
+    for via in [Via::Native(None), Via::Native(Some(&c.planner))] {
+        refused_grant(
+            &h.token(via, &jag_body(&bound, auth()), &[]).await,
+            CERT_REQUIRED,
+            "assertion",
+        );
+    }
+    let a = h
+        .token(
+            Via::Native(Some(&c.planner)),
+            &jag_body(&h.idp.id_jag("alice", "jwt-agent", None), auth()),
+            &[],
+        )
+        .await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    let a = h
+        .token(
+            Via::Native(None),
+            &jag_body(&h.idp.id_jag("alice", "jwt-agent", None), auth()),
+            &[],
+        )
+        .await;
+    assert_eq!(a.status, StatusCode::UNAUTHORIZED, "{}", a.body);
+    assert_eq!(a.code(), "client_assertion_replayed", "{}", a.body);
+    h.stop().await;
+}
+
+/// The certificate must come from the handshake or the trusted proxy: a `Client-Cert` header
+/// on the main listener is refused before any route, the forwarding listener refuses a peer it
+/// does not trust, and without the forwarded section the header is ignored.
+#[tokio::test]
+async fn a_certificate_bound_id_jag_takes_no_header_from_elsewhere() {
+    let h = Harness::start(Opts {
+        main_tls: false,
+        ..Opts::default()
+    })
+    .await;
+    let c = &h.certs;
+    let jag = h.idp.id_jag("alice", "planner", x5t_cnf(&c.planner));
+    let body = jag_body(&jag, json!({"client_id": "planner"}));
+    let a = h
+        .token(Via::Plain, &body, &forwarded_headers(&c.planner))
+        .await;
+    assert_eq!(a.status, StatusCode::BAD_REQUEST, "{}", a.body);
+    assert_eq!(a.code(), "client_cert_header_not_accepted");
+    let mut conn = tcp(h.forwarded, "127.0.0.2".parse().unwrap()).await;
+    let (status, v) = raw_request(&mut conn, "/token", &forwarded_headers(&c.planner)).await;
+    assert_eq!(status, 403, "{v}");
+    assert_eq!(v["code"], "forwarded_peer_not_trusted", "{v}");
+    // The ID-JAG was not used up.
+    let a = h.token(Via::Fwd(Some(&c.planner)), &body, &[]).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    h.stop().await;
+
+    let h = Harness::start(Opts {
+        forwarded: false,
+        ..Opts::default()
+    })
+    .await;
+    let c = &h.certs;
+    let jag = h.idp.id_jag("alice", "both", x5t_cnf(&c.both));
+    let a = h
+        .token(
+            Via::Native(None),
+            &jag_body(
+                &jag,
+                json!({"client_id": "both", "client_secret": "both-secret"}),
+            ),
+            &forwarded_headers(&c.both),
+        )
+        .await;
+    refused_grant(&a, CERT_REQUIRED, "ignored header");
+    h.stop().await;
+}
+
+/// With `[token] tls_client_certificate_bound_access_tokens` off the root token would be a
+/// bearer token, so an ID-JAG bound to a certificate is refused even with that certificate:
+/// its binding is never dropped. With a DPoP proof it is refused for the second binding.
+#[tokio::test]
+async fn a_certificate_bound_id_jag_is_refused_when_tokens_are_not_bound() {
+    let h = Harness::start(Opts {
+        bound: false,
+        ..Opts::default()
+    })
+    .await;
+    let c = &h.certs;
+    let jag = h.idp.id_jag("alice", "planner", x5t_cnf(&c.planner));
+    let body = jag_body(&jag, json!({"client_id": "planner"}));
+    for via in [Via::Native(Some(&c.planner)), Via::Fwd(Some(&c.planner))] {
+        refused_grant(
+            &h.token(via, &body, &[]).await,
+            CERT_REQUIRED,
+            "setting off",
+        );
+    }
+    let key = DpopKey::generate().unwrap();
+    let proof = key.proof("POST", &format!("{PUBLIC_URL}/token"), None, now());
+    let a = h
+        .token(
+            Via::Native(Some(&c.planner)),
+            &body,
+            &[("DPoP", proof.clone())],
+        )
+        .await;
+    assert_eq!(a.status, StatusCode::BAD_REQUEST, "{}", a.body);
+    assert_eq!(a.code(), WITH_DPOP, "{}", a.body);
+    // The proof was not used: it binds an unbound ID-JAG's root token now.
+    let a = h
+        .token(
+            Via::Native(Some(&c.planner)),
+            &jag_body(
+                &h.idp.id_jag("alice", "planner", None),
+                json!({"client_id": "planner"}),
+            ),
+            &[("DPoP", proof)],
+        )
+        .await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert_eq!(a.body["token_type"], "DPoP", "{}", a.body);
+    assert_eq!(h.count("token.root").await, 1);
+    h.stop().await;
+}

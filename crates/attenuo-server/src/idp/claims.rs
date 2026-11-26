@@ -73,13 +73,98 @@ pub(crate) struct IdJagClaims {
     /// `client_id`: the client the IdP issued the assertion to. It must be the agent that
     /// presents it, and becomes the root hop's agent.
     pub client_id: String,
-    /// `cnf.jkt`: the thumbprint of the key the ID-JAG is bound to, when it is sender-constrained
-    /// (draft -04 §9.8.1, -06 §4.4.1). The request must then carry a DPoP proof by that key.
-    pub cnf_jkt: Option<String>,
+    /// `cnf`: what the ID-JAG is bound to, when it is sender-constrained (draft -04 §9.8.1,
+    /// -06 §4.4.1 and §9.11).
+    pub cnf: IdJagCnf,
+}
+
+/// The binding of an ID-JAG, read strictly from its `cnf` claim ([`id_jag_cnf`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum IdJagCnf {
+    /// No `cnf` (or `null`): a bearer ID-JAG.
+    None,
+    /// `cnf.jkt`: bound to a DPoP key (RFC 9449). The request must carry a DPoP proof by that
+    /// key.
+    Jkt(String),
+    /// `cnf.x5t#S256`: bound to a TLS client certificate (RFC 8705 §3.1, draft -06 §9.11.2),
+    /// as the SHA-256 of its DER. The agent must authenticate with that certificate.
+    X5tS256([u8; 32]),
+}
+
+/// The `cnf` members this server can check.
+const CNF_JKT: &str = "jkt";
+const CNF_X5T_S256: &str = "x5t#S256";
+
+/// Read an ID-JAG's `cnf` claim. Fail closed: a `cnf` this server cannot check is refused,
+/// never treated as absent.
+///
+/// - absent or `null`: [`IdJagCnf::None`];
+/// - an object with exactly one member, `jkt` (a non-empty string): [`IdJagCnf::Jkt`];
+/// - an object with exactly one member, `x5t#S256`: [`IdJagCnf::X5tS256`]. The value must be
+///   43 base64url characters without padding that decode to 32 bytes, in the one canonical
+///   spelling.
+///
+/// # Errors
+///
+/// `credential_cnf_unsupported` ([`IntakeError::CnfUnsupported`]) for a `cnf` with both
+/// members, with any other member, or with an `x5t#S256` that is not a base64url SHA-256;
+/// `credential_pop_required` ([`IntakeError::PopRequired`]), as before, for a `cnf` that is
+/// not an object, an empty object, and a `jkt` that is not a non-empty string.
+pub(crate) fn id_jag_cnf(claims: &Map<String, Value>) -> Result<IdJagCnf, IntakeError> {
+    let cnf = match claims.get("cnf") {
+        None | Some(Value::Null) => return Ok(IdJagCnf::None),
+        Some(Value::Object(cnf)) => cnf,
+        Some(_) => {
+            return Err(IntakeError::PopRequired(
+                "the ID-JAG's cnf is not an object".into(),
+            ))
+        }
+    };
+    // Every member must be one this server checks, and only one of them may be there: a
+    // second binding, or a member it does not know, could be a constraint it would drop.
+    if cnf.keys().any(|k| k != CNF_JKT && k != CNF_X5T_S256) {
+        return Err(IntakeError::CnfUnsupported(
+            "the ID-JAG's cnf has a member other than jkt and x5t#S256",
+        ));
+    }
+    match (cnf.get(CNF_JKT), cnf.get(CNF_X5T_S256)) {
+        (Some(_), Some(_)) => Err(IntakeError::CnfUnsupported(
+            "the ID-JAG's cnf has both jkt and x5t#S256; one binding only",
+        )),
+        (Some(jkt), None) => match jkt.as_str() {
+            Some(jkt) if !jkt.is_empty() => Ok(IdJagCnf::Jkt(jkt.to_owned())),
+            _ => Err(IntakeError::PopRequired(
+                "the ID-JAG's cnf.jkt is not a non-empty string".into(),
+            )),
+        },
+        (None, Some(x5t)) => x5t
+            .as_str()
+            .and_then(decode_x5t_s256)
+            .map(IdJagCnf::X5tS256)
+            .ok_or(IntakeError::CnfUnsupported(
+                "the ID-JAG's cnf.x5t#S256 is not a base64url SHA-256 (43 characters, no padding)",
+            )),
+        (None, None) => Err(IntakeError::PopRequired("the ID-JAG's cnf is empty".into())),
+    }
+}
+
+/// An `x5t#S256` value as 32 bytes: exactly 43 base64url characters, no padding, in the one
+/// canonical spelling (the unused low bits of the last character are zero).
+fn decode_x5t_s256(value: &str) -> Option<[u8; 32]> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine as _;
+    if value.len() != 43 {
+        return None;
+    }
+    let bytes = URL_SAFE_NO_PAD.decode(value).ok()?;
+    let bytes: [u8; 32] = bytes.try_into().ok()?;
+    // The decoder refuses set trailing bits; check the round trip all the same, so that two
+    // spellings of one thumbprint can never both be accepted.
+    (URL_SAFE_NO_PAD.encode(bytes) == value).then_some(bytes)
 }
 
 /// Read the ID-JAG-specific claims (draft -06 §3.1): `client_id` and `jti` are required,
-/// and a `cnf` claim must carry a `jkt` (the only binding this server can check).
+/// and a `cnf` claim must hold exactly one binding this server can check ([`id_jag_cnf`]).
 ///
 /// `iss`, `sub`, `aud`, `exp` and `iat`, also required, are checked by
 /// [`IdpRegistry::verify`](super::IdpRegistry::verify) for both credential kinds, and
@@ -100,20 +185,8 @@ pub(crate) fn map_id_jag(claims: &Map<String, Value>) -> Result<IdJagClaims, Int
         Some(j) if !j.is_empty() => {}
         _ => return Err(IntakeError::MissingClaim("jti")),
     }
-    let cnf_jkt = match claims.get("cnf") {
-        None | Some(Value::Null) => None,
-        Some(cnf) => match cnf.get("jkt").and_then(Value::as_str) {
-            Some(jkt) if !jkt.is_empty() => Some(jkt.to_owned()),
-            // Bound to something other than a DPoP key (an mTLS certificate, say): this server
-            // cannot check it, so it refuses rather than treating the grant as a bearer one.
-            _ => {
-                return Err(IntakeError::PopRequired(
-                    "the ID-JAG's cnf has no jkt; only DPoP-bound ID-JAGs are supported".into(),
-                ))
-            }
-        },
-    };
-    Ok(IdJagClaims { client_id, cnf_jkt })
+    let cnf = id_jag_cnf(claims)?;
+    Ok(IdJagClaims { client_id, cnf })
 }
 
 #[cfg(test)]
@@ -168,7 +241,7 @@ mod tests {
             c(json!({"client_id": "planner", "jti": "j1"})).unwrap(),
             IdJagClaims {
                 client_id: "planner".into(),
-                cnf_jkt: None
+                cnf: IdJagCnf::None
             }
         );
         assert_eq!(
@@ -187,7 +260,9 @@ mod tests {
     }
 
     #[test]
-    fn id_jag_cnf_needs_a_jkt() {
+    fn id_jag_cnf_holds_one_binding_this_server_checks() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine as _;
         let c = |v: Value| map_id_jag(v.as_object().unwrap());
         let base = json!({"client_id": "planner", "jti": "j1"});
         let with = |cnf: Value| {
@@ -195,18 +270,72 @@ mod tests {
             v["cnf"] = cnf;
             c(v)
         };
+        let code = |cnf: Value| with(cnf).unwrap_err().description();
         assert_eq!(
-            with(json!({"jkt": "abc"})).unwrap().cnf_jkt.as_deref(),
-            Some("abc")
+            with(json!({"jkt": "abc"})).unwrap().cnf,
+            IdJagCnf::Jkt("abc".into())
         );
-        assert_eq!(with(Value::Null).unwrap().cnf_jkt, None);
+        assert_eq!(with(Value::Null).unwrap().cnf, IdJagCnf::None);
+        assert_eq!(c(base.clone()).unwrap().cnf, IdJagCnf::None);
+
+        // A certificate thumbprint: 43 base64url characters for 32 bytes.
+        let digest = [7u8; 32];
+        let x5t = URL_SAFE_NO_PAD.encode(digest);
         assert_eq!(
-            with(json!({"x5t#S256": "abc"})).unwrap_err().description(),
-            "credential_pop_required"
+            with(json!({ "x5t#S256": x5t })).unwrap().cnf,
+            IdJagCnf::X5tS256(digest)
+        );
+        // Both bindings, or a member this server does not know: refused, never one of them
+        // picked or the rest ignored.
+        assert_eq!(
+            code(json!({"jkt": "abc", "x5t#S256": x5t})),
+            "credential_cnf_unsupported"
         );
         assert_eq!(
-            with(json!("abc")).unwrap_err().description(),
-            "credential_pop_required"
+            code(json!({"jkt": "abc", "kid": "k1"})),
+            "credential_cnf_unsupported"
         );
+        assert_eq!(
+            code(json!({"x5t#S256": x5t, "x5t": "abc"})),
+            "credential_cnf_unsupported"
+        );
+        assert_eq!(code(json!({"jwk": {}})), "credential_cnf_unsupported");
+        // An `x5t#S256` of the wrong length or encoding.
+        let padded = format!("{x5t}=");
+        let std_alphabet = base64::engine::general_purpose::STANDARD_NO_PAD.encode([0xfbu8; 32]);
+        let mut last_bit = x5t.clone();
+        // The last character of a 32-byte value carries 4 bits and two unused ones: `D` sets
+        // the unused bits, so it is never the canonical spelling.
+        last_bit.replace_range(42.., "D");
+        for bad in [
+            json!(""),
+            json!("abc"),
+            json!(URL_SAFE_NO_PAD.encode([7u8; 31])),
+            json!(URL_SAFE_NO_PAD.encode([7u8; 33])),
+            json!(URL_SAFE_NO_PAD.encode([7u8; 48])),
+            json!(padded),
+            json!(std_alphabet),
+            json!(last_bit),
+            json!(hex::encode(digest)),
+            json!(format!(" {}", &x5t[1..])),
+            json!(42),
+            json!(null),
+            json!([x5t]),
+        ] {
+            assert_eq!(
+                code(json!({ "x5t#S256": bad })),
+                "credential_cnf_unsupported",
+                "{bad}"
+            );
+        }
+        // The refusals of before keep their code.
+        for bad in [
+            json!("abc"),
+            json!({}),
+            json!({"jkt": ""}),
+            json!({"jkt": 1}),
+        ] {
+            assert_eq!(code(bad.clone()), "credential_pop_required", "{bad}");
+        }
     }
 }

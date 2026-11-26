@@ -53,7 +53,7 @@ Two top-level fields let you filter and join an export without reading anything 
 | `admin` | any other admin action (policy reload, budget refund, dev root mint) | `admin.*` |
 | `search` | an AuthZEN action search was answered (one record per request; it decides nothing) | `authzen.search` |
 
-A record of a request made with a token bound to a DPoP key carries `"dpop_bound": true`, and one made with a token bound to a TLS client certificate carries `"cert_bound": true` ([binding tokens](../guides/binding-tokens-to-keys.md#binding-tokens-to-a-tls-client-certificate)). So does the record of an issuance that bound the new token. Each member is left out when false, so other records hash as before.
+A record of a request made with a token bound to a DPoP key carries `"dpop_bound": true`, and one made with a token bound to a TLS client certificate carries `"cert_bound": true` ([binding tokens](../guides/binding-tokens-to-keys.md#binding-tokens-to-a-tls-client-certificate)). So does the record of an issuance that bound the new token. Each member is left out when false, so other records hash as before. A root token minted from an ID-JAG bound to a certificate (`cnf.x5t#S256`, [ADR-0025](../decisions/0025-id-jag-certificate-binding.md)) also has `"id_jag_cnf": "x5t#S256"` in the arguments its record digests; other records do not.
 
 Checkpoints are not records, so they have no kind: they sit in their own table and appear as `checkpoint` lines in an export.
 

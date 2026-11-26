@@ -34,9 +34,13 @@
 //!    `[[idps]] tenant` set, `tenant` must equal it (draft -06 §4.4.1).
 //!
 //! The intake handler then reads the ID-JAG's own claims ([`claims::map_id_jag`]: `client_id`
-//! and `jti` required, `cnf.jkt` if bound) and, for a bound ID-JAG, requires a DPoP proof by
-//! that key on the request (`credential_pop_required`, `credential_pop_mismatch`; draft -04
-//! §9.8.1.2, -06 §4.4.1).
+//! and `jti` required, and a `cnf` with exactly one of `jkt` and `x5t#S256` if bound,
+//! `credential_cnf_unsupported` otherwise). For `cnf.jkt` it requires a DPoP proof by that key
+//! on the request (`credential_pop_required`, `credential_pop_mismatch`; draft -04 §9.8.1.2,
+//! -06 §4.4.1). For `cnf.x5t#S256` it requires that the agent authenticated with that TLS
+//! client certificate and that the root token is bound to it (`credential_cert_required`,
+//! `credential_cert_mismatch`; -06 §9.11.2, RFC 8705 §3,
+//! [ADR-0025](../../docs/decisions/0025-id-jag-certificate-binding.md)).
 //!
 //! `nonce` is ignored: it binds an ID token to the browser session that requested it, and the
 //! agent presenting the token here is not that session. Replay is bounded instead by requiring
@@ -146,6 +150,20 @@ pub enum IntakeError {
     PopRequired(String),
     #[error("the DPoP proof's key is not the key the ID-JAG is bound to (cnf.jkt)")]
     PopMismatch,
+    /// The ID-JAG's `cnf` is one this server cannot check: two bindings, a member it does not
+    /// know, or an `x5t#S256` that is not a base64url SHA-256.
+    #[error("unsupported confirmation method: {0}")]
+    CnfUnsupported(&'static str),
+    /// The ID-JAG is bound to a TLS client certificate (`cnf.x5t#S256`) and the agent did not
+    /// authenticate with a verified client certificate on this request, or the server does not
+    /// bind its tokens to certificates.
+    #[error("the ID-JAG is bound to a TLS client certificate: {0}")]
+    CertRequired(&'static str),
+    /// The agent authenticated with another certificate than the one the ID-JAG is bound to.
+    #[error(
+        "the agent's TLS client certificate is not the one the ID-JAG is bound to (cnf.x5t#S256)"
+    )]
+    CertMismatch,
     #[error("cannot fetch the issuer's keys: {0}")]
     JwksUnavailable(String),
 }
@@ -171,6 +189,9 @@ impl IntakeError {
             IntakeError::TenantMismatch(_) => "tenant_mismatch",
             IntakeError::PopRequired(_) => "credential_pop_required",
             IntakeError::PopMismatch => "credential_pop_mismatch",
+            IntakeError::CnfUnsupported(_) => "credential_cnf_unsupported",
+            IntakeError::CertRequired(_) => "credential_cert_required",
+            IntakeError::CertMismatch => "credential_cert_mismatch",
             IntakeError::JwksUnavailable(_) => "jwks_unavailable",
         }
     }
@@ -652,6 +673,13 @@ type JsonObject = Map<String, Value>;
 pub(crate) fn unverified_issuer(token: &str) -> Option<String> {
     let (_, payload) = peek(token).ok()?;
     payload.get("iss")?.as_str().map(str::to_owned)
+}
+
+/// The payload of `token`, not verified: for refusals made before the credential is verified,
+/// which the verified claims then decide again. `None` when it does not decode; verification
+/// refuses it then.
+pub(crate) fn unverified_payload(token: &str) -> Option<JsonObject> {
+    peek(token).ok().map(|(_, payload)| payload)
 }
 
 fn peek(token: &str) -> Result<(JsonObject, JsonObject), IntakeError> {
