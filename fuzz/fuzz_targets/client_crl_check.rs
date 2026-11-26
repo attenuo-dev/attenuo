@@ -15,8 +15,8 @@
 //! Properties beyond "no panic":
 //!
 //! 1. The files load unless there is no CRL, or the intermediate's CRL has no signer (the
-//!    intermediate is in neither file) or is signed by an intermediate of the issuer file only
-//!    that the root's CRL revokes; then they are refused.
+//!    intermediate is in neither file); then they are refused. When the root's CRL revokes the
+//!    intermediate, its CRL is ignored: what it issued is `crl_ignored`.
 //! 2. `CrlSet::status` answers as a model does: a serial number is listed when it equals a
 //!    listed one once leading zero bytes are stripped from both; a CA without a CRL is
 //!    `crl_missing` under "refuse", else not refused.
@@ -237,8 +237,9 @@ fn rank(reason: &str) -> u8 {
         "not_refused" => 0,
         "crl_missing" => 1,
         "crl_stale" => 2,
-        "certificate_revoked" => 3,
-        _ => 4,
+        "crl_ignored" => 3,
+        "certificate_revoked" => 4,
+        _ => 5,
     }
 }
 
@@ -313,9 +314,8 @@ fuzz_target!(|input: Input| {
     let mid_revoked = model(root_listed, &mid_serial, false) == "certificate_revoked";
 
     // 1.
-    let refused = crls.is_empty()
-        || (input.mid_crl && !in_ca && !in_issuers)
-        || (input.mid_crl && !in_ca && in_issuers && mid_revoked);
+    let refused = crls.is_empty() || (input.mid_crl && !in_ca && !in_issuers);
+    let mid_ignored = input.mid_crl && mid_revoked;
     let answers = match crl_check(&entry, &queries, &chain, NAME) {
         Ok(a) => {
             assert!(!refused, "loaded: {input:?}");
@@ -348,7 +348,11 @@ fuzz_target!(|input: Input| {
     }
 
     // 4.
-    let leaf_status = model(mid_listed, &leaf_serial, input.missing_refuse);
+    let leaf_status = if mid_ignored {
+        "crl_ignored"
+    } else {
+        model(mid_listed, &leaf_serial, input.missing_refuse)
+    };
     let mid_status = model(root_listed, &mid_serial, input.missing_refuse);
     let want = if rank(leaf_status) >= rank(mid_status) {
         leaf_status

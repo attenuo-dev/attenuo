@@ -309,8 +309,8 @@ pub mod fuzzing {
     }
 
     /// What [`crl_check`] answers: the reason (`not_refused`, `crl_missing`, `crl_stale`,
-    /// `certificate_revoked`) of each query, of each trust anchor of the CA file in order, and
-    /// the outcome of the whole check of the client certificate chain.
+    /// `crl_ignored`, `certificate_revoked`) of each query, of each trust anchor of the CA
+    /// file in order, and the outcome of the whole check of the client certificate chain.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct CrlAnswers {
         /// `CrlSet::status` of each query.
