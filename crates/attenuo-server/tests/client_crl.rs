@@ -788,8 +788,9 @@ async fn others_work(h: &Harness, coder: &ClientCert, outsider: &ClientCert) {
 }
 
 /// A reload whose root CRL revokes the intermediate while the intermediate's CRL is still
-/// listed goes on: the intermediate's CRL is ignored, its certificates are refused, and the
-/// root's and the other CA's keep working. The same when the intermediate's certificate in
+/// listed goes on, also when that CRL is stale and older than the one in force: the
+/// intermediate's CRL is ignored, its certificates are refused, and the root's and the other
+/// CA's keep working. The same when the intermediate's certificate in
 /// `tls_client_crl_issuer_pem_path` has expired (the client still sends a valid one with the
 /// same name and key): its certificates are refused as unknown, under the default
 /// `tls_client_crl_missing = "allow"`, until the current certificate is listed again.
@@ -810,6 +811,17 @@ async fn a_reload_with_a_revoked_or_expired_crl_signer_goes_on() {
     pki.write(
         "root.crl",
         pki.root.crl(&[ROOT_REVOKED, MID_SERIAL], this, next, 2),
+    );
+    // The intermediate's last CRL, past its nextUpdate and older than the one in force: it is
+    // ignored, so neither holds the reload back.
+    pki.write(
+        "mid.crl",
+        pki.mid.crl(
+            &[MID_REVOKED],
+            now - Duration::hours(2),
+            now - Duration::hours(1),
+            1,
+        ),
     );
     h.reload(&lists)
         .await
@@ -838,6 +850,7 @@ async fn a_reload_with_a_revoked_or_expired_crl_signer_goes_on() {
     others_work(&h, &coder_ok, &outsider_ok).await;
 
     pki.write("mid.pem", pki.mid.cert.pem());
+    pki.write("mid.crl", pki.mid.crl(&[MID_REVOKED], this, next, 2));
     h.reload(&lists)
         .await
         .ok("the current certificate listed again");

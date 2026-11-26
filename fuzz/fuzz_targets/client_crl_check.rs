@@ -16,7 +16,8 @@
 //!
 //! 1. The files load unless there is no CRL, or the intermediate's CRL has no signer (the
 //!    intermediate is in neither file); then they are refused. When the root's CRL revokes the
-//!    intermediate, its CRL is ignored: what it issued is `crl_ignored`.
+//!    intermediate, its CRL is ignored: what it issued is `crl_ignored`, except a certificate
+//!    that CRL lists, which is `certificate_revoked`.
 //! 2. `CrlSet::status` answers as a model does: a serial number is listed when it equals a
 //!    listed one once leading zero bytes are stripped from both; a CA without a CRL is
 //!    `crl_missing` under "refuse", else not refused.
@@ -348,10 +349,11 @@ fuzz_target!(|input: Input| {
     }
 
     // 4.
-    let leaf_status = if mid_ignored {
-        "crl_ignored"
-    } else {
-        model(mid_listed, &leaf_serial, input.missing_refuse)
+    // A certificate an ignored CRL lists is still revoked.
+    let leaf_status = match model(mid_listed, &leaf_serial, input.missing_refuse) {
+        "certificate_revoked" => "certificate_revoked",
+        _ if mid_ignored => "crl_ignored",
+        other => other,
     };
     let mid_status = model(root_listed, &mid_serial, input.missing_refuse);
     let want = if rank(leaf_status) >= rank(mid_status) {

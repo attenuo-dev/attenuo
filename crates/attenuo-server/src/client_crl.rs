@@ -151,7 +151,8 @@ pub(crate) enum Status {
     Stale,
     /// Its issuer signed a CRL that was ignored at load: a CRL of the entry revokes the
     /// issuer (or a CA above it), or none of the issuer's certificates in the files is valid
-    /// now. Whatever `tls_client_crl_missing` says.
+    /// now; and that CRL does not list it (a listed one is [`Status::Revoked`]). Whatever
+    /// `tls_client_crl_missing` says.
     Ignored,
     /// Listed by the CRL of its issuer.
     Revoked,
@@ -198,7 +199,7 @@ pub(crate) struct CrlSet {
     issuers: Option<(PathBuf, String)>,
     pub(crate) stale: ClientCrlRule,
     pub(crate) missing: ClientCrlRule,
-    /// The earliest `nextUpdate` of the set's CRLs.
+    /// The earliest `nextUpdate` of the set's CRLs in force (not ignored).
     earliest_next_update: i64,
     /// By the contents of a trust anchor's subject name: each anchor key with that name that
     /// is not self-issued and whose issuer the entry's files hold, and the certificates to
@@ -268,27 +269,24 @@ impl CrlSet {
     /// `now` (Unix seconds). A listed certificate is [`Status::Revoked`] even when the CRL is
     /// stale: a revocation is never taken back.
     pub(crate) fn status(&self, issuer: &[u8], spki: &[u8], serial: &[u8], now: i64) -> Status {
-        if self
-            .ignored
-            .iter()
-            .any(|(n, k)| n.as_slice() == issuer && k.as_slice() == spki)
-        {
-            return Status::Ignored;
-        }
         let crl = self
             .by_issuer
             .get(issuer)
             .and_then(|keys| keys.iter().find(|(k, _)| k.as_slice() == spki))
             .map(|(_, crl)| crl);
+        // A certificate an ignored CRL lists is still revoked: a listing only adds refusals.
+        if crl.is_some_and(|crl| crl.serials.contains(serial_key(serial))) {
+            return Status::Revoked;
+        }
+        if self.is_ignored(issuer, spki) {
+            return Status::Ignored;
+        }
         let Some(crl) = crl else {
             return match self.missing {
                 ClientCrlRule::Allow => Status::Good,
                 ClientCrlRule::Refuse => Status::Missing,
             };
         };
-        if crl.serials.contains(serial_key(serial)) {
-            return Status::Revoked;
-        }
         if now >= crl.next_update && self.stale == ClientCrlRule::Refuse {
             return Status::Stale;
         }
@@ -319,6 +317,19 @@ impl CrlSet {
     /// earliest `nextUpdate`, when stale CRLs refuse. `None` when they do not.
     pub(crate) fn cache_until(&self) -> Option<i64> {
         (self.stale == ClientCrlRule::Refuse).then(|| self.earliest_next_update.saturating_sub(1))
+    }
+
+    /// Whether the CRL of the CA with this name and key was ignored at load.
+    fn is_ignored(&self, issuer: &[u8], spki: &[u8]) -> bool {
+        self.ignored
+            .iter()
+            .any(|(n, k)| n.as_slice() == issuer && k.as_slice() == spki)
+    }
+
+    /// [`crls`](Self::crls) without those ignored at load: the CRLs in force.
+    fn crls_in_force(&self) -> impl Iterator<Item = (&[u8], &[u8], &Arc<CrlFile>)> {
+        self.crls()
+            .filter(|(name, spki, _)| !self.is_ignored(name, spki))
     }
 
     /// Each CRL of the set with its CA's name and key.
@@ -701,12 +712,10 @@ pub(crate) fn load(s: &Settings<'_>, ca: &CaFile, loading: &mut Loading) -> Resu
     let mut by_issuer = ByIssuer::new();
     let mut files = Vec::with_capacity(s.paths.len());
     let mut signers = Vec::with_capacity(s.paths.len());
-    let mut earliest = i64::MAX;
     for path in s.paths {
         let fail = |e: String| format!("tls_client_crl_paths {:?}: {e}", shown(path));
         let (crl, i) = loading.crl(path).map_err(fail)?;
         let signer = signed_by(&crl, i, &nodes, loading).map_err(fail)?;
-        check_dates(&crl, stale, loading.now).map_err(fail)?;
         let spki = nodes[signer].spki;
         let keys = by_issuer.entry(crl.issuer.clone()).or_default();
         if keys.iter().any(|(k, _)| k.as_slice() == spki) {
@@ -717,9 +726,8 @@ pub(crate) fn load(s: &Settings<'_>, ca: &CaFile, loading: &mut Loading) -> Resu
             ));
         }
         keys.push((spki.to_vec(), crl.clone()));
-        earliest = earliest.min(crl.next_update);
         files.push((path.clone(), crl.sha256.clone()));
-        signers.push(signer);
+        signers.push((path, crl, signer));
     }
     let mut set = CrlSet {
         by_issuer,
@@ -729,7 +737,7 @@ pub(crate) fn load(s: &Settings<'_>, ca: &CaFile, loading: &mut Loading) -> Resu
             .map(|(p, f)| (p.to_path_buf(), f.sha256().to_owned())),
         stale,
         missing,
-        earliest_next_update: earliest,
+        earliest_next_update: i64::MAX,
         anchors: ByAnchor::new(),
         revoked_anchors: Vec::new(),
         uncovered: Vec::new(),
@@ -752,8 +760,8 @@ pub(crate) fn load(s: &Settings<'_>, ca: &CaFile, loading: &mut Loading) -> Resu
     // from every CRL listed, ignored ones too: they can only add refusals.
     let current = reached(&nodes, |n| n.not_before <= now && now < n.not_after);
     let mut ignored = Vec::new();
-    for signer in signers {
-        let (name, spki) = (nodes[signer].subject, nodes[signer].spki);
+    for (_, _, signer) in &signers {
+        let (name, spki) = (nodes[*signer].subject, nodes[*signer].spki);
         let same: Vec<usize> = (0..nodes.len())
             .filter(|&i| nodes[i].subject == name && nodes[i].spki == spki)
             .collect();
@@ -768,6 +776,18 @@ pub(crate) fn load(s: &Settings<'_>, ca: &CaFile, loading: &mut Loading) -> Resu
         set.ignored_crls.push((name_text(name), why));
     }
     set.ignored = ignored;
+    // The dates, once the ignored CRLs are known: an ignored CRL is not stale-checked (nor
+    // compared by a reload, see [`check_not_older`]), so that its own age never holds back the
+    // revocation that made it ignored; its other date checks stay.
+    for (path, crl, signer) in &signers {
+        let fail = |e: String| format!("tls_client_crl_paths {:?}: {e}", shown(path));
+        if set.is_ignored(nodes[*signer].subject, nodes[*signer].spki) {
+            check_dates(crl, ClientCrlRule::Allow, now).map_err(fail)?;
+        } else {
+            check_dates(crl, stale, now).map_err(fail)?;
+            set.earliest_next_update = set.earliest_next_update.min(crl.next_update);
+        }
+    }
     // Trust anchors that are not self-issued and whose issuer the files hold: checked as an
     // intermediate is, at the end of each path ([`CrlSet::anchor_status`]).
     let mut anchors = ByAnchor::new();
@@ -1236,6 +1256,17 @@ fn by_ca<'a>(sets: impl Iterator<Item = &'a CrlSet>) -> ByCa<'a> {
     out
 }
 
+/// [`by_ca`] of the CRLs in force: those ignored at load left out.
+fn in_force_by_ca<'a>(sets: impl Iterator<Item = &'a CrlSet>) -> ByCa<'a> {
+    let mut out = ByCa::new();
+    for set in sets {
+        for (name, spki, crl) in set.crls_in_force() {
+            out.entry((name, spki)).or_default().push(crl);
+        }
+    }
+    out
+}
+
 /// Across all entries of a start or reload, one CA has one CRL content: two entries that list
 /// different CRLs of the same CA (issuer name and key) are refused, since one of them would
 /// check against an older list.
@@ -1257,13 +1288,14 @@ pub(crate) fn check_consistent<'a>(sets: impl Iterator<Item = &'a CrlSet>) -> Re
 /// with a CRL in force (`old`) and in the reload (`new`), the new one's `thisUpdate` must not
 /// be earlier, and when the CRL in force has a `cRLNumber` the new one must have one that is
 /// not smaller. The same content is always accepted. A CA whose CRL the reload no longer lists
-/// is not checked: the operator removed it from the config.
+/// is not checked: the operator removed it from the config. Nor is a CRL ignored at load, in
+/// force or in the reload: it is not in force.
 pub(crate) fn check_not_older<'a>(
     old: impl Iterator<Item = &'a CrlSet>,
     new: impl Iterator<Item = &'a CrlSet>,
 ) -> Result<(), String> {
-    let old = by_ca(old);
-    for (ca, crls) in by_ca(new) {
+    let old = in_force_by_ca(old);
+    for (ca, crls) in in_force_by_ca(new) {
         let (Some(was), Some(now)) = (old.get(&ca).and_then(|v| v.first()), crls.first()) else {
             continue;
         };
@@ -1346,7 +1378,7 @@ pub(crate) fn log_in_force<'a>(sets: impl Iterator<Item = &'a CrlSet> + Clone) {
             }
         }
     }
-    for crls in by_ca(sets).values() {
+    for crls in in_force_by_ca(sets).values() {
         let c = crls[0];
         tracing::info!(
             path = %c.path.display(),
@@ -2415,6 +2447,42 @@ FUf681lvm/SY8PiGiAc8cEZOOFLjLQAUEEQipJ03GNO6fs9AsQyxwBnH6oGLA5kO
             set.status(&subject(&mid), &spki(&mid), &[5], NOW),
             Status::Good
         );
+        // An ignored CRL is neither stale-checked nor compared by a reload: the intermediate's
+        // last CRL, past its nextUpdate and older than the one in force, does not hold back the
+        // root's revocation. A certificate it lists is still revoked; the rest is unknown.
+        let in_force = with(
+            &[
+                dir.write("root.crl", root.crl(&[], NOW - 60, NOW + 3600, 1)),
+                dir.write("mid.crl", mid.crl(&[7], NOW - 60, NOW + 3600, 5)),
+            ],
+            NOW,
+        )
+        .unwrap();
+        let stale_mid = dir.write("mid.crl", mid.crl(&[7], NOW - 7200, NOW - 3600, 4));
+        let root_crl = dir.write("root.crl", root.crl(&[42], NOW - 60, NOW + 3600, 2));
+        let set = with(&[root_crl.clone(), stale_mid.clone()], NOW).unwrap();
+        assert_eq!(set.ignored_crls, [("CN=mid".to_owned(), Ignored::Revoked)]);
+        assert_eq!(
+            set.status(&subject(&mid), &spki(&mid), &[7], NOW),
+            Status::Revoked
+        );
+        assert_eq!(
+            set.status(&subject(&mid), &spki(&mid), &[0, 7], NOW),
+            Status::Revoked
+        );
+        assert_eq!(
+            set.status(&subject(&mid), &spki(&mid), &[8], NOW),
+            Status::Ignored
+        );
+        assert_eq!(set.cache_until(), Some(NOW + 3599));
+        check_not_older(std::iter::once(&in_force), std::iter::once(&set)).unwrap();
+        // Not ignored, the same stale CRL refuses the load.
+        let e = with(std::slice::from_ref(&stale_mid), NOW).err().unwrap();
+        assert!(e.contains("mid.crl"), "{e}");
+        // Its other date checks stay: a thisUpdate far ahead is refused.
+        let bad = dir.write("mid.crl", mid.crl(&[], NOW + 3600, NOW + 7200, 6));
+        let e = with(&[root_crl, bad], NOW).err().unwrap();
+        assert!(e.contains("mid.crl") && e.contains("thisUpdate"), "{e}");
         // An intermediate issued by a CA whose keyUsage leaves keyCertSign out. rcgen
         // refuses to sign with it, so it signs through parameters without key usages.
         let mut no_certs = Ca::with_usages("nocerts", None, vec![rcgen::KeyUsagePurpose::CrlSign]);
