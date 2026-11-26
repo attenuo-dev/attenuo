@@ -1855,6 +1855,11 @@ impl Authenticated {
         Ok(())
     }
 
+    /// The replay-store key of the client's assertion; `None` for any other method.
+    pub(crate) fn replay_key(&self) -> Option<&str> {
+        self.replay.as_ref().map(|(key, _)| key.as_str())
+    }
+
     /// Record the assertion's `jti` as used (nothing for a secret) and return the client id.
     /// A store write: call it on the blocking pool.
     ///
@@ -1875,6 +1880,38 @@ impl Authenticated {
             })?;
         }
         Ok(self.id)
+    }
+}
+
+/// The answer to a request of an authenticated client refused before
+/// [`Authenticated::commit`], for a refusal the client can correct and send again with the
+/// same assertion (a certificate binding at `POST /token`). `replay_key` is the client's
+/// assertion's ([`Authenticated::replay_key`]).
+///
+/// An assertion that was already used is a replay, whatever else is wrong with the request:
+/// it gets `client_assertion_replayed`, as [`Authenticated::commit`] would give it, and is not
+/// counted by `[limits] token_requests_per_minute`, so a caller holding an old assertion
+/// cannot spend the agent's budget. Otherwise the request is counted for `agent`
+/// ([`crate::limits::Limits::admit_agent`]: 429 over the limit) and refused with `refused`.
+/// Nothing is recorded in the replay store. A store read: call it on the blocking pool.
+pub(crate) fn refuse_before_commit(
+    state: &crate::state::AppState,
+    replay_key: Option<&str>,
+    agent: &str,
+    mark: Option<&crate::limits::CallerMark>,
+    now: OffsetDateTime,
+    refused: ApiError,
+) -> ApiError {
+    if let Some(key) = replay_key {
+        match state.replay.is_used(key, now) {
+            Ok(true) => return AssertionError::Replayed.into(),
+            Ok(false) => {}
+            Err(r) => return r.into(),
+        }
+    }
+    match state.limits.admit_agent(mark, agent) {
+        Ok(()) => refused,
+        Err(limited) => limited,
     }
 }
 

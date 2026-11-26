@@ -1754,6 +1754,10 @@ impl crate::replay::ReplayStore for MemoryLeaseStore {
     fn replay_markers(&self) -> Result<usize, AuditError> {
         self.used_credentials.len()
     }
+
+    fn is_used(&self, key: &str, now: i64) -> Result<bool, AuditError> {
+        self.used_credentials.is_used(key, now)
+    }
 }
 
 impl StoreRetention for MemoryLeaseStore {

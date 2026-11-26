@@ -2378,3 +2378,190 @@ async fn a_certificate_bound_id_jag_is_refused_when_tokens_are_not_bound() {
     assert_eq!(h.count("token.root").await, 1);
     h.stop().await;
 }
+
+/// `[[root_grants]]` for `jwt-agent` and `[limits] token_requests_per_minute = 2`.
+const JWT_AGENT_LIMITED: &str = "[[root_grants]]\nissuer = \"https://idp.test\"\n\
+    agent = \"jwt-agent\"\ncapabilities = [\"github:*\"]\n\n\
+    [limits]\ntoken_requests_per_minute = 2\n\n";
+
+/// `client_assertion` fields for `jwt-agent`.
+fn assertion_auth(assertion: &str) -> Value {
+    json!({"client_id": "jwt-agent", "client_assertion": assertion,
+           "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"})
+}
+
+/// A subject token nobody signed, whose payload has the `cnf` given.
+fn forged_with_cnf(cnf: Value) -> String {
+    let b64 = |v: Value| {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&v).unwrap())
+    };
+    format!(
+        "{}.{}.c2ln",
+        b64(json!({"alg": "none", "typ": "oauth-id-jag+jwt"})),
+        b64(json!({ "cnf": cnf }))
+    )
+}
+
+/// A used `private_key_jwt` assertion on a request the early `cnf` pass refuses is a replay:
+/// 401 `client_assertion_replayed`, as on any other request, and it is not counted by
+/// `[limits] token_requests_per_minute`, so whoever holds an old assertion cannot spend the
+/// agent's budget. An unused assertion's early refusal is counted, once.
+#[tokio::test]
+async fn a_used_assertion_is_a_replay_before_the_early_cnf_refusal() {
+    let h = Harness::start(Opts {
+        extra: JWT_AGENT_LIMITED,
+        ..Opts::default()
+    })
+    .await;
+    let c = &h.certs;
+    let used = h.idp.assertion();
+    let unbound = || h.idp.id_jag("alice", "jwt-agent", None);
+    // Counted: 1.
+    let a = h
+        .token(
+            Via::Native(None),
+            &jag_body(&unbound(), assertion_auth(&used)),
+            &[],
+        )
+        .await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    for (forged, via) in [
+        (forged_with_cnf(json!("x")), Via::Native(None)),
+        (
+            forged_with_cnf(json!({"jkt": "k", "kid": "k"})),
+            Via::Native(None),
+        ),
+        (
+            h.idp.id_jag("alice", "jwt-agent", x5t_cnf(&c.planner)),
+            Via::Native(Some(&c.planner)),
+        ),
+    ] {
+        for _ in 0..3 {
+            let a = h
+                .token(via, &jag_body(&forged, assertion_auth(&used)), &[])
+                .await;
+            assert_eq!(a.status, StatusCode::UNAUTHORIZED, "{}", a.body);
+            assert_eq!(a.code(), "client_assertion_replayed", "{}", a.body);
+        }
+    }
+    // The agent's budget is untouched: its next request passes (counted: 2).
+    let a = h
+        .token(
+            Via::Native(None),
+            &jag_body(&unbound(), assertion_auth(&h.idp.assertion())),
+            &[],
+        )
+        .await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    // An unused assertion's early refusal is counted: over the limit now.
+    let a = h
+        .token(
+            Via::Native(None),
+            &jag_body(
+                &forged_with_cnf(json!("x")),
+                assertion_auth(&h.idp.assertion()),
+            ),
+            &[],
+        )
+        .await;
+    assert_eq!(a.status, StatusCode::TOO_MANY_REQUESTS, "{}", a.body);
+    h.stop().await;
+}
+
+/// `[limits] token_requests_per_minute` counts each early intake refusal once and each
+/// request that passes once: two refusals reach the limit of two, and two issuances fit in it.
+#[tokio::test]
+async fn early_intake_refusals_are_counted_once() {
+    let h = Harness::start(Opts {
+        extra: "[limits]\ntoken_requests_per_minute = 2\n\n",
+        ..Opts::default()
+    })
+    .await;
+    let c = &h.certs;
+    let planner = || json!({"client_id": "planner"});
+    let to_coder = || h.idp.id_jag("alice", "planner", x5t_cnf(&c.coder));
+    for _ in 0..2 {
+        refused_grant(
+            &h.token(
+                Via::Native(Some(&c.planner)),
+                &jag_body(&to_coder(), planner()),
+                &[],
+            )
+            .await,
+            CERT_MISMATCH,
+            "another certificate",
+        );
+    }
+    let a = h
+        .token(
+            Via::Native(Some(&c.planner)),
+            &jag_body(&to_coder(), planner()),
+            &[],
+        )
+        .await;
+    assert_eq!(a.status, StatusCode::TOO_MANY_REQUESTS, "{}", a.body);
+    // Passing requests, for another agent: each counts once.
+    let pki = || json!({"client_id": "pki-coder"});
+    for _ in 0..2 {
+        let jag = h.idp.id_jag("alice", "pki-coder", x5t_cnf(&c.pki_coder));
+        let a = h
+            .token(Via::Native(Some(&c.pki_coder)), &jag_body(&jag, pki()), &[])
+            .await;
+        assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    }
+    let jag = h.idp.id_jag("alice", "pki-coder", x5t_cnf(&c.pki_coder));
+    let a = h
+        .token(Via::Native(Some(&c.pki_coder)), &jag_body(&jag, pki()), &[])
+        .await;
+    assert_eq!(a.status, StatusCode::TOO_MANY_REQUESTS, "{}", a.body);
+    h.stop().await;
+}
+
+/// The exchange's early binding refusal (a certificate-bound subject token without its
+/// certificate) answers a used assertion as a replay too, and does not count it.
+#[tokio::test]
+async fn a_used_assertion_is_a_replay_before_the_early_exchange_refusal() {
+    let h = Harness::start(Opts {
+        extra: "[limits]\ntoken_requests_per_minute = 2\n\n",
+        ..Opts::default()
+    })
+    .await;
+    let c = &h.certs;
+    let ex = |parent: &str, assertion: &str| {
+        exchange_body(parent, "jwt-agent", assertion_auth(assertion))
+    };
+    let used = h.idp.assertion();
+    let parent = h.bound_to(Via::Native(Some(&c.coder)), "coder").await;
+    // Counted: 1.
+    let a = h
+        .token(Via::Native(Some(&c.coder)), &ex(&parent, &used), &[])
+        .await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    for via in [Via::Native(None), Via::Native(Some(&c.planner))] {
+        for _ in 0..3 {
+            let a = h.token(via, &ex(&parent, &used), &[]).await;
+            assert_eq!(a.status, StatusCode::UNAUTHORIZED, "{}", a.body);
+            assert_eq!(a.code(), "client_assertion_replayed", "{}", a.body);
+        }
+    }
+    // Budget untouched (counted: 2). The parents come from other agents, each with a budget
+    // of its own.
+    let fresh = h.bound_to(Via::Native(Some(&c.both)), "both").await;
+    let a = h
+        .token(
+            Via::Native(Some(&c.both)),
+            &ex(&fresh, &h.idp.assertion()),
+            &[],
+        )
+        .await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    // An unused assertion's early refusal is counted: over the limit now, and the assertion
+    // is still unused.
+    let unused = h.idp.assertion();
+    let other = h
+        .bound_to(Via::Native(Some(&c.pki_coder)), "pki-coder")
+        .await;
+    let a = h.token(Via::Native(None), &ex(&other, &unused), &[]).await;
+    assert_eq!(a.status, StatusCode::TOO_MANY_REQUESTS, "{}", a.body);
+    h.stop().await;
+}

@@ -74,6 +74,16 @@ impl ReplayStore for SqliteLeaseStore {
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM used_credentials", [], |r| r.get(0))?;
         Ok(usize::try_from(n).unwrap_or(0))
     }
+
+    fn is_used(&self, key: &str, now: i64) -> Result<bool, AuditError> {
+        let conn = self.conn.lock()?;
+        let live: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM used_credentials WHERE key = ?1 AND expires_at > ?2",
+            params![digest(key).as_slice(), now],
+            |r| r.get(0),
+        )?;
+        Ok(live > 0)
+    }
 }
 
 #[cfg(test)]
@@ -122,6 +132,24 @@ mod tests {
                 ReplayOutcome::Replayed,
                 "{name}: the overwritten marker has the new expiry"
             );
+        }
+    }
+
+    /// `is_used` sees a live marker only, and records nothing.
+    #[test]
+    fn is_used_reads_without_recording() {
+        for (name, s) in stores() {
+            assert!(!s.is_used("a", 1_000).unwrap(), "{name}");
+            assert_eq!(s.replay_markers().unwrap(), 0, "{name}");
+            assert_eq!(
+                s.use_all_once(&[("a", 1_000)], 1_000, 10).unwrap(),
+                ReplayOutcome::Recorded,
+                "{name}: the look did not use the key up"
+            );
+            s.use_all_once(&[("b", 1_100)], 1_000, 10).unwrap();
+            assert!(s.is_used("b", 1_099).unwrap(), "{name}");
+            assert!(!s.is_used("b", 1_100).unwrap(), "{name}: expired");
+            assert!(!s.is_used("c", 1_000).unwrap(), "{name}");
         }
     }
 
