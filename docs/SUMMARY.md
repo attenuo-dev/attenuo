@@ -96,6 +96,7 @@
   - [ADR-0022: Certificate-bound access tokens](decisions/0022-certificate-bound-tokens.md)
   - [ADR-0023: Server certificate reload](decisions/0023-server-certificate-reload.md)
   - [ADR-0024: CRL files for client certificates](decisions/0024-client-certificate-crls.md)
+  - [ADR-0025: ID-JAG bound to a TLS client certificate](decisions/0025-id-jag-certificate-binding.md)
 
 # Research
 

@@ -1050,12 +1050,28 @@ async fn id_jag_bound_to_a_dpop_key_needs_its_proof() {
         "invalid_grant",
         "credential_pop_mismatch",
     );
-    // A binding this server cannot check (not a DPoP key) is refused, not ignored.
+    // A binding this server cannot check is refused, not ignored: an `x5t#S256` that is not a
+    // SHA-256, a key binding next to it, or a member it does not know.
+    for cnf in [
+        json!({"x5t#S256": "abc"}),
+        json!({"jkt": key.thumbprint(), "x5t#S256": "abc"}),
+        json!({"jkt": key.thumbprint(), "kid": "k1"}),
+    ] {
+        assert_error(
+            &jag_bearer(&h, &bound(cnf), proof(&key)).await,
+            StatusCode::BAD_REQUEST,
+            "invalid_grant",
+            "credential_cnf_unsupported",
+        );
+    }
+    // A certificate binding, on a server that does not bind its tokens to certificates (and
+    // over plain HTTP, with no certificate at all): refused, never a bearer token.
+    let x5t = json!({ "x5t#S256": "ungWv48Bz-pBQUDeXa4iI7ADYaOWF3qctBD_YfIAFa0" });
     assert_error(
-        &jag_bearer(&h, &bound(json!({"x5t#S256": "abc"})), proof(&key)).await,
+        &jag_bearer(&h, &bound(x5t), None).await,
         StatusCode::BAD_REQUEST,
         "invalid_grant",
-        "credential_pop_required",
+        "credential_cert_required",
     );
     // With the right proof: issued, and bound to the same key.
     let (status, body) = jag_bearer(&h, &bound(jkt.clone()), proof(&key)).await;

@@ -35,7 +35,13 @@
 //! first refuses a kind the issuer's `[[idps]] credentials` does not list with
 //! `credential_type_not_accepted`, SR-122); for
 //! an ID-JAG, require its `client_id` to be the authenticated agent and, when it has a
-//! `cnf.jkt`, a DPoP proof by that key (`credential_pop_required`, `credential_pop_mismatch`);
+//! `cnf.jkt`, a DPoP proof by that key (`credential_pop_required`, `credential_pop_mismatch`),
+//! or, when it has a `cnf.x5t#S256`, that the agent authenticated with that TLS client
+//! certificate and that the root token is bound to it ([`check_cert_bound_id_jag`]:
+//! `credential_cert_required`, `credential_cert_mismatch`; a `cnf` with anything else is
+//! `credential_cnf_unsupported`). The `cnf` rules are also applied to the ID-JAG's payload
+//! right after the agent is authenticated, before anything single-use is recorded, so that a
+//! refusal for the binding uses nothing up;
 //! build the originating user
 //! ([`claims::originating_user`]); find the `[[root_grants]]` entry for (issuer, agent,
 //! subject) and attenuate the request against it (`invalid_scope`); for an ID-JAG from an
@@ -175,6 +181,56 @@ pub(crate) async fn handle(
         .and_then(|c| c.get("source"))
         .and_then(Value::as_str)
         .map(str::to_owned);
+    // The SHA-256 of the certificate that authenticated the agent, if one did: the only
+    // certificate an ID-JAG bound to a certificate (`cnf.x5t#S256`) can be used with.
+    let authenticated_cert = client
+        .as_ref()
+        .and_then(Authenticated::client_cert)
+        .map(|c| *c.sha256());
+    // An ID-JAG's `cnf` decides, before anything is used up, what this request may be: read
+    // from the ID-JAG's payload before its signature is checked, so that a request refused for
+    // its binding uses up no client assertion, DPoP proof, ID-JAG or actor token, and the
+    // client can send it again corrected (SR-108, SR-111). Only a refusal comes of it: the
+    // verified claims decide again below. Counted by `[limits] token_requests_per_minute` as
+    // the later refusals are, except that an assertion already used is refused as a replay
+    // first (`clientauth::refuse_before_commit`).
+    if kind == CredentialKind::IdJag {
+        if let Some(payload) = super::unverified_payload(credential) {
+            let early = claims::id_jag_cnf(&payload)
+                .map_err(ApiError::from)
+                .and_then(|cnf| match cnf {
+                    claims::IdJagCnf::X5tS256(bound) => check_cert_bound_id_jag(
+                        state.cert_bound_tokens,
+                        authenticated_cert.as_ref(),
+                        cert.is_some(),
+                        headers,
+                        &bound,
+                    ),
+                    claims::IdJagCnf::None | claims::IdJagCnf::Jkt(_) => Ok(()),
+                });
+            if let Err(refused) = early {
+                // A used client assertion is answered as a replay and not counted; an unused
+                // one is not recorded, and the request is counted.
+                let key = client
+                    .as_ref()
+                    .and_then(Authenticated::replay_key)
+                    .map(str::to_owned);
+                let (agent, mark) = (agent.clone(), mark.cloned());
+                return Err(state
+                    .blocking(move |s| {
+                        clientauth::refuse_before_commit(
+                            s,
+                            key.as_deref(),
+                            &agent,
+                            mark.as_ref(),
+                            now,
+                            refused,
+                        )
+                    })
+                    .await);
+            }
+        }
+    }
     // A client assertion authenticates this one request, whatever its outcome: its `jti` is
     // recorded now (`crate::clientauth`), unlike the actor token and the IdP credential, which
     // are recorded together once the root token is issued. The rate limit and a DPoP proof
@@ -223,6 +279,8 @@ pub(crate) async fn handle(
     }
 
     let verified = state.idps.verify(credential, kind, &agent, now).await?;
+    // An ID-JAG bound to the certificate the root token is bound to: the record's `id_jag_cnf`.
+    let mut id_jag_cert_bound = false;
     if kind == CredentialKind::IdJag {
         let jag = claims::map_id_jag(&verified.claims)?;
         if jag.client_id != agent {
@@ -232,37 +290,17 @@ pub(crate) async fn handle(
             }
             .into());
         }
-        // A sender-constrained ID-JAG (draft -04 §9.8.1.2, -06 §4.4.1): the request must carry
-        // a DPoP proof by the key in `cnf.jkt`, and the root token is then bound to that key.
-        if let Some(jkt) = &jag.cnf_jkt {
-            match &cnf {
-                Some(c) if c.key_thumbprint() == Some(jkt.as_str()) => {}
-                Some(attenuo_token::Confirmation::Jkt(_)) => {
-                    return Err(IntakeError::PopMismatch.into())
-                }
-                // Bound to the agent's certificate: the ID-JAG's key binding cannot be kept.
-                Some(attenuo_token::Confirmation::X5tS256(_)) => {
-                    return Err(IntakeError::PopRequired(
-                        "the ID-JAG is bound to a DPoP key, and this server binds tokens of \
-                         agents that authenticate with a certificate to the certificate \
-                         ([token] tls_client_certificate_bound_access_tokens)"
-                            .into(),
-                    )
-                    .into())
-                }
-                None => {
-                    return Err(IntakeError::PopRequired(
-                        if state.dpop.mode() == crate::config::DpopMode::Off {
-                            "the ID-JAG is bound to a DPoP key and [token] dpop is off".into()
-                        } else {
-                            "the ID-JAG is bound to a DPoP key: send a DPoP proof by that key"
-                                .into()
-                        },
-                    )
-                    .into())
-                }
-            }
-        }
+        id_jag_cert_bound = verified_binding(
+            &jag.cnf,
+            cnf.as_ref(),
+            &Binder {
+                dpop_off: state.dpop.mode() == crate::config::DpopMode::Off,
+                cert_bound_tokens: state.cert_bound_tokens,
+                authenticated_cert: authenticated_cert.as_ref(),
+                request_has_cert: cert.is_some(),
+                headers,
+            },
+        )?;
     }
     let user = claims::originating_user(&verified)?;
     if crate::routes::is_reserved_subject(&user.subject) {
@@ -397,6 +435,11 @@ pub(crate) async fn handle(
                 "dpop_bound": dpop_bound,
             });
             binding.add_to(&mut args);
+            // Present only for an ID-JAG bound to a certificate, so the digest of every other
+            // record is unchanged.
+            if id_jag_cert_bound {
+                args["id_jag_cnf"] = "x5t#S256".into();
+            }
             // Present only under `[idps.id_jag_ceiling]`, so the digest of every other
             // record is unchanged: the claims that narrowed the root grant (empty when the
             // ID-JAG carried none of them).
@@ -436,6 +479,7 @@ pub(crate) async fn handle(
         agent_auth,
         client_cert_x5t_s256 = client_x5t.as_deref(),
         client_cert_source = client_source.as_deref(),
+        id_jag_cnf = id_jag_cert_bound.then_some("x5t#S256"),
         lease = %issued.lease.0,
         // Only when `[idps.id_jag_ceiling]` was applied: which claims narrowed the root grant
         // and what they said, as the IdP signed them, capped and Debug-formatted (SR-126).
@@ -712,6 +756,130 @@ fn ceiling_claim_values(names: &[&str], claims: &serde_json::Map<String, Value>)
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// What the binding of a hop-0 request depends on, for [`verified_binding`].
+struct Binder<'a> {
+    /// `[token] dpop = "off"`.
+    dpop_off: bool,
+    /// `[token] tls_client_certificate_bound_access_tokens`.
+    cert_bound_tokens: bool,
+    /// The SHA-256 of the certificate that authenticated the agent, if one did.
+    authenticated_cert: Option<&'a [u8; 32]>,
+    /// Whether the request shows a verified client certificate at all.
+    request_has_cert: bool,
+    /// The request's headers (for a `DPoP` header).
+    headers: &'a HeaderMap,
+}
+
+/// The binding rules on the verified `cnf` of an ID-JAG (`cnf_claim`), given the binding the
+/// root token is about to get (`root`). Returns whether the ID-JAG is bound to a certificate
+/// (the record's `id_jag_cnf`).
+///
+/// - no `cnf`: nothing to check;
+/// - `cnf.jkt`: the root token is bound to that key, else `credential_pop_mismatch` (another
+///   key) or `credential_pop_required` (no key, or the agent's certificate);
+/// - `cnf.x5t#S256`: [`check_cert_bound_id_jag`], and the root token is bound to that
+///   certificate, else `credential_cert_mismatch`.
+fn verified_binding(
+    cnf_claim: &claims::IdJagCnf,
+    root: Option<&attenuo_token::Confirmation>,
+    b: &Binder<'_>,
+) -> Result<bool, ApiError> {
+    match cnf_claim {
+        claims::IdJagCnf::None => Ok(false),
+        // A sender-constrained ID-JAG (draft -04 §9.8.1.2, -06 §4.4.1): the request must
+        // carry a DPoP proof by the key in `cnf.jkt`, and the root token is then bound to
+        // that key.
+        claims::IdJagCnf::Jkt(jkt) => match root {
+            Some(c) if c.key_thumbprint() == Some(jkt.as_str()) => Ok(false),
+            Some(attenuo_token::Confirmation::Jkt(_)) => Err(IntakeError::PopMismatch.into()),
+            // Bound to the agent's certificate: the ID-JAG's key binding cannot be kept.
+            Some(attenuo_token::Confirmation::X5tS256(_)) => Err(IntakeError::PopRequired(
+                "the ID-JAG is bound to a DPoP key, and this server binds tokens of \
+                     agents that authenticate with a certificate to the certificate \
+                     ([token] tls_client_certificate_bound_access_tokens)"
+                    .into(),
+            )
+            .into()),
+            None => Err(IntakeError::PopRequired(if b.dpop_off {
+                "the ID-JAG is bound to a DPoP key and [token] dpop is off".into()
+            } else {
+                "the ID-JAG is bound to a DPoP key: send a DPoP proof by that key".into()
+            })
+            .into()),
+        },
+        // Bound to a TLS client certificate (-06 §9.11.2, RFC 8705 §3, ADR-0025): the
+        // agent authenticated with that certificate, and the root token is bound to it.
+        // `handle` decided this already from the payload; here it is decided from the
+        // verified claims.
+        claims::IdJagCnf::X5tS256(bound) => {
+            check_cert_bound_id_jag(
+                b.cert_bound_tokens,
+                b.authenticated_cert,
+                b.request_has_cert,
+                b.headers,
+                bound,
+            )?;
+            match root.and_then(attenuo_token::Confirmation::cert_thumbprint) {
+                Some(issued) if crate::cert_binding::check_cert(issued, Some(bound)).is_ok() => {}
+                // Not reached: the root token is bound to the certificate that
+                // authenticated the agent, which is the one checked. Fail closed.
+                _ => return Err(IntakeError::CertMismatch.into()),
+            }
+            Ok(true)
+        }
+    }
+}
+
+/// The rules of an ID-JAG bound to a TLS client certificate (`cnf.x5t#S256`, SHA-256
+/// `bound`; draft -06 §9.11.2, RFC 8705 §3,
+/// [ADR-0025](../../docs/decisions/0025-id-jag-certificate-binding.md)), in this order:
+///
+/// 1. no `DPoP` header: the root token gets one binding, the certificate
+///    (400 `invalid_request` / `dpop_with_certificate_binding`);
+/// 2. `[token] tls_client_certificate_bound_access_tokens` on (`enabled`): otherwise the root
+///    token would be a bearer token, so the ID-JAG's binding would be lost
+///    (`credential_cert_required`);
+/// 3. the agent authenticated with a TLS client certificate on this request
+///    (`self_signed_tls_client_auth` or `tls_client_auth`, from the handshake or from a
+///    trusted proxy): `authenticated` is its SHA-256. A certificate on the request
+///    (`request_has_cert`) that did not authenticate the agent does not count
+///    (`credential_cert_required`);
+/// 4. that certificate is the bound one, compared in constant time
+///    (`credential_cert_mismatch`).
+///
+/// Every refusal but the first is 400 `invalid_grant`, as for `cnf.jkt` (-06 §9.11).
+fn check_cert_bound_id_jag(
+    enabled: bool,
+    authenticated: Option<&[u8; 32]>,
+    request_has_cert: bool,
+    headers: &HeaderMap,
+    bound: &[u8; 32],
+) -> Result<(), ApiError> {
+    if crate::dpop::header_proof(headers)?.is_some() {
+        return Err(crate::cert_binding::CertFailure::WithDpop { issuing: true }.into());
+    }
+    if !enabled {
+        return Err(IntakeError::CertRequired(
+            "this server does not bind its tokens to client certificates \
+             ([token] tls_client_certificate_bound_access_tokens is off)",
+        )
+        .into());
+    }
+    let Some(authenticated) = authenticated else {
+        return Err(IntakeError::CertRequired(if request_has_cert {
+            "the agent did not authenticate with the TLS client certificate of this request"
+        } else {
+            "the request shows no verified TLS client certificate"
+        })
+        .into());
+    };
+    if crate::routes::admin::constant_time_eq(authenticated, bound) {
+        Ok(())
+    } else {
+        Err(IntakeError::CertMismatch.into())
+    }
 }
 
 /// Which credential the request carries, by grant type and token type.
@@ -1159,6 +1327,132 @@ mod tests {
             )),
             Some("client_auth_not_accepted")
         );
+    }
+
+    /// The rules of an ID-JAG bound to a certificate, in their order: a DPoP proof first, then
+    /// the setting, then a certificate that authenticated the agent, then the thumbprint.
+    #[test]
+    fn a_certificate_bound_id_jag_needs_the_certificate_that_authenticated() {
+        let bound = [1u8; 32];
+        let other = [2u8; 32];
+        let none = HeaderMap::new();
+        let mut dpop = HeaderMap::new();
+        dpop.insert("dpop", HeaderValue::from_static("x.y.z"));
+        let code = |r: Result<(), ApiError>| r.unwrap_err().stable_code().to_owned();
+        let check = |enabled, authenticated, on_request, headers: &HeaderMap| {
+            check_cert_bound_id_jag(enabled, authenticated, on_request, headers, &bound)
+        };
+        assert!(check(true, Some(&bound), true, &none).is_ok());
+        for (enabled, authenticated, on_request, headers, want) in [
+            (
+                true,
+                Some(&bound),
+                true,
+                &dpop,
+                "dpop_with_certificate_binding",
+            ),
+            (
+                false,
+                Some(&bound),
+                true,
+                &dpop,
+                "dpop_with_certificate_binding",
+            ),
+            (false, Some(&bound), true, &none, "credential_cert_required"),
+            (true, None, true, &none, "credential_cert_required"),
+            (true, None, false, &none, "credential_cert_required"),
+            (true, Some(&other), true, &none, "credential_cert_mismatch"),
+        ] {
+            let e = check(enabled, authenticated, on_request, headers).unwrap_err();
+            assert_eq!(e.stable_code(), want);
+            let error = if want == "dpop_with_certificate_binding" {
+                "invalid_request"
+            } else {
+                "invalid_grant"
+            };
+            assert_eq!((e.status.as_u16(), e.code.as_str()), (400, error), "{want}");
+        }
+        // A thumbprint that differs in its last byte only.
+        let mut near = bound;
+        near[31] ^= 1;
+        assert_eq!(
+            code(check(true, Some(&near), true, &none)),
+            "credential_cert_mismatch"
+        );
+    }
+
+    /// The checks on the verified claims, which also hold when the earlier pass on the
+    /// payload did not run: a `cnf.x5t#S256` needs the certificate that authenticated the
+    /// agent and a root token bound to it; a `cnf.jkt` needs a root token bound to its key.
+    #[test]
+    fn the_verified_cnf_decides_the_binding() {
+        use attenuo_token::Confirmation;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let bound = [3u8; 32];
+        let other = [4u8; 32];
+        let x5t = |d: &[u8; 32]| Confirmation::x5t_s256(URL_SAFE_NO_PAD.encode(d));
+        let headers = HeaderMap::new();
+        let binder = |authenticated: Option<&'static [u8; 32]>| Binder {
+            dpop_off: false,
+            cert_bound_tokens: true,
+            authenticated_cert: authenticated,
+            request_has_cert: authenticated.is_some(),
+            headers: &headers,
+        };
+        static BOUND: [u8; 32] = [3u8; 32];
+        static OTHER: [u8; 32] = [4u8; 32];
+        let cert = claims::IdJagCnf::X5tS256(bound);
+        let code = |r: Result<bool, ApiError>| r.unwrap_err().stable_code().to_owned();
+
+        assert!(verified_binding(&cert, Some(&x5t(&bound)), &binder(Some(&BOUND))).unwrap());
+        // The root token would be unbound, bound to a key, or bound to another certificate.
+        for root in [None, Some(Confirmation::jkt("k")), Some(x5t(&other))] {
+            assert_eq!(
+                code(verified_binding(
+                    &cert,
+                    root.as_ref(),
+                    &binder(Some(&BOUND))
+                )),
+                "credential_cert_mismatch",
+                "{root:?}"
+            );
+        }
+        // The agent did not authenticate with the bound certificate.
+        assert_eq!(
+            code(verified_binding(&cert, Some(&x5t(&bound)), &binder(None))),
+            "credential_cert_required"
+        );
+        assert_eq!(
+            code(verified_binding(
+                &cert,
+                Some(&x5t(&bound)),
+                &binder(Some(&OTHER))
+            )),
+            "credential_cert_mismatch"
+        );
+        let mut off = binder(Some(&BOUND));
+        off.cert_bound_tokens = false;
+        assert_eq!(
+            code(verified_binding(&cert, Some(&x5t(&bound)), &off)),
+            "credential_cert_required"
+        );
+
+        // `cnf.jkt` and no `cnf`.
+        let jkt = claims::IdJagCnf::Jkt("k".into());
+        let b = binder(None);
+        assert!(!verified_binding(&jkt, Some(&Confirmation::jkt("k")), &b).unwrap());
+        assert_eq!(
+            code(verified_binding(&jkt, Some(&Confirmation::jkt("j")), &b)),
+            "credential_pop_mismatch"
+        );
+        for root in [None, Some(x5t(&bound))] {
+            assert_eq!(
+                code(verified_binding(&jkt, root.as_ref(), &b)),
+                "credential_pop_required"
+            );
+        }
+        assert!(!verified_binding(&claims::IdJagCnf::None, None, &b).unwrap());
+        assert!(!verified_binding(&claims::IdJagCnf::None, Some(&x5t(&bound)), &b).unwrap());
     }
 
     #[test]

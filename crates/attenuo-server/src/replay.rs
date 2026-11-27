@@ -147,6 +147,19 @@ impl ReplayCache {
         }
     }
 
+    /// Whether `key` is used (a live marker) at `now`, without recording it. Runs a store read:
+    /// call it on the blocking pool.
+    ///
+    /// # Errors
+    ///
+    /// [`ReplayRefusal::Unavailable`] when the store cannot be read (logged): fail closed.
+    pub fn is_used(&self, key: &str, now: OffsetDateTime) -> Result<bool, ReplayRefusal> {
+        self.store.is_used(key, now.unix_timestamp()).map_err(|e| {
+            tracing::error!(error = %e, "could not read the single-use credential markers");
+            ReplayRefusal::Unavailable
+        })
+    }
+
     /// How many markers the store holds (live, or expired and not yet deleted); 0 when it
     /// cannot be read.
     pub fn len(&self) -> usize {

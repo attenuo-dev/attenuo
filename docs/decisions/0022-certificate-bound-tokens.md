@@ -53,7 +53,7 @@ Chosen option: "bind to the certificate that authenticated, the same certificate
   - `ServerAuthorizer::authenticate` without a request (a caller with no headers) refuses every bound token.
 - **Exchange.** A child of a certificate-bound token gets the same `x5t#S256`, whoever it is for and however that actor authenticated, and the request must show that certificate. No `DPoP` header and no `subject_token_dpop` are taken with such a subject token (`dpop_with_certificate_binding`). So there is no way to get an unbound child, a key-bound child, or a child bound to another certificate. These refusals come before a client assertion is recorded, so a corrected request can send the same assertion again (SR-108, SR-111). At `/token` a missing or wrong certificate is 401, as a missing DPoP proof for a key-bound subject token is there. A `jkt` parent keeps the DPoP rules exactly, whatever this setting says; its child is key-bound. An unbound parent's child is bound as at hop 0.
 - **Approval tokens** are never certificate-bound. For a certificate-bound hop the approval token carries no key binding and stays tied to the lease and the call, as for a bearer hop. An approval token with an `x5t#S256` `cnf` is refused.
-- **ID-JAG.** An ID-JAG with `cnf.x5t#S256` is still refused as an unsupported confirmation method. An ID-JAG with `cnf.jkt` needs a DPoP proof, so with the setting on an agent that authenticates with its certificate cannot use one: with a `DPoP` header the request is 400 `dpop_with_certificate_binding`, and without one it is 400 `invalid_grant` / `credential_pop_required`.
+- **ID-JAG.** An ID-JAG with `cnf.x5t#S256` is still refused as an unsupported confirmation method. (Changed by [ADR-0025](0025-id-jag-certificate-binding.md): such an ID-JAG is now accepted from an agent that authenticated with that certificate.) An ID-JAG with `cnf.jkt` needs a DPoP proof, so with the setting on an agent that authenticates with its certificate cannot use one: with a `DPoP` header the request is 400 `dpop_with_certificate_binding`, and without one it is 400 `invalid_grant` / `credential_pop_required`.
 - **Audit.** Records of requests made with a certificate-bound token, and of issuances that bound a token to a certificate, carry `"cert_bound": true` in the record, and the issuance and renewal arguments carry `"cert_bound": true` too. The member is omitted otherwise, so other records hash as before. No `SCHEMA_VERSION` change. Refused presentations and refused exchange bindings are not audited, as DPoP failures are not.
 - **Rotation.** A token dies with its certificate. A new certificate, even for the same agent and pinned next to the old one, does not carry the binding over. The agent gets new tokens with the new certificate.
 
@@ -91,6 +91,6 @@ Chosen option: "bind to the certificate that authenticated, the same certificate
 
 ## More Information
 
-Not done here: cross-holder delegation, ID-JAG `cnf.x5t#S256`, SDK support, a thumbprint passed by an external PEP.
+Not done here: cross-holder delegation, ID-JAG `cnf.x5t#S256` (since done, [ADR-0025](0025-id-jag-certificate-binding.md)), SDK support, a thumbprint passed by an external PEP.
 
 Related: ADR-0019, ADR-0020 and ADR-0021, which decide the certificate; RFC-0001 section 4.1 for DPoP.

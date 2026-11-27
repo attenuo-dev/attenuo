@@ -578,9 +578,20 @@ What attenuo checks:
 - `jti` is present (REQUIRED in the draft); each ID-JAG is accepted once.
 - `exp`, `iat`, `nbf`, `sub` as for an ID token.
 - With `[[idps]] tenant` set, `tenant` is present and equal to it (see below).
-- With a `cnf` claim (a sender-constrained ID-JAG), the request carries a DPoP proof by the key in `cnf.jkt`, and the root token is bound to that key. Without a proof the request fails with `credential_pop_required`, with a proof by another key with `credential_pop_mismatch`. A `cnf` without `jkt` (for example an mTLS certificate binding) is refused with `credential_pop_required`, because attenuo cannot check it, and so is any `cnf` when `[token] dpop = "off"`.
+- With a `cnf` claim (a sender-constrained ID-JAG), `cnf` holds exactly one of `jkt` and `x5t#S256`, and nothing else. A `cnf` with both, with another member, or with an `x5t#S256` that is not a base64url SHA-256 (43 characters, no padding) fails with `credential_cnf_unsupported`. A `cnf` that is not an object, or is empty, fails with `credential_pop_required`.
+- With `cnf.jkt`, the request carries a DPoP proof by that key, and the root token is bound to that key. Without a proof the request fails with `credential_pop_required`, with a proof by another key with `credential_pop_mismatch`. With `[token] dpop = "off"` it always fails with `credential_pop_required`.
+- With `cnf.x5t#S256` (a TLS client certificate, draft §9.11.2), the rules are below, under **ID-JAG bound to a certificate**.
 
-The agent always authenticates (client secret, client assertion or actor token), even for a sender-constrained ID-JAG; the draft only requires one or the other.
+The agent always authenticates (client secret, client assertion, TLS client certificate or actor token), even for a sender-constrained ID-JAG; the draft only requires one or the other.
+
+**ID-JAG bound to a certificate.** An ID-JAG with `cnf.x5t#S256` is accepted only when all of these hold ([ADR-0025](../decisions/0025-id-jag-certificate-binding.md)):
+
+- `[token] tls_client_certificate_bound_access_tokens = true` ([binding tokens](binding-tokens-to-keys.md#binding-tokens-to-a-tls-client-certificate)). Without it the root token would be a bearer token, so the ID-JAG is refused with `credential_cert_required`. attenuo never drops the binding the IdP asked for.
+- The agent authenticated with its TLS client certificate on this request ([TLS client certificates](#tls-client-certificates), [from a CA](#tls-client-certificates-from-a-ca-spiffe)), from attenuo's own TLS listener or from a trusted proxy ([behind a proxy](#behind-a-tls-terminating-proxy)). Send `client_id` and no secret or assertion. An actor token next to it is fine. A certificate on the connection does not count when a secret, an assertion or an actor token alone authenticated the agent: `credential_cert_required`.
+- That certificate's SHA-256 is the `x5t#S256` value. Another certificate fails with `credential_cert_mismatch`, also a second certificate from the same CA with the same SAN, and the next certificate of a rotation.
+- The request has no `DPoP` header. A token has one binding: 400 `invalid_request` / `dpop_with_certificate_binding`.
+
+The root token is bound to the same certificate, and its children keep it. These checks run before anything is used up, so after a refusal the same ID-JAG, client assertion and DPoP proof can be sent again on a corrected request. The `token.root` audit record carries `"id_jag_cnf": "x5t#S256"`.
 
 By default the draft's `resource`, `scope` and `authorization_details` claims are not used: what the root token may carry comes from `[[root_grants]]` and the request, and an IdP that narrows an ID-JAG to one resource does not narrow the root token. `aud_tenant`, `aud_sub` and `sub_id` are never used: the user is `sub`.
 
@@ -794,6 +805,8 @@ Errors carry a stable `code` (the same value as `error_description`, which older
 | `400 invalid_grant` / `audience_mismatch` | An ID-JAG's `aud` is not `[issuer] issuer`, or is an array with more than one element |
 | `400 invalid_grant` / `tenant_mismatch` | An ID-JAG's `tenant` is not the `[[idps]] tenant` of its issuer |
 | `400 invalid_grant` / `credential_pop_required`, `credential_pop_mismatch` | The ID-JAG has a `cnf` claim and the request has no DPoP proof, a proof by another key, or `[token] dpop = "off"` |
+| `400 invalid_grant` / `credential_cert_required`, `credential_cert_mismatch` | The ID-JAG has `cnf.x5t#S256` and the agent did not authenticate with a TLS client certificate, authenticated with another one, or `[token] tls_client_certificate_bound_access_tokens` is off |
+| `400 invalid_grant` / `credential_cnf_unsupported` | The ID-JAG's `cnf` has both `jkt` and `x5t#S256`, another member, or an `x5t#S256` that is not a base64url SHA-256 |
 | `400 invalid_grant` / `unsupported_alg` | The token's `alg` is not in `allowed_algs` |
 | `400 invalid_grant` / `unknown_kid` | The signing key is not in the IdP's JWKS, even after a refetch |
 | `400 invalid_grant` / `bad_signature`, `expired`, `not_yet_valid` | The token is bad, stale, or your clock is off by more than `clock_skew_seconds` |

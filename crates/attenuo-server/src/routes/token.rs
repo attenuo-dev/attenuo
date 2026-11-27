@@ -445,9 +445,17 @@ fn exchange_sync(
                 if let Err(refused) = checked {
                     // Counted by `[limits] token_requests_per_minute` as the refusals after
                     // the commit are, so that this check costs the agent its budget too: over
-                    // the limit the answer is the usual 429. The assertion is not used up.
-                    state.limits.admit_agent(mark, client.id())?;
-                    return Err(refused.into());
+                    // the limit the answer is the usual 429. The assertion is not used up;
+                    // one already used is refused as a replay and not counted
+                    // (`clientauth::refuse_before_commit`).
+                    return Err(clientauth::refuse_before_commit(
+                        state,
+                        client.replay_key(),
+                        client.id(),
+                        mark,
+                        now,
+                        refused.into(),
+                    ));
                 }
             }
         }

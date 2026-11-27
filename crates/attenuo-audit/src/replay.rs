@@ -77,6 +77,16 @@ pub trait ReplayStore: Send + Sync {
     ///
     /// A store fault (see [`ReplayStore`]).
     fn replay_markers(&self) -> Result<usize, AuditError>;
+
+    /// Whether `key` has a live marker at `now` (its expiry after `now`). Reads only: nothing
+    /// is recorded or deleted. For a refusal that must not use a credential up but must not
+    /// treat a used one as fresh either. A later [`use_all_once`](Self::use_all_once) still
+    /// decides the use.
+    ///
+    /// # Errors
+    ///
+    /// A store fault (see [`ReplayStore`]).
+    fn is_used(&self, key: &str, now: i64) -> Result<bool, AuditError>;
 }
 
 /// Whether some key appears twice in `keys`: the same credential twice in one request is a
@@ -136,5 +146,13 @@ impl MemoryReplay {
 
     pub(crate) fn len(&self) -> Result<usize, AuditError> {
         Ok(self.entries.lock()?.len())
+    }
+
+    pub(crate) fn is_used(&self, key: &str, now: i64) -> Result<bool, AuditError> {
+        Ok(self
+            .entries
+            .lock()?
+            .get(key)
+            .is_some_and(|&expires_at| expires_at > now))
     }
 }
