@@ -389,16 +389,15 @@ pub async fn user_get(
             .map_err(|e| ApiError::bad_token(&e))?;
         // A token bound to a TLS client certificate needs the request's certificate
         // (`crate::cert_binding`).
-        crate::cert_binding::check_presented(
+        let cert = extensions.get::<crate::client_cert::ClientCertificate>();
+        let binding = crate::cert_binding::check_presented(
             &state.dpop,
             &crate::cert_binding::Presented {
                 cnf: verified.claims.cnf.as_ref(),
                 token: &token,
                 proof: crate::dpop::header_proof(&headers)?,
                 dpop_scheme: crate::cert_binding::dpop_scheme(&headers),
-                cert: extensions
-                    .get::<crate::client_cert::ClientCertificate>()
-                    .map(crate::client_cert::ClientCertificate::sha256),
+                cert: cert.map(crate::client_cert::ClientCertificate::sha256),
                 method: "GET",
                 url: &state
                     .dpop
@@ -409,6 +408,10 @@ pub async fn user_get(
         if attenuo_core::chain_id_of(&verified.chain).as_deref() != Some(a.chain_id.0.as_str()) {
             // Not this run's: do not confirm the approval exists.
             return Err(unknown_approval(&id));
+        }
+        // After the run check, so that another run's token learns nothing of the approval.
+        if binding.cert() {
+            crate::cert_binding::check_revocation(&state.clients, &verified.chain, cert, now)?;
         }
         // A token whose lease (or an ancestor's) was revoked or has expired speaks for no
         // agent any more, though its signature still verifies (SR-60): answer it as one of

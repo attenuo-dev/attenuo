@@ -256,7 +256,7 @@ Notes:
 - If a request carries a secret or a client assertion too, that one decides. The certificate is then ignored.
 - A certificate on the connection makes `client_id` a credential, also next to an actor token. With an actor token, send no `client_id`, or present no certificate: otherwise the certificate counts too. Under `[token] actor_auth = "actor_token"` the request is then refused with `client_auth_not_accepted`, whatever the certificate. Under `"either"` it is refused with `client_authentication_failed` when the certificate is not pinned for that id.
 - The certificate's dates are checked on every request. An expired certificate stops working without a reload, so renew it in time.
-- There is no CRL or OCSP check. To revoke a certificate, remove its thumbprint and reload.
+- There is no CRL or OCSP check. To revoke a certificate, remove its thumbprint and reload. CRL files apply to certificates from a CA only.
 - Tokens issued this way are bearer tokens (or DPoP-bound, if the client sends a DPoP proof). With `[token] tls_client_certificate_bound_access_tokens = true` they are bound to the certificate instead, and every later request with them must show it ([binding tokens to a TLS client certificate](binding-tokens-to-keys.md#binding-tokens-to-a-tls-client-certificate)).
 - Every refusal is the same `401 client_authentication_failed`. The reason is in the server's debug log.
 
@@ -335,10 +335,69 @@ Notes:
 - The client may send at most 4 intermediate CA certificates. If it needs cross-certificates, it sends the one its path uses first: only the first one with a given subject is used.
 - A certificate that also carries the name of another agent (or, for a PEP, another PEP) is refused. Extra names that no entry uses are fine. So adding an entry whose name is an extra SAN in another client's certificate (for example one of SPIRE's `dns_names`) makes that certificate be refused for both entries; the debug log says `certificate_names_several_clients`.
 - A key-rollover link certificate (the new root signed by the old one) that the client sends is ignored, because it is self-issued: put the new root in the CA file.
-- There is no CRL or OCSP check. To stop a certificate before it expires, remove the CA or change the name on the entry and reload. Short-lived certificates make this matter less.
+- There is no OCSP check. To stop a certificate before it expires, list your CA's CRL ([below](#revoking-certificates-with-a-crl)), or remove the CA or change the name on the entry and reload. Short-lived certificates make this matter less.
 - A CA you list can make a certificate for any name. List a CA only on the entries it should vouch for.
 
 The full rules are in the [config reference](../reference/config.md#tls-client-certificates-from-a-ca).
+
+#### Revoking certificates with a CRL
+
+An entry can list CRL files from its CA. A certificate a CRL lists is refused on its next request, also on a connection that is already open. attenuo reads the files; it never fetches them.
+
+**1. Make a CRL.** With the CA from step 1 above, `openssl ca` keeps a small database of revoked certificates:
+
+```sh
+# Once: the database and its config.
+mkdir -p crl-db && touch crl-db/index.txt && echo 01 > crl-db/crlnumber
+cat > crl.cnf <<'END'
+[ca]
+default_ca = agents
+
+[agents]
+database = crl-db/index.txt
+crlnumber = crl-db/crlnumber
+default_md = sha256
+default_crl_days = 7
+crl_extensions = crl_ext
+
+[crl_ext]
+authorityKeyIdentifier = keyid:always
+END
+
+# Revoke coder's certificate, then write a new CRL.
+openssl ca -config crl.cnf -cert agents-ca.pem -keyfile agents-ca.key -revoke coder.crt
+openssl ca -config crl.cnf -cert agents-ca.pem -keyfile agents-ca.key -gencrl -out agents-ca.crl
+openssl crl -in agents-ca.crl -noout -text
+```
+
+Each `-gencrl` raises the CRL number, and the CRL is valid for `default_crl_days`. Run it again before then, also when nothing was revoked.
+
+**2. Configure.**
+
+```toml
+[[agents]]
+id = "coder"
+tls_client_ca_pem_path = "/etc/attenuo/agents-ca.pem"
+tls_client_auth_san_uri = "spiffe://example.org/ns/agents/sa/coder"
+tls_client_crl_paths = ["/etc/attenuo/agents-ca.crl"]
+```
+
+If an intermediate CA issues the certificates, list its CRL too, and put the intermediate's certificate in `tls_client_crl_issuer_pem_path`, so attenuo knows its key. The root's CRL then covers the intermediate itself. If the intermediate is in `tls_client_ca_pem_path` as well (for clients that send no chain), the path ends there, and attenuo checks the intermediate in the root's CRL only when the root is in `tls_client_ca_pem_path` or `tls_client_crl_issuer_pem_path` too. So keep the root in the CA file next to the intermediate. Each certificate of `tls_client_crl_issuer_pem_path` must have started (`notBefore`) and be issued by a CA allowed to sign certificates. Once the root's CRL revokes the intermediate, the reload goes on and the intermediate's CRL is ignored, with a warning: a revoked CA signs no CRL attenuo uses, so every certificate the intermediate issued is refused (`client_certificate_revocation_unknown`). An ignored CRL is not checked for staleness, nor against the one in force, so the intermediate's last CRL, even past its `nextUpdate`, does not hold the reload back; a certificate it lists is still `client_certificate_revoked`. When an intermediate is renewed, list its current certificate in `tls_client_crl_issuer_pem_path`: with only an expired copy there, its CRL is ignored and every certificate it issued is `client_certificate_revocation_unknown`. This takes effect at the next start or reload after `notAfter`, not at the moment `notAfter` passes. Remove the CRL of a revoked intermediate at the next reload to drop the warning.
+
+**3. Reload after each new CRL.** Copy the new file into place in one step (write it next to the old one, then `mv`), and run `attenuo admin agent reload`. The reload reads every CRL again. It is refused, and the CRLs in force stay, when a file is broken, signed by another key, or older than the one in force (`client_crl_older`).
+
+**What stale means.** A CRL is stale once its `nextUpdate` has passed. By default (`tls_client_crl_stale = "refuse"`) every certificate whose path needs that CRL is refused from that second on, with no reload: the server cannot tell whether it was revoked since. The answer is `401 client_certificate_revocation_unknown`. A server with a stale CRL does not start, and a reload with one is refused. So schedule the new CRL well before `nextUpdate`, and alert when the job fails. With `tls_client_crl_stale = "allow"`, a stale CRL is still used.
+
+Notes:
+
+- A revoked certificate gets `401 client_certificate_revoked`, logged at info level with its `x5t#S256`. Refusals are not audited.
+- A CA with no CRL in the entry is not checked, unless `tls_client_crl_missing = "refuse"`. Under the default, the start and each reload log a warning naming each such CA by subject.
+- A CA certificate in `tls_client_ca_pem_path` that is not self-signed, and whose issuer is in that file or in `tls_client_crl_issuer_pem_path`, is checked in its issuer's CRL like any intermediate, and a warning names it when that CRL lists it. A self-signed root, or a CA whose issuer neither file holds, cannot be revoked by a CRL: remove a compromised one from the file and reload.
+- The rule that a reload never goes back to an older CRL compares with the CRLs in force only. A restart accepts any valid CRL, also an older one than before the restart. So does a reload after one that dropped that CA's CRL. Keep only the newest file in place.
+- Pinned certificates (`tls_client_cert_sha256`) are not affected by CRLs.
+- A token bound to a revoked certificate stops working too; see [binding tokens](binding-tokens-to-keys.md#binding-tokens-to-a-tls-client-certificate).
+
+The full rules are in the [config reference](../reference/config.md#crl-files).
 
 ### Behind a TLS-terminating proxy
 
@@ -350,7 +409,7 @@ What is different:
 - Anyone who can connect to the forwarding listener from a listed address can claim any certificate. Bind it where only the proxy reaches it.
 - Every other listener refuses those headers with `400` while the section is set. So a client that sends them to the main listener fails at once.
 - The audit records say `"source": "forwarded"` in `client_cert`; `actor_auth` and `agent_auth` are the same as on the native listener.
-- With HAProxy, which sends no chain, put the intermediate CA in the entry's CA file.
+- With HAProxy, which sends no chain, put the intermediate CA in the entry's CA file. With CRLs, keep the root in that file too: the intermediate is then checked in the root's CRL, as when the client sends it.
 - With certificate-bound tokens, the proxy must forward the certificate on every route that takes a token, not only on `/token`.
 
 The setup, the fences, and a tested HAProxy recipe are in [forwarded client certificates](deploying.md#forwarded-client-certificates).

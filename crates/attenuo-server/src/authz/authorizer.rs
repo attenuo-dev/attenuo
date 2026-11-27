@@ -31,6 +31,9 @@ pub struct ServerAuthorizer {
     dpop: Option<Arc<crate::dpop::Dpop>>,
     trace: Option<Arc<crate::telemetry::ServerTrace>>,
     limits: Option<Arc<crate::limits::Limits>>,
+    /// The server, for the `[[agents]]` in force: the revocation check of a token bound to a
+    /// certificate (`crate::cert_binding::check_revocation`).
+    clients: Option<Arc<crate::state::AppState>>,
 }
 
 impl ServerAuthorizer {
@@ -46,7 +49,16 @@ impl ServerAuthorizer {
             dpop: None,
             trace: None,
             limits: None,
+            clients: None,
         }
+    }
+
+    /// Check a certificate-bound token's certificate against the CRLs of its agents' entries
+    /// in `state`'s `[[agents]]` (`crate::cert_binding::check_revocation`). Without this, the
+    /// thumbprint alone decides.
+    pub(crate) fn with_clients(mut self, state: Arc<crate::state::AppState>) -> Self {
+        self.clients = Some(state);
+        self
     }
 
     /// Count each authenticated request against `[limits] mcp_requests_per_minute` of its run
@@ -281,6 +293,19 @@ impl Authorizer for ServerAuthorizer {
                 }
             },
         };
+        // A token bound to the request's certificate: that certificate still passes the check
+        // of its agents' entries with CRLs. Only for such a token: nothing more for others.
+        if binding.cert() {
+            if let Some(state) = &self.clients {
+                let cert = crate::cert_binding::request_certificate();
+                crate::cert_binding::check_revocation(
+                    &state.clients,
+                    &v.claims.chain,
+                    cert.as_ref(),
+                    now,
+                )?;
+            }
+        }
         let dpop_bound = binding.dpop();
         // The key an approval for this hop is bound to: only when the request proved it.
         let jkt = dpop_bound

@@ -2,7 +2,7 @@
 //! key URL tests with `ca_pem_path` (`key_url_ca.rs`, `client_jwks_uri.rs`), the server
 //! certificate files and TLS clients of the `[server.tls]` tests (`server_tls.rs`), and
 //! client certificates for the mTLS client authentication tests (`mtls.rs`): self-signed
-//! ones, and ones a CA or an intermediate CA issued.
+//! ones, and ones a CA or an intermediate CA issued; and the CRLs of `client_crl.rs`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -51,8 +51,19 @@ impl Ca {
 
     /// An intermediate CA this CA issues.
     pub fn intermediate(&self, name: &str) -> Self {
+        self.intermediate_with(name, |_| {})
+    }
+
+    /// An intermediate CA this CA issues, with `edit` applied to its parameters (a serial
+    /// number, for a CRL that revokes it).
+    pub fn intermediate_with(
+        &self,
+        name: &str,
+        edit: impl FnOnce(&mut rcgen::CertificateParams),
+    ) -> Self {
         let key = rcgen::KeyPair::generate().unwrap();
-        let params = Self::ca_params(name);
+        let mut params = Self::ca_params(name);
+        edit(&mut params);
         let cert = params
             .signed_by(&key, &rcgen::Issuer::from_params(&self.params, &self.key))
             .unwrap();
@@ -64,6 +75,23 @@ impl Ca {
             key,
             above,
         }
+    }
+
+    /// A new certificate for this CA, with its name and key, that `issuer` signs, with `edit`
+    /// applied to its parameters (its dates, for a copy that has expired).
+    pub fn reissued(
+        &self,
+        issuer: &Ca,
+        edit: impl FnOnce(&mut rcgen::CertificateParams),
+    ) -> rcgen::Certificate {
+        let mut params = self.params.clone();
+        edit(&mut params);
+        params
+            .signed_by(
+                &self.key,
+                &rcgen::Issuer::from_params(&issuer.params, &issuer.key),
+            )
+            .unwrap()
     }
 
     /// A client certificate this CA issues: valid from a day ago for 30 days, `CA:FALSE`,
@@ -102,6 +130,51 @@ impl Ca {
             key_der: self.key.serialize_der(),
             chain: self.above.clone(),
         }
+    }
+
+    /// A CRL this CA signs (PEM), listing the certificates with `serials` as revoked, with
+    /// `thisUpdate` and `nextUpdate` and the `cRLNumber` `number`.
+    pub fn crl(
+        &self,
+        serials: &[u64],
+        this_update: time::OffsetDateTime,
+        next_update: time::OffsetDateTime,
+        number: u64,
+    ) -> String {
+        self.crl_with(serials, this_update, next_update, number, |_| {})
+    }
+
+    /// [`Ca::crl`], with `edit` applied to the parameters (an `issuingDistributionPoint`).
+    pub fn crl_with(
+        &self,
+        serials: &[u64],
+        this_update: time::OffsetDateTime,
+        next_update: time::OffsetDateTime,
+        number: u64,
+        edit: impl FnOnce(&mut rcgen::CertificateRevocationListParams),
+    ) -> String {
+        let mut params = rcgen::CertificateRevocationListParams {
+            this_update,
+            next_update,
+            crl_number: rcgen::SerialNumber::from(number),
+            issuing_distribution_point: None,
+            revoked_certs: serials
+                .iter()
+                .map(|s| rcgen::RevokedCertParams {
+                    serial_number: rcgen::SerialNumber::from(*s),
+                    revocation_time: this_update,
+                    reason_code: Some(rcgen::RevocationReason::KeyCompromise),
+                    invalidity_date: None,
+                })
+                .collect(),
+            key_identifier_method: rcgen::KeyIdMethod::Sha256,
+        };
+        edit(&mut params);
+        params
+            .signed_by(&rcgen::Issuer::from_params(&self.params, &self.key))
+            .unwrap()
+            .pem()
+            .unwrap()
     }
 
     /// Write the CA certificate as PEM into `dir`.

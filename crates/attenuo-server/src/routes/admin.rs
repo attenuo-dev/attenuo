@@ -2116,9 +2116,10 @@ pub async fn reload_agents(
     let (agents_in, peps_in) = (file.agents.clone(), file.peps.clone());
     let (own_check, checked) = state
         .blocking(move |s| {
+            let now = s.now();
             let own_check = (own_rules != s.client_rules)
-                .then(|| own_rules.check(&agents_in, &peps_in).map(|_| ()));
-            (own_check, s.client_rules.check(&agents_in, &peps_in))
+                .then(|| own_rules.check(&agents_in, &peps_in, now).map(|_| ()));
+            (own_check, s.client_rules.check(&agents_in, &peps_in, now))
         })
         .await;
     let (new, mut warnings) = match checked {
@@ -2144,6 +2145,17 @@ pub async fn reload_agents(
         )],
         _ => Vec::new(),
     };
+    // A CRL never goes back: the reload is refused when it would put an older CRL of a CA
+    // in force than the one in force now (`crate::client_crl::check_not_older`).
+    if let Err(e) = crate::client_crl::check_not_older(current.crl_sets(), new.crl_sets()) {
+        let refusal = ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "client_crl_older",
+            format!("{e}; {unchanged}"),
+        );
+        return Err(audited_refusal(&state, who, TOOL, &path, refusal, now).await);
+    }
+    crate::client_crl::log_in_force(new.crl_sets());
     let new = Arc::new(new);
     let old = state.clients.swap(Arc::clone(&new));
     let (agents, peps) = old.changes_to(&new);

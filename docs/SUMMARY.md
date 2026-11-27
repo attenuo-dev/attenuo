@@ -95,6 +95,7 @@
   - [ADR-0021: TLS client certificates forwarded by a proxy](decisions/0021-forwarded-client-certificates.md)
   - [ADR-0022: Certificate-bound access tokens](decisions/0022-certificate-bound-tokens.md)
   - [ADR-0023: Server certificate reload](decisions/0023-server-certificate-reload.md)
+  - [ADR-0024: CRL files for client certificates](decisions/0024-client-certificate-crls.md)
 
 # Research
 

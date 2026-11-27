@@ -377,7 +377,9 @@ impl AppState {
         }
         // `[[agents]]` and `[[peps]]`, with the check `POST /admin/agents/reload` makes too.
         let client_rules = ClientRules::from_config(config);
-        let (clients, warnings) = client_rules.check(&config.agents, &config.peps)?;
+        let (clients, warnings) =
+            client_rules.check(&config.agents, &config.peps, clock.now_utc())?;
+        crate::client_crl::log_in_force(clients.crl_sets());
         for warning in warnings {
             tracing::warn!("{warning}");
         }
