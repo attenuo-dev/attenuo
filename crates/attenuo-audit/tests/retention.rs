@@ -2026,6 +2026,15 @@ fn the_golden_negative_cases_fail_the_anchor_cross_check() {
     assert!(attenuo_audit::cross_check_anchors(&retained, &a, &keys).ok);
 }
 
+/// SQL that changes the first byte of the entry hash at `seq`. (Writing a fixed `ff` left the
+/// hash as it was when it began with `ff`, one run in 256.)
+fn corrupt_entry_hash(seq: u64) -> String {
+    format!(
+        "UPDATE audit SET entry_hash = CASE WHEN substr(entry_hash, 1, 2) = 'ff' \
+         THEN '00' ELSE 'ff' END || substr(entry_hash, 3) WHERE seq = {seq}"
+    )
+}
+
 /// `verify_retained_through`, which an automatic prune runs before it prunes: it walks the
 /// prefix only, so a break above it is not its business, and a break, a rewritten entry or a
 /// bad checkpoint inside it fails it. After a prune it walks from the anchor, on to the prune
@@ -2042,17 +2051,11 @@ fn the_prefix_verify_sees_the_prefix_only() {
         (20, Some(20), None)
     );
     // A rewritten entry above the prefix is not seen; inside it, it is.
-    exec(
-        &log,
-        "UPDATE audit SET entry_hash = 'ff' || substr(entry_hash, 3) WHERE seq = 33",
-    );
+    exec(&log, &corrupt_entry_hash(33));
     assert!(log.verify_retained_through(20, &k).unwrap().ok);
     assert!(!log.verify_chain_signed(&k).unwrap().ok);
     let log = log_of(&issuer, 10, 45);
-    exec(
-        &log,
-        "UPDATE audit SET entry_hash = 'ff' || substr(entry_hash, 3) WHERE seq = 7",
-    );
+    exec(&log, &corrupt_entry_hash(7));
     let r = log.verify_retained_through(20, &k).unwrap();
     assert!(!r.ok, "{r:?}");
     assert_eq!(r.first_bad_seq, Some(7));
