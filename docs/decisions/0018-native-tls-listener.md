@@ -109,3 +109,7 @@ The decision above stands. The CLI limit named under "Bad" is lifted: `--tls-ca-
 ### Update 2026-11-24: forwarded client certificates
 
 The decision above stands. A proxy that ends TLS in front of attenuo can now forward the client's certificate to a listener of its own, `[server.forwarded_client_cert]` ([ADR-0021](0021-forwarded-client-certificates.md)). That listener speaks plain HTTP. With `[server.tls]` set too, the main router's TLS guard accepts requests from that listener's trusted peers in place of TLS ones; every other plain-HTTP request is still refused.
+
+### Update 2026-11-25: certificate reload and handshake metrics
+
+The decision above stands, with one change: the files are no longer read only at start. `POST /admin/tls/reload` (`attenuo admin tls reload`) reads them again from the same paths and puts the new certificate in force for new connections, with the startup checks and a few more: the certificate's dates, no CA certificate first, the chain's length ([ADR-0023](0023-server-certificate-reload.md)). The consequence "a renewed certificate takes a restart" no longer holds. Failed handshakes are now counted in `tls_handshake_failures_total`, by a fixed reason.
