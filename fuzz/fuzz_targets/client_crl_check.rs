@@ -1,5 +1,5 @@
 //! The CRL check of the TLS client certificate check at authentication (`client_crl.rs` and
-//! `client_pki.rs`, ADR-0023), through the `fuzzing` feature of attenuo-server, which wraps the
+//! `client_pki.rs`, ADR-0024), through the `fuzzing` feature of attenuo-server, which wraps the
 //! server's own functions: `crl_check` (`client_crl::load` with its `signers`, signature,
 //! date and issuer-file checks and the trust anchors' issuers, then `CrlSet::status`,
 //! `CrlSet::anchor_status`, and `client_pki::verify`, which runs `path_status` on each path

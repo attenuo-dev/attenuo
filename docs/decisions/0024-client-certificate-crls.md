@@ -6,7 +6,7 @@ consulted: []
 informed: []
 ---
 
-# ADR-0023. CRL files for client certificates from a CA: read from disk, signed by a CA the entry trusts, stale CRLs refuse by default, checked again for certificate-bound tokens
+# ADR-0024. CRL files for client certificates from a CA: read from disk, signed by a CA the entry trusts, stale CRLs refuse by default, checked again for certificate-bound tokens
 
 ## Context and Problem Statement
 

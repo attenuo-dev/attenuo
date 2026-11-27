@@ -1,5 +1,5 @@
 //! Certificate revocation lists (CRL files, RFC 5280 §5) for RFC 8705 `tls_client_auth`
-//! ([ADR-0023](../../docs/decisions/0023-client-certificate-crls.md)).
+//! ([ADR-0024](../../docs/decisions/0024-client-certificate-crls.md)).
 //!
 //! An `[[agents]]` or `[[peps]]` entry with `tls_client_ca_pem_path` may list CRL files in
 //! `tls_client_crl_paths`. They are read at start and by an agents reload, never fetched.

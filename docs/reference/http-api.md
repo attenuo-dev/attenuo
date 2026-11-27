@@ -201,7 +201,7 @@ The table is generated from `attenuo_core::error_codes::ERROR_CODES`, the one pl
 | `prune_not_at_checkpoint` | 409 |  |  | The requested boundary is not a signed checkpoint that matches the log. |
 | `prune_too_recent` | 409 |  |  | The entry at the requested boundary is younger than `[audit.retention] min_age_seconds`. |
 | `rate_limited` | 429 | `-32007` (429) |  | A rate limit is used up; retry after `Retry-After`. |
-| `reload_unavailable` | 409 |  |  | The policy, the admin operators, the agents and peps, or the issuer keys cannot be reloaded in this configuration (no policy file; a server not started from a config file). |
+| `reload_unavailable` | 409 |  |  | The policy, the admin operators, the agents and peps, the issuer keys or the TLS certificate cannot be reloaded in this configuration (no policy file; a server not started from a config file; no `[server.tls]`). |
 | `replay_cache_full` | 503 `temporarily_unavailable` |  |  | Too many single-use credentials are in flight; retry later. |
 | `replay_store_unavailable` | 503 `temporarily_unavailable` |  |  | The use of a single-use credential could not be recorded, so it is refused (fail closed); retry later. |
 | `replayed` | 400 `invalid_grant` |  |  | The credential or delegation was already used. |
@@ -218,6 +218,11 @@ The table is generated from `attenuo_core::error_codes::ERROR_CODES`, the one pl
 | `session_unknown` |  | `-32600` (404) |  | The `Mcp-Session-Id` is not bound; start a new session. |
 | `sink_behind` | 409 |  |  | The checkpoint sink is degraded or has not delivered the checkpoint at the requested boundary. |
 | `tenant_mismatch` | 400 `invalid_grant` |  |  | The ID-JAG's `tenant` is not the `[[idps]] tenant` of its issuer. |
+| `tls_certificate_expired` | 422 |  |  | A TLS certificate reload: the first certificate of `[server.tls] cert_pem_path` has expired (its `notAfter` is in the past). The certificate in force is unchanged. |
+| `tls_certificate_not_yet_valid` | 422 |  |  | A TLS certificate reload: the first certificate of `[server.tls] cert_pem_path` is not valid yet (its `notBefore` is in the future). The certificate in force is unchanged. |
+| `tls_file_invalid` | 422 |  |  | A TLS certificate reload: a `[server.tls]` file can be read but not used (empty, not PEM, no certificate, a private key in the certificate file, no key or more than one private key of any kind, a key or certificate rustls cannot use, dates that cannot be read, a first certificate that is a CA, or a chain of more than 10 certificates or 64 KiB of DER). The message names the setting, never the path or the content. The certificate in force is unchanged. |
+| `tls_file_unreadable` | 422 |  |  | A TLS certificate reload: a `[server.tls]` file cannot be read (missing, no permission, not a regular file, too large), or the key file's owner or mode is refused as at startup. The message names the setting, never the path. The certificate in force is unchanged. |
+| `tls_key_mismatch` | 422 |  |  | A TLS certificate reload: the private key of `[server.tls] key_pem_path` does not belong to the first certificate of `cert_pem_path`. The certificate in force is unchanged. |
 | `token_expired` | 401 `unauthorized`, 400 `invalid_grant` | `-32001` (401), `-32001` (200) |  | The token verified but has expired (a bearer, or at `POST /token` the subject token or a hop of its chain). |
 | `too_many_capabilities` | 400 `invalid_scope` |  |  | A request (an exchange, a hop-0 request, `POST /admin/root-token`) asks for more than 1,024 capabilities, more than one token may hold. |
 | `too_many_constraints` | 400 `invalid_scope` |  |  | A request (an exchange, a hop-0 request, `POST /admin/root-token`) has more than 1,024 argument constraints over all its capabilities. |
@@ -572,6 +577,7 @@ Where they are served: on the main listener by default; with `[admin] listen` se
 | `POST /admin/operators/reload` | Re-read `[[admin.operators]]`, and nothing else, from the config file the server was started with, and swap them in at once. See [Operators reload](#operators-reload). Also on the console listener with `[admin_ui] allow_write = true`, where the console's Reload page uses it. |
 | `POST /admin/agents/reload` | Re-read `[[agents]]` and `[[peps]]` from the config file the server was started with, check them as startup does, and swap both in at once. Tokens already issued are not revoked. Body `{}`, or `allow_empty` / `allow_mismatch`. See [Agents reload](#agents-reload). Also on the console listener with `[admin_ui] allow_write = true`. |
 | `POST /admin/keys/reload` | Re-read the key files named by `[issuer] private_key_pem_path` and `previous_key_paths` in the config file, and swap in the new signing key and verifying keys at once. Body `{}`, or `allow_drop_current` / `allow_drop_audit_key` / `allow_mismatch`. See [Keys reload](#keys-reload). Also on the console listener with `[admin_ui] allow_write = true`. |
+| `POST /admin/tls/reload` | Re-read the `[server.tls]` certificate and key files (the paths read at startup) and use them for new connections. Open connections keep the old certificate. No body. See [TLS certificate reload](#tls-certificate-reload). Also on the console listener with `[admin_ui] allow_write = true`. |
 | `GET /admin/policies` | The policy set in force: file path, its `sha256` and `loaded_at` (startup or last successful reload), `policy_ids`, validation `warnings`, and `policies: [{id, text}]`. |
 | `GET /admin/policies/check` | Lint the policy file as it is on disk now against the running schema, with line and column for each issue, and say whether it differs from the loaded one. Loads nothing, audits nothing. 409 `check_unavailable` without `policy.policies_path`. |
 | `POST /admin/policies/evaluate` | Dry run: what the loaded policies decide for one call, given a token or a chain, and optionally the run-limit state to assume (`budget`). No lease check, no charge, no audit record, no decision metric. |
@@ -704,6 +710,55 @@ Refusals (on every one, the keys in force are unchanged):
 - 409 `reload_unavailable`: the server was not started from a config file.
 - 500 `config_unreadable`: the config file cannot be read; the cause is in the server log only.
 - 500 `server_error`: the file could not be compared with the config in force. This is not expected; nothing is applied, since the mismatch check could not be made.
+
+### TLS certificate reload
+
+`POST /admin/tls/reload` (role `admin`, no body) puts a renewed server certificate in force without a restart. It reads `[server.tls] cert_pem_path` and `key_pem_path` again. The paths are the ones read at startup: the config file is not read again, so a reload cannot change a path or any other setting. Reloads run one at a time.
+
+It makes every check startup makes ([config](config.md#servertls)), and these more:
+
+- The first certificate must be valid now (not expired, not before its `notBefore`). Only the first certificate's dates are checked, not the intermediates'.
+- The first certificate must not be a CA (`basicConstraints` with `cA` true).
+- The chain must hold at most 10 certificates and at most 64 KiB of DER in all. Every handshake sends the whole chain.
+
+Startup checks none of these. It logs a warning for a CA first certificate or a chain over the limits, and starts.
+
+It answers SHA-256 digests and dates, never a key, a file's content or a path:
+
+```json
+{
+  "changed": true,
+  "certificate_sha256": "<64 hex>",
+  "previous_certificate_sha256": "<64 hex>",
+  "not_before": "2026-11-25T00:00:00Z",
+  "not_after": "2027-02-23T00:00:00Z",
+  "chain_length": 2,
+  "audit_id": "<uuid>"
+}
+```
+
+- `certificate_sha256` and `previous_certificate_sha256` are the SHA-256 (lowercase hex) of the first certificate's DER, after and before. `changed` is false when they are the same. The new files are put in force either way.
+- `chain_length` counts the certificates of `cert_pem_path`, the first one included.
+- The `admin.tls.reload` audit record keeps the digest of its arguments: `{cert_pem_path, key_pem_path}` and the members of the answer (without `audit_id`). The record is appended before the new certificate is put in force. When it cannot be appended, nothing changes and the answer is a 500. A reload waits for the one before it to end; if its client goes away while it waits, it never runs. Once a reload has started, it runs to the end even if the client goes away. A 422 refusal is recorded as a `deny` whose `reason` is the refusal's code, with the two paths and `previous_certificate_sha256`. The 409 is not audited.
+
+What follows the reload:
+
+- Each new connection takes one snapshot of the TLS configuration before its handshake. A handshake uses the old certificate and key or the new ones, never a mix.
+- Connections that are already open keep the certificate they were made with, until they close. `[limits] header_read_timeout_seconds` bounds how long an idle one stays open.
+- Nothing else changes: TLS 1.3 only, ALPN `http/1.1`, no session resumption, and `client_certificates` stay as they were. Client certificates, `tls_client_cert_sha256`, `tls_client_ca_pem_path` and certificate-bound tokens are about the client's certificate, so they work as before. The CA files of `tls_client_ca_pem_path` are read by `POST /admin/agents/reload`, not by this reload.
+- `tls_certificate_not_after_timestamp_seconds` shows the new `notAfter`, and `tls_certificate_reloads_total{result="ok"}` counts the reload ([metrics](#metrics)).
+- With several replicas, each one reloads its own files: send the request to each.
+
+Refusals (on every one, the certificate in force keeps serving). `detail` names the setting and the problem, never the path or the file's content:
+
+- 422 `tls_file_unreadable`: a file cannot be read (missing, no permission), is not a regular file, is too large (1 MiB for the certificate file, 64 KiB for the key file), or the key file's owner or mode breaks the startup rule.
+- 422 `tls_file_invalid`: a file can be read but not used: empty, not PEM, no certificate (an empty chain), a private key in the certificate file, no key or more than one private key (any `PRIVATE KEY` section counts, an encrypted one too), an encrypted key, a key rustls cannot use, a first certificate that cannot be parsed, dates that cannot be read, a CA first certificate, or a chain of more than 10 certificates or 64 KiB of DER.
+- 422 `tls_key_mismatch`: the key does not belong to the first certificate. A reload that runs while the files are being written can see a new certificate with the old key. Write each file to a temporary name and rename it into place, then reload.
+- 422 `tls_certificate_expired`: the first certificate's `notAfter` is in the past.
+- 422 `tls_certificate_not_yet_valid`: the first certificate's `notBefore` is in the future.
+- 409 `reload_unavailable`: there is no `[server.tls]`.
+
+Each 422 is counted in `tls_certificate_reloads_total{result="failed"}` and logged at warn. So is a 500 when the audit record cannot be appended.
 
 ### Budget refund
 
@@ -1071,6 +1126,9 @@ Every series is prefixed `attenuo_`. Label values come from fixed sets, so the n
 | `requests_shed_total` | counter | none | Requests answered `503` `overloaded` because `[limits] max_in_flight` requests were already being handled. `/healthz` and `/readyz` are never shed. |
 | `requests_rate_limited_total` | counter | `limit` (`token`, `token_unauthenticated`, `mcp`, `authzen_search`), `cause` (`limit`, `table_full`) | Requests answered `429` by a `[limits]` rate limit: per agent, per peer address, per run, action searches per run; `table_full` when a new caller met `rate_limit_max_keys` callers inside their minute (for the per-peer limit, one that then authenticated no agent). |
 | `request_timeouts_total` | counter | `kind` (`body`, `handler`) | Requests past a `[limits]` deadline: the body did not arrive within `request_body_timeout_seconds`, or no answer within `request_timeout_seconds`. |
+| `tls_handshake_failures_total` | counter | `reason` (`bad_client_certificate`, `protocol`, `peer_alert`, `timeout`, `other`) | Failed TLS handshakes of the main listener (`[server.tls]`). `bad_client_certificate`: the client sent a certificate that does not parse, or whose handshake signature does not verify. `protocol`: the peer does not speak TLS 1.3 with `http/1.1` (another version, no common cipher suite or ALPN protocol, a plain-HTTP request). `peer_alert`: the peer ended the handshake with an alert, for example because it does not trust the server certificate. `timeout`: not done within `[limits] header_read_timeout_seconds`. `other`: the connection closed or broke. The reason comes from the kind of error only, never from what the peer sent. All five series always present; 0 without `[server.tls]`. |
+| `tls_certificate_not_after_timestamp_seconds` | gauge | none | Unix time the server certificate in force expires (the `notAfter` of the first certificate of `[server.tls] cert_pem_path`). Set at startup and by each successful TLS reload. 0 without `[server.tls]`. |
+| `tls_certificate_reloads_total` | counter | `result` (`ok`, `failed`) | `POST /admin/tls/reload` calls that read the files: `ok` put them in force, `failed` was refused and kept the old certificate. Calls refused before reading (no admin bearer, no `[server.tls]`) are not counted. |
 | `http_requests_total` | counter | `route` (route template, for example `/mcp/{server}`), `status` | HTTP requests by route template and status. |
 | `authorize_duration_seconds` | histogram | none | Time to decide one tool call: leases, labels, run limits, run lock, approval, policy, charge and audit append. |
 | `audit_append_duration_seconds` | histogram | none | Time for one audit log append, including waiting for the store's lock. |

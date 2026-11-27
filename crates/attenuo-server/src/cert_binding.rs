@@ -21,7 +21,7 @@
 //! - another certificate: `client_certificate_mismatch`;
 //! - a `DPoP` header, or the `DPoP` authorization scheme: `dpop_with_certificate_binding`;
 //! - a certificate that is the bound one but fails the check of its `[[agents]]` entry with
-//!   `tls_client_crl_paths` ([`check_revocation`], ADR-0023): `client_certificate_revoked`,
+//!   `tls_client_crl_paths` ([`check_revocation`], ADR-0024): `client_certificate_revoked`,
 //!   or `client_certificate_revocation_unknown` for any other failure of that check (a stale
 //!   or missing CRL, an expired certificate, a path that no longer builds). The same codes on
 //!   every route, the MCP proxy's included (JSON-RPC `-32001`). The check runs only for a

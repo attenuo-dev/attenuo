@@ -364,6 +364,20 @@ pub(crate) enum AdminCmd {
     /// The server's token signing key and the retired keys that still verify (`[issuer]`).
     #[command(subcommand)]
     Key(AdminKeyCmd),
+    /// The main listener's TLS certificate (`[server.tls]`).
+    #[command(subcommand)]
+    Tls(AdminTlsCmd),
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum AdminTlsCmd {
+    /// Ask the server to re-read the certificate and key files of `[server.tls]` (the paths it
+    /// was started with) and use them for new connections without a restart
+    /// (`POST /admin/tls/reload`, role `admin`). Open connections keep the old certificate.
+    /// Prints the SHA-256 of the certificate before and after, and its validity dates. On a
+    /// refusal (a file that cannot be read or used, a key that does not match, a certificate
+    /// that has expired or is not valid yet) the certificate in force is unchanged.
+    Reload,
 }
 
 #[derive(Debug, Subcommand)]

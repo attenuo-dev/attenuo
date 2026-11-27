@@ -1,4 +1,4 @@
-//! The CRL file reads of the TLS client certificate check (`client_crl.rs`, ADR-0023), through
+//! The CRL file reads of the TLS client certificate check (`client_crl.rs`, ADR-0024), through
 //! the `fuzzing` feature of attenuo-server, which wraps the server's own functions:
 //! `crl_parse` (a CRL file's bytes, PEM or DER, up to its signature: rustls-webpki's parser,
 //! the entry count and the server's own reads), `crl_facts` (the issuer, dates, `cRLNumber`

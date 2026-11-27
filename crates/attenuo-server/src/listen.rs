@@ -16,9 +16,17 @@
 //! nothing, or half a handshake, is dropped when it runs out. The request headers then get the
 //! timeout again, as on a plain connection. With `[server.tls] client_certificates =
 //! "optional"`, the certificate the client proved in the handshake goes into each request of
-//! the connection as a [`ClientCertificate`]; nothing else ever sets it. A failed handshake (a plain-HTTP request, an old
-//! TLS version, a client that does not trust the certificate) is logged at debug and closes
-//! the connection; the listener goes on.
+//! the connection as a [`ClientCertificate`]; nothing else ever sets it. A failed handshake (a
+//! plain-HTTP request, an old TLS version, a client that does not trust the certificate) closes
+//! the connection and the listener goes on. It is counted in `tls_handshake_failures_total` by
+//! a reason from a fixed set ([`crate::metrics::HandshakeFailure`]), and logged at debug at
+//! most once per 10 seconds, with the number of failures not logged since: a flood of failed
+//! handshakes adds neither series nor log lines without bound.
+//!
+//! Each connection takes one snapshot of the TLS configuration in force
+//! ([`crate::tls::ServerTls::current`]) before its handshake, so a `POST /admin/tls/reload`
+//! that swaps it meanwhile changes nothing for that connection: it uses the old configuration
+//! or the new one, whole. No lock is held across an `await`.
 //!
 //! With [`Transport::Forwarded`] (`[server.forwarded_client_cert]`) the connection is plain
 //! HTTP and its TCP peer address must be in `trusted_peers`: any other peer gets `403
@@ -46,14 +54,21 @@ use tower::ServiceExt as _;
 
 use crate::client_cert::ClientCertificate;
 use crate::forwarded::TrustedPeers;
+use crate::metrics::{HandshakeFailure, Metrics};
+use crate::tls::ServerTls;
+
+/// For the debug line of a failed handshake: at most one per 10 seconds.
+static HANDSHAKE_FAILED: crate::forwarded::Throttle = crate::forwarded::Throttle::new();
 
 /// What a listener speaks, and where a request's client certificate may come from.
 #[derive(Clone)]
 pub(crate) enum Transport {
     /// Plain HTTP; no client certificate.
     Plain,
-    /// TLS ([`crate::tls`]); the certificate of the handshake, if any.
-    Tls(TlsAcceptor),
+    /// TLS ([`crate::tls`]) with the configuration in force when each connection is
+    /// accepted; the certificate of the handshake, if any. Failed handshakes are counted in
+    /// the metrics.
+    Tls(std::sync::Arc<ServerTls>, std::sync::Arc<Metrics>),
     /// Plain HTTP from the peers listed only; the certificate from the `Client-Cert` headers
     /// ([`crate::forwarded`]).
     Forwarded(std::sync::Arc<TrustedPeers>),
@@ -62,7 +77,7 @@ pub(crate) enum Transport {
 impl Transport {
     /// Whether connections speak TLS.
     pub(crate) fn is_tls(&self) -> bool {
-        matches!(self, Transport::Tls(_))
+        matches!(self, Transport::Tls(..))
     }
 }
 
@@ -135,21 +150,27 @@ pub(crate) async fn serve(
                     }
                     serve_connection(stream, service, header_read_timeout, &mut stop).await
                 }
-                Transport::Tls(acceptor) => {
+                Transport::Tls(tls, metrics) => {
+                    // One snapshot for the whole handshake: a reload after this line does not
+                    // change it.
+                    let acceptor = TlsAcceptor::from(tls.current().config.clone());
+                    drop(tls);
                     let handshake =
                         tokio::time::timeout(header_read_timeout, acceptor.accept(stream));
                     let stream = tokio::select! {
                         res = handshake => match res {
                             Ok(Ok(stream)) => stream,
                             Ok(Err(e)) => {
-                                tracing::debug!(%peer, error = %e, "TLS handshake failed");
+                                handshake_failed(
+                                    &metrics,
+                                    peer,
+                                    crate::tls::handshake_failure(&e),
+                                    Some(&e),
+                                );
                                 return;
                             }
                             Err(_) => {
-                                tracing::debug!(
-                                    %peer,
-                                    "TLS handshake not done within the header-read timeout"
-                                );
+                                handshake_failed(&metrics, peer, HandshakeFailure::Timeout, None);
                                 return;
                             }
                         },
@@ -178,6 +199,34 @@ pub(crate) async fn serve(
     drop(stop_tx);
     drop(live_rx);
     live_tx.closed().await;
+}
+
+/// Count a failed handshake, and log it at debug unless one was logged in the last 10 seconds.
+fn handshake_failed(
+    metrics: &Metrics,
+    peer: SocketAddr,
+    reason: HandshakeFailure,
+    error: Option<&std::io::Error>,
+) {
+    metrics.tls_handshake_failed(reason);
+    if let Some(suppressed) = HANDSHAKE_FAILED.warn() {
+        match error {
+            Some(e) => tracing::debug!(
+                %peer,
+                reason = reason.label(),
+                error = %e,
+                suppressed,
+                "TLS handshake failed (suppressed: failures not logged since the last line)"
+            ),
+            None => tracing::debug!(
+                %peer,
+                reason = reason.label(),
+                suppressed,
+                "TLS handshake not done within the header-read timeout (suppressed: failures \
+                 not logged since the last line)"
+            ),
+        }
+    }
 }
 
 /// Serve one connection with hyper's HTTP/1 server until it ends; once `stop` changes (or its

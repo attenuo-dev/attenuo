@@ -145,7 +145,7 @@ Rust-implemented authorization language with a sound-and-complete logical encodi
 
 ## RFC 5280, certificate revocation lists (added 2026-11-25)
 
-RFC 5280 §5 defines the X.509 CRL, and §6.3 how a relying party uses one. attenuo reads CRL files for client certificates from a CA ([ADR-0023](../decisions/0023-client-certificate-crls.md), [CRL files](../reference/config.md#crl-files)).
+RFC 5280 §5 defines the X.509 CRL, and §6.3 how a relying party uses one. attenuo reads CRL files for client certificates from a CA ([ADR-0024](../decisions/0024-client-certificate-crls.md), [CRL files](../reference/config.md#crl-files)).
 
 | RFC 5280 | attenuo | Status |
 | --- | --- | --- |

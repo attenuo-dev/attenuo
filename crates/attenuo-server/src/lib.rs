@@ -34,6 +34,7 @@
 //! | `POST /admin/operators/reload` | admin | re-read `[[admin.operators]]` from the config file and swap them in ([`routes::admin::reload_operators`]) |
 //! | `POST /admin/agents/reload` | admin | re-read `[[agents]]` and `[[peps]]` from the config file, check them as startup does and swap both in at once; tokens already issued are not revoked ([`routes::admin::reload_agents`]) |
 //! | `POST /admin/keys/reload` | admin | re-read the `[issuer]` key files named in the config file and swap in the new signing key and verifying keys at once; refuses to drop the current key or a key that signed the audit log unless asked ([`routes::keys::reload_keys`]) |
+//! | `POST /admin/tls/reload` | admin | re-read the `[server.tls]` certificate and key files (the paths read at startup) and put them in force for new connections; open connections keep the old ones; refuses files that startup would refuse, and an expired or not yet valid certificate ([`routes::tls_reload::reload_tls`]) |
 //! | `GET /admin/policies` | admin | the policy set in force: ids, text, file digest, load time ([`routes::policies`]) |
 //! | `GET /admin/policies/check` | admin | lint the policy file on disk against the running schema; swaps nothing |
 //! | `POST /admin/policies/evaluate` | admin | dry run: what the loaded policies say about one call, optionally with a stated run-limit state (`budget`); no lease check, no charge, no audit |
@@ -568,7 +569,7 @@ pub fn admin_router(state: Arc<AppState>) -> Router {
 /// Every `/admin/*` route of the table above, behind [`routes::admin::require_admin`]. Mounted
 /// on the main listener ([`router`]) or on its own ([`admin_router`]), never on both.
 fn admin_routes(state: &Arc<AppState>) -> Router<Arc<AppState>> {
-    use routes::{admin, approvals, dev_root, keys, policies, retention};
+    use routes::{admin, approvals, dev_root, keys, policies, retention, tls_reload};
 
     let mut admin_routes = Router::new()
         .route("/admin/whoami", get(admin::whoami))
@@ -597,6 +598,7 @@ fn admin_routes(state: &Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/admin/operators/reload", post(admin::reload_operators))
         .route("/admin/agents/reload", post(admin::reload_agents))
         .route("/admin/keys/reload", post(keys::reload_keys))
+        .route("/admin/tls/reload", post(tls_reload::reload_tls))
         .route("/admin/approvals", get(approvals::admin_list))
         .route(
             "/admin/approvals/{id}",
@@ -997,7 +999,7 @@ pub async fn run(
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     let main = match state.main_tls.clone() {
-        Some(tls) => listen::Transport::Tls(tokio_rustls::TlsAcceptor::from(tls)),
+        Some(tls) => listen::Transport::Tls(tls, state.metrics.clone()),
         None => listen::Transport::Plain,
     };
     tracing::info!(

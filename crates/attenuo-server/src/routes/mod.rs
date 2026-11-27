@@ -11,6 +11,7 @@ pub mod page;
 pub mod policies;
 pub mod renew;
 pub mod retention;
+pub mod tls_reload;
 pub mod token;
 pub mod wellknown;
 

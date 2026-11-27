@@ -1,4 +1,4 @@
-//! CRL files for RFC 8705 `tls_client_auth` (ADR-0023): `tls_client_crl_paths`,
+//! CRL files for RFC 8705 `tls_client_auth` (ADR-0024): `tls_client_crl_paths`,
 //! `tls_client_crl_issuer_pem_path`, `tls_client_crl_stale` and `tls_client_crl_missing` on
 //! `[[agents]]` entries with `tls_client_ca_pem_path`. Real sockets through
 //! [`attenuo_server::run`], the code `serve` runs, with the native TLS listener and the
@@ -1723,7 +1723,7 @@ async fn two_cas_with_one_name_are_told_apart_by_key() {
 
 /// The rule that a reload never puts an older CRL in force compares with the CRLs in force
 /// only: a reload that drops a CA's CRL, then one that lists an older CRL of it, are both
-/// accepted (ADR-0023 says so), and so is a restart with the older one. A CA without a CRL
+/// accepted (ADR-0024 says so), and so is a restart with the older one. A CA without a CRL
 /// under `tls_client_crl_missing = "allow"` is named in a warning.
 #[tokio::test]
 async fn a_crl_dropped_then_restored_older_is_not_caught() {

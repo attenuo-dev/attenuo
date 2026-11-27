@@ -186,10 +186,20 @@ impl Ca {
 
     /// A server certificate for `names` (DNS names or IP addresses) signed by this CA.
     pub fn leaf(&self, names: &[&str]) -> (rustls::pki_types::CertificateDer<'static>, Vec<u8>) {
+        self.leaf_with(names, |_| {})
+    }
+
+    /// [`Ca::leaf`], with `edit` applied to its parameters (its dates, for example).
+    pub fn leaf_with(
+        &self,
+        names: &[&str],
+        edit: impl FnOnce(&mut rcgen::CertificateParams),
+    ) -> (rustls::pki_types::CertificateDer<'static>, Vec<u8>) {
         let key = rcgen::KeyPair::generate().unwrap();
         let names: Vec<String> = names.iter().map(|s| s.to_string()).collect();
         let mut params = rcgen::CertificateParams::new(names).unwrap();
         params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        edit(&mut params);
         let issuer = rcgen::Issuer::from_params(&self.params, &self.key);
         let cert = params.signed_by(&key, &issuer).unwrap();
         (cert.der().clone(), key.serialize_der())
@@ -252,7 +262,17 @@ impl Ca {
     /// Write a server certificate for `names` (with this CA's certificate after it) and its
     /// key into `dir` as PEM files, the key with mode 0600. Returns the two paths.
     pub fn write_server_files(&self, dir: &Path, names: &[&str]) -> (PathBuf, PathBuf) {
-        let (cert, key) = self.leaf(names);
+        self.write_server_files_with(dir, names, |_| {})
+    }
+
+    /// [`Ca::write_server_files`], the certificate made with `edit` ([`Ca::leaf_with`]).
+    pub fn write_server_files_with(
+        &self,
+        dir: &Path,
+        names: &[&str],
+        edit: impl FnOnce(&mut rcgen::CertificateParams),
+    ) -> (PathBuf, PathBuf) {
+        let (cert, key) = self.leaf_with(names, edit);
         let cert_path = dir.join("server.crt");
         let key_path = dir.join("server.key");
         std::fs::write(

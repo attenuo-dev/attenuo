@@ -62,6 +62,7 @@ Only the `status` and `date` fields and the More Information section of an accep
 | [0020](0020-pki-tls-client-auth.md) | Client certificates from a CA (`tls_client_auth`): a CA file and exactly one SAN, URI (SPIFFE ID) or DNS, per entry; no subject DN, no revocation | proposed |
 | [0021](0021-forwarded-client-certificates.md) | Client certificates forwarded by a trusted reverse proxy in the RFC 9440 headers: a listener of its own, a required peer allowlist, the headers refused on every other listener, the same checks as the native path | proposed |
 | [0022](0022-certificate-bound-tokens.md) | Certificate-bound access tokens (RFC 8705 §3): off by default, one binding per token, bound to the certificate that authenticated at `/token`, checked on every route that takes a token, the same certificate for every child; no cross-holder delegation | proposed |
-| [0023](0023-client-certificate-crls.md) | CRL files for client certificates from a CA: read from disk at start and reload, signed by a CA the entry trusts, stale CRLs refuse by default, never an older CRL on reload, checked again for certificate-bound tokens | proposed |
+| [0023](0023-server-certificate-reload.md) | Reload the server certificate through `POST /admin/tls/reload`: the paths and TLS settings read at start, the startup checks plus the certificate's dates, new connections only; failed handshakes counted by a fixed reason | proposed |
+| [0024](0024-client-certificate-crls.md) | CRL files for client certificates from a CA: read from disk at start and reload, signed by a CA the entry trusts, stale CRLs refuse by default, never an older CRL on reload, checked again for certificate-bound tokens | proposed |
 
 Add a row for each new ADR.

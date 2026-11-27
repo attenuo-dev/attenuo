@@ -987,6 +987,31 @@ pub(crate) fn render_keys_reload(v: &Value) -> String {
     out
 }
 
+/// The answer of `POST /admin/tls/reload` (`attenuo admin tls reload`): the SHA-256 of the
+/// certificate before and after, its validity dates and the length of its chain.
+pub(crate) fn render_tls_reload(v: &Value) -> String {
+    let one = |key: &str| escape_controls(v[key].as_str().unwrap_or("-"));
+    let (now, before) = (
+        one("certificate_sha256"),
+        one("previous_certificate_sha256"),
+    );
+    let mut out = if v["changed"].as_bool() == Some(false) {
+        format!("certificate (sha256): {now} (unchanged)\n")
+    } else {
+        format!("certificate (sha256): {before} -> {now}\n")
+    };
+    out.push_str(&format!(
+        "valid from {} until {}\n",
+        one("not_before"),
+        one("not_after")
+    ));
+    out.push_str(&format!(
+        "chain: {} certificate(s); new connections use it, open ones keep the old one\n",
+        v["chain_length"].as_u64().unwrap_or_default()
+    ));
+    out
+}
+
 /// The warnings of an agents or keys reload, one `warning:` line each, for stderr: those about
 /// what is now in force (`warnings`), then those about the file's own settings, which a restart
 /// would apply (`restart_warnings`). Empty when there are none.

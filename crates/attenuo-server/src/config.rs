@@ -587,7 +587,8 @@ pub struct ForwardedClientCertSection {
 
 /// `[server.tls]`: the certificate and private key of the main listener (`[server] listen`).
 ///
-/// The files are read once, at startup: a renewed certificate takes a restart. The listener
+/// The files are read at startup, and again by `POST /admin/tls/reload` from the same paths
+/// (`tls.rs`); a path change takes a restart. The listener
 /// speaks TLS 1.3 only, offers ALPN `http/1.1` and keeps no sessions for resumption
 /// (`tls.rs`). It asks for a client certificate only with `client_certificates = "optional"`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
