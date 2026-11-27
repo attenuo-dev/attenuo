@@ -163,6 +163,10 @@ tls_client_cert_sha256 = ["00000000000000000000000000000000000000000000000000000
 tls_client_ca_pem_path = "/etc/attenuo/agents-ca.pem"
 tls_client_auth_san_uri = "spiffe://example.org/ns/agents/sa/planner"
 tls_client_auth_san_dns = "planner.agents.internal"
+tls_client_crl_paths = ["/etc/attenuo/agents-ca.crl"]
+tls_client_crl_issuer_pem_path = "/etc/attenuo/agents-intermediates.pem"
+tls_client_crl_stale = "refuse"
+tls_client_crl_missing = "allow"
 
 [[peps]]
 id = "pep"
@@ -175,6 +179,10 @@ tls_client_cert_sha256 = ["00000000000000000000000000000000000000000000000000000
 tls_client_ca_pem_path = "/etc/attenuo/agents-ca.pem"
 tls_client_auth_san_uri = "spiffe://example.org/ns/agents/sa/planner"
 tls_client_auth_san_dns = "planner.agents.internal"
+tls_client_crl_paths = ["/etc/attenuo/agents-ca.crl"]
+tls_client_crl_issuer_pem_path = "/etc/attenuo/agents-intermediates.pem"
+tls_client_crl_stale = "refuse"
+tls_client_crl_missing = "allow"
 
 [[root_grants]]
 issuer = "https://idp.example"

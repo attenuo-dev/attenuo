@@ -587,7 +587,8 @@ pub struct ForwardedClientCertSection {
 
 /// `[server.tls]`: the certificate and private key of the main listener (`[server] listen`).
 ///
-/// The files are read once, at startup: a renewed certificate takes a restart. The listener
+/// The files are read at startup, and again by `POST /admin/tls/reload` from the same paths
+/// (`tls.rs`); a path change takes a restart. The listener
 /// speaks TLS 1.3 only, offers ALPN `http/1.1` and keeps no sessions for resumption
 /// (`tls.rs`). It asks for a client certificate only with `client_certificates = "optional"`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3151,6 +3152,41 @@ pub struct AgentConfig {
     /// wildcard name in the certificate never matches.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_client_auth_san_dns: Option<String>,
+    /// With `tls_client_ca_pem_path`: certificate revocation lists (RFC 5280 §5) for the
+    /// client's certificate and the CA certificates in its path. 1 to 16 local files, each
+    /// holding one version 2 CRL, PEM (`-----BEGIN X509 CRL-----`) or DER, at most 4 MiB.
+    /// Each must be signed by a CA certificate of `tls_client_ca_pem_path` or of
+    /// `tls_client_crl_issuer_pem_path`, and at most one CRL per CA. Read at start and by an
+    /// agents reload; nothing is fetched. Delta, indirect and partitioned CRLs are refused.
+    /// Unset: no revocation check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_client_crl_paths: Option<Vec<PathBuf>>,
+    /// With `tls_client_crl_paths`: a PEM file of intermediate CA certificates (at most 16,
+    /// each `CA:TRUE`) whose CRLs are in `tls_client_crl_paths`. Each must be issued by a CA of
+    /// `tls_client_ca_pem_path` or by another certificate of this file. They are not trust
+    /// anchors: they only give the keys that sign those CRLs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_client_crl_issuer_pem_path: Option<PathBuf>,
+    /// With `tls_client_crl_paths`: what a CRL whose `nextUpdate` has passed does. `"refuse"`
+    /// (the default): every certificate whose path goes through that CRL's CA is refused, and
+    /// a start or reload with such a CRL is refused. `"allow"`: the CRL is still used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_client_crl_stale: Option<ClientCrlRule>,
+    /// With `tls_client_crl_paths`: what a CA in a certificate's path without a CRL does.
+    /// `"allow"` (the default): that CA's certificates are not checked for revocation.
+    /// `"refuse"`: the certificate is refused, so every CA below the trust anchor needs a CRL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_client_crl_missing: Option<ClientCrlRule>,
+}
+
+/// `[[agents]]` and `[[peps]]` `tls_client_crl_stale` and `tls_client_crl_missing`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientCrlRule {
+    /// Accept the certificate.
+    Allow,
+    /// Refuse the certificate.
+    Refuse,
 }
 
 impl AgentConfig {
@@ -3167,6 +3203,10 @@ impl AgentConfig {
             tls_client_ca_pem_path: None,
             tls_client_auth_san_uri: None,
             tls_client_auth_san_dns: None,
+            tls_client_crl_paths: None,
+            tls_client_crl_issuer_pem_path: None,
+            tls_client_crl_stale: None,
+            tls_client_crl_missing: None,
         }
     }
 
@@ -3183,6 +3223,10 @@ impl AgentConfig {
             tls_client_ca_pem_path: None,
             tls_client_auth_san_uri: None,
             tls_client_auth_san_dns: None,
+            tls_client_crl_paths: None,
+            tls_client_crl_issuer_pem_path: None,
+            tls_client_crl_stale: None,
+            tls_client_crl_missing: None,
         }
     }
 
@@ -3228,6 +3272,10 @@ impl AgentConfig {
             tls_client_ca_pem_path: None,
             tls_client_auth_san_uri: None,
             tls_client_auth_san_dns: None,
+            tls_client_crl_paths: None,
+            tls_client_crl_issuer_pem_path: None,
+            tls_client_crl_stale: None,
+            tls_client_crl_missing: None,
         }
     }
 
@@ -3248,6 +3296,10 @@ impl AgentConfig {
             tls_client_ca_pem_path: None,
             tls_client_auth_san_uri: None,
             tls_client_auth_san_dns: None,
+            tls_client_crl_paths: None,
+            tls_client_crl_issuer_pem_path: None,
+            tls_client_crl_stale: None,
+            tls_client_crl_missing: None,
         }
     }
 
@@ -3265,6 +3317,10 @@ impl AgentConfig {
             tls_client_ca_pem_path: None,
             tls_client_auth_san_uri: None,
             tls_client_auth_san_dns: None,
+            tls_client_crl_paths: None,
+            tls_client_crl_issuer_pem_path: None,
+            tls_client_crl_stale: None,
+            tls_client_crl_missing: None,
         }
     }
 }

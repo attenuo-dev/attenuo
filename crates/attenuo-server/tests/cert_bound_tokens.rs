@@ -1441,6 +1441,113 @@ async fn a_rotated_certificate_does_not_carry_the_binding() {
     h.stop().await;
 }
 
+/// Rotating the server's own certificate (`POST /admin/tls/reload`) does not touch client
+/// certificates: a token bound to the agent's certificate before the reload still works with
+/// it after, on new connections that see the new server certificate, and still needs it.
+#[tokio::test]
+async fn a_bound_token_survives_a_server_certificate_reload() {
+    use rustls::pki_types::pem::PemObject;
+    use sha2::Digest;
+    let h = Harness::start(Opts {
+        forwarded: false,
+        ..Opts::default()
+    })
+    .await;
+    let c = &h.certs;
+    let token = h.bound_to(Via::Native(Some(&c.coder)), "coder").await;
+    assert_eq!(h.x5t(&token), Some(c.coder.x5t_s256()));
+    let leaf_sha256 = || {
+        let pem = std::fs::read(h.dir.path().join("server.crt")).unwrap();
+        let der: rustls::pki_types::CertificateDer<'static> =
+            rustls::pki_types::CertificateDer::pem_slice_iter(&pem)
+                .next()
+                .unwrap()
+                .unwrap();
+        hex::encode(sha2::Sha256::digest(der.as_ref()))
+    };
+    let before = leaf_sha256();
+    h.ca.write_server_files(h.dir.path(), &["127.0.0.1"]);
+    let after = leaf_sha256();
+    assert_ne!(before, after);
+    let a = h
+        .send(
+            h.main(None),
+            Method::POST,
+            "/admin/tls/reload",
+            Some((ADMIN, Auth::Bearer)),
+            None,
+            &[],
+        )
+        .await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert_eq!(a.body["previous_certificate_sha256"], before.as_str());
+    assert_eq!(a.body["certificate_sha256"], after.as_str());
+    // Each `send` is a new connection, so every request below sees the new server
+    // certificate. The bound token works with its certificate on every route tried.
+    let a = h
+        .send(
+            Via::Native(Some(&c.coder)),
+            Method::POST,
+            "/mcp/github",
+            Some((&token, Auth::Bearer)),
+            Some(&read_call()),
+            &[],
+        )
+        .await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert!(a.body.get("result").is_some(), "{}", a.body);
+    let a = h
+        .send(
+            Via::Native(Some(&c.coder)),
+            Method::POST,
+            "/access/v1/evaluation",
+            Some((&token, Auth::Bearer)),
+            Some(&evaluation()),
+            &[],
+        )
+        .await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    let a = h
+        .send(
+            Via::Native(Some(&c.coder)),
+            Method::POST,
+            "/token/renew",
+            Some((&token, Auth::Bearer)),
+            None,
+            &[],
+        )
+        .await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    // And it still needs that certificate.
+    h.send(
+        Via::Native(None),
+        Method::POST,
+        "/mcp/github",
+        Some((&token, Auth::Bearer)),
+        Some(&read_call()),
+        &[],
+    )
+    .await
+    .refused(
+        REQUIRED,
+        "no certificate after the server certificate reload",
+    );
+    h.send(
+        Via::Native(Some(&c.planner)),
+        Method::POST,
+        "/mcp/github",
+        Some((&token, Auth::Bearer)),
+        Some(&read_call()),
+        &[],
+    )
+    .await
+    .refused(
+        MISMATCH,
+        "another certificate after the server certificate reload",
+    );
+    h.stop().await;
+}
+
 /// Turning the setting off later does not unbind a token: once bound, always bound. The same
 /// issuer key, audit log and certificates, the setting off: the token still needs its
 /// certificate.

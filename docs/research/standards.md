@@ -3,7 +3,7 @@
 <!-- renamed-note -->
 > Note (2026-10-23): this project was renamed from `onbehalf` to `attenuo`. This historical document keeps the old name.
 
-- Date: 2026-10-22, updated 2026-11-12 and 2026-11-13 (sections marked "added 2026-11-12" or "added 2026-11-13" use the current name)
+- Date: 2026-10-22, updated 2026-11-12, 2026-11-13 and 2026-11-25 (sections marked "added 2026-11-12", "added 2026-11-13" or "added 2026-11-25" use the current name)
 - Related: [RFC-0001](../spec/rfc-0001-attenuo.md), [related work](related-work.md)
 
 > Update (2026-11-12): MCP's DPoP profile is now an experimental extension, Enterprise-Managed Authorization (ID-JAG) is marked stable on MCP's auth roadmap, ID-JAG is at -06, `draft-ietf-wimse-aims` at -01 has been read in part, and three IETF drafts were added: [attenuating agent tokens](#attenuating-authorization-tokens-for-agentic-delegation-chains), the [OAuth actor profile](#oauth-actor-profile-for-delegation) and the AuthZEN profiles. The closing section no longer says the composition is unowned.
@@ -142,6 +142,27 @@ Rust-implemented authorization language with a sound-and-complete logical encodi
 
 - **Gives us:** in-process argument-aware policy evaluation and a path to policy analysis. See [ADR-0002](../decisions/0002-cedar-for-policy.md).
 - **Gap:** no native ReBAC; temporal/session constraints led AWS to a second language (Dogwood); no notion of delegation depth or attenuation. These are handled outside the language in onbehalf.
+
+## RFC 5280, certificate revocation lists (added 2026-11-25)
+
+RFC 5280 §5 defines the X.509 CRL, and §6.3 how a relying party uses one. attenuo reads CRL files for client certificates from a CA ([ADR-0024](../decisions/0024-client-certificate-crls.md), [CRL files](../reference/config.md#crl-files)).
+
+| RFC 5280 | attenuo | Status |
+| --- | --- | --- |
+| 5.1: v2 CRL, `thisUpdate`, `nextUpdate` | v2 only; `nextUpdate` required (RFC 5280 says conforming CAs MUST include it); `thisUpdate` at most 300 s ahead | supported, stricter |
+| 5.1.2.6 / 5.3.1: revoked entries, reason codes | an entry revokes whatever its reason, also `certificateHold` (no hold release) | supported |
+| 5.1.1.3 / 6.3.3 (f, g): CRL signature by the certificate's issuer | the issuer name must equal a CA certificate's subject byte for byte (not the §7.1 name comparison), and its key must verify the signature; `cRLSign` needed when the signer has `keyUsage` | supported, stricter |
+| 5.2.3: `cRLNumber` | used to refuse an older CRL on reload; not required | supported |
+| 5.2.4: delta CRLs | refused | not supported |
+| 5.2.5: `issuingDistributionPoint` (scoped, partitioned, indirect CRLs) | any `issuingDistributionPoint` is refused | not supported |
+| 5.2.6: `freshestCRL` | ignored (no delta CRLs) | not supported |
+| 4.2.1.13: `cRLDistributionPoints` in certificates | ignored; nothing is fetched | not supported, by design |
+| 6.3.3 (a): fresh CRLs | operator's job: files, reload; stale CRLs refuse by default | supported, offline |
+| 6.3: trust anchor revocation | a self-signed trust anchor is not checked; a CA of the CA file that is not self-issued, and whose issuer the entry's files hold, is checked in that issuer's CRL like an intermediate | supported for anchors with a known issuer |
+| 4.1.2.2: serial numbers | compared as unsigned numbers, leading zero bytes stripped on both sides | supported |
+
+- **Gives us:** revocation for certificates that live longer than SPIRE's, from a format every CA produces.
+- **Gap:** no OCSP (RFC 6960) and no fetch. The CRL is as fresh as the operator's copy job.
 
 ## SPIFFE / SPIRE
 

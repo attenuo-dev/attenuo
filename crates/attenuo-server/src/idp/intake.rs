@@ -1165,6 +1165,10 @@ mod tests {
             tls_client_ca_pem_path: None,
             tls_client_auth_san_uri: None,
             tls_client_auth_san_dns: None,
+            tls_client_crl_paths: None,
+            tls_client_crl_issuer_pem_path: None,
+            tls_client_crl_stale: None,
+            tls_client_crl_missing: None,
         };
         let e = validate_agents(&[neither]).err().unwrap().to_string();
         assert!(e.contains("set secret_sha256, jwks"), "{e}");

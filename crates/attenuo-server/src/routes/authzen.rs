@@ -1032,6 +1032,9 @@ fn bearer_auth(
         },
         now,
     )?;
+    if binding.cert() {
+        crate::cert_binding::check_revocation(&state.clients, &v.chain, cert, now)?;
+    }
     let dpop_bound = binding.dpop();
     let jkt = dpop_bound
         .then(|| {

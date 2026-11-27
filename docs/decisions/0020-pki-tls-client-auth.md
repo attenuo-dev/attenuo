@@ -52,7 +52,7 @@ Chosen option: "a CA file per entry and exactly one SAN, URI or DNS", because it
 
 - Good, because a CA can issue and renew certificates with no change to attenuo, and short-lived SVIDs work.
 - Good, because agent A's certificate never authenticates agent B of the same list, even from the same CA, and even when it carries both names.
-- Bad, because there is no CRL or OCSP check. A revoked certificate works until it expires, or until its CA or name is removed from the entry and the lists are reloaded.
+- Bad, because there is no CRL or OCSP check. A revoked certificate works until it expires, or until its CA or name is removed from the entry and the lists are reloaded. (ADR-0024 later adds CRL files.)
 - Bad, because a CA that issues a certificate with another agent's name makes that agent's identity available. Trust a CA only for the names it should vouch for.
 - Bad, because a rotated CA file (a new SPIRE bundle) needs `attenuo admin agent reload`.
 - Bad, because the check of an entry with a CA takes longer than a refusal for an unknown id, so timing can show which ids use a CA. The answer is the same.

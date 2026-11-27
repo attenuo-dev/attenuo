@@ -53,7 +53,7 @@ use crate::error::ApiError;
 use crate::operators::AdminIdentity;
 use crate::routes::admin::{self, require_admin};
 use crate::routes::extract::{Body, Path, Query};
-use crate::routes::{approvals, keys, policies, retention};
+use crate::routes::{approvals, keys, policies, retention, tls_reload};
 use crate::state::AppState;
 
 /// Where the console lives on its listener. Asset paths are relative to it.
@@ -292,6 +292,7 @@ pub fn write_routes() -> Router<Arc<AppState>> {
         .route("/admin/operators/reload", post(admin::reload_operators))
         .route("/admin/agents/reload", post(admin::reload_agents))
         .route("/admin/keys/reload", post(keys::reload_keys))
+        .route("/admin/tls/reload", post(tls_reload::reload_tls))
         .route("/admin/approvals/{id}", post(approvals::admin_decide))
         .route_layer(middleware::from_fn(require_json))
 }

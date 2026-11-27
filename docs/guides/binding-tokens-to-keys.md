@@ -195,6 +195,10 @@ The server needs a listener that takes client certificates: `[server.tls] client
 | No certificate on the request (a plain-HTTP listener, a TLS connection without one, the ext-authz gateway route) | 401 `client_certificate_required` (MCP: `-32001`, `data.reason`) |
 | Another certificate, also one from the same CA with the same name, or the next one of a rotation | 401 `client_certificate_mismatch` |
 | A `DPoP` header or `Authorization: DPoP` with a certificate-bound token | 401 `dpop_with_certificate_binding`; 400 at `/token` |
+| The bound certificate is from a CA whose entry lists CRL files, and a CRL lists it or a CA in its path | 401 `client_certificate_revoked` (MCP: `-32001`, `data.reason`) |
+| The same, and a CRL its path needs is stale, missing or ignored, or the certificate no longer passes its entry's check for another reason (it expired, say) | 401 `client_certificate_revocation_unknown` (MCP: `-32001`, `data.reason`) |
+
+The two CRL rows are checked with the lists and CRLs in force at the time of the request, so a reload that revokes a certificate stops its tokens too. They apply to the entries of the token's agents (those in its delegation chain) that have `tls_client_crl_paths` ([CRL files](../reference/config.md#crl-files)) and whose name the certificate carries: an agent that authenticated with a secret over another agent's connection is not checked against that agent's certificate. A token bound to a pinned certificate, or to one whose entry has no CRLs, was removed or no longer names it, is checked by thumbprint only. A request with any other token costs no certificate check.
 
 A `Client-Cert` header never stands in for a certificate, except on the forwarding listener from a trusted peer. Elsewhere it is refused (400) or ignored. The ext-authz gateway route sees the gateway's connection, not the agent's, so it refuses certificate-bound tokens. An external PEP that verifies tokens itself must check the certificate itself.
 

@@ -19,7 +19,15 @@
 //! - no certificate on the request (a plain listener, a TLS connection without one, a
 //!   gateway route that sees no agent certificate): `client_certificate_required`;
 //! - another certificate: `client_certificate_mismatch`;
-//! - a `DPoP` header, or the `DPoP` authorization scheme: `dpop_with_certificate_binding`.
+//! - a `DPoP` header, or the `DPoP` authorization scheme: `dpop_with_certificate_binding`;
+//! - a certificate that is the bound one but fails the check of its `[[agents]]` entry with
+//!   `tls_client_crl_paths` ([`check_revocation`], ADR-0024): `client_certificate_revoked`,
+//!   or `client_certificate_revocation_unknown` for any other failure of that check (a stale
+//!   or missing CRL, an expired certificate, a path that no longer builds). The same codes on
+//!   every route, the MCP proxy's included (JSON-RPC `-32001`). The check runs only for a
+//!   token bound to a certificate, once its thumbprint matched; the entries checked are
+//!   those of the token's agents whose name the certificate carries (a hop that
+//!   authenticated with a secret over another agent's connection is not its owner).
 //!
 //! **Exchange.** A child of a certificate-bound token is bound to the same certificate, and
 //! the exchange request must show that certificate. No `DPoP` header and no
@@ -46,6 +54,13 @@ use crate::error::ApiError;
 pub(crate) const CLIENT_CERTIFICATE_REQUIRED: &str = "client_certificate_required";
 /// Code of a certificate-bound token on a request with another client certificate.
 pub(crate) const CLIENT_CERTIFICATE_MISMATCH: &str = "client_certificate_mismatch";
+/// Code of a certificate the CRLs of its entry list as revoked, for client authentication
+/// and for a certificate-bound token.
+pub(crate) const CLIENT_CERTIFICATE_REVOKED: &str = "client_certificate_revoked";
+/// Code of a certificate whose revocation status its entry's CRLs cannot tell, or that fails
+/// its entry's check for another reason, for a certificate-bound token.
+pub(crate) const CLIENT_CERTIFICATE_REVOCATION_UNKNOWN: &str =
+    "client_certificate_revocation_unknown";
 /// Code of a DPoP proof (or the `DPoP` scheme) where the token is, or would be, bound to a
 /// certificate: a token has one binding only.
 pub(crate) const DPOP_WITH_CERTIFICATE_BINDING: &str = "dpop_with_certificate_binding";
@@ -98,6 +113,10 @@ pub(crate) enum CertFailure {
     Required,
     /// The request's client certificate is another one.
     Mismatch,
+    /// The bound certificate is revoked by a CRL of its entry ([`check_revocation`]).
+    Revoked,
+    /// The bound certificate fails its entry's check otherwise ([`check_revocation`]).
+    RevocationUnknown,
     /// A DPoP proof (or the `DPoP` scheme) with a certificate-bound token. `issuing`: at
     /// `POST /token`, where the token is about to be bound.
     WithDpop { issuing: bool },
@@ -109,6 +128,8 @@ impl CertFailure {
         match self {
             CertFailure::Required => CLIENT_CERTIFICATE_REQUIRED,
             CertFailure::Mismatch => CLIENT_CERTIFICATE_MISMATCH,
+            CertFailure::Revoked => CLIENT_CERTIFICATE_REVOKED,
+            CertFailure::RevocationUnknown => CLIENT_CERTIFICATE_REVOCATION_UNKNOWN,
             CertFailure::WithDpop { .. } => DPOP_WITH_CERTIFICATE_BINDING,
         }
     }
@@ -129,6 +150,19 @@ impl From<CertFailure> for ApiError {
                 "invalid_token",
                 "the token is bound to another TLS client certificate than the one this \
                  request shows",
+            ),
+            CertFailure::Revoked => ApiError::new(
+                StatusCode::UNAUTHORIZED,
+                "invalid_token",
+                "the token is bound to a TLS client certificate that is revoked by a CRL of its \
+                 issuer, or whose path holds a revoked CA certificate",
+            ),
+            CertFailure::RevocationUnknown => ApiError::new(
+                StatusCode::UNAUTHORIZED,
+                "invalid_token",
+                "the token is bound to a TLS client certificate that no longer passes its \
+                 entry's check: a CRL of a CA in its path is stale or missing, or the \
+                 certificate or its path is no longer valid",
             ),
             CertFailure::WithDpop { issuing: false } => ApiError::new(
                 StatusCode::UNAUTHORIZED,
@@ -256,6 +290,32 @@ pub(crate) fn check_cert(bound: &str, cert: Option<&[u8; 32]>) -> Result<(), Cer
         Ok(())
     } else {
         Err(CertFailure::Mismatch)
+    }
+}
+
+/// The revocation check of a certificate-bound token, after its thumbprint matched the
+/// request's certificate `cert`: the certificate passes the check of each `[[agents]]` entry
+/// with `tls_client_auth` and `tls_client_crl_paths` that is an agent of the token's `chain`
+/// and whose name the certificate carries
+/// ([`crate::clientauth::Clients::bound_certificate_refusal`], against the agents in force
+/// now). A token none of whose agents has such an entry (a pinned certificate's, one from an
+/// entry without CRLs, one whose entry a reload removed or whose name rule changed) is not
+/// checked: the thumbprint decides, as before. Run only for a token bound to a certificate,
+/// so other requests cost nothing more. Not audited, as the other binding refusals are not.
+pub(crate) fn check_revocation(
+    clients: &crate::clientauth::SharedClients,
+    chain: &attenuo_core::DelegationChain,
+    cert: Option<&ClientCertificate>,
+    now: OffsetDateTime,
+) -> Result<(), CertFailure> {
+    match clients
+        .snapshot()
+        .agents
+        .bound_certificate_refusal(chain, cert, now)
+    {
+        None => Ok(()),
+        Some(crate::client_crl::REVOKED_LOG_REASON) => Err(CertFailure::Revoked),
+        Some(_) => Err(CertFailure::RevocationUnknown),
     }
 }
 
@@ -391,20 +451,38 @@ pub(crate) fn check_exchange_of_cert_bound(
 /// accept loop or the forwarding listener's header check set, and from nothing else. Any
 /// thumbprint already in the extensions is dropped first (none can be: a request off the wire
 /// has no extensions).
+///
+/// The request is then served with the certificate itself in [`REQUEST_CERTIFICATE`], for
+/// the revocation check of a certificate-bound token, which the server's authorizer runs only
+/// once the token's thumbprint matched ([`request_certificate`]). Nothing is checked here.
 pub(crate) async fn expose_to_proxy(
     mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     req.extensions_mut()
         .remove::<attenuo_proxy::ClientCertThumbprint>();
-    let thumbprint = req
-        .extensions()
-        .get::<ClientCertificate>()
-        .map(|c| attenuo_proxy::ClientCertThumbprint(*c.sha256()));
-    if let Some(t) = thumbprint {
-        req.extensions_mut().insert(t);
+    let cert = req.extensions().get::<ClientCertificate>().cloned();
+    match cert {
+        Some(cert) => {
+            req.extensions_mut()
+                .insert(attenuo_proxy::ClientCertThumbprint(*cert.sha256()));
+            REQUEST_CERTIFICATE.scope(cert, next.run(req)).await
+        }
+        None => next.run(req).await,
     }
-    next.run(req).await
+}
+
+tokio::task_local! {
+    /// The verified client certificate of the MCP proxy request being served
+    /// ([`expose_to_proxy`]), for the server's authorizer, which the proxy hands only the
+    /// thumbprint.
+    static REQUEST_CERTIFICATE: ClientCertificate;
+}
+
+/// The verified client certificate of the MCP proxy request being served, as
+/// [`expose_to_proxy`] set it; `None` outside such a request, or for a request without one.
+pub(crate) fn request_certificate() -> Option<ClientCertificate> {
+    REQUEST_CERTIFICATE.try_with(Clone::clone).ok()
 }
 
 #[cfg(test)]
